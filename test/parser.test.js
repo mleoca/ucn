@@ -4547,6 +4547,38 @@ func (s *ServiceB) helper() {}
         }
     });
 
+    it('should detect JSX component usage as calls', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-jsx-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), `{"name": "test"}`);
+
+            fs.writeFileSync(path.join(tmpDir, 'Page.tsx'), `
+function EnvironmentsPage() {
+  return <div>Hello</div>;
+}
+
+function App() {
+  return <EnvironmentsPage />;
+}
+
+export { App, EnvironmentsPage };
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.tsx', { quiet: true });
+
+            const usages = index.usages('EnvironmentsPage', { codeOnly: true });
+            const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+
+            // Should find JSX usage as a call
+            assert.ok(calls.length >= 1, 'Should find at least 1 JSX component usage');
+            assert.ok(calls.some(c => c.content && c.content.includes('<EnvironmentsPage')),
+                'Should detect <EnvironmentsPage /> as a call');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
     it('should detect Rust method calls in usages', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-method-'));
         try {
