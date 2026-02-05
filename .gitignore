@@ -11,3 +11,4 @@ AGENTS.md
 # Test output files
 test/bugs-report.json
 test/public-repos-bugs.json
+test/public-repos-test.js
