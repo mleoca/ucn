@@ -706,9 +706,19 @@ class ProjectIndex {
      * Get context for a symbol (callers + callees)
      */
     context(name, options = {}) {
-        const definitions = this.symbols.get(name) || [];
+        let definitions = this.symbols.get(name) || [];
         if (definitions.length === 0) {
             return { function: name, file: null, callers: [], callees: [] };
+        }
+
+        // Filter by file if specified
+        if (options.file) {
+            const filtered = definitions.filter(d =>
+                d.relativePath && d.relativePath.includes(options.file)
+            );
+            if (filtered.length > 0) {
+                definitions = filtered;
+            }
         }
 
         // Prefer class/struct/interface definitions over functions/methods/constructors
@@ -974,6 +984,10 @@ class ProjectIndex {
             const calls = this.getCachedCalls(def.file);
             if (!calls) return [];
 
+            // Get file language for smart method call handling
+            const fileEntry = this.files.get(def.file);
+            const language = fileEntry?.language;
+
             const callees = new Map();  // name -> count
 
             for (const call of calls) {
@@ -982,8 +996,12 @@ class ProjectIndex {
                 if (call.enclosingFunction.name !== def.name) continue;
                 if (call.enclosingFunction.startLine !== def.startLine) continue;
 
-                // Skip method calls unless explicitly requested
-                if (call.isMethod && !options.includeMethods) continue;
+                // Smart method call handling:
+                // - Go: include all method calls (Go doesn't use this/self/cls)
+                // - Other languages: skip method calls unless explicitly requested
+                if (call.isMethod) {
+                    if (language !== 'go' && !options.includeMethods) continue;
+                }
 
                 // Skip keywords and built-ins
                 if (this.isKeyword(call.name)) continue;
@@ -2102,9 +2120,19 @@ class ProjectIndex {
         const maxDepth = Math.max(0, rawDepth);
         const direction = options.direction || 'down';  // 'down' = callees, 'up' = callers, 'both'
 
-        const definitions = this.symbols.get(name);
+        let definitions = this.symbols.get(name);
         if (!definitions || definitions.length === 0) {
             return null;
+        }
+
+        // Filter by file if specified
+        if (options.file) {
+            const filtered = definitions.filter(d =>
+                d.relativePath && d.relativePath.includes(options.file)
+            );
+            if (filtered.length > 0) {
+                definitions = filtered;
+            }
         }
 
         const def = definitions[0];
@@ -2184,9 +2212,19 @@ class ProjectIndex {
      * @returns {object} Impact analysis
      */
     impact(name, options = {}) {
-        const definitions = this.symbols.get(name);
+        let definitions = this.symbols.get(name);
         if (!definitions || definitions.length === 0) {
             return null;
+        }
+
+        // Filter by file if specified
+        if (options.file) {
+            const filtered = definitions.filter(d =>
+                d.relativePath && d.relativePath.includes(options.file)
+            );
+            if (filtered.length > 0) {
+                definitions = filtered;
+            }
         }
 
         const def = definitions[0];
@@ -2899,10 +2937,10 @@ class ProjectIndex {
         const maxCallees = options.maxCallees || 5;
 
         // Find symbol definition(s)
-        const definitions = this.find(name, { exact: true });
+        const definitions = this.find(name, { exact: true, file: options.file });
         if (definitions.length === 0) {
             // Try fuzzy match
-            const fuzzy = this.find(name);
+            const fuzzy = this.find(name, { file: options.file });
             if (fuzzy.length === 0) {
                 return null;
             }

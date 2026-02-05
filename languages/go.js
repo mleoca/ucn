@@ -567,8 +567,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Only look for identifiers with the matching name
-        if (node.type !== 'identifier' || node.text !== name) {
+        // Look for both identifier and field_identifier (method names in selector expressions)
+        const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier';
+        if (!isIdentifier || node.text !== name) {
             return true;
         }
 
@@ -622,9 +623,8 @@ function findUsagesInCode(code, name, parser) {
             else if (parent.type === 'parameter_declaration') {
                 usageType = 'definition';
             }
-            // Method call: selector_expression followed by call
-            else if (parent.type === 'selector_expression' &&
-                     parent.childForFieldName('field') === node) {
+            // Method call: selector_expression followed by call (field_identifier case)
+            else if (parent.type === 'selector_expression') {
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call_expression') {
                     usageType = 'call';
