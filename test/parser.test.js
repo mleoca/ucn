@@ -4497,6 +4497,56 @@ function main() {
         }
     });
 
+    it('should prefer same-file callees for Go methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-callee-disambig-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), `module example.com/test
+go 1.21
+`);
+
+            // Two files with same method name 'helper'
+            fs.writeFileSync(path.join(tmpDir, 'service_a.go'), `package main
+
+type ServiceA struct{}
+
+func (s *ServiceA) Process() {
+    s.helper()
+}
+
+func (s *ServiceA) helper() {}
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'service_b.go'), `package main
+
+type ServiceB struct{}
+
+func (s *ServiceB) Process() {
+    s.helper()
+}
+
+func (s *ServiceB) helper() {}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // Get callees for ServiceA.Process - should find ServiceA.helper, not ServiceB.helper
+            const defs = index.symbols.get('Process') || [];
+            const serviceAProcess = defs.find(d => d.relativePath.includes('service_a.go'));
+            assert.ok(serviceAProcess, 'Should find ServiceA.Process');
+
+            const callees = index.findCallees(serviceAProcess);
+            assert.ok(callees.length >= 1, 'Should find at least 1 callee');
+
+            const helperCallee = callees.find(c => c.name === 'helper');
+            assert.ok(helperCallee, 'Should find helper callee');
+            assert.ok(helperCallee.relativePath.includes('service_a.go'),
+                'helper callee should be from service_a.go, not service_b.go');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
     it('should detect Rust method calls in usages', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-method-'));
         try {
