@@ -75,9 +75,3 @@ ucn graph <file>        # Dependency tree
 ```bash
 ucn --help            # Full command reference
 ```
-
-## Installation
-
-```bash
-npm install -g ucn
-```
