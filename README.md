@@ -48,6 +48,12 @@ To use UCN as a skill in Claude Code:
 
 ```bash
 mkdir -p ~/.claude/skills
+
+# If installed via npm:
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.claude/skills/
+
+# If cloned from git:
+git clone https://github.com/mleoca/ucn.git
 cp -r ucn/.claude/skills/ucn ~/.claude/skills/
 ```
 
@@ -57,6 +63,12 @@ To use UCN as a skill in OpenAI Codex:
 
 ```bash
 mkdir -p ~/.agents/skills
+
+# If installed via npm:
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
+
+# If cloned from git:
+git clone https://github.com/mleoca/ucn.git
 cp -r ucn/.claude/skills/ucn ~/.agents/skills/
 ```
 
