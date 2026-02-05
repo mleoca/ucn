@@ -1,6 +1,6 @@
 # UCN - Universal Code Navigator
 
-When working with large codebases or even vibe coding all into a single large file, AI agents often need to read entire files just to understand a single function. This fills eats up context rather fast, so the intent is to keep the agents perform better with their context clean than rather cluttered.
+When working with large codebases or even vibe coding all into a single large file, AI agents often need to read entire files just to understand a single function. This eats up the context rather fast, so the intent is to keep the agents perform better with their context clean than rather cluttered.
 
 ## Example
 
