@@ -1,0 +1,667 @@
+/**
+ * languages/python.js - Tree-sitter based Python parsing
+ *
+ * Handles: function definitions (regular, async, decorated),
+ * class definitions, and state objects (constants).
+ */
+
+const {
+    traverseTree,
+    nodeToLocation,
+    parseStructuredParams,
+    extractPythonDocstring
+} = require('./utils');
+const { PARSE_OPTIONS } = require('./index');
+
+/**
+ * Extract return type annotation from Python function
+ * @param {object} node - Function definition node
+ * @returns {string|null} Return type or null
+ */
+function extractReturnType(node) {
+    const returnTypeNode = node.childForFieldName('return_type');
+    if (returnTypeNode) {
+        let text = returnTypeNode.text.trim();
+        if (text.startsWith('->')) {
+            text = text.slice(2).trim();
+        }
+        return text || null;
+    }
+    return null;
+}
+
+/**
+ * Find the actual def line (not decorator) for docstring extraction
+ */
+function getDefLine(node) {
+    return node.startPosition.row + 1;
+}
+
+/**
+ * Get indentation of a node
+ */
+function getIndent(node, code) {
+    const lines = code.split('\n');
+    const firstLine = lines[node.startPosition.row] || '';
+    const indentMatch = firstLine.match(/^(\s*)/);
+    return indentMatch ? indentMatch[1].length : 0;
+}
+
+/**
+ * Extract Python parameters
+ */
+function extractPythonParams(paramsNode) {
+    if (!paramsNode) return '...';
+    const text = paramsNode.text;
+    let params = text.replace(/^\(|\)$/g, '').trim();
+    if (!params) return '...';
+    return params;
+}
+
+/**
+ * Find all functions in Python code using tree-sitter
+ */
+function findFunctions(code, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const functions = [];
+    const processedRanges = new Set();
+
+    traverseTree(tree.rootNode, (node) => {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+
+        if (node.type === 'function_definition') {
+            if (processedRanges.has(rangeKey)) return true;
+            processedRanges.add(rangeKey);
+
+            const nameNode = node.childForFieldName('name');
+            const paramsNode = node.childForFieldName('parameters');
+
+            if (nameNode) {
+                // Check for decorators
+                let startLine = node.startPosition.row + 1;
+                let decoratorStartLine = startLine;
+
+                if (node.parent && node.parent.type === 'decorated_definition') {
+                    decoratorStartLine = node.parent.startPosition.row + 1;
+                }
+
+                const endLine = node.endPosition.row + 1;
+                const indent = getIndent(node, code);
+                const returnType = extractReturnType(node);
+                const defLine = getDefLine(node);
+                const docstring = extractPythonDocstring(code, defLine);
+
+                // Check for async
+                const isAsync = node.text.trimStart().startsWith('async ');
+
+                // Extract decorators
+                const decorators = extractDecorators(node);
+
+                functions.push({
+                    name: nameNode.text,
+                    params: extractPythonParams(paramsNode),
+                    paramsStructured: parseStructuredParams(paramsNode, 'python'),
+                    startLine: decoratorStartLine,
+                    endLine,
+                    indent,
+                    isAsync,
+                    modifiers: isAsync ? ['async'] : [],
+                    ...(returnType && { returnType }),
+                    ...(docstring && { docstring }),
+                    ...(decorators.length > 0 && { decorators })
+                });
+            }
+            return true;
+        }
+
+        if (node.type === 'decorated_definition') {
+            return true;  // Continue traversing into decorated definitions
+        }
+
+        return true;
+    });
+
+    functions.sort((a, b) => a.startLine - b.startLine);
+    return functions;
+}
+
+/**
+ * Extract decorators from a function/class node
+ */
+function extractDecorators(node) {
+    const decorators = [];
+    if (node.parent && node.parent.type === 'decorated_definition') {
+        for (let i = 0; i < node.parent.namedChildCount; i++) {
+            const child = node.parent.namedChild(i);
+            if (child.type === 'decorator') {
+                decorators.push(child.text.replace('@', ''));
+            }
+        }
+    }
+    return decorators;
+}
+
+/**
+ * Find all classes in Python code using tree-sitter
+ */
+function findClasses(code, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const classes = [];
+    const processedRanges = new Set();
+
+    traverseTree(tree.rootNode, (node) => {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+
+        if (node.type === 'class_definition') {
+            if (processedRanges.has(rangeKey)) return true;
+            processedRanges.add(rangeKey);
+
+            const nameNode = node.childForFieldName('name');
+
+            if (nameNode) {
+                // Check for decorators
+                let startLine = node.startPosition.row + 1;
+                if (node.parent && node.parent.type === 'decorated_definition') {
+                    startLine = node.parent.startPosition.row + 1;
+                }
+
+                const endLine = node.endPosition.row + 1;
+                const members = extractClassMembers(node, code);
+                const defLine = getDefLine(node);
+                const docstring = extractPythonDocstring(code, defLine);
+                const decorators = extractDecorators(node);
+                const bases = extractBases(node);
+
+                classes.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    type: 'class',
+                    members,
+                    ...(docstring && { docstring }),
+                    ...(decorators.length > 0 && { decorators }),
+                    ...(bases.length > 0 && { extends: bases.join(', ') })
+                });
+            }
+            return false;  // Don't traverse into class body
+        }
+
+        return true;
+    });
+
+    classes.sort((a, b) => a.startLine - b.startLine);
+    return classes;
+}
+
+/**
+ * Extract base classes from class definition
+ */
+function extractBases(classNode) {
+    const bases = [];
+    const argsNode = classNode.childForFieldName('superclasses');
+    if (argsNode) {
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'identifier' || arg.type === 'attribute') {
+                bases.push(arg.text);
+            }
+        }
+    }
+    return bases;
+}
+
+/**
+ * Extract class members (methods)
+ */
+function extractClassMembers(classNode, code) {
+    const members = [];
+    const bodyNode = classNode.childForFieldName('body');
+    if (!bodyNode) return members;
+
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const child = bodyNode.namedChild(i);
+
+        let funcNode = child;
+        let decoratorStart = null;
+        const memberDecorators = [];
+
+        if (child.type === 'decorated_definition') {
+            decoratorStart = child.startPosition.row + 1;
+            // Collect decorators
+            for (let j = 0; j < child.namedChildCount; j++) {
+                const inner = child.namedChild(j);
+                if (inner.type === 'decorator') {
+                    memberDecorators.push(inner.text.replace('@', ''));
+                }
+                if (inner.type === 'function_definition') {
+                    funcNode = inner;
+                }
+            }
+        }
+
+        if (funcNode.type === 'function_definition') {
+            const nameNode = funcNode.childForFieldName('name');
+            const paramsNode = funcNode.childForFieldName('parameters');
+
+            if (nameNode) {
+                const name = nameNode.text;
+                const startLine = decoratorStart || funcNode.startPosition.row + 1;
+                const endLine = funcNode.endPosition.row + 1;
+
+                // Determine member type
+                let memberType = 'method';
+                if (name === '__init__') {
+                    memberType = 'constructor';
+                } else if (name.startsWith('__') && name.endsWith('__')) {
+                    memberType = 'special';
+                } else if (name.startsWith('_')) {
+                    memberType = 'private';
+                }
+
+                // Check decorators
+                for (const dec of memberDecorators) {
+                    if (dec.includes('staticmethod')) {
+                        memberType = 'static';
+                    } else if (dec.includes('classmethod')) {
+                        memberType = 'classmethod';
+                    } else if (dec.includes('property')) {
+                        memberType = 'property';
+                    }
+                }
+
+                const isAsync = funcNode.text.trimStart().startsWith('async ');
+                const returnType = extractReturnType(funcNode);
+                const defLine = getDefLine(funcNode);
+                const docstring = extractPythonDocstring(code, defLine);
+
+                members.push({
+                    name,
+                    params: extractPythonParams(paramsNode),
+                    paramsStructured: parseStructuredParams(paramsNode, 'python'),
+                    startLine,
+                    endLine,
+                    memberType,
+                    isAsync,
+                    ...(returnType && { returnType }),
+                    ...(docstring && { docstring }),
+                    ...(memberDecorators.length > 0 && { decorators: memberDecorators })
+                });
+            }
+        }
+    }
+
+    return members;
+}
+
+/**
+ * Find state objects (constants) in Python code
+ */
+function findStateObjects(code, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const objects = [];
+
+    const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
+
+    traverseTree(tree.rootNode, (node) => {
+        if (node.type === 'expression_statement' && node.parent === tree.rootNode) {
+            const child = node.namedChild(0);
+            if (child && child.type === 'assignment') {
+                const leftNode = child.childForFieldName('left');
+                const rightNode = child.childForFieldName('right');
+
+                if (leftNode && leftNode.type === 'identifier' && rightNode) {
+                    const name = leftNode.text;
+                    const isObject = rightNode.type === 'dictionary';
+                    const isArray = rightNode.type === 'list';
+
+                    if ((isObject || isArray) && statePattern.test(name)) {
+                        const { startLine, endLine } = nodeToLocation(node, code);
+                        objects.push({ name, startLine, endLine });
+                    }
+                }
+            }
+        }
+        return true;
+    });
+
+    objects.sort((a, b) => a.startLine - b.startLine);
+    return objects;
+}
+
+/**
+ * Parse a Python file completely
+ */
+function parse(code, parser) {
+    return {
+        language: 'python',
+        totalLines: code.split('\n').length,
+        functions: findFunctions(code, parser),
+        classes: findClasses(code, parser),
+        stateObjects: findStateObjects(code, parser),
+        imports: [],
+        exports: []
+    };
+}
+
+/**
+ * Find all function calls in Python code using tree-sitter AST
+ * @param {string} code - Source code to analyze
+ * @param {object} parser - Tree-sitter parser instance
+ * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string}>}
+ */
+function findCallsInCode(code, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const calls = [];
+    const functionStack = [];  // Stack of { name, startLine, endLine }
+
+    // Helper to check if a node creates a function scope
+    const isFunctionNode = (node) => {
+        return ['function_definition', 'async_function_definition', 'lambda'].includes(node.type);
+    };
+
+    // Helper to extract function name from a function node
+    const extractFunctionName = (node) => {
+        if (node.type === 'function_definition' || node.type === 'async_function_definition') {
+            const nameNode = node.childForFieldName('name');
+            return nameNode?.text || '<anonymous>';
+        }
+        if (node.type === 'lambda') {
+            return '<lambda>';
+        }
+        return '<anonymous>';
+    };
+
+    // Helper to get current enclosing function
+    const getCurrentEnclosingFunction = () => {
+        return functionStack.length > 0
+            ? { ...functionStack[functionStack.length - 1] }
+            : null;
+    };
+
+    traverseTree(tree.rootNode, (node) => {
+        // Track function entry
+        if (isFunctionNode(node)) {
+            functionStack.push({
+                name: extractFunctionName(node),
+                startLine: node.startPosition.row + 1,
+                endLine: node.endPosition.row + 1
+            });
+        }
+
+        // Handle function calls: foo(), obj.foo()
+        if (node.type === 'call') {
+            const funcNode = node.childForFieldName('function');
+            if (!funcNode) return true;
+
+            const enclosingFunction = getCurrentEnclosingFunction();
+
+            if (funcNode.type === 'identifier') {
+                // Direct call: foo()
+                calls.push({
+                    name: funcNode.text,
+                    line: node.startPosition.row + 1,
+                    isMethod: false,
+                    enclosingFunction
+                });
+            } else if (funcNode.type === 'attribute') {
+                // Method/attribute call: obj.foo()
+                const attrNode = funcNode.childForFieldName('attribute');
+                const objNode = funcNode.childForFieldName('object');
+
+                if (attrNode) {
+                    calls.push({
+                        name: attrNode.text,
+                        line: node.startPosition.row + 1,
+                        isMethod: true,
+                        receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
+                        enclosingFunction
+                    });
+                }
+            }
+            return true;
+        }
+
+        return true;
+    }, {
+        onLeave: (node) => {
+            if (isFunctionNode(node)) {
+                functionStack.pop();
+            }
+        }
+    });
+
+    return calls;
+}
+
+/**
+ * Find all imports in Python code using tree-sitter AST
+ * @param {string} code - Source code to analyze
+ * @param {object} parser - Tree-sitter parser instance
+ * @returns {Array<{module: string, names: string[], type: string, line: number}>}
+ */
+function findImportsInCode(code, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const imports = [];
+
+    traverseTree(tree.rootNode, (node) => {
+        // import statement: import os, import sys as system
+        if (node.type === 'import_statement') {
+            const line = node.startPosition.row + 1;
+
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'dotted_name') {
+                    // import os
+                    imports.push({
+                        module: child.text,
+                        names: [child.text.split('.').pop()],
+                        type: 'import',
+                        line
+                    });
+                } else if (child.type === 'aliased_import') {
+                    // import sys as system
+                    const nameNode = child.namedChild(0);
+                    const aliasNode = child.namedChild(1);
+                    if (nameNode) {
+                        imports.push({
+                            module: nameNode.text,
+                            names: [aliasNode ? aliasNode.text : nameNode.text.split('.').pop()],
+                            type: 'import',
+                            line
+                        });
+                    }
+                }
+            }
+            return true;
+        }
+
+        // from ... import statement
+        if (node.type === 'import_from_statement') {
+            const line = node.startPosition.row + 1;
+            let modulePath = '';
+            const names = [];
+
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+
+                // Module path (first dotted_name or relative_import)
+                if (i === 0 && (child.type === 'dotted_name' || child.type === 'relative_import')) {
+                    modulePath = child.text;
+                }
+                // Imported names
+                else if (child.type === 'dotted_name') {
+                    names.push(child.text);
+                } else if (child.type === 'aliased_import') {
+                    const nameNode = child.namedChild(0);
+                    if (nameNode) names.push(nameNode.text);
+                } else if (child.type === 'wildcard_import') {
+                    names.push('*');
+                }
+            }
+
+            if (modulePath) {
+                const isRelative = modulePath.startsWith('.');
+                imports.push({
+                    module: modulePath,
+                    names,
+                    type: isRelative ? 'relative' : 'from',
+                    line
+                });
+            }
+            return true;
+        }
+
+        return true;
+    });
+
+    return imports;
+}
+
+/**
+ * Find all exports in Python code using tree-sitter AST
+ * Looks for __all__ assignments
+ * @param {string} code - Source code to analyze
+ * @param {object} parser - Tree-sitter parser instance
+ * @returns {Array<{name: string, type: string, line: number}>}
+ */
+function findExportsInCode(code, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const exports = [];
+
+    traverseTree(tree.rootNode, (node) => {
+        // Look for __all__ = [...]
+        if (node.type === 'expression_statement') {
+            const child = node.namedChild(0);
+            if (child && child.type === 'assignment') {
+                const leftNode = child.childForFieldName('left');
+                const rightNode = child.childForFieldName('right');
+
+                if (leftNode && leftNode.type === 'identifier' && leftNode.text === '__all__') {
+                    const line = node.startPosition.row + 1;
+
+                    if (rightNode && rightNode.type === 'list') {
+                        for (let i = 0; i < rightNode.namedChildCount; i++) {
+                            const item = rightNode.namedChild(i);
+                            if (item.type === 'string') {
+                                // Extract string content
+                                const contentNode = item.childForFieldName('content') ||
+                                                   item.namedChild(0);
+                                if (contentNode && contentNode.type === 'string_content') {
+                                    exports.push({ name: contentNode.text, type: '__all__', line });
+                                } else {
+                                    // Fallback: remove quotes
+                                    const text = item.text;
+                                    const name = text.slice(1, -1);
+                                    exports.push({ name, type: '__all__', line });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return true;
+    });
+
+    return exports;
+}
+
+/**
+ * Find all usages of a name in code using AST
+ * @param {string} code - Source code
+ * @param {string} name - Symbol name to find
+ * @param {object} parser - Tree-sitter parser instance
+ * @returns {Array<{line: number, column: number, usageType: string}>}
+ */
+function findUsagesInCode(code, name, parser) {
+    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const usages = [];
+
+    traverseTree(tree.rootNode, (node) => {
+        // Only look for identifiers with the matching name
+        if (node.type !== 'identifier' || node.text !== name) {
+            return true;
+        }
+
+        const line = node.startPosition.row + 1;
+        const column = node.startPosition.column;
+        const parent = node.parent;
+
+        let usageType = 'reference';
+
+        if (parent) {
+            // Import: from x import name, import name
+            if (parent.type === 'aliased_import' ||
+                parent.type === 'dotted_name' && parent.parent?.type === 'import_statement') {
+                usageType = 'import';
+            }
+            // Import: from x import name (in import_from_statement)
+            else if (parent.type === 'dotted_name' && parent.parent?.type === 'import_from_statement') {
+                usageType = 'import';
+            }
+            // Import: direct identifier in import
+            else if (parent.type === 'import_from_statement') {
+                usageType = 'import';
+            }
+            // Call: name()
+            else if (parent.type === 'call' &&
+                     parent.childForFieldName('function') === node) {
+                usageType = 'call';
+            }
+            // Definition: def name(...):
+            else if (parent.type === 'function_definition' &&
+                     parent.childForFieldName('name') === node) {
+                usageType = 'definition';
+            }
+            // Definition: class name:
+            else if (parent.type === 'class_definition' &&
+                     parent.childForFieldName('name') === node) {
+                usageType = 'definition';
+            }
+            // Definition: parameter
+            else if (parent.type === 'parameter' ||
+                     parent.type === 'default_parameter' ||
+                     parent.type === 'typed_parameter' ||
+                     parent.type === 'typed_default_parameter') {
+                usageType = 'definition';
+            }
+            // Definition: assignment target (x = ...)
+            else if (parent.type === 'assignment' &&
+                     parent.childForFieldName('left') === node) {
+                usageType = 'definition';
+            }
+            // Definition: for loop variable
+            else if (parent.type === 'for_statement' &&
+                     parent.childForFieldName('left') === node) {
+                usageType = 'definition';
+            }
+            // Method call: obj.name()
+            else if (parent.type === 'attribute' &&
+                     parent.childForFieldName('attribute') === node) {
+                const grandparent = parent.parent;
+                if (grandparent && grandparent.type === 'call') {
+                    usageType = 'call';
+                } else {
+                    usageType = 'reference';
+                }
+            }
+        }
+
+        usages.push({ line, column, usageType });
+        return true;
+    });
+
+    return usages;
+}
+
+module.exports = {
+    findFunctions,
+    findClasses,
+    findStateObjects,
+    findCallsInCode,
+    findImportsInCode,
+    findExportsInCode,
+    findUsagesInCode,
+    parse
+};

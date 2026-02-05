@@ -1,0 +1,42 @@
+{
+  "name": "ucn",
+  "version": "3.0.0",
+  "description": "Code navigation built by AI, for AI. Reduces context usage by 90%+ when working with large codebases.",
+  "main": "index.js",
+  "bin": {
+    "ucn": "./cli/index.js"
+  },
+  "scripts": {
+    "test": "node --test test/parser.test.js"
+  },
+  "keywords": [
+    "code-navigation",
+    "ast",
+    "parser",
+    "tree-sitter",
+    "javascript",
+    "typescript",
+    "python",
+    "go",
+    "rust",
+    "java",
+    "ai",
+    "agent"
+  ],
+  "author": "Constantin-Mihail Leoca (https://github.com/mleoca)",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mleoca/ucn.git"
+  },
+  "homepage": "https://github.com/mleoca/ucn#readme",
+  "license": "MIT",
+  "dependencies": {
+    "tree-sitter": "^0.21.0",
+    "tree-sitter-go": "^0.21.0",
+    "tree-sitter-java": "^0.21.0",
+    "tree-sitter-javascript": "^0.21.0",
+    "tree-sitter-python": "^0.21.0",
+    "tree-sitter-rust": "^0.21.0",
+    "tree-sitter-typescript": "^0.21.0"
+  }
+}
