@@ -332,31 +332,51 @@ function findProjectRoot(startDir) {
 
 /**
  * Auto-detect the glob pattern for a project based on its type
+ * Checks both project root and immediate subdirectories for config files
  */
 function detectProjectPattern(projectRoot) {
     const extensions = [];
 
-    if (fs.existsSync(path.join(projectRoot, 'package.json'))) {
-        extensions.push('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs');
-    }
+    // Helper to check for config files in a directory
+    const checkDir = (dir) => {
+        if (fs.existsSync(path.join(dir, 'package.json'))) {
+            extensions.push('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs');
+        }
 
-    if (fs.existsSync(path.join(projectRoot, 'pyproject.toml')) ||
-        fs.existsSync(path.join(projectRoot, 'setup.py')) ||
-        fs.existsSync(path.join(projectRoot, 'requirements.txt'))) {
-        extensions.push('py');
-    }
+        if (fs.existsSync(path.join(dir, 'pyproject.toml')) ||
+            fs.existsSync(path.join(dir, 'setup.py')) ||
+            fs.existsSync(path.join(dir, 'requirements.txt'))) {
+            extensions.push('py');
+        }
 
-    if (fs.existsSync(path.join(projectRoot, 'go.mod'))) {
-        extensions.push('go');
-    }
+        if (fs.existsSync(path.join(dir, 'go.mod'))) {
+            extensions.push('go');
+        }
 
-    if (fs.existsSync(path.join(projectRoot, 'Cargo.toml'))) {
-        extensions.push('rs');
-    }
+        if (fs.existsSync(path.join(dir, 'Cargo.toml'))) {
+            extensions.push('rs');
+        }
 
-    if (fs.existsSync(path.join(projectRoot, 'pom.xml')) ||
-        fs.existsSync(path.join(projectRoot, 'build.gradle'))) {
-        extensions.push('java', 'kt');
+        if (fs.existsSync(path.join(dir, 'pom.xml')) ||
+            fs.existsSync(path.join(dir, 'build.gradle'))) {
+            extensions.push('java', 'kt');
+        }
+    };
+
+    // Check project root
+    checkDir(projectRoot);
+
+    // Also check immediate subdirectories for multi-language projects (e.g., web/, frontend/, server/)
+    try {
+        const entries = fs.readdirSync(projectRoot, { withFileTypes: true });
+        for (const entry of entries) {
+            if (entry.isDirectory() && !entry.name.startsWith('.') &&
+                !EXCLUDED_DIRS.has(entry.name)) {
+                checkDir(path.join(projectRoot, entry.name));
+            }
+        }
+    } catch (e) {
+        // Ignore errors reading directory
     }
 
     if (extensions.length > 0) {

@@ -812,6 +812,50 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
+        // Handle JSX component usage: <Component /> or <Component>...</Component>
+        // Only track PascalCase names (React components), not lowercase (HTML elements)
+        if (node.type === 'jsx_self_closing_element' || node.type === 'jsx_opening_element') {
+            // First named child is the element name
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'identifier') {
+                    const name = child.text;
+                    // React components start with uppercase
+                    if (name && /^[A-Z]/.test(name)) {
+                        const enclosingFunction = getCurrentEnclosingFunction();
+                        calls.push({
+                            name: name,
+                            line: node.startPosition.row + 1,
+                            isMethod: false,
+                            isJsxComponent: true,
+                            enclosingFunction
+                        });
+                    }
+                    break;
+                }
+                // Handle namespaced components: <Foo.Bar />
+                if (child.type === 'member_expression' || child.type === 'nested_identifier') {
+                    const text = child.text;
+                    // Get the last part after the dot
+                    const parts = text.split('.');
+                    const componentName = parts[parts.length - 1];
+                    if (componentName && /^[A-Z]/.test(componentName)) {
+                        const enclosingFunction = getCurrentEnclosingFunction();
+                        calls.push({
+                            name: componentName,
+                            line: node.startPosition.row + 1,
+                            isMethod: true,
+                            receiver: parts.slice(0, -1).join('.'),
+                            isJsxComponent: true,
+                            enclosingFunction
+                        });
+                    }
+                    break;
+                }
+            }
+            return true;
+        }
+
         return true;
     }, {
         onLeave: (node) => {
@@ -1337,6 +1381,10 @@ function findUsagesInCode(code, name, parser) {
                 } else {
                     usageType = 'reference';
                 }
+            }
+            // JSX component usage: <Component /> or <Component>...</Component>
+            else if (parent.type === 'jsx_self_closing_element' || parent.type === 'jsx_opening_element') {
+                usageType = 'call';  // Treat JSX component usage as a "call"
             }
         }
 

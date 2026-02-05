@@ -960,7 +960,8 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'graph': {
             requireArg(arg, 'Usage: ucn . graph <file>');
-            const graphResult = index.graph(arg, { direction: 'both', maxDepth: flags.depth ?? 5 });
+            const graphDepth = flags.depth ?? 2;  // Default to 2 for cleaner output
+            const graphResult = index.graph(arg, { direction: 'both', maxDepth: graphDepth });
             if (graphResult.nodes.length === 0) {
                 console.log(`File not found: ${arg}`);
             } else {
@@ -970,7 +971,7 @@ function runProjectCommand(rootDir, command, arg) {
                         nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
                         edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
                     }, null, 2),
-                    r => { printGraph(r, index.root); }
+                    r => { printGraph(r, index.root, graphDepth); }
                 );
             }
             break;
@@ -1801,12 +1802,15 @@ function printStats(stats) {
     }
 }
 
-function printGraph(graph, root) {
+function printGraph(graph, root, maxDepth = 2) {
     const rootRelPath = path.relative(root, graph.root);
     console.log(`Dependency graph for ${rootRelPath}`);
     console.log('═'.repeat(60));
 
     const printed = new Set();
+    const maxChildren = 8;  // Limit children per node
+    let truncatedNodes = 0;
+    let depthLimited = false;
 
     function printNode(file, indent = 0) {
         const fileEntry = graph.nodes.find(n => n.file === file);
@@ -1819,15 +1823,43 @@ function printGraph(graph, root) {
         }
         printed.add(file);
 
+        // Depth limiting
+        if (indent > maxDepth) {
+            depthLimited = true;
+            console.log(`${prefix}${relPath} ...`);
+            return;
+        }
+
         console.log(`${prefix}${relPath}`);
 
         const edges = graph.edges.filter(e => e.from === file);
-        for (const edge of edges) {
+
+        // Limit children
+        const displayEdges = edges.slice(0, maxChildren);
+        const hiddenCount = edges.length - displayEdges.length;
+
+        for (const edge of displayEdges) {
             printNode(edge.to, indent + 1);
+        }
+
+        if (hiddenCount > 0) {
+            truncatedNodes += hiddenCount;
+            console.log(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
         }
     }
 
     printNode(graph.root);
+
+    // Print helpful note about expanding
+    if (depthLimited || truncatedNodes > 0) {
+        console.log('\n' + '─'.repeat(60));
+        if (depthLimited) {
+            console.log(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
+        }
+        if (truncatedNodes > 0) {
+            console.log(`${truncatedNodes} nodes hidden. Graph has ${graph.nodes.length} total files.`);
+        }
+    }
 }
 
 function printSearchResults(results, term) {
