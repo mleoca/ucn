@@ -1010,11 +1010,37 @@ class ProjectIndex {
             }
 
             // Look up each callee in the symbol table
+            // For methods, prefer callees from: 1) same file, 2) same package, 3) same receiver type
             const result = [];
+            const defDir = path.dirname(def.file);
+            const defReceiver = def.receiver;
+
             for (const [calleeName, count] of callees) {
                 const symbols = this.symbols.get(calleeName);
                 if (symbols && symbols.length > 0) {
-                    const callee = symbols[0];
+                    let callee = symbols[0];
+
+                    // If multiple definitions, try to find the best match
+                    if (symbols.length > 1) {
+                        // Priority 1: Same file
+                        const sameFile = symbols.find(s => s.file === def.file);
+                        if (sameFile) {
+                            callee = sameFile;
+                        } else {
+                            // Priority 2: Same directory (package)
+                            const sameDir = symbols.find(s => path.dirname(s.file) === defDir);
+                            if (sameDir) {
+                                callee = sameDir;
+                            } else if (defReceiver) {
+                                // Priority 3: Same receiver type (for methods)
+                                const sameReceiver = symbols.find(s => s.receiver === defReceiver);
+                                if (sameReceiver) {
+                                    callee = sameReceiver;
+                                }
+                            }
+                        }
+                    }
+
                     result.push({
                         ...callee,
                         callCount: count,
@@ -2137,23 +2163,15 @@ class ProjectIndex {
 
         const def = definitions[0];
         const visited = new Set();
+        const defDir = path.dirname(def.file);
 
-        const buildTree = (funcName, currentDepth, dir) => {
-            if (currentDepth > maxDepth || visited.has(funcName)) {
+        const buildTree = (funcDef, currentDepth, dir) => {
+            const funcName = funcDef.name;
+            if (currentDepth > maxDepth || visited.has(`${funcDef.file}:${funcDef.startLine}`)) {
                 return null;
             }
-            visited.add(funcName);
+            visited.add(`${funcDef.file}:${funcDef.startLine}`);
 
-            const funcDefs = this.symbols.get(funcName);
-            if (!funcDefs || funcDefs.length === 0) {
-                return {
-                    name: funcName,
-                    external: true,
-                    children: []
-                };
-            }
-
-            const funcDef = funcDefs[0];
             const node = {
                 name: funcName,
                 file: funcDef.relativePath,
@@ -2165,7 +2183,8 @@ class ProjectIndex {
             if (dir === 'down' || dir === 'both') {
                 const callees = this.findCallees(funcDef);
                 for (const callee of callees.slice(0, 10)) {  // Limit children
-                    const childTree = buildTree(callee.name, currentDepth + 1, 'down');
+                    // callee already has the best-matched definition from findCallees
+                    const childTree = buildTree(callee, currentDepth + 1, 'down');
                     if (childTree) {
                         node.children.push({
                             ...childTree,
@@ -2179,7 +2198,7 @@ class ProjectIndex {
             return node;
         };
 
-        const tree = buildTree(name, 0, direction);
+        const tree = buildTree(def, 0, direction);
 
         // Also get callers if direction is 'up' or 'both'
         let callers = [];
