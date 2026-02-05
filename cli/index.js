@@ -745,7 +745,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'context': {
             requireArg(arg, 'Usage: ucn . context <name>');
-            const ctx = index.context(arg, { includeMethods: flags.includeMethods });
+            const ctx = index.context(arg, { includeMethods: flags.includeMethods, file: flags.file });
             printOutput(ctx,
                 output.formatContextJson,
                 r => { printContext(r, { expand: flags.expand, root: index.root }); }
@@ -787,7 +787,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes });
+            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file });
             printOutput(aboutResult,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
@@ -797,7 +797,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'impact': {
             requireArg(arg, 'Usage: ucn . impact <name>');
-            const impactResult = index.impact(arg);
+            const impactResult = index.impact(arg, { file: flags.file });
             printOutput(impactResult, output.formatImpactJson, output.formatImpact);
             break;
         }
@@ -821,7 +821,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'trace': {
             requireArg(arg, 'Usage: ucn . trace <name>');
             const traceDepth = flags.depth ? parseInt(flags.depth) : 3;
-            const traceResult = index.trace(arg, { depth: traceDepth });
+            const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file });
             printOutput(traceResult, output.formatTraceJson, output.formatTrace);
             break;
         }

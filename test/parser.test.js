@@ -4344,6 +4344,121 @@ func main() {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     });
+
+    it('should detect Go method calls in usages (field_identifier)', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-method-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), `module example.com/test
+go 1.21
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'service.go'), `package main
+
+type Service struct{}
+
+func (s *Service) CollectAll() error {
+    return nil
+}
+
+func main() {
+    svc := &Service{}
+    svc.CollectAll()
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // usages should find the method call
+            const usages = index.usages('CollectAll', { codeOnly: true });
+            const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+            assert.ok(calls.length >= 1, 'Should find at least 1 call to CollectAll');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should find callees for Go receiver methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-callees-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), `module example.com/test
+go 1.21
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'client.go'), `package main
+
+type Client struct{}
+
+func (c *Client) GetPods() []string {
+    return nil
+}
+
+func (c *Client) GetNodes() []string {
+    return nil
+}
+
+func (c *Client) CollectAll() {
+    c.GetPods()
+    c.GetNodes()
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // context should find callees (Go method calls)
+            const ctx = index.context('CollectAll');
+            assert.ok(ctx.callees, 'Should have callees');
+            assert.ok(ctx.callees.length >= 2, 'Should find at least 2 callees (GetPods, GetNodes)');
+
+            const calleeNames = ctx.callees.map(c => c.name);
+            assert.ok(calleeNames.includes('GetPods'), 'GetPods should be a callee');
+            assert.ok(calleeNames.includes('GetNodes'), 'GetNodes should be a callee');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should filter by --file for Go methods with same name', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-file-filter-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), `module example.com/test
+go 1.21
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'service_a.go'), `package main
+
+type ServiceA struct{}
+
+func (s *ServiceA) Process() error {
+    return nil
+}
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'service_b.go'), `package main
+
+type ServiceB struct{}
+
+func (s *ServiceB) Process() error {
+    return nil
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // Without file filter, should find both
+            const allDefs = index.find('Process');
+            assert.strictEqual(allDefs.length, 2, 'Should find 2 definitions of Process');
+
+            // With file filter, should find only one
+            const filteredDefs = index.find('Process', { file: 'service_a.go' });
+            assert.strictEqual(filteredDefs.length, 1, 'Should find 1 definition with file filter');
+            assert.ok(filteredDefs[0].relativePath.includes('service_a.go'), 'Should be from service_a.go');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
 });
 
 console.log('UCN v3 Test Suite');
