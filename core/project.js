@@ -14,6 +14,9 @@ const { parseFile } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 
+// Read UCN version for cache invalidation
+const UCN_VERSION = require('../package.json').version;
+
 /**
  * Escape special regex characters
  */
@@ -3317,6 +3320,7 @@ class ProjectIndex {
 
         const cacheData = {
             version: 4,  // v4: className, memberType, isMethod for all languages
+            ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
             root: this.root,
             buildTime: this.buildTime,
             timestamp: Date.now(),
@@ -3353,6 +3357,11 @@ class ProjectIndex {
             // v4 adds className, memberType, isMethod for all languages
             // Only accept exactly version 4 (or future versions handled explicitly)
             if (cacheData.version !== 4) {
+                return false;
+            }
+
+            // Invalidate cache when UCN version changes (logic may have changed)
+            if (cacheData.ucnVersion !== UCN_VERSION) {
                 return false;
             }
 
