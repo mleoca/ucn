@@ -1,6 +1,6 @@
 ---
 name: ucn
-description: Semantic code navigation that understands code structure (functions, calls, dependencies) via AST parsing. Use when you need to understand relationships between code (who calls X, what does X call, what breaks if X changes). Better than text search for relationship questions in codebases 1000+ LOC. Supports JS/TS, Python, Go, Rust, Java only.
+description: Universal Code Navigator - extracts specific functions and their relationships (callers, callees, dependencies) without reading entire files. Use when you need one function from a large file or need to understand what calls/is called by a function. Saves context in codebases 1000+ LOC. Skip for simple text search, tiny codebases, or unsupported languages (only JS/TS, Python, Go, Rust, Java).
 allowed-tools: Bash(ucn *), Bash(npx ucn *)
 argument-hint: "[command] [symbol-name]"
 ---
