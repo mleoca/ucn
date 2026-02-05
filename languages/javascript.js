@@ -1248,8 +1248,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Only look for identifiers with the matching name
-        if (node.type !== 'identifier' || node.text !== name) {
+        // Look for both identifier and property_identifier (method names in obj.method() calls)
+        const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier';
+        if (!isIdentifier || node.text !== name) {
             return true;
         }
 
@@ -1318,6 +1319,17 @@ function findUsagesInCode(code, name, parser) {
             // Property access (method call): a.name() - the name after dot
             else if (parent.type === 'member_expression' &&
                      parent.childForFieldName('property') === node) {
+                // Skip built-in objects and common module names (JSON.parse, path.parse, etc.)
+                const object = parent.childForFieldName('object');
+                const builtins = [
+                    // JS built-in objects
+                    'JSON', 'Math', 'console', 'Object', 'Array', 'String', 'Number', 'Date', 'RegExp', 'Promise', 'Reflect', 'Proxy', 'Map', 'Set', 'WeakMap', 'WeakSet', 'Symbol', 'Intl', 'WebAssembly', 'Atomics', 'SharedArrayBuffer', 'ArrayBuffer', 'DataView', 'Int8Array', 'Uint8Array', 'Uint8ClampedArray', 'Int16Array', 'Uint16Array', 'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array', 'BigInt64Array', 'BigUint64Array', 'Error', 'EvalError', 'RangeError', 'ReferenceError', 'SyntaxError', 'TypeError', 'URIError', 'URL', 'URLSearchParams',
+                    // Node.js core modules
+                    'path', 'fs', 'os', 'http', 'https', 'net', 'dgram', 'dns', 'tls', 'crypto', 'zlib', 'stream', 'util', 'events', 'buffer', 'child_process', 'cluster', 'readline', 'repl', 'vm', 'assert', 'querystring', 'url', 'punycode', 'string_decoder', 'timers', 'tty', 'v8', 'perf_hooks', 'worker_threads', 'inspector', 'trace_events', 'async_hooks', 'process'
+                ];
+                if (object && object.type === 'identifier' && builtins.includes(object.text)) {
+                    return true; // Skip built-in method calls
+                }
                 // Check if this is a method call
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call_expression') {

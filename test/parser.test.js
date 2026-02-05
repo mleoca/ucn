@@ -4459,6 +4459,82 @@ func (s *ServiceB) Process() error {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     });
+
+    it('should detect JavaScript method calls but filter built-ins', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-js-method-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'test.js'), `
+class Service {
+  process() {}
+}
+
+function main() {
+  const svc = new Service();
+  svc.process();     // user method - SHOULD be counted
+  JSON.parse('{}');  // built-in - should NOT be counted
+  process();         // direct call - SHOULD be counted
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const usages = index.usages('process', { codeOnly: true });
+            const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+
+            // Should find 2 calls: svc.process() and process()
+            assert.strictEqual(calls.length, 2, 'Should find 2 calls (user method + direct)');
+
+            // Should NOT include JSON.parse
+            const hasJsonParse = calls.some(c => c.content && c.content.includes('JSON.parse'));
+            assert.strictEqual(hasJsonParse, false, 'JSON.parse should NOT be counted');
+
+            // Should include svc.process()
+            const hasUserMethod = calls.some(c => c.content && c.content.includes('svc.process'));
+            assert.strictEqual(hasUserMethod, true, 'svc.process() SHOULD be counted');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should detect Rust method calls in usages', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-method-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), `[package]
+name = "test"
+version = "0.1.0"
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'main.rs'), `
+struct Client {}
+
+impl Client {
+    fn process(&self) {}
+}
+
+fn main() {
+    let c = Client{};
+    c.process();
+    process();
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.rs', { quiet: true });
+
+            const usages = index.usages('process', { codeOnly: true });
+            const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+
+            // Should find 2 calls: c.process() and process()
+            assert.ok(calls.length >= 2, 'Should find at least 2 calls');
+
+            // Should include c.process()
+            const hasMethodCall = calls.some(c => c.content && c.content.includes('c.process'));
+            assert.strictEqual(hasMethodCall, true, 'c.process() SHOULD be counted');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
 });
 
 console.log('UCN v3 Test Suite');
