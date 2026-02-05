@@ -2881,6 +2881,30 @@ describe('Regression: Project detection with language markers', () => {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     });
+
+    it('should detect multi-language project (Go root + TS subdirectory)', () => {
+        const tmpDir = path.join(require('os').tmpdir(), `ucn-test-multilang-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, 'web'), { recursive: true });
+
+        try {
+            // Go at root
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\ngo 1.21');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), 'package main\nfunc main() {}');
+            // TypeScript in web/ subdirectory
+            fs.writeFileSync(path.join(tmpDir, 'web', 'package.json'), '{"name": "web"}');
+            fs.writeFileSync(path.join(tmpDir, 'web', 'App.tsx'), 'export function App() {}');
+
+            const { detectProjectPattern } = require('../core/discovery');
+            const pattern = detectProjectPattern(tmpDir);
+
+            // Should detect BOTH Go and TypeScript
+            assert.ok(pattern.includes('go'), 'Should detect Go files from root');
+            assert.ok(pattern.includes('tsx'), 'Should detect TypeScript files from subdirectory');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
 });
 
 // ============================================================================
