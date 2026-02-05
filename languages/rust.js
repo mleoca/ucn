@@ -910,8 +910,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Only look for identifiers with the matching name
-        if (node.type !== 'identifier' || node.text !== name) {
+        // Look for both identifier and field_identifier (method names in obj.method() calls)
+        const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier';
+        if (!isIdentifier || node.text !== name) {
             return true;
         }
 
