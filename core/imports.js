@@ -431,12 +431,95 @@ function resolveImport(importPath, fromFile, config = {}) {
             }
         }
 
+        // Check Go module imports
+        if (config.language === 'go') {
+            const resolved = resolveGoImport(importPath, fromFile, config.root);
+            if (resolved) return resolved;
+        }
+
         return null;  // External package
     }
 
     // Relative imports
     const resolved = path.resolve(fromDir, importPath);
     return resolveFilePath(resolved, config.extensions || getExtensions(config.language));
+}
+
+// Cache for Go module paths
+const goModuleCache = new Map();
+
+/**
+ * Find and parse go.mod to get the module path
+ * @param {string} startDir - Directory to start searching from
+ * @returns {{modulePath: string, root: string}|null}
+ */
+function findGoModule(startDir) {
+    // Check cache first
+    if (goModuleCache.has(startDir)) {
+        return goModuleCache.get(startDir);
+    }
+
+    let dir = startDir;
+    while (dir !== path.dirname(dir)) {
+        const goModPath = path.join(dir, 'go.mod');
+        if (fs.existsSync(goModPath)) {
+            try {
+                const content = fs.readFileSync(goModPath, 'utf-8');
+                // Parse module line: module github.com/user/project
+                const match = content.match(/^module\s+(\S+)/m);
+                if (match) {
+                    const result = { modulePath: match[1], root: dir };
+                    goModuleCache.set(startDir, result);
+                    return result;
+                }
+            } catch (e) {
+                // Ignore read errors
+            }
+        }
+        dir = path.dirname(dir);
+    }
+
+    goModuleCache.set(startDir, null);
+    return null;
+}
+
+/**
+ * Resolve Go package import to local files
+ * @param {string} importPath - Go import path (e.g., "github.com/user/proj/pkg/util")
+ * @param {string} fromFile - File containing the import
+ * @param {string} projectRoot - Project root directory
+ * @returns {string|null} - Directory path containing the package, or null if external
+ */
+function resolveGoImport(importPath, fromFile, projectRoot) {
+    const goMod = findGoModule(path.dirname(fromFile));
+    if (!goMod) return null;
+
+    const { modulePath, root } = goMod;
+
+    // Check if the import is within this module
+    if (importPath.startsWith(modulePath)) {
+        // Convert module path to relative path
+        // e.g., "github.com/user/proj/pkg/util" -> "pkg/util"
+        const relativePath = importPath.slice(modulePath.length).replace(/^\//, '');
+        const pkgDir = path.join(root, relativePath);
+
+        // Go imports are directories, find a .go file in the directory
+        if (fs.existsSync(pkgDir) && fs.statSync(pkgDir).isDirectory()) {
+            // Return the first .go file in the directory (not _test.go)
+            try {
+                const files = fs.readdirSync(pkgDir);
+                for (const file of files) {
+                    if (file.endsWith('.go') && !file.endsWith('_test.go')) {
+                        return path.join(pkgDir, file);
+                    }
+                }
+            } catch (e) {
+                // Ignore read errors
+            }
+        }
+    }
+
+    return null;
 }
 
 /**
