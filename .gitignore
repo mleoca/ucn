@@ -1,0 +1,13 @@
+node_modules/
+.ucn-cache/
+*.log
+.DS_Store
+CLAUDE.md
+AGENTS.md
+
+# Local Claude settings (not the skill)
+.claude/settings.local.json
+
+# Test output files
+test/bugs-report.json
+test/public-repos-bugs.json
