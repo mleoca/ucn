@@ -4,7 +4,7 @@ When working with large codebases or even vibe coding all into a single large fi
 
 ## Example
 
-You have a 2000-line file and need to understand `handleRequest`:
+A 2000-line file and need to understand `handleRequest`:
 
 ```bash
 $ ucn fn handleRequest
