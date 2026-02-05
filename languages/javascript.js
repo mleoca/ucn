@@ -531,6 +531,7 @@ function extractClassMembers(classNode, code) {
                     memberType,
                     isAsync,
                     isGenerator: isGen,
+                    isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring })
                 });
@@ -557,6 +558,7 @@ function extractClassMembers(classNode, code) {
                         endLine,
                         memberType: name.startsWith('#') ? 'private' : 'field',
                         isArrow: true,
+                        isMethod: true,  // Arrow fields are callable like methods
                         ...(returnType && { returnType })
                     });
                 } else {
@@ -565,6 +567,7 @@ function extractClassMembers(classNode, code) {
                         startLine,
                         endLine,
                         memberType: name.startsWith('#') ? 'private field' : 'field'
+                        // Not a method - regular field
                     });
                 }
             }

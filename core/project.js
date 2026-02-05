@@ -166,7 +166,11 @@ class ProjectIndex {
                 ...(item.extends && { extends: item.extends }),
                 ...(item.implements && { implements: item.implements }),
                 ...(item.indent !== undefined && { indent: item.indent }),
-                ...(item.isNested && { isNested: item.isNested })
+                ...(item.isNested && { isNested: item.isNested }),
+                ...(item.isMethod && { isMethod: item.isMethod }),
+                ...(item.receiver && { receiver: item.receiver }),
+                ...(item.className && { className: item.className }),
+                ...(item.memberType && { memberType: item.memberType })
             };
             fileEntry.symbols.push(symbol);
 
@@ -650,6 +654,55 @@ class ProjectIndex {
     }
 
     /**
+     * Find methods that belong to a class/struct/type
+     * Works for:
+     * - Go: methods with receiver field (e.g., receiver: "*TypeName")
+     * - Python/Java: methods with className field
+     * - Rust: impl methods with receiver field
+     * @param {string} typeName - The class/struct/interface name
+     * @returns {Array} Methods belonging to this type
+     */
+    findMethodsForType(typeName) {
+        const methods = [];
+        // Match both "TypeName" and "*TypeName" receivers (for Go/Rust pointer receivers)
+        const baseTypeName = typeName.replace(/^\*/, '');
+
+        for (const [name, symbols] of this.symbols) {
+            for (const symbol of symbols) {
+                // Skip non-method types (fields, properties, etc.)
+                if (symbol.type === 'field' || symbol.type === 'property') {
+                    continue;
+                }
+
+                // Check Go/Rust-style receiver (e.g., func (r *Router) Method())
+                if (symbol.isMethod && symbol.receiver) {
+                    const receiverBase = symbol.receiver.replace(/^\*/, '');
+                    if (receiverBase === baseTypeName) {
+                        methods.push(symbol);
+                        continue;
+                    }
+                }
+
+                // Check Python/Java/JS-style className (class members)
+                // Must be a method type, not just any symbol with className
+                if (symbol.className === baseTypeName &&
+                    (symbol.isMethod || symbol.type === 'method' || symbol.type === 'constructor')) {
+                    methods.push(symbol);
+                    continue;
+                }
+            }
+        }
+
+        // Sort by file then line
+        methods.sort((a, b) => {
+            if (a.relativePath !== b.relativePath) return a.relativePath.localeCompare(b.relativePath);
+            return a.startLine - b.startLine;
+        });
+
+        return methods;
+    }
+
+    /**
      * Get context for a symbol (callers + callees)
      */
     context(name, options = {}) {
@@ -658,7 +711,53 @@ class ProjectIndex {
             return { function: name, file: null, callers: [], callees: [] };
         }
 
-        const def = definitions[0];  // Use first definition
+        // Prefer class/struct/interface definitions over functions/methods/constructors
+        // This ensures context('ClassName') finds the class, not a constructor with same name
+        const typeOrder = ['class', 'struct', 'interface', 'type', 'impl'];
+        let def = definitions[0];
+        for (const d of definitions) {
+            if (typeOrder.includes(d.type)) {
+                def = d;
+                break;
+            }
+        }
+
+        // Special handling for class/struct/interface types
+        if (['class', 'struct', 'interface', 'type'].includes(def.type)) {
+            const methods = this.findMethodsForType(name);
+
+            const result = {
+                type: def.type,
+                name: name,
+                file: def.relativePath,
+                startLine: def.startLine,
+                endLine: def.endLine,
+                methods: methods.map(m => ({
+                    name: m.name,
+                    file: m.relativePath,
+                    line: m.startLine,
+                    params: m.params,
+                    returnType: m.returnType,
+                    receiver: m.receiver
+                })),
+                // Also include places where the type is used in function parameters/returns
+                callers: this.findCallers(name, { includeMethods: options.includeMethods })
+            };
+
+            if (definitions.length > 1) {
+                result.warnings = [{
+                    type: 'ambiguous',
+                    message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Use --file to disambiguate.`,
+                    alternatives: definitions.slice(1).map(d => ({
+                        file: d.relativePath,
+                        line: d.startLine
+                    }))
+                }];
+            }
+
+            return result;
+        }
+
         const callers = this.findCallers(name, { includeMethods: options.includeMethods });
         const callees = this.findCallees(def, { includeMethods: options.includeMethods });
 
@@ -787,8 +886,9 @@ class ProjectIndex {
                     if (call.isMethod) {
                         // Always skip this/self/cls calls (internal state access, not function calls)
                         if (['this', 'self', 'cls'].includes(call.receiver)) continue;
-                        // Skip other method calls unless explicitly requested
-                        if (!options.includeMethods) continue;
+                        // Go doesn't use this/self/cls - always include Go method calls
+                        // For other languages, skip method calls unless explicitly requested
+                        if (fileEntry.language !== 'go' && !options.includeMethods) continue;
                     }
 
                     // Skip definition lines
@@ -1594,7 +1694,14 @@ class ProjectIndex {
         for (const [name, symbols] of this.symbols) {
             for (const symbol of symbols) {
                 // Skip non-function/class types
-                if (!['function', 'class', 'method'].includes(symbol.type)) {
+                // Include various method types from different languages:
+                // - function: standalone functions
+                // - class, struct, interface: type definitions (skip them in deadcode)
+                // - method: class methods
+                // - static, public, abstract: Java method modifiers used as types
+                // - constructor: constructors
+                const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor'];
+                if (!callableTypes.includes(symbol.type)) {
                     continue;
                 }
 
@@ -1605,11 +1712,33 @@ class ProjectIndex {
 
                 // Check if exported
                 const fileEntry = this.files.get(symbol.file);
+                const lang = fileEntry?.language;
+                const mods = symbol.modifiers || [];
+
+                // Language-specific entry points (called by runtime, no AST-visible callers)
+                // Go: main() and init() are called by runtime
+                const isGoEntryPoint = lang === 'go' && (name === 'main' || name === 'init');
+
+                // Java: public static void main(String[] args) is the entry point
+                const isJavaEntryPoint = lang === 'java' && name === 'main' &&
+                    mods.includes('public') && mods.includes('static');
+
+                // Python: Magic/dunder methods are called by the interpreter, not user code
+                const isPythonMagicMethod = lang === 'python' && /^__\w+__$/.test(name);
+
+                // Rust: main() is entry point, #[test] functions are called by test runner
+                const isRustEntryPoint = lang === 'rust' &&
+                    (name === 'main' || mods.includes('test'));
+
+                const isEntryPoint = isGoEntryPoint || isJavaEntryPoint ||
+                    isPythonMagicMethod || isRustEntryPoint;
+
                 const isExported = fileEntry && (
                     fileEntry.exports.includes(name) ||
-                    (symbol.modifiers && symbol.modifiers.includes('export')) ||
-                    (symbol.modifiers && symbol.modifiers.includes('public')) ||
-                    (fileEntry.language === 'go' && /^[A-Z]/.test(name))
+                    mods.includes('export') ||
+                    mods.includes('public') ||
+                    (lang === 'go' && /^[A-Z]/.test(name)) ||
+                    isEntryPoint
                 );
 
                 // Skip exported unless requested
@@ -3130,7 +3259,7 @@ class ProjectIndex {
         }
 
         const cacheData = {
-            version: 2,  // Bump version for new cache format
+            version: 4,  // v4: className, memberType, isMethod for all languages
             root: this.root,
             buildTime: this.buildTime,
             timestamp: Date.now(),
@@ -3163,8 +3292,10 @@ class ProjectIndex {
         try {
             const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
 
-            // Check version compatibility (support v1 and v2)
-            if (cacheData.version !== 1 && cacheData.version !== 2) {
+            // Check version compatibility
+            // v4 adds className, memberType, isMethod for all languages
+            // Only accept exactly version 4 (or future versions handled explicitly)
+            if (cacheData.version !== 4) {
                 return false;
             }
 

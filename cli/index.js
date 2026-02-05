@@ -1550,6 +1550,66 @@ function printBestExample(index, name) {
 }
 
 function printContext(ctx, options = {}) {
+    // Handle struct/interface types differently
+    if (ctx.type && ['struct', 'interface', 'type'].includes(ctx.type)) {
+        console.log(`Context for ${ctx.type} ${ctx.name}:`);
+        console.log('═'.repeat(60));
+
+        // Display warnings if any
+        if (ctx.warnings && ctx.warnings.length > 0) {
+            console.log('\n⚠️  WARNINGS:');
+            for (const w of ctx.warnings) {
+                console.log(`  ${w.message}`);
+            }
+        }
+
+        const expandable = [];
+        let itemNum = 1;
+
+        // Show methods for structs/interfaces
+        const methods = ctx.methods || [];
+        console.log(`\nMETHODS (${methods.length}):`);
+        for (const m of methods) {
+            const receiver = m.receiver ? `(${m.receiver}) ` : '';
+            const params = m.params || '...';
+            const returnType = m.returnType ? `: ${m.returnType}` : '';
+            console.log(`  [${itemNum}] ${receiver}${m.name}(${params})${returnType}`);
+            console.log(`    ${m.file}:${m.line}`);
+            expandable.push({
+                num: itemNum++,
+                type: 'method',
+                name: m.name,
+                relativePath: m.file,
+                startLine: m.line
+            });
+        }
+
+        // Show callers (type references/usages)
+        const callers = ctx.callers || [];
+        console.log(`\nUSAGES (${callers.length}):`);
+        for (const c of callers) {
+            const callerName = c.callerName || '(module level)';
+            const displayName = c.callerName ? ` [${callerName}]` : '';
+            console.log(`  [${itemNum}] ${c.relativePath}:${c.line}${displayName}`);
+            expandable.push({
+                num: itemNum++,
+                type: 'usage',
+                name: callerName,
+                file: c.callerFile || c.file,
+                relativePath: c.relativePath,
+                line: c.line,
+                startLine: c.callerStartLine || c.line,
+                endLine: c.callerEndLine || c.line
+            });
+            console.log(`    ${c.content.trim()}`);
+        }
+
+        console.log(`\nUse "ucn . expand <N>" to see code for item N`);
+        lastContextExpandable = expandable;
+        return;
+    }
+
+    // Standard function/method context
     console.log(`Context for ${ctx.function}:`);
     console.log('═'.repeat(60));
 
@@ -1565,8 +1625,9 @@ function printContext(ctx, options = {}) {
     const expandable = [];
     let itemNum = 1;
 
-    console.log(`\nCALLERS (${ctx.callers.length}):`);
-    for (const c of ctx.callers) {
+    const callers = ctx.callers || [];
+    console.log(`\nCALLERS (${callers.length}):`);
+    for (const c of callers) {
         // All callers are numbered for expand command
         const callerName = c.callerName || '(module level)';
         const displayName = c.callerName ? ` [${callerName}]` : '';
@@ -1584,8 +1645,9 @@ function printContext(ctx, options = {}) {
         console.log(`    ${c.content.trim()}`);
     }
 
-    console.log(`\nCALLEES (${ctx.callees.length}):`);
-    for (const c of ctx.callees) {
+    const callees = ctx.callees || [];
+    console.log(`\nCALLEES (${callees.length}):`);
+    for (const c of callees) {
         const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
         console.log(`  [${itemNum}] ${c.name}${weight} - ${c.relativePath}:${c.startLine}`);
         expandable.push({
