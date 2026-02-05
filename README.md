@@ -52,6 +52,7 @@ npm link  # makes 'ucn' available globally
 To use UCN as a skill in Claude Code:
 
 ```bash
+mkdir -p ~/.claude/skills
 cp -r ucn/.claude/skills/ucn ~/.claude/skills/
 ```
 
@@ -60,6 +61,7 @@ cp -r ucn/.claude/skills/ucn ~/.claude/skills/
 To use UCN as a skill in OpenAI Codex:
 
 ```bash
+mkdir -p ~/.agents/skills
 cp -r ucn/.claude/skills/ucn ~/.agents/skills/
 ```
 
