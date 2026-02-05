@@ -371,7 +371,7 @@ function detectProjectPattern(projectRoot) {
         const entries = fs.readdirSync(projectRoot, { withFileTypes: true });
         for (const entry of entries) {
             if (entry.isDirectory() && !entry.name.startsWith('.') &&
-                !EXCLUDED_DIRS.has(entry.name)) {
+                !shouldIgnore(entry.name, DEFAULT_IGNORES)) {
                 checkDir(path.join(projectRoot, entry.name));
             }
         }
