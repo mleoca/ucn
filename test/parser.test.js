@@ -3557,7 +3557,7 @@ function helper() { return 42; }
 
             // Verify cache file has callsCache
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 2, 'Cache version should be 2');
+            assert.strictEqual(cacheData.version, 4, 'Cache version should be 4 (className, memberType, isMethod for all languages)');
             assert.ok(Array.isArray(cacheData.callsCache), 'Cache should have callsCache array');
             assert.ok(cacheData.callsCache.length > 0, 'callsCache should have entries');
 
@@ -3651,6 +3651,648 @@ function helper() { return 42; }
 
             assert.notStrictEqual(cached2.mtime, originalMtime, 'mtime should be updated');
             assert.strictEqual(cached2.hash, originalHash, 'hash should be same (content unchanged)');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// REGRESSION TESTS: Go-specific bug fixes (2026-02)
+// ============================================================================
+
+describe('Regression: Go entry points not flagged as deadcode', () => {
+    it('should NOT report main() as dead code in Go', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-main-'));
+        try {
+            // Create a Go project with main and init functions
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+func main() {
+    run()
+}
+
+func init() {
+    setup()
+}
+
+func run() {
+    println("running")
+}
+
+func setup() {
+    println("setup")
+}
+
+func unusedHelper() {
+    println("unused")
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            const deadcode = index.deadcode();
+            const deadNames = deadcode.map(d => d.name);
+
+            // main and init should NOT be reported as dead
+            assert.ok(!deadNames.includes('main'), 'main() should not be flagged as dead code');
+            assert.ok(!deadNames.includes('init'), 'init() should not be flagged as dead code');
+
+            // run and setup are called, so not dead
+            assert.ok(!deadNames.includes('run'), 'run() is called by main, not dead');
+            assert.ok(!deadNames.includes('setup'), 'setup() is called by init, not dead');
+
+            // unusedHelper should be flagged as dead
+            assert.ok(deadNames.includes('unusedHelper'), 'unusedHelper() should be flagged as dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Go method calls included in findCallers', () => {
+    it('should find Go method call sites without --include-methods flag', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-methods-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'server.go'), `package main
+
+type Server struct {
+    port int
+}
+
+func (s *Server) Start() {
+    s.listen()
+}
+
+func (s *Server) listen() {
+    println("listening on", s.port)
+}
+
+func main() {
+    srv := &Server{port: 8080}
+    srv.Start()
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // Find callers of Start method - should find the call in main
+            const callers = index.findCallers('Start');
+
+            assert.strictEqual(callers.length, 1, 'Should find 1 caller for Start method');
+            assert.strictEqual(callers[0].callerName, 'main', 'Caller should be main function');
+            assert.ok(callers[0].content.includes('srv.Start()'), 'Should capture the method call');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should still filter this/self/cls in non-Go languages', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-py-self-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'app.py'), `class Server:
+    def __init__(self, port):
+        self.port = port
+
+    def start(self):
+        self.listen()
+
+    def listen(self):
+        print(f"listening on {self.port}")
+
+def main():
+    srv = Server(8080)
+    srv.start()
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            // self.listen() should be filtered out (self call)
+            // but srv.start() should be included (external call)
+            const listenCallers = index.findCallers('listen');
+            // self.listen() is internal, so it depends on implementation
+            // At minimum, without --include-methods, non-self calls should not show
+
+            const startCallers = index.findCallers('start');
+            // srv.start() is a method call with receiver 'srv', which is not this/self/cls
+            // But since it's Python (not Go), it should be filtered unless --include-methods
+            assert.strictEqual(startCallers.length, 0, 'Python method calls should be filtered by default');
+
+            // With --include-methods, should find the call
+            const startCallersIncluded = index.findCallers('start', { includeMethods: true });
+            assert.strictEqual(startCallersIncluded.length, 1, 'With includeMethods, should find srv.start()');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: context for structs shows methods', () => {
+    it('should return methods for Go struct types', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-struct-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'types.go'), `package main
+
+type User struct {
+    Name  string
+    Email string
+}
+
+func (u *User) Validate() bool {
+    return u.Name != "" && u.Email != ""
+}
+
+func (u *User) String() string {
+    return u.Name + " <" + u.Email + ">"
+}
+
+func (u User) IsEmpty() bool {
+    return u.Name == "" && u.Email == ""
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            const ctx = index.context('User');
+
+            // Should identify as struct type
+            assert.strictEqual(ctx.type, 'struct', 'User should be identified as struct');
+            assert.strictEqual(ctx.name, 'User', 'Should return correct name');
+
+            // Should have methods
+            assert.ok(ctx.methods, 'Should have methods array');
+            assert.strictEqual(ctx.methods.length, 3, 'User struct should have 3 methods');
+
+            const methodNames = ctx.methods.map(m => m.name);
+            assert.ok(methodNames.includes('Validate'), 'Should include Validate method');
+            assert.ok(methodNames.includes('String'), 'Should include String method');
+            assert.ok(methodNames.includes('IsEmpty'), 'Should include IsEmpty method');
+
+            // Methods should have receiver info
+            const validateMethod = ctx.methods.find(m => m.name === 'Validate');
+            assert.strictEqual(validateMethod.receiver, '*User', 'Validate has pointer receiver');
+
+            const isEmptyMethod = ctx.methods.find(m => m.name === 'IsEmpty');
+            assert.strictEqual(isEmptyMethod.receiver, 'User', 'IsEmpty has value receiver');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should return empty methods for struct with no methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-struct-empty-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'types.go'), `package main
+
+type Config struct {
+    Port int
+    Host string
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            const ctx = index.context('Config');
+
+            assert.strictEqual(ctx.type, 'struct', 'Config should be identified as struct');
+            assert.ok(ctx.methods, 'Should have methods array');
+            assert.strictEqual(ctx.methods.length, 0, 'Config struct should have 0 methods');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: receiver field preserved in Go method symbols', () => {
+    it('should store receiver info for Go methods in symbol index', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-receiver-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'handler.go'), `package main
+
+type Handler struct{}
+
+func (h *Handler) ServeHTTP(w, r) {
+    h.handleRequest(w, r)
+}
+
+func (h *Handler) handleRequest(w, r) {
+    println("handling")
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // Check that receiver is preserved in symbols
+            const serveHTTP = index.symbols.get('ServeHTTP');
+            assert.ok(serveHTTP, 'ServeHTTP should be indexed');
+            assert.strictEqual(serveHTTP.length, 1, 'Should have one definition');
+            assert.strictEqual(serveHTTP[0].receiver, '*Handler', 'Receiver should be *Handler');
+            assert.strictEqual(serveHTTP[0].isMethod, true, 'Should be marked as method');
+
+            const handleRequest = index.symbols.get('handleRequest');
+            assert.ok(handleRequest, 'handleRequest should be indexed');
+            assert.strictEqual(handleRequest[0].receiver, '*Handler', 'Receiver should be *Handler');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// REGRESSION TESTS: Multi-language class/method handling (2026-02)
+// ============================================================================
+
+describe('Regression: Python class methods in context', () => {
+    it('should show methods for Python classes via className', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-py-class-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'user.py'), `class User:
+    def __init__(self, name):
+        self.name = name
+
+    def greet(self):
+        return f"Hello {self.name}"
+
+    def validate(self):
+        return len(self.name) > 0
+
+    @staticmethod
+    def create(name):
+        return User(name)
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            const ctx = index.context('User');
+
+            // Should identify as class
+            assert.strictEqual(ctx.type, 'class', 'User should be identified as class');
+            assert.ok(ctx.methods, 'Should have methods array');
+            assert.strictEqual(ctx.methods.length, 4, 'User class should have 4 methods');
+
+            const methodNames = ctx.methods.map(m => m.name);
+            assert.ok(methodNames.includes('__init__'), 'Should include __init__');
+            assert.ok(methodNames.includes('greet'), 'Should include greet');
+            assert.ok(methodNames.includes('validate'), 'Should include validate');
+            assert.ok(methodNames.includes('create'), 'Should include create');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java class methods in context', () => {
+    it('should show methods for Java classes via className', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-java-class-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'User.java'), `public class User {
+    private String name;
+
+    public User(String name) {
+        this.name = name;
+    }
+
+    public String greet() {
+        return "Hello " + this.name;
+    }
+
+    public boolean validate() {
+        return this.name != null && this.name.length() > 0;
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.java', { quiet: true });
+
+            const ctx = index.context('User');
+
+            // Should identify as class
+            assert.strictEqual(ctx.type, 'class', 'User should be identified as class');
+            assert.ok(ctx.methods, 'Should have methods array');
+            assert.strictEqual(ctx.methods.length, 3, 'User class should have 3 methods (constructor + 2 methods)');
+
+            const methodNames = ctx.methods.map(m => m.name);
+            assert.ok(methodNames.includes('User'), 'Should include constructor User');
+            assert.ok(methodNames.includes('greet'), 'Should include greet');
+            assert.ok(methodNames.includes('validate'), 'Should include validate');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Rust impl methods in context', () => {
+    it('should show impl methods for Rust structs via receiver', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-impl-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), `[package]
+name = "test"
+version = "0.1.0"
+`);
+            fs.writeFileSync(path.join(tmpDir, 'lib.rs'), `pub struct User {
+    name: String,
+}
+
+impl User {
+    pub fn new(name: String) -> Self {
+        User { name }
+    }
+
+    pub fn greet(&self) -> String {
+        format!("Hello {}", self.name)
+    }
+
+    fn validate(&self) -> bool {
+        !self.name.is_empty()
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.rs', { quiet: true });
+
+            const ctx = index.context('User');
+
+            // Should identify as struct
+            assert.strictEqual(ctx.type, 'struct', 'User should be identified as struct');
+            assert.ok(ctx.methods, 'Should have methods array');
+            assert.strictEqual(ctx.methods.length, 3, 'User impl should have 3 methods');
+
+            const methodNames = ctx.methods.map(m => m.name);
+            assert.ok(methodNames.includes('new'), 'Should include new');
+            assert.ok(methodNames.includes('greet'), 'Should include greet');
+            assert.ok(methodNames.includes('validate'), 'Should include validate');
+
+            // Methods should have receiver info pointing to User
+            const greetMethod = ctx.methods.find(m => m.name === 'greet');
+            assert.strictEqual(greetMethod.receiver, 'User', 'greet should have User as receiver');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: JavaScript class methods in context', () => {
+    it('should show methods for JS classes via className', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-js-class-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'user.js'), `class User {
+    constructor(name) {
+        this.name = name;
+    }
+
+    greet() {
+        return 'Hello ' + this.name;
+    }
+
+    static create(name) {
+        return new User(name);
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const ctx = index.context('User');
+
+            // Should identify as class
+            assert.strictEqual(ctx.type, 'class', 'User should be identified as class');
+            assert.ok(ctx.methods, 'Should have methods array');
+            assert.strictEqual(ctx.methods.length, 3, 'User class should have 3 methods');
+
+            const methodNames = ctx.methods.map(m => m.name);
+            assert.ok(methodNames.includes('constructor'), 'Should include constructor');
+            assert.ok(methodNames.includes('greet'), 'Should include greet');
+            assert.ok(methodNames.includes('create'), 'Should include create');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java main() not flagged as deadcode', () => {
+    it('should NOT report public static main as dead code in Java', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-java-main-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'App.java'), `public class App {
+    public static void main(String[] args) {
+        System.out.println("Hello");
+        helper();
+    }
+
+    private static void helper() {
+        System.out.println("Helper");
+    }
+
+    private static void unusedMethod() {
+        System.out.println("Unused");
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.java', { quiet: true });
+
+            const deadcode = index.deadcode();
+            const deadNames = deadcode.map(d => d.name);
+
+            // main should NOT be flagged as dead code (entry point)
+            assert.ok(!deadNames.includes('main'), 'main() should not be flagged as dead code');
+
+            // helper is called by main, so not dead
+            assert.ok(!deadNames.includes('helper'), 'helper() is called by main, not dead');
+
+            // unusedMethod should be flagged as dead
+            assert.ok(deadNames.includes('unusedMethod'), 'unusedMethod() should be flagged as dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Python magic methods not flagged as deadcode', () => {
+    it('should NOT report __init__, __call__, __enter__, __exit__ as dead code', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-py-magic-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'context.py'), `class MyContext:
+    def __init__(self):
+        self.count = 0
+
+    def __enter__(self):
+        self.count += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.count -= 1
+        return False
+
+    def __call__(self, x):
+        return x * 2
+
+    def unused_method(self):
+        pass
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            const deadcode = index.deadcode();
+            const deadNames = deadcode.map(d => d.name);
+
+            // Magic methods should NOT be flagged as dead code
+            assert.ok(!deadNames.includes('__init__'), '__init__ should not be flagged as dead code');
+            assert.ok(!deadNames.includes('__enter__'), '__enter__ should not be flagged as dead code');
+            assert.ok(!deadNames.includes('__exit__'), '__exit__ should not be flagged as dead code');
+            assert.ok(!deadNames.includes('__call__'), '__call__ should not be flagged as dead code');
+
+            // unused_method should be flagged as dead
+            assert.ok(deadNames.includes('unused_method'), 'unused_method() should be flagged as dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Rust main and #[test] not flagged as deadcode', () => {
+    it('should NOT report main() or #[test] functions as dead code in Rust', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-main-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), `[package]
+name = "test"
+version = "0.1.0"
+`);
+            fs.writeFileSync(path.join(tmpDir, 'main.rs'), `fn main() {
+    helper();
+}
+
+fn helper() {
+    println!("Helper");
+}
+
+fn unused_fn() {
+    println!("Unused");
+}
+
+#[test]
+fn test_something() {
+    assert!(true);
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.rs', { quiet: true });
+
+            const deadcode = index.deadcode();
+            const deadNames = deadcode.map(d => d.name);
+
+            // main should NOT be flagged as dead code (entry point)
+            assert.ok(!deadNames.includes('main'), 'main() should not be flagged as dead code');
+
+            // test_something should NOT be flagged (has #[test] attribute)
+            assert.ok(!deadNames.includes('test_something'), '#[test] function should not be flagged as dead code');
+
+            // helper is called by main
+            assert.ok(!deadNames.includes('helper'), 'helper() is called by main, not dead');
+
+            // unused_fn should be flagged as dead
+            assert.ok(deadNames.includes('unused_fn'), 'unused_fn() should be flagged as dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: className field preserved in symbol index', () => {
+    it('should store className for Python class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-classname-py-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'models.py'), `class User:
+    def save(self):
+        pass
+
+class Product:
+    def save(self):
+        pass
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            // Both save methods should have className field
+            const saveMethods = index.symbols.get('save');
+            assert.ok(saveMethods, 'save methods should be indexed');
+            assert.strictEqual(saveMethods.length, 2, 'Should have 2 save methods');
+
+            const classNames = saveMethods.map(m => m.className).sort();
+            assert.deepStrictEqual(classNames, ['Product', 'User'], 'Should have User and Product as classNames');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should store className for Java class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-classname-java-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Models.java'), `class User {
+    public void save() {}
+}
+
+class Product {
+    public void save() {}
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.java', { quiet: true });
+
+            // Both save methods should have className field
+            const saveMethods = index.symbols.get('save');
+            assert.ok(saveMethods, 'save methods should be indexed');
+            assert.strictEqual(saveMethods.length, 2, 'Should have 2 save methods');
+
+            const classNames = saveMethods.map(m => m.className).sort();
+            assert.deepStrictEqual(classNames, ['Product', 'User'], 'Should have User and Product as classNames');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should store className for JavaScript class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-classname-js-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'models.js'), `class User {
+    save() {}
+}
+
+class Product {
+    save() {}
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // Both save methods should have className field
+            const saveMethods = index.symbols.get('save');
+            assert.ok(saveMethods, 'save methods should be indexed');
+            assert.strictEqual(saveMethods.length, 2, 'Should have 2 save methods');
+
+            const classNames = saveMethods.map(m => m.className).sort();
+            assert.deepStrictEqual(classNames, ['Product', 'User'], 'Should have User and Product as classNames');
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }

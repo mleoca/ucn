@@ -73,6 +73,20 @@ function findFunctions(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
+            // Skip functions that are inside a class (they're extracted as class members)
+            let parent = node.parent;
+            // Handle decorated_definition wrapper
+            if (parent && parent.type === 'decorated_definition') {
+                parent = parent.parent;
+            }
+            // Check if parent is a class body (block inside class_definition)
+            if (parent && parent.type === 'block') {
+                const grandparent = parent.parent;
+                if (grandparent && grandparent.type === 'class_definition') {
+                    return true;  // Skip - this is a class method
+                }
+            }
+
             const nameNode = node.childForFieldName('name');
             const paramsNode = node.childForFieldName('parameters');
 
@@ -282,6 +296,7 @@ function extractClassMembers(classNode, code) {
                     endLine,
                     memberType,
                     isAsync,
+                    isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring }),
                     ...(memberDecorators.length > 0 && { decorators: memberDecorators })

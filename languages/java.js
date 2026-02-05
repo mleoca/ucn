@@ -111,6 +111,12 @@ function findFunctions(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
+            // Skip methods inside a class body (they're extracted as class members)
+            let parent = node.parent;
+            if (parent && parent.type === 'class_body') {
+                return true;  // Skip - this is a class method
+            }
+
             const nameNode = node.childForFieldName('name');
             const paramsNode = node.childForFieldName('parameters');
 
@@ -393,6 +399,7 @@ function extractClassMembers(classNode, code) {
                     endLine,
                     memberType,
                     modifiers,
+                    isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring })
                 });
@@ -417,6 +424,7 @@ function extractClassMembers(classNode, code) {
                     endLine,
                     memberType: 'constructor',
                     modifiers,
+                    isMethod: true,  // Mark as method for context() lookups
                     ...(docstring && { docstring })
                 });
             }

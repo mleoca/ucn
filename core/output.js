@@ -307,25 +307,59 @@ function formatUsagesJson(usages, name) {
  * Format context (callers + callees) as JSON
  */
 function formatContextJson(context) {
+    // Handle struct/interface types differently
+    if (context.type && ['struct', 'interface', 'type'].includes(context.type)) {
+        const callers = context.callers || [];
+        const methods = context.methods || [];
+        return JSON.stringify({
+            type: context.type,
+            name: context.name,
+            file: context.file,
+            startLine: context.startLine,
+            endLine: context.endLine,
+            methodCount: methods.length,
+            usageCount: callers.length,
+            methods: methods.map(m => ({
+                name: m.name,
+                file: m.file,
+                line: m.line,
+                params: m.params,
+                returnType: m.returnType,
+                receiver: m.receiver
+            })),
+            usages: callers.map(c => ({
+                file: c.relativePath || c.file,
+                line: c.line,
+                expression: c.content,
+                callerName: c.callerName
+            })),
+            ...(context.warnings && { warnings: context.warnings })
+        }, null, 2);
+    }
+
+    // Standard function/method context
+    const callers = context.callers || [];
+    const callees = context.callees || [];
     return JSON.stringify({
         function: context.function,
         file: context.file,
-        callerCount: context.callers.length,
-        calleeCount: context.callees.length,
-        callers: context.callers.map(c => ({
+        callerCount: callers.length,
+        calleeCount: callees.length,
+        callers: callers.map(c => ({
             file: c.relativePath || c.file,
             line: c.line,
             expression: c.content,  // FULL expression
             callerName: c.callerName
         })),
-        callees: context.callees.map(c => ({
+        callees: callees.map(c => ({
             name: c.name,
             type: c.type,
             file: c.relativePath || c.file,
             line: c.startLine,
             params: c.params,  // FULL params
             weight: c.weight || 'normal'  // Dependency weight: core, setup, utility
-        }))
+        })),
+        ...(context.warnings && { warnings: context.warnings })
     }, null, 2);
 }
 

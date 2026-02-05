@@ -52,6 +52,39 @@ function extractVisibility(text) {
 }
 
 /**
+ * Extract attributes from a function node (e.g., #[test], #[tokio::main])
+ * @param {Node} node - AST node
+ * @param {string} code - Source code
+ * @returns {string[]} Array of attribute names
+ */
+function extractAttributes(node, code) {
+    const attributes = [];
+    const lines = code.split('\n');
+
+    // Look at lines before the function for attributes
+    const startLine = node.startPosition.row;
+    for (let i = startLine - 1; i >= 0 && i >= startLine - 5; i--) {
+        const line = lines[i]?.trim();
+        if (!line) continue;
+        if (line.startsWith('#[')) {
+            // Extract attribute name (e.g., #[test] -> test, #[tokio::main] -> tokio::main)
+            const match = line.match(/#\[([^\]]+)\]/);
+            if (match) {
+                const attrContent = match[1];
+                // Get just the attribute name (without arguments)
+                const attrName = attrContent.split('(')[0].trim();
+                attributes.push(attrName);
+            }
+        } else if (!line.startsWith('//')) {
+            // Stop at non-comment, non-attribute lines
+            break;
+        }
+    }
+
+    return attributes;
+}
+
+/**
  * Find all functions in Rust code using tree-sitter
  */
 function findFunctions(code, parser) {
@@ -65,6 +98,19 @@ function findFunctions(code, parser) {
         if (node.type === 'function_item') {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
+
+            // Skip functions inside impl blocks (they're extracted as impl members)
+            let parent = node.parent;
+            if (parent && (parent.type === 'impl_item' || parent.type === 'declaration_list')) {
+                // declaration_list is the body of an impl block
+                const grandparent = parent.parent;
+                if (grandparent && grandparent.type === 'impl_item') {
+                    return true;  // Skip - this is an impl method
+                }
+                if (parent.type === 'impl_item') {
+                    return true;  // Skip - this is an impl method
+                }
+            }
 
             const nameNode = node.childForFieldName('name');
             const paramsNode = node.childForFieldName('parameters');
@@ -81,12 +127,17 @@ function findFunctions(code, parser) {
                 const returnType = extractReturnType(node);
                 const docstring = extractRustDocstring(code, startLine);
                 const generics = extractGenerics(node);
+                const attributes = extractAttributes(node, code);
 
                 const modifiers = [];
                 if (visibility) modifiers.push(visibility);
                 if (isAsync) modifiers.push('async');
                 if (isUnsafe) modifiers.push('unsafe');
                 if (isConst) modifiers.push('const');
+                // Add attributes like #[test] to modifiers
+                for (const attr of attributes) {
+                    modifiers.push(attr);
+                }
 
                 functions.push({
                     name: nameNode.text,
@@ -228,7 +279,7 @@ function findClasses(code, parser) {
                 type: 'impl',
                 traitName: implInfo.traitName,
                 typeName: implInfo.typeName,
-                members: extractImplMembers(node, code),
+                members: extractImplMembers(node, code, implInfo.typeName),
                 modifiers: [],
                 ...(docstring && { docstring })
             });
@@ -390,8 +441,11 @@ function extractImplInfo(implNode) {
 
 /**
  * Extract impl block members (functions)
+ * @param {Node} implNode - The impl block AST node
+ * @param {string} code - Source code
+ * @param {string} [typeName] - The type this impl is for (e.g., "MyStruct")
  */
-function extractImplMembers(implNode, code) {
+function extractImplMembers(implNode, code, typeName) {
     const members = [];
     const bodyNode = implNode.childForFieldName('body');
     if (!bodyNode) return members;
@@ -411,6 +465,9 @@ function extractImplMembers(implNode, code) {
                 const docstring = extractRustDocstring(code, startLine);
                 const visibility = extractVisibility(text);
 
+                // Check if this is a method (has self parameter) or associated function
+                const hasSelf = paramsNode && paramsNode.text.includes('self');
+
                 members.push({
                     name: nameNode.text,
                     params: extractRustParams(paramsNode),
@@ -419,6 +476,8 @@ function extractImplMembers(implNode, code) {
                     endLine,
                     memberType: visibility ? 'public' : 'method',
                     isAsync: firstLine.includes('async '),
+                    isMethod: true,  // Mark as method for context() lookups
+                    ...(typeName && { receiver: typeName }),  // Track which type this impl is for
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring })
                 });
