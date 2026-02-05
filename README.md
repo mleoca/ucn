@@ -38,13 +38,8 @@ JavaScript, TypeScript, Python, Go, Rust, Java
 
 ## Install
 
-Not published to npm yet. Install from source:
-
 ```bash
-git clone https://github.com/mleoca/ucn.git
-cd ucn
-npm install
-npm link  # makes 'ucn' available globally
+npm install -g ucn
 ```
 
 ### Claude Code (optional)
