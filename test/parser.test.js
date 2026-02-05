@@ -4297,6 +4297,53 @@ class Product {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     });
+
+    it('should resolve Go module imports for exporters', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-import-'));
+        try {
+            // Create go.mod file
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), `module example.com/myproject
+
+go 1.21
+`);
+
+            // Create package structure
+            fs.mkdirSync(path.join(tmpDir, 'pkg', 'config'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'pkg', 'config', 'config.go'), `package config
+
+type Config struct {
+    Name string
+}
+
+func NewConfig() *Config {
+    return &Config{}
+}
+`);
+
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+import "example.com/myproject/pkg/config"
+
+func main() {
+    cfg := config.NewConfig()
+    _ = cfg
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.go', { quiet: true });
+
+            // Get exporters for the config package
+            const exportersResult = index.exporters(path.join(tmpDir, 'pkg', 'config', 'config.go'));
+            assert.ok(exportersResult.length > 0, 'Should find files that import the config package');
+
+            // main.go should be in the list
+            const mainFile = exportersResult.find(e => e.file.includes('main.go'));
+            assert.ok(mainFile, 'main.go should import the config package');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
 });
 
 console.log('UCN v3 Test Suite');
