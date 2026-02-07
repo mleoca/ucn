@@ -529,57 +529,11 @@ function usagesInFile(code, lines, name, filePath, result) {
                 return;
             }
         } catch (e) {
-            // Fall through to regex-based detection
+            // AST parsing failed — usages will be empty, only definitions shown
         }
     }
 
-    // Fallback to regex-based detection (for unsupported languages)
-    const regex = new RegExp('\\b' + escapeRegExp(name) + '\\b');
-    lines.forEach((line, idx) => {
-        const lineNum = idx + 1;
-
-        // Skip definition lines
-        if (defs.some(d => d.startLine === lineNum)) {
-            return;
-        }
-
-        if (regex.test(line)) {
-            if (flags.codeOnly && isCommentOrString(line)) {
-                return;
-            }
-
-            // Skip if the match is inside a string literal
-            if (isInsideString(line, name)) {
-                return;
-            }
-
-            const usageType = classifyUsage(line, name);
-            const usage = {
-                file: filePath,
-                relativePath: filePath,
-                line: lineNum,
-                content: line,
-                usageType,
-                isDefinition: false
-            };
-
-            // Add context
-            if (flags.context > 0) {
-                const before = [];
-                const after = [];
-                for (let i = 1; i <= flags.context; i++) {
-                    if (idx - i >= 0) before.unshift(lines[idx - i]);
-                    if (idx + i < lines.length) after.push(lines[idx + i]);
-                }
-                usage.before = before;
-                usage.after = after;
-            }
-
-            usages.push(usage);
-        }
-    });
-
-    // Add definitions to result
+    // Output definitions + any usages found via AST
     const allUsages = [
         ...defs.map(d => ({
             ...d,
@@ -2137,58 +2091,12 @@ function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-function classifyUsage(line, name) {
-    // Check if it's an import first
-    if (/^\s*(import|from|require|use)\b/.test(line)) {
-        return 'import';
-    }
-    // Check if it's a function call (but not a method call)
-    if (new RegExp('\\b' + escapeRegExp(name) + '\\s*\\(').test(line)) {
-        // Exclude method calls (obj.name, this.name, JSON.name, etc.)
-        if (!isMethodCall(line, name)) {
-            return 'call';
-        }
-    }
-    return 'reference';
-}
-
-function isMethodCall(line, name) {
-    // Check if there's a dot or ] immediately before the name
-    const methodPattern = new RegExp('[.\\]]\\s*' + escapeRegExp(name) + '\\s*\\(');
-    return methodPattern.test(line);
-}
-
 function isCommentOrString(line) {
     const trimmed = line.trim();
     return trimmed.startsWith('//') ||
         trimmed.startsWith('#') ||
         trimmed.startsWith('*') ||
         trimmed.startsWith('/*');
-}
-
-function isInsideString(line, name) {
-    // Simple heuristic: check if name appears inside quotes
-    // Find all string regions in the line
-    const stringRegex = /(['"`])(?:(?!\1|\\).|\\.)*\1/g;
-    let match;
-
-    while ((match = stringRegex.exec(line)) !== null) {
-        const stringContent = match[0];
-        const stringStart = match.index;
-        const stringEnd = stringStart + stringContent.length;
-
-        // Find where the name appears in the line
-        const nameRegex = new RegExp('\\b' + escapeRegExp(name) + '\\b', 'g');
-        let nameMatch;
-        while ((nameMatch = nameRegex.exec(line)) !== null) {
-            const nameStart = nameMatch.index;
-            // Check if this name occurrence is inside the string
-            if (nameStart > stringStart && nameStart < stringEnd) {
-                return true;
-            }
-        }
-    }
-    return false;
 }
 
 function printUsage() {

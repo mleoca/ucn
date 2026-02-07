@@ -10,49 +10,6 @@ const path = require('path');
 const { getParser, getLanguageModule } = require('../languages');
 
 /**
- * Import patterns by language
- * @deprecated Use AST-based findImportsInCode() from language modules instead.
- * Kept only as fallback for unsupported languages or when AST parsing fails.
- */
-const IMPORT_PATTERNS = {
-    javascript: {
-        importDefault: /import\s+(\w+)\s+from\s+['"]([^'"]+)['"]/g,
-        importNamed: /import\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g,
-        importNamespace: /import\s*\*\s*as\s+(\w+)\s+from\s+['"]([^'"]+)['"]/g,
-        require: /(?:const|let|var)\s+(?:\{[^}]+\}|(\w+))\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-        exportNamed: /^\s*export\s+(?:async\s+)?(?:function|class|const|let|var|interface|type)\s+(\w+)/gm,
-        exportDefault: /^\s*export\s+default\s+(?:(?:async\s+)?(?:function|class)\s+)?(\w+)?/gm,
-        exportList: /^\s*export\s*\{([^}]+)\}/gm,
-        moduleExports: /^module\.exports\s*=\s*(?:\{([^}]+)\}|(\w+))/gm,
-        exportsNamed: /^exports\.(\w+)\s*=[^=]/gm,
-        importType: /import\s+type\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/g,
-        importSideEffect: /import\s+['"]([^'"]+)['"]/g,
-        importDynamic: /(?:await\s+)?import\s*\(\s*['"]([^'"]+)['"]\s*\)/g,
-        reExportNamed: /^\s*export\s*\{([^}]+)\}\s*from\s*['"]([^'"]+)['"]/gm,
-        reExportAll: /^\s*export\s*\*\s*from\s*['"]([^'"]+)['"]/gm
-    },
-    python: {
-        importModule: /^import\s+([\w.]+)(?:\s+as\s+(\w+))?/gm,
-        fromImport: /^from\s+([.\w]+)\s+import\s+(.+)/gm,
-        exportAll: /__all__\s*=\s*\[([^\]]+)\]/g
-    },
-    go: {
-        importSingle: /import\s+"([^"]+)"/g,
-        importBlock: /import\s*\(\s*([\s\S]*?)\s*\)/g,
-        exportedFunc: /^func\s+(?:\([^)]+\)\s+)?([A-Z]\w*)\s*\(/gm,
-        exportedType: /^type\s+([A-Z]\w*)\s+/gm
-    },
-    java: {
-        importStatement: /import\s+(?:static\s+)?([\w.]+(?:\.\*)?)\s*;/g,
-        exportedClass: /public\s+(?:abstract\s+)?(?:final\s+)?(?:class|interface|enum)\s+(\w+)/g
-    },
-    rust: {
-        useStatement: /^use\s+([^;]+);/gm,
-        modDecl: /^\s*mod\s+(\w+)\s*;/gm
-    }
-};
-
-/**
  * Extract imports from file content using AST
  *
  * @param {string} content - File content
@@ -63,7 +20,6 @@ function extractImports(content, language) {
     // Normalize language name for parser
     const normalizedLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
 
-    // Try AST-based extraction first
     const langModule = getLanguageModule(normalizedLang);
     if (langModule && typeof langModule.findImportsInCode === 'function') {
         try {
@@ -73,176 +29,11 @@ function extractImports(content, language) {
                 return { imports };
             }
         } catch (e) {
-            // Fall through to regex-based extraction
+            // AST parsing failed
         }
     }
 
-    // Fallback to regex-based extraction (deprecated)
-    const imports = [];
-    if (language === 'javascript' || language === 'typescript' || language === 'tsx') {
-        extractJSImports(content, imports);
-    } else if (language === 'python') {
-        extractPythonImports(content, imports);
-    } else if (language === 'go') {
-        extractGoImports(content, imports);
-    } else if (language === 'java') {
-        extractJavaImports(content, imports);
-    } else if (language === 'rust') {
-        extractRustImports(content, imports);
-    }
-
-    return { imports };
-}
-
-/**
- * @deprecated Use AST-based findImportsInCode() from language modules.
- */
-function extractJSImports(content, imports) {
-    const patterns = IMPORT_PATTERNS.javascript;
-    let match;
-
-    // Default imports
-    let regex = new RegExp(patterns.importDefault.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        imports.push({ module: match[2], names: [match[1]], type: 'default' });
-    }
-
-    // Named imports
-    regex = new RegExp(patterns.importNamed.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const names = match[1].split(',').map(n => n.trim().split(/\s+as\s+/)[0].trim()).filter(n => n);
-        imports.push({ module: match[2], names, type: 'named' });
-    }
-
-    // Namespace imports
-    regex = new RegExp(patterns.importNamespace.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        imports.push({ module: match[2], names: [match[1]], type: 'namespace' });
-    }
-
-    // Require
-    regex = new RegExp(patterns.require.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        imports.push({ module: match[2], names: match[1] ? [match[1]] : [], type: 'require' });
-    }
-
-    // Type imports
-    regex = new RegExp(patterns.importType.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const names = match[1].split(',').map(n => n.trim().split(/\s+as\s+/)[0].trim()).filter(n => n);
-        imports.push({ module: match[2], names, type: 'type' });
-    }
-
-    // Side-effect imports
-    regex = new RegExp(patterns.importSideEffect.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const module = match[1];
-        if (!imports.some(i => i.module === module)) {
-            imports.push({ module, names: [], type: 'side-effect' });
-        }
-    }
-
-    // Dynamic imports
-    regex = new RegExp(patterns.importDynamic.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const module = match[1];
-        if (!imports.some(i => i.module === module)) {
-            imports.push({ module, names: [], type: 'dynamic' });
-        }
-    }
-
-    // Re-exports
-    regex = new RegExp(patterns.reExportNamed.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        const names = match[1].split(',').map(n => n.trim().split(/\s+as\s+/)[0].trim()).filter(n => n);
-        imports.push({ module: match[2], names, type: 're-export' });
-    }
-
-    regex = new RegExp(patterns.reExportAll.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        imports.push({ module: match[1], names: ['*'], type: 're-export-all' });
-    }
-}
-
-/** @deprecated Use AST-based findImportsInCode() from language modules. */
-function extractPythonImports(content, imports) {
-    const patterns = IMPORT_PATTERNS.python;
-    let match;
-
-    let regex = new RegExp(patterns.importModule.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        const moduleName = match[1];
-        const alias = match[2] || moduleName.split('.').pop();
-        imports.push({ module: moduleName, names: [alias], type: 'module' });
-    }
-
-    regex = new RegExp(patterns.fromImport.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        const moduleName = match[1];
-        const importList = match[2].trim();
-
-        if (importList === '*') {
-            imports.push({ module: moduleName, names: ['*'], type: 'star' });
-        } else {
-            const names = importList.split(',').map(n => n.trim().split(/\s+as\s+/)[0].trim()).filter(n => n && n !== '(');
-            imports.push({ module: moduleName, names, type: 'from' });
-        }
-    }
-}
-
-/** @deprecated Use AST-based findImportsInCode() from language modules. */
-function extractGoImports(content, imports) {
-    const patterns = IMPORT_PATTERNS.go;
-    let match;
-
-    let regex = new RegExp(patterns.importSingle.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const pkg = match[1];
-        imports.push({ module: pkg, names: [path.basename(pkg)], type: 'single' });
-    }
-
-    regex = new RegExp(patterns.importBlock.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const block = match[1];
-        const pkgMatches = block.matchAll(/"([^"]+)"/g);
-        for (const pkgMatch of pkgMatches) {
-            const pkg = pkgMatch[1];
-            imports.push({ module: pkg, names: [path.basename(pkg)], type: 'block' });
-        }
-    }
-}
-
-/** @deprecated Use AST-based findImportsInCode() from language modules. */
-function extractJavaImports(content, imports) {
-    const patterns = IMPORT_PATTERNS.java;
-    let match;
-
-    let regex = new RegExp(patterns.importStatement.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const fullImport = match[1];
-        const parts = fullImport.split('.');
-        const name = parts[parts.length - 1];
-        imports.push({ module: fullImport, names: name === '*' ? ['*'] : [name], type: 'import' });
-    }
-}
-
-/** @deprecated Use AST-based findImportsInCode() from language modules. */
-function extractRustImports(content, imports) {
-    const patterns = IMPORT_PATTERNS.rust;
-    let match;
-
-    let regex = new RegExp(patterns.useStatement.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        let raw = match[1].trim().split('{')[0].trim().split(' as ')[0].trim().replace(/::$/, '');
-        if (raw) {
-            imports.push({ module: raw, names: [], type: 'use' });
-        }
-    }
-
-    regex = new RegExp(patterns.modDecl.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        imports.push({ module: `self::${match[1]}`, names: [match[1]], type: 'mod' });
-    }
+    return { imports: [] };
 }
 
 /**
@@ -252,7 +43,6 @@ function extractExports(content, language) {
     // Normalize language name for parser
     const normalizedLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
 
-    // Try AST-based extraction first
     const langModule = getLanguageModule(normalizedLang);
     if (langModule && typeof langModule.findExportsInCode === 'function') {
         try {
@@ -262,123 +52,11 @@ function extractExports(content, language) {
                 return { exports: foundExports };
             }
         } catch (e) {
-            // Fall through to regex-based extraction
+            // AST parsing failed
         }
     }
 
-    // Fallback to regex-based extraction (deprecated)
-    const foundExports = [];
-    if (language === 'javascript' || language === 'typescript' || language === 'tsx') {
-        extractJSExports(content, foundExports);
-    } else if (language === 'python') {
-        extractPythonExports(content, foundExports);
-    } else if (language === 'go') {
-        extractGoExports(content, foundExports);
-    } else if (language === 'java') {
-        extractJavaExports(content, foundExports);
-    }
-
-    return { exports: foundExports };
-}
-
-/** @deprecated Use AST-based findExportsInCode() from language modules. */
-function extractJSExports(content, exports) {
-    const patterns = IMPORT_PATTERNS.javascript;
-    let match;
-
-    let regex = new RegExp(patterns.exportNamed.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        exports.push({ name: match[1], type: 'named' });
-    }
-
-    regex = new RegExp(patterns.exportDefault.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        exports.push({ name: match[1] || 'default', type: 'default' });
-    }
-
-    regex = new RegExp(patterns.exportList.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        const names = match[1].split(',').map(n => n.trim().split(/\s+as\s+/)[0].trim()).filter(n => n);
-        for (const name of names) {
-            exports.push({ name, type: 'list' });
-        }
-    }
-
-    regex = new RegExp(patterns.exportsNamed.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        exports.push({ name: match[1], type: 'commonjs-named' });
-    }
-
-    // module.exports = { a, b, c } or module.exports = identifier
-    regex = new RegExp(patterns.moduleExports.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        if (match[1]) {
-            // Object literal: module.exports = { a, b, c }
-            const names = match[1].split(',').map(n => n.trim().split(/\s*:\s*/)[0].trim()).filter(n => n && !n.includes('('));
-            for (const name of names) {
-                exports.push({ name, type: 'commonjs-object' });
-            }
-        } else if (match[2]) {
-            // Single identifier: module.exports = SomeClass
-            exports.push({ name: match[2], type: 'commonjs-default' });
-        }
-    }
-}
-
-/** @deprecated Use AST-based findExportsInCode() from language modules. */
-function extractPythonExports(content, exports) {
-    let match;
-
-    // Check for __all__
-    let regex = new RegExp(IMPORT_PATTERNS.python.exportAll.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        const names = match[1].split(',').map(n => n.trim().replace(/['"]/g, '')).filter(n => n);
-        for (const name of names) {
-            exports.push({ name, type: 'explicit' });
-        }
-    }
-
-    // If no __all__, look for public names
-    if (exports.length === 0) {
-        const funcRegex = /^def\s+([a-zA-Z]\w*)\s*\(/gm;
-        while ((match = funcRegex.exec(content)) !== null) {
-            if (!match[1].startsWith('_')) {
-                exports.push({ name: match[1], type: 'function' });
-            }
-        }
-
-        const classRegex = /^class\s+([a-zA-Z]\w*)/gm;
-        while ((match = classRegex.exec(content)) !== null) {
-            if (!match[1].startsWith('_')) {
-                exports.push({ name: match[1], type: 'class' });
-            }
-        }
-    }
-}
-
-/** @deprecated Use AST-based findExportsInCode() from language modules. */
-function extractGoExports(content, exports) {
-    const patterns = IMPORT_PATTERNS.go;
-    let match;
-
-    let regex = new RegExp(patterns.exportedFunc.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        exports.push({ name: match[1], type: 'function' });
-    }
-
-    regex = new RegExp(patterns.exportedType.source, 'gm');
-    while ((match = regex.exec(content)) !== null) {
-        exports.push({ name: match[1], type: 'type' });
-    }
-}
-
-/** @deprecated Use AST-based findExportsInCode() from language modules. */
-function extractJavaExports(content, exports) {
-    let match;
-    let regex = new RegExp(IMPORT_PATTERNS.java.exportedClass.source, 'g');
-    while ((match = regex.exec(content)) !== null) {
-        exports.push({ name: match[1], type: 'class' });
-    }
+    return { exports: [] };
 }
 
 // Cache for tsconfig lookups
@@ -636,6 +314,5 @@ function stripJsonComments(content) {
 module.exports = {
     extractImports,
     extractExports,
-    resolveImport,
-    IMPORT_PATTERNS
+    resolveImport
 };
