@@ -107,8 +107,7 @@ const TEST_PATTERNS = {
     ],
     rust: [
         /.*_test\.rs$/,
-        /\/tests\//,
-        /mod tests/
+        /\/tests\//
     ]
 };
 

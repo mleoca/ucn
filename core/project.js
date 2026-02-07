@@ -11,11 +11,14 @@ const crypto = require('crypto');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parseFile } = require('./parser');
-const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 
 // Read UCN version for cache invalidation
 const UCN_VERSION = require('../package.json').version;
+
+// Lazy-initialized per-language keyword sets (populated on first isKeyword call)
+let LANGUAGE_KEYWORDS = null;
 
 /**
  * Escape special regex characters
@@ -416,25 +419,6 @@ class ProjectIndex {
         return withCounts;
     }
 
-    /**
-     * Count usages of a symbol across the codebase
-     */
-    countUsages(name) {
-        let count = 0;
-        const regex = new RegExp('\\b' + escapeRegExp(name) + '\\b', 'g');
-
-        for (const [filePath, fileEntry] of this.files) {
-            try {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const matches = content.match(regex);
-                if (matches) count += matches.length;
-            } catch (e) {
-                // Skip unreadable files
-            }
-        }
-
-        return count;
-    }
 
     /**
      * Count usages of a specific symbol (not just by name)
@@ -1007,7 +991,7 @@ class ProjectIndex {
                 }
 
                 // Skip keywords and built-ins
-                if (this.isKeyword(call.name)) continue;
+                if (this.isKeyword(call.name, language)) continue;
 
                 callees.set(call.name, (callees.get(call.name) || 0) + 1);
             }
@@ -1240,20 +1224,53 @@ class ProjectIndex {
     /**
      * Check if a name is a language keyword
      */
-    isKeyword(name) {
-        const keywords = new Set([
-            'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
-            'continue', 'return', 'function', 'class', 'const', 'let', 'var',
-            'new', 'this', 'super', 'import', 'export', 'default', 'from',
-            'try', 'catch', 'finally', 'throw', 'async', 'await', 'yield',
-            'typeof', 'instanceof', 'in', 'of', 'delete', 'void', 'with',
-            'def', 'print', 'range', 'len', 'str', 'int', 'float', 'list',
-            'dict', 'set', 'tuple', 'True', 'False', 'None', 'self', 'cls',
-            'func', 'type', 'struct', 'interface', 'package', 'make', 'append',
-            'fn', 'impl', 'pub', 'mod', 'use', 'crate', 'self', 'super',
-            'match', 'loop', 'unsafe', 'move', 'ref', 'mut', 'where'
-        ]);
-        return keywords.has(name);
+    isKeyword(name, language) {
+        if (!LANGUAGE_KEYWORDS) {
+            // Initialize on first use
+            LANGUAGE_KEYWORDS = {
+                javascript: new Set([
+                    'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
+                    'continue', 'return', 'function', 'class', 'const', 'let', 'var',
+                    'new', 'this', 'super', 'import', 'export', 'default', 'from',
+                    'try', 'catch', 'finally', 'throw', 'async', 'await', 'yield',
+                    'typeof', 'instanceof', 'in', 'of', 'delete', 'void', 'with'
+                ]),
+                python: new Set([
+                    'if', 'else', 'elif', 'for', 'while', 'def', 'class', 'return',
+                    'import', 'from', 'try', 'except', 'finally', 'raise', 'async',
+                    'await', 'yield', 'with', 'as', 'lambda', 'pass', 'break',
+                    'continue', 'del', 'global', 'nonlocal', 'assert', 'is', 'not',
+                    'and', 'or', 'in', 'True', 'False', 'None', 'self', 'cls'
+                ]),
+                go: new Set([
+                    'if', 'else', 'for', 'switch', 'case', 'break', 'continue',
+                    'return', 'func', 'type', 'struct', 'interface', 'package',
+                    'import', 'go', 'defer', 'select', 'chan', 'map', 'range',
+                    'fallthrough', 'goto', 'var', 'const', 'default'
+                ]),
+                rust: new Set([
+                    'if', 'else', 'for', 'while', 'loop', 'fn', 'impl', 'pub',
+                    'mod', 'use', 'crate', 'self', 'super', 'match', 'unsafe',
+                    'move', 'ref', 'mut', 'where', 'let', 'const', 'struct',
+                    'enum', 'trait', 'async', 'await', 'return', 'break',
+                    'continue', 'type', 'as', 'in', 'dyn', 'static'
+                ]),
+                java: new Set([
+                    'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
+                    'continue', 'return', 'class', 'interface', 'enum', 'extends',
+                    'implements', 'new', 'this', 'super', 'import', 'package',
+                    'try', 'catch', 'finally', 'throw', 'throws', 'abstract',
+                    'static', 'final', 'synchronized', 'volatile', 'transient',
+                    'native', 'void', 'instanceof', 'default'
+                ])
+            };
+            // TypeScript/TSX share JavaScript keywords
+            LANGUAGE_KEYWORDS.typescript = LANGUAGE_KEYWORDS.javascript;
+            LANGUAGE_KEYWORDS.tsx = LANGUAGE_KEYWORDS.javascript;
+        }
+
+        const keywords = LANGUAGE_KEYWORDS[language];
+        return keywords ? keywords.has(name) : false;
     }
 
     /**
@@ -2264,6 +2281,7 @@ class ProjectIndex {
                 ...analysis
             };
         });
+        this._clearTreeCache();
 
         // Group by file if requested
         const byFile = new Map();
@@ -2809,6 +2827,7 @@ class ProjectIndex {
                 }
             }
         }
+        this._clearTreeCache();
 
         return {
             found: true,
@@ -2832,87 +2851,89 @@ class ProjectIndex {
     }
 
     /**
-     * Analyze a call site to understand how it's being called
+     * Analyze a call site to understand how it's being called (AST-based)
+     * @param {object} call - Usage object with file, line, content
+     * @param {string} funcName - Function name to find
+     * @returns {object} { args, argCount, hasSpread, hasVariable }
      */
     analyzeCallSite(call, funcName) {
-        const content = call.content;
+        try {
+            const language = detectLanguage(call.file);
+            if (!language) return { args: null, argCount: 0 };
 
-        // Extract arguments from the call
-        const callMatch = new RegExp('\\b' + escapeRegExp(funcName) + '\\s*\\(([^)]*)\\)').exec(content);
-        if (!callMatch) {
+            const parser = getParser(language);
+            if (!parser) return { args: null, argCount: 0 };
+
+            // Use tree cache to avoid re-parsing the same file in batch operations
+            let tree = this._treeCache?.get(call.file);
+            if (!tree) {
+                const content = fs.readFileSync(call.file, 'utf-8');
+                tree = safeParse(parser, content);
+                if (!tree) return { args: null, argCount: 0 };
+                if (!this._treeCache) this._treeCache = new Map();
+                this._treeCache.set(call.file, tree);
+            }
+
+            // Call node types vary by language
+            const callTypes = new Set(['call_expression', 'call', 'method_invocation']);
+            const targetRow = call.line - 1; // tree-sitter is 0-indexed
+
+            // Find the call expression at the target line matching funcName
+            const callNode = this._findCallNode(tree.rootNode, callTypes, targetRow, funcName);
+            if (!callNode) return { args: null, argCount: 0 };
+
+            const argsNode = callNode.childForFieldName('arguments');
+            if (!argsNode) return { args: [], argCount: 0 };
+
+            const args = [];
+            for (let i = 0; i < argsNode.namedChildCount; i++) {
+                args.push(argsNode.namedChild(i).text.trim());
+            }
+
+            return {
+                args,
+                argCount: args.length,
+                hasSpread: args.some(a => a.startsWith('...')),
+                hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a))
+            };
+        } catch (e) {
             return { args: null, argCount: 0 };
         }
-
-        const argsStr = callMatch[1].trim();
-        if (!argsStr) {
-            return { args: [], argCount: 0 };
-        }
-
-        // Simple arg parsing (doesn't handle nested parens/strings perfectly but good enough)
-        const args = this.parseArguments(argsStr);
-
-        return {
-            args,
-            argCount: args.length,
-            hasSpread: args.some(a => a.startsWith('...')),
-            hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a))
-        };
     }
 
     /**
-     * Parse function call arguments (simple version)
+     * Find a call expression node at the target line matching funcName
      */
-    parseArguments(argsStr) {
-        const args = [];
-        let current = '';
-        let depth = 0;
-        let inString = false;
-        let stringChar = '';
-
-        for (let i = 0; i < argsStr.length; i++) {
-            const ch = argsStr[i];
-
-            if (inString) {
-                current += ch;
-                if (ch === stringChar && argsStr[i - 1] !== '\\') {
-                    inString = false;
-                }
-                continue;
-            }
-
-            if (ch === '"' || ch === "'" || ch === '`') {
-                inString = true;
-                stringChar = ch;
-                current += ch;
-                continue;
-            }
-
-            if (ch === '(' || ch === '[' || ch === '{') {
-                depth++;
-                current += ch;
-                continue;
-            }
-
-            if (ch === ')' || ch === ']' || ch === '}') {
-                depth--;
-                current += ch;
-                continue;
-            }
-
-            if (ch === ',' && depth === 0) {
-                args.push(current.trim());
-                current = '';
-                continue;
-            }
-
-            current += ch;
+    _findCallNode(node, callTypes, targetRow, funcName) {
+        if (node.startPosition.row > targetRow || node.endPosition.row < targetRow) {
+            return null; // Skip nodes that don't contain the target line
         }
 
-        if (current.trim()) {
-            args.push(current.trim());
+        if (callTypes.has(node.type) && node.startPosition.row === targetRow) {
+            // Check if this call is for our target function
+            const funcNode = node.childForFieldName('function') ||
+                             node.childForFieldName('name'); // Java method_invocation uses 'name'
+            if (funcNode) {
+                const funcText = funcNode.type === 'member_expression' || funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' || funcNode.type === 'attribute'
+                    ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
+                    : funcNode.text;
+                if (funcText === funcName) return node;
+            }
         }
 
-        return args;
+        // Recurse into children
+        for (let i = 0; i < node.childCount; i++) {
+            const result = this._findCallNode(node.child(i), callTypes, targetRow, funcName);
+            if (result) return result;
+        }
+        return null;
+    }
+
+    /**
+     * Clear the AST tree cache (call after batch operations)
+     */
+    _clearTreeCache() {
+        this._treeCache = null;
     }
 
     /**
