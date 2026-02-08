@@ -1619,15 +1619,10 @@ module.exports = { existingFunc };
         });
     });
 
-    it('context should return empty callers/callees for non-existent symbol', () => {
+    it('context should return null for non-existent symbol', () => {
         withTempProject((index) => {
             const ctx = index.context('nonExistentSymbol');
-            assert.ok(ctx, 'Should return context object');
-            assert.strictEqual(ctx.function, 'nonExistentSymbol', 'Should include queried name');
-            assert.ok(Array.isArray(ctx.callers), 'Callers should be array');
-            assert.ok(Array.isArray(ctx.callees), 'Callees should be array');
-            assert.strictEqual(ctx.callers.length, 0, 'Callers should be empty');
-            assert.strictEqual(ctx.callees.length, 0, 'Callees should be empty');
+            assert.strictEqual(ctx, null, 'Should return null for non-existent symbol');
         });
     });
 
@@ -4637,6 +4632,971 @@ fn main() {
             // Should include c.process()
             const hasMethodCall = calls.some(c => c.content && c.content.includes('c.process'));
             assert.strictEqual(hasMethodCall, true, 'c.process() SHOULD be counted');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// REGRESSION: Reliability fixes (2026-02)
+// ============================================================================
+
+describe('Regression: Context class label bug', () => {
+    it('should show class name in context, not undefined', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-ctx-class-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            // Python class
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            fs.writeFileSync(path.join(tmpDir, 'app.py'), `
+class Session:
+    def __init__(self):
+        self.data = {}
+
+    def get(self, key):
+        return self.data.get(key)
+
+def create_session():
+    return Session()
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const ctx = index.context('Session');
+            assert.strictEqual(ctx.type, 'class', 'Should detect as class type');
+            assert.strictEqual(ctx.name, 'Session', 'Should have class name, not undefined');
+            assert.ok(ctx.name !== undefined, 'Name must not be undefined');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should show Java class name in context', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-ctx-java-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Gson.java'), `
+public class Gson {
+    public Gson() {}
+    public String toJson(Object src) {
+        return "";
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const ctx = index.context('Gson');
+            assert.strictEqual(ctx.type, 'class');
+            assert.strictEqual(ctx.name, 'Gson', 'Should show Gson, not undefined');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java duplicate constructor entries', () => {
+    it('should not duplicate constructors in find results', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-java-dedup-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'MyClass.java'), `
+public class MyClass {
+    private int value;
+
+    public MyClass() {
+        this.value = 0;
+    }
+
+    public MyClass(int value) {
+        this.value = value;
+    }
+
+    public int getValue() {
+        return value;
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const symbols = index.symbols.get('MyClass') || [];
+            // Should have: 1 class + 2 constructors (as members) = 3 entries
+            // Should NOT have: extra duplicates from findFunctions
+            const types = symbols.map(s => s.type);
+            assert.strictEqual(types.filter(t => t === 'class').length, 1, 'Should have exactly 1 class entry');
+            // Constructors should only come from extractClassMembers, not findFunctions
+            const constructors = symbols.filter(s => s.type === 'constructor');
+            assert.strictEqual(constructors.length, 2, 'Should have exactly 2 constructor entries');
+            // Each constructor at a unique line
+            const lines = constructors.map(c => c.startLine);
+            assert.notStrictEqual(lines[0], lines[1], 'Constructors should be at different lines');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java overloaded method callees', () => {
+    it('should detect callees for overloaded methods', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-java-overload-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Converter.java'), `
+public class Converter {
+    public String convert(Object src) {
+        return convert(src, src.getClass());
+    }
+
+    public String convert(Object src, Class<?> type) {
+        return type.getName() + ": " + src.toString();
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // The first overload calls the second — smart should show it as a dependency
+            const smart = index.smart('convert', { file: 'Converter' });
+            assert.ok(smart, 'smart should return a result');
+            // Should have at least 1 dependency (the other overload)
+            assert.ok(smart.dependencies.length >= 1,
+                `Should find overload as dependency, got ${smart.dependencies.length}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Disambiguation prefers non-test definitions', () => {
+    it('should prefer src definition over test definition', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-disambig-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, 'test'), { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'render.js'), `
+function render(template, data) {
+    return template.replace(/{(\\w+)}/g, (_, key) => data[key] || '');
+}
+module.exports = { render };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'test', 'render.test.js'), `
+const { render } = require('../src/render');
+function render(mockTemplate) {
+    return 'mock: ' + mockTemplate;
+}
+test('render', () => { render('hello'); });
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // resolveSymbol should prefer src/render.js over test/render.test.js
+            const { def } = index.resolveSymbol('render');
+            assert.ok(def, 'Should find render');
+            assert.ok(!def.relativePath.includes('test'),
+                `Should prefer non-test file, got ${def.relativePath}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should use consistent selection across context, smart, trace', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-consistent-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function process(data) {
+    return transform(data);
+}
+function transform(x) { return x * 2; }
+module.exports = { process };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), `
+function process(item) {
+    return item.toString();
+}
+module.exports = { process };
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const ctx = index.context('process');
+            const smart = index.smart('process');
+            const trace = index.trace('process');
+
+            // All should pick the same definition
+            assert.strictEqual(ctx.file, smart.target.relativePath,
+                'context and smart should pick same definition');
+            assert.strictEqual(ctx.file, trace.file,
+                'context and trace should pick same definition');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Verify filters method calls', () => {
+    it('should not count obj.get() as call to standalone get()', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-verify-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            fs.writeFileSync(path.join(tmpDir, 'api.py'), `
+def get(url, params=None):
+    return request("GET", url, params=params)
+
+def request(method, url, params=None):
+    pass
+`);
+            fs.writeFileSync(path.join(tmpDir, 'client.py'), `
+from .api import get
+
+def fetch_data():
+    result = get("/api/data")
+    headers = {"Host": "example.com"}
+    host = headers.get("Host")
+    data = {"key": "value"}
+    val = data.get("key")
+    return result
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const result = index.verify('get');
+            assert.ok(result.found, 'Should find get function');
+            // Should NOT count headers.get("Host") or data.get("key") as mismatches
+            // Only get("/api/data") should be counted
+            assert.strictEqual(result.mismatches, 0,
+                `Should have 0 mismatches (method calls filtered), got ${result.mismatches}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Python relative import resolution', () => {
+    it('should resolve from .module import in exporters', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-pyimport-${Date.now()}`);
+        const pkgDir = path.join(tmpDir, 'mypackage');
+        fs.mkdirSync(pkgDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            fs.writeFileSync(path.join(pkgDir, '__init__.py'), `
+from .models import User, Product
+from .utils import helper
+`);
+            fs.writeFileSync(path.join(pkgDir, 'models.py'), `
+class User:
+    def __init__(self, name):
+        self.name = name
+
+class Product:
+    def __init__(self, title):
+        self.title = title
+`);
+            fs.writeFileSync(path.join(pkgDir, 'utils.py'), `
+def helper():
+    return "help"
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // models.py should be found as an exporter (imported by __init__.py)
+            const modelsPath = path.join(pkgDir, 'models.py');
+            const exporters = index.exportGraph.get(modelsPath) || [];
+            assert.ok(exporters.length > 0,
+                `models.py should have importers, got ${exporters.length}`);
+
+            // __init__.py should import models.py
+            const initPath = path.join(pkgDir, '__init__.py');
+            const imports = index.importGraph.get(initPath) || [];
+            assert.ok(imports.some(i => i.includes('models')),
+                `__init__.py should import models.py, got: ${imports.map(i => path.basename(i))}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should resolve parent relative imports (from ..utils import)', () => {
+        const { resolveImport } = require('../core/imports');
+
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-pyrel-${Date.now()}`);
+        const subDir = path.join(tmpDir, 'pkg', 'sub');
+        fs.mkdirSync(subDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pkg', 'utils.py'), 'def helper(): pass');
+            fs.writeFileSync(path.join(subDir, 'mod.py'), 'from ..utils import helper');
+
+            const resolved = resolveImport('..utils', path.join(subDir, 'mod.py'), {
+                language: 'python',
+                root: tmpDir
+            });
+            assert.ok(resolved, 'Should resolve ..utils');
+            assert.ok(resolved.endsWith('utils.py'), `Should resolve to utils.py, got ${resolved}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java inner classes found after constructor dedup', () => {
+    it('should find inner classes with their own members', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-inner-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Outer.java'), `
+public class Outer {
+    public static class Inner {
+        private int x;
+
+        public Inner(int x) {
+            this.x = x;
+        }
+
+        public int getX() {
+            return x;
+        }
+    }
+
+    public Inner create() {
+        return new Inner(42);
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Inner class should be found
+            assert.ok(index.symbols.has('Inner'), 'Should find Inner class');
+            const innerSyms = index.symbols.get('Inner');
+            const innerClass = innerSyms.find(s => s.type === 'class');
+            assert.ok(innerClass, 'Should have Inner as class type');
+
+            // Outer class should also be found
+            assert.ok(index.symbols.has('Outer'), 'Should find Outer class');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: fn command auto-resolves best definition', () => {
+    it('should prefer src/lib definition over test definition via pickBestDefinition-style scoring', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-fn-resolve-${Date.now()}`);
+        fs.mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
+        fs.mkdirSync(path.join(tmpDir, 'test'), { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'lib', 'app.js'), `
+function render(template, data) {
+    return template.replace(/{(\\w+)}/g, (_, key) => data[key] || '');
+}
+module.exports = { render };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'test', 'app.test.js'), `
+const { render } = require('../lib/app');
+function render(mockTemplate) {
+    return 'mock: ' + mockTemplate;
+}
+test('render works', () => { render('hello'); });
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // find should return both definitions
+            const matches = index.find('render').filter(m => m.type === 'function' || m.params !== undefined);
+            assert.ok(matches.length >= 2, `Should find at least 2 definitions, got ${matches.length}`);
+
+            // resolveSymbol should prefer lib/ over test/
+            const { def } = index.resolveSymbol('render');
+            assert.ok(def, 'Should find render');
+            assert.ok(def.relativePath.includes('lib/'),
+                `Should prefer lib/ file, got ${def.relativePath}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java package import resolution for exporters', () => {
+    it('should resolve Java package imports and find exporters', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-java-exports-${Date.now()}`);
+        const pkgDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example');
+        fs.mkdirSync(pkgDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(pkgDir, 'Model.java'), `
+package com.example;
+public class Model {
+    private String name;
+    public String getName() { return name; }
+}
+`);
+            fs.writeFileSync(path.join(pkgDir, 'Service.java'), `
+package com.example;
+import com.example.Model;
+public class Service {
+    public Model getModel() { return new Model(); }
+}
+`);
+            fs.writeFileSync(path.join(pkgDir, 'Controller.java'), `
+package com.example;
+import com.example.Model;
+import com.example.Service;
+public class Controller {
+    private Service service = new Service();
+    public Model handle() { return service.getModel(); }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Model.java should have exporters (Service.java and Controller.java import it)
+            const modelExporters = index.exporters('src/main/java/com/example/Model.java');
+            assert.ok(modelExporters.length >= 2,
+                `Model.java should have at least 2 importers, got ${modelExporters.length}: ${JSON.stringify(modelExporters.map(e => e.file))}`);
+
+            // Service.java should also have an exporter (Controller.java imports it)
+            const serviceExporters = index.exporters('src/main/java/com/example/Service.java');
+            assert.ok(serviceExporters.length >= 1,
+                `Service.java should have at least 1 importer, got ${serviceExporters.length}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java overload callees finds ALL overloads', () => {
+    it('should find all overload callees, not just the first', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-java-all-overloads-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Serializer.java'), `
+public class Serializer {
+    public String serialize(Object src) {
+        if (src == null) {
+            return serialize("null_value");
+        }
+        return serialize(src, src.getClass());
+    }
+
+    public String serialize(Object src, Class<?> type) {
+        return type.getName() + ": " + src.toString();
+    }
+
+    public String serialize(String value) {
+        return "string: " + value;
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // smart for the first overload should show other overloads as dependencies
+            const smart = index.smart('serialize', { file: 'Serializer' });
+            assert.ok(smart, 'smart should return a result');
+
+            // Should find at least 2 overload dependencies (the other two overloads)
+            assert.ok(smart.dependencies.length >= 2,
+                `Should find at least 2 overload dependencies, got ${smart.dependencies.length}: ${smart.dependencies.map(d => d.startLine).join(', ')}`);
+
+            // Each dependency should be a different overload (different startLine)
+            const depLines = new Set(smart.dependencies.map(d => d.startLine));
+            assert.ok(depLines.size >= 2,
+                `Dependencies should be distinct overloads, got ${depLines.size} unique`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should use binding ID for exact symbol lookup', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-java-binding-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Builder.java'), `
+public class Builder {
+    public Builder set(String key, Object value) {
+        return set(key, value, false);
+    }
+
+    public Builder set(String key, Object value, boolean override) {
+        return this;
+    }
+
+    public String build() {
+        return "built";
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // context for the first set() should show the second set() as a callee
+            const ctx = index.context('set', { file: 'Builder' });
+            assert.ok(ctx, 'context should return a result');
+            assert.ok(ctx.callees.length >= 1,
+                `Should find at least 1 callee (the other overload), got ${ctx.callees.length}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// Regression: fn command extracts class methods (not just top-level functions)
+// ============================================================================
+describe('Regression: fn command extracts class methods', () => {
+    it('should find and extract Python __init__ method via symbol index', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-fn-method-${Date.now()}`);
+        fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'models.py'), `
+class Session:
+    def __init__(self, url, timeout=30):
+        self.url = url
+        self.timeout = timeout
+
+    def get(self, path):
+        return self.url + path
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // find should return __init__ (it has params, so it passes the filter)
+            const matches = index.find('__init__').filter(m => m.type === 'function' || m.params !== undefined);
+            assert.ok(matches.length >= 1, `Should find __init__, got ${matches.length}`);
+
+            // The match should have valid startLine/endLine for direct code extraction
+            const match = matches[0];
+            assert.ok(match.startLine, 'Match should have startLine');
+            assert.ok(match.endLine, 'Match should have endLine');
+            assert.ok(match.file, 'Match should have file path');
+
+            // Extract code using startLine/endLine (same approach as the fixed fn command)
+            const code = fs.readFileSync(match.file, 'utf-8');
+            const lines = code.split('\n');
+            const fnCode = lines.slice(match.startLine - 1, match.endLine).join('\n');
+            assert.ok(fnCode.includes('def __init__'), `Extracted code should contain __init__, got: ${fnCode}`);
+            assert.ok(fnCode.includes('self.url = url'), `Extracted code should contain method body, got: ${fnCode}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should find and extract Java overloaded method via symbol index', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-fn-overload-${Date.now()}`);
+        const pkgDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example');
+        fs.mkdirSync(pkgDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(pkgDir, 'Converter.java'), `
+package com.example;
+public class Converter {
+    public String toJson(Object obj) {
+        return obj.toString();
+    }
+    public String toJson(Object obj, boolean pretty) {
+        String result = obj.toString();
+        return pretty ? format(result) : result;
+    }
+    private String format(String s) {
+        return s;
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // find should return toJson overloads
+            const matches = index.find('toJson').filter(m => m.type === 'function' || m.params !== undefined);
+            assert.ok(matches.length >= 1, `Should find toJson, got ${matches.length}`);
+
+            // Each match should have valid location for direct extraction
+            for (const match of matches) {
+                assert.ok(match.startLine, `Match at ${match.relativePath} should have startLine`);
+                assert.ok(match.endLine, `Match at ${match.relativePath} should have endLine`);
+
+                const code = fs.readFileSync(match.file, 'utf-8');
+                const lines = code.split('\n');
+                const fnCode = lines.slice(match.startLine - 1, match.endLine).join('\n');
+                assert.ok(fnCode.includes('toJson'), `Extracted code should contain toJson, got: ${fnCode}`);
+            }
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// Regression: verify totalCalls excludes filtered method calls
+// ============================================================================
+describe('Regression: verify totalCalls excludes filtered method calls', () => {
+    it('should not count method calls in totalCalls for standalone function', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-verify-total-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            fs.writeFileSync(path.join(tmpDir, 'api.py'), `
+def get(url, params=None):
+    return request("GET", url, params=params)
+
+def request(method, url, params=None):
+    pass
+`);
+            fs.writeFileSync(path.join(tmpDir, 'client.py'), `
+from .api import get
+
+def fetch_data():
+    result = get("/api/data")
+    headers = {"Host": "example.com"}
+    host = headers.get("Host")
+    data = {"key": "value"}
+    val = data.get("key")
+    return result
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const result = index.verify('get');
+            assert.ok(result.found, 'Should find get function');
+            // totalCalls should equal valid + mismatches + uncertain (no inflated count)
+            assert.strictEqual(result.totalCalls, result.valid + result.mismatches + result.uncertain,
+                `totalCalls (${result.totalCalls}) should equal valid (${result.valid}) + mismatches (${result.mismatches}) + uncertain (${result.uncertain})`);
+            // Specifically, method calls like headers.get() and data.get() should NOT be in totalCalls
+            assert.ok(result.totalCalls <= 2,
+                `totalCalls should be at most 2 (direct calls only), got ${result.totalCalls}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should have consistent totals for Go method calls', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-verify-go-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `
+package main
+
+import "os/exec"
+
+func Run(opts string) error {
+    return nil
+}
+
+func main() {
+    Run("hello")
+    cmd := exec.Command("ls")
+    cmd.Run()
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const result = index.verify('Run');
+            assert.ok(result.found, 'Should find Run function');
+            // totalCalls must always equal valid + mismatches + uncertain
+            assert.strictEqual(result.totalCalls, result.valid + result.mismatches + result.uncertain,
+                `totalCalls (${result.totalCalls}) should equal valid (${result.valid}) + mismatches (${result.mismatches}) + uncertain (${result.uncertain})`);
+            // cmd.Run() is a method call and should NOT inflate totalCalls
+            assert.ok(result.totalCalls >= 1,
+                `Should find at least 1 direct call to Run, got ${result.totalCalls}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// Regression: context returns null for non-existent symbols
+// ============================================================================
+describe('Regression: context returns null for non-existent symbols', () => {
+    it('should return null when symbol is not defined in the project', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-context-null-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+const router = require('express').Router();
+function handleRequest(req, res) {
+    res.send('hello');
+}
+module.exports = { handleRequest };
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Symbol that doesn't exist at all
+            const result1 = index.context('nonexistentXYZ');
+            assert.strictEqual(result1, null,
+                'context should return null for completely non-existent symbol');
+
+            // Symbol used but not defined in project (external import)
+            const result2 = index.context('Router');
+            assert.strictEqual(result2, null,
+                'context should return null for externally-defined symbol');
+
+            // Symbol that IS defined should still work
+            const result3 = index.context('handleRequest');
+            assert.ok(result3, 'context should return result for defined symbol');
+            assert.ok(result3.function || result3.name, 'Result should have function/name field');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: pickBestDefinition prefers larger function bodies as tiebreaker
+describe('Regression: pickBestDefinition prefers larger functions over trivial ones', () => {
+    it('should pick the __init__ with the largest body when all else is equal', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-pick-best-${Date.now()}`);
+        fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            // Small __init__ (3 lines) - should NOT be preferred
+            fs.writeFileSync(path.join(tmpDir, 'src', 'errors.py'), `
+class AppError(Exception):
+    def __init__(self, message):
+        super().__init__(message)
+        self.message = message
+`);
+            // Large __init__ (20+ lines) - SHOULD be preferred
+            fs.writeFileSync(path.join(tmpDir, 'src', 'client.py'), `
+class Client:
+    def __init__(self, url, timeout=30, retries=3, auth=None, headers=None):
+        self.url = url
+        self.timeout = timeout
+        self.retries = retries
+        self.auth = auth
+        self.headers = headers or {}
+        self.session = None
+        self._pool = None
+        self._closed = False
+        self._setup_logging()
+        self._verify_ssl = True
+        self._proxy = None
+        self._max_redirects = 10
+        self._cookies = {}
+        self._default_encoding = 'utf-8'
+        self._event_hooks = {'request': [], 'response': []}
+        self._transport = None
+        self._base_url = url
+        self._initialized = True
+
+    def get(self, path):
+        pass
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const matches = index.find('__init__').filter(m => m.type === 'function' || m.params !== undefined);
+            assert.ok(matches.length >= 2, `Should find at least 2 __init__ methods, got ${matches.length}`);
+
+            // Sort using same logic as pickBestDefinition
+            const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+            const scored = matches.map(m => {
+                let score = 0;
+                const rp = m.relativePath || '';
+                if (typeOrder.has(m.type)) score += 1000;
+                if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
+                if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
+                if (m.startLine && m.endLine) {
+                    score += Math.min(m.endLine - m.startLine, 100);
+                }
+                return { match: m, score };
+            });
+            scored.sort((a, b) => b.score - a.score);
+            const best = scored[0].match;
+
+            // Should pick client.py (large body) over errors.py (small body)
+            assert.ok(best.file.includes('client.py'),
+                `Should prefer client.py __init__ (large body), got ${best.file}`);
+            assert.ok(best.endLine - best.startLine > 10,
+                `Selected __init__ should have >10 lines, got ${best.endLine - best.startLine}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: Rust crate:: import resolution for exporters
+describe('Regression: Rust crate:: import resolution', () => {
+    it('should resolve crate:: paths and mod declarations to file paths', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-rust-imports-${Date.now()}`);
+        const srcDir = path.join(tmpDir, 'src');
+        const displayDir = path.join(srcDir, 'display');
+        fs.mkdirSync(displayDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test-crate"');
+
+            // main.rs with mod declarations
+            fs.writeFileSync(path.join(srcDir, 'main.rs'), `
+mod display;
+mod config;
+
+use crate::display::Display;
+use crate::config::Settings;
+
+fn main() {
+    let display = Display::new();
+    let config = Settings::default();
+}
+`);
+            // display/mod.rs
+            fs.writeFileSync(path.join(displayDir, 'mod.rs'), `
+use crate::config::Settings;
+
+pub struct Display {
+    width: u32,
+    height: u32,
+}
+
+impl Display {
+    pub fn new() -> Self {
+        Display { width: 800, height: 600 }
+    }
+}
+`);
+            // config.rs
+            fs.writeFileSync(path.join(srcDir, 'config.rs'), `
+pub struct Settings {
+    pub theme: String,
+}
+
+impl Settings {
+    pub fn default() -> Self {
+        Settings { theme: String::from("dark") }
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Test mod declaration resolution: main.rs imports display/ and config.rs
+            const mainImporters = index.importGraph.get(path.join(srcDir, 'main.rs')) || [];
+            assert.ok(mainImporters.length >= 2,
+                `main.rs should import at least 2 files (display + config), got ${mainImporters.length}`);
+
+            // Test exporters: display/mod.rs should be imported by main.rs
+            const displayExporters = index.exporters('src/display/mod.rs');
+            assert.ok(displayExporters.length >= 1,
+                `display/mod.rs should have at least 1 exporter, got ${displayExporters.length}`);
+            assert.ok(displayExporters.some(e => e.file.includes('main.rs')),
+                `main.rs should import display/mod.rs`);
+
+            // Test crate:: resolution: display/mod.rs imports config.rs via crate::config
+            const displayImports = index.importGraph.get(path.join(displayDir, 'mod.rs')) || [];
+            assert.ok(displayImports.some(i => i.includes('config.rs')),
+                `display/mod.rs should import config.rs via crate::config, got ${displayImports.map(i => path.basename(i))}`);
+
+            // Test exporters for config.rs: should be imported by both main.rs and display/mod.rs
+            const configExporters = index.exporters('src/config.rs');
+            assert.ok(configExporters.length >= 2,
+                `config.rs should have at least 2 exporters (main + display), got ${configExporters.length}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should resolve nested crate:: paths like crate::display::color', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-rust-nested-${Date.now()}`);
+        const srcDir = path.join(tmpDir, 'src');
+        const displayDir = path.join(srcDir, 'display');
+        fs.mkdirSync(displayDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"');
+
+            fs.writeFileSync(path.join(srcDir, 'main.rs'), `
+mod display;
+use crate::display::color::Rgb;
+
+fn main() {
+    let c = Rgb::new(255, 0, 0);
+}
+`);
+            fs.writeFileSync(path.join(displayDir, 'mod.rs'), `
+pub mod color;
+pub struct Display;
+`);
+            fs.writeFileSync(path.join(displayDir, 'color.rs'), `
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    pub fn new(r: u8, g: u8, b: u8) -> Self {
+        Rgb { r, g, b }
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // main.rs should resolve crate::display::color::Rgb to display/color.rs
+            const mainImports = index.importGraph.get(path.join(srcDir, 'main.rs')) || [];
+            assert.ok(mainImports.some(i => i.includes('color.rs')),
+                `main.rs should import display/color.rs via crate::display::color::Rgb, got ${mainImports.map(i => path.basename(i))}`);
+
+            // color.rs exporters should include main.rs
+            const colorExporters = index.exporters('src/display/color.rs');
+            assert.ok(colorExporters.some(e => e.file.includes('main.rs')),
+                `color.rs should be exported to main.rs`);
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }

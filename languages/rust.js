@@ -11,7 +11,11 @@ const {
     parseStructuredParams,
     extractRustDocstring
 } = require('./utils');
-const { PARSE_OPTIONS } = require('./index');
+const { PARSE_OPTIONS, safeParse } = require('./index');
+
+function parseTree(parser, code) {
+    return safeParse(parser, code, undefined, PARSE_OPTIONS);
+}
 
 /**
  * Extract return type from Rust function
@@ -88,7 +92,7 @@ function extractAttributes(node, code) {
  * Find all functions in Rust code using tree-sitter
  */
 function findFunctions(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const functions = [];
     const processedRanges = new Set();
 
@@ -177,7 +181,7 @@ function extractGenerics(node) {
  * Find all types (structs, enums, traits, impls) in Rust code
  */
 function findClasses(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const types = [];
     const processedRanges = new Set();
 
@@ -492,7 +496,7 @@ function extractImplMembers(implNode, code, typeName) {
  * Find state objects (const/static) in Rust code
  */
 function findStateObjects(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const objects = [];
 
     const statePattern = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
@@ -555,7 +559,7 @@ function parse(code, parser) {
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string, isMacro?: boolean}>}
  */
 function findCallsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
 
@@ -679,7 +683,7 @@ function findCallsInCode(code, parser) {
  * @returns {Array<{module: string, names: string[], type: string, line: number}>}
  */
 function findImportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const imports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -698,6 +702,7 @@ function findImportsInCode(code, parser) {
                         module: path,
                         names: [segments[segments.length - 1]],
                         type: 'use',
+                        dynamic: false,
                         line
                     });
                 } else if (child.type === 'use_wildcard') {
@@ -708,6 +713,7 @@ function findImportsInCode(code, parser) {
                             module: scopedId.text,
                             names: ['*'],
                             type: 'use-glob',
+                            dynamic: true,
                             line
                         });
                     }
@@ -733,6 +739,7 @@ function findImportsInCode(code, parser) {
                             module: basePath,
                             names,
                             type: 'use',
+                            dynamic: false,
                             line
                         });
                     }
@@ -754,12 +761,33 @@ function findImportsInCode(code, parser) {
                     module: nameNode.text,
                     names: [nameNode.text],
                     type: 'mod',
+                    dynamic: false,
                     line
                 });
             }
             return true;
         }
 
+        return true;
+    });
+
+    // include! macros with non-literal paths
+    traverseTree(tree.rootNode, (node) => {
+        if (node.type === 'macro_invocation') {
+            const nameNode = node.childForFieldName('macro');
+            if (nameNode && /^include(_str|_bytes)?!$/.test(nameNode.text)) {
+                const argsNode = node.childForFieldName('argument_list');
+                const arg = argsNode?.namedChild(0);
+                const dynamic = !arg || arg.type !== 'string_literal';
+                imports.push({
+                    module: arg ? arg.text.replace(/^["']|["']$/g, '') : null,
+                    names: [],
+                    type: 'include',
+                    dynamic,
+                    line: node.startPosition.row + 1
+                });
+            }
+        }
         return true;
     });
 
@@ -774,7 +802,7 @@ function findImportsInCode(code, parser) {
  * @returns {Array<{name: string, type: string, line: number}>}
  */
 function findExportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const exports = [];
 
     function hasVisibility(node) {
@@ -906,7 +934,7 @@ function findExportsInCode(code, parser) {
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
 function findUsagesInCode(code, name, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {

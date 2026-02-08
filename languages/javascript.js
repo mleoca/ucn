@@ -12,7 +12,12 @@ const {
     parseStructuredParams,
     extractJSDocstring
 } = require('./utils');
-const { PARSE_OPTIONS } = require('./index');
+const { PARSE_OPTIONS, safeParse } = require('./index');
+
+// Helper to consistently parse with buffer retries
+function parseTree(parser, code) {
+    return safeParse(parser, code, undefined, PARSE_OPTIONS);
+}
 
 /**
  * Extract return type annotation from JS/TS function
@@ -88,7 +93,7 @@ function extractModifiers(text) {
  * @returns {Array}
  */
 function findFunctions(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const functions = [];
     const processedRanges = new Set();
 
@@ -327,7 +332,7 @@ function findFunctions(code, parser) {
  * @returns {Array}
  */
 function findClasses(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const classes = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -581,7 +586,7 @@ function extractClassMembers(classNode, code) {
  * Find state objects (CONFIG, constants, etc.)
  */
 function findStateObjects(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const objects = [];
 
     const statePattern = /^(CONFIG|[A-Z][a-zA-Z]*(?:State|Store|Context|Options|Settings)|[A-Z][A-Z_]+|Entities|Input)$/;
@@ -655,7 +660,7 @@ function parse(code, parser) {
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string, isConstructor?: boolean}>}
  */
 function findCallsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
 
@@ -718,6 +723,9 @@ function findCallsInCode(code, parser) {
             if (!funcNode) return true;
 
             const enclosingFunction = getCurrentEnclosingFunction();
+            let uncertain = false;
+            // optional chaining implies possible non-call
+            if (node.type === 'call_expression' && node.text.includes('?.')) uncertain = true;
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
@@ -725,7 +733,8 @@ function findCallsInCode(code, parser) {
                     name: funcNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: false,
-                    enclosingFunction
+                    enclosingFunction,
+                    uncertain
                 });
             } else if (funcNode.type === 'member_expression') {
                 // Method call: obj.foo() or foo.call/apply/bind()
@@ -755,7 +764,8 @@ function findCallsInCode(code, parser) {
                                     line: node.startPosition.row + 1,
                                     isMethod: true,
                                     receiver: innerObj?.text,
-                                    enclosingFunction
+                                    enclosingFunction,
+                                    uncertain
                                 });
                             }
                         }
@@ -773,7 +783,8 @@ function findCallsInCode(code, parser) {
                             line: node.startPosition.row + 1,
                             isMethod: true,
                             receiver,
-                            enclosingFunction
+                            enclosingFunction,
+                            uncertain
                         });
                     }
                 }
@@ -877,7 +888,7 @@ function findCallsInCode(code, parser) {
  * @returns {Array<{line: number, context: string, pattern: string}>}
  */
 function findCallbackUsages(code, name, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -974,7 +985,7 @@ function findCallbackUsages(code, name, parser) {
  * @returns {Array<{name: string, from: string, line: number}>}
  */
 function findReExports(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const reExports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -1026,7 +1037,7 @@ function findReExports(code, parser) {
  * @returns {Array<{module: string, names: string[], type: string, line: number}>}
  */
 function findImportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const imports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -1091,35 +1102,41 @@ function findImportsInCode(code, parser) {
                 const argsNode = node.childForFieldName('arguments');
                 if (argsNode && argsNode.namedChildCount > 0) {
                     const firstArg = argsNode.namedChild(0);
-                    if (firstArg && firstArg.type === 'string') {
-                        const modulePath = firstArg.text.slice(1, -1);
-                        const line = node.startPosition.row + 1;
-                        const names = [];
+                    const line = node.startPosition.row + 1;
+                    const names = [];
+                    let modulePath = null;
+                    let dynamic = false;
 
-                        // Check parent for variable name
-                        let parent = node.parent;
-                        if (parent && parent.type === 'variable_declarator') {
-                            const nameNode = parent.childForFieldName('name');
-                            if (nameNode) {
-                                if (nameNode.type === 'identifier') {
-                                    names.push(nameNode.text);
-                                } else if (nameNode.type === 'object_pattern') {
-                                    // Destructuring: const { a, b } = require('x')
-                                    for (let i = 0; i < nameNode.namedChildCount; i++) {
-                                        const prop = nameNode.namedChild(i);
-                                        if (prop.type === 'shorthand_property_identifier_pattern') {
-                                            names.push(prop.text);
-                                        } else if (prop.type === 'pair_pattern') {
-                                            const key = prop.childForFieldName('key');
-                                            if (key) names.push(key.text);
-                                        }
+                    if (firstArg && firstArg.type === 'string') {
+                        modulePath = firstArg.text.slice(1, -1);
+                    } else {
+                        dynamic = true;
+                        modulePath = firstArg ? firstArg.text : null;
+                    }
+
+                    // Check parent for variable name
+                    let parent = node.parent;
+                    if (parent && parent.type === 'variable_declarator') {
+                        const nameNode = parent.childForFieldName('name');
+                        if (nameNode) {
+                            if (nameNode.type === 'identifier') {
+                                names.push(nameNode.text);
+                            } else if (nameNode.type === 'object_pattern') {
+                                // Destructuring: const { a, b } = require('x')
+                                for (let i = 0; i < nameNode.namedChildCount; i++) {
+                                    const prop = nameNode.namedChild(i);
+                                    if (prop.type === 'shorthand_property_identifier_pattern') {
+                                        names.push(prop.text);
+                                    } else if (prop.type === 'pair_pattern') {
+                                        const key = prop.childForFieldName('key');
+                                        if (key) names.push(key.text);
                                     }
                                 }
                             }
                         }
-
-                        imports.push({ module: modulePath, names, type: 'require', line });
                     }
+
+                    imports.push({ module: modulePath, names, type: 'require', line, dynamic });
                 }
             }
 
@@ -1128,10 +1145,12 @@ function findImportsInCode(code, parser) {
                 const argsNode = node.childForFieldName('arguments');
                 if (argsNode && argsNode.namedChildCount > 0) {
                     const firstArg = argsNode.namedChild(0);
+                    const line = node.startPosition.row + 1;
                     if (firstArg && firstArg.type === 'string') {
                         const modulePath = firstArg.text.slice(1, -1);
-                        const line = node.startPosition.row + 1;
-                        imports.push({ module: modulePath, names: [], type: 'dynamic', line });
+                        imports.push({ module: modulePath, names: [], type: 'dynamic', line, dynamic: false });
+                    } else {
+                        imports.push({ module: firstArg ? firstArg.text : null, names: [], type: 'dynamic', line, dynamic: true });
                     }
                 }
             }
@@ -1151,7 +1170,7 @@ function findImportsInCode(code, parser) {
  * @returns {Array<{name: string, type: string, line: number, source?: string}>}
  */
 function findExportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const exports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -1288,7 +1307,7 @@ function findExportsInCode(code, parser) {
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
 function findUsagesInCode(code, name, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {

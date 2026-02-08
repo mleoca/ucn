@@ -11,7 +11,11 @@ const {
     parseStructuredParams,
     extractJavaDocstring
 } = require('./utils');
-const { PARSE_OPTIONS } = require('./index');
+const { PARSE_OPTIONS, safeParse } = require('./index');
+
+function parseTree(parser, code) {
+    return safeParse(parser, code, undefined, PARSE_OPTIONS);
+}
 
 /**
  * Extract Java parameters
@@ -99,7 +103,7 @@ function extractGenerics(node) {
  * Find all methods/constructors in Java code using tree-sitter
  */
 function findFunctions(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const functions = [];
     const processedRanges = new Set();
 
@@ -150,6 +154,12 @@ function findFunctions(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
+            // Skip constructors inside a class body (they're extracted as class members)
+            let parent = node.parent;
+            if (parent && parent.type === 'class_body') {
+                return true;  // Skip - this is a class constructor
+            }
+
             const nameNode = node.childForFieldName('name');
             const paramsNode = node.childForFieldName('parameters');
 
@@ -186,7 +196,7 @@ function findFunctions(code, parser) {
  * Find all classes, interfaces, enums, records in Java code
  */
 function findClasses(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const classes = [];
     const processedRanges = new Set();
 
@@ -209,6 +219,10 @@ function findClasses(code, parser) {
                 const extendsInfo = extractExtends(node);
                 const implementsInfo = extractImplements(node);
 
+                // Check if this is a nested/inner class
+                let parentNode = node.parent;
+                const isNested = parentNode && parentNode.type === 'class_body';
+
                 classes.push({
                     name: nameNode.text,
                     startLine,
@@ -216,6 +230,7 @@ function findClasses(code, parser) {
                     type: 'class',
                     members,
                     modifiers,
+                    ...(isNested && { isNested: true }),
                     ...(docstring && { docstring }),
                     ...(generics && { generics }),
                     ...(annotations.length > 0 && { annotations }),
@@ -223,7 +238,8 @@ function findClasses(code, parser) {
                     ...(implementsInfo.length > 0 && { implements: implementsInfo })
                 });
             }
-            return false;  // Don't traverse into class body
+            // Continue traversal to find inner classes, but members are already extracted
+            return true;
         }
 
         // Interface declarations
@@ -438,7 +454,7 @@ function extractClassMembers(classNode, code) {
  * Find state objects (static final constants) in Java code
  */
 function findStateObjects(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const objects = [];
 
     const statePattern = /^([A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:CONFIG|SETTINGS|OPTIONS))$/;
@@ -495,7 +511,7 @@ function parse(code, parser) {
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string, isConstructor?: boolean}>}
  */
 function findCallsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
 
@@ -602,7 +618,7 @@ function findCallsInCode(code, parser) {
  * @returns {Array<{module: string, names: string[], type: string, line: number}>}
  */
 function findImportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const imports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -648,7 +664,7 @@ function findImportsInCode(code, parser) {
  * @returns {Array<{name: string, type: string, line: number}>}
  */
 function findExportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const exports = [];
 
     function isPublic(node) {
@@ -728,7 +744,7 @@ function findExportsInCode(code, parser) {
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
 function findUsagesInCode(code, name, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {

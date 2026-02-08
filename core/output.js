@@ -195,47 +195,11 @@ function printDefinition(def, relativePath) {
  */
 function formatTocJson(data) {
     return JSON.stringify({
-        files: data.totalFiles,
-        lines: data.totalLines,
-        functions: data.totalFunctions,
-        classes: data.totalClasses,
-        state: data.totalState,
-        byFile: data.byFile.map(f => ({
-            file: f.file,
-            language: f.language,
-            lines: f.lines,
-            functions: f.functions.map(fn => ({
-                name: fn.name,
-                params: fn.params,  // FULL params
-                paramsStructured: fn.paramsStructured || [],
-                startLine: fn.startLine,
-                endLine: fn.endLine,
-                modifiers: fn.modifiers || [],
-                ...(fn.returnType && { returnType: fn.returnType }),
-                ...(fn.generics && { generics: fn.generics }),
-                ...(fn.docstring && { docstring: fn.docstring }),
-                ...(fn.isArrow && { isArrow: true }),
-                ...(fn.isGenerator && { isGenerator: true })
-            })),
-            classes: f.classes.map(c => ({
-                name: c.name,
-                type: c.type,
-                startLine: c.startLine,
-                endLine: c.endLine,
-                modifiers: c.modifiers || [],
-                members: c.members || [],
-                ...(c.extends && { extends: c.extends }),
-                ...(c.implements && { implements: c.implements }),
-                ...(c.generics && { generics: c.generics }),
-                ...(c.docstring && { docstring: c.docstring })
-            })),
-            state: f.state.map(s => ({
-                name: s.name,
-                startLine: s.startLine,
-                endLine: s.endLine
-            }))
-        }))
-    }, null, 2);
+        meta: data.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
+        totals: data.totals,
+        summary: data.summary,
+        files: data.files
+    });
 }
 
 /**
@@ -243,22 +207,25 @@ function formatTocJson(data) {
  */
 function formatSymbolJson(symbols, query) {
     return JSON.stringify({
-        query,
-        count: symbols.length,
-        results: symbols.map(s => ({
-            name: s.name,
-            type: s.type,
-            file: s.relativePath || s.file,
-            startLine: s.startLine,
-            endLine: s.endLine,
-            ...(s.params && { params: s.params }),  // FULL params
-            ...(s.paramsStructured && { paramsStructured: s.paramsStructured }),
-            ...(s.returnType && { returnType: s.returnType }),
-            ...(s.modifiers && { modifiers: s.modifiers }),
-            ...(s.usageCount !== undefined && { usageCount: s.usageCount }),
-            ...(s.usageCounts !== undefined && { usageCounts: s.usageCounts })
-        }))
-    }, null, 2);
+        meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
+        data: {
+            query,
+            count: symbols.length,
+            results: symbols.map(s => ({
+                name: s.name,
+                type: s.type,
+                file: s.relativePath || s.file,
+                startLine: s.startLine,
+                endLine: s.endLine,
+                ...(s.params && { params: s.params }),  // FULL params
+                ...(s.paramsStructured && { paramsStructured: s.paramsStructured }),
+                ...(s.returnType && { returnType: s.returnType }),
+                ...(s.modifiers && { modifiers: s.modifiers }),
+                ...(s.usageCount !== undefined && { usageCount: s.usageCount }),
+                ...(s.usageCounts !== undefined && { usageCounts: s.usageCounts })
+            }))
+        }
+    });
 }
 
 /**
@@ -282,85 +249,95 @@ function formatUsagesJson(usages, name) {
     });
 
     return JSON.stringify({
-        symbol: name,
-        definitionCount: definitions.length,
-        callCount: calls.length,
-        importCount: imports.length,
-        referenceCount: references.length,
-        totalUsages: refs.length,
-        definitions: definitions.map(d => ({
-            file: d.relativePath || d.file,
-            line: d.line,
-            signature: d.signature || null,  // FULL signature
-            type: d.type || null,
-            ...(d.returnType && { returnType: d.returnType }),
-            ...(d.before && d.before.length > 0 && { before: d.before }),
-            ...(d.after && d.after.length > 0 && { after: d.after })
-        })),
-        calls: calls.map(formatUsage),
-        imports: imports.map(formatUsage),
-        references: references.map(formatUsage)
-    }, null, 2);
+        meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
+        data: {
+            symbol: name,
+            definitionCount: definitions.length,
+            callCount: calls.length,
+            importCount: imports.length,
+            referenceCount: references.length,
+            totalUsages: refs.length,
+            definitions: definitions.map(d => ({
+                file: d.relativePath || d.file,
+                line: d.line,
+                signature: d.signature || null,  // FULL signature
+                type: d.type || null,
+                ...(d.returnType && { returnType: d.returnType }),
+                ...(d.before && d.before.length > 0 && { before: d.before }),
+                ...(d.after && d.after.length > 0 && { after: d.after })
+            })),
+            calls: calls.map(formatUsage),
+            imports: imports.map(formatUsage),
+            references: references.map(formatUsage)
+        }
+    });
 }
 
 /**
  * Format context (callers + callees) as JSON
  */
 function formatContextJson(context) {
+    const meta = context.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 };
     // Handle struct/interface types differently
     if (context.type && ['struct', 'interface', 'type'].includes(context.type)) {
         const callers = context.callers || [];
         const methods = context.methods || [];
         return JSON.stringify({
-            type: context.type,
-            name: context.name,
-            file: context.file,
-            startLine: context.startLine,
-            endLine: context.endLine,
-            methodCount: methods.length,
-            usageCount: callers.length,
-            methods: methods.map(m => ({
-                name: m.name,
-                file: m.file,
-                line: m.line,
-                params: m.params,
-                returnType: m.returnType,
-                receiver: m.receiver
-            })),
-            usages: callers.map(c => ({
-                file: c.relativePath || c.file,
-                line: c.line,
-                expression: c.content,
-                callerName: c.callerName
-            })),
-            ...(context.warnings && { warnings: context.warnings })
-        }, null, 2);
+            meta,
+            data: {
+                type: context.type,
+                name: context.name,
+                file: context.file,
+                startLine: context.startLine,
+                endLine: context.endLine,
+                methodCount: methods.length,
+                usageCount: callers.length,
+                methods: methods.map(m => ({
+                    name: m.name,
+                    file: m.file,
+                    line: m.line,
+                    params: m.params,
+                    returnType: m.returnType,
+                    receiver: m.receiver
+                })),
+                usages: callers.map(c => ({
+                    file: c.relativePath || c.file,
+                    line: c.line,
+                    expression: c.content,
+                    callerName: c.callerName
+                })),
+                ...(context.warnings && { warnings: context.warnings })
+            }
+        });
     }
 
     // Standard function/method context
     const callers = context.callers || [];
     const callees = context.callees || [];
     return JSON.stringify({
-        function: context.function,
-        file: context.file,
-        callerCount: callers.length,
-        calleeCount: callees.length,
-        callers: callers.map(c => ({
-            file: c.relativePath || c.file,
-            line: c.line,
-            expression: c.content,  // FULL expression
-            callerName: c.callerName
-        })),
-        callees: callees.map(c => ({
-            name: c.name,
-            type: c.type,
-            file: c.relativePath || c.file,
-            line: c.startLine,
-            params: c.params,  // FULL params
-            weight: c.weight || 'normal'  // Dependency weight: core, setup, utility
-        })),
-        ...(context.warnings && { warnings: context.warnings })
-    }, null, 2);
+        meta,
+        data: {
+            function: context.function,
+            file: context.file,
+            callerCount: callers.length,
+            calleeCount: callees.length,
+            callers: callers.map(c => ({
+                file: c.relativePath || c.file,
+                line: c.line,
+                expression: c.content,  // FULL expression
+                callerName: c.callerName
+            })),
+            callees: callees.map(c => ({
+                name: c.name,
+                type: c.type,
+                file: c.relativePath || c.file,
+                line: c.startLine,
+                params: c.params,  // FULL params
+                weight: c.weight || 'normal'  // Dependency weight: core, setup, utility
+            })),
+            ...(context.warnings && { warnings: context.warnings })
+        }
+    });
 }
 
 /**
@@ -440,29 +417,33 @@ function formatGraphJson(graph) {
  * Includes function + all dependencies
  */
 function formatSmartJson(result) {
+    const meta = result.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 };
     return JSON.stringify({
-        target: {
-            name: result.target.name,
-            file: result.target.file,
-            startLine: result.target.startLine,
-            endLine: result.target.endLine,
-            params: result.target.params,
-            returnType: result.target.returnType,
-            code: result.target.code
-        },
-        dependencies: result.dependencies.map(d => ({
-            name: d.name,
-            type: d.type,
-            file: d.file,
-            startLine: d.startLine,
-            endLine: d.endLine,
-            params: d.params,
-            weight: d.weight,  // core, setup, utility
-            callCount: d.callCount,
-            code: d.code
-        })),
-        types: result.types || []
-    }, null, 2);
+        meta,
+        data: {
+            target: {
+                name: result.target.name,
+                file: result.target.file,
+                startLine: result.target.startLine,
+                endLine: result.target.endLine,
+                params: result.target.params,
+                returnType: result.target.returnType,
+                code: result.target.code
+            },
+            dependencies: result.dependencies.map(d => ({
+                name: d.name,
+                type: d.type,
+                file: d.file,
+                startLine: d.startLine,
+                endLine: d.endLine,
+                params: d.params,
+                weight: d.weight,  // core, setup, utility
+                callCount: d.callCount,
+                code: d.code
+            })),
+            types: result.types || []
+        }
+    });
 }
 
 // ============================================================================
@@ -891,8 +872,12 @@ function formatImpact(impact) {
             }
         }
         if (fileGroup.count > 10) {
-            lines.push(`  ... and ${fileGroup.count - 10} more`);
+            lines.push(`  ... and ${fileGroup.count - 10} more in this file`);
         }
+    }
+
+    if (impact.totalCallSites > 10) {
+        lines.push(`\nShowing up to 10 call sites per file. Use "ucn . usages ${impact.function}" to see all references.`);
     }
 
     return lines.join('\n');
@@ -1132,10 +1117,8 @@ function formatAbout(about, options = {}) {
 
     // Warnings (show early for visibility)
     if (about.warnings && about.warnings.length > 0) {
-        lines.push('');
-        lines.push('⚠️  WARNINGS:');
         for (const w of about.warnings) {
-            lines.push(`  ${w.message}`);
+            lines.push(`  Note: ${w.message}`);
         }
     }
 
@@ -1215,9 +1198,8 @@ function formatAbout(about, options = {}) {
     // Completeness warnings
     if (about.completeness && about.completeness.warnings && about.completeness.warnings.length > 0) {
         lines.push('');
-        lines.push('⚠ COMPLETENESS:');
         for (const w of about.completeness.warnings) {
-            lines.push(`  ${w.message}`);
+            lines.push(`Note: ${w.message}`);
         }
     }
 
