@@ -46,6 +46,10 @@ const flags = {
     includeTests: args.includes('--include-tests'),
     // Deadcode options
     includeExported: args.includes('--include-exported'),
+    // Uncertain matches (off by default)
+    includeUncertain: args.includes('--include-uncertain'),
+    // Detailed listing (e.g. toc with all symbols)
+    detailed: args.includes('--detailed'),
     // Output depth
     depth: args.find(a => a.startsWith('--depth='))?.split('=')[1] || null,
     // Inline expansion for callees
@@ -78,7 +82,7 @@ const knownFlags = new Set([
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact',
     '--no-cache', '--clear-cache', '--include-tests',
-    '--include-exported', '--expand', '--interactive', '-i', '--all', '--include-methods',
+    '--include-exported', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks'
@@ -652,7 +656,7 @@ function runProjectCommand(rootDir, command, arg) {
 
     switch (command) {
         case 'toc': {
-            const toc = index.getToc();
+            const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel });
             printOutput(toc, output.formatTocJson, printProjectToc);
             break;
         }
@@ -699,7 +703,15 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'context': {
             requireArg(arg, 'Usage: ucn . context <name>');
-            const ctx = index.context(arg, { includeMethods: flags.includeMethods, file: flags.file });
+            const ctx = index.context(arg, {
+                includeMethods: flags.includeMethods,
+                includeUncertain: flags.includeUncertain,
+                file: flags.file
+            });
+            if (!ctx) {
+                console.log(`Symbol "${arg}" not found.`);
+                break;
+            }
             printOutput(ctx,
                 output.formatContextJson,
                 r => { printContext(r, { expand: flags.expand, root: index.root }); }
@@ -730,7 +742,11 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'smart': {
             requireArg(arg, 'Usage: ucn . smart <name>');
-            const smart = index.smart(arg, { withTypes: flags.withTypes, includeMethods: flags.includeMethods });
+            const smart = index.smart(arg, {
+                withTypes: flags.withTypes,
+                includeMethods: flags.includeMethods,
+                includeUncertain: flags.includeUncertain
+            });
             if (smart) {
                 printOutput(smart, output.formatSmartJson, printSmart);
             } else {
@@ -906,6 +922,9 @@ function runProjectCommand(rootDir, command, arg) {
                             const exported = item.isExported ? ' [exported]' : '';
                             console.log(`  ${output.lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}`);
                         }
+                        if (!flags.includeExported) {
+                            console.log(`\nExported symbols excluded by default. Add --include-exported to include them.`);
+                        }
                     }
                 );
             }
@@ -977,26 +996,27 @@ function extractFunctionFromProject(index, name) {
         return;
     }
 
+    let match;
     if (matches.length > 1 && !flags.file) {
-        // Disambiguation needed
-        console.log(output.formatDisambiguation(matches, name, 'fn'));
-        return;
+        // Auto-select best match using same scoring as resolveSymbol
+        match = pickBestDefinition(matches);
+        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Use --file to disambiguate.`);
+    } else {
+        match = matches[0];
     }
 
-    const match = matches[0];
+    // Extract code directly using symbol index location (works for class methods and overloads)
     const code = fs.readFileSync(match.file, 'utf-8');
-    const language = detectLanguage(match.file);
-    const { fn, code: fnCode } = extractFunction(code, language, match.name);
+    const lines = code.split('\n');
+    const fnCode = lines.slice(match.startLine - 1, match.endLine).join('\n');
 
-    if (fn) {
-        if (flags.json) {
-            console.log(output.formatFunctionJson(fn, fnCode));
-        } else {
-            console.log(`${match.relativePath}:${fn.startLine}`);
-            console.log(`${output.lineRange(fn.startLine, fn.endLine)} ${output.formatFunctionSignature(fn)}`);
-            console.log('─'.repeat(60));
-            console.log(fnCode);
-        }
+    if (flags.json) {
+        console.log(output.formatFunctionJson(match, fnCode));
+    } else {
+        console.log(`${match.relativePath}:${match.startLine}`);
+        console.log(`${output.lineRange(match.startLine, match.endLine)} ${output.formatFunctionSignature(match)}`);
+        console.log('─'.repeat(60));
+        console.log(fnCode);
     }
 }
 
@@ -1010,13 +1030,15 @@ function extractClassFromProject(index, name) {
         return;
     }
 
+    let match;
     if (matches.length > 1 && !flags.file) {
-        // Disambiguation needed
-        console.log(output.formatDisambiguation(matches, name, 'class'));
-        return;
+        // Auto-select best match using same scoring as resolveSymbol
+        match = pickBestDefinition(matches);
+        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Use --file to disambiguate.`);
+    } else {
+        match = matches[0];
     }
 
-    const match = matches[0];
     const code = fs.readFileSync(match.file, 'utf-8');
     const language = detectLanguage(match.file);
     const { cls, code: clsCode } = extractClass(code, language, match.name);
@@ -1034,28 +1056,60 @@ function extractClassFromProject(index, name) {
 }
 
 function printProjectToc(toc) {
-    console.log(`PROJECT: ${toc.totalFiles} files, ${toc.totalLines} lines`);
-    console.log(`  ${toc.totalFunctions} functions, ${toc.totalClasses} classes, ${toc.totalState} state objects`);
+    const t = toc.totals;
+    console.log(`PROJECT: ${t.files} files, ${t.lines} lines`);
+    console.log(`  ${t.functions} functions, ${t.classes} classes, ${t.state} state objects`);
+
+    // Show meta warnings only when there's something noteworthy
+    const meta = toc.meta || {};
+    const warnings = [];
+    if (meta.dynamicImports) warnings.push(`${meta.dynamicImports} dynamic import(s)`);
+    if (meta.uncertain) warnings.push(`${meta.uncertain} uncertain reference(s)`);
+    if (warnings.length) {
+        const hint = meta.uncertain ? ' — use --include-uncertain to include all' : '';
+        console.log(`  Note: ${warnings.join(', ')}${hint}`);
+    }
+
+    // Hints
+    if (toc.summary) {
+        if (toc.summary.topFunctionFiles?.length) {
+            const hint = toc.summary.topFunctionFiles.map(f => `${f.file} (${f.functions})`).join(', ');
+            console.log(`  Most functions: ${hint}`);
+        }
+        if (toc.summary.topLineFiles?.length) {
+            const hint = toc.summary.topLineFiles.map(f => `${f.file} (${f.lines})`).join(', ');
+            console.log(`  Largest files: ${hint}`);
+        }
+        if (toc.summary.entryFiles?.length) {
+            console.log(`  Entry points: ${toc.summary.entryFiles.join(', ')}`);
+        }
+    }
+
     console.log('═'.repeat(60));
+    const hasDetail = toc.files.some(f => f.symbols);
+    for (const file of toc.files) {
+        const parts = [`${file.lines} lines`];
+        if (file.functions) parts.push(`${file.functions} fn`);
+        if (file.classes) parts.push(`${file.classes} cls`);
+        if (file.state) parts.push(`${file.state} state`);
 
-    for (const file of toc.byFile) {
-        // Filter for top-level only if flag is set
-        let functions = file.functions;
-        if (flags.topLevel) {
-            functions = functions.filter(fn => !fn.isNested && (!fn.indent || fn.indent === 0));
+        if (hasDetail) {
+            console.log(`\n${file.file} (${parts.join(', ')})`);
+            if (file.symbols) {
+                for (const fn of file.symbols.functions) {
+                    console.log(`  ${output.lineRange(fn.startLine, fn.endLine)} ${output.formatFunctionSignature(fn)}`);
+                }
+                for (const cls of file.symbols.classes) {
+                    console.log(`  ${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
+                }
+            }
+        } else {
+            console.log(`  ${file.file} — ${parts.join(', ')}`);
         }
+    }
 
-        if (functions.length === 0 && file.classes.length === 0) continue;
-
-        console.log(`\n${file.file} (${file.lines} lines)`);
-
-        for (const fn of functions) {
-            console.log(`  ${output.lineRange(fn.startLine, fn.endLine)} ${output.formatFunctionSignature(fn)}`);
-        }
-
-        for (const cls of file.classes) {
-            console.log(`  ${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-        }
+    if (!hasDetail) {
+        console.log(`\nAdd --detailed to list all functions, or "ucn . about <name>" for full details on a symbol`);
     }
 }
 
@@ -1506,7 +1560,7 @@ function printBestExample(index, name) {
 
 function printContext(ctx, options = {}) {
     // Handle struct/interface types differently
-    if (ctx.type && ['struct', 'interface', 'type'].includes(ctx.type)) {
+    if (ctx.type && ['class', 'struct', 'interface', 'type'].includes(ctx.type)) {
         console.log(`Context for ${ctx.type} ${ctx.name}:`);
         console.log('═'.repeat(60));
 
@@ -1567,6 +1621,17 @@ function printContext(ctx, options = {}) {
     // Standard function/method context
     console.log(`Context for ${ctx.function}:`);
     console.log('═'.repeat(60));
+
+    // Show meta note when results may be incomplete
+    if (ctx.meta) {
+        const notes = [];
+        if (ctx.meta.dynamicImports) notes.push(`${ctx.meta.dynamicImports} dynamic import(s)`);
+        if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
+        if (notes.length) {
+            const hint = ctx.meta.uncertain ? ' — use --include-uncertain to include all' : '';
+            console.log(`  Note: ${notes.join(', ')}${hint}`);
+        }
+    }
 
     // Display warnings if any
     if (ctx.warnings && ctx.warnings.length > 0) {
@@ -1717,6 +1782,18 @@ function printExpandedItem(item, root) {
 function printSmart(smart) {
     console.log(`${smart.target.name} (${smart.target.file}:${smart.target.startLine})`);
     console.log('═'.repeat(60));
+
+    // Show meta note when results may be incomplete
+    if (smart.meta) {
+        const notes = [];
+        if (smart.meta.dynamicImports) notes.push(`${smart.meta.dynamicImports} dynamic import(s)`);
+        if (smart.meta.uncertain) notes.push(`${smart.meta.uncertain} uncertain call(s) skipped`);
+        if (notes.length) {
+            const hint = smart.meta.uncertain ? ' — use --include-uncertain to include all' : '';
+            console.log(`  Note: ${notes.join(', ')}${hint}`);
+        }
+    }
+
     console.log(smart.target.code);
 
     if (smart.dependencies.length > 0) {
@@ -2076,6 +2153,30 @@ function printLines(lines, range) {
     }
 }
 
+/**
+ * Pick the best definition from multiple matches using same scoring as resolveSymbol.
+ * Prefers lib/src/core over test/examples/vendor directories.
+ */
+function pickBestDefinition(matches) {
+    const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+    const scored = matches.map(m => {
+        let score = 0;
+        const rp = m.relativePath || '';
+        // Prefer class/struct/interface types (+1000) - same as resolveSymbol
+        if (typeOrder.has(m.type)) score += 1000;
+        if (isTestFile(rp, detectLanguage(m.file))) score -= 500;
+        if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
+        if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
+        // Tiebreaker: prefer larger function bodies (more important/complex)
+        if (m.startLine && m.endLine) {
+            score += Math.min(m.endLine - m.startLine, 100);
+        }
+        return { match: m, score };
+    });
+    scored.sort((a, b) => b.score - a.score);
+    return scored[0].match;
+}
+
 function suggestSimilar(query, names) {
     const lower = query.toLowerCase();
     const similar = names.filter(n => n.toLowerCase().includes(lower));
@@ -2109,6 +2210,7 @@ Usage:
   ucn <file> [command] [args]     Single file mode
   ucn <dir> [command] [args]      Project mode (specific directory)
   ucn "pattern" [command] [args]  Glob pattern mode
+  (Default output is text; add --json for machine-readable JSON)
 
 ═══════════════════════════════════════════════════════════════════════════════
 UNDERSTAND CODE (UCN's strength - semantic analysis)
@@ -2321,7 +2423,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: context <name>');
                 return;
             }
-            const ctx = index.context(arg);
+            const ctx = index.context(arg, { includeUncertain: flags.includeUncertain });
             printContext(ctx, { expand: flags.expand, root: index.root });
             break;
         }
@@ -2331,7 +2433,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: smart <name>');
                 return;
             }
-            const smart = index.smart(arg, {});
+            const smart = index.smart(arg, { includeUncertain: flags.includeUncertain });
             if (smart) {
                 printSmart(smart);
             } else {

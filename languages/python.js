@@ -11,7 +11,11 @@ const {
     parseStructuredParams,
     extractPythonDocstring
 } = require('./utils');
-const { PARSE_OPTIONS } = require('./index');
+const { PARSE_OPTIONS, safeParse } = require('./index');
+
+function parseTree(parser, code) {
+    return safeParse(parser, code, undefined, PARSE_OPTIONS);
+}
 
 /**
  * Extract return type annotation from Python function
@@ -62,7 +66,7 @@ function extractPythonParams(paramsNode) {
  * Find all functions in Python code using tree-sitter
  */
 function findFunctions(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const functions = [];
     const processedRanges = new Set();
 
@@ -159,7 +163,7 @@ function extractDecorators(node) {
  * Find all classes in Python code using tree-sitter
  */
 function findClasses(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const classes = [];
     const processedRanges = new Set();
 
@@ -312,7 +316,7 @@ function extractClassMembers(classNode, code) {
  * Find state objects (constants) in Python code
  */
 function findStateObjects(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const objects = [];
 
     const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
@@ -365,7 +369,7 @@ function parse(code, parser) {
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string}>}
  */
 function findCallsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
 
@@ -409,6 +413,7 @@ function findCallsInCode(code, parser) {
             if (!funcNode) return true;
 
             const enclosingFunction = getCurrentEnclosingFunction();
+            let uncertain = false;
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
@@ -416,7 +421,8 @@ function findCallsInCode(code, parser) {
                     name: funcNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: false,
-                    enclosingFunction
+                    enclosingFunction,
+                    uncertain
                 });
             } else if (funcNode.type === 'attribute') {
                 // Method/attribute call: obj.foo()
@@ -429,7 +435,8 @@ function findCallsInCode(code, parser) {
                         line: node.startPosition.row + 1,
                         isMethod: true,
                         receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
-                        enclosingFunction
+                        enclosingFunction,
+                        uncertain
                     });
                 }
             }
@@ -455,7 +462,7 @@ function findCallsInCode(code, parser) {
  * @returns {Array<{module: string, names: string[], type: string, line: number}>}
  */
 function findImportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const imports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -526,6 +533,28 @@ function findImportsInCode(code, parser) {
             return true;
         }
 
+        // Dynamic imports via importlib/import_module or __import__
+        if (node.type === 'call') {
+            const funcNode = node.childForFieldName('function');
+            const argsNode = node.childForFieldName('arguments');
+            if (funcNode && argsNode && argsNode.namedChildCount > 0) {
+                const funcName = funcNode.text;
+                const firstArg = argsNode.namedChild(0);
+                if ((funcName === 'importlib.import_module' || funcName === '__import__') && firstArg) {
+                    const line = node.startPosition.row + 1;
+                    const isLiteral = firstArg.type === 'string';
+                    imports.push({
+                        module: isLiteral ? firstArg.text.replace(/^['"]|['"]$/g, '') : firstArg.text,
+                        names: [],
+                        type: 'dynamic',
+                        line,
+                        dynamic: !isLiteral
+                    });
+                }
+            }
+            return true;
+        }
+
         return true;
     });
 
@@ -540,7 +569,7 @@ function findImportsInCode(code, parser) {
  * @returns {Array<{name: string, type: string, line: number}>}
  */
 function findExportsInCode(code, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const exports = [];
 
     traverseTree(tree.rootNode, (node) => {
@@ -590,7 +619,7 @@ function findExportsInCode(code, parser) {
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
 function findUsagesInCode(code, name, parser) {
-    const tree = parser.parse(code, undefined, PARSE_OPTIONS);
+    const tree = parseTree(parser, code);
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {

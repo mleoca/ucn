@@ -139,7 +139,7 @@ class ProjectIndex {
         if (!language) return;
 
         const parsed = parseFile(filePath);
-        const { imports } = extractImports(content, language);
+        const { imports, dynamicCount } = extractImports(content, language);
         const { exports } = extractExports(content, language);
 
         const fileEntry = {
@@ -152,8 +152,10 @@ class ProjectIndex {
             size: stat.size,
             imports: imports.map(i => i.module),
             exports: exports.map(e => e.name),
-            symbols: []
+            symbols: [],
+            bindings: []
         };
+        fileEntry.dynamicImports = dynamicCount || 0;
 
         // Add symbols
         const addSymbol = (item, type) => {
@@ -169,6 +171,7 @@ class ProjectIndex {
                 returnType: item.returnType,
                 modifiers: item.modifiers,
                 docstring: item.docstring,
+                bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,
                 ...(item.extends && { extends: item.extends }),
                 ...(item.implements && { implements: item.implements }),
                 ...(item.indent !== undefined && { indent: item.indent }),
@@ -179,6 +182,12 @@ class ProjectIndex {
                 ...(item.memberType && { memberType: item.memberType })
             };
             fileEntry.symbols.push(symbol);
+            fileEntry.bindings.push({
+                id: symbol.bindingId,
+                name: symbol.name,
+                type: symbol.type,
+                startLine: symbol.startLine
+            });
 
             if (!this.symbols.has(item.name)) {
                 this.symbols.set(item.name, []);
@@ -234,15 +243,40 @@ class ProjectIndex {
         this.importGraph.clear();
         this.exportGraph.clear();
 
+        // Build Java suffix lookup for package import resolution
+        // Maps "com/google/gson/Gson.java" -> absolute path
+        let javaSuffixMap = null;
+
         for (const [filePath, fileEntry] of this.files) {
             const importedFiles = [];
 
             for (const importModule of fileEntry.imports) {
-                const resolved = resolveImport(importModule, filePath, {
+                let resolved = resolveImport(importModule, filePath, {
                     aliases: this.config.aliases,
                     language: fileEntry.language,
                     root: this.root
                 });
+
+                // Java package imports: resolve by matching file path suffix
+                // e.g., "com.google.gson.Gson" -> find file ending in "com/google/gson/Gson.java"
+                if (!resolved && fileEntry.language === 'java' &&
+                    !importModule.startsWith('.') && !importModule.endsWith('.*')) {
+                    if (!javaSuffixMap) {
+                        javaSuffixMap = new Map();
+                        for (const [absPath, entry] of this.files) {
+                            if (entry.language === 'java') {
+                                javaSuffixMap.set(absPath, absPath);
+                            }
+                        }
+                    }
+                    const fileSuffix = '/' + importModule.split('.').join('/') + '.java';
+                    for (const absPath of javaSuffixMap.keys()) {
+                        if (absPath.endsWith(fileSuffix)) {
+                            resolved = absPath;
+                            break;
+                        }
+                    }
+                }
 
                 if (resolved && this.files.has(resolved)) {
                     importedFiles.push(resolved);
@@ -285,6 +319,17 @@ class ProjectIndex {
                 }
             }
         }
+    }
+
+    /**
+     * Count dynamic imports across indexed files
+     */
+    getDynamicImportCount() {
+        let total = 0;
+        for (const fileEntry of this.files.values()) {
+            total += fileEntry.dynamicImports || 0;
+        }
+        return total;
     }
 
     // ========================================================================
@@ -367,6 +412,80 @@ class ProjectIndex {
      * @param {object} options - { file, prefer, exact, exclude, in }
      * @returns {Array} Matching symbols with usage counts
      */
+
+    /**
+     * Resolve a symbol name to the best matching definition.
+     * Centralized selection logic used by all commands for consistency.
+     *
+     * Priority order:
+     * 1. Filter by --file if specified
+     * 2. Prefer class/struct/interface/type over functions/constructors
+     * 3. Prefer non-test file definitions over test files
+     * 4. Prefer higher usage count
+     *
+     * @param {string} name - Symbol name
+     * @param {object} [options] - { file }
+     * @returns {{ def: object|null, definitions: Array, warnings: Array }}
+     */
+    resolveSymbol(name, options = {}) {
+        let definitions = this.symbols.get(name) || [];
+        if (definitions.length === 0) {
+            return { def: null, definitions: [], warnings: [] };
+        }
+
+        // Filter by file if specified
+        if (options.file) {
+            const filtered = definitions.filter(d =>
+                d.relativePath && d.relativePath.includes(options.file)
+            );
+            if (filtered.length > 0) {
+                definitions = filtered;
+            }
+        }
+
+        // Score each definition for selection
+        const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+        const scored = definitions.map(d => {
+            let score = 0;
+            const rp = d.relativePath || '';
+            // Prefer class/struct/interface types (+1000)
+            if (typeOrder.has(d.type)) score += 1000;
+            // Deprioritize test files (-500)
+            if (isTestFile(rp, detectLanguage(d.file))) {
+                score -= 500;
+            }
+            // Deprioritize examples/docs/vendor directories (-300)
+            if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) {
+                score -= 300;
+            }
+            // Boost lib/src/core/internal directories (+200)
+            if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) {
+                score += 200;
+            }
+            return { def: d, score };
+        });
+
+        // Sort by score descending, then by index order for stability
+        scored.sort((a, b) => b.score - a.score);
+
+        const def = scored[0].def;
+
+        // Build warnings
+        const warnings = [];
+        if (definitions.length > 1) {
+            warnings.push({
+                type: 'ambiguous',
+                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Use --file to disambiguate.`,
+                alternatives: definitions.filter(d => d !== def).map(d => ({
+                    file: d.relativePath,
+                    line: d.startLine
+                }))
+            });
+        }
+
+        return { def, definitions, warnings };
+    }
+
     find(name, options = {}) {
         const matches = this.symbols.get(name) || [];
 
@@ -693,30 +812,10 @@ class ProjectIndex {
      * Get context for a symbol (callers + callees)
      */
     context(name, options = {}) {
-        let definitions = this.symbols.get(name) || [];
-        if (definitions.length === 0) {
-            return { function: name, file: null, callers: [], callees: [] };
-        }
-
-        // Filter by file if specified
-        if (options.file) {
-            const filtered = definitions.filter(d =>
-                d.relativePath && d.relativePath.includes(options.file)
-            );
-            if (filtered.length > 0) {
-                definitions = filtered;
-            }
-        }
-
-        // Prefer class/struct/interface definitions over functions/methods/constructors
-        // This ensures context('ClassName') finds the class, not a constructor with same name
-        const typeOrder = ['class', 'struct', 'interface', 'type', 'impl'];
-        let def = definitions[0];
-        for (const d of definitions) {
-            if (typeOrder.includes(d.type)) {
-                def = d;
-                break;
-            }
+        const resolved = this.resolveSymbol(name, { file: options.file });
+        let { def, definitions, warnings } = resolved;
+        if (!def) {
+            return null;
         }
 
         // Special handling for class/struct/interface types
@@ -738,25 +837,28 @@ class ProjectIndex {
                     receiver: m.receiver
                 })),
                 // Also include places where the type is used in function parameters/returns
-                callers: this.findCallers(name, { includeMethods: options.includeMethods })
+                callers: this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain })
             };
 
-            if (definitions.length > 1) {
-                result.warnings = [{
-                    type: 'ambiguous',
-                    message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Use --file to disambiguate.`,
-                    alternatives: definitions.slice(1).map(d => ({
-                        file: d.relativePath,
-                        line: d.startLine
-                    }))
-                }];
+            if (warnings.length > 0) {
+                result.warnings = warnings;
             }
 
             return result;
         }
 
-        const callers = this.findCallers(name, { includeMethods: options.includeMethods });
-        const callees = this.findCallees(def, { includeMethods: options.includeMethods });
+        const stats = { uncertain: 0 };
+        const callers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+        const callees = this.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+
+        const filesInScope = new Set([def.file]);
+        callers.forEach(c => filesInScope.add(c.file));
+        callees.forEach(c => filesInScope.add(c.file));
+        let dynamicImports = 0;
+        for (const f of filesInScope) {
+            const fe = this.files.get(f);
+            if (fe?.dynamicImports) dynamicImports += fe.dynamicImports;
+        }
 
         const result = {
             function: name,
@@ -766,19 +868,17 @@ class ProjectIndex {
             params: def.params,
             returnType: def.returnType,
             callers,
-            callees
+            callees,
+            meta: {
+                complete: stats.uncertain === 0 && dynamicImports === 0,
+                skipped: 0,
+                dynamicImports,
+                uncertain: stats.uncertain
+            }
         };
 
-        // Add disambiguation warning if multiple definitions exist
-        if (definitions.length > 1) {
-            result.warnings = [{
-                type: 'ambiguous',
-                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Use --file to disambiguate.`,
-                alternatives: definitions.slice(1).map(d => ({
-                    file: d.relativePath,
-                    line: d.startLine
-                }))
-            }];
+        if (warnings.length > 0) {
+            result.warnings = warnings;
         }
 
         return result;
@@ -859,6 +959,7 @@ class ProjectIndex {
      */
     findCallers(name, options = {}) {
         const callers = [];
+        const stats = options.stats;
 
         // Get definition lines to exclude them
         const definitions = this.symbols.get(name) || [];
@@ -879,6 +980,23 @@ class ProjectIndex {
                     // Skip if not matching our target name
                     if (call.name !== name) continue;
 
+                    // Resolve binding within this file (without mutating cached call objects)
+                    let bindingId = call.bindingId;
+                    let isUncertain = call.uncertain;
+                    if (!bindingId) {
+                        const bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
+                        if (bindings.length === 1) {
+                            bindingId = bindings[0].id;
+                        } else if (bindings.length !== 0) {
+                            isUncertain = true;
+                        }
+                    }
+
+                    if (isUncertain && !options.includeUncertain) {
+                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                        continue;
+                    }
+
                     // Smart method call handling
                     if (call.isMethod) {
                         // Always skip this/self/cls calls (internal state access, not function calls)
@@ -890,6 +1008,12 @@ class ProjectIndex {
 
                     // Skip definition lines
                     if (definitionLines.has(`${filePath}:${call.line}`)) continue;
+
+                    // If we have a binding id on definition, require match when available
+                    const targetBindingIds = new Set(definitions.map(d => d.bindingId).filter(Boolean));
+                    if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
+                        continue;
+                    }
 
                     // Find the enclosing function (get full symbol info)
                     const callerSymbol = this.findEnclosingFunction(filePath, call.line, true);
@@ -975,7 +1099,7 @@ class ProjectIndex {
             const fileEntry = this.files.get(def.file);
             const language = fileEntry?.language;
 
-            const callees = new Map();  // name -> count
+            const callees = new Map();  // key -> { name, bindingId, count }
 
             for (const call of calls) {
                 // Filter to calls within this function's scope using enclosingFunction
@@ -993,7 +1117,56 @@ class ProjectIndex {
                 // Skip keywords and built-ins
                 if (this.isKeyword(call.name, language)) continue;
 
-                callees.set(call.name, (callees.get(call.name) || 0) + 1);
+                // Resolve binding within this file (without mutating cached call objects)
+                let calleeKey = call.bindingId || call.name;
+                let bindingResolved = call.bindingId;
+                let isUncertain = call.uncertain;
+                if (!call.bindingId && fileEntry?.bindings) {
+                    const bindings = fileEntry.bindings.filter(b => b.name === call.name);
+                    if (bindings.length === 1) {
+                        bindingResolved = bindings[0].id;
+                        calleeKey = bindingResolved;
+                    } else if (bindings.length > 1) {
+                        if (call.name === def.name) {
+                            // Calling same-name function (e.g., Java overloads)
+                            // Add ALL other overloads as potential callees
+                            const otherBindings = bindings.filter(b =>
+                                b.startLine !== def.startLine
+                            );
+                            for (const ob of otherBindings) {
+                                const existing = callees.get(ob.id);
+                                if (existing) {
+                                    existing.count += 1;
+                                } else {
+                                    callees.set(ob.id, {
+                                        name: call.name,
+                                        bindingId: ob.id,
+                                        count: 1
+                                    });
+                                }
+                            }
+                            continue; // Already added all overloads, skip normal add
+                        } else {
+                            isUncertain = true;
+                        }
+                    }
+                }
+
+                if (isUncertain && !options.includeUncertain) {
+                    if (options.stats) options.stats.uncertain = (options.stats.uncertain || 0) + 1;
+                    continue;
+                }
+
+                const existing = callees.get(calleeKey);
+                if (existing) {
+                    existing.count += 1;
+                } else {
+                    callees.set(calleeKey, {
+                        name: call.name,
+                        bindingId: bindingResolved,
+                        count: 1
+                    });
+                }
             }
 
             // Look up each callee in the symbol table
@@ -1002,16 +1175,24 @@ class ProjectIndex {
             const defDir = path.dirname(def.file);
             const defReceiver = def.receiver;
 
-            for (const [calleeName, count] of callees) {
+            for (const { name: calleeName, bindingId, count } of callees.values()) {
                 const symbols = this.symbols.get(calleeName);
                 if (symbols && symbols.length > 0) {
                     let callee = symbols[0];
 
-                    // If multiple definitions, try to find the best match
-                    if (symbols.length > 1) {
-                        // Priority 1: Same file
+                    // If we have a binding ID, find the exact matching symbol
+                    if (bindingId && symbols.length > 1) {
+                        const exactMatch = symbols.find(s => s.bindingId === bindingId);
+                        if (exactMatch) {
+                            callee = exactMatch;
+                        }
+                    } else if (symbols.length > 1) {
+                        // Priority 1: Same file, but different definition (for overloads)
+                        const sameFileDifferent = symbols.find(s => s.file === def.file && s.startLine !== def.startLine);
                         const sameFile = symbols.find(s => s.file === def.file);
-                        if (sameFile) {
+                        if (sameFileDifferent && calleeName === def.name) {
+                            callee = sameFileDifferent;
+                        } else if (sameFile) {
                             callee = sameFile;
                         } else {
                             // Priority 2: Same directory (package)
@@ -1059,18 +1240,27 @@ class ProjectIndex {
      * Smart extraction: function + dependencies
      */
     smart(name, options = {}) {
-        const definitions = this.symbols.get(name) || [];
-        if (definitions.length === 0) {
+        const { def } = this.resolveSymbol(name, { file: options.file });
+        if (!def) {
             return null;
         }
-
-        const def = definitions[0];
         const code = this.extractCode(def);
-        const callees = this.findCallees(def, { includeMethods: options.includeMethods });
+        const stats = { uncertain: 0 };
+        const callees = this.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
 
-        // Extract code for each dependency, excluding the main function itself
+        const filesInScope = new Set([def.file]);
+        callees.forEach(c => filesInScope.add(c.file));
+        let dynamicImports = 0;
+        for (const f of filesInScope) {
+            const fe = this.files.get(f);
+            if (fe?.dynamicImports) dynamicImports += fe.dynamicImports;
+        }
+
+        // Extract code for each dependency, excluding the exact same function
+        // (but keeping same-name overloads, e.g. Java toJson(Object) vs toJson(Object, Class))
+        const defBindingId = def.bindingId;
         const dependencies = callees
-            .filter(callee => callee.name !== name)  // Don't include self
+            .filter(callee => callee.bindingId !== defBindingId)
             .map(callee => ({
                 ...callee,
                 code: this.extractCode(callee)
@@ -1102,7 +1292,13 @@ class ProjectIndex {
                 code
             },
             dependencies,
-            types
+            types,
+            meta: {
+                complete: stats.uncertain === 0 && dynamicImports === 0,
+                skipped: 0,
+                dynamicImports,
+                uncertain: stats.uncertain
+            }
         };
     }
 
@@ -2026,13 +2222,11 @@ class ProjectIndex {
      * @param {string} name - Function name
      * @returns {object} Related functions grouped by relationship type
      */
-    related(name) {
-        const definitions = this.symbols.get(name);
-        if (!definitions || definitions.length === 0) {
+    related(name, options = {}) {
+        const { def } = this.resolveSymbol(name, { file: options.file });
+        if (!def) {
             return null;
         }
-
-        const def = definitions[0];
         const related = {
             target: {
                 name: def.name,
@@ -2166,22 +2360,10 @@ class ProjectIndex {
         const maxDepth = Math.max(0, rawDepth);
         const direction = options.direction || 'down';  // 'down' = callees, 'up' = callers, 'both'
 
-        let definitions = this.symbols.get(name);
-        if (!definitions || definitions.length === 0) {
+        const { def } = this.resolveSymbol(name, { file: options.file });
+        if (!def) {
             return null;
         }
-
-        // Filter by file if specified
-        if (options.file) {
-            const filtered = definitions.filter(d =>
-                d.relativePath && d.relativePath.includes(options.file)
-            );
-            if (filtered.length > 0) {
-                definitions = filtered;
-            }
-        }
-
-        const def = definitions[0];
         const visited = new Set();
         const defDir = path.dirname(def.file);
 
@@ -2251,22 +2433,10 @@ class ProjectIndex {
      * @returns {object} Impact analysis
      */
     impact(name, options = {}) {
-        let definitions = this.symbols.get(name);
-        if (!definitions || definitions.length === 0) {
+        const { def } = this.resolveSymbol(name, { file: options.file });
+        if (!def) {
             return null;
         }
-
-        // Filter by file if specified
-        if (options.file) {
-            const filtered = definitions.filter(d =>
-                d.relativePath && d.relativePath.includes(options.file)
-            );
-            if (filtered.length > 0) {
-                definitions = filtered;
-            }
-        }
-
-        const def = definitions[0];
         const usages = this.usages(name, { codeOnly: true });
         const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
 
@@ -2747,13 +2917,11 @@ class ProjectIndex {
      * @param {string} name - Function name
      * @returns {object} Verification results with mismatches
      */
-    verify(name) {
-        const definitions = this.symbols.get(name);
-        if (!definitions || definitions.length === 0) {
+    verify(name, options = {}) {
+        const { def } = this.resolveSymbol(name, { file: options.file });
+        if (!def) {
             return { found: false, function: name };
         }
-
-        const def = definitions[0];
         const expectedParamCount = def.paramsStructured?.length || 0;
         const optionalCount = (def.paramsStructured || []).filter(p => p.optional || p.default !== undefined).length;
         const minArgs = expectedParamCount - optionalCount;
@@ -2767,8 +2935,17 @@ class ProjectIndex {
         const mismatches = [];
         const uncertain = [];
 
+        // If the definition is NOT a method, filter out method calls (e.g., dict.get() vs get())
+        // This prevents false positives where a standalone function name matches method calls
+        const defIsMethod = def.isMethod || def.type === 'method' || def.className;
+
         for (const call of calls) {
             const analysis = this.analyzeCallSite(call, name);
+
+            // Skip method calls when verifying a non-method definition
+            if (analysis.isMethodCall && !defIsMethod) {
+                continue;
+            }
 
             if (analysis.args === null) {
                 // Couldn't parse arguments
@@ -2841,7 +3018,7 @@ class ProjectIndex {
                 hasDefault: p.default !== undefined
             })) || [],
             expectedArgs: { min: minArgs, max: hasRest ? '∞' : expectedParamCount },
-            totalCalls: calls.length,
+            totalCalls: valid.length + mismatches.length + uncertain.length,
             valid: valid.length,
             mismatches: mismatches.length,
             uncertain: uncertain.length,
@@ -2882,8 +3059,23 @@ class ProjectIndex {
             const callNode = this._findCallNode(tree.rootNode, callTypes, targetRow, funcName);
             if (!callNode) return { args: null, argCount: 0 };
 
+            // Check if this is a method call (obj.func()) vs a direct call (func())
+            const funcNode = callNode.childForFieldName('function') ||
+                             callNode.childForFieldName('name');
+            let isMethodCall = false;
+            if (funcNode) {
+                // member_expression (JS), attribute (Python), selector_expression (Go), field_expression (Rust)
+                if (['member_expression', 'attribute', 'selector_expression', 'field_expression'].includes(funcNode.type)) {
+                    isMethodCall = true;
+                }
+                // Java method_invocation with object
+                if (callNode.type === 'method_invocation' && callNode.childForFieldName('object')) {
+                    isMethodCall = true;
+                }
+            }
+
             const argsNode = callNode.childForFieldName('arguments');
-            if (!argsNode) return { args: [], argCount: 0 };
+            if (!argsNode) return { args: [], argCount: 0, isMethodCall };
 
             const args = [];
             for (let i = 0; i < argsNode.namedChildCount; i++) {
@@ -2894,7 +3086,8 @@ class ProjectIndex {
                 args,
                 argCount: args.length,
                 hasSpread: args.some(a => a.startsWith('...')),
-                hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a))
+                hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a)),
+                isMethodCall
             };
         } catch (e) {
             return { args: null, argCount: 0 };
@@ -3000,9 +3193,12 @@ class ProjectIndex {
             };
         }
 
-        // Use the definition with highest usage count (primary implementation)
-        const primary = definitions[0];
-        const others = definitions.slice(1);
+        // Use resolveSymbol for consistent primary selection (prefers non-test files)
+        const { def: resolved } = this.resolveSymbol(name, { file: options.file });
+        const primary = resolved || definitions[0];
+        const others = definitions.filter(d =>
+            d.relativePath !== primary.relativePath || d.startLine !== primary.startLine
+        );
 
         // Use the actual symbol name (may differ from query if fuzzy matched)
         const symbolName = primary.name;
@@ -3268,42 +3464,89 @@ class ProjectIndex {
     /**
      * Get TOC for all files
      */
-    getToc() {
+    getToc(options = {}) {
         const files = [];
         let totalFunctions = 0;
         let totalClasses = 0;
         let totalState = 0;
         let totalLines = 0;
+        let totalDynamic = 0;
+        let totalTests = 0;
 
         for (const [filePath, fileEntry] of this.files) {
-            const functions = fileEntry.symbols.filter(s => s.type === 'function');
+            let functions = fileEntry.symbols.filter(s => s.type === 'function');
             const classes = fileEntry.symbols.filter(s =>
                 ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'impl'].includes(s.type)
             );
             const state = fileEntry.symbols.filter(s => s.type === 'state');
 
+            if (options.topLevel) {
+                functions = functions.filter(fn => !fn.isNested && (!fn.indent || fn.indent === 0));
+            }
+
             totalFunctions += functions.length;
             totalClasses += classes.length;
             totalState += state.length;
             totalLines += fileEntry.lines;
+            totalDynamic += fileEntry.dynamicImports || 0;
+            if (isTestFile(filePath)) totalTests += 1;
 
-            files.push({
+            const entry = {
                 file: fileEntry.relativePath,
                 language: fileEntry.language,
                 lines: fileEntry.lines,
-                functions,
-                classes,
-                state
-            });
+                functions: functions.length,
+                classes: classes.length,
+                state: state.length
+            };
+
+            if (options.detailed) {
+                entry.symbols = { functions, classes, state };
+            }
+
+            files.push(entry);
         }
 
+        // Hints: top files by function count and lines
+        const topFunctionFiles = [...files]
+            .sort((a, b) => b.functions - a.functions || b.lines - a.lines)
+            .filter(f => f.functions > 0)
+            .slice(0, 3)
+            .map(f => ({ file: f.file, functions: f.functions }));
+
+        const topLineFiles = [...files]
+            .sort((a, b) => b.lines - a.lines)
+            .slice(0, 3)
+            .map(f => ({ file: f.file, lines: f.lines }));
+
+        // Entry point candidates
+        const entryPattern = /(main|index|server|app)\.(js|jsx|ts|tsx|py|go|rs|java)$/i;
+        const entryFiles = files
+            .filter(f => entryPattern.test(f.file))
+            .slice(0, 5)
+            .map(f => f.file);
+
         return {
-            totalFiles: files.length,
-            totalLines,
-            totalFunctions,
-            totalClasses,
-            totalState,
-            byFile: files
+            meta: {
+                complete: totalDynamic === 0,
+                skipped: 0,
+                dynamicImports: totalDynamic,
+                uncertain: 0
+            },
+            totals: {
+                files: files.length,
+                lines: totalLines,
+                functions: totalFunctions,
+                classes: totalClasses,
+                state: totalState,
+                testFiles: totalTests
+            },
+            summary: {
+                topFunctionFiles,
+                topLineFiles,
+                entryFiles
+            },
+            files
         };
     }
 

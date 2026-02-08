@@ -201,7 +201,7 @@ FIND CODE
 ═══════════════════════════════════════════════════════════════════════════════
   find <name>         Find symbol definitions (top 5 by usage count)
   usages <name>       All usages grouped: definitions, calls, imports, references
-  toc                 Table of contents (functions, classes, state)
+  toc                 Table of contents (compact; --detailed lists all symbols)
   search <term>       Text search (for simple patterns, consider grep instead)
   tests <name>        Find test files for a function
 
@@ -250,13 +250,17 @@ Common Flags:
   --top=N / --all     Limit or show all results
   --include-tests     Include test files
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
+  --include-uncertain Include ambiguous/uncertain call matches
+  --include-exported  Include exported symbols in deadcode
+  --detailed          List all symbols in toc (compact counts by default)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
   --no-follow-symlinks  Don't follow symbolic links
   -i, --interactive   Keep index in memory for multiple queries
 
 Quick Start:
-  ucn toc                             # See project structure
+  ucn toc                             # See project structure (compact)
+  ucn toc --detailed                  # List all functions/classes
   ucn about handleRequest             # Understand a function
   ucn impact handleRequest            # Before modifying
   ucn fn handleRequest --file api     # Extract specific function

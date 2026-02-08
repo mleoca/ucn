@@ -26,14 +26,15 @@ function extractImports(content, language) {
             const parser = getParser(normalizedLang);
             if (parser) {
                 const imports = langModule.findImportsInCode(content, parser);
-                return { imports };
+                const dynamicCount = imports.filter(i => i.dynamic).length;
+                return { imports, dynamicCount };
             }
         } catch (e) {
             // AST parsing failed
         }
     }
 
-    return { imports: [] };
+    return { imports: [], dynamicCount: 0 };
 }
 
 /**
@@ -115,11 +116,37 @@ function resolveImport(importPath, fromFile, config = {}) {
             if (resolved) return resolved;
         }
 
+        // Rust: crate::, super::, self:: paths and mod declarations
+        if (config.language === 'rust') {
+            const resolved = resolveRustImport(importPath, fromFile, config.root);
+            if (resolved) return resolved;
+        }
+
         return null;  // External package
     }
 
+    // Python relative imports: translate dot-prefix notation to file paths
+    // e.g., ".models" -> "./models", "..utils" -> "../utils", "." -> "."
+    let normalizedPath = importPath;
+    if (config.language === 'python') {
+        // Count leading dots and convert to filesystem relative path
+        const dotMatch = importPath.match(/^(\.+)(.*)/);
+        if (dotMatch) {
+            const dots = dotMatch[1];
+            const rest = dotMatch[2];
+            if (dots.length === 1) {
+                // ".models" -> "./models", "." -> "."
+                normalizedPath = rest ? './' + rest.replace(/\./g, '/') : '.';
+            } else {
+                // "..models" -> "../models", "...models" -> "../../models"
+                const upDirs = '../'.repeat(dots.length - 1);
+                normalizedPath = rest ? upDirs + rest.replace(/\./g, '/') : upDirs.slice(0, -1);
+            }
+        }
+    }
+
     // Relative imports
-    const resolved = path.resolve(fromDir, importPath);
+    const resolved = path.resolve(fromDir, normalizedPath);
     return resolveFilePath(resolved, config.extensions || getExtensions(config.language));
 }
 
@@ -200,6 +227,125 @@ function resolveGoImport(importPath, fromFile, projectRoot) {
     return null;
 }
 
+// Cache for Rust crate roots (Cargo.toml locations)
+const cargoCache = new Map();
+
+/**
+ * Find the nearest Cargo.toml and return the crate's source root
+ * @param {string} startDir - Directory to start searching from
+ * @returns {{root: string, srcDir: string}|null}
+ */
+function findCargoRoot(startDir) {
+    if (cargoCache.has(startDir)) {
+        return cargoCache.get(startDir);
+    }
+
+    let dir = startDir;
+    while (dir !== path.dirname(dir)) {
+        const cargoPath = path.join(dir, 'Cargo.toml');
+        if (fs.existsSync(cargoPath)) {
+            const srcDir = path.join(dir, 'src');
+            const result = fs.existsSync(srcDir) ? { root: dir, srcDir } : null;
+            cargoCache.set(startDir, result);
+            return result;
+        }
+        dir = path.dirname(dir);
+    }
+
+    cargoCache.set(startDir, null);
+    return null;
+}
+
+/**
+ * Try to resolve a Rust module path to a file
+ * Checks both <path>.rs and <path>/mod.rs
+ * @param {string} dir - Base directory
+ * @param {string[]} segments - Path segments to resolve
+ * @returns {string|null}
+ */
+function resolveRustModulePath(dir, segments) {
+    // Try progressively shorter paths (items at the end may be types, not modules)
+    for (let len = segments.length; len >= 1; len--) {
+        const modPath = path.join(dir, ...segments.slice(0, len));
+        // Try <path>.rs
+        const rsFile = modPath + '.rs';
+        if (fs.existsSync(rsFile) && fs.statSync(rsFile).isFile()) {
+            return rsFile;
+        }
+        // Try <path>/mod.rs
+        const modFile = path.join(modPath, 'mod.rs');
+        if (fs.existsSync(modFile) && fs.statSync(modFile).isFile()) {
+            return modFile;
+        }
+    }
+    return null;
+}
+
+/**
+ * Resolve Rust import paths to local files
+ * Handles: crate::, super::, self::, and mod declarations
+ * @param {string} importPath - Rust import path (e.g., "crate::display::Display" or "display")
+ * @param {string} fromFile - File containing the import
+ * @param {string} projectRoot - Project root directory
+ * @returns {string|null}
+ */
+function resolveRustImport(importPath, fromFile, projectRoot) {
+    const fromDir = path.dirname(fromFile);
+
+    // crate:: paths - resolve from the crate's src/ directory
+    if (importPath.startsWith('crate::')) {
+        const cargo = findCargoRoot(fromDir);
+        if (!cargo) return null;
+
+        const rest = importPath.slice('crate::'.length);
+        const segments = rest.split('::');
+        return resolveRustModulePath(cargo.srcDir, segments);
+    }
+
+    // super:: paths - resolve relative to parent directory
+    if (importPath.startsWith('super::')) {
+        let dir = fromDir;
+        let rest = importPath;
+        while (rest.startsWith('super::')) {
+            // If current file is mod.rs, go up one more directory
+            const basename = path.basename(fromFile);
+            if (basename === 'mod.rs' && dir === fromDir) {
+                dir = path.dirname(dir);
+            }
+            dir = path.dirname(dir);
+            rest = rest.slice('super::'.length);
+        }
+        const segments = rest.split('::');
+        return resolveRustModulePath(dir, segments);
+    }
+
+    // self:: paths - resolve within current module directory
+    if (importPath.startsWith('self::')) {
+        const rest = importPath.slice('self::'.length);
+        const segments = rest.split('::');
+        // If current file is mod.rs, resolve relative to its directory
+        const basename = path.basename(fromFile);
+        const dir = basename === 'mod.rs' ? fromDir : path.dirname(fromDir);
+        return resolveRustModulePath(dir, segments);
+    }
+
+    // Plain module name without :: (potential mod declaration)
+    // e.g., "display" from `mod display;` - resolve relative to declaring file
+    if (!importPath.includes('::')) {
+        // For mod declarations: <dir>/<name>.rs or <dir>/<name>/mod.rs
+        const rsFile = path.join(fromDir, importPath + '.rs');
+        if (fs.existsSync(rsFile) && fs.statSync(rsFile).isFile()) {
+            return rsFile;
+        }
+        const modFile = path.join(fromDir, importPath, 'mod.rs');
+        if (fs.existsSync(modFile) && fs.statSync(modFile).isFile()) {
+            return modFile;
+        }
+    }
+
+    return null;
+}
+
 /**
  * Try to resolve a path with various extensions
  */
@@ -215,11 +361,14 @@ function resolveFilePath(basePath, extensions) {
         if (fs.existsSync(withExt)) return withExt;
     }
 
-    // Try index files
+    // Try index files (index.js for JS/TS, __init__.py for Python)
     for (const ext of extensions) {
         const indexPath = path.join(basePath, 'index' + ext);
         if (fs.existsSync(indexPath)) return indexPath;
     }
+    // Python __init__.py
+    const initPath = path.join(basePath, '__init__.py');
+    if (fs.existsSync(initPath)) return initPath;
 
     return null;
 }
