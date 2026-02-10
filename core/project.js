@@ -1021,6 +1021,14 @@ class ProjectIndex {
                             const matchesDef = definitions.some(d => d.className === targetClass);
                             if (!matchesDef) continue;
                             // Falls through to add as caller
+                        } else if (fileEntry.language === 'python' && ['self', 'cls'].includes(call.receiver)) {
+                            // self.method() / cls.method() — resolve to same-class method
+                            const callerSymbol = this.findEnclosingFunction(filePath, call.line, true);
+                            if (!callerSymbol?.className) continue;
+                            // Check if any definition of searched function belongs to caller's class
+                            const matchesDef = definitions.some(d => d.className === callerSymbol.className);
+                            if (!matchesDef) continue;
+                            // Falls through to add as caller
                         } else {
                             // Always skip this/self/cls calls (internal state access, not function calls)
                             if (['this', 'self', 'cls'].includes(call.receiver)) continue;
@@ -1125,6 +1133,7 @@ class ProjectIndex {
 
             const callees = new Map();  // key -> { name, bindingId, count }
             let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
+            let selfMethodCalls = null; // collected for Python self.method() resolution
 
             for (const call of calls) {
                 // Filter to calls within this function's scope using enclosingFunction
@@ -1134,11 +1143,14 @@ class ProjectIndex {
 
                 // Smart method call handling:
                 // - Go: include all method calls (Go doesn't use this/self/cls)
+                // - Python self.method(): resolve to same-class method (handled below)
                 // - Python self.attr.method(): resolve via selfAttribute (handled below)
                 // - Other languages: skip method calls unless explicitly requested
                 if (call.isMethod) {
                     if (call.selfAttribute && language === 'python') {
                         // Will be resolved in second pass below
+                    } else if (language === 'python' && ['self', 'cls'].includes(call.receiver)) {
+                        // self.method() / cls.method() — resolve to same-class method below
                     } else if (language !== 'go' && !options.includeMethods) {
                         continue;
                     }
@@ -1151,6 +1163,13 @@ class ProjectIndex {
                 if (call.selfAttribute && language === 'python') {
                     if (!selfAttrCalls) selfAttrCalls = [];
                     selfAttrCalls.push(call);
+                    continue;
+                }
+
+                // Collect Python self.method() calls for same-class resolution
+                if (language === 'python' && call.isMethod && ['self', 'cls'].includes(call.receiver)) {
+                    if (!selfMethodCalls) selfMethodCalls = [];
+                    selfMethodCalls.push(call);
                     continue;
                 }
 
@@ -1232,6 +1251,30 @@ class ProjectIndex {
                                 count: 1
                             });
                         }
+                    }
+                }
+            }
+
+            // Third pass: resolve Python self.method() calls to same-class methods
+            if (selfMethodCalls && def.className) {
+                for (const call of selfMethodCalls) {
+                    const symbols = this.symbols.get(call.name);
+                    if (!symbols) continue;
+
+                    // Find method in same class
+                    const match = symbols.find(s => s.className === def.className);
+                    if (!match) continue;
+
+                    const key = match.bindingId || `${def.className}.${call.name}`;
+                    const existing = callees.get(key);
+                    if (existing) {
+                        existing.count += 1;
+                    } else {
+                        callees.set(key, {
+                            name: call.name,
+                            bindingId: match.bindingId,
+                            count: 1
+                        });
                     }
                 }
             }
