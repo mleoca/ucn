@@ -39,7 +39,10 @@ function extractModifiers(node) {
         for (let i = 0; i < modifiersNode.namedChildCount; i++) {
             const mod = modifiersNode.namedChild(i);
             if (mod.type === 'marker_annotation' || mod.type === 'annotation') {
-                continue;  // Skip annotations for modifiers
+                // Store annotation name (without @) as modifier (e.g., @Test -> 'test', @Override -> 'override')
+                const annoText = mod.text.replace(/^@/, '').split('(')[0].toLowerCase();
+                modifiers.push(annoText);
+                continue;
             }
             modifiers.push(mod.text);
         }

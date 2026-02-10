@@ -249,8 +249,14 @@ class ProjectIndex {
 
         for (const [filePath, fileEntry] of this.files) {
             const importedFiles = [];
+            const seenModules = new Set();
 
             for (const importModule of fileEntry.imports) {
+                // Deduplicate: same module imported multiple times in one file
+                // (e.g., lazy imports inside different functions)
+                if (seenModules.has(importModule)) continue;
+                seenModules.add(importModule);
+
                 let resolved = resolveImport(importModule, filePath, {
                     aliases: this.config.aliases,
                     language: fileEntry.language,
@@ -344,10 +350,14 @@ class ProjectIndex {
      */
     matchesFilters(filePath, filters = {}) {
         // Check exclusions (patterns like 'test', 'mock', 'spec')
+        // Uses path-segment boundary matching to avoid false positives
+        // (e.g. 'test' should NOT match 'backtester', but should match 'tests/', 'test_foo', '_test.')
         if (filters.exclude && filters.exclude.length > 0) {
             const lowerPath = filePath.toLowerCase();
             for (const pattern of filters.exclude) {
-                if (lowerPath.includes(pattern.toLowerCase())) {
+                const escaped = pattern.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(`(^|/)${escaped}|[_.\\-]${escaped}([_.\\-/]|$)`);
+                if (regex.test(lowerPath)) {
                     return false;
                 }
             }
@@ -1610,8 +1620,13 @@ class ProjectIndex {
             try {
                 const content = fs.readFileSync(importerPath, 'utf-8');
                 const lines = content.split('\n');
-                const targetRelative = path.relative(this.root, targetPath);
-                const targetBasename = path.basename(targetPath, path.extname(targetPath));
+                let targetBasename = path.basename(targetPath, path.extname(targetPath));
+
+                // For __init__.py, search for the package name (parent dir)
+                // e.g., "from tools import X" → search for "tools" not "__init__"
+                if (targetBasename === '__init__') {
+                    targetBasename = path.basename(path.dirname(targetPath));
+                }
 
                 for (let i = 0; i < lines.length; i++) {
                     if (lines[i].includes(targetBasename) &&
@@ -1984,14 +1999,24 @@ class ProjectIndex {
                     mods.includes('public') && mods.includes('static');
 
                 // Python: Magic/dunder methods are called by the interpreter, not user code
-                const isPythonMagicMethod = lang === 'python' && /^__\w+__$/.test(name);
+                // test_* functions/methods are called by pytest/unittest via reflection
+                const isPythonEntryPoint = lang === 'python' &&
+                    (/^__\w+__$/.test(name) || /^test_/.test(name));
 
                 // Rust: main() is entry point, #[test] functions are called by test runner
                 const isRustEntryPoint = lang === 'rust' &&
                     (name === 'main' || mods.includes('test'));
 
-                const isEntryPoint = isGoEntryPoint || isJavaEntryPoint ||
-                    isPythonMagicMethod || isRustEntryPoint;
+                // Go: Test*, Benchmark*, Example* functions are called by go test
+                const isGoTestFunc = lang === 'go' &&
+                    /^(Test|Benchmark|Example)[A-Z]/.test(name);
+
+                // Java: @Test annotated methods are called by JUnit
+                const isJavaTestMethod = lang === 'java' && mods.includes('test');
+
+                const isEntryPoint = isGoEntryPoint || isGoTestFunc ||
+                    isJavaEntryPoint || isJavaTestMethod ||
+                    isPythonEntryPoint || isRustEntryPoint;
 
                 const isExported = fileEntry && (
                     fileEntry.exports.includes(name) ||
@@ -2922,10 +2947,21 @@ class ProjectIndex {
         if (!def) {
             return { found: false, function: name };
         }
-        const expectedParamCount = def.paramsStructured?.length || 0;
-        const optionalCount = (def.paramsStructured || []).filter(p => p.optional || p.default !== undefined).length;
+        // For Python/Rust methods, exclude self/cls from parameter count
+        // (callers don't pass self/cls explicitly: obj.method(a, b) not obj.method(obj, a, b))
+        const fileEntry = this.files.get(def.file);
+        const lang = fileEntry?.language;
+        let params = def.paramsStructured || [];
+        if ((lang === 'python' || lang === 'rust') && params.length > 0) {
+            const firstName = params[0].name;
+            if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self') {
+                params = params.slice(1);
+            }
+        }
+        const expectedParamCount = params.length;
+        const optionalCount = params.filter(p => p.optional || p.default !== undefined).length;
         const minArgs = expectedParamCount - optionalCount;
-        const hasRest = (def.paramsStructured || []).some(p => p.rest);
+        const hasRest = params.some(p => p.rest);
 
         // Get all call sites
         const usages = this.usages(name, { codeOnly: true });
@@ -3012,11 +3048,11 @@ class ProjectIndex {
             file: def.relativePath,
             startLine: def.startLine,
             signature: this.formatSignature(def),
-            params: def.paramsStructured?.map(p => ({
+            params: params.map(p => ({
                 name: p.name,
                 optional: p.optional || p.default !== undefined,
                 hasDefault: p.default !== undefined
-            })) || [],
+            })),
             expectedArgs: { min: minArgs, max: hasRest ? '∞' : expectedParamCount },
             totalCalls: valid.length + mismatches.length + uncertain.length,
             valid: valid.length,
