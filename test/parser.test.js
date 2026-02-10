@@ -6188,6 +6188,164 @@ class Line:
     });
 });
 
+describe('Regression: JS this.method() same-class resolution', () => {
+    it('findCallees should resolve this.method() to same-class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-jsthis-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'service.js'), `
+class DataService {
+    _fetchRemote(key, days) {
+        return this._makeRequest(\`/api/\${key}\`);
+    }
+
+    _makeRequest(url) {
+        return null;
+    }
+
+    getRecords(key, days = 365) {
+        if (this._isValid(key)) {
+            return this._fetchRemote(key, days);
+        }
+        return null;
+    }
+
+    _isValid(key) {
+        return key.length > 0;
+    }
+}
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // getRecords should have _fetchRemote and _isValid as callees
+            const defs = index.symbols.get('getRecords');
+            assert.ok(defs && defs.length > 0, 'Should find getRecords');
+            const callees = index.findCallees(defs[0]);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('_fetchRemote'),
+                `Should resolve this._fetchRemote(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('_isValid'),
+                `Should resolve this._isValid(), got: ${calleeNames.join(', ')}`);
+
+            // _fetchRemote should have getRecords as caller
+            const callers = index.findCallers('_fetchRemote');
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('getRecords'),
+                `Should find getRecords as caller of _fetchRemote, got: ${callerNames.join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java this.method() same-class resolution', () => {
+    it('findCallees should resolve this.method() to same-class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-javathis-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'DataService.java'), `
+public class DataService {
+    private Object fetchRemote(String key, int days) {
+        return this.makeRequest("/api/" + key);
+    }
+
+    private Object makeRequest(String url) {
+        return null;
+    }
+
+    public Object getRecords(String key) {
+        if (this.isValid(key)) {
+            return this.fetchRemote(key, 365);
+        }
+        return null;
+    }
+
+    private boolean isValid(String key) {
+        return key.length() > 0;
+    }
+}
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.java', { quiet: true });
+
+            // getRecords should have fetchRemote and isValid as callees
+            const defs = index.symbols.get('getRecords');
+            assert.ok(defs && defs.length > 0, 'Should find getRecords');
+            const callees = index.findCallees(defs[0]);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('fetchRemote'),
+                `Should resolve this.fetchRemote(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('isValid'),
+                `Should resolve this.isValid(), got: ${calleeNames.join(', ')}`);
+
+            // fetchRemote should have getRecords as caller
+            const callers = index.findCallers('fetchRemote');
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('getRecords'),
+                `Should find getRecords as caller of fetchRemote, got: ${callerNames.join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Rust self.method() same-class resolution', () => {
+    it('findCallees should resolve self.method() to same-class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rustself-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"');
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'service.rs'), `
+struct DataService {
+    base_url: String,
+}
+
+impl DataService {
+    fn fetch_remote(&self, key: &str, days: i32) -> Option<String> {
+        self.make_request(&format!("/api/{}", key))
+    }
+
+    fn make_request(&self, url: &str) -> Option<String> {
+        None
+    }
+
+    fn get_records(&self, key: &str) -> Option<String> {
+        if self.is_valid(key) {
+            return self.fetch_remote(key, 365);
+        }
+        None
+    }
+
+    fn is_valid(&self, key: &str) -> bool {
+        !key.is_empty()
+    }
+}
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.rs', { quiet: true });
+
+            // get_records should have fetch_remote and is_valid as callees
+            const defs = index.symbols.get('get_records');
+            assert.ok(defs && defs.length > 0, 'Should find get_records');
+            const callees = index.findCallees(defs[0]);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('fetch_remote'),
+                `Should resolve self.fetch_remote(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('is_valid'),
+                `Should resolve self.is_valid(), got: ${calleeNames.join(', ')}`);
+
+            // fetch_remote should have get_records as caller
+            const callers = index.findCallers('fetch_remote');
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('get_records'),
+                `Should find get_records as caller of fetch_remote, got: ${callerNames.join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 describe('Regression: Python self.method() same-class resolution', () => {
     it('findCallees should resolve self.method() to same-class methods', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));
