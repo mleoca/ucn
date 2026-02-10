@@ -6188,5 +6188,51 @@ class Line:
     });
 });
 
+describe('Regression: Python self.method() same-class resolution', () => {
+    it('findCallees should resolve self.method() to same-class methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfmethod-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'service.py'), `
+class DataService:
+    def _fetch_remote(self, key, days):
+        return self._make_request(f"/api/{key}")
+
+    def _make_request(self, url):
+        return None
+
+    def get_records(self, key, days=365):
+        if self._is_valid(key):
+            return self._fetch_remote(key, days)
+        return None
+
+    def _is_valid(self, key):
+        return len(key) > 0
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            // get_records should have _fetch_remote and _is_valid as callees
+            const defs = index.symbols.get('get_records');
+            assert.ok(defs && defs.length > 0, 'Should find get_records');
+            const callees = index.findCallees(defs[0]);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('_fetch_remote'),
+                `Should resolve self._fetch_remote(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('_is_valid'),
+                `Should resolve self._is_valid(), got: ${calleeNames.join(', ')}`);
+
+            // _fetch_remote should have get_records as caller
+            const fetchDefs = index.symbols.get('_fetch_remote');
+            assert.ok(fetchDefs && fetchDefs.length > 0, 'Should find _fetch_remote');
+            const callers = index.findCallers('_fetch_remote');
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('get_records'),
+                `Should find get_records as caller of _fetch_remote, got: ${callerNames.join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
