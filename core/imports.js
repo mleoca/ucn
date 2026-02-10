@@ -122,6 +122,15 @@ function resolveImport(importPath, fromFile, config = {}) {
             if (resolved) return resolved;
         }
 
+        // Python: non-relative package imports (e.g., "tools.analyzer" -> "tools/analyzer.py")
+        // Try resolving dotted module path from the project root
+        if (config.language === 'python' && config.root) {
+            const modulePath = importPath.replace(/\./g, '/');
+            const fullPath = path.join(config.root, modulePath);
+            const resolved = resolveFilePath(fullPath, getExtensions('python'));
+            if (resolved) return resolved;
+        }
+
         return null;  // External package
     }
 

@@ -806,7 +806,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'verify': {
             requireArg(arg, 'Usage: ucn . verify <name>');
-            const verifyResult = index.verify(arg);
+            const verifyResult = index.verify(arg, { file: flags.file });
             printOutput(verifyResult, r => JSON.stringify(r, null, 2), output.formatVerify);
             break;
         }

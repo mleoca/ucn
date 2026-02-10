@@ -5603,5 +5603,255 @@ impl Rgb {
     });
 });
 
+// Regression: verify should exclude self/cls from Python method parameter count
+describe('Regression: verify excludes Python self/cls from param count', () => {
+    it('should not count self as a required argument for Python methods', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-verify-self-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(tmpDir, 'calculator.py'), `
+class Calculator:
+    def add(self, a, b):
+        return a + b
+
+    def multiply(self, x, y, z=1):
+        return x * y * z
+
+    @classmethod
+    def from_string(cls, s):
+        return cls()
+`);
+            fs.writeFileSync(path.join(tmpDir, 'main.py'), `
+from calculator import Calculator
+
+c = Calculator()
+c.add(1, 2)
+c.add(3, 4)
+c.multiply(2, 3)
+c.multiply(2, 3, 4)
+Calculator.from_string("test")
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // verify add: 2 params (not 3 counting self)
+            const addResult = index.verify('add');
+            assert.ok(addResult.found, 'add should be found');
+            assert.strictEqual(addResult.expectedArgs.min, 2, 'add should expect min 2 args (not 3)');
+            assert.strictEqual(addResult.expectedArgs.max, 2, 'add should expect max 2 args (not 3)');
+            assert.strictEqual(addResult.mismatches, 0, `add should have 0 mismatches, got ${addResult.mismatches}`);
+
+            // verify multiply: 2-3 params (not 3-4 counting self)
+            const mulResult = index.verify('multiply');
+            assert.ok(mulResult.found, 'multiply should be found');
+            assert.strictEqual(mulResult.expectedArgs.min, 2, 'multiply should expect min 2 args');
+            assert.strictEqual(mulResult.expectedArgs.max, 3, 'multiply should expect max 3 args');
+            assert.strictEqual(mulResult.mismatches, 0, `multiply should have 0 mismatches, got ${mulResult.mismatches}`);
+
+            // verify from_string: cls should also be excluded
+            const clsResult = index.verify('from_string');
+            assert.ok(clsResult.found, 'from_string should be found');
+            assert.strictEqual(clsResult.expectedArgs.min, 1, 'from_string should expect 1 arg (not 2)');
+            assert.strictEqual(clsResult.mismatches, 0, `from_string should have 0 mismatches, got ${clsResult.mismatches}`);
+
+            // params list should not include self/cls
+            assert.ok(!addResult.params.some(p => p.name === 'self'), 'params should not include self');
+            assert.ok(!clsResult.params.some(p => p.name === 'cls'), 'params should not include cls');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: deadcode should treat test_* as entry points in Python
+describe('Regression: deadcode treats Python test_* as entry points', () => {
+    it('should not flag test_* functions as dead code', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-deadcode-tests-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(tmpDir, 'app.py'), `
+def helper():
+    return 42
+
+def unused_func():
+    return 0
+`);
+            fs.writeFileSync(path.join(tmpDir, 'test_app.py'), `
+from app import helper
+
+def test_helper_returns_42():
+    assert helper() == 42
+
+def test_helper_type():
+    assert isinstance(helper(), int)
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const dead = index.deadcode({ includeTests: true });
+            const deadNames = dead.map(d => d.name);
+
+            // test_* functions should NOT be in dead code
+            assert.ok(!deadNames.includes('test_helper_returns_42'),
+                'test_helper_returns_42 should not be flagged as dead code');
+            assert.ok(!deadNames.includes('test_helper_type'),
+                'test_helper_type should not be flagged as dead code');
+
+            // unused_func should still be flagged
+            assert.ok(deadNames.includes('unused_func'),
+                'unused_func should be flagged as dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: Python non-relative package imports should resolve to local files
+describe('Regression: Python package imports resolve to local files', () => {
+    it('should resolve "tools.analyzer" to tools/analyzer.py', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-py-pkg-imports-${Date.now()}`);
+        const toolsDir = path.join(tmpDir, 'tools');
+        fs.mkdirSync(toolsDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(toolsDir, '__init__.py'), '');
+            fs.writeFileSync(path.join(toolsDir, 'analyzer.py'), `
+class Analyzer:
+    def analyze(self, data):
+        return len(data)
+`);
+            fs.writeFileSync(path.join(toolsDir, 'helper.py'), `
+def compute():
+    return 42
+`);
+            fs.writeFileSync(path.join(tmpDir, 'main.py'), `
+from tools.analyzer import Analyzer
+from tools.helper import compute
+
+a = Analyzer()
+a.analyze([1, 2, 3])
+compute()
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // imports for main.py should resolve tools.analyzer
+            const mainImports = index.importGraph.get(path.join(tmpDir, 'main.py')) || [];
+            assert.ok(mainImports.some(i => i.includes('analyzer.py')),
+                `main.py should import tools/analyzer.py, got ${mainImports.map(i => path.relative(tmpDir, i))}`);
+            assert.ok(mainImports.some(i => i.includes('helper.py')),
+                `main.py should import tools/helper.py, got ${mainImports.map(i => path.relative(tmpDir, i))}`);
+
+            // exporters for analyzer.py should include main.py
+            const exporters = index.exporters('tools/analyzer.py');
+            assert.ok(exporters.some(e => e.file.includes('main.py')),
+                `tools/analyzer.py should be exported to main.py, got ${JSON.stringify(exporters)}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: exporters deduplicates repeated imports of same module', () => {
+    it('should not duplicate exporters when a file imports same module multiple times', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dedup-'));
+        const pkgDir = path.join(tmpDir, 'pkg');
+        fs.mkdirSync(pkgDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(pkgDir, '__init__.py'), '');
+            fs.writeFileSync(path.join(pkgDir, 'db.py'), `
+def get_connection():
+    pass
+
+def insert_record():
+    pass
+
+def delete_record():
+    pass
+`);
+            // File with multiple function-body imports of same module
+            fs.writeFileSync(path.join(tmpDir, 'app.py'), `
+def cmd_add():
+    from pkg.db import get_connection, insert_record
+    conn = get_connection()
+    insert_record()
+
+def cmd_remove():
+    from pkg.db import get_connection, delete_record
+    conn = get_connection()
+    delete_record()
+
+def cmd_list():
+    from pkg.db import get_connection
+    conn = get_connection()
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // exporters for db.py should list app.py exactly once
+            const exporters = index.exporters('pkg/db.py');
+            const appEntries = exporters.filter(e => e.file.includes('app.py'));
+            assert.strictEqual(appEntries.length, 1,
+                `pkg/db.py should have exactly 1 exporter entry for app.py, got ${appEntries.length}`);
+
+            // importGraph should also be deduplicated
+            const appImports = index.importGraph.get(path.join(tmpDir, 'app.py')) || [];
+            const dbImports = appImports.filter(i => i.includes('db.py'));
+            assert.strictEqual(dbImports.length, 1,
+                `app.py importGraph should have db.py once, got ${dbImports.length}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: exporters shows line numbers for __init__.py', () => {
+    it('should find import line for package __init__.py using parent dir name', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-init-'));
+        const pkgDir = path.join(tmpDir, 'mypackage');
+        fs.mkdirSync(pkgDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(pkgDir, '__init__.py'), `
+CONFIG = {'debug': False}
+
+def load_config():
+    return CONFIG
+`);
+            fs.writeFileSync(path.join(tmpDir, 'main.py'), `
+import os
+from mypackage import load_config
+
+config = load_config()
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const exporters = index.exporters('mypackage/__init__.py');
+            const mainEntry = exporters.find(e => e.file.includes('main.py'));
+            assert.ok(mainEntry, 'main.py should be an exporter of mypackage/__init__.py');
+            assert.ok(mainEntry.importLine !== null,
+                `Should find import line for __init__.py, got null`);
+            assert.strictEqual(mainEntry.importLine, 3,
+                `Import line should be 3 (from mypackage import ...), got ${mainEntry.importLine}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
