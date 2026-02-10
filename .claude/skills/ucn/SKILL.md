@@ -1,27 +1,96 @@
 ---
 name: ucn
-description: Universal Code Navigator - extracts specific functions and their relationships (callers, callees, dependencies) without reading entire files. Use when you need one function from a large file or need to understand what calls/is called by a function. Saves context in codebases 1000+ LOC. Skip for simple text search, tiny codebases, or unsupported languages (only JS/TS, Python, Go, Rust, Java).
+description: "Code relationship analyzer (callers, call trees, impact, dead code) via tree-sitter AST. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on Python, JS/TS, Go, Rust, Java. Skip for plain text search or codebases under 500 LOC."
 allowed-tools: Bash(ucn *), Bash(npx ucn *)
 argument-hint: "[command] [symbol-name] [--flags]"
 ---
 
-# UCN - Universal Code Navigator
+# UCN — Universal Code Navigator
 
-UCN uses tree-sitter ASTs to understand code structure: functions, classes, callers, callees, imports, and dependencies. It works on JavaScript/TypeScript, Python, Go, Rust, and Java.
+Understands code structure via tree-sitter ASTs: who calls what, what breaks if you change something, full call trees, dead code. Works on Python, JS/TS, Go, Rust, Java.
 
-## When to Use vs Skip
+## When to Reach for UCN Instead of Grep/Read
 
-**Use UCN when** the codebase is 1000+ LOC and you need:
-- Who calls a function or what it calls
-- What breaks if you change something
-- One function from a large file (without reading the whole file)
-- Unused code detection, dependency graphs
+**Use UCN when your next action would be:**
 
-**Skip UCN when:**
-- Simple text search (TODOs, error messages) — use grep
-- Codebase < 500 LOC — just read the files
-- Language not supported — use grep/read
+- "Let me grep for all callers of this function" → `ucn impact <name>` — finds every call site, grouped by file, with args shown
+- "Let me read this 800-line file to find one function" → `ucn fn <name> --file=<hint>` — extracts just that function
+- "Let me trace through this code to understand the flow" → `ucn trace <name> --depth=3` — shows the full call tree without reading any files
+- "I need to understand this function before changing it" → `ucn about <name>` — returns definition + callers + callees + tests + source in one call
+- "I wonder if anything still uses this code" → `ucn deadcode` — lists every function/class with zero callers
+
+**Stick with grep/read when:**
+
+- Searching for a string literal, error message, TODO, or config value
+- The codebase is under 500 LOC — just read the files
+- Language not supported (only Python, JS/TS, Go, Rust, Java)
 - Finding files by name — use glob
+
+## The 5 Commands You'll Use Most
+
+### 1. `about` — First stop for any investigation
+
+One command returns: definition, source code, who calls it, what it calls, related tests.
+
+```bash
+ucn about compute_composite
+```
+
+Replaces: grep for definition → read the file → grep for callers → grep for tests. All in one call.
+
+### 2. `impact` — Before changing any function
+
+Shows every call site with arguments and surrounding context. Essential before modifying a signature, renaming, or deleting.
+
+```bash
+ucn impact score_trend              # Every caller, grouped by file
+ucn impact score_trend --exclude=test  # Only production callers
+```
+
+Replaces: grep for the function name → manually filtering definitions vs calls vs imports → reading context around each match.
+
+### 3. `trace` — Understand execution flow
+
+Draws the call tree downward from any function. Depth-limited.
+
+```bash
+ucn trace generate_report --depth=3
+```
+
+This shows the entire pipeline — what `generate_report` calls, what those functions call, etc. — as an indented tree. No file reading needed. Invaluable for understanding orchestrator functions or entry points.
+
+### 4. `fn` / `class` — Extract without reading the whole file
+
+Pull one function or class out of a large file. Saves hundreds of lines of context window.
+
+```bash
+ucn fn handle_request --file=api    # --file disambiguates when name exists in multiple files
+ucn class MarketDataFetcher
+```
+
+### 5. `deadcode` — Find unused code
+
+Lists all functions and classes with zero callers across the project.
+
+```bash
+ucn deadcode                        # Everything
+ucn deadcode --exclude=test         # Skip test files (most useful)
+```
+
+## When to Use the Other Commands
+
+| Situation | Command | What it does |
+|-----------|---------|-------------|
+| Need function + all its helpers inline | `ucn smart <name>` | Returns function source with every helper it calls expanded below it |
+| Checking if a refactor broke signatures | `ucn verify <name>` | Validates all call sites match the function's parameter count |
+| Understanding a file's role in the project | `ucn imports <file>` | What it depends on |
+| Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
+| Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
+| Finding all usages (not just calls) | `ucn usages <name>` | Groups into: definitions, calls, imports, type references |
+| Finding related code to refactor together | `ucn related <name>` | Functions sharing dependencies or in same file |
+| Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |
+| Dependency tree for a file | `ucn graph <file> --depth=2` | Visual import tree |
+| Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
 
 ## Command Format
 
@@ -30,113 +99,42 @@ ucn [target] <command> [name] [--flags]
 ```
 
 **Target** (optional, defaults to current directory):
-- Omit or `.` — current project directory (most common)
-- `path/to/file.js` — single file mode
-- `path/to/dir` — specific project directory
+- Omit — scans current project (most common)
+- `path/to/file.py` — single file
+- `path/to/dir` — specific directory
 - `"src/**/*.py"` — glob pattern (quote it)
-
-**Examples of correct invocation:**
-```bash
-ucn about handleRequest
-ucn fn parseConfig --file=utils
-ucn toc
-ucn src/api/routes.js fn handleRequest
-ucn impact createUser --exclude=test
-```
-
-## Commands
-
-### Understand Code
-| Command | Args | What it returns |
-|---------|------|-----------------|
-| `about <name>` | symbol name | Definition + callers + callees + tests + source code. **Start here.** |
-| `context <name>` | symbol name | Callers and callees (numbered — use `expand N` to see code) |
-| `smart <name>` | symbol name | Function source + all helper functions it calls, inline |
-| `impact <name>` | symbol name | Every call site grouped by file. Use before modifying a function. |
-| `trace <name>` | symbol name | Call tree (who calls who) at `--depth=N` (default 3) |
-| `example <name>` | symbol name | Best real usage example with surrounding context |
-
-### Find Code
-| Command | Args | What it returns |
-|---------|------|-----------------|
-| `find <name>` | symbol name | Definitions ranked by usage count (top 5) |
-| `usages <name>` | symbol name | All usages grouped: definitions, calls, imports, references |
-| `toc` | none | Table of contents: all functions, classes, exports |
-| `tests <name>` | symbol name | Test files and test functions for the given symbol |
-| `search <text>` | search term | Text search (grep-like, but respects project ignores) |
-| `deadcode` | none | Lists all functions/classes with zero callers |
-
-### Extract Code
-| Command | Args | What it returns |
-|---------|------|-----------------|
-| `fn <name>` | function name | Full function source code |
-| `class <name>` | class name | Full class source code |
-| `lines <range>` | e.g. `50-100` | Lines from file. In project mode requires `--file=<path>` |
-| `expand <N>` | number | Source code for numbered item from last `context` output |
-
-### Dependencies
-| Command | Args | What it returns |
-|---------|------|-----------------|
-| `imports <file>` | relative path | What the file imports (modules, symbols) |
-| `exporters <file>` | relative path | Which files import this file |
-| `file-exports <file>` | relative path | What the file exports |
-| `graph <file>` | relative path | Dependency tree at `--depth=N` |
-
-### Refactoring
-| Command | Args | What it returns |
-|---------|------|-----------------|
-| `verify <name>` | function name | Checks all call sites match the function's signature |
-| `plan <name>` | function name | Preview refactoring with `--rename-to`, `--add-param`, `--remove-param` |
-| `related <name>` | symbol name | Functions in same file or sharing dependencies |
 
 ## Key Flags
 
-| Flag | Works with | Effect |
-|------|-----------|--------|
-| `--file=<pattern>` | any symbol command | Filter by file path when name is ambiguous (e.g., `--file=routes`) |
-| `--exclude=a,b` | any | Exclude files matching patterns (e.g., `--exclude=test,mock`) |
-| `--in=<path>` | any | Only search within path (e.g., `--in=src/core`) |
-| `--include-tests` | any | Include test files in results (excluded by default) |
-| `--include-methods` | `context`, `smart` | Include `obj.method()` calls (only direct calls shown by default) |
-| `--depth=N` | `trace`, `graph`, `about`, `find` | Tree/expansion depth (default 3) |
-| `--context=N` | `usages`, `search` | Lines of context around each match |
-| `--json` | any | Machine-readable JSON output |
-| `--code-only` | `search` | Exclude matches in comments and strings |
-| `--with-types` | `smart`, `about` | Include type definitions |
-| `--top=N` / `--all` | `find`, `usages` | Limit results to top N, or show all |
-| `--no-cache` | any | Skip cached index (use after file changes) |
-| `--clear-cache` | any | Delete cached index before running |
+| Flag | When to use it |
+|------|---------------|
+| `--file=<pattern>` | Disambiguate when a name exists in multiple files (e.g., `--file=api`) |
+| `--exclude=test,mock` | Focus on production code only |
+| `--in=src/core` | Limit search to a subdirectory |
+| `--depth=N` | Control tree depth for `trace` and `graph` (default 3) |
+| `--include-tests` | Include test files in results (excluded by default) |
+| `--include-methods` | Include `obj.method()` calls in `context`/`smart` (only direct calls shown by default) |
+| `--no-cache` | Force re-index after editing files |
+| `--context=N` | Lines of surrounding context in `usages`/`search` output |
 
-## Common Patterns
+## Workflow Integration
 
-**Investigate a function (first stop):**
+**Investigating a bug:**
 ```bash
-ucn about handleRequest
+ucn about problematic_function          # Understand it fully
+ucn trace problematic_function --depth=2  # See what it calls
 ```
 
 **Before modifying a function:**
 ```bash
-ucn impact handleRequest          # See all callers
-ucn smart handleRequest           # See function + its helpers
+ucn impact the_function                 # Who will break?
+ucn smart the_function                  # See it + its helpers
+# ... make your changes ...
+ucn verify the_function                 # Did all call sites survive?
 ```
 
-**Extract one function from a large file:**
+**Periodic maintenance:**
 ```bash
-ucn fn handleRequest --file=api   # Disambiguate by file path
-```
-
-**Find unused code:**
-```bash
-ucn deadcode
-```
-
-**Understand a file's role:**
-```bash
-ucn imports core/project.js       # What it depends on
-ucn exporters core/project.js     # Who depends on it
-```
-
-**Multiple queries (keeps index in memory):**
-```bash
-ucn --interactive
+ucn deadcode --exclude=test             # What can be deleted?
+ucn toc                                 # Project overview
 ```
