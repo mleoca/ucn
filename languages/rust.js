@@ -622,7 +622,7 @@ function findCallsInCode(code, parser) {
                         name: fieldNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: true,
-                        receiver: valueNode?.type === 'identifier' ? valueNode.text : undefined,
+                        receiver: (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined,
                         enclosingFunction
                     });
                 }

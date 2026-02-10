@@ -567,7 +567,7 @@ function findCallsInCode(code, parser) {
                     name: nameNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: !!objNode,
-                    receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
+                    receiver: (objNode?.type === 'identifier' || objNode?.type === 'this') ? objNode.text : undefined,
                     enclosingFunction
                 });
             }

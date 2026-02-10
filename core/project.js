@@ -1021,8 +1021,8 @@ class ProjectIndex {
                             const matchesDef = definitions.some(d => d.className === targetClass);
                             if (!matchesDef) continue;
                             // Falls through to add as caller
-                        } else if (fileEntry.language === 'python' && ['self', 'cls'].includes(call.receiver)) {
-                            // self.method() / cls.method() — resolve to same-class method
+                        } else if (['self', 'cls', 'this'].includes(call.receiver)) {
+                            // self.method() / cls.method() / this.method() — resolve to same-class method
                             const callerSymbol = this.findEnclosingFunction(filePath, call.line, true);
                             if (!callerSymbol?.className) continue;
                             // Check if any definition of searched function belongs to caller's class
@@ -1030,8 +1030,6 @@ class ProjectIndex {
                             if (!matchesDef) continue;
                             // Falls through to add as caller
                         } else {
-                            // Always skip this/self/cls calls (internal state access, not function calls)
-                            if (['this', 'self', 'cls'].includes(call.receiver)) continue;
                             // Go doesn't use this/self/cls - always include Go method calls
                             // For other languages, skip method calls unless explicitly requested
                             if (fileEntry.language !== 'go' && !options.includeMethods) continue;
@@ -1143,14 +1141,14 @@ class ProjectIndex {
 
                 // Smart method call handling:
                 // - Go: include all method calls (Go doesn't use this/self/cls)
-                // - Python self.method(): resolve to same-class method (handled below)
+                // - self/this.method(): resolve to same-class method (handled below)
                 // - Python self.attr.method(): resolve via selfAttribute (handled below)
                 // - Other languages: skip method calls unless explicitly requested
                 if (call.isMethod) {
                     if (call.selfAttribute && language === 'python') {
                         // Will be resolved in second pass below
-                    } else if (language === 'python' && ['self', 'cls'].includes(call.receiver)) {
-                        // self.method() / cls.method() — resolve to same-class method below
+                    } else if (['self', 'cls', 'this'].includes(call.receiver)) {
+                        // self.method() / cls.method() / this.method() — resolve to same-class method below
                     } else if (language !== 'go' && !options.includeMethods) {
                         continue;
                     }
@@ -1166,8 +1164,8 @@ class ProjectIndex {
                     continue;
                 }
 
-                // Collect Python self.method() calls for same-class resolution
-                if (language === 'python' && call.isMethod && ['self', 'cls'].includes(call.receiver)) {
+                // Collect self/this.method() calls for same-class resolution
+                if (call.isMethod && ['self', 'cls', 'this'].includes(call.receiver)) {
                     if (!selfMethodCalls) selfMethodCalls = [];
                     selfMethodCalls.push(call);
                     continue;
@@ -1255,7 +1253,7 @@ class ProjectIndex {
                 }
             }
 
-            // Third pass: resolve Python self.method() calls to same-class methods
+            // Third pass: resolve self/this.method() calls to same-class methods
             if (selfMethodCalls && def.className) {
                 for (const call of selfMethodCalls) {
                     const symbols = this.symbols.get(call.name);
@@ -1590,7 +1588,7 @@ class ProjectIndex {
         const fileEntry = this.files.get(filePath);
         if (!fileEntry) return null;
 
-        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state']);
+        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl']);
         for (const symbol of fileEntry.symbols) {
             if (!nonCallableTypes.has(symbol.type) &&
                 symbol.startLine <= lineNum &&
