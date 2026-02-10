@@ -267,6 +267,28 @@ Quick Start:
   ucn --interactive                   # Multiple queries
 ```
 
+## Workflows
+
+**Investigating a bug:**
+```bash
+ucn about problematic_function          # Understand it fully
+ucn trace problematic_function --depth=2  # See what it calls
+```
+
+**Before modifying a function:**
+```bash
+ucn impact the_function                 # Who will break?
+ucn smart the_function                  # See it + its helpers
+# ... make your changes ...
+ucn verify the_function                 # Did all call sites survive?
+```
+
+**Periodic cleanup:**
+```bash
+ucn deadcode --exclude=test             # What can be deleted?
+ucn toc                                 # Project overview
+```
+
 ## License
 
 MIT
