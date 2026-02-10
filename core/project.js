@@ -1009,11 +1009,25 @@ class ProjectIndex {
 
                     // Smart method call handling
                     if (call.isMethod) {
-                        // Always skip this/self/cls calls (internal state access, not function calls)
-                        if (['this', 'self', 'cls'].includes(call.receiver)) continue;
-                        // Go doesn't use this/self/cls - always include Go method calls
-                        // For other languages, skip method calls unless explicitly requested
-                        if (fileEntry.language !== 'go' && !options.includeMethods) continue;
+                        if (call.selfAttribute && fileEntry.language === 'python') {
+                            // self.attr.method() — resolve via attribute type inference
+                            const callerSymbol = this.findEnclosingFunction(filePath, call.line, true);
+                            if (!callerSymbol?.className) continue;
+                            const attrTypes = this.getInstanceAttributeTypes(filePath, callerSymbol.className);
+                            if (!attrTypes) continue;
+                            const targetClass = attrTypes.get(call.selfAttribute);
+                            if (!targetClass) continue;
+                            // Check if any definition of searched function belongs to targetClass
+                            const matchesDef = definitions.some(d => d.className === targetClass);
+                            if (!matchesDef) continue;
+                            // Falls through to add as caller
+                        } else {
+                            // Always skip this/self/cls calls (internal state access, not function calls)
+                            if (['this', 'self', 'cls'].includes(call.receiver)) continue;
+                            // Go doesn't use this/self/cls - always include Go method calls
+                            // For other languages, skip method calls unless explicitly requested
+                            if (fileEntry.language !== 'go' && !options.includeMethods) continue;
+                        }
                     }
 
                     // Skip definition lines
@@ -1110,6 +1124,7 @@ class ProjectIndex {
             const language = fileEntry?.language;
 
             const callees = new Map();  // key -> { name, bindingId, count }
+            let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
 
             for (const call of calls) {
                 // Filter to calls within this function's scope using enclosingFunction
@@ -1119,13 +1134,25 @@ class ProjectIndex {
 
                 // Smart method call handling:
                 // - Go: include all method calls (Go doesn't use this/self/cls)
+                // - Python self.attr.method(): resolve via selfAttribute (handled below)
                 // - Other languages: skip method calls unless explicitly requested
                 if (call.isMethod) {
-                    if (language !== 'go' && !options.includeMethods) continue;
+                    if (call.selfAttribute && language === 'python') {
+                        // Will be resolved in second pass below
+                    } else if (language !== 'go' && !options.includeMethods) {
+                        continue;
+                    }
                 }
 
                 // Skip keywords and built-ins
                 if (this.isKeyword(call.name, language)) continue;
+
+                // Collect selfAttribute calls for second-pass resolution
+                if (call.selfAttribute && language === 'python') {
+                    if (!selfAttrCalls) selfAttrCalls = [];
+                    selfAttrCalls.push(call);
+                    continue;
+                }
 
                 // Resolve binding within this file (without mutating cached call objects)
                 let calleeKey = call.bindingId || call.name;
@@ -1176,6 +1203,36 @@ class ProjectIndex {
                         bindingId: bindingResolved,
                         count: 1
                     });
+                }
+            }
+
+            // Second pass: resolve Python self.attr.method() calls
+            if (selfAttrCalls && def.className) {
+                const attrTypes = this.getInstanceAttributeTypes(def.file, def.className);
+                if (attrTypes) {
+                    for (const call of selfAttrCalls) {
+                        const targetClass = attrTypes.get(call.selfAttribute);
+                        if (!targetClass) continue;
+
+                        // Find method in symbol table where className matches
+                        const symbols = this.symbols.get(call.name);
+                        if (!symbols) continue;
+
+                        const match = symbols.find(s => s.className === targetClass);
+                        if (!match) continue;
+
+                        const key = match.bindingId || `${targetClass}.${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                        } else {
+                            callees.set(key, {
+                                name: call.name,
+                                bindingId: match.bindingId,
+                                count: 1
+                            });
+                        }
+                    }
                 }
             }
 
@@ -1490,8 +1547,9 @@ class ProjectIndex {
         const fileEntry = this.files.get(filePath);
         if (!fileEntry) return null;
 
+        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state']);
         for (const symbol of fileEntry.symbols) {
-            if (symbol.type === 'function' &&
+            if (!nonCallableTypes.has(symbol.type) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {
                 if (returnSymbol) {
@@ -1501,6 +1559,35 @@ class ProjectIndex {
             }
         }
         return null;
+    }
+
+    /**
+     * Get instance attribute types for a class in a file.
+     * Returns Map<attrName, typeName> for a given className.
+     * Caches results per file.
+     */
+    getInstanceAttributeTypes(filePath, className) {
+        if (!this._attrTypeCache) this._attrTypeCache = new Map();
+
+        let fileCache = this._attrTypeCache.get(filePath);
+        if (!fileCache) {
+            const fileEntry = this.files.get(filePath);
+            if (!fileEntry || fileEntry.language !== 'python') return null;
+
+            const langModule = getLanguageModule('python');
+            if (!langModule?.findInstanceAttributeTypes) return null;
+
+            try {
+                const content = fs.readFileSync(filePath, 'utf-8');
+                const parser = getParser('python');
+                fileCache = langModule.findInstanceAttributeTypes(content, parser);
+                this._attrTypeCache.set(filePath, fileCache);
+            } catch {
+                return null;
+            }
+        }
+
+        return fileCache.get(className) || null;
     }
 
     /**

@@ -5853,5 +5853,340 @@ config = load_config()
     });
 });
 
+describe('Regression: Python self.attr.method() resolution', () => {
+    it('findCallsInCode should detect selfAttribute for self.X.method()', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('python');
+        const langModule = getLanguageModule('python');
+
+        const code = `class ReportGenerator:
+    def __init__(self, analyzer):
+        self.analyzer = analyzer
+        self.name = "test"
+
+    def generate(self):
+        result = self.analyzer.analyze(data)
+        self.save(result)
+        helper(result)
+        self.name.upper()
+`;
+        const calls = langModule.findCallsInCode(code, parser);
+
+        // self.analyzer.analyze() should have selfAttribute
+        const analyzeCall = calls.find(c => c.name === 'analyze');
+        assert.ok(analyzeCall, 'Should find analyze call');
+        assert.strictEqual(analyzeCall.selfAttribute, 'analyzer');
+        assert.strictEqual(analyzeCall.receiver, 'self');
+        assert.strictEqual(analyzeCall.isMethod, true);
+
+        // self.save() should NOT have selfAttribute (direct self method)
+        const saveCall = calls.find(c => c.name === 'save');
+        assert.ok(saveCall, 'Should find save call');
+        assert.strictEqual(saveCall.selfAttribute, undefined);
+        assert.strictEqual(saveCall.receiver, 'self');
+
+        // helper() should be a regular function call
+        const helperCall = calls.find(c => c.name === 'helper');
+        assert.ok(helperCall, 'Should find helper call');
+        assert.strictEqual(helperCall.isMethod, false);
+        assert.strictEqual(helperCall.selfAttribute, undefined);
+
+        // self.name.upper() should have selfAttribute but string method
+        const upperCall = calls.find(c => c.name === 'upper');
+        assert.ok(upperCall, 'Should find upper call');
+        assert.strictEqual(upperCall.selfAttribute, 'name');
+    });
+
+    it('findInstanceAttributeTypes should parse __init__ assignments', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('python');
+        const langModule = getLanguageModule('python');
+
+        const code = `class ReportGenerator:
+    def __init__(self, analyzer=None, db=None):
+        self.analyzer = InstrumentAnalyzer(config)
+        self.db = db or DatabaseClient()
+        self.name = "test"
+        self.count = 0
+        self.items = []
+        self.scanner = (param or MarketScanner())
+
+class OtherClass:
+    def __init__(self):
+        self.helper = HelperTool()
+`;
+        const result = langModule.findInstanceAttributeTypes(code, parser);
+
+        // ReportGenerator
+        const rg = result.get('ReportGenerator');
+        assert.ok(rg, 'Should find ReportGenerator');
+        assert.strictEqual(rg.get('analyzer'), 'InstrumentAnalyzer');
+        assert.strictEqual(rg.get('db'), 'DatabaseClient');
+        assert.strictEqual(rg.get('scanner'), 'MarketScanner');
+        assert.strictEqual(rg.has('name'), false, 'Should skip string literals');
+        assert.strictEqual(rg.has('count'), false, 'Should skip number literals');
+        assert.strictEqual(rg.has('items'), false, 'Should skip list literals');
+
+        // OtherClass
+        const oc = result.get('OtherClass');
+        assert.ok(oc, 'Should find OtherClass');
+        assert.strictEqual(oc.get('helper'), 'HelperTool');
+    });
+
+    it('findCallees should resolve self.attr.method() to target class', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfattr-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'analyzer.py'), `class InstrumentAnalyzer:
+    def __init__(self, config):
+        self.config = config
+
+    def analyze_instrument(self, data):
+        return process(data)
+
+    def get_summary(self):
+        return "summary"
+`);
+            fs.writeFileSync(path.join(tmpDir, 'report.py'), `from analyzer import InstrumentAnalyzer
+
+class ReportGenerator:
+    def __init__(self, config):
+        self.analyzer = InstrumentAnalyzer(config)
+
+    def generate_report(self, data):
+        result = self.analyzer.analyze_instrument(data)
+        summary = self.analyzer.get_summary()
+        return format_output(result, summary)
+
+def format_output(result, summary):
+    return str(result) + summary
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            // Find generate_report definition
+            const defs = index.symbols.get('generate_report');
+            assert.ok(defs && defs.length > 0, 'Should find generate_report');
+
+            const callees = index.findCallees(defs[0]);
+            const calleeNames = callees.map(c => c.name);
+
+            assert.ok(calleeNames.includes('analyze_instrument'),
+                `Should resolve self.analyzer.analyze_instrument(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('get_summary'),
+                `Should resolve self.analyzer.get_summary(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('format_output'),
+                `Should include direct call format_output(), got: ${calleeNames.join(', ')}`);
+
+            // Verify the resolved callee points to InstrumentAnalyzer's method
+            const analyzeCallee = callees.find(c => c.name === 'analyze_instrument');
+            assert.strictEqual(analyzeCallee.className, 'InstrumentAnalyzer',
+                'Resolved callee should belong to InstrumentAnalyzer class');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('findCallers should find callers through self.attr.method()', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-selfattr-callers-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'analyzer.py'), `class InstrumentAnalyzer:
+    def __init__(self, config):
+        self.config = config
+
+    def analyze_instrument(self, data):
+        return process(data)
+`);
+            fs.writeFileSync(path.join(tmpDir, 'report.py'), `from analyzer import InstrumentAnalyzer
+
+class ReportGenerator:
+    def __init__(self, config):
+        self.analyzer = InstrumentAnalyzer(config)
+
+    def generate_report(self, data):
+        result = self.analyzer.analyze_instrument(data)
+        return result
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            const callers = index.findCallers('analyze_instrument');
+            assert.ok(callers.length >= 1,
+                `Should find at least 1 caller for analyze_instrument, got ${callers.length}`);
+
+            const reportCaller = callers.find(c => c.callerName === 'generate_report');
+            assert.ok(reportCaller,
+                `Should find generate_report as caller, got: ${callers.map(c => c.callerName).join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Python decorated function callees', () => {
+    it('findCallees should work for @property and other decorated methods', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-decorated-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'models.py'), `class Headers:
+    def get(self, key):
+        return self.data.get(key)
+
+class Response:
+    def __init__(self, headers):
+        self.headers = Headers(headers)
+
+    @property
+    def charset_encoding(self):
+        content_type = self.headers.get("Content-Type")
+        return parse_charset(content_type)
+
+    @staticmethod
+    def create(data):
+        return Response(data)
+
+    def normal_method(self):
+        return self.headers.get("Accept")
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            // @property method should have callees
+            const propDefs = index.symbols.get('charset_encoding');
+            assert.ok(propDefs && propDefs.length > 0, 'Should find charset_encoding');
+            const propCallees = index.findCallees(propDefs[0]);
+            const propCalleeNames = propCallees.map(c => c.name);
+            assert.ok(propCalleeNames.includes('parse_charset') || propCalleeNames.includes('get'),
+                `@property should have callees, got: ${propCalleeNames.join(', ')}`);
+
+            // Normal method should also have callees
+            const normalDefs = index.symbols.get('normal_method');
+            assert.ok(normalDefs && normalDefs.length > 0, 'Should find normal_method');
+            const normalCallees = index.findCallees(normalDefs[0]);
+            assert.ok(normalCallees.length > 0,
+                `Normal method should have callees, got: ${normalCallees.map(c => c.name).join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Python conditional expression in attribute types', () => {
+    it('findInstanceAttributeTypes should resolve conditional expressions', () => {
+        const Parser = require('tree-sitter');
+        const Python = require('tree-sitter-python');
+        const parser = new Parser();
+        parser.setLanguage(Python);
+        const pythonParser = require('../languages/python');
+
+        const code = `
+class Live:
+    def __init__(self, renderable=None, console=None):
+        self._live_render = renderable if renderable else LiveRender(Text())
+        self.console = console or Console()
+        self.plain = "hello"
+`;
+        const result = pythonParser.findInstanceAttributeTypes(code, parser);
+        assert.ok(result.has('Live'), 'Should find Live class');
+        const attrs = result.get('Live');
+        assert.strictEqual(attrs.get('_live_render'), 'LiveRender', 'Should resolve conditional to LiveRender');
+        assert.strictEqual(attrs.get('console'), 'Console', 'Should still resolve boolean or pattern');
+        assert.ok(!attrs.has('plain'), 'Should skip string literals');
+    });
+});
+
+describe('Regression: Python @dataclass field annotation types', () => {
+    it('findInstanceAttributeTypes should extract types from @dataclass annotated fields', () => {
+        const Parser = require('tree-sitter');
+        const Python = require('tree-sitter-python');
+        const parser = new Parser();
+        parser.setLanguage(Python);
+        const pythonParser = require('../languages/python');
+
+        const code = `
+from dataclasses import dataclass, field
+
+@dataclass
+class Line:
+    depth: int = 0
+    bracket_tracker: BracketTracker = field(default_factory=BracketTracker)
+    inside_brackets: bool = False
+    comments: list = field(default_factory=list)
+    mode: Mode = Mode.DEFAULT
+`;
+        const result = pythonParser.findInstanceAttributeTypes(code, parser);
+        assert.ok(result.has('Line'), 'Should find Line class');
+        const attrs = result.get('Line');
+        assert.strictEqual(attrs.get('bracket_tracker'), 'BracketTracker', 'Should extract BracketTracker from annotation');
+        assert.strictEqual(attrs.get('mode'), 'Mode', 'Should extract Mode from annotation');
+        assert.ok(!attrs.has('depth'), 'Should skip int primitive');
+        assert.ok(!attrs.has('inside_brackets'), 'Should skip bool primitive');
+        assert.ok(!attrs.has('comments'), 'Should skip list primitive');
+    });
+
+    it('findInstanceAttributeTypes should not scan non-dataclass classes for field annotations', () => {
+        const Parser = require('tree-sitter');
+        const Python = require('tree-sitter-python');
+        const parser = new Parser();
+        parser.setLanguage(Python);
+        const pythonParser = require('../languages/python');
+
+        const code = `
+class RegularClass:
+    name: str = "default"
+    tracker: BracketTracker = None
+
+    def __init__(self):
+        self.helper = Helper()
+`;
+        const result = pythonParser.findInstanceAttributeTypes(code, parser);
+        // Should find Helper from __init__ but NOT BracketTracker from class-level annotation
+        assert.ok(result.has('RegularClass'), 'Should find RegularClass');
+        const attrs = result.get('RegularClass');
+        assert.strictEqual(attrs.get('helper'), 'Helper', 'Should find Helper from __init__');
+        assert.ok(!attrs.has('tracker'), 'Should NOT extract from non-dataclass class annotations');
+    });
+
+    it('findCallees should resolve @dataclass attribute method calls', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dataclass-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'linegen.py'), `
+from dataclasses import dataclass, field
+
+class BracketTracker:
+    def any_open_brackets(self):
+        return len(self.brackets) > 0
+
+    def mark(self, leaf):
+        self.brackets.append(leaf)
+
+@dataclass
+class Line:
+    bracket_tracker: BracketTracker = field(default_factory=BracketTracker)
+
+    def should_split(self):
+        if self.bracket_tracker.any_open_brackets():
+            return True
+        self.bracket_tracker.mark(None)
+        return False
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.py', { quiet: true });
+
+            const defs = index.symbols.get('should_split');
+            assert.ok(defs && defs.length > 0, 'Should find should_split');
+            const callees = index.findCallees(defs[0]);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('any_open_brackets'),
+                `Should resolve self.bracket_tracker.any_open_brackets(), got: ${calleeNames.join(', ')}`);
+            assert.ok(calleeNames.includes('mark'),
+                `Should resolve self.bracket_tracker.mark(), got: ${calleeNames.join(', ')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
