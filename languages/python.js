@@ -400,9 +400,14 @@ function findCallsInCode(code, parser) {
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
+            // Use decorated_definition start line if present, to match symbol index
+            let startLine = node.startPosition.row + 1;
+            if (node.parent && node.parent.type === 'decorated_definition') {
+                startLine = node.parent.startPosition.row + 1;
+            }
             functionStack.push({
                 name: extractFunctionName(node),
-                startLine: node.startPosition.row + 1,
+                startLine,
                 endLine: node.endPosition.row + 1
             });
         }
@@ -425,16 +430,32 @@ function findCallsInCode(code, parser) {
                     uncertain
                 });
             } else if (funcNode.type === 'attribute') {
-                // Method/attribute call: obj.foo()
+                // Method/attribute call: obj.foo() or self.attr.foo()
                 const attrNode = funcNode.childForFieldName('attribute');
                 const objNode = funcNode.childForFieldName('object');
 
                 if (attrNode) {
+                    let receiver = objNode?.type === 'identifier' ? objNode.text : undefined;
+                    let selfAttribute = undefined;
+
+                    // Detect self.X.method() pattern: objNode is attribute access on self/cls
+                    if (objNode?.type === 'attribute') {
+                        const innerObj = objNode.childForFieldName('object');
+                        const innerAttr = objNode.childForFieldName('attribute');
+                        if (innerObj?.type === 'identifier' &&
+                            ['self', 'cls'].includes(innerObj.text) &&
+                            innerAttr) {
+                            selfAttribute = innerAttr.text;
+                            receiver = innerObj.text;
+                        }
+                    }
+
                     calls.push({
                         name: attrNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: true,
-                        receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
+                        receiver,
+                        ...(selfAttribute && { selfAttribute }),
                         enclosingFunction,
                         uncertain
                     });
@@ -699,6 +720,183 @@ function findUsagesInCode(code, name, parser) {
     return usages;
 }
 
+/**
+ * Find instance attribute types from __init__ constructor assignments.
+ * Parses self.X = ClassName(...) patterns in __init__ methods.
+ * @param {string} code - Source code to analyze
+ * @param {object} parser - Tree-sitter parser instance
+ * @returns {Map<string, Map<string, string>>} className -> (attrName -> typeName)
+ */
+function findInstanceAttributeTypes(code, parser) {
+    const tree = parseTree(parser, code);
+    const result = new Map(); // className -> Map(attrName -> typeName)
+
+    const PRIMITIVE_TYPES = new Set(['int', 'float', 'str', 'bool', 'bytes', 'list', 'dict', 'set', 'tuple', 'None', 'Any', 'object']);
+
+    traverseTree(tree.rootNode, (node) => {
+        if (node.type !== 'class_definition') return true;
+
+        const classNameNode = node.childForFieldName('name');
+        if (!classNameNode) return true;
+        const className = classNameNode.text;
+
+        const body = node.childForFieldName('body');
+        if (!body) return false;
+
+        const attrTypes = new Map();
+
+        // Check for @dataclass decorator — scan annotated class-level fields
+        const parentNode = node.parent;
+        if (parentNode?.type === 'decorated_definition') {
+            for (let d = 0; d < parentNode.childCount; d++) {
+                const dec = parentNode.child(d);
+                if (dec.type !== 'decorator') continue;
+                // Match @dataclass or @dataclasses.dataclass
+                const decText = dec.text;
+                if (decText.startsWith('@dataclass') || decText.includes('.dataclass')) {
+                    // Scan class body for annotated fields: name: Type = ...
+                    for (let i = 0; i < body.childCount; i++) {
+                        const stmt = body.child(i);
+                        if (stmt.type !== 'expression_statement') continue;
+                        const assign = stmt.firstChild;
+                        if (!assign || assign.type !== 'assignment') continue;
+
+                        // Must have a type annotation
+                        const typeNode = assign.childForFieldName('type');
+                        if (!typeNode) continue;
+
+                        // Extract type name from annotation
+                        const typeIdent = typeNode.type === 'type' ? typeNode.firstChild : typeNode;
+                        if (!typeIdent || typeIdent.type !== 'identifier') continue;
+                        const typeName = typeIdent.text;
+
+                        // Skip primitives and lowercase types
+                        if (PRIMITIVE_TYPES.has(typeName)) continue;
+                        if (typeName[0] < 'A' || typeName[0] > 'Z') continue;
+
+                        // Field name from LHS
+                        const lhs = assign.childForFieldName('left');
+                        if (!lhs || lhs.type !== 'identifier') continue;
+                        attrTypes.set(lhs.text, typeName);
+                    }
+                    break;
+                }
+            }
+        }
+
+        // Scan __init__ for self.X = ClassName(...) assignments
+        for (let i = 0; i < body.childCount; i++) {
+            let child = body.child(i);
+            // Handle decorated_definition wrapper
+            if (child.type === 'decorated_definition') {
+                for (let j = 0; j < child.childCount; j++) {
+                    if (child.child(j).type === 'function_definition') {
+                        child = child.child(j);
+                        break;
+                    }
+                }
+            }
+            if (child.type !== 'function_definition') continue;
+
+            const fnName = child.childForFieldName('name');
+            if (!fnName || fnName.text !== '__init__') continue;
+
+            // Found __init__, now scan for self.X = ClassName(...) assignments
+            const initBody = child.childForFieldName('body');
+            if (!initBody) continue;
+
+            traverseTree(initBody, (stmt) => {
+                if (stmt.type !== 'expression_statement') return true;
+
+                const assign = stmt.firstChild;
+                if (!assign || assign.type !== 'assignment') return true;
+
+                // LHS: self.X
+                const lhs = assign.childForFieldName('left');
+                if (!lhs || lhs.type !== 'attribute') return true;
+                const lhsObj = lhs.childForFieldName('object');
+                const lhsAttr = lhs.childForFieldName('attribute');
+                if (!lhsObj || lhsObj.text !== 'self' || !lhsAttr) return true;
+
+                const attrName = lhsAttr.text;
+
+                // RHS: ClassName(...) or param or ClassName(...)
+                const rhs = assign.childForFieldName('right');
+                if (!rhs) return true;
+
+                const typeName = extractConstructorName(rhs);
+                if (typeName) {
+                    attrTypes.set(attrName, typeName);
+                }
+
+                return true;
+            });
+        }
+
+        if (attrTypes.size > 0) {
+            result.set(className, attrTypes);
+        }
+
+        return false; // don't descend into nested classes from traverseTree
+    });
+
+    return result;
+}
+
+/**
+ * Extract constructor class name from an expression node.
+ * Handles: ClassName(...), param or ClassName(...), (param or ClassName(...)),
+ *          expr if cond else ClassName(...)
+ */
+function extractConstructorName(node) {
+    if (!node) return null;
+
+    // Direct call: ClassName(...)
+    if (node.type === 'call') {
+        const func = node.childForFieldName('function');
+        if (func?.type === 'identifier') {
+            const name = func.text;
+            // Only uppercase-first names (constructor heuristic)
+            if (name[0] >= 'A' && name[0] <= 'Z') return name;
+        }
+        return null;
+    }
+
+    // Boolean fallback: param or ClassName(...)
+    if (node.type === 'boolean_operator') {
+        // Check operator is 'or'
+        const op = node.child(1);
+        if (op?.text === 'or') {
+            const right = node.child(2);
+            return extractConstructorName(right);
+        }
+    }
+
+    // Conditional expression: expr if cond else ClassName(...)
+    if (node.type === 'conditional_expression') {
+        // Children: [0]=truthy, [1]='if', [2]=condition, [3]='else', [4]=else_value
+        // Try else branch first (usually has the constructor fallback)
+        const elseVal = node.child(4);
+        const fromElse = extractConstructorName(elseVal);
+        if (fromElse) return fromElse;
+        // Also try truthy branch
+        const truthyVal = node.child(0);
+        return extractConstructorName(truthyVal);
+    }
+
+    // Parenthesized expression
+    if (node.type === 'parenthesized_expression') {
+        for (let i = 0; i < node.childCount; i++) {
+            const child = node.child(i);
+            if (child.type !== '(' && child.type !== ')') {
+                return extractConstructorName(child);
+            }
+        }
+    }
+
+    return null;
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -707,5 +905,6 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    findInstanceAttributeTypes,
     parse
 };
