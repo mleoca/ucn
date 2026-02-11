@@ -155,124 +155,10 @@ ucn verify the_function                 # Did all call sites survive?
 ucn deadcode --exclude=test             # What can be deleted?
 ucn toc                                 # Project overview
 ```
+
 ## Supported Languages
 
 JavaScript, TypeScript, Python, Go, Rust, Java
-
-## Install
-
-```bash
-npm install -g ucn
-```
-
-### MCP Server
-
-UCN includes a built-in [MCP](https://modelcontextprotocol.io) server, so any MCP-compatible AI client can use it as a tool.
-
-**Claude Code** (`~/.claude/mcp-config.json`):
-```json
-{
-  "mcpServers": {
-    "ucn": {
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
-
-**Claude Desktop** (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
-```json
-{
-  "mcpServers": {
-    "ucn": {
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
-
-**Cursor** (`~/.cursor/mcp.json` or `.cursor/mcp.json` in project):
-```json
-{
-  "mcpServers": {
-    "ucn": {
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
-
-**Windsurf** (`~/.codeium/windsurf/mcp_config.json`):
-```json
-{
-  "mcpServers": {
-    "ucn": {
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
-
-**VS Code Copilot** (`.vscode/mcp.json`):
-```json
-{
-  "servers": {
-    "ucn": {
-      "type": "stdio",
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
-
-**Zed** (Settings > `settings.json`):
-```json
-{
-  "context_servers": {
-    "ucn": {
-      "command": "npx",
-      "args": ["-y", "ucn", "--mcp"]
-    }
-  }
-}
-```
-
-The MCP server exposes 27 tools: `ucn_about`, `ucn_context`, `ucn_impact`, `ucn_smart`, `ucn_trace`, `ucn_find`, `ucn_usages`, `ucn_toc`, `ucn_deadcode`, `ucn_fn`, `ucn_class`, `ucn_verify`, `ucn_imports`, `ucn_exporters`, `ucn_tests`, `ucn_related`, `ucn_graph`, `ucn_file_exports`, `ucn_search`, `ucn_plan`, `ucn_typedef`, `ucn_stacktrace`, `ucn_example`, `ucn_expand`, `ucn_lines`, `ucn_api`, `ucn_stats`.
-
-### Claude Code Skill (alternative)
-
-To use UCN as a skill in Claude Code (alternative to MCP):
-
-```bash
-mkdir -p ~/.claude/skills
-
-# If installed via npm:
-cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.claude/skills/
-
-# If cloned from git:
-git clone https://github.com/mleoca/ucn.git
-cp -r ucn/.claude/skills/ucn ~/.claude/skills/
-```
-
-### Codex (optional)
-
-To use UCN as a skill in OpenAI Codex:
-
-```bash
-mkdir -p ~/.agents/skills
-
-# If installed via npm:
-cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
-
-# If cloned from git:
-git clone https://github.com/mleoca/ucn.git
-cp -r ucn/.claude/skills/ucn ~/.agents/skills/
-```
 
 ## Usage
 
@@ -366,6 +252,87 @@ Quick Start:
   ucn impact handleRequest            # Before modifying
   ucn fn handleRequest --file api     # Extract specific function
   ucn --interactive                   # Multiple queries
+```
+
+## Install
+
+```bash
+npm install -g ucn
+```
+
+### MCP Server
+
+UCN includes a built-in [MCP](https://modelcontextprotocol.io) server, so any MCP-compatible AI client can use it as a tool. It exposes 27 tools (`ucn_about`, `ucn_context`, `ucn_impact`, `ucn_smart`, `ucn_trace`, `ucn_find`, `ucn_usages`, `ucn_toc`, `ucn_deadcode`, `ucn_fn`, `ucn_class`, `ucn_verify`, `ucn_imports`, `ucn_exporters`, `ucn_tests`, `ucn_related`, `ucn_graph`, `ucn_file_exports`, `ucn_search`, `ucn_plan`, `ucn_typedef`, `ucn_stacktrace`, `ucn_example`, `ucn_expand`, `ucn_lines`, `ucn_api`, `ucn_stats`).
+
+**One-line setup** (for clients that support it):
+
+| Client | Command |
+|--------|---------|
+| Claude Code | `claude mcp add ucn -- npx -y ucn --mcp` |
+| OpenAI Codex CLI | `codex mcp add ucn -- npx -y ucn --mcp` |
+| VS Code Copilot | `code --add-mcp '{"name":"ucn","command":"npx","args":["-y","ucn","--mcp"]}'` |
+
+**Manual config** — add to the appropriate config file for your client:
+
+| Client | Config file |
+|--------|-------------|
+| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) |
+| Cursor | `~/.cursor/mcp.json` or `.cursor/mcp.json` in project |
+| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
+| Cline | VS Code sidebar > MCP Servers > Configure |
+| Claude Code | `~/.claude/mcp-config.json` |
+
+```json
+{
+  "mcpServers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+<details>
+<summary>VS Code Copilot uses a slightly different format (<code>.vscode/mcp.json</code>)</summary>
+
+```json
+{
+  "servers": {
+    "ucn": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+</details>
+
+### Claude Code Skill (alternative to MCP)
+
+```bash
+mkdir -p ~/.claude/skills
+
+# If installed via npm:
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.claude/skills/
+
+# If cloned from git:
+git clone https://github.com/mleoca/ucn.git
+cp -r ucn/.claude/skills/ucn ~/.claude/skills/
+```
+
+### Codex Skill (alternative to MCP)
+
+```bash
+mkdir -p ~/.agents/skills
+
+# If installed via npm:
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
+
+# If cloned from git:
+git clone https://github.com/mleoca/ucn.git
+cp -r ucn/.claude/skills/ucn ~/.agents/skills/
 ```
 
 ## License

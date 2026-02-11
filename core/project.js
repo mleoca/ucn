@@ -1803,7 +1803,7 @@ class ProjectIndex {
         // Find all test files
         const testFiles = [];
         for (const [filePath, fileEntry] of this.files) {
-            if (isTestFile(filePath, fileEntry.language)) {
+            if (isTestFile(fileEntry.relativePath, fileEntry.language)) {
                 testFiles.push({ path: filePath, entry: fileEntry });
             }
         }
@@ -2108,14 +2108,13 @@ class ProjectIndex {
                     continue;
                 }
 
-                // Skip test files unless requested
-                if (!options.includeTests && isTestFile(symbol.file, symbol.language)) {
-                    continue;
-                }
-
-                // Check if exported
                 const fileEntry = this.files.get(symbol.file);
                 const lang = fileEntry?.language;
+
+                // Skip test files unless requested
+                if (!options.includeTests && isTestFile(symbol.relativePath, lang)) {
+                    continue;
+                }
                 const mods = symbol.modifiers || [];
 
                 // Language-specific entry points (called by runtime, no AST-visible callers)
@@ -3653,7 +3652,7 @@ class ProjectIndex {
             totalState += state.length;
             totalLines += fileEntry.lines;
             totalDynamic += fileEntry.dynamicImports || 0;
-            if (isTestFile(filePath)) totalTests += 1;
+            if (isTestFile(fileEntry.relativePath, fileEntry.language)) totalTests += 1;
 
             const entry = {
                 file: fileEntry.relativePath,

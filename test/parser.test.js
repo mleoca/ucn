@@ -6392,5 +6392,244 @@ class DataService:
     });
 });
 
+// Regression: isTestFile should use relative paths, not absolute paths
+// Bug: When project lived at /Users/x/test/project/, the /test/ in the parent
+// path matched the Python test pattern /\/tests?\//, marking ALL files as test files.
+// This caused deadcode to either miss real dead code or produce false positives.
+describe('Regression: deadcode uses relative paths for isTestFile', () => {
+    it('should not treat non-test files as test files when project is inside a /test/ directory', () => {
+        // Simulate a project inside a directory named "test"
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-relpath-${Date.now()}`, 'test', 'myproject');
+        const toolsDir = path.join(tmpDir, 'tools');
+        fs.mkdirSync(toolsDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(toolsDir, '__init__.py'), '');
+            fs.writeFileSync(path.join(toolsDir, 'helper.py'), `
+def unused_helper():
+    return 42
+
+def used_helper():
+    return 1
+`);
+            fs.writeFileSync(path.join(tmpDir, 'main.py'), `
+from tools.helper import used_helper
+
+def main():
+    print(used_helper())
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const dead = index.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // unused_helper should be flagged as dead code
+            assert.ok(deadNames.includes('unused_helper'),
+                `unused_helper should be flagged as dead code, got: ${deadNames.join(', ')}`);
+
+            // used_helper should NOT be flagged
+            assert.ok(!deadNames.includes('used_helper'),
+                `used_helper should not be flagged as dead code`);
+        } finally {
+            fs.rmSync(path.join(os.tmpdir(), `ucn-test-relpath-${Date.now()}`), { recursive: true, force: true });
+            // Clean up the created dir tree
+            const topDir = tmpDir.split('/test/myproject')[0];
+            if (topDir.includes('ucn-test-relpath')) {
+                fs.rmSync(topDir, { recursive: true, force: true });
+            }
+        }
+    });
+
+    it('should correctly filter test files even when project is inside /test/ directory', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-relpath2-${Date.now()}`, 'test', 'myproject');
+        const testsDir = path.join(tmpDir, 'tests');
+        fs.mkdirSync(testsDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(tmpDir, 'app.py'), `
+def exported_func():
+    return 42
+
+def unused_func():
+    return 0
+`);
+            fs.writeFileSync(path.join(testsDir, 'test_app.py'), `
+from app import exported_func
+
+def test_exported():
+    assert exported_func() == 42
+
+def _helper_in_test():
+    return 'setup'
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Default: test files excluded
+            const deadDefault = index.deadcode();
+            const deadDefaultNames = deadDefault.map(d => d.name);
+
+            // unused_func from app.py should appear
+            assert.ok(deadDefaultNames.includes('unused_func'),
+                `unused_func should be in deadcode results`);
+
+            // _helper_in_test from test file should NOT appear (test files excluded by default)
+            assert.ok(!deadDefaultNames.includes('_helper_in_test'),
+                `_helper_in_test should not appear without --include-tests`);
+
+            // With --include-tests: test file symbols should appear
+            const deadWithTests = index.deadcode({ includeTests: true });
+            const deadWithTestsNames = deadWithTests.map(d => d.name);
+
+            assert.ok(deadWithTestsNames.includes('_helper_in_test'),
+                `_helper_in_test should appear with --include-tests`);
+
+            // test_* functions should still be excluded (they're entry points)
+            assert.ok(!deadWithTestsNames.includes('test_exported'),
+                `test_exported should not be flagged (entry point)`);
+        } finally {
+            const topDir = tmpDir.split('/test/myproject')[0];
+            if (topDir.includes('ucn-test-relpath2')) {
+                fs.rmSync(topDir, { recursive: true, force: true });
+            }
+        }
+    });
+});
+
+// Regression: deadcode --include-exported should not include test file symbols
+// unless --include-tests is also specified
+describe('Regression: deadcode --include-exported respects test file filtering', () => {
+    it('should not show test methods when only --include-exported is set', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-exported-${Date.now()}`);
+        const testsDir = path.join(tmpDir, 'tests');
+        fs.mkdirSync(testsDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'setup.py'), '');
+            fs.writeFileSync(path.join(tmpDir, 'lib.py'), `
+def public_func():
+    return 42
+`);
+            fs.writeFileSync(path.join(testsDir, 'test_lib.py'), `
+from lib import public_func
+
+class TestLib:
+    def test_public_func(self):
+        assert public_func() == 42
+
+    def test_another(self):
+        assert True
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // --include-exported but NOT --include-tests
+            const dead = index.deadcode({ includeExported: true, includeTests: false });
+            const deadNames = dead.map(d => d.name);
+
+            // Test methods should NOT appear
+            assert.ok(!deadNames.includes('test_public_func'),
+                `test methods should not appear with only --include-exported`);
+            assert.ok(!deadNames.includes('test_another'),
+                `test methods should not appear with only --include-exported`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: isTestFile relative path fix applies to all languages (not just Python)
+// Rust has /\/tests\// pattern that could match parent directories
+describe('Regression: deadcode relative path fix works for Rust projects', () => {
+    it('should not treat non-test Rust files as test files when project is inside /tests/ directory', () => {
+        // Project lives inside a directory called "tests"
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-rust-relpath-${Date.now()}`, 'tests', 'myproject');
+        const srcDir = path.join(tmpDir, 'src');
+        fs.mkdirSync(srcDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"');
+            fs.writeFileSync(path.join(srcDir, 'lib.rs'), `
+fn unused_helper() -> i32 {
+    42
+}
+
+pub fn used_func() -> i32 {
+    unused_helper()
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const dead = index.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // unused_helper should be flagged (it has a caller but let's check it's not filtered)
+            // The key assertion: src/lib.rs should NOT be treated as a test file
+            const { isTestFile } = require('../core/discovery');
+            assert.ok(!isTestFile('src/lib.rs', 'rust'),
+                'src/lib.rs should not be a test file');
+
+            // Verify the old bug: absolute path WOULD falsely match
+            const absPath = path.join(tmpDir, 'src', 'lib.rs');
+            // The absolute path contains /tests/ from parent dir
+            assert.ok(absPath.includes('/tests/'),
+                'Absolute path should contain /tests/ from parent directory');
+        } finally {
+            const topDir = tmpDir.split('/tests/myproject')[0];
+            if (topDir.includes('ucn-test-rust-relpath')) {
+                fs.rmSync(topDir, { recursive: true, force: true });
+            }
+        }
+    });
+});
+
+// Regression: deadcode relative path fix works for JS projects with __tests__ in parent
+describe('Regression: deadcode relative path fix works for JS projects', () => {
+    it('should not treat non-test JS files as test files when project is inside /__tests__/ directory', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-js-relpath-${Date.now()}`, '__tests__', 'myproject');
+        const srcDir = path.join(tmpDir, 'src');
+        fs.mkdirSync(srcDir, { recursive: true });
+
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name": "test"}');
+            fs.writeFileSync(path.join(srcDir, 'utils.js'), `
+function unusedUtil() {
+    return 42;
+}
+
+function usedUtil() {
+    return unusedUtil();
+}
+
+module.exports = { usedUtil };
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const dead = index.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // src/utils.js should NOT be treated as a test file
+            const { isTestFile } = require('../core/discovery');
+            assert.ok(!isTestFile('src/utils.js', 'javascript'),
+                'src/utils.js should not be a test file');
+        } finally {
+            const topDir = tmpDir.split('/__tests__/myproject')[0];
+            if (topDir.includes('ucn-test-js-relpath')) {
+                fs.rmSync(topDir, { recursive: true, force: true });
+            }
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
