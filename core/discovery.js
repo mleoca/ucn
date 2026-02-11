@@ -95,7 +95,7 @@ const TEST_PATTERNS = {
     python: [
         /^test_.*\.py$/,
         /.*_test\.py$/,
-        /\/tests?\//
+        /(^|\/)tests?\//
     ],
     go: [
         /.*_test\.go$/
@@ -107,7 +107,7 @@ const TEST_PATTERNS = {
     ],
     rust: [
         /.*_test\.rs$/,
-        /\/tests\//
+        /(^|\/)tests\//
     ]
 };
 
