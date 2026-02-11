@@ -6631,5 +6631,252 @@ module.exports = { usedUtil };
     });
 });
 
+// Regression: Rust trait impl methods should not appear as deadcode
+describe('Regression: deadcode skips Rust trait impl methods', () => {
+    it('should not report trait impl methods as dead code', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-rust-trait-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"\nversion = "0.1.0"');
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            // A struct with an inherent impl and a trait impl
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.rs'), `
+struct Foo {
+    val: i32,
+}
+
+impl Foo {
+    fn new(val: i32) -> Self {
+        Foo { val }
+    }
+
+    fn unused_method(&self) -> i32 {
+        self.val
+    }
+}
+
+impl std::fmt::Display for Foo {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.val)
+    }
+}
+
+impl PartialEq for Foo {
+    fn eq(&self, other: &Self) -> bool {
+        self.val == other.val
+    }
+}
+
+fn main() {
+    let f = Foo::new(42);
+}
+`);
+            const idx = new ProjectIndex(tmpDir);
+            idx.build(null, { quiet: true });
+            const dead = idx.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // Trait impl methods should NOT appear
+            assert.ok(!deadNames.includes('fmt'), 'fmt (trait impl) should not be dead code');
+            assert.ok(!deadNames.includes('eq'), 'eq (trait impl) should not be dead code');
+
+            // Genuinely unused inherent method SHOULD appear
+            assert.ok(deadNames.includes('unused_method'), 'unused_method should be dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: Rust #[bench] functions should be treated as entry points
+describe('Regression: deadcode treats Rust #[bench] as entry points', () => {
+    it('should not report #[bench] functions as dead code', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-rust-bench-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"\nversion = "0.1.0"');
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.mkdirSync(path.join(tmpDir, 'benches'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.rs'), `
+fn main() {}
+
+fn helper() -> i32 { 42 }
+`);
+            fs.writeFileSync(path.join(tmpDir, 'benches', 'my_bench.rs'), `
+#![feature(test)]
+extern crate test;
+use test::Bencher;
+
+#[bench]
+fn bench_something(b: &mut Bencher) {
+    b.iter(|| 1 + 1);
+}
+
+fn unused_bench_helper() -> i32 {
+    42
+}
+`);
+            const idx = new ProjectIndex(tmpDir);
+            idx.build(null, { quiet: true });
+            const dead = idx.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // #[bench] should NOT appear as dead code
+            assert.ok(!deadNames.includes('bench_something'), 'bench_something should not be dead code');
+
+            // Genuinely unused function SHOULD appear
+            assert.ok(deadNames.includes('unused_bench_helper'), 'unused_bench_helper should be dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: test file patterns should match relative paths starting with tests/
+describe('Regression: test file patterns match relative paths', () => {
+    it('should detect tests/ at start of relative path for Python', () => {
+        const { isTestFile } = require('../core/discovery');
+        // Relative paths starting with tests/ should match
+        assert.ok(isTestFile('tests/test_app.py', 'python'),
+            'tests/test_app.py should be a test file');
+        assert.ok(isTestFile('tests/helpers/factory.py', 'python'),
+            'tests/helpers/factory.py should be a test file');
+        // Subdirectory should still work
+        assert.ok(isTestFile('src/tests/test_util.py', 'python'),
+            'src/tests/test_util.py should be a test file');
+        // Non-test paths should not match
+        assert.ok(!isTestFile('src/utils.py', 'python'),
+            'src/utils.py should not be a test file');
+    });
+
+    it('should detect tests/ at start of relative path for Rust', () => {
+        const { isTestFile } = require('../core/discovery');
+        assert.ok(isTestFile('tests/integration.rs', 'rust'),
+            'tests/integration.rs should be a test file');
+        assert.ok(isTestFile('tests/examples/hello.rs', 'rust'),
+            'tests/examples/hello.rs should be a test file');
+        // Non-test paths should not match
+        assert.ok(!isTestFile('src/lib.rs', 'rust'),
+            'src/lib.rs should not be a test file');
+    });
+});
+
+// Regression: Java @Override methods should not appear as deadcode
+describe('Regression: deadcode skips Java @Override methods', () => {
+    it('should not report @Override methods as dead code', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-java-override-'));
+        try {
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'MyClass.java'), `
+public class MyClass implements Runnable {
+    @Override
+    public void run() {
+        System.out.println("running");
+    }
+
+    @Override
+    public String toString() {
+        return "MyClass";
+    }
+
+    void unusedMethod() {
+        System.out.println("unused");
+    }
+
+    public static void main(String[] args) {
+        new MyClass().run();
+    }
+}
+`);
+            const idx = new ProjectIndex(tmpDir);
+            idx.build(null, { quiet: true });
+            const dead = idx.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // @Override methods should NOT appear
+            assert.ok(!deadNames.includes('run'), 'run (@Override) should not be dead code');
+            assert.ok(!deadNames.includes('toString'), 'toString (@Override) should not be dead code');
+
+            // Genuinely unused method SHOULD appear
+            assert.ok(deadNames.includes('unusedMethod'), 'unusedMethod should be dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// Regression: Python setUp/tearDown and pytest_* should be entry points
+describe('Regression: deadcode treats Python framework methods as entry points', () => {
+    it('should not report setUp/tearDown as dead code', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-py-setup-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            // setUp/tearDown in a non-test file (e.g., scripts/ directory)
+            fs.writeFileSync(path.join(tmpDir, 'release_tests.py'), `
+import unittest
+
+class TestFoo(unittest.TestCase):
+    def setUp(self):
+        self.x = 42
+
+    def tearDown(self):
+        pass
+
+    def test_something(self):
+        assert self.x == 42
+`);
+            // Separate non-test file with genuinely unused code
+            fs.writeFileSync(path.join(tmpDir, 'utils.py'), `
+def unused_helper():
+    return 1
+`);
+            const idx = new ProjectIndex(tmpDir);
+            idx.build(null, { quiet: true });
+            const dead = idx.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // Framework methods should NOT appear (even in non-test files)
+            assert.ok(!deadNames.includes('setUp'), 'setUp should not be dead code');
+            assert.ok(!deadNames.includes('tearDown'), 'tearDown should not be dead code');
+            assert.ok(!deadNames.includes('test_something'), 'test_something should not be dead code');
+
+            // Genuinely unused function SHOULD appear
+            assert.ok(deadNames.includes('unused_helper'), 'unused_helper should be dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should not report pytest_* hooks as dead code', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-py-pytest-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+            fs.writeFileSync(path.join(tmpDir, 'conftest.py'), `
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: slow test")
+
+def pytest_collection_modifyitems(config, items):
+    pass
+
+def unused_function():
+    return 1
+`);
+            const idx = new ProjectIndex(tmpDir);
+            idx.build(null, { quiet: true });
+            const dead = idx.deadcode();
+            const deadNames = dead.map(d => d.name);
+
+            // pytest hooks should NOT appear
+            assert.ok(!deadNames.includes('pytest_configure'), 'pytest_configure should not be dead code');
+            assert.ok(!deadNames.includes('pytest_collection_modifyitems'),
+                'pytest_collection_modifyitems should not be dead code');
+
+            // Genuinely unused function SHOULD appear
+            assert.ok(deadNames.includes('unused_function'), 'unused_function should be dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

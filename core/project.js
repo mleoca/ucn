@@ -2127,12 +2127,22 @@ class ProjectIndex {
 
                 // Python: Magic/dunder methods are called by the interpreter, not user code
                 // test_* functions/methods are called by pytest/unittest via reflection
+                // setUp/tearDown are unittest.TestCase framework methods called by test runner
+                // pytest_* are pytest plugin hooks called by the framework
                 const isPythonEntryPoint = lang === 'python' &&
-                    (/^__\w+__$/.test(name) || /^test_/.test(name));
+                    (/^__\w+__$/.test(name) || /^test_/.test(name) ||
+                     /^(setUp|tearDown)(Class|Module)?$/.test(name) ||
+                     /^pytest_/.test(name));
 
-                // Rust: main() is entry point, #[test] functions are called by test runner
+                // Rust: main() is entry point, #[test] and #[bench] functions are called by test/bench runner
                 const isRustEntryPoint = lang === 'rust' &&
-                    (name === 'main' || mods.includes('test'));
+                    (name === 'main' || mods.includes('test') || mods.includes('bench'));
+
+                // Rust: trait impl methods are invoked via trait dispatch, not direct calls
+                // They can never be "dead" - the trait contract requires them to exist
+                // className for trait impls contains " for " (e.g., "PartialEq for Glob")
+                const isRustTraitImpl = lang === 'rust' && symbol.isMethod &&
+                    symbol.className && symbol.className.includes(' for ');
 
                 // Go: Test*, Benchmark*, Example* functions are called by go test
                 const isGoTestFunc = lang === 'go' &&
@@ -2140,6 +2150,15 @@ class ProjectIndex {
 
                 // Java: @Test annotated methods are called by JUnit
                 const isJavaTestMethod = lang === 'java' && mods.includes('test');
+
+                // Java: @Override methods are invoked via polymorphic dispatch
+                // They implement interface/superclass contracts and can't be dead
+                const isJavaOverride = lang === 'java' && mods.includes('override');
+
+                // Skip trait impl / @Override methods entirely - they're required by the type system
+                if (isRustTraitImpl || isJavaOverride) {
+                    continue;
+                }
 
                 const isEntryPoint = isGoEntryPoint || isGoTestFunc ||
                     isJavaEntryPoint || isJavaTestMethod ||
