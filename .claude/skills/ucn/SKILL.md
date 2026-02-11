@@ -81,15 +81,15 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 
 | Situation | Command | What it does |
 |-----------|---------|-------------|
-| Need function + all its helpers inline | `ucn smart <name>` | Returns function source with every helper it calls expanded below it |
+| Need function + all its helpers inline | `ucn smart <name>` | Returns function source with every helper it calls expanded below it. Use instead of `about` when you need code, not metadata |
 | Checking if a refactor broke signatures | `ucn verify <name>` | Validates all call sites match the function's parameter count |
 | Understanding a file's role in the project | `ucn imports <file>` | What it depends on |
 | Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
 | Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
 | Finding all usages (not just calls) | `ucn usages <name>` | Groups into: definitions, calls, imports, type references |
-| Finding related code to refactor together | `ucn related <name>` | Functions sharing dependencies or in same file |
+| Finding sibling/related functions | `ucn related <name>` | Name-based + structural matching (same file, shared deps). Not semantic — best for parse/format pairs |
 | Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |
-| Dependency tree for a file | `ucn graph <file> --depth=2` | Visual import tree |
+| File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Can be noisy — use depth=1 for large/tightly-coupled projects. For function-level flow, use `trace` instead |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
 
 ## Command Format
