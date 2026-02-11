@@ -1,11 +1,11 @@
 {
   "name": "ucn",
-  "version": "3.4.5",
+  "version": "3.4.6",
   "description": "Code navigation built by AI, for AI. Reduces context usage when working with large codebases.",
   "main": "index.js",
   "bin": {
-    "ucn": "./cli/index.js",
-    "ucn-mcp": "./mcp/server.js"
+    "ucn": "cli/index.js",
+    "ucn-mcp": "mcp/server.js"
   },
   "scripts": {
     "test": "node --test test/parser.test.js"
