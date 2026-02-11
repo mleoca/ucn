@@ -134,6 +134,27 @@ EXTERNAL:
   fs, path, crypto
 ```
 
+## Workflows
+
+**Investigating a bug:**
+```bash
+ucn about problematic_function          # Understand it fully
+ucn trace problematic_function --depth=2  # See what it calls
+```
+
+**Before modifying a function:**
+```bash
+ucn impact the_function                 # Who will break?
+ucn smart the_function                  # See it + its helpers
+# ... make your changes ...
+ucn verify the_function                 # Did all call sites survive?
+```
+
+**Periodic cleanup:**
+```bash
+ucn deadcode --exclude=test             # What can be deleted?
+ucn toc                                 # Project overview
+```
 ## Supported Languages
 
 JavaScript, TypeScript, Python, Go, Rust, Java
@@ -144,9 +165,88 @@ JavaScript, TypeScript, Python, Go, Rust, Java
 npm install -g ucn
 ```
 
-### Claude Code (optional)
+### MCP Server
 
-To use UCN as a skill in Claude Code:
+UCN includes a built-in [MCP](https://modelcontextprotocol.io) server, so any MCP-compatible AI client can use it as a tool.
+
+**Claude Code** (`~/.claude/mcp-config.json`):
+```json
+{
+  "mcpServers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+**Claude Desktop** (macOS: `~/Library/Application Support/Claude/claude_desktop_config.json`):
+```json
+{
+  "mcpServers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+**Cursor** (`~/.cursor/mcp.json` or `.cursor/mcp.json` in project):
+```json
+{
+  "mcpServers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+**Windsurf** (`~/.codeium/windsurf/mcp_config.json`):
+```json
+{
+  "mcpServers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+**VS Code Copilot** (`.vscode/mcp.json`):
+```json
+{
+  "servers": {
+    "ucn": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+**Zed** (Settings > `settings.json`):
+```json
+{
+  "context_servers": {
+    "ucn": {
+      "command": "npx",
+      "args": ["-y", "ucn", "--mcp"]
+    }
+  }
+}
+```
+
+The MCP server exposes 27 tools: `ucn_about`, `ucn_context`, `ucn_impact`, `ucn_smart`, `ucn_trace`, `ucn_find`, `ucn_usages`, `ucn_toc`, `ucn_deadcode`, `ucn_fn`, `ucn_class`, `ucn_verify`, `ucn_imports`, `ucn_exporters`, `ucn_tests`, `ucn_related`, `ucn_graph`, `ucn_file_exports`, `ucn_search`, `ucn_plan`, `ucn_typedef`, `ucn_stacktrace`, `ucn_example`, `ucn_expand`, `ucn_lines`, `ucn_api`, `ucn_stats`.
+
+### Claude Code Skill (alternative)
+
+To use UCN as a skill in Claude Code (alternative to MCP):
 
 ```bash
 mkdir -p ~/.claude/skills
@@ -257,6 +357,7 @@ Common Flags:
   --clear-cache       Clear cache before running
   --no-follow-symlinks  Don't follow symbolic links
   -i, --interactive   Keep index in memory for multiple queries
+  --mcp               Start as MCP server (stdio transport)
 
 Quick Start:
   ucn toc                             # See project structure (compact)
@@ -265,28 +366,6 @@ Quick Start:
   ucn impact handleRequest            # Before modifying
   ucn fn handleRequest --file api     # Extract specific function
   ucn --interactive                   # Multiple queries
-```
-
-## Workflows
-
-**Investigating a bug:**
-```bash
-ucn about problematic_function          # Understand it fully
-ucn trace problematic_function --depth=2  # See what it calls
-```
-
-**Before modifying a function:**
-```bash
-ucn impact the_function                 # Who will break?
-ucn smart the_function                  # See it + its helpers
-# ... make your changes ...
-ucn verify the_function                 # Did all call sites survive?
-```
-
-**Periodic cleanup:**
-```bash
-ucn deadcode --exclude=test             # What can be deleted?
-ucn toc                                 # Project overview
 ```
 
 ## License

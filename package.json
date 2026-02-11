@@ -1,10 +1,11 @@
 {
   "name": "ucn",
-  "version": "3.4.4",
+  "version": "3.4.5",
   "description": "Code navigation built by AI, for AI. Reduces context usage when working with large codebases.",
   "main": "index.js",
   "bin": {
-    "ucn": "./cli/index.js"
+    "ucn": "./cli/index.js",
+    "ucn-mcp": "./mcp/server.js"
   },
   "scripts": {
     "test": "node --test test/parser.test.js"
@@ -38,5 +39,9 @@
     "tree-sitter-python": "^0.21.0",
     "tree-sitter-rust": "^0.21.0",
     "tree-sitter-typescript": "^0.21.0"
+  },
+  "optionalDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "zod": "^3.25.0"
   }
 }

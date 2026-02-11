@@ -22,6 +22,10 @@ const output = require('../core/output');
 
 const rawArgs = process.argv.slice(2);
 
+// MCP server mode — launch server and skip CLI
+if (rawArgs.includes('--mcp')) {
+    require('../mcp/server.js');
+} else {
 // Support -- to separate flags from positional arguments
 const doubleDashIdx = rawArgs.indexOf('--');
 const args = doubleDashIdx === -1 ? rawArgs : rawArgs.slice(0, doubleDashIdx);
@@ -78,7 +82,7 @@ if (fileArgIdx !== -1 && args[fileArgIdx + 1]) {
 
 // Known flags for validation
 const knownFlags = new Set([
-    '--help', '-h',
+    '--help', '-h', '--mcp',
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact',
     '--no-cache', '--clear-cache', '--include-tests',
@@ -2542,3 +2546,5 @@ if (flags.interactive) {
 } else {
     main();
 }
+
+} // end of --mcp else block

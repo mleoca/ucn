@@ -298,7 +298,8 @@ function shouldIgnore(name, ignores, parentDir) {
     }
 
     // Check conditional ignores (only if parentDir provided)
-    if (parentDir && CONDITIONAL_IGNORES[name]) {
+    // Use Array.isArray to avoid matching Object.prototype properties (e.g. dir named "constructor")
+    if (parentDir && Array.isArray(CONDITIONAL_IGNORES[name])) {
         const markers = CONDITIONAL_IGNORES[name];
         for (const marker of markers) {
             if (fs.existsSync(path.join(parentDir, marker))) {
