@@ -756,7 +756,7 @@ function requireName(name) {
 server.registerTool(
     'ucn_toc',
     {
-        description: 'Project overview: file counts, line counts, function/class counts per file. Use detailed=true to list all symbols. Works on JS/TS, Python, Go, Rust, Java.',
+        description: 'Get a quick overview of a project you haven\'t seen before. Shows file counts, line counts, function/class counts per file, largest files, and entry points. Use detailed=true to list every function and class. Start here when orienting in a new codebase, then use ucn_about or ucn_find to dive into specific symbols.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             detailed: z.boolean().optional().describe('Show full symbol listing per file')
@@ -777,7 +777,7 @@ server.registerTool(
 server.registerTool(
     'ucn_find',
     {
-        description: 'Find where a symbol is defined. Returns top matches sorted by usage count with signatures.',
+        description: 'Locate where a function, class, or method is defined. Use when you know the name but not the file. Returns top matches ranked by usage count with full signatures. Use file parameter to narrow results in large projects with common names.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -807,7 +807,7 @@ server.registerTool(
 server.registerTool(
     'ucn_about',
     {
-        description: 'Everything about a symbol in one call: definition, source code, callers, callees, tests. START HERE when investigating any function or class — replaces 3-4 grep+read cycles. For narrower views, use ucn_context (callers/callees only), ucn_smart (code + dependencies), or ucn_impact (call sites for refactoring).',
+        description: 'Your first stop when investigating any function or class. Returns everything in one call: definition with source code, who calls it, what it calls, and related tests. Replaces 3-4 grep+read cycles. Use this instead of reading files and grepping for callers manually. For narrower views: ucn_context (just callers/callees, no code), ucn_smart (code + dependencies inline), or ucn_impact (call sites with arguments, for refactoring).',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -832,7 +832,7 @@ server.registerTool(
 server.registerTool(
     'ucn_context',
     {
-        description: 'Lightweight caller/callee list with numbered items. Use when you just need "who calls X and what does X call" without full source code. Items are numbered — use ucn_expand to drill into any item. For the full picture (code + tests + everything), use ucn_about instead.',
+        description: 'Quick answer to "who calls this function and what does it call?" without pulling source code. Lighter than ucn_about when you don\'t need the full picture. Results are numbered — drill into any item with ucn_expand to see its code. For classes/structs, shows all methods instead of callers/callees.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -866,7 +866,7 @@ server.registerTool(
 server.registerTool(
     'ucn_impact',
     {
-        description: 'Every call site of a function, grouped by file, with the actual arguments used at each site. Use BEFORE changing a function signature — shows exactly what will break. For a lighter caller list without arguments, use ucn_context.',
+        description: 'Shows every place a function is called, with the actual arguments passed at each call site. Essential before changing a function signature — tells you exactly what will break and what needs updating. Grouped by file for easy navigation. For a lighter caller overview without arguments, use ucn_context instead.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -890,7 +890,7 @@ server.registerTool(
 server.registerTool(
     'ucn_smart',
     {
-        description: 'Function source code with all its dependencies expanded inline. Use when you need to read or modify a function and want its helpers included — saves multiple file reads. For call relationships without source code, use ucn_context.',
+        description: 'Get a function\'s source code with all its helper functions expanded inline. Use when you need to understand or modify a function and its dependencies in one read — saves opening multiple files. Better than reading whole files when you only need one function and its callees. For just the caller/callee list without code, use ucn_context.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -922,7 +922,7 @@ server.registerTool(
 server.registerTool(
     'ucn_trace',
     {
-        description: 'Call tree visualization showing execution flow from a function downward. Maps architecture — shows which modules a pipeline touches. For file-level dependency trees, use ucn_graph instead.',
+        description: 'Visualize the execution flow from a function downward as a call tree. Use when you need to understand "what happens when X runs" — maps which modules and functions a pipeline touches without reading any files. Set depth to control how deep to trace (default: 3). For file-level import/export dependencies, use ucn_graph instead.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -947,7 +947,7 @@ server.registerTool(
 server.registerTool(
     'ucn_usages',
     {
-        description: 'All usages of a symbol grouped by type: definitions, calls, imports, references.',
+        description: 'See every usage of a symbol across the project, organized by type: definitions, calls, imports, and references. Use when you need the complete picture of how something is used — not just callers (ucn_context) or call sites (ucn_impact), but also imports and non-call references. Use code_only=true to skip matches in comments and strings.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -981,7 +981,7 @@ server.registerTool(
 server.registerTool(
     'ucn_deadcode',
     {
-        description: 'Find unused functions and classes with zero callers across the project.',
+        description: 'Find dead code: functions and classes with zero callers anywhere in the project. Use during cleanup to identify code that can be safely deleted. By default excludes exported symbols (they may be used externally) and test files — set include_exported=true to audit everything, or include_tests=true to check test helpers too.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             include_exported: z.boolean().optional().describe('Include exported symbols (excluded by default)'),
@@ -1006,7 +1006,7 @@ server.registerTool(
 server.registerTool(
     'ucn_fn',
     {
-        description: "Extract a single function's source code from the project. Use file parameter to disambiguate when multiple functions share the same name.",
+        description: "Extract just one function's source code. Use instead of reading an entire file when you only need a specific function — avoids pulling thousands of irrelevant lines. Use file parameter to disambiguate when multiple functions share the same name (e.g. file='parser' to get the one in parser.js).",
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -1045,7 +1045,7 @@ server.registerTool(
 server.registerTool(
     'ucn_class',
     {
-        description: 'Extract a single class/struct/interface source code from the project.',
+        description: 'Extract a single class, struct, or interface with all its methods. Use instead of reading an entire file when you only need one class definition. Handles all supported types: JS/TS classes, Python classes, Go structs, Rust structs/traits, Java classes/interfaces.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -1091,7 +1091,7 @@ server.registerTool(
 server.registerTool(
     'ucn_verify',
     {
-        description: "Check all call sites match a function's parameter count. Use before changing a signature.",
+        description: "Safety check before changing a function signature. Verifies that every call site passes the right number of arguments. Shows valid calls, mismatches, and uncertain cases. Run this before adding/removing parameters to catch breakage early — pair with ucn_plan to preview the refactoring.",
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -1115,7 +1115,7 @@ server.registerTool(
 server.registerTool(
     'ucn_imports',
     {
-        description: 'What does a file import? Shows all import dependencies with resolved paths.',
+        description: 'List all imports in a file with resolved file paths. Use to understand what a module depends on before modifying or moving it. Resolves relative imports, package imports, and language-specific patterns (Go modules, Rust crate paths, Java packages).',
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().describe('File path (relative to project root or absolute) to analyze imports for')
@@ -1136,7 +1136,7 @@ server.registerTool(
 server.registerTool(
     'ucn_exporters',
     {
-        description: 'Who imports this file? Shows all files that depend on it.',
+        description: 'Find every file that imports/depends on a given file. Use before moving, renaming, or deleting a file to see what would break. The reverse of ucn_imports — shows dependents rather than dependencies.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().describe('File path (relative to project root or absolute) to find importers of')
@@ -1157,7 +1157,7 @@ server.registerTool(
 server.registerTool(
     'ucn_tests',
     {
-        description: 'Find test files and test cases for a function or file. Shows test-case matches, imports, and call sites in test files.',
+        description: 'Find existing tests for a function. Shows which test files cover it, matching test case names, and how the function is called in tests. Use to check test coverage before modifying a function, or to find example test patterns to follow when writing new tests.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam
@@ -1180,7 +1180,7 @@ server.registerTool(
 server.registerTool(
     'ucn_related',
     {
-        description: 'Find structurally related functions: same file, similar names, shared callers/callees. Results are name-based and structural, not semantic — best for finding sibling functions (e.g. parse/format pairs) rather than conceptually related code.',
+        description: 'Find sibling functions that are structurally related: same file, similar names, or shared callers/callees. Use to discover companion functions you might need to update together (e.g., finding serialize when you\'re changing deserialize, or findAll when modifying findOne). Name-based and structural, not semantic.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -1204,7 +1204,7 @@ server.registerTool(
 server.registerTool(
     'ucn_graph',
     {
-        description: 'File-level dependency graph showing import/export relationships between files. Best for understanding module structure. Can be noisy in tightly-coupled projects — use depth=1 for large codebases. For function-level execution flow, use ucn_trace instead.',
+        description: 'Visualize how files depend on each other through imports/exports. Use to understand module architecture — which files form a cluster, what the dependency chain looks like. Set direction to "imports" (what this file uses), "importers" (who uses this file), or "both". Can be noisy — use depth=1 for large codebases. For function-level execution flow, use ucn_trace instead.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().describe('File path (relative to project root or absolute) to graph dependencies for'),
@@ -1227,7 +1227,7 @@ server.registerTool(
 server.registerTool(
     'ucn_file_exports',
     {
-        description: "Show what a file exports (its public API). Lists exported functions, classes, and variables with signatures.",
+        description: "Show a file's public API: all exported functions, classes, and variables with their signatures. Use to understand what a module offers before importing from it, or to review the surface area of a file you're about to refactor.",
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().describe('File path (relative to project root or absolute) to list exports for')
@@ -1248,7 +1248,7 @@ server.registerTool(
 server.registerTool(
     'ucn_search',
     {
-        description: 'Text search across project files. Respects project ignores. Optionally filter to code only (exclude comments/strings).',
+        description: 'Plain text search across all project files (like grep, but respects .gitignore and project excludes). Use for non-semantic searches: TODOs, error messages, config keys, string literals. For semantic code queries (callers, usages, definitions), prefer ucn_context/ucn_usages/ucn_find. Set code_only=true to skip matches in comments and strings.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             term: z.string().describe('Search term (plain text, not regex)'),
@@ -1277,7 +1277,7 @@ server.registerTool(
 server.registerTool(
     'ucn_plan',
     {
-        description: 'Preview a refactoring: add/remove parameter or rename function. Shows before/after signatures and all call sites that need updating.',
+        description: 'Preview a refactoring before doing it. Shows before/after signatures and every call site that needs updating. Supports three operations: add a parameter (with optional default value for backward compatibility), remove a parameter, or rename the function. Pair with ucn_verify to check current state first.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -1312,7 +1312,7 @@ server.registerTool(
 server.registerTool(
     'ucn_typedef',
     {
-        description: 'Find type/interface/enum/struct/trait definitions matching a name.',
+        description: 'Find type definitions: interfaces, enums, structs, traits, or type aliases matching a name. Use when you need to see the shape of a type — what fields a struct has, what methods an interface requires, or what values an enum contains.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam
@@ -1335,7 +1335,7 @@ server.registerTool(
 server.registerTool(
     'ucn_stacktrace',
     {
-        description: 'Parse a stack trace and show source code context for each frame. Supports JS, Python, Go, Rust, Java stack formats.',
+        description: 'Paste a stack trace and get source code context for each frame. Automatically parses JS, Python, Go, Rust, and Java stack trace formats. Use when debugging an error — shows the relevant code at each level of the call stack without manually opening files.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             stack: z.string().describe('The stack trace text to parse')
@@ -1359,7 +1359,7 @@ server.registerTool(
 server.registerTool(
     'ucn_example',
     {
-        description: 'Find the best usage example of a function. Scores call sites by quality (typed assignment, destructuring, context) and returns the best one with surrounding code.',
+        description: 'Find the best real-world example of how a function is used. Automatically scores all call sites by quality (typed assignments, destructured results, documented calls rank highest) and returns the top one with surrounding code for context. Use when you need to understand the expected calling pattern before using a function yourself.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam
@@ -1381,7 +1381,7 @@ server.registerTool(
 server.registerTool(
     'ucn_expand',
     {
-        description: 'Show source code for a numbered item from the last ucn_context call. Run ucn_context first to get numbered callers/callees, then use this to drill into any item.',
+        description: 'Drill into a numbered item from the last ucn_context result. Context returns numbered callers/callees — use this to see the full source code of any one of them without a separate find+read cycle. Must run ucn_context first.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             item: z.number().describe('Item number from ucn_context output (e.g. 1, 2, 3)')
@@ -1430,7 +1430,7 @@ server.registerTool(
 server.registerTool(
     'ucn_lines',
     {
-        description: 'Extract a range of lines from a project file. Supports "10-20" or single line "15".',
+        description: 'Extract specific lines from a file (e.g., "10-20" or just "15"). Use when you know the exact line range you need — more precise than reading an entire file. File paths can be relative to the project root.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().describe('File path (relative to project root or absolute)'),
@@ -1490,7 +1490,7 @@ server.registerTool(
 server.registerTool(
     'ucn_api',
     {
-        description: 'Show exported/public symbols in the project. Works best with JS/TS (export keyword), Go (capitalized names), Rust (pub), Java (public). For Python, requires __all__ — projects without it will return empty results. Use ucn_toc for a general overview instead.',
+        description: 'List the public API surface of a project or file: all exported/public symbols with signatures. Use to understand what a library exposes before using it. Works best with JS/TS (export), Go (capitalized names), Rust (pub), Java (public). Python requires __all__ — use ucn_toc instead for Python projects without it.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().optional().describe('Optional file path to show exports for (relative to project root)')
@@ -1512,7 +1512,7 @@ server.registerTool(
 server.registerTool(
     'ucn_stats',
     {
-        description: 'Show project statistics: file counts, symbol counts, lines of code, breakdown by language and type.',
+        description: 'Quick project stats: file counts, symbol counts, lines of code, broken down by language and symbol type. Use for a high-level size check — how big is this codebase, what languages does it use, how many functions/classes exist.',
         inputSchema: z.object({
             project_dir: projectDirParam
         })

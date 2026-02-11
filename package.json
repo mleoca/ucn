@@ -1,6 +1,6 @@
 {
   "name": "ucn",
-  "version": "3.4.8",
+  "version": "3.4.9",
   "description": "Code navigation built by AI, for AI. Reduces context usage when working with large codebases.",
   "main": "index.js",
   "bin": {
