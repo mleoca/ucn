@@ -455,7 +455,7 @@ function pickBestDefinition(matches) {
     return scored[0].match;
 }
 
-function formatGraphText(graph) {
+function formatGraphText(graph, showAll = false) {
     if (graph.nodes.length === 0) return 'File not found.';
 
     const rootEntry = graph.nodes.find(n => n.file === graph.root);
@@ -465,7 +465,7 @@ function formatGraphText(graph) {
     lines.push('═'.repeat(60));
 
     const printed = new Set();
-    const maxChildren = 8;
+    const maxChildren = showAll ? Infinity : 8;
 
     function printNode(file, indent) {
         const fileEntry = graph.nodes.find(n => n.file === file);
@@ -922,7 +922,7 @@ server.registerTool(
 server.registerTool(
     'ucn_trace',
     {
-        description: 'Visualize the execution flow from a function downward as a call tree. Use when you need to understand "what happens when X runs" — maps which modules and functions a pipeline touches without reading any files. Set depth to control how deep to trace (default: 3). For file-level import/export dependencies, use ucn_graph instead.',
+        description: 'Visualize the execution flow from a function downward as a call tree. Use when you need to understand "what happens when X runs" — maps which modules and functions a pipeline touches without reading any files. Set depth to control how deep to trace (default: 3); setting depth also expands all children at each level. For file-level import/export dependencies, use ucn_graph instead.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
@@ -935,7 +935,7 @@ server.registerTool(
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const result = index.trace(name, { depth: depth ?? 3, file });
+            const result = index.trace(name, { depth: depth ?? 3, file, all: depth !== undefined });
             return toolResult(output.formatTrace(result));
         } catch (e) {
             return toolError(e.message);
@@ -1204,7 +1204,7 @@ server.registerTool(
 server.registerTool(
     'ucn_graph',
     {
-        description: 'Visualize how files depend on each other through imports/exports. Use to understand module architecture — which files form a cluster, what the dependency chain looks like. Set direction to "imports" (what this file uses), "importers" (who uses this file), or "both". Can be noisy — use depth=1 for large codebases. For function-level execution flow, use ucn_trace instead.',
+        description: 'Visualize how files depend on each other through imports/exports. Use to understand module architecture — which files form a cluster, what the dependency chain looks like. Set direction to "imports" (what this file uses), "importers" (who uses this file), or "both". Can be noisy — use depth=1 for large codebases; setting depth also expands all children at each level. For function-level execution flow, use ucn_trace instead.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             file: z.string().describe('File path (relative to project root or absolute) to graph dependencies for'),
@@ -1216,7 +1216,7 @@ server.registerTool(
         try {
             const index = getIndex(project_dir);
             const result = index.graph(file, { direction: direction || 'both', maxDepth: depth ?? 2 });
-            return toolResult(formatGraphText(result));
+            return toolResult(formatGraphText(result, depth !== undefined));
         } catch (e) {
             return toolError(e.message);
         }

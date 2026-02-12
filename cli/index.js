@@ -660,7 +660,7 @@ function runProjectCommand(rootDir, command, arg) {
 
     switch (command) {
         case 'toc': {
-            const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel });
+            const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel, all: flags.all });
             printOutput(toc, output.formatTocJson, printProjectToc);
             break;
         }
@@ -761,7 +761,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file });
+            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all });
             printOutput(aboutResult,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
@@ -795,7 +795,8 @@ function runProjectCommand(rootDir, command, arg) {
         case 'trace': {
             requireArg(arg, 'Usage: ucn . trace <name>');
             const traceDepth = flags.depth ? parseInt(flags.depth) : 3;
-            const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file });
+            const depthExplicit = flags.depth !== undefined;
+            const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file, all: flags.all || depthExplicit });
             printOutput(traceResult, output.formatTraceJson, output.formatTrace);
             break;
         }
@@ -817,8 +818,8 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'related': {
             requireArg(arg, 'Usage: ucn . related <name>');
-            const relatedResult = index.related(arg);
-            printOutput(relatedResult, output.formatRelatedJson, output.formatRelated);
+            const relatedResult = index.related(arg, { file: flags.file, all: flags.all });
+            printOutput(relatedResult, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all }));
             break;
         }
 
@@ -948,7 +949,7 @@ function runProjectCommand(rootDir, command, arg) {
                         nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
                         edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
                     }, null, 2),
-                    r => { printGraph(r, index.root, graphDepth); }
+                    r => { printGraph(r, index.root, graphDepth, flags.all || flags.depth !== undefined); }
                 );
             }
             break;
@@ -1837,13 +1838,13 @@ function printStats(stats) {
     }
 }
 
-function printGraph(graph, root, maxDepth = 2) {
+function printGraph(graph, root, maxDepth = 2, showAll = false) {
     const rootRelPath = path.relative(root, graph.root);
     console.log(`Dependency graph for ${rootRelPath}`);
     console.log('═'.repeat(60));
 
     const printed = new Set();
-    const maxChildren = 8;  // Limit children per node
+    const maxChildren = showAll ? Infinity : 8;
     let truncatedNodes = 0;
     let depthLimited = false;
 
@@ -1892,7 +1893,7 @@ function printGraph(graph, root, maxDepth = 2) {
             console.log(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
         }
         if (truncatedNodes > 0) {
-            console.log(`${truncatedNodes} nodes hidden. Graph has ${graph.nodes.length} total files.`);
+            console.log(`${truncatedNodes} nodes hidden. Use --all to show all children. Graph has ${graph.nodes.length} total files.`);
         }
     }
 }
@@ -2223,7 +2224,7 @@ UNDERSTAND CODE (UCN's strength - semantic analysis)
   context <name>      Who calls this + what it calls (numbered for expand)
   smart <name>        Function + all dependencies inline
   impact <name>       What breaks if changed (call sites grouped by file)
-  trace <name>        Call tree visualization (--depth=N)
+  trace <name>        Call tree visualization (--depth=N expands all children)
 
 ═══════════════════════════════════════════════════════════════════════════════
 FIND CODE
@@ -2248,7 +2249,7 @@ FILE DEPENDENCIES
   imports <file>      What does file import
   exporters <file>    Who imports this file
   file-exports <file> What does file export
-  graph <file>        Full dependency tree (--depth=N)
+  graph <file>        Full dependency tree (--depth=N expands all children)
 
 ═══════════════════════════════════════════════════════════════════════════════
 REFACTORING HELPERS
@@ -2271,12 +2272,13 @@ Common Flags:
   --file <pattern>    Filter by file path (e.g., --file=routes)
   --exclude=a,b       Exclude patterns (e.g., --exclude=test,mock)
   --in=<path>         Only in path (e.g., --in=src/core)
-  --depth=N           Trace/graph depth (default: 3)
+  --depth=N           Trace/graph depth (default: 3, also expands all children)
+  --all               Expand truncated sections (about, trace, graph, related)
+  --top=N             Limit results (find)
   --context=N         Lines of context around matches
   --json              Machine-readable output
   --code-only         Filter out comments and strings
   --with-types        Include type definitions
-  --top=N / --all     Limit or show all results
   --include-tests     Include test files
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches

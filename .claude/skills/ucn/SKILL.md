@@ -40,7 +40,7 @@ Replaces: grep for definition → read the file → grep for callers → grep fo
 
 ### 2. `impact` — Before changing any function
 
-Shows every call site with arguments and surrounding context. Essential before modifying a signature, renaming, or deleting.
+Shows every call site with arguments and surrounding context, without truncation. Essential before modifying a signature, renaming, or deleting.
 
 ```bash
 ucn impact score_trend              # Every caller, grouped by file
@@ -51,13 +51,15 @@ Replaces: grep for the function name → manually filtering definitions vs calls
 
 ### 3. `trace` — Understand execution flow
 
-Draws the call tree downward from any function. Depth-limited.
+Draws the call tree downward from any function. Compact by default; setting `--depth=N` shows the full tree to that depth with all children expanded.
 
 ```bash
-ucn trace generate_report --depth=3
+ucn trace generate_report            # compact (depth 3, limited breadth)
+ucn trace generate_report --depth=5  # full tree to depth 5, all children shown
+ucn trace generate_report --all      # all children at default depth
 ```
 
-This shows the entire pipeline — what `generate_report` calls, what those functions call, etc. — as an indented tree. No file reading needed. Invaluable for understanding orchestrator functions or entry points.
+Shows the entire pipeline — what `generate_report` calls, what those functions call, etc. — as an indented tree. No file reading needed. Invaluable for understanding orchestrator functions or entry points.
 
 ### 4. `fn` / `class` — Extract without reading the whole file
 
@@ -89,7 +91,7 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Finding all usages (not just calls) | `ucn usages <name>` | Groups into: definitions, calls, imports, type references |
 | Finding sibling/related functions | `ucn related <name>` | Name-based + structural matching (same file, shared deps). Not semantic — best for parse/format pairs |
 | Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |
-| File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Can be noisy — use depth=1 for large/tightly-coupled projects. For function-level flow, use `trace` instead |
+| File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Setting `--depth=N` expands all children. Can be noisy — use depth=1 for large projects. For function-level flow, use `trace` instead |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
 
 ## Command Format
@@ -111,7 +113,8 @@ ucn [target] <command> [name] [--flags]
 | `--file=<pattern>` | Disambiguate when a name exists in multiple files (e.g., `--file=api`) |
 | `--exclude=test,mock` | Focus on production code only |
 | `--in=src/core` | Limit search to a subdirectory |
-| `--depth=N` | Control tree depth for `trace` and `graph` (default 3) |
+| `--depth=N` | Control tree depth for `trace` and `graph` (default 3). Also expands all children — no breadth limit |
+| `--all` | Expand truncated sections in `about`, `trace`, `graph`, `related` |
 | `--include-tests` | Include test files in results (excluded by default) |
 | `--include-methods` | Include `obj.method()` calls in `context`/`smart` (only direct calls shown by default) |
 | `--no-cache` | Force re-index after editing files |

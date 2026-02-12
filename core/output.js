@@ -694,6 +694,7 @@ function formatTrace(trace) {
     lines.push('');
 
     // Render tree
+    let hasTruncation = false;
     const renderNode = (node, prefix = '', isLast = true) => {
         const connector = isLast ? '└── ' : '├── ';
         const extension = isLast ? '    ' : '│   ';
@@ -714,9 +715,14 @@ function formatTrace(trace) {
         lines.push(prefix + connector + label);
 
         if (node.children) {
+            const hasMore = node.truncatedChildren > 0;
             for (let i = 0; i < node.children.length; i++) {
-                const isChildLast = i === node.children.length - 1;
+                const isChildLast = !hasMore && i === node.children.length - 1;
                 renderNode(node.children[i], prefix + extension, isChildLast);
+            }
+            if (hasMore) {
+                hasTruncation = true;
+                lines.push(prefix + extension + `└── ... and ${node.truncatedChildren} more callees`);
             }
         }
     };
@@ -724,9 +730,14 @@ function formatTrace(trace) {
     // Root node
     lines.push(trace.root);
     if (trace.tree && trace.tree.children) {
+        const rootHasMore = trace.tree.truncatedChildren > 0;
         for (let i = 0; i < trace.tree.children.length; i++) {
-            const isLast = i === trace.tree.children.length - 1;
+            const isLast = !rootHasMore && i === trace.tree.children.length - 1;
             renderNode(trace.tree.children[i], '', isLast);
+        }
+        if (rootHasMore) {
+            hasTruncation = true;
+            lines.push(`└── ... and ${trace.tree.truncatedChildren} more callees`);
         }
     }
 
@@ -738,6 +749,14 @@ function formatTrace(trace) {
             lines.push(`  ${c.name} - ${c.file}:${c.line}`);
             lines.push(`    ${c.expression}`);
         }
+        if (trace.truncatedCallers) {
+            hasTruncation = true;
+            lines.push(`  ... and ${trace.truncatedCallers} more callers`);
+        }
+    }
+
+    if (hasTruncation) {
+        lines.push(`\nSome results truncated. Use --all to show all.`);
     }
 
     return lines.join('\n');
@@ -756,7 +775,7 @@ function formatTraceJson(trace) {
 /**
  * Format related command output - text
  */
-function formatRelated(related) {
+function formatRelated(related, options = {}) {
     if (!related) {
         return 'Function not found.';
     }
@@ -770,14 +789,17 @@ function formatRelated(related) {
     lines.push('');
 
     // Same file
+    let relatedTruncated = false;
     if (related.sameFile.length > 0) {
+        const maxSameFile = options.showAll ? Infinity : 8;
         lines.push(`SAME FILE (${related.sameFile.length}):`);
-        for (const f of related.sameFile.slice(0, 8)) {
+        for (const f of related.sameFile.slice(0, maxSameFile)) {
             const params = f.params ? `(${f.params})` : '';
             lines.push(`  :${f.line} ${f.name}${params}`);
         }
-        if (related.sameFile.length > 8) {
-            lines.push(`  ... and ${related.sameFile.length - 8} more`);
+        if (related.sameFile.length > maxSameFile) {
+            relatedTruncated = true;
+            lines.push(`  ... and ${related.sameFile.length - maxSameFile} more`);
         }
         lines.push('');
     }
@@ -809,6 +831,10 @@ function formatRelated(related) {
         }
     }
 
+    if (relatedTruncated) {
+        lines.push(`\nSome sections truncated. Use --all to show all.`);
+    }
+
     return lines.join('\n');
 }
 
@@ -826,7 +852,7 @@ function formatRelatedJson(related) {
  * Format impact command output - text
  * Shows what would need updating if a function signature changes
  */
-function formatImpact(impact) {
+function formatImpact(impact, options = {}) {
     if (!impact) {
         return 'Function not found.';
     }
@@ -863,7 +889,7 @@ function formatImpact(impact) {
     lines.push('BY FILE:');
     for (const fileGroup of impact.byFile) {
         lines.push(`\n${fileGroup.file} (${fileGroup.count} calls)`);
-        for (const site of fileGroup.sites.slice(0, 10)) {  // Limit to 10 per file
+        for (const site of fileGroup.sites) {
             const caller = site.callerName ? `[${site.callerName}]` : '';
             lines.push(`  :${site.line} ${caller}`);
             lines.push(`    ${site.expression}`);
@@ -871,13 +897,6 @@ function formatImpact(impact) {
                 lines.push(`    args: ${site.args.join(', ')}`);
             }
         }
-        if (fileGroup.count > 10) {
-            lines.push(`  ... and ${fileGroup.count - 10} more in this file`);
-        }
-    }
-
-    if (impact.totalCallSites > 10) {
-        lines.push(`\nShowing up to 10 call sites per file. Use "ucn . usages ${impact.function}" to see all references.`);
     }
 
     return lines.join('\n');
@@ -897,7 +916,7 @@ function formatImpactJson(impact) {
  * Format plan command output - text
  * Shows before/after signatures and all changes needed
  */
-function formatPlan(plan) {
+function formatPlan(plan, options = {}) {
     if (!plan) {
         return 'Function not found.';
     }
@@ -939,13 +958,10 @@ function formatPlan(plan) {
     lines.push('BY FILE:');
     for (const [file, changes] of byFile) {
         lines.push(`\n${file} (${changes.length} changes)`);
-        for (const change of changes.slice(0, 10)) {
+        for (const change of changes) {
             lines.push(`  :${change.line}`);
             lines.push(`    ${change.expression}`);
             lines.push(`    → ${change.suggestion}`);
-        }
-        if (changes.length > 10) {
-            lines.push(`  ... and ${changes.length - 10} more`);
         }
     }
 
@@ -1003,7 +1019,7 @@ function formatStackTrace(result) {
  * Format verify command output - text
  * Shows call site validation results
  */
-function formatVerify(result) {
+function formatVerify(result, options = {}) {
     if (!result) {
         return 'Function not found.';
     }
@@ -1038,13 +1054,10 @@ function formatVerify(result) {
     if (result.mismatchDetails.length > 0) {
         lines.push('');
         lines.push('MISMATCHES:');
-        for (const m of result.mismatchDetails.slice(0, 10)) {
+        for (const m of result.mismatchDetails) {
             lines.push(`  ${m.file}:${m.line}`);
             lines.push(`    ${m.expression}`);
             lines.push(`    Expected ${m.expected}, got ${m.actual}: [${m.args?.join(', ') || ''}]`);
-        }
-        if (result.mismatchDetails.length > 10) {
-            lines.push(`  ... and ${result.mismatchDetails.length - 10} more`);
         }
     }
 
@@ -1052,13 +1065,10 @@ function formatVerify(result) {
     if (result.uncertainDetails.length > 0) {
         lines.push('');
         lines.push('UNCERTAIN (manual check needed):');
-        for (const u of result.uncertainDetails.slice(0, 5)) {
+        for (const u of result.uncertainDetails) {
             lines.push(`  ${u.file}:${u.line}`);
             lines.push(`    ${u.expression}`);
             lines.push(`    Reason: ${u.reason}`);
-        }
-        if (result.uncertainDetails.length > 5) {
-            lines.push(`  ... and ${result.uncertainDetails.length - 5} more`);
         }
     }
 
@@ -1128,9 +1138,15 @@ function formatAbout(about, options = {}) {
     lines.push(`  ${about.usages.calls} calls, ${about.usages.imports} imports, ${about.usages.references} references`);
 
     // Callers
+    let aboutTruncated = false;
     if (about.callers.total > 0) {
         lines.push('');
-        lines.push(`CALLERS (${about.callers.total} total, showing top ${about.callers.top.length}):`);
+        if (about.callers.total > about.callers.top.length) {
+            lines.push(`CALLERS (showing ${about.callers.top.length} of ${about.callers.total}):`);
+            aboutTruncated = true;
+        } else {
+            lines.push(`CALLERS (${about.callers.total}):`);
+        }
         for (const c of about.callers.top) {
             const caller = c.callerName ? `[${c.callerName}]` : '';
             lines.push(`  ${c.file}:${c.line} ${caller}`);
@@ -1141,7 +1157,12 @@ function formatAbout(about, options = {}) {
     // Callees
     if (about.callees.total > 0) {
         lines.push('');
-        lines.push(`CALLEES (${about.callees.total} total, showing top ${about.callees.top.length}):`);
+        if (about.callees.total > about.callees.top.length) {
+            lines.push(`CALLEES (showing ${about.callees.top.length} of ${about.callees.total}):`);
+            aboutTruncated = true;
+        } else {
+            lines.push(`CALLEES (${about.callees.total}):`);
+        }
         for (const c of about.callees.top) {
             const weight = c.weight !== 'normal' ? `[${c.weight}]` : '';
             lines.push(`  ${c.name} ${weight} - ${c.file}:${c.line} (${c.callCount}x)`);
@@ -1171,7 +1192,12 @@ function formatAbout(about, options = {}) {
     // Tests
     if (about.tests.totalMatches > 0) {
         lines.push('');
-        lines.push(`TESTS: ${about.tests.totalMatches} matches in ${about.tests.fileCount} file(s)`);
+        if (about.tests.fileCount > about.tests.files.length) {
+            lines.push(`TESTS: ${about.tests.totalMatches} matches in ${about.tests.fileCount} file(s), showing ${about.tests.files.length}:`);
+            aboutTruncated = true;
+        } else {
+            lines.push(`TESTS: ${about.tests.totalMatches} matches in ${about.tests.fileCount} file(s)`);
+        }
         for (const f of about.tests.files) {
             lines.push(`  ${f}`);
         }
@@ -1208,6 +1234,10 @@ function formatAbout(about, options = {}) {
         lines.push('');
         lines.push('─── CODE ───');
         lines.push(about.code);
+    }
+
+    if (aboutTruncated) {
+        lines.push(`\nSome sections truncated. Use --all to show all.`);
     }
 
     return lines.join('\n');
