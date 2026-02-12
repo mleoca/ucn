@@ -1001,11 +1001,32 @@ function extractFunctionFromProject(index, name) {
         return;
     }
 
+    if (matches.length > 1 && !flags.file && flags.all) {
+        // Show all definitions
+        for (let i = 0; i < matches.length; i++) {
+            const m = matches[i];
+            const code = fs.readFileSync(m.file, 'utf-8');
+            const lines = code.split('\n');
+            const fnCode = lines.slice(m.startLine - 1, m.endLine).join('\n');
+            if (i > 0) console.log('');
+            if (flags.json) {
+                console.log(output.formatFunctionJson(m, fnCode));
+            } else {
+                console.log(`${m.relativePath}:${m.startLine}`);
+                console.log(`${output.lineRange(m.startLine, m.endLine)} ${output.formatFunctionSignature(m)}`);
+                console.log('─'.repeat(60));
+                console.log(fnCode);
+            }
+        }
+        return;
+    }
+
     let match;
     if (matches.length > 1 && !flags.file) {
         // Auto-select best match using same scoring as resolveSymbol
         match = pickBestDefinition(matches);
-        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Use --file to disambiguate.`);
+        const others = matches.filter(m => m !== match).map(m => `${m.relativePath}:${m.startLine}`).join(', ');
+        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
     } else {
         match = matches[0];
     }
@@ -1035,11 +1056,34 @@ function extractClassFromProject(index, name) {
         return;
     }
 
+    if (matches.length > 1 && !flags.file && flags.all) {
+        // Show all definitions
+        for (let i = 0; i < matches.length; i++) {
+            const m = matches[i];
+            const code = fs.readFileSync(m.file, 'utf-8');
+            const language = detectLanguage(m.file);
+            const { cls, code: clsCode } = extractClass(code, language, m.name);
+            if (cls) {
+                if (i > 0) console.log('');
+                if (flags.json) {
+                    console.log(JSON.stringify({ ...cls, code: clsCode }, null, 2));
+                } else {
+                    console.log(`${m.relativePath}:${cls.startLine}`);
+                    console.log(`${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
+                    console.log('─'.repeat(60));
+                    console.log(clsCode);
+                }
+            }
+        }
+        return;
+    }
+
     let match;
     if (matches.length > 1 && !flags.file) {
         // Auto-select best match using same scoring as resolveSymbol
         match = pickBestDefinition(matches);
-        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Use --file to disambiguate.`);
+        const others = matches.filter(m => m !== match).map(m => `${m.relativePath}:${m.startLine}`).join(', ');
+        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
     } else {
         match = matches[0];
     }

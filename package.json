@@ -1,7 +1,7 @@
 {
   "name": "ucn",
-  "version": "3.5.0",
-  "description": "Code navigation built by AI, for AI. Reduces context usage when working with large codebases.",
+  "version": "3.5.1",
+  "description": "Universal Code Navigator — function relationships, call trees, and impact analysis across large codebases without reading entire files.",
   "main": "index.js",
   "bin": {
     "ucn": "cli/index.js",
