@@ -2446,7 +2446,7 @@ class ProjectIndex {
         }
         // Sort by number of shared parts
         related.similarNames.sort((a, b) => b.sharedParts.length - a.sharedParts.length);
-        related.similarNames = related.similarNames.slice(0, 10);
+        if (!options.all) related.similarNames = related.similarNames.slice(0, 10);
 
         // 3. Shared callers - functions called by the same callers
         const myCallers = new Set(this.findCallers(name).map(c => c.callerName).filter(Boolean));
@@ -2464,9 +2464,10 @@ class ProjectIndex {
                 }
             }
             // Sort by shared caller count
+            const maxShared = options.all ? Infinity : 5;
             const sorted = Array.from(callerCounts.entries())
                 .sort((a, b) => b[1] - a[1])
-                .slice(0, 5);
+                .slice(0, maxShared);
             for (const [symName, count] of sorted) {
                 const sym = this.symbols.get(symName)?.[0];
                 if (sym) {
@@ -2499,7 +2500,7 @@ class ProjectIndex {
                 // Sort by shared callee count
                 const sorted = Array.from(calleeCounts.entries())
                     .sort((a, b) => b[1] - a[1])
-                    .slice(0, 5);
+                    .slice(0, options.all ? Infinity : 5);
                 for (const [symName, count] of sorted) {
                     const sym = this.symbols.get(symName)?.[0];
                     if (sym) {
@@ -2530,6 +2531,7 @@ class ProjectIndex {
         const rawDepth = options.depth ?? 3;
         const maxDepth = Math.max(0, rawDepth);
         const direction = options.direction || 'down';  // 'down' = callees, 'up' = callers, 'both'
+        const maxChildren = options.all ? Infinity : 10;
 
         const { def } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
@@ -2555,7 +2557,7 @@ class ProjectIndex {
 
             if (dir === 'down' || dir === 'both') {
                 const callees = this.findCallees(funcDef);
-                for (const callee of callees.slice(0, 10)) {  // Limit children
+                for (const callee of callees.slice(0, maxChildren)) {
                     // callee already has the best-matched definition from findCallees
                     const childTree = buildTree(callee, currentDepth + 1, 'down');
                     if (childTree) {
@@ -2566,6 +2568,9 @@ class ProjectIndex {
                         });
                     }
                 }
+                if (callees.length > maxChildren) {
+                    node.truncatedChildren = callees.length - maxChildren;
+                }
             }
 
             return node;
@@ -2575,13 +2580,18 @@ class ProjectIndex {
 
         // Also get callers if direction is 'up' or 'both'
         let callers = [];
+        let truncatedCallers = 0;
         if (direction === 'up' || direction === 'both') {
-            callers = this.findCallers(name).slice(0, 10).map(c => ({
+            const allCallers = this.findCallers(name);
+            callers = allCallers.slice(0, maxChildren).map(c => ({
                 name: c.callerName || '(anonymous)',
                 file: c.relativePath,
                 line: c.line,
                 expression: c.content.trim()
             }));
+            if (allCallers.length > maxChildren) {
+                truncatedCallers = allCallers.length - maxChildren;
+            }
         }
 
         return {
@@ -2591,7 +2601,8 @@ class ProjectIndex {
             direction,
             maxDepth,
             tree,
-            callers: direction !== 'down' ? callers : undefined
+            callers: direction !== 'down' ? callers : undefined,
+            truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined
         };
     }
 
@@ -3351,8 +3362,8 @@ class ProjectIndex {
      * @returns {object} Complete symbol info
      */
     about(name, options = {}) {
-        const maxCallers = options.maxCallers || 5;
-        const maxCallees = options.maxCallees || 5;
+        const maxCallers = options.all ? Infinity : (options.maxCallers || 5);
+        const maxCallees = options.all ? Infinity : (options.maxCallees || 5);
 
         // Find symbol definition(s)
         const definitions = this.find(name, { exact: true, file: options.file });
@@ -3365,7 +3376,7 @@ class ProjectIndex {
             // Return suggestion
             return {
                 found: false,
-                suggestions: fuzzy.slice(0, 5).map(s => ({
+                suggestions: (options.all ? fuzzy : fuzzy.slice(0, 5)).map(s => ({
                     name: s.name,
                     file: s.relativePath,
                     line: s.startLine,
@@ -3425,7 +3436,7 @@ class ProjectIndex {
         const testSummary = {
             fileCount: tests.length,
             totalMatches: tests.reduce((sum, t) => sum + t.matches.length, 0),
-            files: tests.slice(0, 3).map(t => t.file)
+            files: (options.all ? tests : tests.slice(0, 3)).map(t => t.file)
         };
 
         // Extract code if requested (default: true)
@@ -3480,7 +3491,7 @@ class ProjectIndex {
                 top: callees
             },
             tests: testSummary,
-            otherDefinitions: others.slice(0, 3).map(d => ({
+            otherDefinitions: (options.all ? others : others.slice(0, 3)).map(d => ({
                 file: d.relativePath,
                 line: d.startLine,
                 usageCount: d.usageCount
@@ -3690,22 +3701,23 @@ class ProjectIndex {
         }
 
         // Hints: top files by function count and lines
+        const hintLimit = options.all ? Infinity : 3;
         const topFunctionFiles = [...files]
             .sort((a, b) => b.functions - a.functions || b.lines - a.lines)
             .filter(f => f.functions > 0)
-            .slice(0, 3)
+            .slice(0, hintLimit)
             .map(f => ({ file: f.file, functions: f.functions }));
 
         const topLineFiles = [...files]
             .sort((a, b) => b.lines - a.lines)
-            .slice(0, 3)
+            .slice(0, hintLimit)
             .map(f => ({ file: f.file, lines: f.lines }));
 
         // Entry point candidates
         const entryPattern = /(main|index|server|app)\.(js|jsx|ts|tsx|py|go|rs|java)$/i;
         const entryFiles = files
             .filter(f => entryPattern.test(f.file))
-            .slice(0, 5)
+            .slice(0, options.all ? Infinity : 5)
             .map(f => f.file);
 
         return {
