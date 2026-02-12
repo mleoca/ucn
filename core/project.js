@@ -485,7 +485,7 @@ class ProjectIndex {
         if (definitions.length > 1) {
             warnings.push({
                 type: 'ambiguous',
-                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Use --file to disambiguate.`,
+                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${definitions.filter(d => d !== def).map(d => `${d.relativePath}:${d.startLine}`).join(', ')}. Use --file to disambiguate.`,
                 alternatives: definitions.filter(d => d !== def).map(d => ({
                     file: d.relativePath,
                     line: d.startLine
