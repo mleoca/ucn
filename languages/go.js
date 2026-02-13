@@ -578,8 +578,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Look for both identifier and field_identifier (method names in selector expressions)
-        const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier';
+        // Look for identifier, field_identifier (method names in selector expressions),
+        // and type_identifier (type references in params, return types, composite literals, etc.)
+        const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier';
         if (!isIdentifier || node.text !== name) {
             return true;
         }
@@ -630,9 +631,15 @@ function findUsagesInCode(code, name, parser) {
                     usageType = 'definition';
                 }
             }
-            // Definition: parameter
-            else if (parent.type === 'parameter_declaration') {
+            // Definition: parameter name (not the type)
+            else if (parent.type === 'parameter_declaration' &&
+                     parent.childForFieldName('name') === node) {
                 usageType = 'definition';
+            }
+            // Composite literal: Type{} — type_identifier is the type of composite_literal
+            else if (parent.type === 'composite_literal' &&
+                     parent.childForFieldName('type') === node) {
+                usageType = 'call';
             }
             // Method call: selector_expression followed by call (field_identifier case)
             else if (parent.type === 'selector_expression') {

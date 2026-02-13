@@ -938,8 +938,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Look for both identifier and field_identifier (method names in obj.method() calls)
-        const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier';
+        // Look for identifier, field_identifier (method names in obj.method() calls),
+        // and type_identifier (type references in params, return types, struct expressions, etc.)
+        const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier';
         if (!isIdentifier || node.text !== name) {
             return true;
         }
@@ -961,6 +962,14 @@ function findUsagesInCode(code, name, parser) {
             else if (parent.type === 'call_expression' &&
                      parent.childForFieldName('function') === node) {
                 usageType = 'call';
+            }
+            // Scoped call: Type::method() — identifier inside scoped_identifier inside call_expression
+            else if (parent.type === 'scoped_identifier') {
+                const grandparent = parent.parent;
+                if (grandparent && grandparent.type === 'call_expression' &&
+                    grandparent.childForFieldName('function') === parent) {
+                    usageType = 'call';
+                }
             }
             // Macro invocation: name!
             else if (parent.type === 'macro_invocation') {
@@ -1003,9 +1012,15 @@ function findUsagesInCode(code, name, parser) {
                      parent.childForFieldName('name') === node) {
                 usageType = 'definition';
             }
-            // Definition: parameter
-            else if (parent.type === 'parameter') {
+            // Definition: parameter name (not the type)
+            else if (parent.type === 'parameter' &&
+                     parent.childForFieldName('pattern') === node) {
                 usageType = 'definition';
+            }
+            // Struct expression: Type { field: value }
+            else if (parent.type === 'struct_expression' &&
+                     parent.childForFieldName('name') === node) {
+                usageType = 'call';
             }
             // Method call: obj.name()
             else if (parent.type === 'field_expression' &&

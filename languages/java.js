@@ -760,8 +760,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Only look for identifiers with the matching name
-        if (node.type !== 'identifier' || node.text !== name) {
+        // Look for identifiers and type_identifiers with the matching name
+        // type_identifier is used in Java for type references: new ClassName(), extends ClassName, field types
+        if ((node.type !== 'identifier' && node.type !== 'type_identifier') || node.text !== name) {
             return true;
         }
 
@@ -832,9 +833,14 @@ function findUsagesInCode(code, name, parser) {
             // Object creation: new ClassName()
             else if (parent.type === 'object_creation_expression') {
                 const typeNode = parent.childForFieldName('type');
-                if (typeNode?.text === name) {
+                if (typeNode === node || typeNode?.text === name) {
                     usageType = 'call';
                 }
+            }
+            // Static method call: ClassName.staticMethod() — ClassName is the object
+            else if (parent.type === 'method_invocation' &&
+                     parent.childForFieldName('object') === node) {
+                usageType = 'call';
             }
             // Field access: obj.field
             else if (parent.type === 'field_access' &&

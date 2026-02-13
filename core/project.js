@@ -1139,15 +1139,32 @@ class ProjectIndex {
             const fileEntry = this.files.get(def.file);
             const language = fileEntry?.language;
 
+            // Build list of inner callable symbols (functions/methods defined inside def)
+            // to exclude calls that belong to nested named functions
+            const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl']);
+            const innerSymbolRanges = fileEntry ? fileEntry.symbols
+                .filter(s => !nonCallableTypes.has(s.type) &&
+                        s.startLine > def.startLine && s.endLine <= def.endLine &&
+                        s.startLine !== def.startLine)
+                .map(s => [s.startLine, s.endLine]) : [];
+
             const callees = new Map();  // key -> { name, bindingId, count }
             let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
             let selfMethodCalls = null; // collected for Python self.method() resolution
 
             for (const call of calls) {
-                // Filter to calls within this function's scope using enclosingFunction
-                if (!call.enclosingFunction) continue;
-                if (call.enclosingFunction.name !== def.name) continue;
-                if (call.enclosingFunction.startLine !== def.startLine) continue;
+                // Filter to calls within this function's scope
+                // Method 1: Direct match via enclosingFunction (fast path for direct calls)
+                const isDirectMatch = call.enclosingFunction &&
+                    call.enclosingFunction.startLine === def.startLine;
+                // Method 2: Line-range containment (catches calls inside nested callbacks/closures)
+                // A call is in our scope if it's within our line range AND not inside a named inner symbol
+                const isInRange = call.line >= def.startLine && call.line <= def.endLine;
+                const isInInnerSymbol = isInRange && innerSymbolRanges.some(
+                    ([start, end]) => call.line >= start && call.line <= end);
+                const isNestedCallback = isInRange && !isInInnerSymbol && !isDirectMatch;
+
+                if (!isDirectMatch && !isNestedCallback) continue;
 
                 // Smart method call handling:
                 // - Go: include all method calls (Go doesn't use this/self/cls)
@@ -1799,7 +1816,10 @@ class ProjectIndex {
         const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class'];
         const matches = this.find(name);
 
-        return matches.filter(m => typeKinds.includes(m.type));
+        return matches.filter(m => typeKinds.includes(m.type)).map(m => ({
+            ...m,
+            code: this.extractCode(m)
+        }));
     }
 
     /**
@@ -1876,7 +1896,7 @@ class ProjectIndex {
      * @param {string} [filePath] - Optional file to limit to
      * @returns {Array} Exported symbols
      */
-    api(filePath) {
+    api(filePath, options = {}) {
         const results = [];
 
         const filesToCheck = filePath
@@ -1885,6 +1905,11 @@ class ProjectIndex {
 
         for (const [absPath, fileEntry] of (filePath ? [[this.findFile(filePath), this.files.get(this.findFile(filePath))]] : this.files.entries())) {
             if (!fileEntry) continue;
+
+            // Skip test files by default (test classes aren't part of public API)
+            if (!options.includeTests && isTestFile(fileEntry.relativePath, fileEntry.language)) {
+                continue;
+            }
 
             const exportedNames = new Set(fileEntry.exports);
 
@@ -2220,12 +2245,16 @@ class ProjectIndex {
                     isJavaEntryPoint || isJavaTestMethod ||
                     isPythonEntryPoint || isRustEntryPoint;
 
+                // Entry points are always excluded — they're invoked by the runtime, not user code
+                if (isEntryPoint) {
+                    continue;
+                }
+
                 const isExported = fileEntry && (
                     fileEntry.exports.includes(name) ||
                     mods.includes('export') ||
                     mods.includes('public') ||
-                    (lang === 'go' && /^[A-Z]/.test(name)) ||
-                    isEntryPoint
+                    (lang === 'go' && /^[A-Z]/.test(name))
                 );
 
                 // Skip exported unless requested
@@ -2295,45 +2324,69 @@ class ProjectIndex {
         }
 
         if (!this.files.has(targetPath)) {
-            return { root: filePath, nodes: [], edges: [] };
+            return { root: filePath, nodes: [], edges: [], direction };
         }
 
-        const visited = new Set();
-        const graph = {
+        const buildSubgraph = (dir) => {
+            const visited = new Set();
+            const nodes = [];
+            const edges = [];
+
+            const traverse = (file, depth) => {
+                if (visited.has(file)) return;
+                visited.add(file);
+
+                const fileEntry = this.files.get(file);
+                const relPath = fileEntry ? fileEntry.relativePath : path.relative(this.root, file);
+                nodes.push({ file, relativePath: relPath, depth });
+
+                // Stop traversal at max depth but still register the node above
+                if (depth >= maxDepth) return;
+
+                let neighbors = [];
+                if (dir === 'imports') {
+                    neighbors = this.importGraph.get(file) || [];
+                } else {
+                    neighbors = this.exportGraph.get(file) || [];
+                }
+
+                // Deduplicate neighbors (same file may be imported multiple times, e.g. Java inner classes)
+                const uniqueNeighbors = [...new Set(neighbors)];
+
+                for (const neighbor of uniqueNeighbors) {
+                    edges.push({ from: file, to: neighbor });
+                    traverse(neighbor, depth + 1);
+                }
+            };
+
+            traverse(targetPath, 0);
+            return { nodes, edges };
+        };
+
+        if (direction === 'both') {
+            // Build separate sub-graphs for imports and importers
+            const importsGraph = buildSubgraph('imports');
+            const importersGraph = buildSubgraph('importers');
+
+            return {
+                root: targetPath,
+                direction: 'both',
+                imports: { nodes: importsGraph.nodes, edges: importsGraph.edges },
+                importers: { nodes: importersGraph.nodes, edges: importersGraph.edges },
+                // Keep combined for backward compat
+                nodes: [...importsGraph.nodes, ...importersGraph.nodes.filter(n =>
+                    !importsGraph.nodes.some(in_ => in_.file === n.file))],
+                edges: [...importsGraph.edges, ...importersGraph.edges]
+            };
+        }
+
+        const subgraph = buildSubgraph(direction);
+        return {
             root: targetPath,
-            nodes: [],
-            edges: []
+            direction,
+            nodes: subgraph.nodes,
+            edges: subgraph.edges
         };
-
-        const traverse = (file, depth) => {
-            if (visited.has(file)) return;
-            visited.add(file);
-
-            const fileEntry = this.files.get(file);
-            const relPath = fileEntry ? fileEntry.relativePath : path.relative(this.root, file);
-            graph.nodes.push({ file, relativePath: relPath, depth });
-
-            // Stop traversal at max depth but still register the node above
-            if (depth >= maxDepth) return;
-
-            let neighbors = [];
-            if (direction === 'imports' || direction === 'both') {
-                const imports = this.importGraph.get(file) || [];
-                neighbors = neighbors.concat(imports);
-            }
-            if (direction === 'importers' || direction === 'both') {
-                const importers = this.exportGraph.get(file) || [];
-                neighbors = neighbors.concat(importers);
-            }
-
-            for (const neighbor of neighbors) {
-                graph.edges.push({ from: file, to: neighbor });
-                traverse(neighbor, depth + 1);
-            }
-        };
-
-        traverse(targetPath, 0);
-        return graph;
     }
 
     /**
@@ -3571,7 +3624,8 @@ class ProjectIndex {
     search(term, options = {}) {
         const results = [];
         // Escape the term to handle special regex characters
-        const regex = new RegExp(escapeRegExp(term), 'gi');
+        const regexFlags = options.caseSensitive ? 'g' : 'gi';
+        const regex = new RegExp(escapeRegExp(term), regexFlags);
 
         for (const [filePath, fileEntry] of this.files) {
             try {

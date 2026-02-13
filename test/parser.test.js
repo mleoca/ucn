@@ -7381,5 +7381,661 @@ public class App {}
     });
 });
 
+// ============================================================
+// Regression tests for Bug Report #3 (2026-02-13)
+// ============================================================
+
+describe('Bug Report #3 Regressions', () => {
+
+it('BUG 1 — JS/TS callback references in HOFs (.then(fn), .map(fn))', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+function handlePaste() {
+    setErr(null);
+    navigator.clipboard
+        .readText()
+        .then(handleProcess)
+        .catch((e) => { console.log(e); });
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+
+    // handleProcess should be detected as a function reference
+    const ref = calls.find(c => c.name === 'handleProcess');
+    assert.ok(ref, 'handleProcess should be detected as a function reference');
+    assert.strictEqual(ref.isFunctionReference, true, 'should be marked as isFunctionReference');
+    assert.strictEqual(ref.isMethod, false);
+});
+
+it('BUG 2 — findCallees detects calls inside nested callbacks', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug2-'));
+
+    // Define the functions so they resolve in the symbol table
+    fs.writeFileSync(path.join(tmpDir, 'auth.js'), `
+export function setAccessToken(token) { /* store token */ }
+export function processData(data) { return data; }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'App.js'), `
+import { setAccessToken, processData } from './auth';
+
+function handleLogin() {
+    fetch('/api/login')
+        .then((r) => {
+            setAccessToken(r.token);
+            processData(r.data);
+        });
+}
+
+export { handleLogin };
+`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    const defs = index.find('handleLogin');
+    assert.ok(defs.length > 0, 'handleLogin should be found');
+
+    const callees = index.findCallees(defs[0]);
+    const calleeNames = callees.map(c => c.name);
+
+    // The key test: setAccessToken inside .then() callback should be detected
+    assert.ok(calleeNames.includes('setAccessToken'),
+        `setAccessToken should be detected as callee of handleLogin (got: ${calleeNames.join(', ')})`);
+    assert.ok(calleeNames.includes('processData'),
+        `processData should be detected as callee of handleLogin (got: ${calleeNames.join(', ')})`);
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 2b — nested callbacks do not steal calls from inner named symbols', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug2b-'));
+    fs.writeFileSync(path.join(tmpDir, 'helpers.js'), `
+function foo() { return 1; }
+function bar() { return 2; }
+module.exports = { foo, bar };
+`);
+    fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+const { foo, bar } = require('./helpers');
+
+function outer() {
+    foo();
+}
+
+function inner() {
+    bar();
+}
+
+module.exports = { outer, inner };
+`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    // outer should NOT have bar() as a callee (bar is inside inner, a separate symbol)
+    const outerDefs = index.find('outer');
+    assert.ok(outerDefs.length > 0);
+    const outerCallees = index.findCallees(outerDefs[0]);
+    const outerCalleeNames = outerCallees.map(c => c.name);
+    assert.ok(!outerCalleeNames.includes('bar'),
+        `outer should NOT have bar as callee (got: ${outerCalleeNames.join(', ')})`);
+
+    // inner should have bar() as a callee
+    const innerDefs = index.find('inner');
+    assert.ok(innerDefs.length > 0);
+    const innerCallees = index.findCallees(innerDefs[0]);
+    const innerCalleeNames = innerCallees.map(c => c.name);
+    assert.ok(innerCalleeNames.includes('bar'),
+        `inner should have bar as callee (got: ${innerCalleeNames.join(', ')})`);
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 3 — typedef returns source code', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug3-'));
+    fs.writeFileSync(path.join(tmpDir, 'types.ts'), `
+export interface UserProps {
+    name: string;
+    email: string;
+    age?: number;
+}
+
+export type Status = 'active' | 'inactive';
+`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    const types = index.typedef('UserProps');
+    assert.ok(types.length > 0, 'UserProps should be found');
+    assert.ok(types[0].code, 'typedef should include source code');
+    assert.ok(types[0].code.includes('name: string'), 'code should contain the interface fields');
+    assert.ok(types[0].code.includes('email: string'), 'code should contain email field');
+
+    const statusTypes = index.typedef('Status');
+    assert.ok(statusTypes.length > 0, 'Status should be found');
+    assert.ok(statusTypes[0].code, 'typedef should include source code for type alias');
+    assert.ok(statusTypes[0].code.includes('active'), 'code should contain type values');
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 4 — fileExports detects export type and export interface', (t) => {
+    const { getParser } = require('../languages');
+    const { findExportsInCode } = require('../languages/javascript');
+
+    const code = `
+export type UIObjectType = 'dashboard' | 'report';
+export interface ListItemsParams {
+    objectType?: string;
+    title?: string;
+}
+export enum Status {
+    Active = 'active',
+    Inactive = 'inactive'
+}
+export function fetchData() { return null; }
+export const isProd = true;
+`;
+    const parser = getParser('typescript');
+    const exports = findExportsInCode(code, parser);
+    const names = exports.map(e => e.name);
+
+    assert.ok(names.includes('UIObjectType'), 'export type should be detected');
+    assert.ok(names.includes('ListItemsParams'), 'export interface should be detected');
+    assert.ok(names.includes('Status'), 'export enum should be detected');
+    assert.ok(names.includes('fetchData'), 'export function should be detected');
+    assert.ok(names.includes('isProd'), 'export const should be detected');
+
+    // Type exports should be marked
+    const typeExport = exports.find(e => e.name === 'UIObjectType');
+    assert.strictEqual(typeExport.isTypeExport, true, 'type export should have isTypeExport flag');
+});
+
+it('BUG 5 — graph deduplicates multiple imports to same file', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug5-'));
+
+    // Create Java files where one imports multiple items from same file
+    const srcDir = path.join(tmpDir, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+
+    fs.writeFileSync(path.join(srcDir, 'FilterCondition.java'), `
+package example;
+public class FilterCondition {
+    public enum Operator { EQ, NE, GT }
+    public enum Condition { AND, OR }
+}
+`);
+    fs.writeFileSync(path.join(srcDir, 'Visitor.java'), `
+package example;
+import example.FilterCondition;
+import example.FilterCondition.Operator;
+import example.FilterCondition.Condition;
+
+public class Visitor {
+    public void visit(FilterCondition fc) {
+        Operator op = fc.getOp();
+        Condition cond = fc.getCond();
+    }
+}
+`);
+    fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    const graph = index.graph('src/Visitor.java', { direction: 'imports', maxDepth: 1 });
+    // Count edges from root to FilterCondition
+    const edgesToFC = graph.edges.filter(e =>
+        e.from === graph.root && e.to.includes('FilterCondition'));
+    assert.ok(edgesToFC.length <= 1,
+        `Should have at most 1 edge to FilterCondition (got ${edgesToFC.length})`);
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 6 — graph "both" direction returns separate sections', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug6-'));
+
+    fs.writeFileSync(path.join(tmpDir, 'a.js'), `const b = require('./b');`);
+    fs.writeFileSync(path.join(tmpDir, 'b.js'), `const c = require('./c'); module.exports = {};`);
+    fs.writeFileSync(path.join(tmpDir, 'c.js'), `module.exports = {};`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    const graph = index.graph('b.js', { direction: 'both', maxDepth: 2 });
+    assert.strictEqual(graph.direction, 'both', 'direction should be "both"');
+    assert.ok(graph.imports, 'should have imports sub-graph');
+    assert.ok(graph.importers, 'should have importers sub-graph');
+
+    // b.js imports c.js
+    const importEdges = graph.imports.edges.filter(e => e.from === graph.root);
+    const importTargets = importEdges.map(e => path.basename(e.to));
+    assert.ok(importTargets.some(t => t === 'c.js'),
+        'imports should include c.js');
+
+    // a.js imports b.js (so a.js is an importer)
+    const importerEdges = graph.importers.edges.filter(e => e.from === graph.root);
+    const importerTargets = importerEdges.map(e => path.basename(e.to));
+    assert.ok(importerTargets.some(t => t === 'a.js'),
+        'importers should include a.js');
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 8 — Java new ClassName() classified as call, not reference', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/java');
+
+    const code = `
+package example;
+import example.EntityRepository;
+
+public class Controller {
+    public void handle() {
+        EntityRepository repo = new EntityRepository(dataSource);
+        repo.findAll();
+    }
+}
+`;
+    const parser = getParser('java');
+    const usages = findUsagesInCode(code, 'EntityRepository', parser);
+
+    // new EntityRepository() should be a "call"
+    const constructorUsage = usages.find(u => u.usageType === 'call');
+    assert.ok(constructorUsage, 'new EntityRepository() should be classified as "call"');
+});
+
+it('BUG 8b — Java static method calls classified as call', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/java');
+
+    const code = `
+package example;
+import example.ErrorUtil;
+
+public class Handler {
+    public void handle() {
+        String uid = ErrorUtil.createErrorUid(exception);
+    }
+}
+`;
+    const parser = getParser('java');
+    const usages = findUsagesInCode(code, 'ErrorUtil', parser);
+
+    // ErrorUtil in ErrorUtil.createErrorUid() should be a "call" (static method invocation)
+    const callUsages = usages.filter(u => u.usageType === 'call');
+    assert.ok(callUsages.length > 0,
+        'ErrorUtil.createErrorUid() should classify ErrorUtil as "call"');
+});
+
+it('BUG 8c — Java type_identifier in new expression detected', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/java');
+
+    const code = `
+package example;
+
+public class Service {
+    private Repository repo;
+    public void init() {
+        this.repo = new Repository(config);
+    }
+}
+`;
+    const parser = getParser('java');
+    const usages = findUsagesInCode(code, 'Repository', parser);
+
+    // Should find definition (field type) and call (new expression)
+    assert.ok(usages.length >= 1, 'Repository should have usages');
+    const callUsage = usages.find(u => u.usageType === 'call');
+    assert.ok(callUsage, 'new Repository() should be classified as "call"');
+});
+
+it('BUG 9 — search case sensitivity option', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug9-'));
+    fs.writeFileSync(path.join(tmpDir, 'test.js'), `
+// TODO: fix this
+// todo: also fix this
+const TODO_LIST = [];
+`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    // Case-insensitive (default)
+    const insensitive = index.search('TODO');
+    const insensitiveCount = insensitive.reduce((sum, r) => sum + r.matches.length, 0);
+
+    // Case-sensitive
+    const sensitive = index.search('TODO', { caseSensitive: true });
+    const sensitiveCount = sensitive.reduce((sum, r) => sum + r.matches.length, 0);
+
+    assert.ok(insensitiveCount > sensitiveCount,
+        `Case-insensitive (${insensitiveCount}) should find more matches than case-sensitive (${sensitiveCount})`);
+    assert.ok(sensitiveCount >= 2, 'Case-sensitive should find at least 2 matches (TODO comment and TODO_LIST)');
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 12 — deadcode excludes entry points even with include_exported', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug12-'));
+    const srcDir = path.join(tmpDir, 'src');
+    fs.mkdirSync(srcDir, { recursive: true });
+
+    fs.writeFileSync(path.join(srcDir, 'Application.java'), `
+package example;
+
+public class Application {
+    public static void main(String[] args) {
+        System.out.println("Hello");
+    }
+}
+`);
+    fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    // Even with include_exported, main() should not be dead code
+    const dead = index.deadcode({ includeExported: true });
+    const mainDead = dead.find(d => d.name === 'main');
+    assert.ok(!mainDead, 'main() should never be reported as dead code');
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 13 — api excludes test files by default', (t) => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug13-'));
+
+    fs.writeFileSync(path.join(tmpDir, 'src.js'), `
+export function realApi() { return 1; }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'src.test.js'), `
+export function testHelper() { return 2; }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+    const { ProjectIndex } = require('../core/project');
+    const index = new ProjectIndex(tmpDir);
+    index.build(null, { quiet: true });
+
+    const apiSymbols = index.api();
+    const names = apiSymbols.map(s => s.name);
+
+    assert.ok(names.includes('realApi'), 'realApi should be in API');
+    assert.ok(!names.includes('testHelper'), 'testHelper from test file should be excluded from API by default');
+
+    fs.rmSync(tmpDir, { recursive: true });
+});
+
+it('BUG 1b — HOF callback detection respects argument positions', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+function process(items) {
+    items.reduce(accumulate, initialValue);
+    setTimeout(doWork, delay);
+    element.addEventListener(eventType, handleClick);
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+    const refs = calls.filter(c => c.isFunctionReference);
+    const refNames = refs.map(c => c.name);
+
+    // Only callback-position args should be detected
+    assert.ok(refNames.includes('accumulate'), 'reduce arg 0 should be detected');
+    assert.ok(!refNames.includes('initialValue'), 'reduce arg 1 should NOT be detected');
+    assert.ok(refNames.includes('doWork'), 'setTimeout arg 0 should be detected');
+    assert.ok(!refNames.includes('delay'), 'setTimeout arg 1 should NOT be detected');
+    assert.ok(refNames.includes('handleClick'), 'addEventListener arg 1 should be detected');
+    assert.ok(!refNames.includes('eventType'), 'addEventListener arg 0 should NOT be detected');
+});
+
+it('BUG 1c — HOF callback detection handles member_expression args', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+function process() {
+    promise.then(utils.handleError);
+    items.map(validators.isValid);
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+    const refs = calls.filter(c => c.isFunctionReference);
+
+    const handleErrorRef = refs.find(c => c.name === 'handleError');
+    assert.ok(handleErrorRef, 'utils.handleError should be detected as callback');
+    assert.strictEqual(handleErrorRef.isMethod, true, 'should be marked as method');
+    assert.strictEqual(handleErrorRef.receiver, 'utils', 'receiver should be utils');
+
+    const isValidRef = refs.find(c => c.name === 'isValid');
+    assert.ok(isValidRef, 'validators.isValid should be detected as callback');
+    assert.strictEqual(isValidRef.receiver, 'validators');
+});
+
+it('BUG 3b — typedef in file mode includes source code and class type', (t) => {
+    const tmpFile = path.join(os.tmpdir(), 'ucn-typedef-test.py');
+    fs.writeFileSync(tmpFile, `
+from enum import Enum
+
+class Color(Enum):
+    RED = 1
+    GREEN = 2
+    BLUE = 3
+
+class Point:
+    x: float
+    y: float
+`);
+
+    const lang = require('../languages');
+    const pyMod = lang.getLanguageModule('python');
+    const parser = lang.getParser('python');
+    const code = fs.readFileSync(tmpFile, 'utf-8');
+    const classes = pyMod.findClasses(code, parser);
+
+    // Python enums are classified as 'class' — typedef should find them
+    const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class'];
+    const colorMatch = classes.find(c => c.name === 'Color' && typeKinds.includes(c.type));
+    assert.ok(colorMatch, 'Color(Enum) should be found by typedef with class in typeKinds');
+
+    fs.unlinkSync(tmpFile);
+});
+
+it('BUG 4b — TS export type/interface/enum detected by findExportsInCode', (t) => {
+    const { getParser } = require('../languages');
+    const { findExportsInCode } = require('../languages/javascript');
+
+    const code = `
+export type UIObjectType = 'dashboard' | 'report';
+export interface ListItemsParams { page: number; }
+export enum Status { Active = 'active', Inactive = 'inactive' }
+export const API_URL = '/api';
+export function fetchData() { return null; }
+`;
+    const parser = getParser('typescript');
+    const exports = findExportsInCode(code, parser);
+    const names = exports.map(e => e.name);
+
+    assert.ok(names.includes('UIObjectType'), 'export type should be detected');
+    assert.ok(names.includes('ListItemsParams'), 'export interface should be detected');
+    assert.ok(names.includes('Status'), 'export enum should be detected');
+    assert.ok(names.includes('API_URL'), 'export const should be detected');
+    assert.ok(names.includes('fetchData'), 'export function should be detected');
+
+    // Verify type export flag
+    const typeExport = exports.find(e => e.name === 'UIObjectType');
+    assert.strictEqual(typeExport.isTypeExport, true, 'type export should be flagged');
+    const ifaceExport = exports.find(e => e.name === 'ListItemsParams');
+    assert.strictEqual(ifaceExport.isTypeExport, true, 'interface export should be flagged');
+});
+
+// Cross-language type_identifier regression tests (Go, Rust)
+// Same bug as Java BUG 8/58 — type references use type_identifier AST node
+
+it('Go type_identifier — composite literals and type references detected', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/go');
+
+    const code = `package main
+
+type MyService struct {
+    Name string
+}
+
+func NewMyService() *MyService {
+    return &MyService{Name: "test"}
+}
+
+func useService(svc MyService) {
+    svc.Run()
+}
+
+func main() {
+    var x MyService
+    y := MyService{Name: "hello"}
+    _ = x
+    _ = y
+}
+`;
+    const parser = getParser('go');
+    const usages = findUsagesInCode(code, 'MyService', parser);
+
+    // Composite literals MyService{} should be "call"
+    const calls = usages.filter(u => u.usageType === 'call');
+    assert.ok(calls.length >= 2, `Should find at least 2 composite literal calls, got ${calls.length}`);
+
+    // Type references (*MyService, param type, var type) should be "reference"
+    const refs = usages.filter(u => u.usageType === 'reference');
+    assert.ok(refs.length >= 2, `Should find type references, got ${refs.length}`);
+
+    // Definition should exist
+    const defs = usages.filter(u => u.usageType === 'definition');
+    assert.ok(defs.length >= 1, 'Should find at least 1 definition');
+
+    // Total usages should be 7+: 1 def + 2 calls + 4 references
+    assert.ok(usages.length >= 6, `Should find at least 6 usages, got ${usages.length}`);
+});
+
+it('Go type_identifier — parameter type not misclassified as definition', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/go');
+
+    const code = `package main
+type Config struct{}
+func use(cfg Config) {}
+`;
+    const parser = getParser('go');
+    const usages = findUsagesInCode(code, 'Config', parser);
+
+    // The parameter type should be "reference", not "definition"
+    const paramTypeUsage = usages.find(u => u.line === 3 && u.usageType !== 'definition');
+    assert.ok(paramTypeUsage, 'Config in func use(cfg Config) should be reference, not definition');
+    assert.strictEqual(paramTypeUsage.usageType, 'reference');
+});
+
+it('Rust type_identifier — struct expressions and type annotations detected', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/rust');
+
+    const code = `struct MyService {
+    name: String,
+}
+
+impl MyService {
+    fn new() -> MyService {
+        MyService { name: String::new() }
+    }
+    fn run(&self) {}
+}
+
+fn use_service(svc: MyService) {
+    svc.run();
+}
+
+fn main() {
+    let svc = MyService::new();
+    let x: MyService = svc;
+}
+`;
+    const parser = getParser('rust');
+    const usages = findUsagesInCode(code, 'MyService', parser);
+
+    // Struct expression MyService{} should be "call"
+    const calls = usages.filter(u => u.usageType === 'call');
+    assert.ok(calls.length >= 2, `Should find at least 2 calls (struct expr + scoped call), got ${calls.length}`);
+
+    // MyService::new() should be classified as "call" (the identifier inside scoped_identifier)
+    const scopedCall = usages.find(u => u.line === 17 && u.usageType === 'call');
+    assert.ok(scopedCall, 'MyService::new() should classify MyService as "call"');
+
+    // Type references (return type, param type, let type) should be found
+    const refs = usages.filter(u => u.usageType === 'reference');
+    assert.ok(refs.length >= 2, `Should find type references, got ${refs.length}`);
+
+    // Total usages should include type_identifier nodes
+    assert.ok(usages.length >= 7, `Should find at least 7 usages (with type_identifier), got ${usages.length}`);
+});
+
+it('Rust type_identifier — parameter type not misclassified as definition', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/rust');
+
+    const code = `struct Config {}
+fn use_cfg(cfg: Config) {}
+`;
+    const parser = getParser('rust');
+    const usages = findUsagesInCode(code, 'Config', parser);
+
+    // The parameter type should be "reference", not "definition"
+    const paramTypeUsage = usages.find(u => u.line === 2 && u.usageType !== 'definition');
+    assert.ok(paramTypeUsage, 'Config in fn use_cfg(cfg: Config) should be reference, not definition');
+    assert.strictEqual(paramTypeUsage.usageType, 'reference');
+});
+
+it('Rust scoped call — Type::method() classified as call', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/rust');
+
+    const code = `struct Config {}
+impl Config {
+    fn new() -> Config { Config {} }
+    fn default() -> Config { Config::new() }
+}
+fn main() {
+    let c = Config::new();
+}
+`;
+    const parser = getParser('rust');
+    const usages = findUsagesInCode(code, 'Config', parser);
+
+    // Config::new() calls should be classified as "call"
+    const callLines = usages.filter(u => u.usageType === 'call').map(u => u.line);
+    assert.ok(callLines.includes(4), 'Config::new() on line 4 should be "call"');
+    assert.ok(callLines.includes(7), 'Config::new() on line 7 should be "call"');
+});
+
+}); // end describe('Bug Report #3 Regressions')
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
