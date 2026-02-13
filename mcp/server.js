@@ -461,38 +461,66 @@ function formatGraphText(graph, showAll = false) {
     const rootEntry = graph.nodes.find(n => n.file === graph.root);
     const rootRelPath = rootEntry ? rootEntry.relativePath : graph.root;
     const lines = [];
-    lines.push(`Dependency graph for ${rootRelPath}`);
-    lines.push('═'.repeat(60));
 
-    const printed = new Set();
     const maxChildren = showAll ? Infinity : 8;
 
-    function printNode(file, indent) {
-        const fileEntry = graph.nodes.find(n => n.file === file);
-        const relPath = fileEntry ? fileEntry.relativePath : file;
-        const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
+    function printTree(nodes, edges, rootFile) {
+        const printed = new Set();
 
-        if (printed.has(file)) {
-            lines.push(`${prefix}${relPath} (circular)`);
-            return;
+        function printNode(file, indent) {
+            const fileEntry = nodes.find(n => n.file === file);
+            const relPath = fileEntry ? fileEntry.relativePath : file;
+            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
+
+            if (printed.has(file)) {
+                lines.push(`${prefix}${relPath} (circular)`);
+                return;
+            }
+            printed.add(file);
+            lines.push(`${prefix}${relPath}`);
+
+            const fileEdges = edges.filter(e => e.from === file);
+            const displayEdges = fileEdges.slice(0, maxChildren);
+            const hiddenCount = fileEdges.length - displayEdges.length;
+
+            for (const edge of displayEdges) {
+                printNode(edge.to, indent + 1);
+            }
+
+            if (hiddenCount > 0) {
+                lines.push(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
+            }
         }
-        printed.add(file);
-        lines.push(`${prefix}${relPath}`);
 
-        const edges = graph.edges.filter(e => e.from === file);
-        const displayEdges = edges.slice(0, maxChildren);
-        const hiddenCount = edges.length - displayEdges.length;
-
-        for (const edge of displayEdges) {
-            printNode(edge.to, indent + 1);
-        }
-
-        if (hiddenCount > 0) {
-            lines.push(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
-        }
+        printNode(rootFile, 0);
     }
 
-    printNode(graph.root, 0);
+    if (graph.direction === 'both' && graph.imports && graph.importers) {
+        const importCount = graph.imports.edges.filter(e => e.from === graph.root).length;
+        const importerCount = graph.importers.edges.filter(e => e.from === graph.root).length;
+
+        lines.push(`Dependency graph for ${rootRelPath}`);
+        lines.push('═'.repeat(60));
+
+        lines.push(`\nIMPORTS (what this file depends on): ${importCount} files`);
+        if (importCount > 0) {
+            printTree(graph.imports.nodes, graph.imports.edges, graph.root);
+        } else {
+            lines.push('  (none)');
+        }
+
+        lines.push(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
+        if (importerCount > 0) {
+            printTree(graph.importers.nodes, graph.importers.edges, graph.root);
+        } else {
+            lines.push('  (none)');
+        }
+    } else {
+        lines.push(`Dependency graph for ${rootRelPath}`);
+        lines.push('═'.repeat(60));
+        printTree(graph.nodes, graph.edges, graph.root);
+    }
+
     return lines.join('\n');
 }
 
@@ -1252,15 +1280,16 @@ server.registerTool(
 server.registerTool(
     'ucn_search',
     {
-        description: 'Plain text search across all project files (like grep, but respects .gitignore and project excludes). Use for non-semantic searches: TODOs, error messages, config keys, string literals. For semantic code queries (callers, usages, definitions), prefer ucn_context/ucn_usages/ucn_find. Set code_only=true to skip matches in comments and strings.',
+        description: 'Plain text search across all project files (like grep, but respects .gitignore and project excludes). Use for non-semantic searches: TODOs, error messages, config keys, string literals. For semantic code queries (callers, usages, definitions), prefer ucn_context/ucn_usages/ucn_find. Set code_only=true to skip matches in comments and strings. Search is case-insensitive by default; set case_sensitive=true for exact case matching.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             term: z.string().describe('Search term (plain text, not regex)'),
             code_only: z.boolean().optional().describe('Exclude matches in comments and strings'),
-            context: z.number().optional().describe('Lines of context around each match')
+            context: z.number().optional().describe('Lines of context around each match'),
+            case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)')
         })
     },
-    async ({ project_dir, term, code_only, context }) => {
+    async ({ project_dir, term, code_only, context, case_sensitive }) => {
         if (!term || !term.trim()) {
             return toolError('Search term is required.');
         }
@@ -1268,7 +1297,8 @@ server.registerTool(
             const index = getIndex(project_dir);
             const result = index.search(term, {
                 codeOnly: code_only || false,
-                context: context || 0
+                context: context || 0,
+                caseSensitive: case_sensitive || false
             });
             return toolResult(formatSearchText(result, term));
         } catch (e) {

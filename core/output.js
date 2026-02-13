@@ -516,9 +516,15 @@ function formatTypedef(types, name) {
         lines.push('  (none found)');
     } else {
         for (const t of types) {
-            lines.push(`  ${t.relativePath}:${t.startLine}  ${t.type} ${t.name}`);
+            lines.push(`${t.relativePath}:${t.startLine}  ${t.type} ${t.name}`);
             if (t.usageCount !== undefined) {
-                lines.push(`    (${t.usageCount} usages)`);
+                lines.push(`  (${t.usageCount} usages)`);
+            }
+            if (t.code) {
+                lines.push('');
+                lines.push('─── CODE ───');
+                lines.push(t.code);
+                lines.push('');
             }
         }
     }
@@ -637,7 +643,8 @@ function formatTypedefJson(types, name) {
             file: t.relativePath || t.file,
             startLine: t.startLine,
             endLine: t.endLine,
-            ...(t.usageCount !== undefined && { usageCount: t.usageCount })
+            ...(t.usageCount !== undefined && { usageCount: t.usageCount }),
+            ...(t.code && { code: t.code })
         }))
     }, null, 2);
 }

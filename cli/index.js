@@ -36,6 +36,7 @@ const flags = {
     json: args.includes('--json'),
     quiet: !args.includes('--verbose') && !args.includes('--no-quiet'),
     codeOnly: args.includes('--code-only'),
+    caseSensitive: args.includes('--case-sensitive'),
     withTypes: args.includes('--with-types'),
     topLevel: args.includes('--top-level'),
     exact: args.includes('--exact'),
@@ -84,7 +85,7 @@ if (fileArgIdx !== -1 && args[fileArgIdx + 1]) {
 const knownFlags = new Set([
     '--help', '-h', '--mcp',
     '--json', '--verbose', '--no-quiet', '--quiet',
-    '--code-only', '--with-types', '--top-level', '--exact',
+    '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests',
     '--include-exported', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed',
     '--file', '--context', '--exclude', '--not', '--in',
@@ -562,16 +563,28 @@ function usagesInFile(code, lines, name, filePath, result) {
 }
 
 function typedefInFile(result, name, filePath) {
-    const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait'];
+    const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class'];
     const matches = result.classes.filter(c =>
         typeKinds.includes(c.type) &&
         (flags.exact ? c.name === name : c.name.toLowerCase().includes(name.toLowerCase()))
     );
 
+    // Extract source code for each match
+    const absPath = path.resolve(filePath);
+    let fileLines = null;
+    try { fileLines = fs.readFileSync(absPath, 'utf-8').split('\n'); } catch (e) { /* ignore */ }
+    const enriched = matches.map(m => {
+        const obj = { ...m, relativePath: filePath };
+        if (fileLines && m.startLine && m.endLine) {
+            obj.code = fileLines.slice(m.startLine - 1, m.endLine).join('\n');
+        }
+        return obj;
+    });
+
     if (flags.json) {
-        console.log(output.formatTypedefJson(matches.map(m => ({ ...m, relativePath: filePath })), name));
+        console.log(output.formatTypedefJson(enriched, name));
     } else {
-        console.log(output.formatTypedef(matches.map(m => ({ ...m, relativePath: filePath })), name));
+        console.log(output.formatTypedef(enriched, name));
     }
 }
 
@@ -957,7 +970,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'search': {
             requireArg(arg, 'Usage: ucn . search <term>');
-            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context });
+            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive });
             printOutput(searchResults,
                 r => output.formatSearchJson(r, arg),
                 r => { printSearchResults(r, arg); }
@@ -1884,60 +1897,84 @@ function printStats(stats) {
 
 function printGraph(graph, root, maxDepth = 2, showAll = false) {
     const rootRelPath = path.relative(root, graph.root);
-    console.log(`Dependency graph for ${rootRelPath}`);
-    console.log('═'.repeat(60));
-
-    const printed = new Set();
     const maxChildren = showAll ? Infinity : 8;
-    let truncatedNodes = 0;
-    let depthLimited = false;
 
-    function printNode(file, indent = 0) {
-        const fileEntry = graph.nodes.find(n => n.file === file);
-        const relPath = fileEntry ? fileEntry.relativePath : path.relative(root, file);
-        const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
+    function printTree(nodes, edges, rootFile) {
+        const printed = new Set();
+        let truncatedNodes = 0;
+        let depthLimited = false;
 
-        if (printed.has(file)) {
-            console.log(`${prefix}${relPath} (circular)`);
-            return;
+        function printNode(file, indent = 0) {
+            const fileEntry = nodes.find(n => n.file === file);
+            const relPath = fileEntry ? fileEntry.relativePath : path.relative(root, file);
+            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
+
+            if (printed.has(file)) {
+                console.log(`${prefix}${relPath} (circular)`);
+                return;
+            }
+            printed.add(file);
+
+            if (indent > maxDepth) {
+                depthLimited = true;
+                console.log(`${prefix}${relPath} ...`);
+                return;
+            }
+
+            console.log(`${prefix}${relPath}`);
+
+            const fileEdges = edges.filter(e => e.from === file);
+            const displayEdges = fileEdges.slice(0, maxChildren);
+            const hiddenCount = fileEdges.length - displayEdges.length;
+
+            for (const edge of displayEdges) {
+                printNode(edge.to, indent + 1);
+            }
+
+            if (hiddenCount > 0) {
+                truncatedNodes += hiddenCount;
+                console.log(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
+            }
         }
-        printed.add(file);
 
-        // Depth limiting
-        if (indent > maxDepth) {
-            depthLimited = true;
-            console.log(`${prefix}${relPath} ...`);
-            return;
-        }
-
-        console.log(`${prefix}${relPath}`);
-
-        const edges = graph.edges.filter(e => e.from === file);
-
-        // Limit children
-        const displayEdges = edges.slice(0, maxChildren);
-        const hiddenCount = edges.length - displayEdges.length;
-
-        for (const edge of displayEdges) {
-            printNode(edge.to, indent + 1);
-        }
-
-        if (hiddenCount > 0) {
-            truncatedNodes += hiddenCount;
-            console.log(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
-        }
+        printNode(rootFile);
+        return { truncatedNodes, depthLimited };
     }
 
-    printNode(graph.root);
+    if (graph.direction === 'both' && graph.imports && graph.importers) {
+        const importCount = graph.imports.edges.filter(e => e.from === graph.root).length;
+        const importerCount = graph.importers.edges.filter(e => e.from === graph.root).length;
 
-    // Print helpful note about expanding
-    if (depthLimited || truncatedNodes > 0) {
-        console.log('\n' + '─'.repeat(60));
-        if (depthLimited) {
-            console.log(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
+        console.log(`Dependency graph for ${rootRelPath}`);
+        console.log('═'.repeat(60));
+
+        console.log(`\nIMPORTS (what this file depends on): ${importCount} files`);
+        if (importCount > 0) {
+            printTree(graph.imports.nodes, graph.imports.edges, graph.root);
+        } else {
+            console.log('  (none)');
         }
-        if (truncatedNodes > 0) {
-            console.log(`${truncatedNodes} nodes hidden. Use --all to show all children. Graph has ${graph.nodes.length} total files.`);
+
+        console.log(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
+        if (importerCount > 0) {
+            printTree(graph.importers.nodes, graph.importers.edges, graph.root);
+        } else {
+            console.log('  (none)');
+        }
+    } else {
+        console.log(`Dependency graph for ${rootRelPath}`);
+        console.log('═'.repeat(60));
+
+        const { truncatedNodes, depthLimited } = printTree(graph.nodes, graph.edges, graph.root);
+
+        if (depthLimited || truncatedNodes > 0) {
+            console.log('\n' + '─'.repeat(60));
+            if (depthLimited) {
+                console.log(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
+            }
+            if (truncatedNodes > 0) {
+                console.log(`${truncatedNodes} nodes hidden. Use --all to show all children. Graph has ${graph.nodes.length} total files.`);
+            }
         }
     }
 }

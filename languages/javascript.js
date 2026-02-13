@@ -682,6 +682,36 @@ function findCallsInCode(code, parser) {
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
 
+    // Known higher-order function methods where arguments are likely function references
+    // Maps method name -> Set of argument indices that are callbacks (null = all args are callbacks)
+    const HOF_METHODS = new Map([
+        // Promise — all args are callbacks
+        ['then', null], ['catch', null], ['finally', null],
+        // Array — first arg is always the callback
+        ['map', new Set([0])], ['flatMap', new Set([0])], ['filter', new Set([0])],
+        ['find', new Set([0])], ['findIndex', new Set([0])],
+        ['some', new Set([0])], ['every', new Set([0])],
+        ['forEach', new Set([0])], ['reduce', new Set([0])], ['reduceRight', new Set([0])],
+        ['sort', new Set([0])], ['toSorted', new Set([0])],
+        // Event — second arg is the callback (first is event name string)
+        ['addEventListener', new Set([1])], ['removeEventListener', new Set([1])],
+        ['on', new Set([1])], ['once', new Set([1])], ['off', new Set([1])],
+        // Other common HOFs — all args
+        ['pipe', null], ['subscribe', null], ['tap', null], ['use', null]
+    ]);
+    // Standalone HOFs (called as free functions, not methods)
+    const HOF_FUNCTIONS = new Map([
+        ['setTimeout', new Set([0])], ['setInterval', new Set([0])],
+        ['setImmediate', new Set([0])], ['requestAnimationFrame', new Set([0])],
+        ['queueMicrotask', new Set([0])]
+    ]);
+    // Identifiers that should never be treated as function references
+    const SKIP_IDENTS = new Set([
+        'null', 'undefined', 'true', 'false', 'this', 'super',
+        'NaN', 'Infinity', 'arguments', 'globalThis', 'window', 'document',
+        'module', 'exports', 'require', 'console', 'process'
+    ]);
+
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['function_declaration', 'function_expression', 'arrow_function',
@@ -807,6 +837,61 @@ function findCallsInCode(code, parser) {
                     }
                 }
             }
+
+            // Detect function references passed as arguments to HOFs
+            // e.g., .then(handleProcess), .map(processItem), setTimeout(doWork, 1000)
+            let calledName = null;
+            if (funcNode.type === 'identifier') {
+                calledName = funcNode.text;
+            } else if (funcNode.type === 'member_expression') {
+                const propNode = funcNode.childForFieldName('property');
+                calledName = propNode?.text;
+            }
+
+            const hofMethodIndices = calledName ? HOF_METHODS.get(calledName) : undefined;
+            const hofFuncIndices = (funcNode.type === 'identifier' && calledName) ? HOF_FUNCTIONS.get(calledName) : undefined;
+            const isHOF = HOF_METHODS.has(calledName) || (funcNode.type === 'identifier' && HOF_FUNCTIONS.has(calledName));
+            const callbackIndices = hofMethodIndices !== undefined ? hofMethodIndices : hofFuncIndices;
+            if (isHOF) {
+                const argsNode = node.childForFieldName('arguments');
+                if (argsNode) {
+                    let argIdx = 0;
+                    for (let i = 0; i < argsNode.namedChildCount; i++) {
+                        const arg = argsNode.namedChild(i);
+                        // Skip non-argument nodes (e.g. commas)
+                        if (arg.type === 'comment') continue;
+                        // Only check args at callback positions (null = all positions)
+                        const isCallbackPos = callbackIndices === null || callbackIndices === undefined || callbackIndices.has(argIdx);
+                        if (isCallbackPos) {
+                            if (arg.type === 'identifier' && !SKIP_IDENTS.has(arg.text)) {
+                                calls.push({
+                                    name: arg.text,
+                                    line: arg.startPosition.row + 1,
+                                    isMethod: false,
+                                    isFunctionReference: true,
+                                    enclosingFunction
+                                });
+                            } else if (arg.type === 'member_expression') {
+                                // Handle obj.method passed as callback: .then(utils.handleError)
+                                const propNode = arg.childForFieldName('property');
+                                const objNode = arg.childForFieldName('object');
+                                if (propNode && !SKIP_IDENTS.has(propNode.text)) {
+                                    calls.push({
+                                        name: propNode.text,
+                                        line: arg.startPosition.row + 1,
+                                        isMethod: true,
+                                        receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
+                                        isFunctionReference: true,
+                                        enclosingFunction
+                                    });
+                                }
+                            }
+                        }
+                        argIdx++;
+                    }
+                }
+            }
+
             return true;
         }
 
@@ -1238,6 +1323,24 @@ function findExportsInCode(code, parser) {
                         exports.push({ name: nameNode.text, type: 'named', line });
                     }
                 } else if (child.type === 'class_declaration') {
+                    const nameNode = child.childForFieldName('name');
+                    if (nameNode) {
+                        exports.push({ name: nameNode.text, type: 'named', line });
+                    }
+                } else if (child.type === 'type_alias_declaration') {
+                    // export type X = ...
+                    const nameNode = child.childForFieldName('name');
+                    if (nameNode) {
+                        exports.push({ name: nameNode.text, type: 'named', line, isTypeExport: true });
+                    }
+                } else if (child.type === 'interface_declaration') {
+                    // export interface X { ... }
+                    const nameNode = child.childForFieldName('name');
+                    if (nameNode) {
+                        exports.push({ name: nameNode.text, type: 'named', line, isTypeExport: true });
+                    }
+                } else if (child.type === 'enum_declaration') {
+                    // export enum X { ... }
                     const nameNode = child.childForFieldName('name');
                     if (nameNode) {
                         exports.push({ name: nameNode.text, type: 'named', line });
