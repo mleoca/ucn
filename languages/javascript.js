@@ -681,6 +681,7 @@ function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+    const aliases = new Map();  // Track local aliases: aliasName -> originalName (string or string[])
 
     // Known higher-order function methods where arguments are likely function references
     // Maps method name -> Set of argument indices that are callbacks (null = all args are callbacks)
@@ -765,6 +766,39 @@ function findCallsInCode(code, parser) {
             });
         }
 
+        // Track local aliases: const myParse = parse, const { parse: csvParse } = ...
+        if (node.type === 'variable_declarator') {
+            const nameNode = node.childForFieldName('name');
+            const initNode = node.childForFieldName('value');
+            if (nameNode?.type === 'identifier' && initNode?.type === 'identifier') {
+                // Simple alias: const p = parse
+                aliases.set(nameNode.text, initNode.text);
+            }
+            // Ternary alias: const fn = cond ? parseCSV : parseJSON → both targets
+            if (nameNode?.type === 'identifier' && initNode?.type === 'ternary_expression') {
+                const consequence = initNode.childForFieldName('consequence');
+                const alternative = initNode.childForFieldName('alternative');
+                const targets = [];
+                if (consequence?.type === 'identifier') targets.push(consequence.text);
+                if (alternative?.type === 'identifier') targets.push(alternative.text);
+                if (targets.length > 0) aliases.set(nameNode.text, targets);
+            }
+            // Destructured rename: const { parse: csvParse } = require(...)
+            if (nameNode?.type === 'object_pattern') {
+                for (let i = 0; i < nameNode.namedChildCount; i++) {
+                    const prop = nameNode.namedChild(i);
+                    if (prop.type === 'pair_pattern') {
+                        const key = prop.childForFieldName('key');
+                        const value = prop.childForFieldName('value');
+                        if ((key?.type === 'identifier' || key?.type === 'property_identifier') &&
+                            value?.type === 'identifier') {
+                            aliases.set(value.text, key.text);
+                        }
+                    }
+                }
+            }
+        }
+
         // Handle regular function calls: foo(), obj.foo(), foo.call()
         if (node.type === 'call_expression') {
             const funcNode = node.childForFieldName('function');
@@ -777,8 +811,13 @@ function findCallsInCode(code, parser) {
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
+                const alias = aliases.get(funcNode.text);
+                const resolvedName = typeof alias === 'string' ? alias : undefined;
+                const resolvedNames = Array.isArray(alias) ? alias : undefined;
                 calls.push({
                     name: funcNode.text,
+                    ...(resolvedName && { resolvedName }),
+                    ...(resolvedNames && { resolvedNames }),
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     enclosingFunction,
@@ -888,6 +927,48 @@ function findCallsInCode(code, parser) {
                             }
                         }
                         argIdx++;
+                    }
+                }
+            }
+
+            // General function-argument detection for non-HOF calls
+            // Detects: execute(processItem, 42), retry(fetchData, 3), etc.
+            // Also detects function refs in object literal args: doRequest({onSuccess: handleSuccess})
+            if (!isHOF) {
+                const argsNode = node.childForFieldName('arguments');
+                if (argsNode) {
+                    for (let i = 0; i < argsNode.namedChildCount; i++) {
+                        const arg = argsNode.namedChild(i);
+                        if (arg.type === 'identifier' && !SKIP_IDENTS.has(arg.text)) {
+                            calls.push({
+                                name: arg.text,
+                                line: arg.startPosition.row + 1,
+                                isMethod: false,
+                                isFunctionReference: true,
+                                isPotentialCallback: true,
+                                enclosingFunction
+                            });
+                        }
+                        // Scan object literal args for function refs in property values
+                        // e.g., doRequest({onSuccess: handleSuccess, onError: handleError})
+                        if (arg.type === 'object') {
+                            for (let j = 0; j < arg.namedChildCount; j++) {
+                                const prop = arg.namedChild(j);
+                                if (prop.type === 'pair') {
+                                    const val = prop.childForFieldName('value');
+                                    if (val?.type === 'identifier' && !SKIP_IDENTS.has(val.text)) {
+                                        calls.push({
+                                            name: val.text,
+                                            line: val.startPosition.row + 1,
+                                            isMethod: false,
+                                            isFunctionReference: true,
+                                            isPotentialCallback: true,
+                                            enclosingFunction
+                                        });
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1142,6 +1223,7 @@ function findReExports(code, parser) {
 function findImportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const imports = [];
+    let importAliases = null;  // {original, local}[] — tracks renamed imports
 
     traverseTree(tree.rootNode, (node) => {
         // ES6 import statements
@@ -1173,7 +1255,13 @@ function findImportsInCode(code, parser) {
                                 const specifier = clauseChild.namedChild(k);
                                 if (specifier.type === 'import_specifier') {
                                     const nameNode = specifier.namedChild(0);
+                                    const aliasNode = specifier.namedChild(1);
                                     if (nameNode) names.push(nameNode.text);
+                                    // Track renamed imports: import { X as Y }
+                                    if (nameNode && aliasNode && aliasNode.text !== nameNode.text) {
+                                        if (!importAliases) importAliases = [];
+                                        importAliases.push({ original: nameNode.text, local: aliasNode.text });
+                                    }
                                 }
                             }
                             importType = 'named';
@@ -1232,7 +1320,13 @@ function findImportsInCode(code, parser) {
                                         names.push(prop.text);
                                     } else if (prop.type === 'pair_pattern') {
                                         const key = prop.childForFieldName('key');
+                                        const val = prop.childForFieldName('value');
                                         if (key) names.push(key.text);
+                                        // Track renamed destructuring: const { X: Y } = require(...)
+                                        if (key && val && val.text !== key.text) {
+                                            if (!importAliases) importAliases = [];
+                                            importAliases.push({ original: key.text, local: val.text });
+                                        }
                                     }
                                 }
                             }
@@ -1263,6 +1357,8 @@ function findImportsInCode(code, parser) {
         return true;
     });
 
+    // Attach aliases to the imports array for buildInheritanceGraph resolution
+    if (importAliases) imports.aliases = importAliases;
     return imports;
 }
 

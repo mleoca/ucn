@@ -27,7 +27,8 @@ function extractImports(content, language) {
             if (parser) {
                 const imports = langModule.findImportsInCode(content, parser);
                 const dynamicCount = imports.filter(i => i.dynamic).length;
-                return { imports, dynamicCount };
+                const importAliases = imports.aliases || null;
+                return { imports, dynamicCount, importAliases };
             }
         } catch (e) {
             // AST parsing failed

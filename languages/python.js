@@ -372,6 +372,7 @@ function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+    const aliases = new Map();  // Track local aliases: aliasName -> originalName
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
@@ -412,6 +413,15 @@ function findCallsInCode(code, parser) {
             });
         }
 
+        // Track local aliases: my_parse = parse
+        if (node.type === 'assignment') {
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            if (left?.type === 'identifier' && right?.type === 'identifier') {
+                aliases.set(left.text, right.text);
+            }
+        }
+
         // Handle function calls: foo(), obj.foo()
         if (node.type === 'call') {
             const funcNode = node.childForFieldName('function');
@@ -422,8 +432,10 @@ function findCallsInCode(code, parser) {
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
+                const resolvedName = aliases.get(funcNode.text);
                 calls.push({
                     name: funcNode.text,
+                    ...(resolvedName && { resolvedName }),
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     enclosingFunction,
@@ -437,6 +449,14 @@ function findCallsInCode(code, parser) {
                 if (attrNode) {
                     let receiver = objNode?.type === 'identifier' ? objNode.text : undefined;
                     let selfAttribute = undefined;
+
+                    // Detect super().method() pattern
+                    if (objNode?.type === 'call') {
+                        const superFunc = objNode.childForFieldName('function');
+                        if (superFunc?.type === 'identifier' && superFunc.text === 'super') {
+                            receiver = 'super';
+                        }
+                    }
 
                     // Detect self.X.method() pattern: objNode is attribute access on self/cls
                     if (objNode?.type === 'attribute') {
@@ -461,6 +481,53 @@ function findCallsInCode(code, parser) {
                     });
                 }
             }
+
+            // General function-argument detection
+            // Detects: map(process, items), registry.register('x', handler), etc.
+            const PYTHON_SKIP = new Set([
+                'None', 'True', 'False', 'self', 'cls', 'super',
+                'print', 'len', 'range', 'str', 'int', 'float', 'bool',
+                'list', 'dict', 'set', 'tuple', 'type', 'object',
+                'isinstance', 'issubclass', 'hasattr', 'getattr', 'setattr',
+                'property', 'staticmethod', 'classmethod',
+            ]);
+            const argsNode = node.childForFieldName('arguments');
+            if (argsNode) {
+                for (let i = 0; i < argsNode.namedChildCount; i++) {
+                    const arg = argsNode.namedChild(i);
+                    if (arg.type === 'identifier' && !PYTHON_SKIP.has(arg.text)) {
+                        calls.push({
+                            name: arg.text,
+                            line: arg.startPosition.row + 1,
+                            isMethod: false,
+                            isFunctionReference: true,
+                            isPotentialCallback: true,
+                            enclosingFunction
+                        });
+                    }
+                    // Scan dict literal args for function refs in values
+                    // e.g., do_request({'on_success': handle_success})
+                    if (arg.type === 'dictionary') {
+                        for (let j = 0; j < arg.namedChildCount; j++) {
+                            const pair = arg.namedChild(j);
+                            if (pair.type === 'pair') {
+                                const val = pair.childForFieldName('value');
+                                if (val?.type === 'identifier' && !PYTHON_SKIP.has(val.text)) {
+                                    calls.push({
+                                        name: val.text,
+                                        line: val.startPosition.row + 1,
+                                        isMethod: false,
+                                        isFunctionReference: true,
+                                        isPotentialCallback: true,
+                                        enclosingFunction
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             return true;
         }
 
@@ -485,6 +552,7 @@ function findCallsInCode(code, parser) {
 function findImportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const imports = [];
+    let importAliases = null;  // {original, local}[] — tracks renamed imports
 
     traverseTree(tree.rootNode, (node) => {
         // import statement: import os, import sys as system
@@ -512,6 +580,10 @@ function findImportsInCode(code, parser) {
                             type: 'import',
                             line
                         });
+                        if (aliasNode && aliasNode.text !== nameNode.text) {
+                            if (!importAliases) importAliases = [];
+                            importAliases.push({ original: nameNode.text, local: aliasNode.text });
+                        }
                     }
                 }
             }
@@ -536,7 +608,12 @@ function findImportsInCode(code, parser) {
                     names.push(child.text);
                 } else if (child.type === 'aliased_import') {
                     const nameNode = child.namedChild(0);
+                    const aliasNode = child.namedChild(1);
                     if (nameNode) names.push(nameNode.text);
+                    if (nameNode && aliasNode && aliasNode.text !== nameNode.text) {
+                        if (!importAliases) importAliases = [];
+                        importAliases.push({ original: nameNode.text, local: aliasNode.text });
+                    }
                 } else if (child.type === 'wildcard_import') {
                     names.push('*');
                 }
@@ -579,6 +656,7 @@ function findImportsInCode(code, parser) {
         return true;
     });
 
+    if (importAliases) imports.aliases = importAliases;
     return imports;
 }
 
