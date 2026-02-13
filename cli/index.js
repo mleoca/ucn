@@ -1695,6 +1695,10 @@ function printContext(ctx, options = {}) {
         }
     }
 
+    if (ctx.meta && !ctx.meta.includeMethods) {
+        console.log('  Note: obj.method() calls excluded — use --include-methods to include them');
+    }
+
     // Display warnings if any
     if (ctx.warnings && ctx.warnings.length > 0) {
         console.log('\n⚠️  WARNINGS:');

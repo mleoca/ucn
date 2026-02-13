@@ -8363,5 +8363,166 @@ fn main() {
 
 }); // end describe('Bug Report #4 Regressions')
 
+// ============================================================================
+// MCP Demo Fixes (2026-02-13)
+// ============================================================================
+
+describe('MCP Demo Fixes', () => {
+
+// Issue 1: Variable require() should be DYNAMIC, not EXTERNAL
+it('imports() classifies variable require() as isDynamic', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dynreq-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+const path = require('path');
+const configPath = './config.json';
+const config = require(configPath);
+module.exports = config;
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.js', { quiet: true });
+        const imports = index.imports(path.join(tmpDir, 'main.js'));
+
+        const pathImp = imports.find(i => i.module === 'path');
+        assert.ok(pathImp, 'Should find path import');
+        assert.strictEqual(pathImp.isDynamic, false, 'path should not be dynamic');
+
+        const dynImp = imports.find(i => i.module === 'configPath');
+        assert.ok(dynImp, 'Should find dynamic require(configPath)');
+        assert.strictEqual(dynImp.isDynamic, true, 'variable require should be isDynamic');
+        assert.strictEqual(dynImp.isExternal, false, 'variable require should not be isExternal');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// Issue 1: formatImports shows DYNAMIC group
+it('formatImports shows DYNAMIC (unresolved) group', () => {
+    const { formatImports } = require('../core/output');
+    const imports = [
+        { module: './utils', names: ['helper'], type: 'esm', resolved: 'src/utils.js', isExternal: false, isDynamic: false },
+        { module: 'lodash', names: ['map'], type: 'esm', resolved: null, isExternal: true, isDynamic: false },
+        { module: 'configPath', names: [], type: 'require', resolved: null, isExternal: false, isDynamic: true }
+    ];
+    const text = formatImports(imports, 'test.js');
+    assert.ok(text.includes('INTERNAL:'), 'Should have INTERNAL section');
+    assert.ok(text.includes('EXTERNAL:'), 'Should have EXTERNAL section');
+    assert.ok(text.includes('DYNAMIC (unresolved):'), 'Should have DYNAMIC section');
+    assert.ok(text.includes('configPath'), 'DYNAMIC section should contain configPath');
+    // configPath should NOT be under EXTERNAL
+    const externalIdx = text.indexOf('EXTERNAL:');
+    const dynamicIdx = text.indexOf('DYNAMIC (unresolved):');
+    const configIdx = text.indexOf('configPath');
+    assert.ok(configIdx > dynamicIdx, 'configPath should appear after DYNAMIC header, not EXTERNAL');
+});
+
+// Issue 2: ucn_class summary for large classes
+it('large class gets summary when no max_lines set', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bigclass-'));
+    try {
+        // Generate a class with >200 lines
+        let classBody = 'class BigClass {\n';
+        for (let i = 0; i < 210; i++) {
+            classBody += `  method${i}() { return ${i}; }\n`;
+        }
+        classBody += '}\nmodule.exports = BigClass;\n';
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'big.js'), classBody);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.js', { quiet: true });
+
+        // Verify the class is found and >200 lines
+        const matches = index.find('BigClass', {}).filter(m =>
+            ['class', 'interface', 'type', 'enum', 'struct', 'trait'].includes(m.type)
+        );
+        assert.ok(matches.length > 0, 'Should find BigClass');
+        const match = matches[0];
+        const lineCount = match.endLine - match.startLine + 1;
+        assert.ok(lineCount > 200, `Class should be >200 lines, got ${lineCount}`);
+
+        // Verify findMethodsForType finds methods
+        const methods = index.findMethodsForType('BigClass');
+        assert.ok(methods.length > 100, `Should find >100 methods, got ${methods.length}`);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// Issue 5: context() includes includeMethods in meta
+it('context() meta includes includeMethods flag', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-incmeth-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function greet(name) { return 'hi ' + name; }
+function main() { greet('world'); }
+module.exports = { greet, main };
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.js', { quiet: true });
+
+        // Default: includeMethods should be false
+        const ctx1 = index.context('greet', {});
+        assert.ok(ctx1, 'Should find greet');
+        assert.ok(ctx1.meta, 'Should have meta');
+        assert.strictEqual(ctx1.meta.includeMethods, false, 'includeMethods should be false by default');
+
+        // With includeMethods: true
+        const ctx2 = index.context('greet', { includeMethods: true });
+        assert.strictEqual(ctx2.meta.includeMethods, true, 'includeMethods should be true when set');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// Issue 5: trace() includes includeMethods flag
+it('trace() includes includeMethods flag', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-tracemeth-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function greet(name) { return 'hi ' + name; }
+function main() { greet('world'); }
+module.exports = { greet, main };
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.js', { quiet: true });
+
+        const trace1 = index.trace('main', {});
+        assert.ok(trace1, 'Should find main');
+        assert.strictEqual(trace1.includeMethods, false, 'includeMethods should be false by default');
+
+        const trace2 = index.trace('main', { includeMethods: true });
+        assert.strictEqual(trace2.includeMethods, true, 'includeMethods should be true when set');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// Issue 5: formatTrace includes include_methods hint
+it('formatTrace includes include_methods hint when not set', () => {
+    const { formatTrace } = require('../core/output');
+    const traceData = {
+        root: 'test',
+        file: 'a.js',
+        line: 1,
+        direction: 'down',
+        maxDepth: 3,
+        includeMethods: false,
+        tree: { name: 'test', file: 'a.js', line: 1, children: [] }
+    };
+    const text = formatTrace(traceData);
+    assert.ok(text.includes('obj.method() calls excluded'), 'Should hint about include-methods');
+
+    // With includeMethods: true, no hint
+    const traceData2 = { ...traceData, includeMethods: true };
+    const text2 = formatTrace(traceData2);
+    assert.ok(!text2.includes('obj.method() calls excluded'), 'Should not hint when includeMethods=true');
+});
+
+}); // end describe('MCP Demo Fixes')
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

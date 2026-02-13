@@ -336,16 +336,6 @@ class ProjectIndex {
         }
     }
 
-    /**
-     * Count dynamic imports across indexed files
-     */
-    getDynamicImportCount() {
-        let total = 0;
-        for (const fileEntry of this.files.values()) {
-            total += fileEntry.dynamicImports || 0;
-        }
-        return total;
-    }
 
     // ========================================================================
     // QUERY METHODS
@@ -892,7 +882,8 @@ class ProjectIndex {
                 complete: stats.uncertain === 0 && dynamicImports === 0,
                 skipped: 0,
                 dynamicImports,
-                uncertain: stats.uncertain
+                uncertain: stats.uncertain,
+                includeMethods: !!options.includeMethods
             }
         };
 
@@ -1788,6 +1779,30 @@ class ProjectIndex {
             const { imports: rawImports } = extractImports(content, fileEntry.language);
 
             return rawImports.map(imp => {
+                // Dynamic imports with variable path (e.g. require(varName), import(varExpr)) can't be resolved.
+                // Only JS/TS require()/import() with dynamic=true has unresolvable paths.
+                // Go side-effect/dot imports and Rust glob uses also set dynamic=true but have valid module paths.
+                const isUnresolvableDynamic = imp.dynamic && (imp.type === 'require' || imp.type === 'dynamic');
+                if (isUnresolvableDynamic) {
+                    const lines = content.split('\n');
+                    let line = null;
+                    for (let i = 0; i < lines.length; i++) {
+                        if (lines[i].includes(imp.module || 'require')) {
+                            line = i + 1;
+                            break;
+                        }
+                    }
+                    return {
+                        module: imp.module,
+                        names: imp.names,
+                        type: imp.type,
+                        resolved: null,
+                        isExternal: false,
+                        isDynamic: true,
+                        line
+                    };
+                }
+
                 let resolved = resolveImport(imp.module, normalizedPath, {
                     aliases: this.config.aliases,
                     language: fileEntry.language,
@@ -1816,6 +1831,7 @@ class ProjectIndex {
                     type: imp.type,
                     resolved: resolved ? path.relative(this.root, resolved) : null,
                     isExternal: !resolved,
+                    isDynamic: false,
                     line
                 };
             });
@@ -2150,42 +2166,6 @@ class ProjectIndex {
         return usages;
     }
 
-    /**
-     * Find re-exports of a symbol across the codebase
-     * @param {string} name - Symbol name
-     * @returns {Array} Re-export locations
-     */
-    findReExportsOf(name) {
-        const reExports = [];
-
-        for (const [filePath, fileEntry] of this.files) {
-            try {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const language = detectLanguage(filePath);
-                if (!language) continue;
-
-                const langModule = getLanguageModule(language);
-                if (!langModule.findReExports) continue;
-
-                const parser = getParser(language);
-                const exports = langModule.findReExports(content, parser);
-
-                for (const exp of exports) {
-                    if (exp.name === name) {
-                        reExports.push({
-                            file: filePath,
-                            relativePath: fileEntry.relativePath,
-                            ...exp
-                        });
-                    }
-                }
-            } catch (e) {
-                // Skip files that can't be processed
-            }
-        }
-
-        return reExports;
-    }
 
     /**
      * Build a usage index for all identifiers in the codebase (optimized for deadcode)
@@ -2545,32 +2525,6 @@ class ProjectIndex {
         return this._completenessCache;
     }
 
-    /**
-     * Add completeness info to a result
-     */
-    withCompleteness(result, totalResults, maxResults = 100) {
-        const completeness = {
-            warnings: []
-        };
-
-        if (totalResults > maxResults) {
-            completeness.warnings.push({
-                type: 'truncated',
-                message: `Showing ${maxResults} of ${totalResults} results`
-            });
-        }
-
-        // Get project-wide completeness
-        const projectCompleteness = this.detectCompleteness();
-        completeness.warnings.push(...projectCompleteness.warnings);
-
-        completeness.complete = completeness.warnings.length === 0;
-
-        return {
-            ...result,
-            completeness
-        };
-    }
 
     /**
      * Find related functions - same file, similar names, shared dependencies
@@ -2786,6 +2740,7 @@ class ProjectIndex {
             line: def.startLine,
             direction,
             maxDepth,
+            includeMethods: !!options.includeMethods,
             tree,
             callers: direction !== 'down' ? callers : undefined,
             truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined
