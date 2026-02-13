@@ -323,10 +323,19 @@ function parse(code, parser) {
  * @param {object} parser - Tree-sitter parser instance
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string}>}
  */
+// Go built-in functions — calls to these should not match user-defined functions
+const GO_BUILTINS = new Set([
+    'append', 'cap', 'clear', 'close', 'complex', 'copy', 'delete',
+    'imag', 'len', 'make', 'max', 'min', 'new', 'panic', 'print',
+    'println', 'real', 'recover'
+]);
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+    // Track local closure names per function scope (scopeStartLine -> Set<name>)
+    const closureScopes = new Map();
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
@@ -356,6 +365,15 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    // Check if current scope has a local closure with the given name
+    const isLocalClosure = (name) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const scope = closureScopes.get(functionStack[i].startLine);
+            if (scope?.has(name)) return true;
+        }
+        return false;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
@@ -364,6 +382,33 @@ function findCallsInCode(code, parser) {
                 startLine: node.startPosition.row + 1,
                 endLine: node.endPosition.row + 1
             });
+        }
+
+        // Track local closures: atoi := func(...) { ... }
+        if (node.type === 'short_var_declaration' || node.type === 'var_declaration') {
+            // Check if RHS contains a func_literal
+            const hasFunc = (n) => {
+                if (n.type === 'func_literal') return true;
+                for (let i = 0; i < n.childCount; i++) {
+                    if (hasFunc(n.child(i))) return true;
+                }
+                return false;
+            };
+            if (hasFunc(node)) {
+                // Extract the variable name from the LHS
+                const left = node.childForFieldName('left');
+                if (left) {
+                    const names = left.type === 'expression_list'
+                        ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
+                              .filter(n => n.type === 'identifier').map(n => n.text)
+                        : left.type === 'identifier' ? [left.text] : [];
+                    if (names.length > 0 && functionStack.length > 0) {
+                        const scopeKey = functionStack[functionStack.length - 1].startLine;
+                        if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Set());
+                        for (const n of names) closureScopes.get(scopeKey).add(n);
+                    }
+                }
+            }
         }
 
         // Handle function calls: foo(), pkg.Foo(), obj.Method()
@@ -375,9 +420,15 @@ function findCallsInCode(code, parser) {
             let uncertain = false;
 
             if (funcNode.type === 'identifier') {
+                const callName = funcNode.text;
+                // Skip Go built-in function calls
+                if (GO_BUILTINS.has(callName)) return true;
+                // Skip calls to local closures (they shadow package-level functions)
+                if (isLocalClosure(callName)) return true;
+
                 // Direct call: foo()
                 calls.push({
-                    name: funcNode.text,
+                    name: callName,
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     enclosingFunction,
@@ -406,7 +457,8 @@ function findCallsInCode(code, parser) {
     }, {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
-                functionStack.pop();
+                const leaving = functionStack.pop();
+                closureScopes.delete(leaving.startLine);
             }
         }
     });

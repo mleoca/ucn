@@ -809,7 +809,7 @@ function runProjectCommand(rootDir, command, arg) {
             requireArg(arg, 'Usage: ucn . trace <name>');
             const traceDepth = flags.depth ? parseInt(flags.depth) : 3;
             const depthExplicit = flags.depth !== undefined;
-            const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file, all: flags.all || depthExplicit });
+            const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file, all: flags.all || depthExplicit, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain });
             printOutput(traceResult, output.formatTraceJson, output.formatTrace);
             break;
         }
@@ -1900,7 +1900,8 @@ function printGraph(graph, root, maxDepth = 2, showAll = false) {
     const maxChildren = showAll ? Infinity : 8;
 
     function printTree(nodes, edges, rootFile) {
-        const printed = new Set();
+        const visited = new Set();     // all nodes ever printed (for diamond dep detection)
+        const ancestors = new Set();   // current path from root (for true circular detection)
         let truncatedNodes = 0;
         let depthLimited = false;
 
@@ -1909,11 +1910,15 @@ function printGraph(graph, root, maxDepth = 2, showAll = false) {
             const relPath = fileEntry ? fileEntry.relativePath : path.relative(root, file);
             const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
 
-            if (printed.has(file)) {
+            if (ancestors.has(file)) {
                 console.log(`${prefix}${relPath} (circular)`);
                 return;
             }
-            printed.add(file);
+            if (visited.has(file)) {
+                console.log(`${prefix}${relPath} (already shown)`);
+                return;
+            }
+            visited.add(file);
 
             if (indent > maxDepth) {
                 depthLimited = true;
@@ -1923,6 +1928,7 @@ function printGraph(graph, root, maxDepth = 2, showAll = false) {
 
             console.log(`${prefix}${relPath}`);
 
+            ancestors.add(file);
             const fileEdges = edges.filter(e => e.from === file);
             const displayEdges = fileEdges.slice(0, maxChildren);
             const hiddenCount = fileEdges.length - displayEdges.length;
@@ -1930,6 +1936,7 @@ function printGraph(graph, root, maxDepth = 2, showAll = false) {
             for (const edge of displayEdges) {
                 printNode(edge.to, indent + 1);
             }
+            ancestors.delete(file);
 
             if (hiddenCount > 0) {
                 truncatedNodes += hiddenCount;

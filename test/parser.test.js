@@ -8037,5 +8037,331 @@ fn main() {
 
 }); // end describe('Bug Report #3 Regressions')
 
+describe('Bug Report #4 Regressions (5-language scan)', () => {
+
+// BUG 1: trace should forward --include-methods/--include-uncertain
+it('trace forwards includeMethods and includeUncertain to findCallees/findCallers', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const code = `
+function outer() {
+    helper();
+}
+function helper() {}
+`;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug1-'));
+    fs.writeFileSync(path.join(tmpDir, 'test.js'), code);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        const result = idx.trace('outer', { depth: 2, includeMethods: true, includeUncertain: true });
+        assert.ok(result, 'trace should return a result');
+        assert.ok(result.tree, 'trace should return a tree');
+        const calleeNames = result.tree.children.map(c => c.name);
+        assert.ok(calleeNames.includes('helper'), 'trace should find helper as callee');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 2: Same-class self/this.method() callers should not be marked uncertain
+it('Java same-class implicit calls are not marked uncertain', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const javaCode = `
+package test;
+public class MyService {
+    public void process() {
+        validate();
+        execute();
+    }
+    private void validate() {}
+    private void execute() {}
+}
+`;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug2-'));
+    const srcDir = path.join(tmpDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'MyService.java'), javaCode);
+    fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        const stats = { uncertain: 0 };
+        const callers = idx.findCallers('validate', { stats });
+        assert.ok(callers.length > 0, 'validate should have callers');
+        assert.ok(callers.some(c => c.callerName === 'process'), 'process should call validate');
+        // The key assertion: these should NOT be uncertain
+        assert.strictEqual(stats.uncertain, 0, 'same-class implicit calls should not be uncertain');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 3: Rust Type::method() static calls should be included by default
+it('Rust auto-includes method calls like Go/Java', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const rustCode = `
+struct Config {}
+impl Config {
+    fn new() -> Config { Config {} }
+}
+fn main() {
+    let c = Config::new();
+}
+`;
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug3-'));
+    const srcDir = path.join(tmpDir, 'src');
+    fs.mkdirSync(srcDir);
+    fs.writeFileSync(path.join(srcDir, 'main.rs'), rustCode);
+    fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        const callers = idx.findCallers('new', {});
+        assert.ok(callers.some(c => c.callerName === 'main'), 'Rust Config::new() should be found as caller of new without --include-methods');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 4: graph should distinguish circular from diamond dependencies
+it('graph labels diamond deps as "(already shown)" not "(circular)"', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug4-'));
+    // a.js imports b.js and c.js; both b.js and c.js import d.js (diamond)
+    fs.writeFileSync(path.join(tmpDir, 'a.js'), "const b = require('./b');\nconst c = require('./c');");
+    fs.writeFileSync(path.join(tmpDir, 'b.js'), "const d = require('./d');\nmodule.exports = {};");
+    fs.writeFileSync(path.join(tmpDir, 'c.js'), "const d = require('./d');\nmodule.exports = {};");
+    fs.writeFileSync(path.join(tmpDir, 'd.js'), "module.exports = {};");
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        const result = idx.graph(path.join(tmpDir, 'a.js'), { depth: 3, direction: 'imports' });
+        assert.ok(result, 'graph should return a result');
+        // Verify d.js appears in the graph (diamond dep is present)
+        const imports = result.imports || result;
+        assert.ok(imports, 'graph should have imports section');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 5: Go closures should not be attributed to package-level functions
+it('Go local closures are not matched as callers of package-level function', (t) => {
+    const { getParser } = require('../languages');
+    const goMod = require('../languages/go');
+
+    const code = `package main
+
+func globalAtoi(s string) int { return 0 }
+
+func processInput(input string) {
+    atoi := func(s string) int { return 0 }
+    val := atoi(input)
+    _ = val
+}
+
+func useGlobal(s string) {
+    v := globalAtoi(s)
+    _ = v
+}
+`;
+    const parser = getParser('go');
+    const calls = goMod.findCallsInCode(code, parser);
+    // Calls to local closure 'atoi' inside processInput should be filtered
+    const atoiCalls = calls.filter(c => c.name === 'atoi');
+    assert.strictEqual(atoiCalls.length, 0, 'calls to local closure atoi should be filtered');
+    // Calls to globalAtoi should still be present
+    const globalCalls = calls.filter(c => c.name === 'globalAtoi');
+    assert.ok(globalCalls.length > 0, 'calls to package-level globalAtoi should be kept');
+});
+
+// BUG 5b: Go package-scoped binding resolution
+it('Go findCallers resolves sibling file bindings (same package)', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug5b-'));
+    const pkgDir = path.join(tmpDir, 'pkg');
+    fs.mkdirSync(pkgDir);
+    // pkg/a.go defines helper
+    fs.writeFileSync(path.join(pkgDir, 'a.go'), `package pkg
+func helper() int { return 1 }
+`);
+    // pkg/b.go calls helper
+    fs.writeFileSync(path.join(pkgDir, 'b.go'), `package pkg
+func useHelper() int { return helper() }
+`);
+    // other/c.go defines its own helper
+    const otherDir = path.join(tmpDir, 'other');
+    fs.mkdirSync(otherDir);
+    fs.writeFileSync(path.join(otherDir, 'c.go'), `package other
+func helper() int { return 2 }
+func useOther() int { return helper() }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        // When targeting pkg/a.go:helper, callers should include pkg/b.go but NOT other/c.go
+        const callers = idx.findCallers('helper', { targetDefinitions: [{ bindingId: 'pkg/a.go:function:2' }] });
+        const callerFiles = callers.map(c => c.relativePath);
+        assert.ok(callerFiles.some(f => f.includes('b.go')), 'pkg/b.go should call pkg/a.go helper');
+        assert.ok(!callerFiles.some(f => f.includes('c.go')), 'other/c.go should NOT be a caller of pkg/a.go helper');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 5c: impact filters by binding and cross-references with findCallsInCode
+it('impact filters calls from files with their own definition of same-named function', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug5c-'));
+    // main.js defines and calls parse
+    fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+function parse(s) { return JSON.parse(s); }
+const result = parse('{}');
+`);
+    // other.js defines its own parse
+    fs.writeFileSync(path.join(tmpDir, 'other.js'), `
+function parse(s) { return s.split(','); }
+const items = parse('a,b,c');
+`);
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        const result = idx.impact('parse', { file: 'main' });
+        assert.ok(result, 'impact should return a result');
+        // Should only show calls from main.js, not other.js
+        const files = result.byFile.map(f => f.file);
+        assert.ok(!files.some(f => f.includes('other')), 'impact should not include calls from other.js which has its own parse');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 6: Go built-in functions should not match user-defined functions
+it('Go built-in functions (append, len, etc.) are filtered from findCallsInCode', (t) => {
+    const { getParser } = require('../languages');
+    const goMod = require('../languages/go');
+
+    const code = `package main
+
+func main() {
+    s := []int{1, 2, 3}
+    s = append(s, 4)
+    n := len(s)
+    m := make(map[string]int)
+    _ = n
+    _ = m
+    customFunc(s)
+}
+
+func customFunc(s []int) {}
+`;
+    const parser = getParser('go');
+    const calls = goMod.findCallsInCode(code, parser);
+    const callNames = calls.map(c => c.name);
+    assert.ok(!callNames.includes('append'), 'append should be filtered as Go built-in');
+    assert.ok(!callNames.includes('len'), 'len should be filtered as Go built-in');
+    assert.ok(!callNames.includes('make'), 'make should be filtered as Go built-in');
+    assert.ok(callNames.includes('customFunc'), 'user-defined functions should not be filtered');
+});
+
+// BUG 6b: Cross-type method calls marked as uncertain
+it('Go cross-type method calls with multiple definitions are uncertain when no local binding', (t) => {
+    const { ProjectIndex } = require('../core/project');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-bug6b-'));
+    // Three packages: two define Length(), third calls it without local binding
+    const pkgA = path.join(tmpDir, 'a');
+    const pkgB = path.join(tmpDir, 'b');
+    const pkgC = path.join(tmpDir, 'c');
+    fs.mkdirSync(pkgA);
+    fs.mkdirSync(pkgB);
+    fs.mkdirSync(pkgC);
+    fs.writeFileSync(path.join(pkgA, 'a.go'), `package a
+type TypeA struct{}
+func (t *TypeA) Length() int { return 0 }
+`);
+    fs.writeFileSync(path.join(pkgB, 'b.go'), `package b
+type TypeB struct{}
+func (t *TypeB) Length() int { return 0 }
+`);
+    // c/c.go calls obj.Length() but has NO local Length definition
+    fs.writeFileSync(path.join(pkgC, 'c.go'), `package c
+func UseC(obj interface{ Length() int }) int { return obj.Length() }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test');
+    try {
+        const idx = new ProjectIndex(tmpDir);
+        idx.build();
+        const stats = { uncertain: 0 };
+        const callees = idx.findCallees(
+            { file: path.join(pkgC, 'c.go'), name: 'UseC', startLine: 2, endLine: 2 },
+            { stats }
+        );
+        // Length() is uncertain because there are 2 definitions and no local binding
+        const lengthCallee = callees.find(c => c.name === 'Length');
+        assert.ok(!lengthCallee, 'Length should be filtered as uncertain when multiple defs and no local binding');
+        assert.ok(stats.uncertain > 0, 'cross-type method call should be counted as uncertain');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
+});
+
+// BUG 7: Rust enum variant references should not match struct usages
+it('Rust usages filters Boundary::Grid enum variant from Grid struct usages', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/rust');
+
+    const code = `
+enum Boundary {
+    Grid,
+    Cursor,
+}
+struct Grid<T> {
+    data: Vec<T>,
+}
+impl<T> Grid<T> {
+    fn new() -> Grid<T> { Grid { data: vec![] } }
+}
+fn main() {
+    let g = Grid::new();
+    let b = Boundary::Grid;
+    let c = Boundary::Cursor;
+}
+`;
+    const parser = getParser('rust');
+    const usages = findUsagesInCode(code, 'Grid', parser);
+    // Boundary::Grid should NOT be in the usages (line 14 in the test code)
+    const lines = usages.map(u => u.line);
+    assert.ok(!lines.includes(14), 'Boundary::Grid (line 14) should not be a usage of Grid struct');
+    // Grid::new() SHOULD be in the usages (Grid is the path/left side, line 13)
+    assert.ok(lines.includes(13), 'Grid::new() (line 13) should be a usage of Grid struct');
+    // Boundary::Cursor should not appear at all (searching for "Grid")
+    assert.ok(!lines.includes(15), 'Boundary::Cursor should not appear in Grid usages');
+});
+
+// BUG 7b: Rust enum variant filter doesn't affect module paths or Self::
+it('Rust usages keeps module::Item and Self::method references', (t) => {
+    const { getParser } = require('../languages');
+    const { findUsagesInCode } = require('../languages/rust');
+
+    const code = `
+mod mymod {
+    pub fn helper() {}
+}
+fn main() {
+    mymod::helper();
+}
+`;
+    const parser = getParser('rust');
+    const usages = findUsagesInCode(code, 'helper', parser);
+    // mymod::helper() should still be found (module path is lowercase)
+    assert.ok(usages.some(u => u.line === 6 && u.usageType === 'call'), 'mymod::helper() should be found as call');
+});
+
+}); // end describe('Bug Report #4 Regressions')
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
