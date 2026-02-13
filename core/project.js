@@ -867,7 +867,7 @@ class ProjectIndex {
         }
 
         const stats = { uncertain: 0 };
-        const callers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+        const callers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, targetDefinitions: [def] });
         const callees = this.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
 
         const filesInScope = new Set([def.file]);
@@ -1003,20 +1003,44 @@ class ProjectIndex {
                     let bindingId = call.bindingId;
                     let isUncertain = call.uncertain;
                     if (!bindingId) {
-                        const bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
+                        let bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
+                        // For Go, also check sibling files in same directory (same package scope)
+                        if (bindings.length === 0 && fileEntry.language === 'go') {
+                            const dir = path.dirname(filePath);
+                            for (const [fp, fe] of this.files) {
+                                if (fp !== filePath && path.dirname(fp) === dir) {
+                                    const sibling = (fe.bindings || []).filter(b => b.name === call.name);
+                                    bindings = bindings.concat(sibling);
+                                }
+                            }
+                        }
                         if (bindings.length === 1) {
                             bindingId = bindings[0].id;
+                        } else if (bindings.length > 1 && !call.isMethod) {
+                            // For implicit same-class calls (Java: execute() means this.execute()),
+                            // try to resolve via caller's className before marking uncertain
+                            const callerSym = this.findEnclosingFunction(filePath, call.line, true);
+                            if (callerSym?.className) {
+                                const callSymbols = this.symbols.get(call.name);
+                                const sameClassSym = callSymbols?.find(s => s.className === callerSym.className);
+                                if (sameClassSym) {
+                                    const matchingBinding = bindings.find(b => b.startLine === sameClassSym.startLine);
+                                    bindingId = matchingBinding?.id || sameClassSym.bindingId;
+                                } else {
+                                    isUncertain = true;
+                                }
+                            } else {
+                                isUncertain = true;
+                            }
                         } else if (bindings.length !== 0) {
                             isUncertain = true;
                         }
                     }
 
-                    if (isUncertain && !options.includeUncertain) {
-                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
-                        continue;
-                    }
-
-                    // Smart method call handling
+                    // Smart method call handling — do this BEFORE uncertain check so
+                    // self/this.method() calls can be resolved by same-class matching
+                    // even when binding is ambiguous (e.g. method exists in multiple classes)
+                    let resolvedBySameClass = false;
                     if (call.isMethod) {
                         if (call.selfAttribute && fileEntry.language === 'python') {
                             // self.attr.method() — resolve via attribute type inference
@@ -1029,6 +1053,7 @@ class ProjectIndex {
                             // Check if any definition of searched function belongs to targetClass
                             const matchesDef = definitions.some(d => d.className === targetClass);
                             if (!matchesDef) continue;
+                            resolvedBySameClass = true;
                             // Falls through to add as caller
                         } else if (['self', 'cls', 'this'].includes(call.receiver)) {
                             // self.method() / cls.method() / this.method() — resolve to same-class method
@@ -1037,20 +1062,30 @@ class ProjectIndex {
                             // Check if any definition of searched function belongs to caller's class
                             const matchesDef = definitions.some(d => d.className === callerSymbol.className);
                             if (!matchesDef) continue;
+                            resolvedBySameClass = true;
                             // Falls through to add as caller
                         } else {
                             // Go doesn't use this/self/cls - always include Go method calls
                             // Java method calls are always obj.method() - include by default
+                            // Rust Type::method() calls - include by default (associated functions)
                             // For other languages, skip method calls unless explicitly requested
-                            if (fileEntry.language !== 'go' && fileEntry.language !== 'java' && !options.includeMethods) continue;
+                            if (fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust' && !options.includeMethods) continue;
                         }
+                    }
+
+                    // Skip uncertain calls unless resolved by same-class matching or explicitly requested
+                    if (isUncertain && !resolvedBySameClass && !options.includeUncertain) {
+                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                        continue;
                     }
 
                     // Skip definition lines
                     if (definitionLines.has(`${filePath}:${call.line}`)) continue;
 
                     // If we have a binding id on definition, require match when available
-                    const targetBindingIds = new Set(definitions.map(d => d.bindingId).filter(Boolean));
+                    // When targetDefinitions is provided, only those definitions' bindings are valid targets
+                    const targetDefs = options.targetDefinitions || definitions;
+                    const targetBindingIds = new Set(targetDefs.map(d => d.bindingId).filter(Boolean));
                     if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
                         continue;
                     }
@@ -1203,7 +1238,24 @@ class ProjectIndex {
                 let bindingResolved = call.bindingId;
                 let isUncertain = call.uncertain;
                 if (!call.bindingId && fileEntry?.bindings) {
-                    const bindings = fileEntry.bindings.filter(b => b.name === call.name);
+                    let bindings = fileEntry.bindings.filter(b => b.name === call.name);
+                    // For Go, also check sibling files in same directory (same package scope)
+                    if (bindings.length === 0 && language === 'go') {
+                        const dir = path.dirname(def.file);
+                        for (const [fp, fe] of this.files) {
+                            if (fp !== def.file && path.dirname(fp) === dir) {
+                                const sibling = (fe.bindings || []).filter(b => b.name === call.name);
+                                bindings = bindings.concat(sibling);
+                            }
+                        }
+                    }
+                    // If still no binding and call is a method call with multiple definitions, mark uncertain
+                    if (bindings.length === 0 && call.isMethod) {
+                        const defs = this.symbols.get(call.name);
+                        if (defs && defs.length > 1) {
+                            isUncertain = true;
+                        }
+                    }
                     if (bindings.length === 1) {
                         bindingResolved = bindings[0].id;
                         calleeKey = bindingResolved;
@@ -1227,6 +1279,28 @@ class ProjectIndex {
                                 }
                             }
                             continue; // Already added all overloads, skip normal add
+                        } else if (def.className && !call.isMethod) {
+                            // Implicit same-class call (Java: execute() means this.execute())
+                            // Try to resolve to a binding in the same class via symbol lookup
+                            const callSymbols = this.symbols.get(call.name);
+                            if (callSymbols) {
+                                const sameClassSym = callSymbols.find(s => s.className === def.className);
+                                if (sameClassSym) {
+                                    // Find the binding that matches this symbol's line
+                                    const matchingBinding = bindings.find(b => b.startLine === sameClassSym.startLine);
+                                    if (matchingBinding) {
+                                        bindingResolved = matchingBinding.id;
+                                        calleeKey = bindingResolved;
+                                    } else {
+                                        bindingResolved = sameClassSym.bindingId;
+                                        calleeKey = bindingResolved || `${def.className}.${call.name}`;
+                                    }
+                                } else {
+                                    isUncertain = true;
+                                }
+                            } else {
+                                isUncertain = true;
+                            }
                         } else {
                             isUncertain = true;
                         }
@@ -2668,7 +2742,7 @@ class ProjectIndex {
             };
 
             if (dir === 'down' || dir === 'both') {
-                const callees = this.findCallees(funcDef);
+                const callees = this.findCallees(funcDef, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain });
                 for (const callee of callees.slice(0, maxChildren)) {
                     // callee already has the best-matched definition from findCallees
                     const childTree = buildTree(callee, currentDepth + 1, 'down');
@@ -2694,7 +2768,7 @@ class ProjectIndex {
         let callers = [];
         let truncatedCallers = 0;
         if (direction === 'up' || direction === 'both') {
-            const allCallers = this.findCallers(name);
+            const allCallers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [def] });
             callers = allCallers.slice(0, maxChildren).map(c => ({
                 name: c.callerName || '(anonymous)',
                 file: c.relativePath,
@@ -2732,7 +2806,38 @@ class ProjectIndex {
             return null;
         }
         const usages = this.usages(name, { codeOnly: true });
-        const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+        const targetBindingId = def.bindingId;
+        const calls = usages.filter(u => {
+            if (u.usageType !== 'call' || u.isDefinition) return false;
+            const fileEntry = this.files.get(u.file);
+            if (fileEntry) {
+                // Filter by binding: skip calls from files that define their own version of this function
+                // For Go, also check sibling files in same directory (same package scope)
+                if (targetBindingId) {
+                    let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
+                    if (localBindings.length === 0 && fileEntry.language === 'go') {
+                        const dir = path.dirname(u.file);
+                        for (const [fp, fe] of this.files) {
+                            if (fp !== u.file && path.dirname(fp) === dir) {
+                                const sibling = (fe.bindings || []).filter(b => b.name === name);
+                                localBindings = localBindings.concat(sibling);
+                            }
+                        }
+                    }
+                    if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
+                        return false; // This file/package has its own definition — call is to that, not our target
+                    }
+                }
+                // Cross-reference with findCallsInCode to filter local closures and built-ins
+                // (findCallsInCode has scope-aware filtering that findUsagesInCode lacks)
+                const parsedCalls = this.getCachedCalls(u.file);
+                if (parsedCalls && Array.isArray(parsedCalls)) {
+                    const hasCall = parsedCalls.some(c => c.name === name && c.line === u.line);
+                    if (!hasCall) return false;
+                }
+            }
+            return true;
+        });
 
         // Analyze each call site
         const callSites = calls.map(call => {

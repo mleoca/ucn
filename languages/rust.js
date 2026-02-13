@@ -1034,6 +1034,23 @@ function findUsagesInCode(code, name, parser) {
             }
         }
 
+        // Filter out enum variant references: Boundary::Grid is NOT a usage of Grid struct
+        // If our node is the NAME (right side) of a scoped_identifier/scoped_type_identifier,
+        // and the PATH (left side) is a different Capitalized type, it's likely an enum variant
+        if (parent && (parent.type === 'scoped_identifier' || parent.type === 'scoped_type_identifier')) {
+            const nameField = parent.childForFieldName('name');
+            const pathField = parent.childForFieldName('path');
+            if (nameField === node && pathField) {
+                const pathText = pathField.text;
+                // If path is a Capitalized identifier different from our target, it's Type::Variant
+                // Skip module paths (lowercase), self/Self/super/crate keywords
+                if (/^[A-Z]/.test(pathText) && pathText !== name &&
+                    !['Self'].includes(pathText)) {
+                    return true; // Skip — this is EnumType::Variant, not our type
+                }
+            }
+        }
+
         usages.push({ line, column, usageType });
         return true;
     });

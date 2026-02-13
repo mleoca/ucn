@@ -955,15 +955,17 @@ server.registerTool(
             project_dir: projectDirParam,
             name: nameParam,
             file: fileParam,
-            depth: z.number().optional().describe('Maximum call tree depth (default: 3)')
+            depth: z.number().optional().describe('Maximum call tree depth (default: 3)'),
+            include_methods: z.boolean().optional().describe('Include obj.method() calls in caller/callee analysis'),
+            include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches')
         })
     },
-    async ({ project_dir, name, file, depth }) => {
+    async ({ project_dir, name, file, depth, include_methods, include_uncertain }) => {
         const err = requireName(name);
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const result = index.trace(name, { depth: depth ?? 3, file, all: depth !== undefined });
+            const result = index.trace(name, { depth: depth ?? 3, file, all: depth !== undefined, includeMethods: include_methods, includeUncertain: include_uncertain });
             return toolResult(output.formatTrace(result));
         } catch (e) {
             return toolError(e.message);
