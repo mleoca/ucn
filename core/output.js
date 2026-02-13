@@ -388,7 +388,8 @@ function formatImportsJson(imports, filePath) {
             module: i.module,
             names: i.names,
             type: i.type,
-            resolved: i.resolved || null
+            resolved: i.resolved || null,
+            isDynamic: !!i.isDynamic
         }))
     }, null, 2);
 }
@@ -455,8 +456,9 @@ function formatSmartJson(result) {
 function formatImports(imports, filePath) {
     const lines = [`Imports in ${filePath}:\n`];
 
-    const internal = imports.filter(i => !i.isExternal);
-    const external = imports.filter(i => i.isExternal);
+    const internal = imports.filter(i => !i.isExternal && !i.isDynamic);
+    const external = imports.filter(i => i.isExternal && !i.isDynamic);
+    const dynamic = imports.filter(i => i.isDynamic);
 
     if (internal.length > 0) {
         lines.push('INTERNAL:');
@@ -476,6 +478,17 @@ function formatImports(imports, filePath) {
         lines.push('EXTERNAL:');
         for (const imp of external) {
             lines.push(`  ${imp.module}`);
+            if (imp.names && imp.names.length > 0) {
+                lines.push(`    ${imp.names.join(', ')}`);
+            }
+        }
+    }
+
+    if (dynamic.length > 0) {
+        if (internal.length > 0 || external.length > 0) lines.push('');
+        lines.push('DYNAMIC (unresolved):');
+        for (const imp of dynamic) {
+            lines.push(`  ${imp.module || '(variable)'}`);
             if (imp.names && imp.names.length > 0) {
                 lines.push(`    ${imp.names.join(', ')}`);
             }
@@ -763,6 +776,10 @@ function formatTrace(trace) {
 
     if (hasTruncation) {
         lines.push(`\nSome results truncated. Use --all to show all.`);
+    }
+
+    if (!trace.includeMethods) {
+        lines.push(`\nNote: obj.method() calls excluded. Use --include-methods to include them.`);
     }
 
     return lines.join('\n');

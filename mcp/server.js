@@ -355,6 +355,10 @@ function formatContextText(ctx) {
         });
     }
 
+    if (ctx.meta && !ctx.meta.includeMethods) {
+        lines.push(`\nNote: obj.method() calls excluded. Use include_methods=true to include them.`);
+    }
+
     if (expandable.length > 0) {
         lines.push(`\nUse ucn_expand with item number to see code for any item.`);
     }
@@ -1079,10 +1083,11 @@ server.registerTool(
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
-            file: fileParam
+            file: fileParam,
+            max_lines: z.number().optional().describe('Maximum lines of source to show. If omitted, large classes (>200 lines) show a summary instead of full source.')
         })
     },
-    async ({ project_dir, name, file }) => {
+    async ({ project_dir, name, file, max_lines }) => {
         const err = requireName(name);
         if (err) return err;
         try {
@@ -1112,6 +1117,34 @@ server.registerTool(
             let note = '';
             if (matches.length > 1 && !file) {
                 note = `Note: Found ${matches.length} definitions for "${name}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n\n`;
+            }
+
+            const classLineCount = cls.endLine - cls.startLine + 1;
+
+            // Large class: show summary by default, truncated source with max_lines
+            if (classLineCount > 200 && max_lines === undefined) {
+                const lines = [];
+                lines.push(`${cls.relativePath}:${cls.startLine}`);
+                lines.push(`${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
+                lines.push('─'.repeat(60));
+
+                // Show method list from index
+                const methods = index.findMethodsForType(match.name);
+                if (methods.length > 0) {
+                    lines.push(`\nMethods (${methods.length}):`);
+                    for (const m of methods) {
+                        lines.push(`  ${output.formatFunctionSignature(m)}  [line ${m.startLine}]`);
+                    }
+                }
+
+                lines.push(`\nClass is ${classLineCount} lines. Use max_lines param to see source, or ucn_fn for individual methods.`);
+                return toolResult(note + lines.join('\n'));
+            }
+
+            if (max_lines !== undefined && classLineCount > max_lines) {
+                const truncatedCode = clsCode.split('\n').slice(0, max_lines).join('\n');
+                const result = formatClassText(cls, truncatedCode);
+                return toolResult(note + result + `\n\n... showing ${max_lines} of ${classLineCount} lines`);
             }
 
             return toolResult(note + formatClassText(cls, clsCode));
