@@ -1031,8 +1031,9 @@ class ProjectIndex {
                             // Falls through to add as caller
                         } else {
                             // Go doesn't use this/self/cls - always include Go method calls
+                            // Java method calls are always obj.method() - include by default
                             // For other languages, skip method calls unless explicitly requested
-                            if (fileEntry.language !== 'go' && !options.includeMethods) continue;
+                            if (fileEntry.language !== 'go' && fileEntry.language !== 'java' && !options.includeMethods) continue;
                         }
                     }
 
@@ -1149,7 +1150,7 @@ class ProjectIndex {
                         // Will be resolved in second pass below
                     } else if (['self', 'cls', 'this'].includes(call.receiver)) {
                         // self.method() / cls.method() / this.method() — resolve to same-class method below
-                    } else if (language !== 'go' && !options.includeMethods) {
+                    } else if (language !== 'go' && language !== 'java' && !options.includeMethods) {
                         continue;
                     }
                 }
@@ -1687,11 +1688,24 @@ class ProjectIndex {
             const { imports: rawImports } = extractImports(content, fileEntry.language);
 
             return rawImports.map(imp => {
-                const resolved = resolveImport(imp.module, normalizedPath, {
+                let resolved = resolveImport(imp.module, normalizedPath, {
                     aliases: this.config.aliases,
                     language: fileEntry.language,
                     root: this.root
                 });
+
+                // Java package imports: resolve by matching file path suffix
+                // e.g., "com.anylyze.data.ExposableEntity" -> find file ending in "com/anylyze/data/ExposableEntity.java"
+                if (!resolved && fileEntry.language === 'java' &&
+                    !imp.module.startsWith('.') && !imp.module.endsWith('.*')) {
+                    const fileSuffix = '/' + imp.module.split('.').join('/') + '.java';
+                    for (const absPath of this.files.keys()) {
+                        if (absPath.endsWith(fileSuffix)) {
+                            resolved = absPath;
+                            break;
+                        }
+                    }
+                }
 
                 // Find line number of import
                 const lines = content.split('\n');
@@ -2250,12 +2264,15 @@ class ProjectIndex {
         };
 
         const traverse = (file, depth) => {
-            if (depth > maxDepth || visited.has(file)) return;
+            if (visited.has(file)) return;
             visited.add(file);
 
             const fileEntry = this.files.get(file);
             const relPath = fileEntry ? fileEntry.relativePath : path.relative(this.root, file);
             graph.nodes.push({ file, relativePath: relPath, depth });
+
+            // Stop traversal at max depth but still register the node above
+            if (depth >= maxDepth) return;
 
             let neighbors = [];
             if (direction === 'imports' || direction === 'both') {

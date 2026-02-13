@@ -59,33 +59,32 @@ function lineLoc(line) {
  * @returns {string}
  */
 function formatFunctionSignature(fn) {
-    const parts = [];
+    const prefix = [];
 
     // Modifiers
     if (fn.modifiers && fn.modifiers.length > 0) {
-        parts.push(fn.modifiers.join(' '));
+        prefix.push(fn.modifiers.join(' '));
     }
 
     // Generator marker
-    if (fn.isGenerator) parts.push('*');
+    if (fn.isGenerator) prefix.push('*');
 
-    // Name
-    parts.push(fn.name);
-
-    // Generics
-    if (fn.generics) parts.push(fn.generics);
-
-    // Parameters - FULL, never truncated
+    // Name + generics + params (concatenated without spaces)
+    let sig = fn.name;
+    if (fn.generics) sig += fn.generics;
     const params = normalizeParams(fn.params);
-    parts.push(`(${params})`);
+    sig += `(${params})`;
 
     // Return type
-    if (fn.returnType) parts.push(`: ${fn.returnType}`);
+    if (fn.returnType) sig += `: ${fn.returnType}`;
 
     // Arrow indicator
-    if (fn.isArrow) parts.push(' =>');
+    if (fn.isArrow) sig += ' =>';
 
-    return parts.filter(p => p).join('');
+    if (prefix.length > 0) {
+        return prefix.join(' ') + ' ' + sig;
+    }
+    return sig;
 }
 
 /**

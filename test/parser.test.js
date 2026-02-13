@@ -6878,5 +6878,257 @@ def unused_function():
     });
 });
 
+// ============================================================================
+// BUG 1 REGRESSION: extractExports must use TS parser for TypeScript files
+// ============================================================================
+
+describe('Regression: extractExports uses correct parser for TypeScript', () => {
+    it('should find all exports in TypeScript files with type annotations', () => {
+        const { extractExports } = require('../core/imports');
+        const tsCode = `
+import { UseMutationResult } from '@tanstack/react-query';
+
+export function useGetToken(): UseMutationResult<string> {
+    return {} as any;
+}
+
+export function useGetConfig(): Promise<Config> {
+    return {} as any;
+}
+
+export function useUpdateConfig(data: ConfigData): void {
+    console.log(data);
+}
+
+export function useSaveConfig(): void {
+    console.log('save');
+}
+
+export function useRefresh(): void {
+    console.log('refresh');
+}
+`;
+        const { exports } = extractExports(tsCode, 'typescript');
+        const names = exports.map(e => e.name);
+        assert.ok(names.includes('useGetToken'), 'should find useGetToken');
+        assert.ok(names.includes('useGetConfig'), 'should find useGetConfig');
+        assert.ok(names.includes('useUpdateConfig'), 'should find useUpdateConfig');
+        assert.ok(names.includes('useSaveConfig'), 'should find useSaveConfig');
+        assert.ok(names.includes('useRefresh'), 'should find useRefresh');
+        assert.strictEqual(names.length, 5, 'should find all 5 exports');
+    });
+
+    it('should find export const with TS type annotations', () => {
+        const { extractExports } = require('../core/imports');
+        const tsCode = `
+export const client: AxiosInstance = axios.create({});
+export const cloudClient: AxiosInstance = axios.create({});
+export function customRequest<T>(url: string): Promise<T> {
+    return {} as any;
+}
+`;
+        const { exports } = extractExports(tsCode, 'typescript');
+        const names = exports.map(e => e.name);
+        assert.ok(names.includes('client'), 'should find client');
+        assert.ok(names.includes('cloudClient'), 'should find cloudClient');
+        assert.ok(names.includes('customRequest'), 'should find customRequest');
+    });
+});
+
+// ============================================================================
+// BUG 3 REGRESSION: formatFunctionSignature spacing
+// ============================================================================
+
+describe('Regression: formatFunctionSignature has correct spacing', () => {
+    it('should separate modifiers from function name with space', () => {
+        const output = require('../core/output');
+        const sig = output.formatFunctionSignature({
+            name: 'getSymbol',
+            modifiers: ['public'],
+            params: 'String key'
+        });
+        assert.ok(sig.startsWith('public getSymbol('), `Expected "public getSymbol(" but got "${sig}"`);
+    });
+
+    it('should handle multiple modifiers', () => {
+        const output = require('../core/output');
+        const sig = output.formatFunctionSignature({
+            name: 'main',
+            modifiers: ['public', 'static'],
+            params: 'String[] args',
+            returnType: 'void'
+        });
+        assert.ok(sig.startsWith('public static main('), `Expected "public static main(" but got "${sig}"`);
+        assert.ok(sig.includes('): void'), `Expected return type but got "${sig}"`);
+    });
+
+    it('should not add leading space when no modifiers', () => {
+        const output = require('../core/output');
+        const sig = output.formatFunctionSignature({
+            name: 'helper',
+            modifiers: [],
+            params: ''
+        });
+        assert.ok(sig.startsWith('helper('), `Expected "helper(" but got "${sig}"`);
+    });
+});
+
+// ============================================================================
+// BUG 4 REGRESSION: Java "extends extends" duplication
+// ============================================================================
+
+describe('Regression: Java extractExtends should not include "extends" keyword', () => {
+    it('should extract superclass name without extends keyword', () => {
+        const { parse } = require('../core/parser');
+        const result = parse(`
+public class SecurityConfig extends WebSecurityConfigurerAdapter {
+    public void configure() {}
+}
+`, 'java');
+        assert.ok(result.classes.length > 0, 'should find the class');
+        const cls = result.classes[0];
+        assert.strictEqual(cls.extends, 'WebSecurityConfigurerAdapter',
+            `Expected "WebSecurityConfigurerAdapter" but got "${cls.extends}"`);
+    });
+
+    it('should handle generic superclass', () => {
+        const { parse } = require('../core/parser');
+        const result = parse(`
+public class MyList extends ArrayList<String> {
+}
+`, 'java');
+        const cls = result.classes[0];
+        assert.strictEqual(cls.extends, 'ArrayList<String>',
+            `Expected "ArrayList<String>" but got "${cls.extends}"`);
+    });
+});
+
+// ============================================================================
+// BUG 5 REGRESSION: JS/TS extends clause should capture full generic type
+// ============================================================================
+
+describe('Regression: JS/TS extractExtends preserves generic types', () => {
+    it('should capture dotted names and generics in extends clause', () => {
+        const { parse } = require('../core/parser');
+        const result = parse(`
+export class ErrorBoundary extends React.Component {
+    render() {}
+}
+`, 'javascript');
+        const cls = result.classes[0];
+        assert.strictEqual(cls.extends, 'React.Component',
+            `Expected "React.Component" but got "${cls.extends}"`);
+    });
+});
+
+// ============================================================================
+// BUG 6 REGRESSION: Java callers found by default (no include_methods needed)
+// ============================================================================
+
+describe('Regression: Java method callers found by default', () => {
+    it('should find Java method callers without include_methods flag', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-java-callers-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Service.java'), `
+public class Service {
+    public String getData() {
+        return "data";
+    }
+}
+`);
+            fs.writeFileSync(path.join(tmpDir, 'Controller.java'), `
+public class Controller {
+    private Service service;
+    public void handle() {
+        String result = service.getData();
+    }
+}
+`);
+            const idx = new ProjectIndex(tmpDir);
+            idx.build(null, { quiet: true });
+            // Default: no includeMethods flag
+            const callers = idx.findCallers('getData');
+            assert.ok(callers.length > 0, 'should find callers of getData without include_methods');
+            assert.ok(callers.some(c => c.content.includes('getData')), 'should include the call site');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// BUG 7 REGRESSION: deadcode excludes Java src/test/ files
+// ============================================================================
+
+describe('Regression: deadcode excludes Java src/test/ files', () => {
+    it('should not report symbols from src/test/ as dead code', () => {
+        const { isTestFile } = require('../core/discovery');
+        // Java files in src/test/ directory should be recognized as test files
+        assert.ok(isTestFile('src/test/java/com/example/MyShould.java', 'java'),
+            'src/test/ java file should be test file');
+        assert.ok(isTestFile('src/test/java/com/example/HelperShould.java', 'java'),
+            'src/test/ java file with non-Test suffix should be test file');
+    });
+});
+
+// ============================================================================
+// BUG 8 REGRESSION: JS export modifier detected for export function
+// ============================================================================
+
+describe('Regression: JS parser detects export modifier on exported functions', () => {
+    it('should include export in modifiers for export function declarations', () => {
+        const { parse } = require('../core/parser');
+        const result = parse(`
+export function myFunc() {
+    return 1;
+}
+
+export const myArrow = () => {
+    return 2;
+};
+`, 'javascript');
+        const myFunc = result.functions.find(f => f.name === 'myFunc');
+        assert.ok(myFunc, 'should find myFunc');
+        assert.ok(myFunc.modifiers.includes('export'),
+            `myFunc modifiers should include "export" but got [${myFunc.modifiers}]`);
+
+        const myArrow = result.functions.find(f => f.name === 'myArrow');
+        assert.ok(myArrow, 'should find myArrow');
+        assert.ok(myArrow.modifiers.includes('export'),
+            `myArrow modifiers should include "export" but got [${myArrow.modifiers}]`);
+    });
+});
+
+// ============================================================================
+// BUG 10 REGRESSION: findUsagesInCode counts TS type annotations
+// ============================================================================
+
+describe('Regression: findUsagesInCode counts TypeScript type annotations', () => {
+    it('should find type_identifier usages in type annotations', () => {
+        const { getParser } = require('../languages');
+        const jsModule = require('../languages/javascript');
+        const parser = getParser('typescript');
+        const code = `
+import { ListItemsParams } from './types';
+
+export function useWorkspaces(params?: ListItemsParams) {
+    return [];
+}
+
+function other(x: ListItemsParams): ListItemsParams {
+    return x;
+}
+`;
+        const usages = jsModule.findUsagesInCode(code, 'ListItemsParams', parser);
+        // Should find: 1 import + at least 2 type annotation references
+        assert.ok(usages.length >= 3,
+            `Expected at least 3 usages but got ${usages.length}: ${JSON.stringify(usages)}`);
+        const refs = usages.filter(u => u.usageType === 'reference');
+        assert.ok(refs.length >= 2,
+            `Expected at least 2 reference usages but got ${refs.length}`);
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

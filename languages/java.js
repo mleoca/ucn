@@ -342,7 +342,16 @@ function findClasses(code, parser) {
 function extractExtends(classNode) {
     const superclassNode = classNode.childForFieldName('superclass');
     if (superclassNode) {
-        return superclassNode.text;
+        // superclassNode.text includes "extends TypeName", extract just the type
+        for (let i = 0; i < superclassNode.namedChildCount; i++) {
+            const child = superclassNode.namedChild(i);
+            if (child.type === 'type_identifier' || child.type === 'generic_type' || child.type === 'scoped_type_identifier') {
+                return child.text;
+            }
+        }
+        // Fallback: strip leading "extends " if present
+        const text = superclassNode.text;
+        return text.startsWith('extends ') ? text.slice(8) : text;
     }
     return null;
 }
