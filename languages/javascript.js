@@ -114,7 +114,10 @@ function findFunctions(code, parser) {
                 const generics = extractGenerics(node);
                 const docstring = extractJSDocstring(code, startLine);
                 const isGen = isGenerator(node);
-                const modifiers = extractModifiers(node.text);
+                // Check parent for export status (function_declaration inside export_statement)
+                const modifiers = node.parent && node.parent.type === 'export_statement'
+                    ? extractModifiers(node.parent.text)
+                    : extractModifiers(node.text);
 
                 functions.push({
                     name: nameNode.text,
@@ -189,7 +192,10 @@ function findFunctions(code, parser) {
                             const generics = extractGenerics(valueNode);
                             const docstring = extractJSDocstring(code, startLine);
                             const isGen = isGenerator(valueNode);
-                            const modifiers = extractModifiers(node.text);
+                            // Check parent for export status (lexical_declaration inside export_statement)
+                            const modifiers = node.parent && node.parent.type === 'export_statement'
+                                ? extractModifiers(node.parent.text)
+                                : extractModifiers(node.text);
 
                             functions.push({
                                 name: nameNode.text,
@@ -433,8 +439,20 @@ function extractExtends(classNode) {
     for (let i = 0; i < classNode.namedChildCount; i++) {
         const child = classNode.namedChild(i);
         if (child.type === 'class_heritage') {
-            const extendsClause = child.text.match(/extends\s+(\w+)/);
-            if (extendsClause) return extendsClause[1];
+            // Extract extends clause, preserving dotted names and generic type params
+            // e.g. "extends React.Component<Props, State>" → "React.Component<Props, State>"
+            const text = child.text;
+            const extendsIdx = text.indexOf('extends ');
+            if (extendsIdx !== -1) {
+                let extendsType = text.slice(extendsIdx + 8).trim();
+                // Stop at "implements" if present
+                const implIdx = extendsType.indexOf(' implements ');
+                if (implIdx !== -1) extendsType = extendsType.slice(0, implIdx).trim();
+                // Stop at opening brace
+                const braceIdx = extendsType.indexOf('{');
+                if (braceIdx !== -1) extendsType = extendsType.slice(0, braceIdx).trim();
+                if (extendsType) return extendsType;
+            }
         }
     }
     return null;
@@ -1311,8 +1329,9 @@ function findUsagesInCode(code, name, parser) {
     const usages = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Look for both identifier and property_identifier (method names in obj.method() calls)
-        const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier';
+        // Look for identifier, property_identifier (method names in obj.method() calls),
+        // and type_identifier (TypeScript type annotations like `params: MyType`)
+        const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier' || node.type === 'type_identifier';
         if (!isIdentifier || node.text !== name) {
             return true;
         }

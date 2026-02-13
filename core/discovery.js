@@ -103,7 +103,8 @@ const TEST_PATTERNS = {
     java: [
         /.*Test\.java$/,
         /.*TestCase\.java$/,
-        /.*Tests\.java$/
+        /.*Tests\.java$/,
+        /(^|\/)src\/test\//
     ],
     rust: [
         /.*_test\.rs$/,

@@ -99,7 +99,7 @@ function formatTocText(toc) {
     const lines = [];
     const t = toc.totals;
     lines.push(`PROJECT: ${t.files} files, ${t.lines} lines`);
-    lines.push(`  ${t.functions} functions, ${t.classes} classes, ${t.state} state objects`);
+    lines.push(`  ${t.functions} functions, ${t.classes} types (classes/interfaces/enums), ${t.state} state objects`);
 
     const meta = toc.meta || {};
     const warnings = [];
@@ -128,7 +128,7 @@ function formatTocText(toc) {
     for (const file of toc.files) {
         const parts = [`${file.lines} lines`];
         if (file.functions) parts.push(`${file.functions} fn`);
-        if (file.classes) parts.push(`${file.classes} cls`);
+        if (file.classes) parts.push(`${file.classes} types`);
         if (file.state) parts.push(`${file.state} state`);
 
         if (hasDetail) {
@@ -1074,6 +1074,10 @@ server.registerTool(
             if (!cls) {
                 return toolResult(`Class "${name}" could not be extracted.`);
             }
+
+            // Add path info from index match (parser doesn't include file paths)
+            cls.relativePath = match.relativePath;
+            cls.file = match.file;
 
             let note = '';
             if (matches.length > 1 && !file) {

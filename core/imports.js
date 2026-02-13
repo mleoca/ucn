@@ -17,13 +17,13 @@ const { getParser, getLanguageModule } = require('../languages');
  * @returns {{ imports: Array<{ module: string, names: string[], type: string, line: number }> }}
  */
 function extractImports(content, language) {
-    // Normalize language name for parser
-    const normalizedLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
+    // Use JS language module for TS/TSX (same import syntax), but the actual language's parser
+    const moduleLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
 
-    const langModule = getLanguageModule(normalizedLang);
+    const langModule = getLanguageModule(moduleLang);
     if (langModule && typeof langModule.findImportsInCode === 'function') {
         try {
-            const parser = getParser(normalizedLang);
+            const parser = getParser(language);
             if (parser) {
                 const imports = langModule.findImportsInCode(content, parser);
                 const dynamicCount = imports.filter(i => i.dynamic).length;
@@ -41,13 +41,13 @@ function extractImports(content, language) {
  * Extract exports from file content using AST
  */
 function extractExports(content, language) {
-    // Normalize language name for parser
-    const normalizedLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
+    // Use JS language module for TS/TSX (same export syntax), but the actual language's parser
+    const moduleLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
 
-    const langModule = getLanguageModule(normalizedLang);
+    const langModule = getLanguageModule(moduleLang);
     if (langModule && typeof langModule.findExportsInCode === 'function') {
         try {
-            const parser = getParser(normalizedLang);
+            const parser = getParser(language);
             if (parser) {
                 const foundExports = langModule.findExportsInCode(content, parser);
                 return { exports: foundExports };
