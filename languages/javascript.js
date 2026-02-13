@@ -1243,12 +1243,21 @@ function findExportsInCode(code, parser) {
                         exports.push({ name: nameNode.text, type: 'named', line });
                     }
                 } else if (child.type === 'lexical_declaration' || child.type === 'variable_declaration') {
+                    // Determine declaration kind from AST (const/let/var)
+                    let declKind = 'var';
+                    if (child.type === 'lexical_declaration') {
+                        const firstChild = child.child(0);
+                        if (firstChild) declKind = firstChild.text; // 'const' or 'let'
+                    }
                     for (let j = 0; j < child.namedChildCount; j++) {
                         const declarator = child.namedChild(j);
                         if (declarator.type === 'variable_declarator') {
                             const nameNode = declarator.childForFieldName('name');
                             if (nameNode && nameNode.type === 'identifier') {
-                                exports.push({ name: nameNode.text, type: 'named', line });
+                                // Extract type annotation from AST (TypeScript)
+                                const typeNode = declarator.childForFieldName('type');
+                                const typeAnnotation = typeNode ? typeNode.text.replace(/^\s*:\s*/, '') : null;
+                                exports.push({ name: nameNode.text, type: 'named', line, isVariable: true, declKind, typeAnnotation });
                             }
                         }
                     }

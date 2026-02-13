@@ -7130,5 +7130,256 @@ function other(x: ListItemsParams): ListItemsParams {
     });
 });
 
+// ============================================================================
+// BUG A REGRESSION: fileExports/api must detect export const/let/var
+// ============================================================================
+
+describe('Regression: fileExports detects export const/let/var', () => {
+    it('should detect export const and export let in TypeScript', () => {
+        const { extractExports } = require('../core/imports');
+        const tsCode = `
+export let API_URL: string;
+export let WS_URL: string;
+export const URL_SCHEMA = 'anylyze://';
+export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+`;
+        const { exports } = extractExports(tsCode, 'typescript');
+        const names = exports.map(e => e.name);
+        assert.ok(names.includes('API_URL'), 'should find API_URL');
+        assert.ok(names.includes('WS_URL'), 'should find WS_URL');
+        assert.ok(names.includes('URL_SCHEMA'), 'should find URL_SCHEMA');
+        assert.ok(names.includes('IS_PRODUCTION'), 'should find IS_PRODUCTION');
+
+        // Check variable metadata
+        const apiUrl = exports.find(e => e.name === 'API_URL');
+        assert.strictEqual(apiUrl.isVariable, true);
+        assert.strictEqual(apiUrl.declKind, 'let');
+        assert.strictEqual(apiUrl.typeAnnotation, 'string');
+
+        const urlSchema = exports.find(e => e.name === 'URL_SCHEMA');
+        assert.strictEqual(urlSchema.isVariable, true);
+        assert.strictEqual(urlSchema.declKind, 'const');
+    });
+
+    it('should include variable exports in fileExports results', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+        // File with only const/let exports (no functions)
+        fs.writeFileSync(path.join(tmpDir, 'urls.ts'), `
+export let API_URL: string;
+export const URL_SCHEMA = 'anylyze://';
+export const IS_PRODUCTION = process.env.NODE_ENV === 'production';
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const exports = index.fileExports('urls.ts');
+        const names = exports.map(e => e.name);
+        assert.ok(names.includes('API_URL'), `should find API_URL, got: ${names.join(', ')}`);
+        assert.ok(names.includes('URL_SCHEMA'), `should find URL_SCHEMA, got: ${names.join(', ')}`);
+        assert.ok(names.includes('IS_PRODUCTION'), `should find IS_PRODUCTION, got: ${names.join(', ')}`);
+        assert.strictEqual(exports.length, 3, `should find 3 exports, got ${exports.length}`);
+
+        // Check types
+        const apiUrl = exports.find(e => e.name === 'API_URL');
+        assert.strictEqual(apiUrl.type, 'variable');
+        assert.ok(apiUrl.signature.includes('let'), `signature should include let: ${apiUrl.signature}`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('should include variable exports alongside function exports in fileExports', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+        // Mixed file: const + function exports
+        fs.writeFileSync(path.join(tmpDir, 'request.ts'), `
+export const client = new GraphQLClient('http://localhost');
+export const cloudClient = new GraphQLClient('http://cloud');
+export function customRequest(url: string): Promise<any> {
+    return fetch(url);
+}
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const exports = index.fileExports('request.ts');
+        const names = exports.map(e => e.name);
+        assert.ok(names.includes('client'), `should find client, got: ${names.join(', ')}`);
+        assert.ok(names.includes('cloudClient'), `should find cloudClient, got: ${names.join(', ')}`);
+        assert.ok(names.includes('customRequest'), `should find customRequest, got: ${names.join(', ')}`);
+        assert.strictEqual(exports.length, 3, `should find 3 exports, got ${exports.length}`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('should include variable exports in api() results', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+        fs.writeFileSync(path.join(tmpDir, 'colors.ts'), `
+export const colors = { white: '#ffffff', black: '#000000' };
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const apiResults = index.api();
+        const names = apiResults.map(e => e.name);
+        assert.ok(names.includes('colors'), `api() should find colors export, got: ${names.join(', ')}`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
+// ============================================================================
+// BUG B REGRESSION: Java static imports resolved as INTERNAL
+// ============================================================================
+
+describe('Regression: Java static imports resolved as INTERNAL', () => {
+    it('should resolve import static com.pkg.Class.method as INTERNAL', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+
+        // Create the target class
+        const utilDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example', 'util');
+        fs.mkdirSync(utilDir, { recursive: true });
+        fs.writeFileSync(path.join(utilDir, 'CollectionsUtil.java'), `
+package com.example.util;
+public class CollectionsUtil {
+    public static <T> List<T> copyOf(Collection<T> c) { return new ArrayList<>(c); }
+}
+`);
+
+        // Create the importing file
+        const repoDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example', 'repo');
+        fs.mkdirSync(repoDir, { recursive: true });
+        fs.writeFileSync(path.join(repoDir, 'EntityRepo.java'), `
+package com.example.repo;
+import static com.example.util.CollectionsUtil.copyOf;
+public class EntityRepo {
+    public List<String> getNames() { return copyOf(names); }
+}
+`);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const imports = index.imports('src/main/java/com/example/repo/EntityRepo.java');
+        const staticImport = imports.find(i => i.module.includes('CollectionsUtil.copyOf'));
+        assert.ok(staticImport, 'should find static import');
+        assert.strictEqual(staticImport.isExternal, false,
+            `static import CollectionsUtil.copyOf should be INTERNAL but was EXTERNAL`);
+        assert.ok(staticImport.resolved.includes('CollectionsUtil.java'),
+            `should resolve to CollectionsUtil.java, got: ${staticImport.resolved}`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('should resolve import static com.pkg.Class.* as INTERNAL', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+
+        const utilDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example', 'util');
+        fs.mkdirSync(utilDir, { recursive: true });
+        fs.writeFileSync(path.join(utilDir, 'DataShareUtil.java'), `
+package com.example.util;
+public class DataShareUtil {
+    public static String format(String s) { return s; }
+}
+`);
+
+        const consumerDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example', 'service');
+        fs.mkdirSync(consumerDir, { recursive: true });
+        fs.writeFileSync(path.join(consumerDir, 'Service.java'), `
+package com.example.service;
+import static com.example.util.DataShareUtil.*;
+public class Service {
+    public String process(String s) { return format(s); }
+}
+`);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const imports = index.imports('src/main/java/com/example/service/Service.java');
+        const wildcardImport = imports.find(i => i.module.includes('DataShareUtil.*'));
+        assert.ok(wildcardImport, 'should find wildcard static import');
+        assert.strictEqual(wildcardImport.isExternal, false,
+            `static wildcard import DataShareUtil.* should be INTERNAL but was EXTERNAL`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('should resolve import static with inner class path as INTERNAL', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+
+        const modelDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example', 'model');
+        fs.mkdirSync(modelDir, { recursive: true });
+        fs.writeFileSync(path.join(modelDir, 'FilterCondition.java'), `
+package com.example.model;
+public class FilterCondition {
+    public enum Operator { IN, EQ, GT }
+}
+`);
+
+        const consumerDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example', 'service');
+        fs.mkdirSync(consumerDir, { recursive: true });
+        fs.writeFileSync(path.join(consumerDir, 'Query.java'), `
+package com.example.service;
+import static com.example.model.FilterCondition.Operator.IN;
+public class Query {
+    public void filter() { Operator op = IN; }
+}
+`);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const imports = index.imports('src/main/java/com/example/service/Query.java');
+        const innerImport = imports.find(i => i.module.includes('FilterCondition.Operator.IN'));
+        assert.ok(innerImport, 'should find inner class static import');
+        assert.strictEqual(innerImport.isExternal, false,
+            `static import FilterCondition.Operator.IN should be INTERNAL but was EXTERNAL`);
+        assert.ok(innerImport.resolved.includes('FilterCondition.java'),
+            `should resolve to FilterCondition.java, got: ${innerImport.resolved}`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('should keep truly external static imports as EXTERNAL', () => {
+        const { ProjectIndex } = require('../core/project');
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+
+        const srcDir = path.join(tmpDir, 'src', 'main', 'java', 'com', 'example');
+        fs.mkdirSync(srcDir, { recursive: true });
+        fs.writeFileSync(path.join(srcDir, 'App.java'), `
+package com.example;
+import static java.util.List.of;
+import static java.util.stream.Collectors.toList;
+public class App {}
+`);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const imports = index.imports('src/main/java/com/example/App.java');
+        for (const imp of imports) {
+            assert.strictEqual(imp.isExternal, true,
+                `stdlib import ${imp.module} should be EXTERNAL`);
+        }
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

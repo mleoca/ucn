@@ -152,6 +152,7 @@ class ProjectIndex {
             size: stat.size,
             imports: imports.map(i => i.module),
             exports: exports.map(e => e.name),
+            exportDetails: exports,
             symbols: [],
             bindings: []
         };
@@ -237,6 +238,29 @@ class ProjectIndex {
     }
 
     /**
+     * Resolve a Java package import to a project file.
+     * Handles regular imports, static imports (strips member name), and wildcards (strips .*).
+     * Progressively strips trailing segments to find the class file.
+     */
+    _resolveJavaPackageImport(importModule) {
+        // Strip wildcard suffix (e.g., "com.pkg.Class.*" -> "com.pkg.Class")
+        const mod = importModule.endsWith('.*') ? importModule.slice(0, -2) : importModule;
+        const segments = mod.split('.');
+
+        // Try progressively shorter paths: full path, then strip last segment, etc.
+        // This handles static imports where path includes member name after class
+        for (let i = segments.length; i > 0; i--) {
+            const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
+            for (const absPath of this.files.keys()) {
+                if (absPath.endsWith(fileSuffix)) {
+                    return absPath;
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
      * Build import/export relationship graphs
      */
     buildImportGraph() {
@@ -263,25 +287,10 @@ class ProjectIndex {
                     root: this.root
                 });
 
-                // Java package imports: resolve by matching file path suffix
-                // e.g., "com.google.gson.Gson" -> find file ending in "com/google/gson/Gson.java"
-                if (!resolved && fileEntry.language === 'java' &&
-                    !importModule.startsWith('.') && !importModule.endsWith('.*')) {
-                    if (!javaSuffixMap) {
-                        javaSuffixMap = new Map();
-                        for (const [absPath, entry] of this.files) {
-                            if (entry.language === 'java') {
-                                javaSuffixMap.set(absPath, absPath);
-                            }
-                        }
-                    }
-                    const fileSuffix = '/' + importModule.split('.').join('/') + '.java';
-                    for (const absPath of javaSuffixMap.keys()) {
-                        if (absPath.endsWith(fileSuffix)) {
-                            resolved = absPath;
-                            break;
-                        }
-                    }
+                // Java package imports: resolve by progressive suffix matching
+                // Handles regular, static (com.pkg.Class.method), and wildcard (com.pkg.Class.*) imports
+                if (!resolved && fileEntry.language === 'java' && !importModule.startsWith('.')) {
+                    resolved = this._resolveJavaPackageImport(importModule);
                 }
 
                 if (resolved && this.files.has(resolved)) {
@@ -1694,17 +1703,10 @@ class ProjectIndex {
                     root: this.root
                 });
 
-                // Java package imports: resolve by matching file path suffix
-                // e.g., "com.anylyze.data.ExposableEntity" -> find file ending in "com/anylyze/data/ExposableEntity.java"
-                if (!resolved && fileEntry.language === 'java' &&
-                    !imp.module.startsWith('.') && !imp.module.endsWith('.*')) {
-                    const fileSuffix = '/' + imp.module.split('.').join('/') + '.java';
-                    for (const absPath of this.files.keys()) {
-                        if (absPath.endsWith(fileSuffix)) {
-                            resolved = absPath;
-                            break;
-                        }
-                    }
+                // Java package imports: resolve by progressive suffix matching
+                // Handles regular, static (com.pkg.Class.method), and wildcard (com.pkg.Class.*) imports
+                if (!resolved && fileEntry.language === 'java' && !imp.module.startsWith('.')) {
+                    resolved = this._resolveJavaPackageImport(imp.module);
                 }
 
                 // Find line number of import
@@ -1905,6 +1907,26 @@ class ProjectIndex {
                     });
                 }
             }
+
+            // Add variable exports (export const/let/var) not matched to symbols
+            if (fileEntry.exportDetails) {
+                const matchedNames = new Set(results.filter(r => r.file === fileEntry.relativePath).map(r => r.name));
+                for (const exp of fileEntry.exportDetails) {
+                    if (exp.isVariable && !matchedNames.has(exp.name)) {
+                        const sig = `${exp.declKind} ${exp.name}${exp.typeAnnotation ? ': ' + exp.typeAnnotation : ''}`;
+                        results.push({
+                            name: exp.name,
+                            type: 'variable',
+                            file: fileEntry.relativePath,
+                            startLine: exp.line,
+                            endLine: exp.line,
+                            params: undefined,
+                            returnType: exp.typeAnnotation || null,
+                            signature: sig
+                        });
+                    }
+                }
+            }
         }
 
         return results;
@@ -1968,6 +1990,26 @@ class ProjectIndex {
                     returnType: symbol.returnType,
                     signature: this.formatSignature(symbol)
                 });
+            }
+        }
+
+        // Add variable exports (export const/let/var) not matched to symbols
+        if (fileEntry.exportDetails) {
+            const matchedNames = new Set(results.map(r => r.name));
+            for (const exp of fileEntry.exportDetails) {
+                if (exp.isVariable && !matchedNames.has(exp.name)) {
+                    const sig = `${exp.declKind} ${exp.name}${exp.typeAnnotation ? ': ' + exp.typeAnnotation : ''}`;
+                    results.push({
+                        name: exp.name,
+                        type: 'variable',
+                        file: fileEntry.relativePath,
+                        startLine: exp.line,
+                        endLine: exp.line,
+                        params: undefined,
+                        returnType: exp.typeAnnotation || null,
+                        signature: sig
+                    });
+                }
             }
         }
 
