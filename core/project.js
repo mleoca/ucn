@@ -41,7 +41,7 @@ class ProjectIndex {
         this.symbols = new Map();         // name -> SymbolEntry[]
         this.importGraph = new Map();     // file -> [imported files]
         this.exportGraph = new Map();     // file -> [files that import it]
-        this.extendsGraph = new Map();    // className -> parentName
+        this.extendsGraph = new Map();    // className -> [parentName, ...] (array of parents)
         this.extendedByGraph = new Map(); // parentName -> [childInfo]
         this.config = this.loadConfig();
         this.buildTime = null;
@@ -139,7 +139,7 @@ class ProjectIndex {
         if (!language) return;
 
         const parsed = parseFile(filePath);
-        const { imports, dynamicCount } = extractImports(content, language);
+        const { imports, dynamicCount, importAliases } = extractImports(content, language);
         const { exports } = extractExports(content, language);
 
         const fileEntry = {
@@ -154,7 +154,8 @@ class ProjectIndex {
             exports: exports.map(e => e.name),
             exportDetails: exports,
             symbols: [],
-            bindings: []
+            bindings: [],
+            ...(importAliases && { importAliases })
         };
         fileEntry.dynamicImports = dynamicCount || 0;
 
@@ -314,6 +315,16 @@ class ProjectIndex {
         this.extendsGraph.clear();
         this.extendedByGraph.clear();
 
+        // Collect all class/interface/struct names for alias resolution
+        const classNames = new Set();
+        for (const [, fileEntry] of this.files) {
+            for (const symbol of fileEntry.symbols) {
+                if (['class', 'interface', 'struct', 'trait'].includes(symbol.type)) {
+                    classNames.add(symbol.name);
+                }
+            }
+        }
+
         for (const [filePath, fileEntry] of this.files) {
             for (const symbol of fileEntry.symbols) {
                 if (!['class', 'interface', 'struct', 'trait'].includes(symbol.type)) {
@@ -321,16 +332,33 @@ class ProjectIndex {
                 }
 
                 if (symbol.extends) {
-                    this.extendsGraph.set(symbol.name, symbol.extends);
+                    // Parse comma-separated parents (Python MRO: "Flyable, Swimmable")
+                    const parents = symbol.extends.split(',').map(s => s.trim()).filter(Boolean);
 
-                    if (!this.extendedByGraph.has(symbol.extends)) {
-                        this.extendedByGraph.set(symbol.extends, []);
-                    }
-                    this.extendedByGraph.get(symbol.extends).push({
-                        name: symbol.name,
-                        type: symbol.type,
-                        file: filePath
+                    // Resolve aliased parent names via import aliases
+                    // e.g., const { BaseHandler: Handler } = require('./base')
+                    //        class Child extends Handler → resolve Handler to BaseHandler
+                    const resolvedParents = parents.map(parent => {
+                        if (classNames.has(parent)) return parent;
+                        if (fileEntry.importAliases) {
+                            const alias = fileEntry.importAliases.find(a => a.local === parent);
+                            if (alias && classNames.has(alias.original)) return alias.original;
+                        }
+                        return parent;
                     });
+
+                    this.extendsGraph.set(symbol.name, resolvedParents);
+
+                    for (const parent of resolvedParents) {
+                        if (!this.extendedByGraph.has(parent)) {
+                            this.extendedByGraph.set(parent, []);
+                        }
+                        this.extendedByGraph.get(parent).push({
+                            name: symbol.name,
+                            type: symbol.type,
+                            file: filePath
+                        });
+                    }
                 }
             }
         }
@@ -987,8 +1015,31 @@ class ProjectIndex {
                 const lines = content.split('\n');
 
                 for (const call of calls) {
-                    // Skip if not matching our target name
-                    if (call.name !== name) continue;
+                    // Skip if not matching our target name (also check alias resolution)
+                    if (call.name !== name && call.resolvedName !== name &&
+                        !(call.resolvedNames && call.resolvedNames.includes(name))) continue;
+
+                    // For potential callbacks (function passed as arg), validate against symbol table
+                    // and skip complex binding resolution — just check the name exists
+                    if (call.isPotentialCallback) {
+                        const syms = definitions;
+                        if (!syms || syms.length === 0) continue;
+                        // Find the enclosing function
+                        const callerSymbol = this.findEnclosingFunction(filePath, call.line, true);
+                        callers.push({
+                            file: filePath,
+                            relativePath: fileEntry.relativePath,
+                            line: call.line,
+                            content: lines[call.line - 1] || '',
+                            callerName: callerSymbol ? callerSymbol.name : null,
+                            callerFile: callerSymbol ? filePath : null,
+                            callerStartLine: callerSymbol ? callerSymbol.startLine : null,
+                            callerEndLine: callerSymbol ? callerSymbol.endLine : null,
+                            isMethod: false,
+                            isFunctionReference: true
+                        });
+                        continue;
+                    }
 
                     // Resolve binding within this file (without mutating cached call objects)
                     let bindingId = call.bindingId;
@@ -1021,8 +1072,41 @@ class ProjectIndex {
                                     isUncertain = true;
                                 }
                             } else {
-                                isUncertain = true;
+                                // Scope-based disambiguation for shadowed functions:
+                                // When multiple bindings exist, use indent level to determine
+                                // which binding is in scope at the call site
+                                const defs = this.symbols.get(call.name);
+                                let resolved = false;
+                                if (defs) {
+                                    // Sort bindings by indent desc (most nested first)
+                                    const scopedBindings = bindings.map(b => {
+                                        const sym = defs.find(s => s.startLine === b.startLine && s.file === filePath);
+                                        return { ...b, indent: sym?.indent ?? 0, endLine: sym?.endLine ?? b.startLine };
+                                    }).sort((a, b) => b.indent - a.indent);
+
+                                    for (const sb of scopedBindings) {
+                                        if (sb.indent === 0) {
+                                            // Module-level binding — always in scope, use as fallback
+                                            bindingId = sb.id;
+                                            resolved = true;
+                                            break;
+                                        }
+                                        // Nested binding — check if call is inside its enclosing function
+                                        const enclosing = this.findEnclosingFunction(filePath, sb.startLine, true);
+                                        if (enclosing && call.line >= enclosing.startLine && call.line <= enclosing.endLine) {
+                                            // Call is inside the same function as this binding
+                                            bindingId = sb.id;
+                                            resolved = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                                if (!resolved) isUncertain = true;
                             }
+                        } else if (bindings.length > 1 && call.isMethod) {
+                            // Multiple method bindings (e.g. Go String() on Reader vs Writer):
+                            // Don't mark uncertain — include them even if conflated.
+                            // Better to over-report than lose all callers.
                         } else if (bindings.length !== 0) {
                             isUncertain = true;
                         }
@@ -1046,12 +1130,31 @@ class ProjectIndex {
                             if (!matchesDef) continue;
                             resolvedBySameClass = true;
                             // Falls through to add as caller
-                        } else if (['self', 'cls', 'this'].includes(call.receiver)) {
-                            // self.method() / cls.method() / this.method() — resolve to same-class method
+                        } else if (['self', 'cls', 'this', 'super'].includes(call.receiver)) {
+                            // self/this/super.method() — resolve to same-class or parent method
                             const callerSymbol = this.findEnclosingFunction(filePath, call.line, true);
                             if (!callerSymbol?.className) continue;
-                            // Check if any definition of searched function belongs to caller's class
-                            const matchesDef = definitions.some(d => d.className === callerSymbol.className);
+                            // For super(), skip same-class — only check parent chain
+                            let matchesDef = call.receiver === 'super'
+                                ? false
+                                : definitions.some(d => d.className === callerSymbol.className);
+                            // Walk inheritance chain if not found in same class
+                            if (!matchesDef) {
+                                let parents = this.extendsGraph.get(callerSymbol.className);
+                                const visited = new Set([callerSymbol.className]);
+                                while (parents && !matchesDef) {
+                                    for (const parent of parents) {
+                                        if (visited.has(parent)) continue;
+                                        visited.add(parent);
+                                        matchesDef = definitions.some(d => d.className === parent);
+                                        if (matchesDef) break;
+                                    }
+                                    if (!matchesDef) {
+                                        const nextParent = parents.find(p => !visited.has(p)) || parents[0];
+                                        parents = this.extendsGraph.get(nextParent);
+                                    }
+                                }
+                            }
                             if (!matchesDef) continue;
                             resolvedBySameClass = true;
                             // Falls through to add as caller
@@ -1202,6 +1305,8 @@ class ProjectIndex {
                         // Will be resolved in second pass below
                     } else if (['self', 'cls', 'this'].includes(call.receiver)) {
                         // self.method() / cls.method() / this.method() — resolve to same-class method below
+                    } else if (call.receiver === 'super') {
+                        // super().method() — resolve to parent class method below
                     } else if (language !== 'go' && language !== 'java' && !options.includeMethods) {
                         continue;
                     }
@@ -1209,6 +1314,25 @@ class ProjectIndex {
 
                 // Skip keywords and built-ins
                 if (this.isKeyword(call.name, language)) continue;
+
+                // Use resolved name (from alias tracking) if available
+                // For multi-target aliases (ternary), pick the first that exists in symbol table
+                let effectiveName = call.resolvedName || call.name;
+                if (call.resolvedNames) {
+                    for (const rn of call.resolvedNames) {
+                        if (this.symbols.has(rn)) { effectiveName = rn; break; }
+                    }
+                }
+
+                // For potential callbacks (identifier args to non-HOF calls),
+                // only include if name exists as a function in symbol table
+                if (call.isPotentialCallback) {
+                    const syms = this.symbols.get(effectiveName);
+                    if (!syms || !syms.some(s =>
+                        ['function', 'method', 'constructor', 'static', 'public', 'abstract'].includes(s.type))) {
+                        continue;
+                    }
+                }
 
                 // Collect selfAttribute calls for second-pass resolution
                 if (call.selfAttribute && language === 'python') {
@@ -1224,8 +1348,15 @@ class ProjectIndex {
                     continue;
                 }
 
+                // Collect super().method() calls for parent-class resolution
+                if (call.isMethod && call.receiver === 'super') {
+                    if (!selfMethodCalls) selfMethodCalls = [];
+                    selfMethodCalls.push(call);
+                    continue;
+                }
+
                 // Resolve binding within this file (without mutating cached call objects)
-                let calleeKey = call.bindingId || call.name;
+                let calleeKey = call.bindingId || effectiveName;
                 let bindingResolved = call.bindingId;
                 let isUncertain = call.uncertain;
                 if (!call.bindingId && fileEntry?.bindings) {
@@ -1263,7 +1394,7 @@ class ProjectIndex {
                                     existing.count += 1;
                                 } else {
                                     callees.set(ob.id, {
-                                        name: call.name,
+                                        name: effectiveName,
                                         bindingId: ob.id,
                                         count: 1
                                     });
@@ -1308,7 +1439,7 @@ class ProjectIndex {
                     existing.count += 1;
                 } else {
                     callees.set(calleeKey, {
-                        name: call.name,
+                        name: effectiveName,
                         bindingId: bindingResolved,
                         count: 1
                     });
@@ -1345,17 +1476,40 @@ class ProjectIndex {
                 }
             }
 
-            // Third pass: resolve self/this.method() calls to same-class methods
+            // Third pass: resolve self/this/super.method() calls to same-class or parent methods
+            // Falls back to walking the inheritance chain if not found in same class
             if (selfMethodCalls && def.className) {
                 for (const call of selfMethodCalls) {
                     const symbols = this.symbols.get(call.name);
                     if (!symbols) continue;
 
-                    // Find method in same class
-                    const match = symbols.find(s => s.className === def.className);
+                    // For super().method(), skip same-class — start from parent
+                    let match = call.receiver === 'super'
+                        ? null
+                        : symbols.find(s => s.className === def.className);
+
+                    // Walk inheritance chain if not found in same class
+                    if (!match) {
+                        let parents = this.extendsGraph.get(def.className);
+                        const visited = new Set([def.className]);
+                        while (parents && !match) {
+                            for (const parent of parents) {
+                                if (visited.has(parent)) continue;
+                                visited.add(parent);
+                                match = symbols.find(s => s.className === parent);
+                                if (match) break;
+                            }
+                            if (!match) {
+                                // Follow first parent's chain (simplified MRO)
+                                const nextParent = parents.find(p => !visited.has(p)) || parents[0];
+                                parents = this.extendsGraph.get(nextParent);
+                            }
+                        }
+                    }
+
                     if (!match) continue;
 
-                    const key = match.bindingId || `${def.className}.${call.name}`;
+                    const key = match.bindingId || `${match.className}.${call.name}`;
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
