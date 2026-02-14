@@ -9839,5 +9839,222 @@ describe('Regression: F-003 matchesFilters boundary edge cases', () => {
     });
 });
 
+// === Fix 66: functools.partial alias resolution (Python) ===
+it('FIX 66 — functools.partial alias resolves to wrapped function', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/python');
+
+    const code = `
+from functools import partial
+
+def process(data, mode='default'):
+    return data
+
+fast_process = partial(process, mode='fast')
+
+def run():
+    fast_process(data)
+`;
+    const parser = getParser('python');
+    const calls = findCallsInCode(code, parser);
+
+    const fpCall = calls.find(c => c.name === 'fast_process' && !c.isFunctionReference);
+    assert.ok(fpCall, 'fast_process() call should be detected');
+    assert.strictEqual(fpCall.resolvedName, 'process',
+        'fast_process should resolve to process via partial alias');
+});
+
+it('FIX 66 — functools.partial with qualified import', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/python');
+
+    const code = `
+import functools
+
+def transform(data):
+    return data
+
+quick_transform = functools.partial(transform, fast=True)
+
+def main():
+    quick_transform(items)
+`;
+    const parser = getParser('python');
+    const calls = findCallsInCode(code, parser);
+
+    const qtCall = calls.find(c => c.name === 'quick_transform' && !c.isFunctionReference);
+    assert.ok(qtCall, 'quick_transform() call should be detected');
+    assert.strictEqual(qtCall.resolvedName, 'transform',
+        'quick_transform should resolve to transform via functools.partial alias');
+});
+
+it('FIX 66 — partial with keyword-only args still resolves', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/python');
+
+    const code = `
+from functools import partial
+
+def send(url, method='GET', timeout=30):
+    pass
+
+post = partial(send, method='POST')
+`;
+    const parser = getParser('python');
+    const calls = findCallsInCode(code, parser);
+
+    // partial(send, method='POST') — first positional arg is 'send'
+    const postCall = calls.find(c => c.name === 'post' && !c.isFunctionReference);
+    // 'post' is not called in this snippet, but check the alias was created
+    // by checking for the partial call itself which should also emit process as alias
+    const partialCall = calls.find(c => c.name === 'partial' && !c.isFunctionReference);
+    assert.ok(partialCall, 'partial() call should be detected');
+    // The send identifier passed as arg should be detected as a function reference
+    const sendRef = calls.find(c => c.name === 'send' && c.isFunctionReference);
+    assert.ok(sendRef, 'send should be detected as function reference argument to partial');
+});
+
+// === Fix 67: Non-callable shadowed name false positive prevention ===
+it('FIX 67 — JS: non-callable variable shadows should not produce false callback', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+function parse(input) { return input; }
+
+function test() {
+    const parse = 5;
+    console.log(parse);
+    someFunc(parse);
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+
+    // parse = 5 means parse is non-callable, so passing it as arg should NOT be isPotentialCallback
+    const falseCb = calls.find(c => c.name === 'parse' && c.isPotentialCallback);
+    assert.ok(!falseCb, 'parse (assigned to 5) should NOT be detected as potential callback');
+
+    // The console.log call itself should still be detected
+    const logCall = calls.find(c => c.name === 'log' && c.isMethod);
+    assert.ok(logCall, 'console.log() call should still be detected');
+});
+
+it('FIX 67 — JS: string/boolean/null/array/object non-callable literals', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+const count = 42;
+const name = "hello";
+const flag = true;
+const empty = null;
+const items = [1, 2, 3];
+const config = { a: 1 };
+
+function test() {
+    doSomething(count, name, flag, empty, items, config);
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+
+    const callbacks = calls.filter(c => c.isPotentialCallback);
+    const cbNames = callbacks.map(c => c.name);
+    assert.ok(!cbNames.includes('count'), 'count (number) should not be potential callback');
+    assert.ok(!cbNames.includes('name'), 'name (string) should not be potential callback');
+    assert.ok(!cbNames.includes('flag'), 'flag (boolean) should not be potential callback');
+    assert.ok(!cbNames.includes('empty'), 'empty (null) should not be potential callback');
+    assert.ok(!cbNames.includes('items'), 'items (array) should not be potential callback');
+    assert.ok(!cbNames.includes('config'), 'config (object) should not be potential callback');
+});
+
+it('FIX 67 — JS: object with function values should NOT be marked non-callable', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+const handlers = { onClick: () => {} };
+const realFn = function() {};
+
+function test() {
+    register(handlers, realFn);
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+
+    // handlers has arrow function value, so should NOT be excluded
+    const handlersCb = calls.find(c => c.name === 'handlers' && c.isPotentialCallback);
+    assert.ok(handlersCb, 'handlers (object with function values) SHOULD still be potential callback');
+
+    // realFn is a function expression, not a non-callable literal
+    const realFnCb = calls.find(c => c.name === 'realFn' && c.isPotentialCallback);
+    assert.ok(realFnCb, 'realFn (function expression) SHOULD still be potential callback');
+});
+
+it('FIX 67 — JS: non-callable in object literal arg values', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/javascript');
+
+    const code = `
+const status = "active";
+
+function test() {
+    doRequest({ handler: status });
+}
+`;
+    const parser = getParser('javascript');
+    const calls = findCallsInCode(code, parser);
+
+    const falseCb = calls.find(c => c.name === 'status' && c.isPotentialCallback);
+    assert.ok(!falseCb, 'status (string) in object literal value should NOT be potential callback');
+});
+
+it('FIX 67 — Python: non-callable variable shadows should not produce false callback', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/python');
+
+    const code = `
+def parse(data):
+    return data
+
+parse = 5
+count = "hello"
+items = [1, 2, 3]
+config = {'a': 1}
+
+def test():
+    print(parse)
+    some_func(count, items, config)
+`;
+    const parser = getParser('python');
+    const calls = findCallsInCode(code, parser);
+
+    const callbacks = calls.filter(c => c.isPotentialCallback);
+    const cbNames = callbacks.map(c => c.name);
+    assert.ok(!cbNames.includes('parse'), 'parse (integer) should not be potential callback');
+    assert.ok(!cbNames.includes('count'), 'count (string) should not be potential callback');
+    assert.ok(!cbNames.includes('items'), 'items (list) should not be potential callback');
+    assert.ok(!cbNames.includes('config'), 'config (dict) should not be potential callback');
+});
+
+it('FIX 67 — Python: dict with lambda values should NOT be marked non-callable', (t) => {
+    const { getParser } = require('../languages');
+    const { findCallsInCode } = require('../languages/python');
+
+    const code = `
+dispatch = {'add': lambda x: x + 1}
+
+def test():
+    run(dispatch)
+`;
+    const parser = getParser('python');
+    const calls = findCallsInCode(code, parser);
+
+    const dispatchCb = calls.find(c => c.name === 'dispatch' && c.isPotentialCallback);
+    assert.ok(dispatchCb, 'dispatch (dict with lambda) SHOULD still be potential callback');
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

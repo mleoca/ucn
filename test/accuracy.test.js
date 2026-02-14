@@ -143,7 +143,7 @@ def caller():
         } finally { rm(d); }
     });
 
-    it('LIMITATION: functools.partial creates untraceable alias', () => {
+    it('FIXED: functools.partial alias resolves to wrapped function', () => {
         const d = tmp({
             'pyproject.toml': '[project]\nname = "t"',
             'lib.py': `
@@ -160,8 +160,8 @@ def process(text):
         try {
             const index = idx(d);
             const callers = index.findCallers('transform');
-            assert.ok(!callers.some(c => c.callerName === 'process'),
-                'partial(transform) creates alias "upper" — breaks tracking');
+            assert.ok(callers.some(c => c.callerName === 'process'),
+                'partial(transform) alias "upper" should resolve — process calls transform via upper');
         } finally { rm(d); }
     });
 
