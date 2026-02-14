@@ -33,7 +33,17 @@ function extractJavaParams(paramsNode) {
  */
 function extractModifiers(node) {
     const modifiers = [];
-    const modifiersNode = node.childForFieldName('modifiers');
+    // Try field name first, fall back to finding child by type
+    // (class body members may not have 'modifiers' as a field name)
+    let modifiersNode = node.childForFieldName('modifiers');
+    if (!modifiersNode) {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            if (node.namedChild(i).type === 'modifiers') {
+                modifiersNode = node.namedChild(i);
+                break;
+            }
+        }
+    }
 
     if (modifiersNode) {
         for (let i = 0; i < modifiersNode.namedChildCount; i++) {
@@ -134,6 +144,8 @@ function findFunctions(code, parser) {
                 const returnType = extractReturnType(node);
                 const generics = extractGenerics(node);
                 const docstring = extractJavaDocstring(code, startLine);
+                // nameLine: where the name identifier lives (differs from startLine when annotations are present)
+                const nameLine = nameNode.startPosition.row + 1;
 
                 functions.push({
                     name: nameNode.text,
@@ -146,7 +158,8 @@ function findFunctions(code, parser) {
                     ...(returnType && { returnType }),
                     ...(generics && { generics }),
                     ...(docstring && { docstring }),
-                    ...(annotations.length > 0 && { annotations })
+                    ...(annotations.length > 0 && { annotations }),
+                    ...(nameLine !== startLine && { nameLine })
                 });
             }
             return true;
@@ -171,6 +184,7 @@ function findFunctions(code, parser) {
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
                 const docstring = extractJavaDocstring(code, startLine);
+                const nameLine = nameNode.startPosition.row + 1;
 
                 functions.push({
                     name: nameNode.text,
@@ -182,7 +196,8 @@ function findFunctions(code, parser) {
                     modifiers,
                     isConstructor: true,
                     ...(docstring && { docstring }),
-                    ...(annotations.length > 0 && { annotations })
+                    ...(annotations.length > 0 && { annotations }),
+                    ...(nameLine !== startLine && { nameLine })
                 });
             }
             return true;
@@ -411,6 +426,7 @@ function extractClassMembers(classNode, code) {
                 const modifiers = extractModifiers(child);
                 const returnType = extractReturnType(child);
                 const docstring = extractJavaDocstring(code, startLine);
+                const nameLine = nameNode.startPosition.row + 1;
 
                 let memberType = 'method';
                 if (modifiers.includes('static')) {
@@ -429,7 +445,8 @@ function extractClassMembers(classNode, code) {
                     modifiers,
                     isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
-                    ...(docstring && { docstring })
+                    ...(docstring && { docstring }),
+                    ...(nameLine !== startLine && { nameLine })
                 });
             }
         }
@@ -443,6 +460,7 @@ function extractClassMembers(classNode, code) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const modifiers = extractModifiers(child);
                 const docstring = extractJavaDocstring(code, startLine);
+                const nameLine = nameNode.startPosition.row + 1;
 
                 members.push({
                     name: nameNode.text,
@@ -453,7 +471,8 @@ function extractClassMembers(classNode, code) {
                     memberType: 'constructor',
                     modifiers,
                     isMethod: true,  // Mark as method for context() lookups
-                    ...(docstring && { docstring })
+                    ...(docstring && { docstring }),
+                    ...(nameLine !== startLine && { nameLine })
                 });
             }
         }

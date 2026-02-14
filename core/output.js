@@ -779,7 +779,7 @@ function formatTrace(trace) {
     }
 
     if (!trace.includeMethods) {
-        lines.push(`\nNote: obj.method() calls excluded. Use --include-methods to include them.`);
+        lines.push(`\nNote: obj.method() calls excluded (--include-methods=false). Remove flag to include them (default).`);
     }
 
     return lines.join('\n');
@@ -1612,6 +1612,12 @@ function formatContext(ctx, options = {}) {
         });
     }
 
+    // Structural hint: class methods may have callers through constructed/injected instances
+    // that static analysis can't track. Only show when caller count is low (≤3) to avoid noise.
+    if (ctx.meta && (ctx.meta.isMethod || ctx.meta.className || ctx.meta.receiver) && callers.length <= 3) {
+        lines.push(`  Note: ${ctx.function} is a class/struct method — additional callers through constructed or injected instances are not tracked by static analysis.`);
+    }
+
     const callees = ctx.callees || [];
     lines.push(`\nCALLEES (${callees.length}):`);
     for (const c of callees) {
@@ -1699,7 +1705,16 @@ function formatDeadcode(results, options = {}) {
             lines.push(item.file);
         }
         const exported = item.isExported ? ' [exported]' : '';
-        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}`);
+        // Surface decorators/annotations — structural hint that a framework may invoke this
+        const hints = [];
+        if (item.decorators && item.decorators.length > 0) {
+            hints.push(...item.decorators.map(d => `@${d}`));
+        }
+        if (item.annotations && item.annotations.length > 0) {
+            hints.push(...item.annotations.map(a => `@${a}`));
+        }
+        const hintStr = hints.length > 0 ? ` [has ${hints.join(', ')}]` : '';
+        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}`);
     }
 
     if (options.exportedHint) {
