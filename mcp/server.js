@@ -632,15 +632,16 @@ server.registerTool(
         description: 'Find existing tests for a function. Shows which test files cover it, matching test case names, and how the function is called in tests. Use to check test coverage before modifying a function, or to find example test patterns to follow when writing new tests.',
         inputSchema: z.object({
             project_dir: projectDirParam,
-            name: nameParam
+            name: nameParam,
+            calls_only: z.boolean().optional().describe('Only show direct call and test-case matches, filtering out string references, imports, and other non-invocation mentions')
         })
     },
-    async ({ project_dir, name }) => {
+    async ({ project_dir, name, calls_only }) => {
         const err = requireName(name);
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const result = index.tests(name);
+            const result = index.tests(name, { callsOnly: calls_only });
             return toolResult(output.formatTests(result, name));
         } catch (e) {
             return toolError(e.message);
