@@ -540,7 +540,7 @@ class ProjectIndex {
     find(name, options = {}) {
         const matches = this.symbols.get(name) || [];
 
-        if (matches.length === 0) {
+        if (matches.length === 0 && !options.exact) {
             // Smart fuzzy search with scoring
             const candidates = [];
             for (const [symName, symbols] of this.symbols) {
@@ -2326,6 +2326,65 @@ class ProjectIndex {
                     });
                 }
             }
+
+            // Add re-exports: export { X } from './module'
+            // Resolve to the source file and look up the symbol there
+            for (const exp of fileEntry.exportDetails) {
+                if ((exp.type === 're-export' || exp.type === 're-export-all') && exp.source && !matchedNames.has(exp.name)) {
+                    const { resolveImport } = require('./imports');
+                    const resolved = resolveImport(exp.source, absPath, {
+                        language: fileEntry.language,
+                        root: this.root,
+                        extensions: this.extensions
+                    });
+                    if (resolved) {
+                        const sourceEntry = this.files.get(resolved);
+                        if (sourceEntry) {
+                            // For star re-exports, include all exported symbols from source
+                            if (exp.type === 're-export-all') {
+                                const sourceExports = this.fileExports(resolved);
+                                for (const srcExp of sourceExports) {
+                                    if (!matchedNames.has(srcExp.name)) {
+                                        matchedNames.add(srcExp.name);
+                                        results.push({ ...srcExp, file: fileEntry.relativePath, reExportedFrom: srcExp.file });
+                                    }
+                                }
+                            } else {
+                                // Named re-export: find the specific symbol
+                                const srcSymbol = sourceEntry.symbols.find(s => s.name === exp.name);
+                                if (srcSymbol) {
+                                    matchedNames.add(exp.name);
+                                    results.push({
+                                        name: exp.name,
+                                        type: srcSymbol.type,
+                                        file: fileEntry.relativePath,
+                                        startLine: exp.line,
+                                        endLine: exp.line,
+                                        params: srcSymbol.params,
+                                        returnType: srcSymbol.returnType,
+                                        signature: this.formatSignature(srcSymbol),
+                                        reExportedFrom: sourceEntry.relativePath
+                                    });
+                                } else {
+                                    // Symbol not found in source — still list it as a re-export
+                                    matchedNames.add(exp.name);
+                                    results.push({
+                                        name: exp.name,
+                                        type: 're-export',
+                                        file: fileEntry.relativePath,
+                                        startLine: exp.line,
+                                        endLine: exp.line,
+                                        params: undefined,
+                                        returnType: null,
+                                        signature: `re-export ${exp.name} from '${exp.source}'`,
+                                        reExportedFrom: sourceEntry.relativePath
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         return results;
@@ -2497,9 +2556,22 @@ class ProjectIndex {
                     continue;
                 }
 
+                // JavaScript/TypeScript: framework lifecycle methods called by runtime
+                // React class components, Web Components, Angular, Vue
+                const jsLifecycleMethods = new Set([
+                    // React class component lifecycle
+                    'render', 'componentDidMount', 'componentDidUpdate', 'componentWillUnmount',
+                    'getDerivedStateFromProps', 'getDerivedStateFromError', 'componentDidCatch',
+                    'getSnapshotBeforeUpdate', 'shouldComponentUpdate',
+                    // Web Components lifecycle
+                    'connectedCallback', 'disconnectedCallback', 'attributeChangedCallback', 'adoptedCallback'
+                ]);
+                const isJsEntryPoint = (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') &&
+                    symbol.isMethod && jsLifecycleMethods.has(name);
+
                 const isEntryPoint = isGoEntryPoint || isGoTestFunc ||
                     isJavaEntryPoint || isJavaTestMethod ||
-                    isPythonEntryPoint || isRustEntryPoint;
+                    isPythonEntryPoint || isRustEntryPoint || isJsEntryPoint;
 
                 // Entry points are always excluded — they're invoked by the runtime, not user code
                 if (isEntryPoint) {
@@ -3652,7 +3724,7 @@ class ProjectIndex {
             }
 
             // Call node types vary by language
-            const callTypes = new Set(['call_expression', 'call', 'method_invocation']);
+            const callTypes = new Set(['call_expression', 'call', 'method_invocation', 'object_creation_expression']);
             const targetRow = call.line - 1; // tree-sitter is 0-indexed
 
             // Find the call expression at the target line matching funcName
@@ -3703,14 +3775,24 @@ class ProjectIndex {
         }
 
         if (callTypes.has(node.type) && node.startPosition.row === targetRow) {
-            // Check if this call is for our target function
-            const funcNode = node.childForFieldName('function') ||
-                             node.childForFieldName('name'); // Java method_invocation uses 'name'
-            if (funcNode) {
-                const funcText = funcNode.type === 'member_expression' || funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' || funcNode.type === 'attribute'
-                    ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
-                    : funcNode.text;
-                if (funcText === funcName) return node;
+            // Java constructor: new ClassName(args) — name is in 'type' field
+            if (node.type === 'object_creation_expression') {
+                const typeNode = node.childForFieldName('type');
+                if (typeNode) {
+                    // Strip generics and package qualifiers: com.foo.Bar<T> -> Bar
+                    const typeName = typeNode.text.replace(/<.*>$/, '').split('.').pop();
+                    if (typeName === funcName) return node;
+                }
+            } else {
+                // Check if this call is for our target function
+                const funcNode = node.childForFieldName('function') ||
+                                 node.childForFieldName('name'); // Java method_invocation uses 'name'
+                if (funcNode) {
+                    const funcText = funcNode.type === 'member_expression' || funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' || funcNode.type === 'attribute'
+                        ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
+                        : funcNode.text;
+                    if (funcText === funcName) return node;
+                }
             }
         }
 
@@ -4077,7 +4159,9 @@ class ProjectIndex {
         let totalTests = 0;
 
         for (const [filePath, fileEntry] of this.files) {
-            let functions = fileEntry.symbols.filter(s => s.type === 'function');
+            let functions = fileEntry.symbols.filter(s =>
+                s.type === 'function' || s.type === 'method' || s.type === 'static' || s.type === 'constructor'
+            );
             const classes = fileEntry.symbols.filter(s =>
                 ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'impl'].includes(s.type)
             );
