@@ -686,6 +686,43 @@ function findCallsInCode(code, parser) {
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
     const aliases = new Map();  // Track local aliases: aliasName -> originalName (string or string[])
+    const nonCallableNames = new Set();  // Track names assigned non-callable values
+
+    // Helper to check if a node is a non-callable literal
+    const isNonCallableInit = (node) => {
+        // Primitive literals
+        if (['number', 'string', 'template_string', 'true', 'false', 'null', 'regex'].includes(node.type)) {
+            return true;
+        }
+        if (node.type === 'identifier' && node.text === 'undefined') {
+            return true;
+        }
+        // Array literal: non-callable if no function-valued elements
+        if (node.type === 'array') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const el = node.namedChild(i);
+                if (['function_expression', 'arrow_function', 'generator_function'].includes(el.type)) {
+                    return false;
+                }
+            }
+            return true;
+        }
+        // Object literal: non-callable if no function-valued properties
+        if (node.type === 'object') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const prop = node.namedChild(i);
+                if (prop.type === 'method_definition') return false;
+                if (prop.type === 'pair') {
+                    const val = prop.childForFieldName('value');
+                    if (val && ['function_expression', 'arrow_function', 'generator_function'].includes(val.type)) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        }
+        return false;
+    };
 
     // Known higher-order function methods where arguments are likely function references
     // Maps method name -> Set of argument indices that are callbacks (null = all args are callbacks)
@@ -800,6 +837,10 @@ function findCallsInCode(code, parser) {
                         }
                     }
                 }
+            }
+            // Track non-callable assignments: const count = 5, const name = "hello"
+            if (nameNode?.type === 'identifier' && initNode && isNonCallableInit(initNode)) {
+                nonCallableNames.add(nameNode.text);
             }
         }
 
@@ -943,7 +984,7 @@ function findCallsInCode(code, parser) {
                 if (argsNode) {
                     for (let i = 0; i < argsNode.namedChildCount; i++) {
                         const arg = argsNode.namedChild(i);
-                        if (arg.type === 'identifier' && !SKIP_IDENTS.has(arg.text)) {
+                        if (arg.type === 'identifier' && !SKIP_IDENTS.has(arg.text) && !nonCallableNames.has(arg.text)) {
                             calls.push({
                                 name: arg.text,
                                 line: arg.startPosition.row + 1,
@@ -960,7 +1001,7 @@ function findCallsInCode(code, parser) {
                                 const prop = arg.namedChild(j);
                                 if (prop.type === 'pair') {
                                     const val = prop.childForFieldName('value');
-                                    if (val?.type === 'identifier' && !SKIP_IDENTS.has(val.text)) {
+                                    if (val?.type === 'identifier' && !SKIP_IDENTS.has(val.text) && !nonCallableNames.has(val.text)) {
                                         calls.push({
                                             name: val.text,
                                             line: val.startPosition.row + 1,

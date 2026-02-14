@@ -383,6 +383,34 @@ function findCallsInCode(code, parser) {
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
     const aliases = new Map();  // Track local aliases: aliasName -> originalName
+    const nonCallableNames = new Set();  // Track names assigned non-callable values
+
+    // Helper to check if a node is a non-callable literal
+    const isNonCallableInit = (node) => {
+        // Primitive literals
+        if (['integer', 'float', 'string', 'concatenated_string',
+             'true', 'false', 'none'].includes(node.type)) {
+            return true;
+        }
+        // Collection literals: non-callable if no lambda values
+        if (['list', 'tuple', 'set'].includes(node.type)) {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                if (node.namedChild(i).type === 'lambda') return false;
+            }
+            return true;
+        }
+        if (node.type === 'dictionary') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const pair = node.namedChild(i);
+                if (pair.type === 'pair') {
+                    const val = pair.childForFieldName('value');
+                    if (val?.type === 'lambda') return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    };
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
@@ -423,12 +451,46 @@ function findCallsInCode(code, parser) {
             });
         }
 
-        // Track local aliases: my_parse = parse
+        // Track local aliases and non-callable assignments
         if (node.type === 'assignment') {
             const left = node.childForFieldName('left');
             const right = node.childForFieldName('right');
-            if (left?.type === 'identifier' && right?.type === 'identifier') {
-                aliases.set(left.text, right.text);
+            if (left?.type === 'identifier') {
+                if (right?.type === 'identifier') {
+                    aliases.set(left.text, right.text);
+                }
+                // Track partial(fn, ...) aliases: fast_process = partial(process, mode='fast')
+                else if (right?.type === 'call') {
+                    const callFunc = right.childForFieldName('function');
+                    let isPartial = false;
+                    if (callFunc?.type === 'identifier' && callFunc.text === 'partial') {
+                        isPartial = true;
+                    } else if (callFunc?.type === 'attribute') {
+                        const attr = callFunc.childForFieldName('attribute');
+                        const obj = callFunc.childForFieldName('object');
+                        if (attr?.text === 'partial' && obj?.type === 'identifier' && obj.text === 'functools') {
+                            isPartial = true;
+                        }
+                    }
+                    if (isPartial) {
+                        const args = right.childForFieldName('arguments');
+                        if (args) {
+                            for (let i = 0; i < args.namedChildCount; i++) {
+                                const arg = args.namedChild(i);
+                                if (arg.type === 'identifier') {
+                                    aliases.set(left.text, arg.text);
+                                    break;
+                                }
+                                if (arg.type === 'keyword_argument') continue;
+                                break;
+                            }
+                        }
+                    }
+                }
+                // Track non-callable assignments: count = 5, name = "hello"
+                if (right && isNonCallableInit(right)) {
+                    nonCallableNames.add(left.text);
+                }
             }
         }
 
@@ -505,7 +567,7 @@ function findCallsInCode(code, parser) {
             if (argsNode) {
                 for (let i = 0; i < argsNode.namedChildCount; i++) {
                     const arg = argsNode.namedChild(i);
-                    if (arg.type === 'identifier' && !PYTHON_SKIP.has(arg.text)) {
+                    if (arg.type === 'identifier' && !PYTHON_SKIP.has(arg.text) && !nonCallableNames.has(arg.text)) {
                         calls.push({
                             name: arg.text,
                             line: arg.startPosition.row + 1,
@@ -522,7 +584,7 @@ function findCallsInCode(code, parser) {
                             const pair = arg.namedChild(j);
                             if (pair.type === 'pair') {
                                 const val = pair.childForFieldName('value');
-                                if (val?.type === 'identifier' && !PYTHON_SKIP.has(val.text)) {
+                                if (val?.type === 'identifier' && !PYTHON_SKIP.has(val.text) && !nonCallableNames.has(val.text)) {
                                     calls.push({
                                         name: val.text,
                                         line: val.startPosition.row + 1,
