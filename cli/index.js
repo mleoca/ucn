@@ -51,6 +51,7 @@ const flags = {
     includeTests: args.includes('--include-tests'),
     // Deadcode options
     includeExported: args.includes('--include-exported'),
+    includeDecorated: args.includes('--include-decorated'),
     // Uncertain matches (off by default)
     includeUncertain: args.includes('--include-uncertain'),
     // Detailed listing (e.g. toc with all symbols)
@@ -90,7 +91,7 @@ const knownFlags = new Set([
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests',
-    '--include-exported', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed',
+    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks'
@@ -814,7 +815,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all });
+            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods });
             printOutput(aboutResult,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
@@ -953,13 +954,12 @@ function runProjectCommand(rootDir, command, arg) {
         case 'deadcode': {
             const deadcodeResults = index.deadcode({
                 includeExported: flags.includeExported,
+                includeDecorated: flags.includeDecorated,
                 includeTests: flags.includeTests
             });
             printOutput(deadcodeResults,
                 r => JSON.stringify({ deadcode: r }, null, 2),
-                r => output.formatDeadcode(r, {
-                    exportedHint: !flags.includeExported ? 'Exported symbols excluded by default. Add --include-exported to include them.' : undefined
-                })
+                r => output.formatDeadcode(r)
             );
             break;
         }
@@ -1712,6 +1712,7 @@ Common Flags:
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
   --include-exported  Include exported symbols in deadcode
+  --include-decorated Include decorated/annotated symbols in deadcode
   --detailed          List all symbols in toc (compact by default)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
@@ -1843,7 +1844,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: about <name>');
                 return;
             }
-            const aboutResult = index.about(arg, {});
+            const aboutResult = index.about(arg, { includeMethods: flags.includeMethods });
             console.log(output.formatAbout(aboutResult, { expand: flags.expand, root: index.root }));
             break;
         }

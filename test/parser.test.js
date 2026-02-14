@@ -8869,7 +8869,7 @@ it('formatContext shows class method hint when callers <= 3', () => {
 });
 
 // --- deadcode: decorated/annotated functions now detected ---
-it('deadcode detects decorated Python functions as dead', () => {
+it('deadcode excludes decorated Python functions by default, includes with flag', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dc-pydeco-'));
     try {
         fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
@@ -8893,17 +8893,26 @@ def used_fn():
 `);
         const index = new ProjectIndex(tmpDir);
         index.build('**/*.py', { quiet: true });
-        const dc = index.deadcode();
-        const names = dc.map(d => d.name);
 
-        // ALL three should be dead (no callers)
-        assert.ok(names.includes('list_users'), 'Decorated list_users should be detected as dead');
-        assert.ok(names.includes('health_check'), 'Decorated health_check should be detected as dead');
-        // plain_unused is called by used_fn, so it should NOT be dead
-        assert.ok(!names.includes('plain_unused'), 'plain_unused is called and should not be dead');
+        // Default: decorated functions with '.' are excluded
+        const dcDefault = index.deadcode();
+        const defaultNames = dcDefault.map(d => d.name);
+        assert.ok(!defaultNames.includes('list_users'), 'Decorated list_users should be excluded by default');
+        assert.ok(!defaultNames.includes('health_check'), 'Decorated health_check should be excluded by default');
+        assert.strictEqual(dcDefault.excludedDecorated, 2, 'Should report 2 excluded decorated symbols');
 
-        // Verify decorator hints are present
-        const listUsersResult = dc.find(d => d.name === 'list_users');
+        // With includeDecorated: decorated functions are included
+        const dcAll = index.deadcode({ includeDecorated: true });
+        const allNames = dcAll.map(d => d.name);
+        assert.ok(allNames.includes('list_users'), 'Decorated list_users should be included with flag');
+        assert.ok(allNames.includes('health_check'), 'Decorated health_check should be included with flag');
+        assert.strictEqual(dcAll.excludedDecorated, 0, 'No excluded decorated when includeDecorated=true');
+
+        // plain_unused is called by used_fn, so it should NOT be dead in either case
+        assert.ok(!defaultNames.includes('plain_unused'), 'plain_unused is called and should not be dead');
+
+        // Verify decorator hints are present when included
+        const listUsersResult = dcAll.find(d => d.name === 'list_users');
         assert.ok(listUsersResult.decorators, 'list_users should have decorators');
         assert.ok(listUsersResult.decorators.some(d => d.includes('app.route')), 'Should include app.route decorator');
     } finally {
@@ -8911,7 +8920,7 @@ def used_fn():
     }
 });
 
-it('deadcode detects annotated Java methods as dead', () => {
+it('deadcode excludes annotated Java methods by default, includes with flag', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dc-javaanno-'));
     try {
         fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project><groupId>test</groupId></project>');
@@ -8935,16 +8944,24 @@ public class Service {
 `);
         const index = new ProjectIndex(tmpDir);
         index.build('**/*.java', { quiet: true });
-        const dc = index.deadcode({ includeExported: true });
-        const names = dc.map(d => d.name);
 
-        // All three should be dead
-        assert.ok(names.includes('cleanup'), 'Annotated cleanup should be detected as dead');
-        assert.ok(names.includes('dataSource'), 'Annotated dataSource should be detected as dead');
-        assert.ok(names.includes('plainUnused'), 'plainUnused should be detected as dead');
+        // Default: annotated methods are excluded (cleanup has @Scheduled, dataSource has @Bean)
+        const dcDefault = index.deadcode({ includeExported: true });
+        const defaultNames = dcDefault.map(d => d.name);
+        assert.ok(!defaultNames.includes('cleanup'), 'Annotated cleanup should be excluded by default');
+        assert.ok(!defaultNames.includes('dataSource'), 'Annotated dataSource should be excluded by default');
+        assert.ok(defaultNames.includes('plainUnused'), 'plainUnused (no annotations) should still be detected');
+        assert.strictEqual(dcDefault.excludedDecorated, 2, 'Should report 2 excluded annotated symbols');
 
-        // Verify annotation hints
-        const cleanupResult = dc.find(d => d.name === 'cleanup');
+        // With includeDecorated: annotated methods are included
+        const dcAll = index.deadcode({ includeExported: true, includeDecorated: true });
+        const allNames = dcAll.map(d => d.name);
+        assert.ok(allNames.includes('cleanup'), 'Annotated cleanup should be included with flag');
+        assert.ok(allNames.includes('dataSource'), 'Annotated dataSource should be included with flag');
+        assert.ok(allNames.includes('plainUnused'), 'plainUnused should be included');
+
+        // Verify annotation hints when included
+        const cleanupResult = dcAll.find(d => d.name === 'cleanup');
         assert.ok(cleanupResult.annotations, 'cleanup should have annotations');
         assert.ok(cleanupResult.annotations.includes('scheduled'), 'Should include scheduled annotation');
     } finally {
@@ -9006,6 +9023,165 @@ public class MyClass {
         const plainSyms = index.symbols.get('plain');
         assert.ok(plainSyms && plainSyms.length > 0, 'plain should be in index');
         assert.ok(!plainSyms[0].modifiers.includes('override'), 'plain should not have override');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// --- about: includeMethods default ---
+it('about includes method callers by default', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-about-methods-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+        fs.writeFileSync(path.join(tmpDir, 'service.py'), `
+class Analyzer:
+    def analyze(self, data):
+        return self._process(data)
+
+    def _process(self, data):
+        return data * 2
+`);
+        fs.writeFileSync(path.join(tmpDir, 'main.py'), `
+from service import Analyzer
+def run():
+    a = Analyzer()
+    a.analyze('test')
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.py', { quiet: true });
+
+        // Default: includeMethods=true — should find callers via obj.method()
+        const aboutDefault = index.about('analyze');
+        assert.ok(aboutDefault, 'Should find analyze');
+        assert.ok(aboutDefault.found, 'Should be found');
+        assert.ok(aboutDefault.includeMethods === true, 'includeMethods should default to true');
+
+        // Explicit false: fewer callers
+        const aboutNoMethods = index.about('analyze', { includeMethods: false });
+        assert.ok(aboutNoMethods, 'Should find analyze with includeMethods=false');
+        assert.ok(aboutNoMethods.includeMethods === false, 'includeMethods should be false');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('about with includeMethods=false shows note in formatted output', () => {
+    const { formatAbout } = require('../core/output');
+
+    // Mock about result with includeMethods=false
+    const aboutResult = {
+        found: true,
+        symbol: { name: 'analyze', type: 'method', file: 'service.py', startLine: 3, endLine: 5, signature: 'analyze(self, data)' },
+        usages: { definitions: 1, calls: 0, imports: 0, references: 0 },
+        totalUsages: 0,
+        callers: { total: 0, top: [] },
+        callees: { total: 0, top: [] },
+        tests: { fileCount: 0, totalMatches: 0, files: [] },
+        otherDefinitions: [],
+        types: [],
+        code: null,
+        includeMethods: false,
+        completeness: { warnings: [] }
+    };
+    const text = formatAbout(aboutResult);
+    assert.ok(text.includes('obj.method() callers/callees excluded'), 'Should show note when includeMethods=false');
+    assert.ok(text.includes('--include-methods=false'), 'Should mention the flag');
+
+    // With includeMethods=true (default) — no note
+    aboutResult.includeMethods = true;
+    const text2 = formatAbout(aboutResult);
+    assert.ok(!text2.includes('obj.method() callers/callees excluded'), 'Should NOT show note when includeMethods=true');
+});
+
+// --- deadcode: exclusion counts in output ---
+it('deadcode returns exclusion counts for decorated and exported', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dc-counts-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+        fs.writeFileSync(path.join(tmpDir, 'app.py'), `
+import something
+
+@something.route('/a')
+def route_a():
+    return 1
+
+@something.task
+def task_b():
+    return 2
+
+def plain_unused():
+    return 3
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.py', { quiet: true });
+
+        const dc = index.deadcode();
+        // route_a and task_b have '.' decorators — excluded
+        assert.strictEqual(dc.excludedDecorated, 2, 'Should exclude 2 decorated symbols');
+        // plain_unused should be in results
+        const names = dc.map(d => d.name);
+        assert.ok(names.includes('plain_unused'), 'plain_unused should be in results');
+        assert.ok(!names.includes('route_a'), 'route_a should be excluded');
+        assert.ok(!names.includes('task_b'), 'task_b should be excluded');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('formatDeadcode shows exclusion counts in hints', () => {
+    const { formatDeadcode } = require('../core/output');
+
+    // Simulate results with exclusion counts
+    const results = [
+        { name: 'helper', type: 'function', file: 'utils.py', startLine: 1, endLine: 3, isExported: false }
+    ];
+    results.excludedDecorated = 5;
+    results.excludedExported = 12;
+
+    const text = formatDeadcode(results);
+    assert.ok(text.includes('5 decorated/annotated symbol(s) hidden'), 'Should show decorated count');
+    assert.ok(text.includes('--include-decorated'), 'Should hint at --include-decorated flag');
+    assert.ok(text.includes('12 exported symbol(s) hidden'), 'Should show exported count');
+    assert.ok(text.includes('--include-exported'), 'Should hint at --include-exported flag');
+});
+
+it('formatDeadcode handles zero exclusions without hints', () => {
+    const { formatDeadcode } = require('../core/output');
+
+    const results = [
+        { name: 'helper', type: 'function', file: 'utils.py', startLine: 1, endLine: 3, isExported: false }
+    ];
+    results.excludedDecorated = 0;
+    results.excludedExported = 0;
+
+    const text = formatDeadcode(results);
+    assert.ok(!text.includes('hidden'), 'Should not show any hidden hints when counts are 0');
+    assert.ok(text.includes('helper'), 'Should still show the result');
+});
+
+it('deadcode Python: simple decorators NOT excluded (only attribute access)', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dc-simple-deco-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
+        fs.writeFileSync(path.join(tmpDir, 'app.py'), `
+class Service:
+    @staticmethod
+    def unused_static():
+        return 42
+
+    @property
+    def unused_prop(self):
+        return 'x'
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.py', { quiet: true });
+        const dc = index.deadcode();
+        const names = dc.map(d => d.name);
+
+        // @staticmethod and @property don't have '.' — should NOT be excluded
+        assert.ok(names.includes('unused_static') || names.includes('unused_prop'),
+            'Simple decorators (no dot) should still appear in deadcode');
+        assert.strictEqual(dc.excludedDecorated, 0, 'No dot-decorators, so 0 excluded');
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }

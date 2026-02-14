@@ -233,15 +233,16 @@ server.registerTool(
             project_dir: projectDirParam,
             name: nameParam,
             file: fileParam,
-            with_types: z.boolean().optional().describe('Include related type definitions in output')
+            with_types: z.boolean().optional().describe('Include related type definitions in output'),
+            include_methods: z.boolean().optional().describe('Include obj.method() calls in caller/callee analysis (default: true)')
         })
     },
-    async ({ project_dir, name, file, with_types }) => {
+    async ({ project_dir, name, file, with_types, include_methods }) => {
         const err = requireName(name);
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const result = index.about(name, { file, withTypes: with_types || false });
+            const result = index.about(name, { file, withTypes: with_types || false, includeMethods: include_methods ?? undefined });
             return toolResult(output.formatAbout(result));
         } catch (e) {
             return toolError(e.message);
@@ -404,22 +405,25 @@ server.registerTool(
 server.registerTool(
     'ucn_deadcode',
     {
-        description: 'Find dead code: functions and classes with zero callers anywhere in the project. Use during cleanup to identify code that can be safely deleted. By default excludes exported symbols (they may be used externally) and test files — set include_exported=true to audit everything, or include_tests=true to check test helpers too.',
+        description: 'Find dead code: functions and classes with zero callers anywhere in the project. Use during cleanup to identify code that can be safely deleted. By default excludes exported symbols (they may be used externally), decorated/annotated symbols (likely framework-registered), and test files. Use include flags to expand results.',
         inputSchema: z.object({
             project_dir: projectDirParam,
             include_exported: z.boolean().optional().describe('Include exported symbols (excluded by default)'),
+            include_decorated: z.boolean().optional().describe('Include decorated/annotated symbols like @router.get, @Bean (excluded by default as they are typically framework-registered)'),
             include_tests: includeTestsParam
         })
     },
-    async ({ project_dir, include_exported, include_tests }) => {
+    async ({ project_dir, include_exported, include_decorated, include_tests }) => {
         try {
             const index = getIndex(project_dir);
             const result = index.deadcode({
                 includeExported: include_exported || false,
+                includeDecorated: include_decorated || false,
                 includeTests: include_tests || false
             });
             return toolResult(output.formatDeadcode(result, {
-                exportedHint: !include_exported ? 'Exported symbols excluded by default. Use include_exported=true to include them.' : undefined
+                decoratedHint: !include_decorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
+                exportedHint: !include_exported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) hidden. Use include_exported=true to include them.` : undefined
             }));
         } catch (e) {
             return toolError(e.message);
