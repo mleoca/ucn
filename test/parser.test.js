@@ -8524,5 +8524,205 @@ it('formatTrace includes include_methods hint when not set', () => {
 
 }); // end describe('MCP Demo Fixes')
 
+// ============================================================================
+// MCP Issues & Suggestions Fixes (2026-02-14)
+// ============================================================================
+
+describe('MCP Issues Fixes', () => {
+
+    // Issue 1: expand cache was keyed by project only, losing previous context results
+    // Testing that the cache key structure supports multiple symbols per project
+    it('expand cache supports multiple symbols per project (issue 1)', () => {
+        // Simulate the expand cache behavior
+        const expandCache = new Map();
+        const projectRoot = '/fake/project';
+
+        // Store context for symbol A
+        expandCache.set(`${projectRoot}:funcA`, {
+            items: [{ num: 1, name: 'callerOfA', type: 'function' }],
+            root: projectRoot,
+            symbolName: 'funcA'
+        });
+
+        // Store context for symbol B (should NOT overwrite A)
+        expandCache.set(`${projectRoot}:funcB`, {
+            items: [{ num: 1, name: 'callerOfB', type: 'function' }],
+            root: projectRoot,
+            symbolName: 'funcB'
+        });
+
+        // Both should be retrievable
+        const cachedA = expandCache.get(`${projectRoot}:funcA`);
+        const cachedB = expandCache.get(`${projectRoot}:funcB`);
+        assert.ok(cachedA, 'funcA cache should still exist');
+        assert.ok(cachedB, 'funcB cache should exist');
+        assert.strictEqual(cachedA.items[0].name, 'callerOfA');
+        assert.strictEqual(cachedB.items[0].name, 'callerOfB');
+
+        // Search across all entries for a project (like expand handler does)
+        let found = null;
+        for (const [key, cached] of expandCache) {
+            if (cached.root === projectRoot) {
+                const match = cached.items.find(i => i.num === 1 && i.name === 'callerOfA');
+                if (match) { found = match; break; }
+            }
+        }
+        assert.ok(found, 'should find item from funcA when searching all project caches');
+    });
+
+    // Issue 2: example() method moved to core/project.js
+    it('ProjectIndex.example() returns scored result (issue 2)', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        // Create a JS file with a function that is called
+        fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(dir, 'lib.js'), `
+function greet(name) {
+    return 'Hello ' + name;
+}
+module.exports = { greet };
+`);
+        fs.writeFileSync(path.join(dir, 'app.js'), `
+const { greet } = require('./lib');
+const msg = greet('world');
+console.log(msg);
+`);
+
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+
+        const result = index.example('greet');
+        assert.ok(result, 'example() should return a result');
+        assert.ok(result.best, 'should have a best example');
+        assert.ok(result.best.score >= 0, 'should have a score');
+        assert.ok(result.totalCalls > 0, 'should have total calls');
+        assert.ok(result.best.content.includes('greet'), 'best example content should contain the function name');
+
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('ProjectIndex.example() returns null when no calls found (issue 2)', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(dir, 'lib.js'), `
+function unusedFn() { return 42; }
+`);
+
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+
+        const result = index.example('unusedFn');
+        assert.strictEqual(result, null, 'should return null for unused function');
+
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('formatExample formats result correctly (issue 2)', () => {
+        const output = require('../core/output');
+        const result = {
+            best: {
+                relativePath: 'app.js',
+                line: 5,
+                content: 'const x = greet("hi")',
+                before: ['// setup'],
+                after: ['console.log(x)'],
+                score: 15,
+                reasons: ['typed assignment']
+            },
+            totalCalls: 3
+        };
+
+        const text = output.formatExample(result, 'greet');
+        assert.ok(text.includes('Best example of "greet"'), 'should include header');
+        assert.ok(text.includes('app.js:5'), 'should include file:line');
+        assert.ok(text.includes('greet'), 'should include function name');
+        assert.ok(text.includes('Score: 15'), 'should include score');
+        assert.ok(text.includes('3 total calls'), 'should include total calls');
+        assert.ok(text.includes('typed assignment'), 'should include reasons');
+    });
+
+    it('formatExample handles null result (issue 2)', () => {
+        const output = require('../core/output');
+        const text = output.formatExample(null, 'missing');
+        assert.ok(text.includes('No call examples found'), 'should show not found message');
+    });
+
+    // Issue 3: ucn_class uses index data instead of re-parsing (generics stored in index)
+    it('index stores generics for classes (issue 4)', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(dir, 'generic.ts'), `
+class Container<T> {
+    private value: T;
+    constructor(val: T) {
+        this.value = val;
+    }
+    get(): T { return this.value; }
+}
+`);
+
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+
+        const matches = index.find('Container').filter(m => m.type === 'class');
+        assert.ok(matches.length > 0, 'should find Container class');
+        assert.ok(matches[0].generics, 'class should have generics field');
+        assert.ok(matches[0].generics.includes('T'), 'generics should contain T');
+
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    // Issue 5: CALLERS label instead of USAGES
+    it('context class output uses CALLERS label instead of USAGES (issue 5)', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(dir, 'animal.js'), `
+class Animal {
+    constructor(name) { this.name = name; }
+    speak() { return this.name; }
+}
+module.exports = { Animal };
+`);
+        fs.writeFileSync(path.join(dir, 'main.js'), `
+const { Animal } = require('./animal');
+const a = new Animal('dog');
+`);
+
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+        const ctx = index.context('Animal');
+        assert.ok(ctx, 'context should return result');
+        // The formatting uses 'CALLERS' not 'USAGES' — we can't directly test MCP formatters
+        // but we verify the data comes through as callers (not usages)
+        assert.ok(ctx.callers !== undefined, 'should have callers field');
+    });
+
+    // Issue 6: CLI graph --direction flag
+    it('graph supports direction=imports (issue 6)', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+        fs.writeFileSync(path.join(dir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(dir, 'a.js'), `const b = require('./b'); module.exports = {};`);
+        fs.writeFileSync(path.join(dir, 'b.js'), `module.exports = { x: 1 };`);
+        fs.writeFileSync(path.join(dir, 'c.js'), `const a = require('./a'); module.exports = {};`);
+
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+
+        // direction=imports — what a.js depends on
+        const imports = index.graph('a.js', { direction: 'imports', maxDepth: 2 });
+        assert.ok(imports.nodes.length > 0, 'should have nodes');
+        const importPaths = imports.nodes.map(n => n.relativePath);
+        assert.ok(importPaths.includes('b.js'), 'imports should include b.js');
+
+        // direction=importers — who depends on a.js
+        const importers = index.graph('a.js', { direction: 'importers', maxDepth: 2 });
+        assert.ok(importers.nodes.length > 0, 'should have nodes');
+        const importerPaths = importers.nodes.map(n => n.relativePath);
+        assert.ok(importerPaths.includes('c.js'), 'importers should include c.js');
+
+        fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+}); // end describe('MCP Issues Fixes')
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

@@ -71,6 +71,8 @@ const flags = {
     all: args.includes('--all'),
     // Include method calls in caller/callee analysis
     includeMethods: args.includes('--include-methods'),
+    // Graph direction (imports/importers/both)
+    direction: args.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
     // Symlink handling (follow by default)
     followSymlinks: !args.includes('--no-follow-symlinks')
 };
@@ -89,7 +91,7 @@ const knownFlags = new Set([
     '--no-cache', '--clear-cache', '--include-tests',
     '--include-exported', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed',
     '--file', '--context', '--exclude', '--not', '--in',
-    '--depth', '--add-param', '--remove-param', '--rename-to',
+    '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks'
 ]);
 
@@ -533,7 +535,7 @@ function usagesInFile(code, lines, name, filePath, result) {
                 if (flags.json) {
                     console.log(output.formatUsagesJson(allUsages, name));
                 } else {
-                    printUsagesText(allUsages, name);
+                    console.log(output.formatUsages(allUsages, name));
                 }
                 return;
             }
@@ -558,7 +560,7 @@ function usagesInFile(code, lines, name, filePath, result) {
     if (flags.json) {
         console.log(output.formatUsagesJson(allUsages, name));
     } else {
-        printUsagesText(allUsages, name);
+        console.log(output.formatUsages(allUsages, name));
     }
 }
 
@@ -674,7 +676,10 @@ function runProjectCommand(rootDir, command, arg) {
     switch (command) {
         case 'toc': {
             const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel, all: flags.all });
-            printOutput(toc, output.formatTocJson, printProjectToc);
+            printOutput(toc, output.formatTocJson, r => output.formatToc(r, {
+                detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
+                uncertainHint: 'use --include-uncertain to include all'
+            }));
             break;
         }
 
@@ -705,7 +710,7 @@ function runProjectCommand(rootDir, command, arg) {
             });
             printOutput(usages,
                 r => output.formatUsagesJson(r, arg),
-                r => { printUsagesText(r, arg); }
+                r => output.formatUsages(r, arg)
             );
             break;
         }
@@ -715,7 +720,7 @@ function runProjectCommand(rootDir, command, arg) {
                 console.error('Usage: ucn . example <name>');
                 process.exit(1);
             }
-            printBestExample(index, arg);
+            console.log(output.formatExample(index.example(arg), arg));
             break;
 
         case 'context': {
@@ -729,10 +734,42 @@ function runProjectCommand(rootDir, command, arg) {
                 console.log(`Symbol "${arg}" not found.`);
                 break;
             }
-            printOutput(ctx,
-                output.formatContextJson,
-                r => { printContext(r, { expand: flags.expand, root: index.root }); }
-            );
+            if (flags.json) {
+                console.log(output.formatContextJson(ctx));
+            } else {
+                const { text, expandable } = output.formatContext(ctx, {
+                    methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
+                    expandHint: 'Use "ucn . expand <N>" to see code for item N',
+                    uncertainHint: 'use --include-uncertain to include all'
+                });
+                console.log(text);
+
+                // Inline expansion of callees when --expand flag is set
+                if (flags.expand && index.root && ctx.callees) {
+                    for (const c of ctx.callees) {
+                        if (c.relativePath && c.startLine) {
+                            try {
+                                const filePath = path.join(index.root, c.relativePath);
+                                const content = fs.readFileSync(filePath, 'utf-8');
+                                const codeLines = content.split('\n');
+                                const endLine = c.endLine || c.startLine + 5;
+                                const previewLines = Math.min(3, endLine - c.startLine + 1);
+                                for (let i = 0; i < previewLines && c.startLine - 1 + i < codeLines.length; i++) {
+                                    console.log(`      │ ${codeLines[c.startLine - 1 + i]}`);
+                                }
+                                if (endLine - c.startLine + 1 > 3) {
+                                    console.log(`      │ ... (${endLine - c.startLine - 2} more lines)`);
+                                }
+                            } catch (e) {
+                                // Skip on error
+                            }
+                        }
+                    }
+                }
+
+                // Save expandable items to cache for 'expand' command
+                saveExpandableItems(expandable, index.root);
+            }
             break;
         }
 
@@ -765,7 +802,9 @@ function runProjectCommand(rootDir, command, arg) {
                 includeUncertain: flags.includeUncertain
             });
             if (smart) {
-                printOutput(smart, output.formatSmartJson, printSmart);
+                printOutput(smart, output.formatSmartJson, r => output.formatSmart(r, {
+                    uncertainHint: 'use --include-uncertain to include all'
+                }));
             } else {
                 console.error(`Function "${arg}" not found`);
             }
@@ -903,19 +942,10 @@ function runProjectCommand(rootDir, command, arg) {
         case 'what-exports': {
             requireArg(arg, 'Usage: ucn . file-exports <file>');
             const fileExports = index.fileExports(arg);
-            if (fileExports.length === 0) {
-                console.log(`No exports found in ${arg}`);
-            } else {
-                printOutput(fileExports,
-                    r => JSON.stringify({ file: arg, exports: r }, null, 2),
-                    r => {
-                        console.log(`Exports from ${arg}:\n`);
-                        for (const exp of r) {
-                            console.log(`  ${output.lineRange(exp.startLine, exp.endLine)} ${exp.signature || exp.name}`);
-                        }
-                    }
-                );
-            }
+            printOutput(fileExports,
+                r => JSON.stringify({ file: arg, exports: r }, null, 2),
+                r => output.formatFileExports(r, arg)
+            );
             break;
         }
 
@@ -924,47 +954,28 @@ function runProjectCommand(rootDir, command, arg) {
                 includeExported: flags.includeExported,
                 includeTests: flags.includeTests
             });
-            if (deadcodeResults.length === 0) {
-                console.log('No dead code found');
-            } else {
-                printOutput(deadcodeResults,
-                    r => JSON.stringify({ deadcode: r }, null, 2),
-                    r => {
-                        console.log(`Dead code: ${r.length} unused symbol(s)\n`);
-                        let currentFile = null;
-                        for (const item of r) {
-                            if (item.file !== currentFile) {
-                                currentFile = item.file;
-                                console.log(`${item.file}`);
-                            }
-                            const exported = item.isExported ? ' [exported]' : '';
-                            console.log(`  ${output.lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}`);
-                        }
-                        if (!flags.includeExported) {
-                            console.log(`\nExported symbols excluded by default. Add --include-exported to include them.`);
-                        }
-                    }
-                );
-            }
+            printOutput(deadcodeResults,
+                r => JSON.stringify({ deadcode: r }, null, 2),
+                r => output.formatDeadcode(r, {
+                    exportedHint: !flags.includeExported ? 'Exported symbols excluded by default. Add --include-exported to include them.' : undefined
+                })
+            );
             break;
         }
 
         case 'graph': {
             requireArg(arg, 'Usage: ucn . graph <file>');
             const graphDepth = flags.depth ?? 2;  // Default to 2 for cleaner output
-            const graphResult = index.graph(arg, { direction: 'both', maxDepth: graphDepth });
-            if (graphResult.nodes.length === 0) {
-                console.log(`File not found: ${arg}`);
-            } else {
-                printOutput(graphResult,
-                    r => JSON.stringify({
-                        root: path.relative(index.root, r.root),
-                        nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
-                        edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
-                    }, null, 2),
-                    r => { printGraph(r, index.root, graphDepth, flags.all || flags.depth !== undefined); }
-                );
-            }
+            const graphDirection = flags.direction || 'both';
+            const graphResult = index.graph(arg, { direction: graphDirection, maxDepth: graphDepth });
+            printOutput(graphResult,
+                r => JSON.stringify({
+                    root: path.relative(index.root, r.root),
+                    nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
+                    edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
+                }, null, 2),
+                r => output.formatGraph(r, { showAll: flags.all || flags.depth !== undefined, maxDepth: graphDepth, file: arg })
+            );
             break;
         }
 
@@ -973,7 +984,7 @@ function runProjectCommand(rootDir, command, arg) {
             const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive });
             printOutput(searchResults,
                 r => output.formatSearchJson(r, arg),
-                r => { printSearchResults(r, arg); }
+                r => output.formatSearch(r, arg)
             );
             break;
         }
@@ -995,7 +1006,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'stats': {
             const stats = index.getStats();
-            printOutput(stats, output.formatStatsJson, printStats);
+            printOutput(stats, output.formatStatsJson, output.formatStats);
             break;
         }
 
@@ -1025,10 +1036,7 @@ function extractFunctionFromProject(index, name) {
             if (flags.json) {
                 console.log(output.formatFunctionJson(m, fnCode));
             } else {
-                console.log(`${m.relativePath}:${m.startLine}`);
-                console.log(`${output.lineRange(m.startLine, m.endLine)} ${output.formatFunctionSignature(m)}`);
-                console.log('─'.repeat(60));
-                console.log(fnCode);
+                console.log(output.formatFn(m, fnCode));
             }
         }
         return;
@@ -1052,10 +1060,7 @@ function extractFunctionFromProject(index, name) {
     if (flags.json) {
         console.log(output.formatFunctionJson(match, fnCode));
     } else {
-        console.log(`${match.relativePath}:${match.startLine}`);
-        console.log(`${output.lineRange(match.startLine, match.endLine)} ${output.formatFunctionSignature(match)}`);
-        console.log('─'.repeat(60));
-        console.log(fnCode);
+        console.log(output.formatFn(match, fnCode));
     }
 }
 
@@ -1070,22 +1075,17 @@ function extractClassFromProject(index, name) {
     }
 
     if (matches.length > 1 && !flags.file && flags.all) {
-        // Show all definitions
+        // Show all definitions using index data (no re-parsing)
         for (let i = 0; i < matches.length; i++) {
             const m = matches[i];
             const code = fs.readFileSync(m.file, 'utf-8');
-            const language = detectLanguage(m.file);
-            const { cls, code: clsCode } = extractClass(code, language, m.name);
-            if (cls) {
-                if (i > 0) console.log('');
-                if (flags.json) {
-                    console.log(JSON.stringify({ ...cls, code: clsCode }, null, 2));
-                } else {
-                    console.log(`${m.relativePath}:${cls.startLine}`);
-                    console.log(`${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-                    console.log('─'.repeat(60));
-                    console.log(clsCode);
-                }
+            const codeLines = code.split('\n');
+            const clsCode = codeLines.slice(m.startLine - 1, m.endLine).join('\n');
+            if (i > 0) console.log('');
+            if (flags.json) {
+                console.log(JSON.stringify({ ...m, code: clsCode }, null, 2));
+            } else {
+                console.log(output.formatClass(m, clsCode));
             }
         }
         return;
@@ -1101,79 +1101,18 @@ function extractClassFromProject(index, name) {
         match = matches[0];
     }
 
+    // Use index data directly instead of re-parsing the file
     const code = fs.readFileSync(match.file, 'utf-8');
-    const language = detectLanguage(match.file);
-    const { cls, code: clsCode } = extractClass(code, language, match.name);
+    const codeLines = code.split('\n');
+    const clsCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
 
-    if (cls) {
-        if (flags.json) {
-            console.log(JSON.stringify({ ...cls, code: clsCode }, null, 2));
-        } else {
-            console.log(`${match.relativePath}:${cls.startLine}`);
-            console.log(`${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-            console.log('─'.repeat(60));
-            console.log(clsCode);
-        }
+    if (flags.json) {
+        console.log(JSON.stringify({ ...match, code: clsCode }, null, 2));
+    } else {
+        console.log(output.formatClass(match, clsCode));
     }
 }
 
-function printProjectToc(toc) {
-    const t = toc.totals;
-    console.log(`PROJECT: ${t.files} files, ${t.lines} lines`);
-    console.log(`  ${t.functions} functions, ${t.classes} classes, ${t.state} state objects`);
-
-    // Show meta warnings only when there's something noteworthy
-    const meta = toc.meta || {};
-    const warnings = [];
-    if (meta.dynamicImports) warnings.push(`${meta.dynamicImports} dynamic import(s)`);
-    if (meta.uncertain) warnings.push(`${meta.uncertain} uncertain reference(s)`);
-    if (warnings.length) {
-        const hint = meta.uncertain ? ' — use --include-uncertain to include all' : '';
-        console.log(`  Note: ${warnings.join(', ')}${hint}`);
-    }
-
-    // Hints
-    if (toc.summary) {
-        if (toc.summary.topFunctionFiles?.length) {
-            const hint = toc.summary.topFunctionFiles.map(f => `${f.file} (${f.functions})`).join(', ');
-            console.log(`  Most functions: ${hint}`);
-        }
-        if (toc.summary.topLineFiles?.length) {
-            const hint = toc.summary.topLineFiles.map(f => `${f.file} (${f.lines})`).join(', ');
-            console.log(`  Largest files: ${hint}`);
-        }
-        if (toc.summary.entryFiles?.length) {
-            console.log(`  Entry points: ${toc.summary.entryFiles.join(', ')}`);
-        }
-    }
-
-    console.log('═'.repeat(60));
-    const hasDetail = toc.files.some(f => f.symbols);
-    for (const file of toc.files) {
-        const parts = [`${file.lines} lines`];
-        if (file.functions) parts.push(`${file.functions} fn`);
-        if (file.classes) parts.push(`${file.classes} cls`);
-        if (file.state) parts.push(`${file.state} state`);
-
-        if (hasDetail) {
-            console.log(`\n${file.file} (${parts.join(', ')})`);
-            if (file.symbols) {
-                for (const fn of file.symbols.functions) {
-                    console.log(`  ${output.lineRange(fn.startLine, fn.endLine)} ${output.formatFunctionSignature(fn)}`);
-                }
-                for (const cls of file.symbols.classes) {
-                    console.log(`  ${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-                }
-            }
-        } else {
-            console.log(`  ${file.file} — ${parts.join(', ')}`);
-        }
-    }
-
-    if (!hasDetail) {
-        console.log(`\nAdd --detailed to list all functions, or "ucn . about <name>" for full details on a symbol`);
-    }
-}
 
 function printSymbols(symbols, query, options = {}) {
     const { depth, top, all } = options;
@@ -1330,459 +1269,6 @@ function countNestedGenerics(str) {
     return maxDepth;
 }
 
-function printUsagesText(usages, name) {
-    const defs = usages.filter(u => u.isDefinition);
-    const calls = usages.filter(u => u.usageType === 'call');
-    const imports = usages.filter(u => u.usageType === 'import');
-    const refs = usages.filter(u => !u.isDefinition && u.usageType === 'reference');
-
-    console.log(`Usages of "${name}": ${defs.length} definitions, ${calls.length} calls, ${imports.length} imports, ${refs.length} references`);
-    console.log('═'.repeat(60));
-
-    if (defs.length > 0) {
-        console.log('\nDEFINITIONS:');
-        for (const d of defs) {
-            console.log(`  ${d.relativePath}:${d.line || d.startLine}`);
-            if (d.signature) console.log(`    ${d.signature}`);
-        }
-    }
-
-    if (calls.length > 0) {
-        console.log('\nCALLS:');
-        for (const c of calls) {
-            console.log(`  ${c.relativePath}:${c.line}`);
-            printBeforeLines(c);
-            console.log(`    ${c.content.trim()}`);
-            printAfterLines(c);
-        }
-    }
-
-    if (imports.length > 0) {
-        console.log('\nIMPORTS:');
-        for (const i of imports) {
-            console.log(`  ${i.relativePath}:${i.line}`);
-            console.log(`    ${i.content.trim()}`);
-        }
-    }
-
-    if (refs.length > 0) {
-        console.log('\nREFERENCES:');
-        for (const r of refs) {
-            console.log(`  ${r.relativePath}:${r.line}`);
-            printBeforeLines(r);
-            console.log(`    ${r.content.trim()}`);
-            printAfterLines(r);
-        }
-    }
-}
-
-function printBeforeLines(usage) {
-    if (usage.before && usage.before.length > 0) {
-        for (const line of usage.before) {
-            console.log(`      ${line}`);
-        }
-    }
-}
-
-function printAfterLines(usage) {
-    if (usage.after && usage.after.length > 0) {
-        for (const line of usage.after) {
-            console.log(`      ${line}`);
-        }
-    }
-}
-
-/**
- * Analyze call site context using AST for better example scoring
- * @param {string} filePath - Path to the file
- * @param {number} lineNum - Line number of the call
- * @param {string} funcName - Function being called
- * @returns {object} AST-based scoring info
- */
-function analyzeCallSiteAST(filePath, lineNum, funcName) {
-    const result = {
-        isAwait: false,
-        isDestructured: false,
-        isTypedAssignment: false,
-        isInReturn: false,
-        isInCatch: false,
-        isInConditional: false,
-        hasComment: false,
-        isStandalone: false
-    };
-
-    try {
-        const language = detectLanguage(filePath);
-        if (!language) return result;
-
-        const parser = getParser(language);
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const { PARSE_OPTIONS } = require('../languages');
-        const tree = parser.parse(content, undefined, PARSE_OPTIONS);
-
-        // Find the node at the call site
-        const row = lineNum - 1; // 0-indexed
-        const node = tree.rootNode.descendantForPosition({ row, column: 0 });
-        if (!node) return result;
-
-        // Walk up to find the call expression and its context
-        let current = node;
-        let foundCall = false;
-
-        while (current) {
-            const type = current.type;
-
-            // Check if this is our target call
-            if (!foundCall && (type === 'call_expression' || type === 'call')) {
-                const calleeNode = current.childForFieldName('function') || current.namedChild(0);
-                if (calleeNode && calleeNode.text === funcName) {
-                    foundCall = true;
-                }
-            }
-
-            if (foundCall) {
-                // Check context of the call
-                if (type === 'await_expression') {
-                    result.isAwait = true;
-                }
-                if (type === 'variable_declarator' || type === 'assignment_expression') {
-                    const parent = current.parent;
-                    if (parent && (parent.type === 'lexical_declaration' || parent.type === 'variable_declaration')) {
-                        result.isTypedAssignment = true;
-                    }
-                }
-                if (type === 'array_pattern' || type === 'object_pattern') {
-                    result.isDestructured = true;
-                }
-                if (type === 'return_statement') {
-                    result.isInReturn = true;
-                }
-                if (type === 'catch_clause' || type === 'except_clause') {
-                    result.isInCatch = true;
-                }
-                if (type === 'if_statement' || type === 'conditional_expression' || type === 'ternary_expression') {
-                    result.isInConditional = true;
-                }
-                if (type === 'expression_statement') {
-                    // Standalone statement - good example
-                    result.isStandalone = true;
-                }
-            }
-
-            current = current.parent;
-        }
-
-        // Check for preceding comment
-        const lines = content.split('\n');
-        if (lineNum > 1) {
-            const prevLine = lines[lineNum - 2].trim();
-            if (prevLine.startsWith('//') || prevLine.startsWith('#') || prevLine.endsWith('*/')) {
-                result.hasComment = true;
-            }
-        }
-    } catch (e) {
-        // Return default result on error
-    }
-
-    return result;
-}
-
-/**
- * Print the best example usage of a function
- * Selects based on AST analysis: await, destructuring, typed assignment, context
- */
-function printBestExample(index, name) {
-    // Get usages excluding test files
-    const usages = index.usages(name, {
-        codeOnly: true,
-        exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
-        context: 5  // Get 5 lines before/after
-    });
-
-    // Filter to only calls (not definitions, imports, or references)
-    const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
-
-    if (calls.length === 0) {
-        console.log(`No call examples found for "${name}"`);
-        return;
-    }
-
-    // Score each call using both regex and AST analysis
-    const scored = calls.map(call => {
-        let score = 0;
-        const reasons = [];
-        const line = call.content.trim();
-
-        // Get AST-based analysis
-        const astInfo = analyzeCallSiteAST(call.file, call.line, name);
-
-        // AST-based scoring (more accurate)
-        if (astInfo.isTypedAssignment) {
-            score += 15;
-            reasons.push('typed assignment');
-        }
-        if (astInfo.isInReturn) {
-            score += 10;
-            reasons.push('in return');
-        }
-        if (astInfo.isAwait) {
-            score += 10;
-            reasons.push('async usage');
-        }
-        if (astInfo.isDestructured) {
-            score += 8;
-            reasons.push('destructured');
-        }
-        if (astInfo.isStandalone) {
-            score += 5;
-            reasons.push('standalone');
-        }
-        if (astInfo.hasComment) {
-            score += 3;
-            reasons.push('documented');
-        }
-
-        // Penalties
-        if (astInfo.isInCatch) {
-            score -= 5;
-            reasons.push('in catch block');
-        }
-        if (astInfo.isInConditional) {
-            score -= 3;
-            reasons.push('in conditional');
-        }
-
-        // Fallback regex-based scoring (for when AST doesn't find much)
-        if (score === 0) {
-            // Return value is used (assigned to variable): +10
-            if (/^(const|let|var|return)\s/.test(line) || /^\w+\s*=/.test(line)) {
-                score += 10;
-                reasons.push('return value used');
-            }
-
-            // Standalone statement: +5
-            if (line.startsWith(name + '(') || /^(const|let|var)\s+\w+\s*=\s*\w*$/.test(line.split(name)[0])) {
-                score += 5;
-                reasons.push('clear usage');
-            }
-        }
-
-        // Context bonus
-        if (call.before && call.before.length > 0) score += 3;
-        if (call.after && call.after.length > 0) score += 3;
-        if (call.before?.length > 0 && call.after?.length > 0) {
-            reasons.push('has context');
-        }
-
-        // Not inside another function call: +2
-        const beforeCall = line.split(name + '(')[0];
-        if (!beforeCall.includes('(') || /^\s*(const|let|var|return)?\s*\w+\s*=\s*$/.test(beforeCall)) {
-            score += 2;
-        }
-
-        // Shorter files are often better examples: +1
-        if (call.line < 100) score += 1;
-
-        return { ...call, score, reasons };
-    });
-
-    // Sort by score descending
-    scored.sort((a, b) => b.score - a.score);
-
-    const best = scored[0];
-
-    console.log(`Best example of "${name}":`);
-    console.log('═'.repeat(60));
-    console.log(`${best.relativePath}:${best.line}`);
-    console.log('');
-
-    // Print context before
-    if (best.before) {
-        for (let i = 0; i < best.before.length; i++) {
-            const lineNum = best.line - best.before.length + i;
-            console.log(`${lineNum.toString().padStart(4)}│ ${best.before[i]}`);
-        }
-    }
-
-    // Print the call line (highlighted)
-    console.log(`${best.line.toString().padStart(4)}│ ${best.content}  ◀──`);
-
-    // Print context after
-    if (best.after) {
-        for (let i = 0; i < best.after.length; i++) {
-            const lineNum = best.line + i + 1;
-            console.log(`${lineNum.toString().padStart(4)}│ ${best.after[i]}`);
-        }
-    }
-
-    console.log('');
-    console.log(`Score: ${best.score} (${calls.length} total calls)`);
-    console.log(`Why: ${best.reasons.length > 0 ? best.reasons.join(', ') : 'first available call'}`);
-}
-
-function printContext(ctx, options = {}) {
-    // Handle struct/interface types differently
-    if (ctx.type && ['class', 'struct', 'interface', 'type'].includes(ctx.type)) {
-        console.log(`Context for ${ctx.type} ${ctx.name}:`);
-        console.log('═'.repeat(60));
-
-        // Display warnings if any
-        if (ctx.warnings && ctx.warnings.length > 0) {
-            console.log('\n⚠️  WARNINGS:');
-            for (const w of ctx.warnings) {
-                console.log(`  ${w.message}`);
-            }
-        }
-
-        const expandable = [];
-        let itemNum = 1;
-
-        // Show methods for structs/interfaces
-        const methods = ctx.methods || [];
-        console.log(`\nMETHODS (${methods.length}):`);
-        for (const m of methods) {
-            const receiver = m.receiver ? `(${m.receiver}) ` : '';
-            const params = m.params || '...';
-            const returnType = m.returnType ? `: ${m.returnType}` : '';
-            console.log(`  [${itemNum}] ${receiver}${m.name}(${params})${returnType}`);
-            console.log(`    ${m.file}:${m.line}`);
-            expandable.push({
-                num: itemNum++,
-                type: 'method',
-                name: m.name,
-                relativePath: m.file,
-                startLine: m.line
-            });
-        }
-
-        // Show callers (type references/usages)
-        const callers = ctx.callers || [];
-        console.log(`\nUSAGES (${callers.length}):`);
-        for (const c of callers) {
-            const callerName = c.callerName || '(module level)';
-            const displayName = c.callerName ? ` [${callerName}]` : '';
-            console.log(`  [${itemNum}] ${c.relativePath}:${c.line}${displayName}`);
-            expandable.push({
-                num: itemNum++,
-                type: 'usage',
-                name: callerName,
-                file: c.callerFile || c.file,
-                relativePath: c.relativePath,
-                line: c.line,
-                startLine: c.callerStartLine || c.line,
-                endLine: c.callerEndLine || c.line
-            });
-            console.log(`    ${c.content.trim()}`);
-        }
-
-        console.log(`\nUse "ucn . expand <N>" to see code for item N`);
-        lastContextExpandable = expandable;
-        return;
-    }
-
-    // Standard function/method context
-    console.log(`Context for ${ctx.function}:`);
-    console.log('═'.repeat(60));
-
-    // Show meta note when results may be incomplete
-    if (ctx.meta) {
-        const notes = [];
-        if (ctx.meta.dynamicImports) notes.push(`${ctx.meta.dynamicImports} dynamic import(s)`);
-        if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
-        if (notes.length) {
-            const hint = ctx.meta.uncertain ? ' — use --include-uncertain to include all' : '';
-            console.log(`  Note: ${notes.join(', ')}${hint}`);
-        }
-    }
-
-    if (ctx.meta && !ctx.meta.includeMethods) {
-        console.log('  Note: obj.method() calls excluded — use --include-methods to include them');
-    }
-
-    // Display warnings if any
-    if (ctx.warnings && ctx.warnings.length > 0) {
-        console.log('\n⚠️  WARNINGS:');
-        for (const w of ctx.warnings) {
-            console.log(`  ${w.message}`);
-        }
-    }
-
-    // Track expandable items for later use with 'expand' command
-    const expandable = [];
-    let itemNum = 1;
-
-    const callers = ctx.callers || [];
-    console.log(`\nCALLERS (${callers.length}):`);
-    for (const c of callers) {
-        // All callers are numbered for expand command
-        const callerName = c.callerName || '(module level)';
-        const displayName = c.callerName ? ` [${callerName}]` : '';
-        console.log(`  [${itemNum}] ${c.relativePath}:${c.line}${displayName}`);
-        expandable.push({
-            num: itemNum++,
-            type: 'caller',
-            name: callerName,
-            file: c.callerFile || c.file,
-            relativePath: c.relativePath,
-            line: c.line,
-            startLine: c.callerStartLine || c.line,
-            endLine: c.callerEndLine || c.line
-        });
-        console.log(`    ${c.content.trim()}`);
-    }
-
-    const callees = ctx.callees || [];
-    console.log(`\nCALLEES (${callees.length}):`);
-    for (const c of callees) {
-        const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
-        console.log(`  [${itemNum}] ${c.name}${weight} - ${c.relativePath}:${c.startLine}`);
-        expandable.push({
-            num: itemNum++,
-            type: 'callee',
-            name: c.name,
-            file: c.file,
-            relativePath: c.relativePath,
-            startLine: c.startLine,
-            endLine: c.endLine
-        });
-
-        // Inline expansion
-        if (options.expand && options.root && c.relativePath && c.startLine) {
-            try {
-                const filePath = path.join(options.root, c.relativePath);
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const lines = content.split('\n');
-                const endLine = c.endLine || c.startLine + 5;
-                const previewLines = Math.min(3, endLine - c.startLine + 1);
-                for (let i = 0; i < previewLines && c.startLine - 1 + i < lines.length; i++) {
-                    console.log(`      │ ${lines[c.startLine - 1 + i]}`);
-                }
-                if (endLine - c.startLine + 1 > 3) {
-                    console.log(`      │ ... (${endLine - c.startLine - 2} more lines)`);
-                }
-            } catch (e) {
-                // Skip on error
-            }
-        }
-    }
-
-    // Save expandable items to cache for 'expand' command
-    saveExpandableItems(expandable, options.root);
-
-    if (expandable.length > 0) {
-        console.log(`\nUse "ucn . expand <N>" to see code for item N`);
-    }
-}
-
-/**
- * Extract function name from a call expression
- */
-function extractFunctionNameFromContent(content) {
-    if (!content) return null;
-    // Look for common patterns: funcName(, obj.method(, etc.
-    const match = content.match(/(\w+)\s*\(/);
-    return match ? match[1] : null;
-}
 
 /**
  * Save expandable items to cache file
@@ -1845,173 +1331,8 @@ function printExpandedItem(item, root) {
     }
 }
 
-function printSmart(smart) {
-    console.log(`${smart.target.name} (${smart.target.file}:${smart.target.startLine})`);
-    console.log('═'.repeat(60));
 
-    // Show meta note when results may be incomplete
-    if (smart.meta) {
-        const notes = [];
-        if (smart.meta.dynamicImports) notes.push(`${smart.meta.dynamicImports} dynamic import(s)`);
-        if (smart.meta.uncertain) notes.push(`${smart.meta.uncertain} uncertain call(s) skipped`);
-        if (notes.length) {
-            const hint = smart.meta.uncertain ? ' — use --include-uncertain to include all' : '';
-            console.log(`  Note: ${notes.join(', ')}${hint}`);
-        }
-    }
 
-    console.log(smart.target.code);
-
-    if (smart.dependencies.length > 0) {
-        console.log('\n─── DEPENDENCIES ───');
-        for (const dep of smart.dependencies) {
-            const weight = dep.weight && dep.weight !== 'normal' ? ` [${dep.weight}]` : '';
-            console.log(`\n// ${dep.name}${weight} (${dep.relativePath}:${dep.startLine})`);
-            console.log(dep.code);
-        }
-    }
-
-    if (smart.types && smart.types.length > 0) {
-        console.log('\n─── TYPES ───');
-        for (const t of smart.types) {
-            console.log(`\n// ${t.name} (${t.relativePath}:${t.startLine})`);
-            console.log(t.code);
-        }
-    }
-}
-
-function printStats(stats) {
-    console.log('PROJECT STATISTICS');
-    console.log('═'.repeat(60));
-    console.log(`Root: ${stats.root}`);
-    console.log(`Files: ${stats.files}`);
-    console.log(`Symbols: ${stats.symbols}`);
-    console.log(`Build time: ${stats.buildTime}ms`);
-
-    console.log('\nBy Language:');
-    for (const [lang, info] of Object.entries(stats.byLanguage)) {
-        console.log(`  ${lang}: ${info.files} files, ${info.lines} lines, ${info.symbols} symbols`);
-    }
-
-    console.log('\nBy Type:');
-    for (const [type, count] of Object.entries(stats.byType)) {
-        console.log(`  ${type}: ${count}`);
-    }
-}
-
-function printGraph(graph, root, maxDepth = 2, showAll = false) {
-    const rootRelPath = path.relative(root, graph.root);
-    const maxChildren = showAll ? Infinity : 8;
-
-    function printTree(nodes, edges, rootFile) {
-        const visited = new Set();     // all nodes ever printed (for diamond dep detection)
-        const ancestors = new Set();   // current path from root (for true circular detection)
-        let truncatedNodes = 0;
-        let depthLimited = false;
-
-        function printNode(file, indent = 0) {
-            const fileEntry = nodes.find(n => n.file === file);
-            const relPath = fileEntry ? fileEntry.relativePath : path.relative(root, file);
-            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
-
-            if (ancestors.has(file)) {
-                console.log(`${prefix}${relPath} (circular)`);
-                return;
-            }
-            if (visited.has(file)) {
-                console.log(`${prefix}${relPath} (already shown)`);
-                return;
-            }
-            visited.add(file);
-
-            if (indent > maxDepth) {
-                depthLimited = true;
-                console.log(`${prefix}${relPath} ...`);
-                return;
-            }
-
-            console.log(`${prefix}${relPath}`);
-
-            ancestors.add(file);
-            const fileEdges = edges.filter(e => e.from === file);
-            const displayEdges = fileEdges.slice(0, maxChildren);
-            const hiddenCount = fileEdges.length - displayEdges.length;
-
-            for (const edge of displayEdges) {
-                printNode(edge.to, indent + 1);
-            }
-            ancestors.delete(file);
-
-            if (hiddenCount > 0) {
-                truncatedNodes += hiddenCount;
-                console.log(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
-            }
-        }
-
-        printNode(rootFile);
-        return { truncatedNodes, depthLimited };
-    }
-
-    if (graph.direction === 'both' && graph.imports && graph.importers) {
-        const importCount = graph.imports.edges.filter(e => e.from === graph.root).length;
-        const importerCount = graph.importers.edges.filter(e => e.from === graph.root).length;
-
-        console.log(`Dependency graph for ${rootRelPath}`);
-        console.log('═'.repeat(60));
-
-        console.log(`\nIMPORTS (what this file depends on): ${importCount} files`);
-        if (importCount > 0) {
-            printTree(graph.imports.nodes, graph.imports.edges, graph.root);
-        } else {
-            console.log('  (none)');
-        }
-
-        console.log(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
-        if (importerCount > 0) {
-            printTree(graph.importers.nodes, graph.importers.edges, graph.root);
-        } else {
-            console.log('  (none)');
-        }
-    } else {
-        console.log(`Dependency graph for ${rootRelPath}`);
-        console.log('═'.repeat(60));
-
-        const { truncatedNodes, depthLimited } = printTree(graph.nodes, graph.edges, graph.root);
-
-        if (depthLimited || truncatedNodes > 0) {
-            console.log('\n' + '─'.repeat(60));
-            if (depthLimited) {
-                console.log(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
-            }
-            if (truncatedNodes > 0) {
-                console.log(`${truncatedNodes} nodes hidden. Use --all to show all children. Graph has ${graph.nodes.length} total files.`);
-            }
-        }
-    }
-}
-
-function printSearchResults(results, term) {
-    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
-    console.log(`Found ${totalMatches} matches for "${term}" in ${results.length} files:`);
-    console.log('═'.repeat(60));
-
-    for (const result of results) {
-        console.log(`\n${result.file}`);
-        for (const m of result.matches) {
-            console.log(`  ${m.line}: ${m.content.trim()}`);
-            if (m.before && m.before.length > 0) {
-                for (const line of m.before) {
-                    console.log(`      ... ${line.trim()}`);
-                }
-            }
-            if (m.after && m.after.length > 0) {
-                for (const line of m.after) {
-                    console.log(`      ... ${line.trim()}`);
-                }
-            }
-        }
-    }
-}
 
 // ============================================================================
 // GLOB MODE
@@ -2057,11 +1378,25 @@ function runGlobCommand(pattern, command, arg) {
                 }
             }
 
-            const toc = { totalFiles: files.length, totalLines, totalFunctions, totalClasses, totalState, byFile };
+            const tocRaw = { totalFiles: files.length, totalLines, totalFunctions, totalClasses, totalState, byFile };
             if (flags.json) {
-                console.log(output.formatTocJson(toc));
+                console.log(output.formatTocJson(tocRaw));
             } else {
-                printProjectToc(toc);
+                // Convert glob toc to shared formatter format
+                const toc = {
+                    totals: { files: files.length, lines: totalLines, functions: totalFunctions, classes: totalClasses, state: totalState },
+                    files: byFile.map(f => ({
+                        file: f.file,
+                        lines: f.lines,
+                        functions: f.functions.length,
+                        classes: f.classes.length,
+                        state: f.stateObjects ? f.stateObjects.length : (f.state ? f.state.length : 0)
+                    })),
+                    meta: {}
+                };
+                console.log(output.formatToc(toc, {
+                    detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol'
+                }));
             }
             break;
 
@@ -2114,7 +1449,7 @@ function findInGlobFiles(files, name) {
     if (flags.json) {
         console.log(output.formatSymbolJson(allMatches, name));
     } else {
-        printSymbols(allMatches, name, { top: flags.top, all: flags.all });
+        printSymbols(allMatches, name, { depth: flags.depth, top: flags.top, all: flags.all });
     }
 }
 
@@ -2162,7 +1497,7 @@ function searchGlobFiles(files, term) {
     if (flags.json) {
         console.log(output.formatSearchJson(results, term));
     } else {
-        printSearchResults(results, term);
+        console.log(output.formatSearch(results, term));
     }
 }
 
@@ -2341,7 +1676,7 @@ FILE DEPENDENCIES
   imports <file>      What does file import
   exporters <file>    Who imports this file
   file-exports <file> What does file export
-  graph <file>        Full dependency tree (--depth=N expands all children)
+  graph <file>        Full dependency tree (--depth=N, --direction=imports|importers|both)
 
 ═══════════════════════════════════════════════════════════════════════════════
 REFACTORING HELPERS
@@ -2365,6 +1700,7 @@ Common Flags:
   --exclude=a,b       Exclude patterns (e.g., --exclude=test,mock)
   --in=<path>         Only in path (e.g., --in=src/core)
   --depth=N           Trace/graph depth (default: 3, also expands all children)
+  --direction=X       Graph direction: imports, importers, or both (default: both)
   --all               Expand truncated sections (about, trace, graph, related)
   --top=N             Limit results (find)
   --context=N         Lines of context around matches
@@ -2481,7 +1817,9 @@ function executeInteractiveCommand(index, command, arg) {
     switch (command) {
         case 'toc': {
             const toc = index.getToc();
-            printProjectToc(toc);
+            console.log(output.formatToc(toc, {
+                detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol'
+            }));
             break;
         }
 
@@ -2515,7 +1853,7 @@ function executeInteractiveCommand(index, command, arg) {
                 return;
             }
             const usages = index.usages(arg, {});
-            printUsagesText(usages, arg);
+            console.log(output.formatUsages(usages, arg));
             break;
         }
 
@@ -2525,7 +1863,17 @@ function executeInteractiveCommand(index, command, arg) {
                 return;
             }
             const ctx = index.context(arg, { includeUncertain: flags.includeUncertain });
-            printContext(ctx, { expand: flags.expand, root: index.root });
+            if (!ctx) {
+                console.log(`Symbol "${arg}" not found.`);
+            } else {
+                const { text, expandable } = output.formatContext(ctx, {
+                    methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
+                    expandHint: 'Use "ucn . expand <N>" to see code for item N',
+                    uncertainHint: 'use --include-uncertain to include all'
+                });
+                console.log(text);
+                saveExpandableItems(expandable, index.root);
+            }
             break;
         }
 
@@ -2536,7 +1884,9 @@ function executeInteractiveCommand(index, command, arg) {
             }
             const smart = index.smart(arg, { includeUncertain: flags.includeUncertain });
             if (smart) {
-                printSmart(smart);
+                console.log(output.formatSmart(smart, {
+                    uncertainHint: 'use --include-uncertain to include all'
+                }));
             } else {
                 console.log(`Function "${arg}" not found`);
             }
@@ -2599,7 +1949,7 @@ function executeInteractiveCommand(index, command, arg) {
                 return;
             }
             const results = index.search(arg, {});
-            printSearchResults(results, arg);
+            console.log(output.formatSearch(results, arg));
             break;
         }
 
@@ -2621,7 +1971,7 @@ function executeInteractiveCommand(index, command, arg) {
 
         case 'stats': {
             const stats = index.getStats();
-            printStats(stats);
+            console.log(output.formatStats(stats));
             break;
         }
 

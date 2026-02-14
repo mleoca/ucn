@@ -174,6 +174,7 @@ class ProjectIndex {
                 modifiers: item.modifiers,
                 docstring: item.docstring,
                 bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,
+                ...(item.generics && { generics: item.generics }),
                 ...(item.extends && { extends: item.extends }),
                 ...(item.implements && { implements: item.implements }),
                 ...(item.indent !== undefined && { indent: item.indent }),
@@ -4237,6 +4238,132 @@ class ProjectIndex {
         }
 
         return false;
+    }
+
+    /**
+     * Find the best usage example of a function.
+     * Scores call sites using AST analysis (await, destructuring, typed assignment, etc.)
+     * @param {string} name - Symbol name
+     * @returns {{ best: object, totalCalls: number } | null}
+     */
+    example(name) {
+        const usages = this.usages(name, {
+            codeOnly: true,
+            exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
+            context: 5
+        });
+
+        const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+        if (calls.length === 0) return null;
+
+        const scored = calls.map(call => {
+            let score = 0;
+            const reasons = [];
+            const line = call.content.trim();
+
+            const astInfo = this._analyzeCallSiteAST(call.file, call.line, name);
+
+            if (astInfo.isTypedAssignment) { score += 15; reasons.push('typed assignment'); }
+            if (astInfo.isInReturn) { score += 10; reasons.push('in return'); }
+            if (astInfo.isAwait) { score += 10; reasons.push('async usage'); }
+            if (astInfo.isDestructured) { score += 8; reasons.push('destructured'); }
+            if (astInfo.isStandalone) { score += 5; reasons.push('standalone'); }
+            if (astInfo.hasComment) { score += 3; reasons.push('documented'); }
+            if (astInfo.isInCatch) { score -= 5; reasons.push('in catch block'); }
+            if (astInfo.isInConditional) { score -= 3; reasons.push('in conditional'); }
+
+            if (score === 0) {
+                if (/^(const|let|var|return)\s/.test(line) || /^\w+\s*=/.test(line)) {
+                    score += 10; reasons.push('return value used');
+                }
+                if (line.startsWith(name + '(') || /^(const|let|var)\s+\w+\s*=\s*\w*$/.test(line.split(name)[0])) {
+                    score += 5; reasons.push('clear usage');
+                }
+            }
+
+            if (call.before && call.before.length > 0) score += 3;
+            if (call.after && call.after.length > 0) score += 3;
+            if (call.before?.length > 0 && call.after?.length > 0) reasons.push('has context');
+
+            const beforeCall = line.split(name + '(')[0];
+            if (!beforeCall.includes('(') || /^\s*(const|let|var|return)?\s*\w+\s*=\s*$/.test(beforeCall)) {
+                score += 2;
+            }
+            if (call.line < 100) score += 1;
+
+            return { ...call, score, reasons };
+        });
+
+        scored.sort((a, b) => b.score - a.score);
+        return { best: scored[0], totalCalls: calls.length };
+    }
+
+    /**
+     * Analyze a call site using AST for example scoring.
+     * @private
+     */
+    _analyzeCallSiteAST(filePath, lineNum, funcName) {
+        const result = {
+            isAwait: false, isDestructured: false, isTypedAssignment: false,
+            isInReturn: false, isInCatch: false, isInConditional: false,
+            hasComment: false, isStandalone: false
+        };
+
+        try {
+            const language = detectLanguage(filePath);
+            if (!language) return result;
+
+            const parser = getParser(language);
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const tree = parser.parse(content, undefined, PARSE_OPTIONS);
+
+            const row = lineNum - 1;
+            const node = tree.rootNode.descendantForPosition({ row, column: 0 });
+            if (!node) return result;
+
+            let current = node;
+            let foundCall = false;
+
+            while (current) {
+                const type = current.type;
+
+                if (!foundCall && (type === 'call_expression' || type === 'call')) {
+                    const calleeNode = current.childForFieldName('function') || current.namedChild(0);
+                    if (calleeNode && calleeNode.text === funcName) {
+                        foundCall = true;
+                    }
+                }
+
+                if (foundCall) {
+                    if (type === 'await_expression') result.isAwait = true;
+                    if (type === 'variable_declarator' || type === 'assignment_expression') {
+                        const parent = current.parent;
+                        if (parent && (parent.type === 'lexical_declaration' || parent.type === 'variable_declaration')) {
+                            result.isTypedAssignment = true;
+                        }
+                    }
+                    if (type === 'array_pattern' || type === 'object_pattern') result.isDestructured = true;
+                    if (type === 'return_statement') result.isInReturn = true;
+                    if (type === 'catch_clause' || type === 'except_clause') result.isInCatch = true;
+                    if (type === 'if_statement' || type === 'conditional_expression' || type === 'ternary_expression') result.isInConditional = true;
+                    if (type === 'expression_statement') result.isStandalone = true;
+                }
+
+                current = current.parent;
+            }
+
+            const contentLines = content.split('\n');
+            if (lineNum > 1) {
+                const prevLine = contentLines[lineNum - 2].trim();
+                if (prevLine.startsWith('//') || prevLine.startsWith('#') || prevLine.endsWith('*/')) {
+                    result.hasComment = true;
+                }
+            }
+        } catch (e) {
+            // Return default result on error
+        }
+
+        return result;
     }
 }
 

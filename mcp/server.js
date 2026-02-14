@@ -33,7 +33,6 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot, isTestFile } = require('../core/discovery');
 const { detectLanguage } = require('../core/parser');
-const { getParser, PARSE_OPTIONS } = require('../languages');
 const output = require('../core/output');
 
 // ============================================================================
@@ -41,7 +40,7 @@ const output = require('../core/output');
 // ============================================================================
 
 const indexCache = new Map(); // projectDir → { index, checkedAt }
-const expandCache = new Map(); // projectDir → { items, root }
+const expandCache = new Map(); // projectDir:symbolName → { items, root }
 const MAX_CACHE_SIZE = 10;
 const STALE_CHECK_INTERVAL = 30000; // 30s
 
@@ -91,356 +90,6 @@ function getIndex(projectDir) {
     return index;
 }
 
-// ============================================================================
-// TEXT FORMATTERS (for commands not in core/output.js)
-// ============================================================================
-
-function formatTocText(toc) {
-    const lines = [];
-    const t = toc.totals;
-    lines.push(`PROJECT: ${t.files} files, ${t.lines} lines`);
-    lines.push(`  ${t.functions} functions, ${t.classes} types (classes/interfaces/enums), ${t.state} state objects`);
-
-    const meta = toc.meta || {};
-    const warnings = [];
-    if (meta.dynamicImports) warnings.push(`${meta.dynamicImports} dynamic import(s)`);
-    if (meta.uncertain) warnings.push(`${meta.uncertain} uncertain reference(s)`);
-    if (warnings.length) {
-        lines.push(`  Note: ${warnings.join(', ')}`);
-    }
-
-    if (toc.summary) {
-        if (toc.summary.topFunctionFiles?.length) {
-            const hint = toc.summary.topFunctionFiles.map(f => `${f.file} (${f.functions})`).join(', ');
-            lines.push(`  Most functions: ${hint}`);
-        }
-        if (toc.summary.topLineFiles?.length) {
-            const hint = toc.summary.topLineFiles.map(f => `${f.file} (${f.lines})`).join(', ');
-            lines.push(`  Largest files: ${hint}`);
-        }
-        if (toc.summary.entryFiles?.length) {
-            lines.push(`  Entry points: ${toc.summary.entryFiles.join(', ')}`);
-        }
-    }
-
-    lines.push('═'.repeat(60));
-    const hasDetail = toc.files.some(f => f.symbols);
-    for (const file of toc.files) {
-        const parts = [`${file.lines} lines`];
-        if (file.functions) parts.push(`${file.functions} fn`);
-        if (file.classes) parts.push(`${file.classes} types`);
-        if (file.state) parts.push(`${file.state} state`);
-
-        if (hasDetail) {
-            lines.push(`\n${file.file} (${parts.join(', ')})`);
-            if (file.symbols) {
-                for (const fn of file.symbols.functions) {
-                    lines.push(`  ${output.lineRange(fn.startLine, fn.endLine)} ${output.formatFunctionSignature(fn)}`);
-                }
-                for (const cls of file.symbols.classes) {
-                    lines.push(`  ${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-                }
-            }
-        } else {
-            lines.push(`  ${file.file} — ${parts.join(', ')}`);
-        }
-    }
-
-    if (!hasDetail) {
-        lines.push(`\nUse detailed=true to list all functions and classes.`);
-    }
-
-    return lines.join('\n');
-}
-
-function formatFindText(symbols, query, top) {
-    if (symbols.length === 0) {
-        return `No symbols found for "${query}"`;
-    }
-
-    const lines = [];
-    const limit = (top && top > 0) ? Math.min(symbols.length, top) : Math.min(symbols.length, 10);
-    const hidden = symbols.length - limit;
-
-    if (hidden > 0) {
-        lines.push(`Found ${symbols.length} match(es) for "${query}" (showing top ${limit}):`);
-    } else {
-        lines.push(`Found ${symbols.length} match(es) for "${query}":`);
-    }
-    lines.push('─'.repeat(60));
-
-    for (let i = 0; i < limit; i++) {
-        const s = symbols[i];
-        const sig = s.params !== undefined
-            ? output.formatFunctionSignature(s)
-            : output.formatClassSignature(s);
-        lines.push(`${s.relativePath}:${s.startLine}  ${sig}`);
-        if (s.usageCounts !== undefined) {
-            const c = s.usageCounts;
-            const parts = [];
-            if (c.calls > 0) parts.push(`${c.calls} calls`);
-            if (c.definitions > 0) parts.push(`${c.definitions} def`);
-            if (c.imports > 0) parts.push(`${c.imports} imports`);
-            if (c.references > 0) parts.push(`${c.references} refs`);
-            lines.push(`  (${c.total} usages: ${parts.join(', ')})`);
-        } else if (s.usageCount !== undefined) {
-            lines.push(`  (${s.usageCount} usages)`);
-        }
-    }
-
-    if (hidden > 0) {
-        lines.push(`... ${hidden} more result(s).`);
-    }
-
-    return lines.join('\n');
-}
-
-function formatUsagesText(usages, name) {
-    const defs = usages.filter(u => u.isDefinition);
-    const calls = usages.filter(u => u.usageType === 'call');
-    const imports = usages.filter(u => u.usageType === 'import');
-    const refs = usages.filter(u => !u.isDefinition && u.usageType === 'reference');
-
-    const lines = [];
-    lines.push(`Usages of "${name}": ${defs.length} definitions, ${calls.length} calls, ${imports.length} imports, ${refs.length} references`);
-    lines.push('═'.repeat(60));
-
-    if (defs.length > 0) {
-        lines.push('\nDEFINITIONS:');
-        for (const d of defs) {
-            lines.push(`  ${d.relativePath}:${d.line || d.startLine}`);
-            if (d.signature) lines.push(`    ${d.signature}`);
-        }
-    }
-
-    if (calls.length > 0) {
-        lines.push('\nCALLS:');
-        for (const c of calls) {
-            lines.push(`  ${c.relativePath}:${c.line}`);
-            lines.push(`    ${c.content.trim()}`);
-        }
-    }
-
-    if (imports.length > 0) {
-        lines.push('\nIMPORTS:');
-        for (const i of imports) {
-            lines.push(`  ${i.relativePath}:${i.line}`);
-            lines.push(`    ${i.content.trim()}`);
-        }
-    }
-
-    if (refs.length > 0) {
-        lines.push('\nREFERENCES:');
-        for (const r of refs) {
-            lines.push(`  ${r.relativePath}:${r.line}`);
-            lines.push(`    ${r.content.trim()}`);
-        }
-    }
-
-    return lines.join('\n');
-}
-
-function formatContextText(ctx) {
-    if (!ctx) return { text: 'Symbol not found.', expandable: [] };
-
-    const lines = [];
-    const expandable = [];
-    let itemNum = 1;
-
-    // Handle struct/interface types
-    if (ctx.type && ['class', 'struct', 'interface', 'type'].includes(ctx.type)) {
-        lines.push(`Context for ${ctx.type} ${ctx.name}:`);
-        lines.push('═'.repeat(60));
-
-        if (ctx.warnings && ctx.warnings.length > 0) {
-            for (const w of ctx.warnings) {
-                lines.push(`  Note: ${w.message}`);
-            }
-        }
-
-        const methods = ctx.methods || [];
-        lines.push(`\nMETHODS (${methods.length}):`);
-        for (const m of methods) {
-            const receiver = m.receiver ? `(${m.receiver}) ` : '';
-            const params = m.params || '...';
-            const returnType = m.returnType ? `: ${m.returnType}` : '';
-            lines.push(`  [${itemNum}] ${receiver}${m.name}(${params})${returnType}`);
-            lines.push(`    ${m.file}:${m.line}`);
-            expandable.push({
-                num: itemNum++,
-                type: 'method',
-                name: m.name,
-                file: m.file,
-                relativePath: m.file,
-                startLine: m.line,
-                endLine: m.endLine || m.line
-            });
-        }
-
-        const callers = ctx.callers || [];
-        lines.push(`\nUSAGES (${callers.length}):`);
-        for (const c of callers) {
-            const callerName = c.callerName ? ` [${c.callerName}]` : '';
-            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
-            lines.push(`    ${c.content.trim()}`);
-            expandable.push({
-                num: itemNum++,
-                type: 'caller',
-                name: c.callerName || '(module level)',
-                file: c.callerFile || c.file,
-                relativePath: c.relativePath,
-                line: c.line,
-                startLine: c.callerStartLine || c.line,
-                endLine: c.callerEndLine || c.line
-            });
-        }
-
-        if (expandable.length > 0) {
-            lines.push(`\nUse ucn_expand with item number to see code for any item.`);
-        }
-
-        return { text: lines.join('\n'), expandable };
-    }
-
-    // Standard function/method context
-    lines.push(`Context for ${ctx.function}:`);
-    lines.push('═'.repeat(60));
-
-    if (ctx.meta) {
-        const notes = [];
-        if (ctx.meta.dynamicImports) notes.push(`${ctx.meta.dynamicImports} dynamic import(s)`);
-        if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
-        if (notes.length) {
-            lines.push(`  Note: ${notes.join(', ')}`);
-        }
-    }
-
-    if (ctx.warnings && ctx.warnings.length > 0) {
-        for (const w of ctx.warnings) {
-            lines.push(`  Note: ${w.message}`);
-        }
-    }
-
-    const callers = ctx.callers || [];
-    lines.push(`\nCALLERS (${callers.length}):`);
-    for (const c of callers) {
-        const callerName = c.callerName ? ` [${c.callerName}]` : '';
-        lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
-        lines.push(`    ${c.content.trim()}`);
-        expandable.push({
-            num: itemNum++,
-            type: 'caller',
-            name: c.callerName || '(module level)',
-            file: c.callerFile || c.file,
-            relativePath: c.relativePath,
-            line: c.line,
-            startLine: c.callerStartLine || c.line,
-            endLine: c.callerEndLine || c.line
-        });
-    }
-
-    const callees = ctx.callees || [];
-    lines.push(`\nCALLEES (${callees.length}):`);
-    for (const c of callees) {
-        const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
-        lines.push(`  [${itemNum}] ${c.name}${weight} - ${c.relativePath}:${c.startLine}`);
-        expandable.push({
-            num: itemNum++,
-            type: 'callee',
-            name: c.name,
-            file: c.file,
-            relativePath: c.relativePath,
-            startLine: c.startLine,
-            endLine: c.endLine
-        });
-    }
-
-    if (ctx.meta && !ctx.meta.includeMethods) {
-        lines.push(`\nNote: obj.method() calls excluded. Use include_methods=true to include them.`);
-    }
-
-    if (expandable.length > 0) {
-        lines.push(`\nUse ucn_expand with item number to see code for any item.`);
-    }
-
-    return { text: lines.join('\n'), expandable };
-}
-
-function formatSmartText(smart) {
-    if (!smart) return 'Function not found.';
-
-    const lines = [];
-    lines.push(`${smart.target.name} (${smart.target.file}:${smart.target.startLine})`);
-    lines.push('═'.repeat(60));
-
-    if (smart.meta) {
-        const notes = [];
-        if (smart.meta.dynamicImports) notes.push(`${smart.meta.dynamicImports} dynamic import(s)`);
-        if (smart.meta.uncertain) notes.push(`${smart.meta.uncertain} uncertain call(s) skipped`);
-        if (notes.length) {
-            lines.push(`  Note: ${notes.join(', ')}`);
-        }
-    }
-
-    lines.push(smart.target.code);
-
-    if (smart.dependencies.length > 0) {
-        lines.push('\n─── DEPENDENCIES ───');
-        for (const dep of smart.dependencies) {
-            const weight = dep.weight && dep.weight !== 'normal' ? ` [${dep.weight}]` : '';
-            lines.push(`\n// ${dep.name}${weight} (${dep.relativePath}:${dep.startLine})`);
-            lines.push(dep.code);
-        }
-    }
-
-    if (smart.types && smart.types.length > 0) {
-        lines.push('\n─── TYPES ───');
-        for (const t of smart.types) {
-            lines.push(`\n// ${t.name} (${t.relativePath}:${t.startLine})`);
-            lines.push(t.code);
-        }
-    }
-
-    return lines.join('\n');
-}
-
-function formatDeadcodeText(results) {
-    if (results.length === 0) return 'No dead code found.';
-
-    const lines = [];
-    lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
-
-    let currentFile = null;
-    for (const item of results) {
-        if (item.file !== currentFile) {
-            currentFile = item.file;
-            lines.push(item.file);
-        }
-        const exported = item.isExported ? ' [exported]' : '';
-        lines.push(`  ${output.lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}`);
-    }
-
-    return lines.join('\n');
-}
-
-function formatFnText(match, fnCode) {
-    const lines = [];
-    lines.push(`${match.relativePath}:${match.startLine}`);
-    lines.push(`${output.lineRange(match.startLine, match.endLine)} ${output.formatFunctionSignature(match)}`);
-    lines.push('─'.repeat(60));
-    lines.push(fnCode);
-    return lines.join('\n');
-}
-
-function formatClassText(cls, clsCode) {
-    const lines = [];
-    lines.push(`${cls.relativePath || cls.file}:${cls.startLine}`);
-    lines.push(`${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-    lines.push('─'.repeat(60));
-    lines.push(clsCode);
-    return lines.join('\n');
-}
-
 function pickBestDefinition(matches) {
     const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
     const scored = matches.map(m => {
@@ -457,266 +106,6 @@ function pickBestDefinition(matches) {
     });
     scored.sort((a, b) => b.score - a.score);
     return scored[0].match;
-}
-
-function formatGraphText(graph, showAll = false) {
-    if (graph.nodes.length === 0) return 'File not found.';
-
-    const rootEntry = graph.nodes.find(n => n.file === graph.root);
-    const rootRelPath = rootEntry ? rootEntry.relativePath : graph.root;
-    const lines = [];
-
-    const maxChildren = showAll ? Infinity : 8;
-
-    function printTree(nodes, edges, rootFile) {
-        const printed = new Set();
-
-        function printNode(file, indent) {
-            const fileEntry = nodes.find(n => n.file === file);
-            const relPath = fileEntry ? fileEntry.relativePath : file;
-            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
-
-            if (printed.has(file)) {
-                lines.push(`${prefix}${relPath} (circular)`);
-                return;
-            }
-            printed.add(file);
-            lines.push(`${prefix}${relPath}`);
-
-            const fileEdges = edges.filter(e => e.from === file);
-            const displayEdges = fileEdges.slice(0, maxChildren);
-            const hiddenCount = fileEdges.length - displayEdges.length;
-
-            for (const edge of displayEdges) {
-                printNode(edge.to, indent + 1);
-            }
-
-            if (hiddenCount > 0) {
-                lines.push(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
-            }
-        }
-
-        printNode(rootFile, 0);
-    }
-
-    if (graph.direction === 'both' && graph.imports && graph.importers) {
-        const importCount = graph.imports.edges.filter(e => e.from === graph.root).length;
-        const importerCount = graph.importers.edges.filter(e => e.from === graph.root).length;
-
-        lines.push(`Dependency graph for ${rootRelPath}`);
-        lines.push('═'.repeat(60));
-
-        lines.push(`\nIMPORTS (what this file depends on): ${importCount} files`);
-        if (importCount > 0) {
-            printTree(graph.imports.nodes, graph.imports.edges, graph.root);
-        } else {
-            lines.push('  (none)');
-        }
-
-        lines.push(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
-        if (importerCount > 0) {
-            printTree(graph.importers.nodes, graph.importers.edges, graph.root);
-        } else {
-            lines.push('  (none)');
-        }
-    } else {
-        lines.push(`Dependency graph for ${rootRelPath}`);
-        lines.push('═'.repeat(60));
-        printTree(graph.nodes, graph.edges, graph.root);
-    }
-
-    return lines.join('\n');
-}
-
-function formatSearchText(results, term) {
-    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
-    if (totalMatches === 0) return `No matches found for "${term}"`;
-
-    const lines = [];
-    lines.push(`Found ${totalMatches} matches for "${term}" in ${results.length} files:`);
-    lines.push('═'.repeat(60));
-
-    for (const result of results) {
-        lines.push(`\n${result.file}`);
-        for (const m of result.matches) {
-            lines.push(`  ${m.line}: ${m.content.trim()}`);
-            if (m.before && m.before.length > 0) {
-                for (const line of m.before) {
-                    lines.push(`      ... ${line.trim()}`);
-                }
-            }
-            if (m.after && m.after.length > 0) {
-                for (const line of m.after) {
-                    lines.push(`      ... ${line.trim()}`);
-                }
-            }
-        }
-    }
-
-    return lines.join('\n');
-}
-
-function formatFileExportsText(exports, filePath) {
-    if (exports.length === 0) return `No exports found in ${filePath}`;
-
-    const lines = [];
-    lines.push(`Exports from ${filePath}:\n`);
-    for (const exp of exports) {
-        lines.push(`  ${output.lineRange(exp.startLine, exp.endLine)} ${exp.signature || exp.name}`);
-    }
-    return lines.join('\n');
-}
-
-function analyzeCallSiteAST(filePath, lineNum, funcName) {
-    const result = {
-        isAwait: false,
-        isDestructured: false,
-        isTypedAssignment: false,
-        isInReturn: false,
-        isInCatch: false,
-        isInConditional: false,
-        hasComment: false,
-        isStandalone: false
-    };
-
-    try {
-        const language = detectLanguage(filePath);
-        if (!language) return result;
-
-        const parser = getParser(language);
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const tree = parser.parse(content, undefined, PARSE_OPTIONS);
-
-        const row = lineNum - 1;
-        const node = tree.rootNode.descendantForPosition({ row, column: 0 });
-        if (!node) return result;
-
-        let current = node;
-        let foundCall = false;
-
-        while (current) {
-            const type = current.type;
-
-            if (!foundCall && (type === 'call_expression' || type === 'call')) {
-                const calleeNode = current.childForFieldName('function') || current.namedChild(0);
-                if (calleeNode && calleeNode.text === funcName) {
-                    foundCall = true;
-                }
-            }
-
-            if (foundCall) {
-                if (type === 'await_expression') result.isAwait = true;
-                if (type === 'variable_declarator' || type === 'assignment_expression') {
-                    const parent = current.parent;
-                    if (parent && (parent.type === 'lexical_declaration' || parent.type === 'variable_declaration')) {
-                        result.isTypedAssignment = true;
-                    }
-                }
-                if (type === 'array_pattern' || type === 'object_pattern') result.isDestructured = true;
-                if (type === 'return_statement') result.isInReturn = true;
-                if (type === 'catch_clause' || type === 'except_clause') result.isInCatch = true;
-                if (type === 'if_statement' || type === 'conditional_expression' || type === 'ternary_expression') result.isInConditional = true;
-                if (type === 'expression_statement') result.isStandalone = true;
-            }
-
-            current = current.parent;
-        }
-
-        const contentLines = content.split('\n');
-        if (lineNum > 1) {
-            const prevLine = contentLines[lineNum - 2].trim();
-            if (prevLine.startsWith('//') || prevLine.startsWith('#') || prevLine.endsWith('*/')) {
-                result.hasComment = true;
-            }
-        }
-    } catch (e) {
-        // Return default result on error
-    }
-
-    return result;
-}
-
-function findBestExample(index, name) {
-    const usages = index.usages(name, {
-        codeOnly: true,
-        exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
-        context: 5
-    });
-
-    const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
-
-    if (calls.length === 0) {
-        return `No call examples found for "${name}"`;
-    }
-
-    const scored = calls.map(call => {
-        let score = 0;
-        const reasons = [];
-        const line = call.content.trim();
-
-        const astInfo = analyzeCallSiteAST(call.file, call.line, name);
-
-        if (astInfo.isTypedAssignment) { score += 15; reasons.push('typed assignment'); }
-        if (astInfo.isInReturn) { score += 10; reasons.push('in return'); }
-        if (astInfo.isAwait) { score += 10; reasons.push('async usage'); }
-        if (astInfo.isDestructured) { score += 8; reasons.push('destructured'); }
-        if (astInfo.isStandalone) { score += 5; reasons.push('standalone'); }
-        if (astInfo.hasComment) { score += 3; reasons.push('documented'); }
-        if (astInfo.isInCatch) { score -= 5; reasons.push('in catch block'); }
-        if (astInfo.isInConditional) { score -= 3; reasons.push('in conditional'); }
-
-        if (score === 0) {
-            if (/^(const|let|var|return)\s/.test(line) || /^\w+\s*=/.test(line)) {
-                score += 10; reasons.push('return value used');
-            }
-            if (line.startsWith(name + '(') || /^(const|let|var)\s+\w+\s*=\s*\w*$/.test(line.split(name)[0])) {
-                score += 5; reasons.push('clear usage');
-            }
-        }
-
-        if (call.before && call.before.length > 0) score += 3;
-        if (call.after && call.after.length > 0) score += 3;
-        if (call.before?.length > 0 && call.after?.length > 0) reasons.push('has context');
-
-        const beforeCall = line.split(name + '(')[0];
-        if (!beforeCall.includes('(') || /^\s*(const|let|var|return)?\s*\w+\s*=\s*$/.test(beforeCall)) {
-            score += 2;
-        }
-        if (call.line < 100) score += 1;
-
-        return { ...call, score, reasons };
-    });
-
-    scored.sort((a, b) => b.score - a.score);
-    const best = scored[0];
-
-    const lines = [];
-    lines.push(`Best example of "${name}":`);
-    lines.push('═'.repeat(60));
-    lines.push(`${best.relativePath}:${best.line}`);
-    lines.push('');
-
-    if (best.before) {
-        for (let i = 0; i < best.before.length; i++) {
-            const ln = best.line - best.before.length + i;
-            lines.push(`${ln.toString().padStart(4)}| ${best.before[i]}`);
-        }
-    }
-
-    lines.push(`${best.line.toString().padStart(4)}| ${best.content}  <--`);
-
-    if (best.after) {
-        for (let i = 0; i < best.after.length; i++) {
-            const ln = best.line + i + 1;
-            lines.push(`${ln.toString().padStart(4)}| ${best.after[i]}`);
-        }
-    }
-
-    lines.push('');
-    lines.push(`Score: ${best.score} (${calls.length} total calls)`);
-    lines.push(`Why: ${best.reasons.length > 0 ? best.reasons.join(', ') : 'first available call'}`);
-
-    return lines.join('\n');
 }
 
 // ============================================================================
@@ -798,7 +187,7 @@ server.registerTool(
         try {
             const index = getIndex(project_dir);
             const toc = index.getToc({ detailed: detailed || false });
-            return toolResult(formatTocText(toc));
+            return toolResult(output.formatToc(toc));
         } catch (e) {
             return toolError(e.message);
         }
@@ -828,7 +217,7 @@ server.registerTool(
             const index = getIndex(project_dir);
             const excludeArr = include_tests ? parseExclude(exclude) : addTestExclusions(parseExclude(exclude));
             const found = index.find(name, { file, exclude: excludeArr, exact: exact || false, in: inPath });
-            return toolResult(formatFindText(found, name, top));
+            return toolResult(output.formatFind(found, name, top));
         } catch (e) {
             return toolError(e.message);
         }
@@ -883,9 +272,9 @@ server.registerTool(
                 includeUncertain: include_uncertain || false,
                 file
             });
-            const { text, expandable } = formatContextText(ctx);
+            const { text, expandable } = output.formatContext(ctx);
             if (expandable.length > 0) {
-                expandCache.set(index.root, { items: expandable, root: index.root });
+                expandCache.set(`${index.root}:${name}`, { items: expandable, root: index.root, symbolName: name });
             }
             return toolResult(text);
         } catch (e) {
@@ -943,7 +332,7 @@ server.registerTool(
                 includeMethods: include_methods || false,
                 includeUncertain: include_uncertain || false
             });
-            return toolResult(formatSmartText(result));
+            return toolResult(output.formatSmart(result));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1004,7 +393,7 @@ server.registerTool(
                 context: context || 0,
                 in: inPath
             });
-            return toolResult(formatUsagesText(result, name));
+            return toolResult(output.formatUsages(result, name));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1029,7 +418,9 @@ server.registerTool(
                 includeExported: include_exported || false,
                 includeTests: include_tests || false
             });
-            return toolResult(formatDeadcodeText(result));
+            return toolResult(output.formatDeadcode(result, {
+                exportedHint: !include_exported ? 'Exported symbols excluded by default. Use include_exported=true to include them.' : undefined
+            }));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1068,7 +459,7 @@ server.registerTool(
                 note = `Note: Found ${matches.length} definitions for "${name}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n\n`;
             }
 
-            return toolResult(note + formatFnText(match, fnCode));
+            return toolResult(note + output.formatFn(match, fnCode));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1092,7 +483,6 @@ server.registerTool(
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const { extractClass } = require('../core/parser');
             const matches = index.find(name, { file }).filter(m =>
                 ['class', 'interface', 'type', 'enum', 'struct', 'trait'].includes(m.type)
             );
@@ -1102,30 +492,24 @@ server.registerTool(
             }
 
             const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
+
+            // Use index data directly instead of re-parsing the file
             const code = fs.readFileSync(match.file, 'utf-8');
-            const language = detectLanguage(match.file);
-            const { cls, code: clsCode } = extractClass(code, language, match.name);
-
-            if (!cls) {
-                return toolResult(`Class "${name}" could not be extracted.`);
-            }
-
-            // Add path info from index match (parser doesn't include file paths)
-            cls.relativePath = match.relativePath;
-            cls.file = match.file;
+            const codeLines = code.split('\n');
+            const clsCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
 
             let note = '';
             if (matches.length > 1 && !file) {
                 note = `Note: Found ${matches.length} definitions for "${name}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n\n`;
             }
 
-            const classLineCount = cls.endLine - cls.startLine + 1;
+            const classLineCount = match.endLine - match.startLine + 1;
 
             // Large class: show summary by default, truncated source with max_lines
             if (classLineCount > 200 && max_lines === undefined) {
                 const lines = [];
-                lines.push(`${cls.relativePath}:${cls.startLine}`);
-                lines.push(`${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
+                lines.push(`${match.relativePath}:${match.startLine}`);
+                lines.push(`${output.lineRange(match.startLine, match.endLine)} ${output.formatClassSignature(match)}`);
                 lines.push('─'.repeat(60));
 
                 // Show method list from index
@@ -1142,12 +526,12 @@ server.registerTool(
             }
 
             if (max_lines !== undefined && classLineCount > max_lines) {
-                const truncatedCode = clsCode.split('\n').slice(0, max_lines).join('\n');
-                const result = formatClassText(cls, truncatedCode);
+                const truncatedCode = codeLines.slice(match.startLine - 1, match.startLine - 1 + max_lines).join('\n');
+                const result = output.formatClass(match, truncatedCode);
                 return toolResult(note + result + `\n\n... showing ${max_lines} of ${classLineCount} lines`);
             }
 
-            return toolResult(note + formatClassText(cls, clsCode));
+            return toolResult(note + output.formatClass(match, clsCode));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1283,7 +667,7 @@ server.registerTool(
         try {
             const index = getIndex(project_dir);
             const result = index.graph(file, { direction: direction || 'both', maxDepth: depth ?? 2 });
-            return toolResult(formatGraphText(result, depth !== undefined));
+            return toolResult(output.formatGraph(result, { showAll: depth !== undefined, file }));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1304,7 +688,7 @@ server.registerTool(
         try {
             const index = getIndex(project_dir);
             const result = index.fileExports(file);
-            return toolResult(formatFileExportsText(result, file));
+            return toolResult(output.formatFileExports(result, file));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1335,7 +719,7 @@ server.registerTool(
                 context: context || 0,
                 caseSensitive: case_sensitive || false
             });
-            return toolResult(formatSearchText(result, term));
+            return toolResult(output.formatSearch(result, term));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1439,7 +823,7 @@ server.registerTool(
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            return toolResult(findBestExample(index, name));
+            return toolResult(output.formatExample(index.example(name), name));
         } catch (e) {
             return toolError(e.message);
         }
@@ -1459,17 +843,24 @@ server.registerTool(
     async ({ project_dir, item }) => {
         try {
             const index = getIndex(project_dir);
-            const cached = expandCache.get(index.root);
-            if (!cached || !cached.items || cached.items.length === 0) {
+            // Search all cache entries for this project root to find the item
+            let match = null;
+            let cachedItemCount = 0;
+            for (const [key, cached] of expandCache) {
+                if (cached.root === index.root && cached.items) {
+                    cachedItemCount = Math.max(cachedItemCount, cached.items.length);
+                    const found = cached.items.find(i => i.num === item);
+                    if (found) { match = found; break; }
+                }
+            }
+            if (!match && cachedItemCount === 0) {
                 return toolError('No expandable items found. Run ucn_context first to get numbered items.');
             }
-
-            const match = cached.items.find(i => i.num === item);
             if (!match) {
-                return toolError(`Item ${item} not found. Available: 1-${cached.items.length}`);
+                return toolError(`Item ${item} not found. Available items: 1-${cachedItemCount}`);
             }
 
-            const filePath = match.file || (cached.root && match.relativePath ? path.join(cached.root, match.relativePath) : null);
+            const filePath = match.file || (index.root && match.relativePath ? path.join(index.root, match.relativePath) : null);
             if (!filePath || !fs.existsSync(filePath)) {
                 return toolError(`Cannot locate file for ${match.name}`);
             }
@@ -1590,34 +981,12 @@ server.registerTool(
         try {
             const index = getIndex(project_dir);
             const stats = index.getStats();
-            return toolResult(formatStatsText(stats));
+            return toolResult(output.formatStats(stats));
         } catch (e) {
             return toolError(e.message);
         }
     }
 );
-
-function formatStatsText(stats) {
-    const lines = [];
-    lines.push('PROJECT STATISTICS');
-    lines.push('═'.repeat(60));
-    lines.push(`Root: ${stats.root}`);
-    lines.push(`Files: ${stats.files}`);
-    lines.push(`Symbols: ${stats.symbols}`);
-    lines.push(`Build time: ${stats.buildTime}ms`);
-
-    lines.push('\nBy Language:');
-    for (const [lang, info] of Object.entries(stats.byLanguage)) {
-        lines.push(`  ${lang}: ${info.files} files, ${info.lines} lines, ${info.symbols} symbols`);
-    }
-
-    lines.push('\nBy Type:');
-    for (const [type, count] of Object.entries(stats.byType)) {
-        lines.push(`  ${type}: ${count}`);
-    }
-
-    return lines.join('\n');
-}
 
 // ============================================================================
 // START SERVER
