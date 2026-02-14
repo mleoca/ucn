@@ -70,7 +70,8 @@ const flags = {
     top: parseInt(args.find(a => a.startsWith('--top='))?.split('=')[1] || '0'),
     all: args.includes('--all'),
     // Include method calls in caller/callee analysis
-    includeMethods: args.includes('--include-methods'),
+    // Tri-state: true (--include-methods), false (--include-methods=false), undefined (let command decide default)
+    includeMethods: args.includes('--include-methods=false') ? false : args.includes('--include-methods') ? true : undefined,
     // Graph direction (imports/importers/both)
     direction: args.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
     // Symlink handling (follow by default)

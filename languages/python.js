@@ -115,6 +115,10 @@ function findFunctions(code, parser) {
                 // Extract decorators
                 const decorators = extractDecorators(node);
 
+                // nameLine: the line where the name identifier lives (for deadcode def-site filtering)
+                // Only set when different from startLine (i.e., when decorators push startLine earlier)
+                const nameLine = nameNode.startPosition.row + 1;
+
                 functions.push({
                     name: nameNode.text,
                     params: extractPythonParams(paramsNode),
@@ -126,7 +130,8 @@ function findFunctions(code, parser) {
                     modifiers: isAsync ? ['async'] : [],
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring }),
-                    ...(decorators.length > 0 && { decorators })
+                    ...(decorators.length > 0 && { decorators }),
+                    ...(nameLine !== decoratorStartLine && { nameLine })
                 });
             }
             return true;
@@ -189,6 +194,7 @@ function findClasses(code, parser) {
                 const docstring = extractPythonDocstring(code, defLine);
                 const decorators = extractDecorators(node);
                 const bases = extractBases(node);
+                const nameLine = nameNode.startPosition.row + 1;
 
                 classes.push({
                     name: nameNode.text,
@@ -198,7 +204,8 @@ function findClasses(code, parser) {
                     members,
                     ...(docstring && { docstring }),
                     ...(decorators.length > 0 && { decorators }),
-                    ...(bases.length > 0 && { extends: bases.join(', ') })
+                    ...(bases.length > 0 && { extends: bases.join(', ') }),
+                    ...(nameLine !== startLine && { nameLine })
                 });
             }
             return false;  // Don't traverse into class body
@@ -291,6 +298,8 @@ function extractClassMembers(classNode, code) {
                 const returnType = extractReturnType(funcNode);
                 const defLine = getDefLine(funcNode);
                 const docstring = extractPythonDocstring(code, defLine);
+                // nameLine: where the name identifier lives (differs from startLine when decorated)
+                const nameLine = nameNode.startPosition.row + 1;
 
                 members.push({
                     name,
@@ -303,7 +312,8 @@ function extractClassMembers(classNode, code) {
                     isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring }),
-                    ...(memberDecorators.length > 0 && { decorators: memberDecorators })
+                    ...(memberDecorators.length > 0 && { decorators: memberDecorators }),
+                    ...(nameLine !== startLine && { nameLine })
                 });
             }
         }

@@ -349,7 +349,7 @@ server.registerTool(
             name: nameParam,
             file: fileParam,
             depth: z.number().optional().describe('Maximum call tree depth (default: 3)'),
-            include_methods: z.boolean().optional().describe('Include obj.method() calls in caller/callee analysis'),
+            include_methods: z.boolean().optional().describe('Include obj.method() calls in caller/callee analysis (default: true for trace)'),
             include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches')
         })
     },

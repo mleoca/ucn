@@ -182,7 +182,9 @@ class ProjectIndex {
                 ...(item.isMethod && { isMethod: item.isMethod }),
                 ...(item.receiver && { receiver: item.receiver }),
                 ...(item.className && { className: item.className }),
-                ...(item.memberType && { memberType: item.memberType })
+                ...(item.memberType && { memberType: item.memberType }),
+                ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
+                ...(item.nameLine && { nameLine: item.nameLine })
             };
             fileEntry.symbols.push(symbol);
             fileEntry.bindings.push({
@@ -912,7 +914,11 @@ class ProjectIndex {
                 skipped: 0,
                 dynamicImports,
                 uncertain: stats.uncertain,
-                includeMethods: !!options.includeMethods
+                includeMethods: !!options.includeMethods,
+                // Structural facts for reliability hints
+                ...(def.isMethod && { isMethod: true }),
+                ...(def.className && { className: def.className }),
+                ...(def.receiver && { receiver: def.receiver })
             }
         };
 
@@ -2475,14 +2481,26 @@ class ProjectIndex {
                 const allUsages = usageIndex.get(name) || [];
 
                 // Filter out usages that are at the definition location
+                // nameLine: when decorators/annotations are present, startLine is the decorator line
+                // but the name identifier is on a different line (nameLine). Check both.
                 const nonDefUsages = allUsages.filter(u =>
-                    !(u.file === symbol.file && u.line === symbol.startLine)
+                    !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine))
                 );
 
                 // Total includes all usage types (calls, references, callbacks, re-exports)
                 const totalUsages = nonDefUsages.length;
 
                 if (totalUsages === 0) {
+                    // Collect decorators/annotations for hint display
+                    // Python: symbol.decorators (e.g., ['app.route("/path")', 'login_required'])
+                    // Java/Rust/Go: symbol.modifiers may contain annotations (e.g., 'bean', 'scheduled')
+                    const decorators = symbol.decorators || [];
+                    // For Java, extract annotation-like modifiers (lowercase single words that aren't standard keywords)
+                    const javaKeywords = new Set(['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default']);
+                    const annotations = lang === 'java'
+                        ? mods.filter(m => !javaKeywords.has(m))
+                        : [];
+
                     results.push({
                         name: symbol.name,
                         type: symbol.type,
@@ -2490,7 +2508,9 @@ class ProjectIndex {
                         startLine: symbol.startLine,
                         endLine: symbol.endLine,
                         isExported,
-                        usageCount: 0
+                        usageCount: 0,
+                        ...(decorators.length > 0 && { decorators }),
+                        ...(annotations.length > 0 && { annotations })
                     });
                 }
             }
@@ -2827,6 +2847,8 @@ class ProjectIndex {
         const maxDepth = Math.max(0, rawDepth);
         const direction = options.direction || 'down';  // 'down' = callees, 'up' = callers, 'both'
         const maxChildren = options.all ? Infinity : 10;
+        // trace defaults to includeMethods=true (execution flow should show method calls)
+        const includeMethods = options.includeMethods ?? true;
 
         const { def } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
@@ -2851,7 +2873,7 @@ class ProjectIndex {
             };
 
             if (dir === 'down' || dir === 'both') {
-                const callees = this.findCallees(funcDef, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain });
+                const callees = this.findCallees(funcDef, { includeMethods, includeUncertain: options.includeUncertain });
                 for (const callee of callees.slice(0, maxChildren)) {
                     // callee already has the best-matched definition from findCallees
                     const childTree = buildTree(callee, currentDepth + 1, 'down');
@@ -2877,7 +2899,7 @@ class ProjectIndex {
         let callers = [];
         let truncatedCallers = 0;
         if (direction === 'up' || direction === 'both') {
-            const allCallers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [def] });
+            const allCallers = this.findCallers(name, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [def] });
             callers = allCallers.slice(0, maxChildren).map(c => ({
                 name: c.callerName || '(anonymous)',
                 file: c.relativePath,
@@ -2895,7 +2917,7 @@ class ProjectIndex {
             line: def.startLine,
             direction,
             maxDepth,
-            includeMethods: !!options.includeMethods,
+            includeMethods,
             tree,
             callers: direction !== 'down' ? callers : undefined,
             truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined
