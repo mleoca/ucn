@@ -10056,5 +10056,121 @@ def test():
     assert.ok(dispatchCb, 'dispatch (dict with lambda) SHOULD still be potential callback');
 });
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// FIX 76-79: Bug report fixes (impact false positives, count consistency,
+// tests labels, usages dedup)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+it('FIX 76 — impact excludes method calls for standalone function targets', () => {
+    // impact for a standalone function should NOT include obj.fn() calls
+    const index = new ProjectIndex('.');
+    index.build(null, { quiet: true });
+
+    const result = index.impact('parse', { file: 'core/parser.js' });
+    assert.ok(result, 'Should find parse');
+
+    // All call sites should be direct calls, not method calls
+    for (const group of result.byFile) {
+        for (const site of group.sites) {
+            assert.ok(!site.isMethodCall,
+                `${group.file}:${site.line} should not be a method call: ${site.expression}`);
+        }
+    }
+
+    // impact and verify should agree on call count
+    const verified = index.verify('parse', { file: 'core/parser.js' });
+    assert.strictEqual(result.totalCallSites, verified.totalCalls,
+        'impact and verify call counts must match');
+});
+
+it('FIX 77 — find counts match usages via transitive re-exports', () => {
+    // countSymbolUsages should follow re-export chains
+    const index = new ProjectIndex('.');
+    index.build(null, { quiet: true });
+
+    const defs = index.symbols.get('detectLanguage');
+    assert.ok(defs && defs.length > 0, 'Should find detectLanguage');
+    const def = defs.find(d => d.relativePath === 'languages/index.js');
+    assert.ok(def, 'Should find definition in languages/index.js');
+
+    const counts = index.countSymbolUsages(def);
+    const usages = index.usages('detectLanguage', { includeTests: true });
+    const usageCalls = usages.filter(u => u.usageType === 'call').length;
+
+    assert.strictEqual(counts.calls, usageCalls,
+        `find call count (${counts.calls}) must match usages call count (${usageCalls})`);
+});
+
+it('FIX 78 — tests classifies string-literal mentions as string-ref', () => {
+    const index = new ProjectIndex('.');
+    index.build(null, { quiet: true });
+
+    const tests = index.tests('parseFile');
+    const allMatches = tests.flatMap(t => t.matches);
+    const stringRefs = allMatches.filter(m => m.matchType === 'string-ref');
+
+    // Lines like index.usages('parseFile') should be classified as string-ref
+    assert.ok(stringRefs.length > 0, 'Should find string-ref matches');
+    for (const m of stringRefs) {
+        assert.ok(m.content.includes("'parseFile'") || m.content.includes('"parseFile"'),
+            `string-ref match should contain quoted name: ${m.content}`);
+    }
+});
+
+it('FIX 78 — tests --calls-only filters non-call matches', () => {
+    const index = new ProjectIndex('.');
+    index.build(null, { quiet: true });
+
+    const all = index.tests('parseFile');
+    const callsOnly = index.tests('parseFile', { callsOnly: true });
+
+    const allCount = all.flatMap(t => t.matches).length;
+    const callsCount = callsOnly.flatMap(t => t.matches).length;
+
+    assert.ok(allCount > callsCount || callsCount === 0,
+        'calls-only should return fewer or equal matches');
+
+    // Every match in calls-only should be a call or test-case
+    for (const t of callsOnly) {
+        for (const m of t.matches) {
+            assert.ok(m.matchType === 'call' || m.matchType === 'test-case',
+                `calls-only match should be call or test-case, got: ${m.matchType}`);
+        }
+    }
+});
+
+it('FIX 79 — usages deduplicates same-line same-type entries', () => {
+    const index = new ProjectIndex('.');
+    index.build(null, { quiet: true });
+
+    const usages = index.usages('detectLanguage', { includeTests: true });
+
+    // Check no duplicate file:line:usageType combinations
+    const seen = new Set();
+    for (const u of usages) {
+        const key = `${u.file}:${u.line}:${u.usageType}:${u.isDefinition}`;
+        assert.ok(!seen.has(key), `Duplicate usage entry: ${key}`);
+        seen.add(key);
+    }
+});
+
+// Cross-command consistency invariant test
+it('INVARIANT — impact/verify/find call counts are consistent for common symbols', () => {
+    const index = new ProjectIndex('.');
+    index.build(null, { quiet: true });
+
+    // Test with a few symbols that have cross-command relevance
+    const symbols = ['detectLanguage', 'parseFile'];
+    for (const name of symbols) {
+        const impact = index.impact(name);
+        const verified = index.verify(name);
+
+        if (impact && verified.found) {
+            assert.strictEqual(impact.totalCallSites, verified.totalCalls,
+                `${name}: impact (${impact.totalCallSites}) != verify (${verified.totalCalls})`);
+        }
+    }
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

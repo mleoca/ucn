@@ -2145,7 +2145,7 @@ class ProjectIndex {
      * @param {string} nameOrFile - Function name or file path
      * @returns {Array} Test files and matches
      */
-    tests(nameOrFile) {
+    tests(nameOrFile, options = {}) {
         const results = [];
 
         // Check if it's a file path
@@ -2202,10 +2202,13 @@ class ProjectIndex {
                     }
                 });
 
-                if (matches.length > 0) {
+                const filtered = options.callsOnly
+                    ? matches.filter(m => m.matchType === 'call' || m.matchType === 'test-case')
+                    : matches;
+                if (filtered.length > 0) {
                     results.push({
                         file: entry.relativePath,
-                        matches
+                        matches: filtered
                     });
                 }
             } catch (e) {

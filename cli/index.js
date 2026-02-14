@@ -73,6 +73,8 @@ const flags = {
     // Include method calls in caller/callee analysis
     // Tri-state: true (--include-methods), false (--include-methods=false), undefined (let command decide default)
     includeMethods: args.includes('--include-methods=false') ? false : args.includes('--include-methods') ? true : undefined,
+    // Tests: only show call/test-case matches
+    callsOnly: args.includes('--calls-only'),
     // Graph direction (imports/importers/both)
     direction: args.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
     // Symlink handling (follow by default)
@@ -91,7 +93,7 @@ const knownFlags = new Set([
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests',
-    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed',
+    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed', '--calls-only',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks'
@@ -924,7 +926,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'tests': {
             requireArg(arg, 'Usage: ucn . tests <name>');
-            const tests = index.tests(arg);
+            const tests = index.tests(arg, { callsOnly: flags.callsOnly });
             printOutput(tests,
                 r => output.formatTestsJson(r, arg),
                 r => output.formatTests(r, arg)
@@ -1941,7 +1943,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: tests <name>');
                 return;
             }
-            const tests = index.tests(arg);
+            const tests = index.tests(arg, { callsOnly: flags.callsOnly });
             console.log(output.formatTests(tests, arg));
             break;
         }
