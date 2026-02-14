@@ -605,10 +605,22 @@ class ProjectIndex {
         // Get files that could reference this symbol:
         // 1. The file where it's defined
         // 2. Files that import from the definition file
+        // 3. Transitively: files that import from re-exporters of this symbol
         const relevantFiles = new Set([defFile]);
-        const importers = this.exportGraph.get(defFile) || [];
-        for (const importer of importers) {
-            relevantFiles.add(importer);
+        const queue = [defFile];
+        while (queue.length > 0) {
+            const file = queue.pop();
+            const importers = this.exportGraph.get(file) || [];
+            for (const importer of importers) {
+                if (!relevantFiles.has(importer)) {
+                    relevantFiles.add(importer);
+                    // If this importer re-exports the symbol, follow its importers too
+                    const importerEntry = this.files.get(importer);
+                    if (importerEntry && importerEntry.exports && importerEntry.exports.includes(name)) {
+                        queue.push(importer);
+                    }
+                }
+            }
         }
 
         let calls = 0;
@@ -631,7 +643,12 @@ class ProjectIndex {
                         const parser = getParser(language);
                         if (parser) {
                             const usages = langModule.findUsagesInCode(content, name, parser);
+                            // Deduplicate same-line same-type entries (e.g., `name: obj.name` has two AST nodes)
+                            const seen = new Set();
                             for (const u of usages) {
+                                const key = `${filePath}:${u.line}:${u.usageType}`;
+                                if (seen.has(key)) continue;
+                                seen.add(key);
                                 switch (u.usageType) {
                                     case 'call': calls++; break;
                                     case 'definition': definitions++; break;
@@ -807,7 +824,18 @@ class ProjectIndex {
             }
         }
 
-        return usages;
+        // Deduplicate same-file, same-line, same-usageType entries
+        // (e.g., `detectLanguage: parser.detectLanguage` has the name twice on one line)
+        const seen = new Set();
+        const deduped = [];
+        for (const u of usages) {
+            const key = `${u.file}:${u.line}:${u.usageType}:${u.isDefinition}`;
+            if (!seen.has(key)) {
+                seen.add(key);
+                deduped.push(u);
+            }
+        }
+        return deduped;
     }
 
     /**
@@ -2158,6 +2186,13 @@ class ProjectIndex {
                         } else if (new RegExp(searchTerm + '\\s*\\(').test(line)) {
                             matchType = 'call';
                         }
+                        // Detect if the match is inside a string literal (e.g., 'parseFile' or "parseFile")
+                        if (matchType === 'reference' || matchType === 'call') {
+                            const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
+                            if (strPattern.test(line)) {
+                                matchType = 'string-ref';
+                            }
+                        }
 
                         matches.push({
                             line: idx + 1,
@@ -3100,20 +3135,26 @@ class ProjectIndex {
             return true;
         });
 
-        // Analyze each call site
-        const callSites = calls.map(call => {
+        // Analyze each call site, filtering out method calls for non-method definitions
+        const defIsMethod = def.isMethod || def.type === 'method' || def.className;
+        const callSites = [];
+        for (const call of calls) {
             const analysis = this.analyzeCallSite(call, name);
-            return {
+            // Skip method calls (obj.parse()) when target is a standalone function (parse())
+            if (analysis.isMethodCall && !defIsMethod) {
+                continue;
+            }
+            callSites.push({
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
                 callerName: this.findEnclosingFunction(call.file, call.line),
                 ...analysis
-            };
-        });
+            });
+        }
         this._clearTreeCache();
 
-        // Group by file if requested
+        // Group by file
         const byFile = new Map();
         for (const site of callSites) {
             if (!byFile.has(site.file)) {
@@ -3132,7 +3173,7 @@ class ProjectIndex {
             signature: this.formatSignature(def),
             params: def.params,
             paramsStructured: def.paramsStructured,
-            totalCallSites: calls.length,
+            totalCallSites: callSites.length,
             byFile: Array.from(byFile.entries()).map(([file, sites]) => ({
                 file,
                 count: sites.length,

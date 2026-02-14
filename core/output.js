@@ -562,7 +562,8 @@ function formatTests(tests, name) {
             for (const match of testFile.matches) {
                 const typeLabel = match.matchType === 'test-case' ? '[test]' :
                     match.matchType === 'import' ? '[import]' :
-                    match.matchType === 'call' ? '[call]' : '';
+                    match.matchType === 'call' ? '[call]' :
+                    match.matchType === 'string-ref' ? '[string]' : '[ref]';
                 lines.push(`  ${match.line}: ${typeLabel} ${match.content}`);
             }
             lines.push('');
