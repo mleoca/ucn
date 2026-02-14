@@ -40,9 +40,10 @@ const output = require('../core/output');
 // ============================================================================
 
 const indexCache = new Map(); // projectDir → { index, checkedAt }
-const expandCache = new Map(); // projectDir:symbolName → { items, root }
+const expandCache = new Map(); // projectDir:symbolName → { items, root, symbolName, usedAt }
 const lastContextKey = new Map(); // projectRoot → expandCache key
 const MAX_CACHE_SIZE = 10;
+const MAX_EXPAND_CACHE_SIZE = 50;
 
 function getIndex(projectDir) {
     const absDir = path.resolve(projectDir);
@@ -54,6 +55,7 @@ function getIndex(projectDir) {
 
     // Always check staleness — isCacheStale() is cheap (mtime/size checks)
     if (cached && !cached.index.isCacheStale()) {
+        cached.checkedAt = Date.now(); // True LRU: refresh on access
         return cached.index;
     }
 
@@ -77,7 +79,14 @@ function getIndex(projectDir) {
                 oldestKey = key;
             }
         }
-        if (oldestKey) indexCache.delete(oldestKey);
+        if (oldestKey) {
+            indexCache.delete(oldestKey);
+            // Clean up associated expandCache and lastContextKey entries
+            for (const [key, val] of expandCache) {
+                if (val.root === oldestKey) expandCache.delete(key);
+            }
+            lastContextKey.delete(oldestKey);
+        }
     }
 
     indexCache.set(root, { index, checkedAt: Date.now() });
@@ -270,7 +279,19 @@ server.registerTool(
             const { text, expandable } = output.formatContext(ctx);
             if (expandable.length > 0) {
                 const cacheKey = `${index.root}:${name}`;
-                expandCache.set(cacheKey, { items: expandable, root: index.root, symbolName: name });
+                // LRU eviction for expandCache
+                if (expandCache.size >= MAX_EXPAND_CACHE_SIZE && !expandCache.has(cacheKey)) {
+                    let oldestKey = null;
+                    let oldestTime = Infinity;
+                    for (const [key, val] of expandCache) {
+                        if ((val.usedAt || 0) < oldestTime) {
+                            oldestTime = val.usedAt || 0;
+                            oldestKey = key;
+                        }
+                    }
+                    if (oldestKey) expandCache.delete(oldestKey);
+                }
+                expandCache.set(cacheKey, { items: expandable, root: index.root, symbolName: name, usedAt: Date.now() });
                 lastContextKey.set(index.root, cacheKey);
             }
             return toolResult(text);
@@ -854,12 +875,14 @@ server.registerTool(
 
             if (recentCache && recentCache.items) {
                 // Strict: only expand from the most recent context call
+                recentCache.usedAt = Date.now(); // LRU: refresh on access
                 cachedItemCount = recentCache.items.length;
                 match = recentCache.items.find(i => i.num === item);
             } else {
                 // No recent context — fallback to any cached context for this project
                 for (const [key, cached] of expandCache) {
                     if (cached.root === index.root && cached.items) {
+                        cached.usedAt = Date.now(); // LRU: refresh on access
                         cachedItemCount = Math.max(cachedItemCount, cached.items.length);
                         const found = cached.items.find(i => i.num === item);
                         if (found) { match = found; break; }

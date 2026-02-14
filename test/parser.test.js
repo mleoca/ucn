@@ -9506,5 +9506,338 @@ describe('Regression: F-005 .ucn.json exclude applied to file discovery', () => 
     });
 });
 
+// ============================================================================
+// REGRESSION: F-001 — Exclude filter must use boundary matching
+// ============================================================================
+
+describe('Regression: F-001 matchesFilters boundary matching', () => {
+    it('does not exclude files whose names contain test patterns as substrings', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f001-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+            // Production files that contain test/spec/mock as substrings
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'spectrum.js'),
+                'export function alpha() { return 1; }');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'inspector.js'),
+                'export function inspect() { return 2; }');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'contest.js'),
+                'export function compete() { return 3; }');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'mocker.js'),
+                'export function mockery() { return 4; }');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // With default test exclusions, these should still be found
+            const exclude = ['test', 'spec', 'mock'];
+            const alphaResult = index.find('alpha', { exclude });
+            const inspectResult = index.find('inspect', { exclude });
+            const competeResult = index.find('compete', { exclude });
+            const mockeryResult = index.find('mockery', { exclude });
+
+            assert.ok(alphaResult.length > 0,
+                'alpha in spectrum.js should NOT be excluded by "spec" pattern');
+            assert.ok(inspectResult.length > 0,
+                'inspect in inspector.js should NOT be excluded by "spec" pattern');
+            assert.ok(competeResult.length > 0,
+                'compete in contest.js should NOT be excluded by "test" pattern');
+            assert.ok(mockeryResult.length > 0,
+                'mockery in mocker.js should NOT be excluded by "mock" pattern');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('still excludes real test directories and files', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f001b-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.js'),
+                'export function main() {}');
+
+            // Real test paths that SHOULD be excluded
+            fs.mkdirSync(path.join(tmpDir, 'test'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'test', 'runner.js'),
+                'function runTest() {}');
+            fs.mkdirSync(path.join(tmpDir, 'tests'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'tests', 'unit.js'),
+                'function unitTest() {}');
+            fs.mkdirSync(path.join(tmpDir, 'spec'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'spec', 'helpers.js'),
+                'function specHelper() {}');
+            fs.mkdirSync(path.join(tmpDir, '__tests__'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, '__tests__', 'app.js'),
+                'function appTest() {}');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.test.js'),
+                'function mainTest() {}');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.spec.js'),
+                'function mainSpec() {}');
+            fs.mkdirSync(path.join(tmpDir, 'src', 'test_utils'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'test_utils', 'factory.js'),
+                'function testFactory() {}');
+            fs.mkdirSync(path.join(tmpDir, '__mocks__'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, '__mocks__', 'api.js'),
+                'function mockApi() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const exclude = ['test', 'spec', '__tests__', '__mocks__', 'mock'];
+
+            assert.ok(index.find('main', { exclude }).length > 0,
+                'main in src/ should be found');
+            assert.strictEqual(index.find('runTest', { exclude }).length, 0,
+                'runTest in test/ should be excluded');
+            assert.strictEqual(index.find('unitTest', { exclude }).length, 0,
+                'unitTest in tests/ should be excluded');
+            assert.strictEqual(index.find('specHelper', { exclude }).length, 0,
+                'specHelper in spec/ should be excluded');
+            assert.strictEqual(index.find('appTest', { exclude }).length, 0,
+                'appTest in __tests__/ should be excluded');
+            assert.strictEqual(index.find('mainTest', { exclude }).length, 0,
+                'mainTest in main.test.js should be excluded');
+            assert.strictEqual(index.find('mainSpec', { exclude }).length, 0,
+                'mainSpec in main.spec.js should be excluded');
+            assert.strictEqual(index.find('testFactory', { exclude }).length, 0,
+                'testFactory in test_utils/ should be excluded');
+            assert.strictEqual(index.find('mockApi', { exclude }).length, 0,
+                'mockApi in __mocks__/ should be excluded');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('handles special directory names like src/special/', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f001c-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.mkdirSync(path.join(tmpDir, 'src', 'special'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'special', 'handler.js'),
+                'export function handleSpecial() {}');
+            fs.mkdirSync(path.join(tmpDir, 'src', 'fixtures_data'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'src', 'fixtures_data', 'loader.js'),
+                'export function loadData() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const exclude = ['test', 'spec', 'fixture'];
+
+            assert.ok(index.find('handleSpecial', { exclude }).length > 0,
+                'handleSpecial in src/special/ should NOT be excluded (special != spec)');
+            // fixtures_data starts with 'fixture' + 's' at boundary — SHOULD be excluded
+            assert.strictEqual(index.find('loadData', { exclude }).length, 0,
+                'loadData in fixtures_data/ should be excluded (fixture + s + boundary)');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// REGRESSION: F-002 — Untyped method calls should be uncertain
+// ============================================================================
+
+describe('Regression: F-002 untyped method call uncertainty', () => {
+    it('does not link m.get() to unrelated standalone get() in findCallees', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f002-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'repository.js'),
+                'export function get(id) { return id; }');
+            fs.writeFileSync(path.join(tmpDir, 'app.js'),
+                'export function getIndex(m) { return m.get("k"); }');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Default about() includes methods but not uncertain
+            const result = index.about('getIndex', { includeMethods: true });
+            assert.ok(result && result.found, 'about should return a result');
+
+            const calleeNames = (result.callees.top || []).map(c => c.name);
+            assert.ok(!calleeNames.includes('get'),
+                'repository.get should NOT appear as callee of getIndex (m has no type evidence)');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('still resolves this.method() to same-class method', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f002b-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'service.js'), `
+class Service {
+    get(id) { return id; }
+    getIndex() { return this.get("k"); }
+}
+module.exports = Service;
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const result = index.about('getIndex', { includeMethods: true });
+            assert.ok(result && result.found, 'about should return a result');
+
+            const calleeNames = (result.callees.top || []).map(c => c.name);
+            assert.ok(calleeNames.includes('get'),
+                'this.get() should resolve to same-class Service.get');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('does not link m.get() to unrelated get() in findCallers', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f002c-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'repository.js'),
+                'export function get(id) { return id; }');
+            fs.writeFileSync(path.join(tmpDir, 'app.js'),
+                'export function getIndex(m) { return m.get("k"); }');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // findCallers for 'get' should NOT include getIndex (m.get is uncertain)
+            const callers = index.findCallers('get');
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(!callerNames.includes('getIndex'),
+                'getIndex should NOT be a caller of get (m has no type evidence)');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('preserves Go package method calls (receiver is known import)', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f002d-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/app\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'utils.go'), `package main
+
+func Get(id string) string {
+    return id
+}
+`);
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+import "fmt"
+
+func main() {
+    fmt.Println(Get("hello"))
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // fmt.Println is a package call — fmt is a known import
+            // Get("hello") is a direct call, not a method call — should always work
+            const result = index.about('main');
+            assert.ok(result && result.found, 'about should return a result');
+
+            const calleeNames = (result.callees.top || []).map(c => c.name);
+            assert.ok(calleeNames.includes('Get'),
+                'direct Get() call should appear as callee of main');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('includes untyped method calls when includeUncertain is true', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f002e-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'repository.js'),
+                'export function get(id) { return id; }');
+            fs.writeFileSync(path.join(tmpDir, 'app.js'),
+                'export function getIndex(m) { return m.get("k"); }');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // With includeUncertain, the method call should appear
+            const callees = index.findCallees(
+                { name: 'getIndex', file: path.join(tmpDir, 'app.js'), startLine: 1, endLine: 1 },
+                { includeMethods: true, includeUncertain: true }
+            );
+            const calleeNames = [...callees.values()].map(c => c.name);
+            assert.ok(calleeNames.includes('get'),
+                'with includeUncertain, m.get() should appear as uncertain callee');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// REGRESSION: F-003/F-004 — MCP cache behavior
+// ============================================================================
+
+describe('Regression: F-003 matchesFilters boundary edge cases', () => {
+    it('matchesFilters correctly handles all boundary types', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f003-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'dummy.js'), 'function x() {}');
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const exclude = ['test', 'spec', 'mock', 'fixture'];
+
+            // Should PASS filter (not excluded)
+            assert.ok(index.matchesFilters('src/spectrum.js', { exclude }),
+                'spectrum should not be excluded by spec');
+            assert.ok(index.matchesFilters('src/inspector.js', { exclude }),
+                'inspector should not be excluded by spec');
+            assert.ok(index.matchesFilters('src/contest/handler.js', { exclude }),
+                'contest should not be excluded by test');
+            assert.ok(index.matchesFilters('src/backtester.js', { exclude }),
+                'backtester should not be excluded by test');
+            assert.ok(index.matchesFilters('src/mocker.js', { exclude }),
+                'mocker should not be excluded by mock');
+            assert.ok(index.matchesFilters('lib/distributed.js', { exclude }),
+                'distributed should not be excluded by test');
+            assert.ok(index.matchesFilters('src/testing.js', { exclude }),
+                'testing should not be excluded by test');
+            assert.ok(index.matchesFilters('src/special/handler.js', { exclude }),
+                'special should not be excluded by spec');
+
+            // Should FAIL filter (excluded)
+            assert.ok(!index.matchesFilters('test/runner.js', { exclude }),
+                'test/ should be excluded');
+            assert.ok(!index.matchesFilters('tests/unit.js', { exclude }),
+                'tests/ should be excluded');
+            assert.ok(!index.matchesFilters('spec/helper.js', { exclude }),
+                'spec/ should be excluded');
+            assert.ok(!index.matchesFilters('specs/helper.js', { exclude }),
+                'specs/ should be excluded');
+            assert.ok(!index.matchesFilters('src/file.test.js', { exclude }),
+                'file.test.js should be excluded');
+            assert.ok(!index.matchesFilters('src/file.spec.js', { exclude }),
+                'file.spec.js should be excluded');
+            assert.ok(!index.matchesFilters('src/test_utils/factory.js', { exclude }),
+                'test_utils/ should be excluded');
+            assert.ok(!index.matchesFilters('__tests__/app.js', { exclude }),
+                '__tests__/ should be excluded');
+            assert.ok(!index.matchesFilters('__mocks__/api.js', { exclude: ['mock'] }),
+                '__mocks__/ should be excluded by mock pattern');
+            assert.ok(!index.matchesFilters('src/mock_data.js', { exclude }),
+                'mock_data.js should be excluded');
+            assert.ok(!index.matchesFilters('src/fixtures/data.js', { exclude }),
+                'fixtures/ should be excluded by fixture pattern');
+            assert.ok(!index.matchesFilters('fixture/setup.js', { exclude }),
+                'fixture/ should be excluded');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
