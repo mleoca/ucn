@@ -1,12 +1,200 @@
 # UCN - Universal Code Navigator
 
-AI agents working with large codebases often read entire files just to understand a single function. UCN uses tree-sitter ASTs to extract exactly what you need — functions, callers, callees, dependencies — without wasting context.
+### Understand your codebase without reading every file.
 
-## Examples
+---
 
-**Extract a function** from a large file without reading it:
+## Three Ways to Use UCN
+
+```
+  ┌──────────────────────────────────────────────────────────────────────┐
+  │                                                                      │
+  │   1. CLI                    Use it directly from the terminal.       │
+  │      $ ucn about myFunc     Works standalone, no agent required.     │
+  │                                                                      │
+  │   2. MCP Server             Any MCP-compatible AI agent connects     │
+  │      $ ucn --mcp            and gets 27 tools automatically.         │
+  │                                                                      │
+  │   3. Agent Skill            Drop-in skill for Claude Code and        │
+  │      /ucn about myFunc      OpenAI Codex CLI. No server needed.      │
+  │                                                                      │
+  └──────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## The Problem
+
+Typically, AI agents working with code do something like this:
+
+```
+  grep "functionName"      →  47 matches, 23 files
+       │
+       ▼
+  read file1.ts            →  2000 lines... wrong function
+       │
+       ▼
+  read file2.ts            →  1500 lines... still not it
+       │
+       ▼
+  read file3.ts            →  found it, finally
+       │
+       ▼
+  grep "whoCallsThis"      →  start over
+       │
+       ▼
+  ┌─────────────────────────────────────────┐
+  │  Half the context window is gone.       │
+  │  The agent hasn't changed a single line.│
+  └─────────────────────────────────────────┘
+```
+
+---
+
+## The Solution
+
+UCN parses your code with tree-sitter and gives you 27 semantic navigation tools.
+
+Instead of reading entire files, ask precise questions:
+
+```
+  ┌──────────────────────────────────────┐
+  │                                      │
+  │   "Who calls this function?"         │──→  list of actual callers
+  │                                      │
+  │   "What breaks if I change this?"    │──→  every call site, with arguments
+  │                                      │
+  │   "Show me this function and         │──→  source + dependencies inline
+  │    everything it depends on"         │
+  │                                      │
+  └──────────────────────────────────────┘
+```
+
+Use it from the terminal, as an MCP server for any AI agent, or as a skill for Claude Code and Codex.
+
+---
+
+## How It Works
+
+```
+  ┌──────────────────────────────────────────────┐
+  │              Any AI Agent                    │
+  │  Claude Code · Cursor · Windsurf · Copilot   │
+  └───────────────────────┬──────────────────────┘
+                          │
+                         MCP
+                          │
+                          ▼
+                 ┌───────────────────┐
+                 │   UCN MCP Server  │
+                 │   27 tools        │
+                 │   runs locally    │
+                 └────────┬──────────┘
+                          │
+                    tree-sitter AST
+                          │
+              ┌───────────┼───────────┐
+              │           │           │
+          ┌───┴───┐  ┌────┴────┐  ┌───┴──┐
+          │ JS/TS │  │ Python  │  │  Go  │
+          └───────┘  └─────────┘  └──────┘
+              ┌───────────┼───────────┐
+          ┌───┴───┐              ┌────┴───┐
+          │ Rust  │              │  Java  │
+          └───────┘              └────────┘
+```
+
+No cloud. No API keys. Parses locally, stays local.
+
+---
+
+## Before & After
+
+```
+  WITHOUT UCN                              WITH UCN
+  ──────────────────────                   ──────────────────────
+
+  grep "processOrder"                      ucn_impact "processOrder"
+       │                                        │
+       ▼                                        ▼
+  34 matches, mostly noise                 8 call sites, grouped by file,
+       │                                   with actual arguments passed
+       ▼                                        │
+  read service.ts  (800 lines)                  │
+       │                                        │
+       ▼                                        │
+  read handler.ts  (600 lines)             ucn_smart "processOrder"
+       │                                        │
+       ▼                                        ▼
+  read batch.ts    (400 lines)             function + all dependencies
+       │                                   expanded inline
+       ▼                                        │
+  read orders.test (500 lines)                  │
+       │                                        ▼
+       ▼                                   Done. Full picture.
+  grep "import.*processOrder"              Ready to make the change.
+       │
+       ▼
+  read routes.ts   (300 lines)
+       │
+       ▼
+  ... still not sure about full impact
+
+
+  8+ tool calls                            2 tool calls
+  Reads thousands of lines                 Reads zero full files
+  Context spent on file contents           Context spent on reasoning
+```
+
+---
+
+## grep vs AST
+
+```
+  Code: processOrder(items, user)
+
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  grep "processOrder"                                            │
+  │                                                                 │
+  │    ✓  processOrder(items, user)          ← the actual call      │
+  │    ✗  // TODO: refactor processOrder     ← comment, not a call  │
+  │    ✗  const processOrder = "label"       ← string, not a call   │
+  │    ✗  order.processOrder()               ← different class      │
+  │    ✗  import { processOrder }            ← import, not a call   │
+  │                                                                 │
+  │  5 results. 1 is what you wanted.                               │
+  └─────────────────────────────────────────────────────────────────┘
+
+
+  ┌─────────────────────────────────────────────────────────────────┐
+  │  ucn_context "processOrder"                                     │
+  │                                                                 │
+  │    Callers:                                                     │
+  │      handleCheckout    src/api/checkout.ts:45                   │
+  │      batchProcess      src/workers/batch.ts:12                  │
+  │      runDailyOrders    src/jobs/daily.ts:88                     │
+  │                                                                 │
+  │    Callees:                                                     │
+  │      validateItems     src/orders/validate.ts:20                │
+  │      calculateTotal    src/orders/pricing.ts:55                 │
+  │      saveOrder         src/db/orders.ts:30                      │
+  │                                                                 │
+  │  3 callers, 3 callees. Verified from the AST.                   │
+  └─────────────────────────────────────────────────────────────────┘
+```
+
+The tradeoff: grep works on any language and any text. UCN only works on supported languages but gives you structural understanding within those.
+
+---
+
+## See It in Action
+
+Extract a function from a large file without reading it:
+
 ```
 $ ucn fn expandGlob
+
 core/discovery.js:135
 [ 135- 166] expandGlob(pattern, options = {})
 ────────────────────────────────────────────────────────────
@@ -18,9 +206,11 @@ function expandGlob(pattern, options = {}) {
 }
 ```
 
-**See who calls a function and what it calls:**
+See who calls it and what it calls:
+
 ```
 $ ucn context expandGlob
+
 Context for expandGlob:
 ════════════════════════════════════════════════════════════
 
@@ -38,9 +228,11 @@ CALLEES (2):
   [9] walkDir [utility] - core/discovery.js:227
 ```
 
-**See what breaks if you change a function:**
+See what breaks if you change it:
+
 ```
 $ ucn impact shouldIgnore
+
 Impact analysis for shouldIgnore
 ════════════════════════════════════════════════════════════
 core/discovery.js:289
@@ -60,10 +252,12 @@ core/discovery.js (2 calls)
     args: entry.name, DEFAULT_IGNORES
 ```
 
-**Get a function with all its dependencies inline:**
+Get a function with all its dependencies inline:
+
 ```
 $ ucn smart shouldIgnore
-shouldIgnore (/Users/mihail/ucn/core/discovery.js:289)
+
+shouldIgnore (core/discovery.js:289)
 ════════════════════════════════════════════════════════════
 function shouldIgnore(name, ignores, parentDir) {
     for (const pattern of ignores) {
@@ -85,9 +279,11 @@ function globToRegex(glob) {
 }
 ```
 
-**Trace the call tree:**
+Trace the call tree:
+
 ```
 $ ucn trace expandGlob --depth=2
+
 Call tree for expandGlob
 ════════════════════════════════════════════════════════════
 
@@ -98,9 +294,11 @@ expandGlob
     └── shouldIgnore (core/discovery.js:289) [utility] 1x
 ```
 
-**Find unused code:**
+Find unused code:
+
 ```
 $ ucn deadcode
+
 Dead code: 15 unused symbol(s)
 
 cli/index.js
@@ -111,148 +309,7 @@ core/project.js
 ...
 ```
 
-**See a file's dependencies:**
-```
-$ ucn imports core/project.js
-Imports in core/project.js:
-
-INTERNAL:
-  ./discovery
-    -> core/discovery.js
-    expandGlob, findProjectRoot, detectProjectPattern, isTestFile
-  ./imports
-    -> core/imports.js
-    extractImports, extractExports, resolveImport
-  ./parser
-    -> core/parser.js
-    parseFile
-  ../languages
-    -> languages/index.js
-    detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse
-
-EXTERNAL:
-  fs, path, crypto
-```
-
-## Workflows
-
-**Investigating a bug:**
-```bash
-ucn about problematic_function          # Understand it fully
-ucn trace problematic_function --depth=2  # See what it calls
-```
-
-**Before modifying a function:**
-```bash
-ucn impact the_function                 # Who will break?
-ucn smart the_function                  # See it + its helpers
-# ... make your changes ...
-ucn verify the_function                 # Did all call sites survive?
-```
-
-**Periodic cleanup:**
-```bash
-ucn deadcode --exclude=test             # What can be deleted?
-ucn toc                                 # Project overview
-```
-
-## Supported Languages
-
-JavaScript, TypeScript, Python, Go, Rust, Java
-
-## Usage
-
-```
-UCN - Universal Code Navigator
-
-Supported: JavaScript, TypeScript, Python, Go, Rust, Java
-
-Usage:
-  ucn [command] [args]            Project mode (current directory)
-  ucn <file> [command] [args]     Single file mode
-  ucn <dir> [command] [args]      Project mode (specific directory)
-  ucn "pattern" [command] [args]  Glob pattern mode
-
-═══════════════════════════════════════════════════════════════════════════════
-UNDERSTAND CODE (UCN's strength - semantic analysis)
-═══════════════════════════════════════════════════════════════════════════════
-  about <name>        RECOMMENDED: Full picture (definition, callers, callees, tests, code)
-  context <name>      Who calls this + what it calls (numbered for expand)
-  smart <name>        Function + all dependencies inline
-  impact <name>       What breaks if changed (call sites grouped by file)
-  trace <name>        Call tree visualization (--depth=N)
-
-═══════════════════════════════════════════════════════════════════════════════
-FIND CODE
-═══════════════════════════════════════════════════════════════════════════════
-  find <name>         Find symbol definitions (top 5 by usage count)
-  usages <name>       All usages grouped: definitions, calls, imports, references
-  toc                 Table of contents (compact; --detailed lists all symbols)
-  search <term>       Text search (for simple patterns, consider grep instead)
-  tests <name>        Find test files for a function
-
-═══════════════════════════════════════════════════════════════════════════════
-EXTRACT CODE
-═══════════════════════════════════════════════════════════════════════════════
-  fn <name>           Extract function (--file to disambiguate)
-  class <name>        Extract class
-  lines <range>       Extract line range (e.g., lines 50-100)
-  expand <N>          Show code for item N from context output
-
-═══════════════════════════════════════════════════════════════════════════════
-FILE DEPENDENCIES
-═══════════════════════════════════════════════════════════════════════════════
-  imports <file>      What does file import
-  exporters <file>    Who imports this file
-  file-exports <file> What does file export
-  graph <file>        Full dependency tree (--depth=N)
-
-═══════════════════════════════════════════════════════════════════════════════
-REFACTORING HELPERS
-═══════════════════════════════════════════════════════════════════════════════
-  plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to)
-  verify <name>       Check all call sites match signature
-  deadcode            Find unused functions/classes
-  related <name>      Find similar functions (same file, shared deps)
-
-═══════════════════════════════════════════════════════════════════════════════
-OTHER
-═══════════════════════════════════════════════════════════════════════════════
-  api                 Show exported/public symbols
-  typedef <name>      Find type definitions
-  stats               Project statistics
-  stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
-  example <name>      Best usage example with context
-
-Common Flags:
-  --file <pattern>    Filter by file path (e.g., --file=routes)
-  --exclude=a,b       Exclude patterns (e.g., --exclude=test,mock)
-  --in=<path>         Only in path (e.g., --in=src/core)
-  --depth=N           Trace/graph depth (default: 3)
-  --context=N         Lines of context around matches
-  --json              Machine-readable output
-  --code-only         Filter out comments and strings
-  --with-types        Include type definitions
-  --top=N / --all     Limit or show all results
-  --include-tests     Include test files
-  --include-methods   Include method calls (obj.fn) in caller/callee analysis
-  --include-uncertain Include ambiguous/uncertain call matches
-  --include-exported  Include exported symbols in deadcode
-  --detailed          List all symbols in toc (compact counts by default)
-  --no-cache          Disable caching
-  --clear-cache       Clear cache before running
-  --no-follow-symlinks  Don't follow symbolic links
-  -i, --interactive   Keep index in memory for multiple queries
-  --mcp               Start as MCP server (stdio transport)
-
-Quick Start:
-  ucn toc                             # See project structure (compact)
-  ucn toc --detailed                  # List all functions/classes
-  ucn about handleRequest             # Understand a function
-  ucn impact handleRequest            # Before modifying
-  ucn fn handleRequest --file api     # Extract specific function
-  ucn --interactive                   # Multiple queries
-```
+---
 
 ## Install
 
@@ -260,27 +317,22 @@ Quick Start:
 npm install -g ucn
 ```
 
-### MCP Server
+### As an MCP Server
 
-UCN includes a built-in [MCP](https://modelcontextprotocol.io) server, so any MCP-compatible AI client can use it as a tool. It exposes 27 tools (`ucn_about`, `ucn_context`, `ucn_impact`, `ucn_smart`, `ucn_trace`, `ucn_find`, `ucn_usages`, `ucn_toc`, `ucn_deadcode`, `ucn_fn`, `ucn_class`, `ucn_verify`, `ucn_imports`, `ucn_exporters`, `ucn_tests`, `ucn_related`, `ucn_graph`, `ucn_file_exports`, `ucn_search`, `ucn_plan`, `ucn_typedef`, `ucn_stacktrace`, `ucn_example`, `ucn_expand`, `ucn_lines`, `ucn_api`, `ucn_stats`).
+One-line setup for supported clients:
 
-**One-line setup** (for clients that support it):
+```bash
+# Claude Code
+claude mcp add ucn -- npx -y ucn --mcp
 
-| Client | Command |
-|--------|---------|
-| Claude Code | `claude mcp add ucn -- npx -y ucn --mcp` |
-| OpenAI Codex CLI | `codex mcp add ucn -- npx -y ucn --mcp` |
-| VS Code Copilot | `code --add-mcp '{"name":"ucn","command":"npx","args":["-y","ucn","--mcp"]}'` |
+# OpenAI Codex CLI
+codex mcp add ucn -- npx -y ucn --mcp
 
-**Manual config** — add to the appropriate config file for your client:
+# VS Code Copilot
+code --add-mcp '{"name":"ucn","command":"npx","args":["-y","ucn","--mcp"]}'
+```
 
-| Client | Config file |
-|--------|-------------|
-| Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) |
-| Cursor | `~/.cursor/mcp.json` or `.cursor/mcp.json` in project |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` |
-| Cline | VS Code sidebar > MCP Servers > Configure |
-| Claude Code | `~/.claude/mcp-config.json` |
+Or add to your client's MCP config file manually:
 
 ```json
 {
@@ -294,7 +346,7 @@ UCN includes a built-in [MCP](https://modelcontextprotocol.io) server, so any MC
 ```
 
 <details>
-<summary>VS Code Copilot uses a slightly different format (<code>.vscode/mcp.json</code>)</summary>
+<summary>VS Code Copilot uses a slightly different format (.vscode/mcp.json)</summary>
 
 ```json
 {
@@ -309,32 +361,138 @@ UCN includes a built-in [MCP](https://modelcontextprotocol.io) server, so any MC
 ```
 </details>
 
-### Claude Code Skill (alternative to MCP)
+### As a Claude Code / Codex Skill
+
+When MCP server is not needed, drop it in as a native skill:
 
 ```bash
+# Claude Code
 mkdir -p ~/.claude/skills
-
-# If installed via npm:
 cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.claude/skills/
 
-# If cloned from git:
-git clone https://github.com/mleoca/ucn.git
-cp -r ucn/.claude/skills/ucn ~/.claude/skills/
+# OpenAI Codex CLI
+mkdir -p ~/.agents/skills
+cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
 ```
 
-### Codex Skill (alternative to MCP)
+### As a CLI Tool
+
+Works standalone from the terminal — no agent required:
 
 ```bash
-mkdir -p ~/.agents/skills
-
-# If installed via npm:
-cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
-
-# If cloned from git:
-git clone https://github.com/mleoca/ucn.git
-cp -r ucn/.claude/skills/ucn ~/.agents/skills/
+ucn toc                             # Project overview
+ucn about handleRequest             # Understand a function
+ucn impact handleRequest            # Before modifying
+ucn fn handleRequest --file api     # Extract specific function
+ucn --interactive                   # Multiple queries, index stays in memory
 ```
+
+---
+
+## Workflows
+
+Investigating a bug:
+```bash
+ucn about problematic_function            # Understand it fully
+ucn trace problematic_function --depth=2  # See what it calls
+```
+
+Before modifying a function:
+```bash
+ucn impact the_function                   # Who will break?
+ucn smart the_function                    # See it + its helpers
+# ... make your changes ...
+ucn verify the_function                   # Did all call sites survive?
+```
+
+Periodic cleanup:
+```bash
+ucn deadcode --exclude=test               # What can be deleted?
+ucn toc                                   # Project overview
+```
+
+---
+
+## Limitations (and how we handle them)
+
+```
+  ┌──────────────────────────┬──────────────────────────────────────────┐
+  │  Limitation              │  What happens                            │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │                          │                                          │
+  │  5 languages only        │  JS/TS, Python, Go, Rust, Java.          │
+  │  (no C, Ruby, PHP, etc.) │  Agents fall back to grep for the rest.  │
+  │                          │  UCN complements, doesn't replace.       │
+  │                          │                                          │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │                          │                                          │
+  │  Dynamic dispatch        │  getattr(), reflection, eval() — UCN     │
+  │                          │  does static analysis and can't follow   │
+  │                          │  calls that only exist at runtime.       │
+  │                          │                                          │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │                          │                                          │
+  │  Duck-typed methods      │  obj.method() in JS/TS/Python — when     │
+  │                          │  the receiver type is ambiguous, results │
+  │                          │  are marked "uncertain" so the agent     │
+  │                          │  knows to verify. Go/Rust/Java resolve   │
+  │                          │  with high confidence.                   │
+  │                          │                                          │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │                          │                                          │
+  │  Single project scope    │  UCN follows imports within the project  │
+  │                          │  but stops at the boundary — no tracing  │
+  │                          │  into node_modules or site-packages.     │
+  │                          │                                          │
+  ├──────────────────────────┼──────────────────────────────────────────┤
+  │                          │                                          │
+  │  First-query index time  │  Tree-sitter index is built on first     │
+  │                          │  query. A few seconds on large projects. │
+  │                          │  Cached across subsequent calls.         │
+  │                          │                                          │
+  └──────────────────────────┴──────────────────────────────────────────┘
+```
+
+---
+
+## All 27 Tools
+
+```
+  UNDERSTAND                          MODIFY SAFELY
+  ─────────────────────               ─────────────────────
+  ucn_about     everything in one     ucn_impact   all call sites
+                call: definition,                  with arguments
+                callers, callees,
+                tests, source         ucn_verify   check all sites
+                                                   match signature
+  ucn_context   callers + callees
+                (quick overview)      ucn_plan     preview a refactor
+                                                   before doing it
+  ucn_smart     function + helpers
+                expanded inline
+
+  ucn_trace     call tree — map
+                a whole pipeline
+
+
+  FIND & NAVIGATE                     ARCHITECTURE
+  ─────────────────────               ─────────────────────
+  ucn_find      locate definitions    ucn_imports     file dependencies
+  ucn_usages    all occurrences       ucn_exporters   who depends on it
+  ucn_fn        extract a function    ucn_graph       dependency tree
+  ucn_class     extract a class       ucn_related     sibling functions
+  ucn_toc       project overview      ucn_tests       find tests
+  ucn_deadcode  unused functions      ucn_stacktrace  error trace context
+  ucn_search    text search           ucn_api         public API surface
+  ucn_example   best usage example    ucn_typedef     type definitions
+  ucn_lines     extract line range    ucn_file_exports file's exports
+  ucn_expand    drill into context    ucn_stats       project size stats
+```
+
+---
 
 ## License
 
 MIT
+
+UCN - Universal Code Navigator
