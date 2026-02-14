@@ -1263,6 +1263,10 @@ function formatAbout(about, options = {}) {
         lines.push(`\nSome sections truncated. Use --all to show all.`);
     }
 
+    if (about.includeMethods === false) {
+        lines.push(`\nNote: obj.method() callers/callees excluded (--include-methods=false). Remove flag to include them (default).`);
+    }
+
     return lines.join('\n');
 }
 
@@ -1693,10 +1697,14 @@ function formatSmart(smart, options = {}) {
  * @param {string} [options.exportedHint] - Hint about exported symbols exclusion
  */
 function formatDeadcode(results, options = {}) {
-    if (results.length === 0) return 'No dead code found.';
+    if (results.length === 0 && !results.excludedDecorated && !results.excludedExported) {
+        return 'No dead code found.';
+    }
 
     const lines = [];
-    lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
+    if (results.length > 0) {
+        lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
+    }
 
     let currentFile = null;
     for (const item of results) {
@@ -1717,8 +1725,18 @@ function formatDeadcode(results, options = {}) {
         lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}`);
     }
 
-    if (options.exportedHint) {
-        lines.push(`\n${options.exportedHint}`);
+    // Show counts of excluded items with expansion hints
+    if (results.excludedDecorated > 0) {
+        const decoratedHint = options.decoratedHint || `${results.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.`;
+        lines.push(`\n${decoratedHint}`);
+    }
+    if (results.excludedExported > 0) {
+        const exportedHint = options.exportedHint || `${results.excludedExported} exported symbol(s) hidden. Use --include-exported to include them.`;
+        lines.push(`\n${exportedHint}`);
+    }
+
+    if (results.length === 0 && lines.length === 0) {
+        return 'No dead code found.';
     }
 
     return lines.join('\n');

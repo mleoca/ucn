@@ -2386,6 +2386,8 @@ class ProjectIndex {
      */
     deadcode(options = {}) {
         const results = [];
+        let excludedDecorated = 0;
+        let excludedExported = 0;
 
         // Build usage index once (instead of per-symbol)
         const usageIndex = this.buildUsageIndex();
@@ -2465,6 +2467,27 @@ class ProjectIndex {
                     continue;
                 }
 
+                // Framework registration decorators — excluded by default to reduce noise
+                // Python: decorators with '.' (attribute access) like @router.get, @app.route, @celery.task
+                // Java: non-standard annotations like @Bean, @Scheduled, @GetMapping
+                // These functions are invoked by frameworks, not by user code — AST can't see the call path
+                const javaKeywords = new Set(['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default']);
+                const hasRegistrationDecorator = (() => {
+                    if (lang === 'python') {
+                        const decorators = symbol.decorators || [];
+                        return decorators.some(d => d.includes('.'));
+                    }
+                    if (lang === 'java') {
+                        return mods.some(m => !javaKeywords.has(m));
+                    }
+                    return false;
+                })();
+
+                if (hasRegistrationDecorator && !options.includeDecorated) {
+                    excludedDecorated++;
+                    continue;
+                }
+
                 const isExported = fileEntry && (
                     fileEntry.exports.includes(name) ||
                     mods.includes('export') ||
@@ -2474,6 +2497,7 @@ class ProjectIndex {
 
                 // Skip exported unless requested
                 if (isExported && !options.includeExported) {
+                    excludedExported++;
                     continue;
                 }
 
@@ -2495,8 +2519,7 @@ class ProjectIndex {
                     // Python: symbol.decorators (e.g., ['app.route("/path")', 'login_required'])
                     // Java/Rust/Go: symbol.modifiers may contain annotations (e.g., 'bean', 'scheduled')
                     const decorators = symbol.decorators || [];
-                    // For Java, extract annotation-like modifiers (lowercase single words that aren't standard keywords)
-                    const javaKeywords = new Set(['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default']);
+                    // For Java, extract annotation-like modifiers (javaKeywords defined above)
                     const annotations = lang === 'java'
                         ? mods.filter(m => !javaKeywords.has(m))
                         : [];
@@ -2521,6 +2544,10 @@ class ProjectIndex {
             if (a.file !== b.file) return a.file.localeCompare(b.file);
             return a.startLine - b.startLine;
         });
+
+        // Attach exclusion counts as array properties (backwards-compatible)
+        results.excludedDecorated = excludedDecorated;
+        results.excludedExported = excludedExported;
 
         return results;
     }
@@ -3713,6 +3740,7 @@ class ProjectIndex {
     about(name, options = {}) {
         const maxCallers = options.all ? Infinity : (options.maxCallers || 5);
         const maxCallees = options.all ? Infinity : (options.maxCallees || 5);
+        const includeMethods = options.includeMethods ?? true;
 
         // Find symbol definition(s)
         const definitions = this.find(name, { exact: true, file: options.file });
@@ -3760,7 +3788,7 @@ class ProjectIndex {
         let allCallers = null;
         let allCallees = null;
         if (primary.type === 'function' || primary.params !== undefined) {
-            allCallers = this.findCallers(symbolName);
+            allCallers = this.findCallers(symbolName, { includeMethods });
             callers = allCallers.slice(0, maxCallers).map(c => ({
                 file: c.relativePath,
                 line: c.line,
@@ -3768,7 +3796,7 @@ class ProjectIndex {
                 callerName: c.callerName
             }));
 
-            allCallees = this.findCallees(primary);
+            allCallees = this.findCallees(primary, { includeMethods });
             callees = allCallees.slice(0, maxCallees).map(c => ({
                 name: c.name,
                 file: c.relativePath,
@@ -3847,6 +3875,7 @@ class ProjectIndex {
             })),
             types,
             code,
+            includeMethods,
             completeness: this.detectCompleteness()
         };
 
