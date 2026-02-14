@@ -1716,6 +1716,9 @@ Common Flags:
   --include-uncertain Include ambiguous/uncertain matches
   --include-exported  Include exported symbols in deadcode
   --include-decorated Include decorated/annotated symbols in deadcode
+  --exact             Exact name match only (find)
+  --calls-only        Only show call/test-case matches (tests)
+  --case-sensitive    Case-sensitive text search (search)
   --detailed          List all symbols in toc (compact by default)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
