@@ -1,6 +1,6 @@
 {
   "name": "ucn",
-  "version": "3.6.0",
+  "version": "3.6.1",
   "description": "Universal Code Navigator — function relationships, call trees, and impact analysis across large codebases without reading entire files.",
   "main": "index.js",
   "bin": {
@@ -8,7 +8,7 @@
     "ucn-mcp": "mcp/server.js"
   },
   "scripts": {
-    "test": "node --test test/parser.test.js"
+    "test": "node --test test/parser.test.js test/accuracy.test.js test/systematic-test.js test/mcp-edge-cases.js"
   },
   "keywords": [
     "code-navigation",

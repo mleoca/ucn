@@ -840,7 +840,8 @@ function runProjectCommand(rootDir, command, arg) {
                 addParam: flags.addParam,
                 removeParam: flags.removeParam,
                 renameTo: flags.renameTo,
-                defaultValue: flags.defaultValue
+                defaultValue: flags.defaultValue,
+                file: flags.file
             });
             printOutput(planResult, r => JSON.stringify(r, null, 2), output.formatPlan);
             break;
@@ -1790,7 +1791,7 @@ Commands:
 
         if (input === 'rebuild') {
             console.log('Rebuilding index...');
-            index.build(null, { quiet: true });
+            index.build(null, { quiet: true, forceRebuild: true });
             console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
             rl.prompt();
             return;

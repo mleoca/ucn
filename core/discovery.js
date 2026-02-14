@@ -68,7 +68,7 @@ const CONDITIONAL_IGNORES = {
 // Project root markers
 const PROJECT_MARKERS = [
     '.git',
-    '.ucn.js',
+    '.ucn.json',
     'package.json',
     'pyproject.toml',
     'setup.py',

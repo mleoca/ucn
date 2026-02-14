@@ -9189,5 +9189,322 @@ class Service:
 
 }); // end describe('Reliability Hints')
 
+// ==========================================
+// Regression tests for production readiness fixes (2026-02-14)
+// ==========================================
+
+describe('Production readiness fixes', () => {
+
+    it('plan() uses resolveSymbol to pick source over test file', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-plan-resolve-'));
+        try {
+            // Create two files with same function name - one test, one source
+            fs.writeFileSync(path.join(tmpDir, 'utils.test.js'), `
+function process(x) { return x + 1; }
+module.exports = { process };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'utils.js'), `
+function process(x, y) { return x + y; }
+module.exports = { process };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+const { process } = require('./utils');
+process(1, 2);
+`);
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const plan = index.plan('process', { renameTo: 'compute' });
+            assert.ok(plan.found, 'Should find the function');
+            // resolveSymbol should pick source file (utils.js) over test file (utils.test.js)
+            assert.ok(plan.file.includes('utils.js') && !plan.file.includes('test'),
+                `Should pick source file, got: ${plan.file}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('plan() respects --file disambiguation', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-plan-file-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'alpha.js'), `
+function doWork(a) { return a; }
+module.exports = { doWork };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'beta.js'), `
+function doWork(a, b) { return a + b; }
+module.exports = { doWork };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const plan = index.plan('doWork', { renameTo: 'doTask', file: 'beta' });
+            assert.ok(plan.found, 'Should find the function');
+            assert.ok(plan.file.includes('beta'), `Should pick beta.js, got: ${plan.file}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('.ucn.json config is loaded correctly', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-json-config-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, '.ucn.json'), JSON.stringify({
+                aliases: { '@': './src' }
+            }));
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'index.js'), 'function main() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            assert.deepStrictEqual(index.config.aliases, { '@': './src' },
+                'Should load aliases from .ucn.json');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('completeness detection counts all dynamic patterns additively', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-completeness-'));
+        try {
+            // File with multiple dynamic pattern types
+            fs.writeFileSync(path.join(tmpDir, 'dynamic.js'), `
+const mod = 'fs';
+import(mod);
+require(mod);
+const x = eval('1+1');
+const fn = new Function('return 1');
+`);
+            fs.writeFileSync(path.join(tmpDir, 'reflect.py'), `
+x = getattr(obj, 'method')
+y = hasattr(obj, 'method')
+`);
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.{js,py}', { quiet: true });
+
+            const completeness = index.detectCompleteness();
+            assert.ok(!completeness.complete, 'Should not be complete');
+
+            const dynamicWarn = completeness.warnings.find(w => w.type === 'dynamic_imports');
+            assert.ok(dynamicWarn, 'Should have dynamic_imports warning');
+            assert.ok(dynamicWarn.count >= 2,
+                `Should count both import() and require() independently, got: ${dynamicWarn.count}`);
+
+            const evalWarn = completeness.warnings.find(w => w.type === 'eval');
+            assert.ok(evalWarn, 'Should have eval warning');
+            assert.ok(evalWarn.count >= 2,
+                `Should count both eval() and new Function() independently, got: ${evalWarn.count}`);
+
+            const reflectWarn = completeness.warnings.find(w => w.type === 'reflection');
+            assert.ok(reflectWarn, 'Should have reflection warning');
+            assert.ok(reflectWarn.count >= 2,
+                `Should count both getattr() and hasattr() independently, got: ${reflectWarn.count}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+});
+
+// ============================================================================
+// Regression: Production Trust Audit fixes (2026-02-14)
+// ============================================================================
+
+describe('Regression: F-001 stale rebuild removes deleted file symbols', () => {
+    it('build with forceRebuild removes symbols from deleted files', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f001-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'main.js'), 'function main() {}');
+            fs.writeFileSync(path.join(tmpDir, 'helper.js'), 'function ghost() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            assert.ok(index.symbols.has('ghost'), 'ghost should exist before delete');
+            assert.ok(index.symbols.has('main'), 'main should exist');
+
+            // Delete the file
+            fs.unlinkSync(path.join(tmpDir, 'helper.js'));
+
+            // Rebuild WITHOUT forceRebuild — ghost should persist (the bug)
+            index.build(null, { quiet: true });
+            const ghostAfterNoForce = index.symbols.has('ghost');
+
+            // Rebuild WITH forceRebuild — ghost should be gone (the fix)
+            index.build(null, { quiet: true, forceRebuild: true });
+            assert.ok(!index.symbols.has('ghost'),
+                'ghost symbol should be removed after forceRebuild');
+            assert.ok(index.symbols.has('main'),
+                'main should still exist after forceRebuild');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: F-003 completeness cache invalidated on rebuild', () => {
+    it('detectCompleteness returns fresh result after rebuild', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f003-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'clean.js'), 'function clean() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            const first = index.detectCompleteness();
+            assert.ok(first.complete, 'Should be complete initially (no dynamic patterns)');
+
+            // Add a file with eval
+            fs.writeFileSync(path.join(tmpDir, 'dirty.js'), 'const x = eval("1+1");');
+            index.build(null, { quiet: true, forceRebuild: true });
+
+            const second = index.detectCompleteness();
+            assert.ok(!second.complete,
+                'Should NOT be complete after adding eval — cache must be invalidated on rebuild');
+            assert.ok(second.warnings.some(w => w.type === 'eval'),
+                'Should have eval warning after rebuild');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: F-004 expand scoped to last context call', () => {
+    it('context for different symbols produces independent expandable items', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f004-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function alpha() { beta(); }
+function beta() { gamma(); }
+function gamma() {}
+`);
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), `
+function delta() { epsilon(); }
+function epsilon() {}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+            const output = require('../core/output');
+
+            // Call context for 'alpha'
+            const ctxAlpha = index.context('alpha', {});
+            const fmtAlpha = output.formatContext(ctxAlpha);
+
+            // Call context for 'delta'
+            const ctxDelta = index.context('delta', {});
+            const fmtDelta = output.formatContext(ctxDelta);
+
+            // Both should have expandable items
+            assert.ok(fmtAlpha.expandable.length > 0, 'alpha context should have expandable items');
+            assert.ok(fmtDelta.expandable.length > 0, 'delta context should have expandable items');
+
+            // Items start at 1 for each context call — they overlap in numbering
+            assert.strictEqual(fmtAlpha.expandable[0].num, 1);
+            assert.strictEqual(fmtDelta.expandable[0].num, 1);
+
+            // But they reference different symbols
+            const alphaNames = fmtAlpha.expandable.map(e => e.name);
+            const deltaNames = fmtDelta.expandable.map(e => e.name);
+            assert.ok(!alphaNames.includes('epsilon'), 'alpha expandable should not include epsilon');
+            assert.ok(!deltaNames.includes('beta'), 'delta expandable should not include beta');
+
+            // Simulate the MCP lastContextKey logic:
+            // The last context call was for 'delta', so expand should prefer delta's items
+            const expandCache = new Map();
+            const lastContextKey = new Map();
+            const root = index.root;
+
+            const keyAlpha = `${root}:alpha`;
+            const keyDelta = `${root}:delta`;
+            expandCache.set(keyAlpha, { items: fmtAlpha.expandable, root, symbolName: 'alpha' });
+            lastContextKey.set(root, keyAlpha);
+            expandCache.set(keyDelta, { items: fmtDelta.expandable, root, symbolName: 'delta' });
+            lastContextKey.set(root, keyDelta);
+
+            // Expand item 1 should come from delta (last context), not alpha
+            const recentKey = lastContextKey.get(root);
+            const recentCache = expandCache.get(recentKey);
+            const match = recentCache.items.find(i => i.num === 1);
+            assert.ok(match, 'Should find item 1 in recent context');
+            assert.ok(deltaNames.includes(match.name),
+                `Item 1 should be from delta context (got ${match.name}), not alpha`);
+
+            // When recent context exists, items NOT in it should NOT fall back to older caches
+            // alpha has more items than delta — item beyond delta's range must not resolve from alpha
+            const maxDeltaItem = Math.max(...fmtDelta.expandable.map(i => i.num));
+            const beyondRange = maxDeltaItem + 10;
+            const fallbackMatch = recentCache.items.find(i => i.num === beyondRange);
+            assert.strictEqual(fallbackMatch, undefined,
+                `Item ${beyondRange} should NOT be found — strict scoping means no fallback to alpha's cache`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: F-005 .ucn.json exclude applied to file discovery', () => {
+    it('files in excluded directories are not indexed', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f005-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, '.ucn.json'), JSON.stringify({
+                exclude: ['vendor', 'generated']
+            }));
+            fs.writeFileSync(path.join(tmpDir, 'main.js'), 'function main() {}');
+
+            fs.mkdirSync(path.join(tmpDir, 'vendor'));
+            fs.writeFileSync(path.join(tmpDir, 'vendor', 'lib.js'), 'function vendorFn() {}');
+
+            fs.mkdirSync(path.join(tmpDir, 'generated'));
+            fs.writeFileSync(path.join(tmpDir, 'generated', 'auto.js'), 'function autoFn() {}');
+
+            fs.mkdirSync(path.join(tmpDir, 'src'));
+            fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), 'function appFn() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            assert.ok(index.symbols.has('main'), 'main should be indexed');
+            assert.ok(index.symbols.has('appFn'), 'appFn should be indexed');
+            assert.ok(!index.symbols.has('vendorFn'),
+                'vendorFn should NOT be indexed (vendor is excluded)');
+            assert.ok(!index.symbols.has('autoFn'),
+                'autoFn should NOT be indexed (generated is excluded)');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('exclude config does not affect indexing when not set', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-f005b-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+            fs.writeFileSync(path.join(tmpDir, 'main.js'), 'function main() {}');
+
+            fs.mkdirSync(path.join(tmpDir, 'vendor'));
+            fs.writeFileSync(path.join(tmpDir, 'vendor', 'lib.js'), 'function vendorFn() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // Without .ucn.json exclude, vendor IS indexed (it's not in DEFAULT_IGNORES)
+            assert.ok(index.symbols.has('main'), 'main should be indexed');
+            assert.ok(index.symbols.has('vendorFn'),
+                'vendorFn should be indexed when no exclude config');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

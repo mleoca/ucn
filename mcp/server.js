@@ -41,8 +41,8 @@ const output = require('../core/output');
 
 const indexCache = new Map(); // projectDir → { index, checkedAt }
 const expandCache = new Map(); // projectDir:symbolName → { items, root }
+const lastContextKey = new Map(); // projectRoot → expandCache key
 const MAX_CACHE_SIZE = 10;
-const STALE_CHECK_INTERVAL = 30000; // 30s
 
 function getIndex(projectDir) {
     const absDir = path.resolve(projectDir);
@@ -52,24 +52,18 @@ function getIndex(projectDir) {
     const root = findProjectRoot(absDir);
     const cached = indexCache.get(root);
 
-    if (cached && (Date.now() - cached.checkedAt < STALE_CHECK_INTERVAL)) {
+    // Always check staleness — isCacheStale() is cheap (mtime/size checks)
+    if (cached && !cached.index.isCacheStale()) {
         return cached.index;
     }
 
-    if (cached) {
-        if (!cached.index.isCacheStale()) {
-            cached.checkedAt = Date.now();
-            return cached.index;
-        }
-    }
-
-    // Build new index
+    // Build new index (or rebuild stale one)
     const index = new ProjectIndex(root);
     const loaded = index.loadCache();
     if (loaded && !index.isCacheStale()) {
-        // Cache is fresh
+        // Disk cache is fresh
     } else {
-        index.build(null, { quiet: true });
+        index.build(null, { quiet: true, forceRebuild: loaded });
         index.saveCache();
     }
 
@@ -275,7 +269,9 @@ server.registerTool(
             });
             const { text, expandable } = output.formatContext(ctx);
             if (expandable.length > 0) {
-                expandCache.set(`${index.root}:${name}`, { items: expandable, root: index.root, symbolName: name });
+                const cacheKey = `${index.root}:${name}`;
+                expandCache.set(cacheKey, { items: expandable, root: index.root, symbolName: name });
+                lastContextKey.set(index.root, cacheKey);
             }
             return toolResult(text);
         } catch (e) {
@@ -738,13 +734,14 @@ server.registerTool(
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
+            file: fileParam,
             add_param: z.string().optional().describe('Parameter name to add'),
             remove_param: z.string().optional().describe('Parameter name to remove'),
             rename_to: z.string().optional().describe('New function name'),
             default_value: z.string().optional().describe('Default value for added parameter (makes change backward-compatible)')
         })
     },
-    async ({ project_dir, name, add_param, remove_param, rename_to, default_value }) => {
+    async ({ project_dir, name, file, add_param, remove_param, rename_to, default_value }) => {
         const err = requireName(name);
         if (err) return err;
         if (!add_param && !remove_param && !rename_to) {
@@ -756,7 +753,8 @@ server.registerTool(
                 addParam: add_param,
                 removeParam: remove_param,
                 renameTo: rename_to,
-                defaultValue: default_value
+                defaultValue: default_value,
+                file
             });
             return toolResult(output.formatPlan(result));
         } catch (e) {
@@ -847,21 +845,34 @@ server.registerTool(
     async ({ project_dir, item }) => {
         try {
             const index = getIndex(project_dir);
-            // Search all cache entries for this project root to find the item
+            // Look up from the most recent context call for this project
+            const recentKey = lastContextKey.get(index.root);
+            const recentCache = recentKey ? expandCache.get(recentKey) : null;
+
             let match = null;
             let cachedItemCount = 0;
-            for (const [key, cached] of expandCache) {
-                if (cached.root === index.root && cached.items) {
-                    cachedItemCount = Math.max(cachedItemCount, cached.items.length);
-                    const found = cached.items.find(i => i.num === item);
-                    if (found) { match = found; break; }
+
+            if (recentCache && recentCache.items) {
+                // Strict: only expand from the most recent context call
+                cachedItemCount = recentCache.items.length;
+                match = recentCache.items.find(i => i.num === item);
+            } else {
+                // No recent context — fallback to any cached context for this project
+                for (const [key, cached] of expandCache) {
+                    if (cached.root === index.root && cached.items) {
+                        cachedItemCount = Math.max(cachedItemCount, cached.items.length);
+                        const found = cached.items.find(i => i.num === item);
+                        if (found) { match = found; break; }
+                    }
                 }
             }
+
             if (!match && cachedItemCount === 0) {
                 return toolError('No expandable items found. Run ucn_context first to get numbered items.');
             }
             if (!match) {
-                return toolError(`Item ${item} not found. Available items: 1-${cachedItemCount}`);
+                const scopeHint = recentCache ? ` (from last ucn_context for "${recentCache.symbolName}")` : '';
+                return toolError(`Item ${item} not found${scopeHint}. Available items: 1-${cachedItemCount}`);
             }
 
             const filePath = match.file || (index.root && match.relativePath ? path.join(index.root, match.relativePath) : null);

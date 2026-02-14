@@ -49,14 +49,13 @@ class ProjectIndex {
     }
 
     /**
-     * Load .ucn.js config if present
+     * Load .ucn.json config if present (data-only, no code execution)
      */
     loadConfig() {
-        const configPath = path.join(this.root, '.ucn.js');
-        if (fs.existsSync(configPath)) {
+        const jsonPath = path.join(this.root, '.ucn.json');
+        if (fs.existsSync(jsonPath)) {
             try {
-                delete require.cache[require.resolve(configPath)];
-                return require(configPath);
+                return JSON.parse(fs.readFileSync(jsonPath, 'utf-8'));
             } catch (e) {
                 // Config load failed, use defaults
             }
@@ -78,11 +77,18 @@ class ProjectIndex {
             pattern = detectProjectPattern(this.root);
         }
 
-        const files = expandGlob(pattern, {
+        const globOpts = {
             root: this.root,
             maxFiles: options.maxFiles || 10000,
             followSymlinks: options.followSymlinks
-        });
+        };
+
+        // Merge .ucn.json exclude into file discovery
+        if (this.config.exclude && this.config.exclude.length > 0) {
+            globOpts.ignores = [...require('./discovery').DEFAULT_IGNORES, ...this.config.exclude];
+        }
+
+        const files = expandGlob(pattern, globOpts);
 
         if (!quiet) {
             console.error(`Indexing ${files.length} files in ${this.root}...`);
@@ -94,6 +100,9 @@ class ProjectIndex {
             this.importGraph.clear();
             this.exportGraph.clear();
         }
+
+        // Always invalidate completeness cache on rebuild
+        this._completenessCache = null;
 
         let indexed = 0;
         for (const file of files) {
@@ -2669,27 +2678,18 @@ class ProjectIndex {
                 const content = fs.readFileSync(filePath, 'utf-8');
 
                 // Dynamic imports: import(), require(variable), __import__
-                const dynamicMatches = content.match(/import\s*\([^'"]/g) ||
-                    content.match(/require\s*\([^'"]/g) ||
-                    content.match(/__import__\s*\(/g);
-                if (dynamicMatches) {
-                    dynamicImports += dynamicMatches.length;
-                }
+                dynamicImports += (content.match(/import\s*\([^'"]/g) || []).length;
+                dynamicImports += (content.match(/require\s*\([^'"]/g) || []).length;
+                dynamicImports += (content.match(/__import__\s*\(/g) || []).length;
 
-                // eval, Function constructor, exec (but not exec in comments/strings context)
-                const evalMatches = content.match(/[^a-zA-Z_]eval\s*\(/g) ||
-                    content.match(/new\s+Function\s*\(/g);
-                if (evalMatches) {
-                    evalUsage += evalMatches.length;
-                }
+                // eval, Function constructor
+                evalUsage += (content.match(/(^|[^a-zA-Z_])eval\s*\(/gm) || []).length;
+                evalUsage += (content.match(/new\s+Function\s*\(/g) || []).length;
 
                 // Reflection: getattr, hasattr, Reflect
-                const reflectMatches = content.match(/\bgetattr\s*\(/g) ||
-                    content.match(/\bhasattr\s*\(/g) ||
-                    content.match(/\bReflect\./g);
-                if (reflectMatches) {
-                    reflectionUsage += reflectMatches.length;
-                }
+                reflectionUsage += (content.match(/\bgetattr\s*\(/g) || []).length;
+                reflectionUsage += (content.match(/\bhasattr\s*\(/g) || []).length;
+                reflectionUsage += (content.match(/\bReflect\./g) || []).length;
             } catch (e) {
                 // Skip unreadable files
             }
@@ -3052,8 +3052,9 @@ class ProjectIndex {
             return { found: false, function: name };
         }
 
-        const def = definitions[0];
-        const impact = this.impact(name);
+        const resolved = this.resolveSymbol(name, { file: options.file });
+        const def = resolved.def || definitions[0];
+        const impact = this.impact(name, { file: options.file });
         const currentParams = def.paramsStructured || [];
         const currentSignature = this.formatSignature(def);
 
