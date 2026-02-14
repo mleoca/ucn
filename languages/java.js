@@ -504,7 +504,7 @@ function findStateObjects(code, parser) {
                             const name = nameNode.text;
                             if (statePattern.test(name)) {
                                 const { startLine, endLine } = nodeToLocation(node, code);
-                                objects.push({ name, startLine, endLine });
+                                objects.push({ name, startLine, endLine, modifiers });
                             }
                         }
                     }

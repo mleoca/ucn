@@ -150,8 +150,19 @@ function parseRustParam(param, info) {
 
 function parseJavaParam(param, info) {
     if (param.type === 'formal_parameter' || param.type === 'spread_parameter') {
-        const nameNode = param.childForFieldName('name');
+        let nameNode = param.childForFieldName('name');
         const typeNode = param.childForFieldName('type');
+        // Java varargs: spread_parameter wraps name in variable_declarator
+        // e.g., `String... args` → spread_parameter > variable_declarator > identifier
+        if (!nameNode && param.type === 'spread_parameter') {
+            for (let i = 0; i < param.namedChildCount; i++) {
+                const child = param.namedChild(i);
+                if (child.type === 'variable_declarator') {
+                    nameNode = child.childForFieldName('name');
+                    break;
+                }
+            }
+        }
         if (nameNode) info.name = nameNode.text;
         if (typeNode) info.type = typeNode.text;
         if (param.type === 'spread_parameter') info.rest = true;

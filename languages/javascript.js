@@ -1331,6 +1331,38 @@ function findImportsInCode(code, parser) {
             return true;
         }
 
+        // Re-export statements: export { X } from './module' or export * from './module'
+        // These are implicit imports that must be tracked for dependency resolution
+        if (node.type === 'export_statement') {
+            let source = null;
+            const names = [];
+
+            // Find the source module (string node with 'from')
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'string') {
+                    source = child.text.slice(1, -1);
+                }
+                if (child.type === 'export_clause') {
+                    for (let j = 0; j < child.namedChildCount; j++) {
+                        const specifier = child.namedChild(j);
+                        if (specifier.type === 'export_specifier') {
+                            const nameNode = specifier.namedChild(0);
+                            if (nameNode) names.push(nameNode.text);
+                        }
+                    }
+                }
+            }
+
+            if (source) {
+                const line = node.startPosition.row + 1;
+                const isStarReExport = node.text.includes('export *');
+                const importType = isStarReExport ? 'namespace' : 'named';
+                imports.push({ module: source, names, type: importType, line, isReExport: true });
+            }
+            return true;
+        }
+
         // CommonJS require() calls
         if (node.type === 'call_expression') {
             const funcNode = node.childForFieldName('function');

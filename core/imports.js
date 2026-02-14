@@ -94,19 +94,28 @@ function resolveImport(importPath, fromFile, config = {}) {
         // Check tsconfig paths (JS/TS only)
         if (config.language === 'javascript' || config.language === 'typescript' || config.language === 'tsx') {
             const tsconfig = findTsConfig(fromDir, config.root);
-            if (tsconfig && tsconfig.compiledPaths) {
-                // Use pre-compiled regex patterns from cache
-                for (const { regex, targets } of tsconfig.compiledPaths) {
-                    const match = importPath.match(regex);
-                    if (match) {
-                        for (const target of targets) {
-                            const resolved = target.replace('*', match[1] || '');
-                            const basePath = tsconfig.baseUrl || path.dirname(tsconfig.configPath);
-                            const fullPath = path.join(basePath, resolved);
-                            const result = resolveFilePath(fullPath, config.extensions || getExtensions(config.language));
-                            if (result) return result;
+            if (tsconfig) {
+                if (tsconfig.compiledPaths) {
+                    // Use pre-compiled regex patterns from cache
+                    for (const { regex, targets } of tsconfig.compiledPaths) {
+                        const match = importPath.match(regex);
+                        if (match) {
+                            for (const target of targets) {
+                                const resolved = target.replace('*', match[1] || '');
+                                const basePath = tsconfig.baseUrl || path.dirname(tsconfig.configPath);
+                                const fullPath = path.join(basePath, resolved);
+                                const result = resolveFilePath(fullPath, config.extensions || getExtensions(config.language));
+                                if (result) return result;
+                            }
                         }
                     }
+                }
+                // Fallback: resolve non-relative import directly from baseUrl
+                // e.g., import 'services/user' with baseUrl='src' -> src/services/user
+                if (tsconfig.baseUrl) {
+                    const fullPath = path.join(tsconfig.baseUrl, importPath);
+                    const result = resolveFilePath(fullPath, config.extensions || getExtensions(config.language));
+                    if (result) return result;
                 }
             }
         }
@@ -422,27 +431,7 @@ function findTsConfig(fromDir, rootDir) {
         const tsconfigPath = path.join(currentDir, 'tsconfig.json');
         if (fs.existsSync(tsconfigPath)) {
             try {
-                const content = fs.readFileSync(tsconfigPath, 'utf-8');
-                const cleanJson = stripJsonComments(content);
-                const config = JSON.parse(cleanJson);
-
-                const paths = config.compilerOptions?.paths || {};
-                // Pre-compile regex patterns for path aliases to avoid repeated compilation
-                const compiledPaths = Object.entries(paths).map(([pattern, targets]) => ({
-                    pattern,
-                    regex: new RegExp('^' + pattern.replace('*', '(.*)') + '$'),
-                    targets
-                }));
-
-                const result = {
-                    configPath: tsconfigPath,
-                    baseUrl: config.compilerOptions?.baseUrl
-                        ? path.resolve(path.dirname(tsconfigPath), config.compilerOptions.baseUrl)
-                        : null,
-                    paths,
-                    compiledPaths
-                };
-
+                const result = loadTsConfig(tsconfigPath);
                 tsconfigCache.set(cacheKey, result);
                 return result;
             } catch (e) {
@@ -458,6 +447,70 @@ function findTsConfig(fromDir, rootDir) {
 
     tsconfigCache.set(cacheKey, null);
     return null;
+}
+
+/**
+ * Load and parse a tsconfig.json, following "extends" chains
+ */
+function loadTsConfig(tsconfigPath, visited) {
+    if (!visited) visited = new Set();
+    if (visited.has(tsconfigPath)) return null; // prevent circular extends
+    visited.add(tsconfigPath);
+
+    const content = fs.readFileSync(tsconfigPath, 'utf-8');
+    const cleanJson = stripJsonComments(content);
+    const config = JSON.parse(cleanJson);
+    const configDir = path.dirname(tsconfigPath);
+
+    // Merge with base config if "extends" is present
+    let basePaths = {};
+    let baseUrl = null;
+    if (config.extends) {
+        const extendsList = Array.isArray(config.extends) ? config.extends : [config.extends];
+        for (const ext of extendsList) {
+            let basePath;
+            if (ext.startsWith('.')) {
+                basePath = path.resolve(configDir, ext);
+            } else {
+                // node_modules package (e.g., "@tsconfig/node20/tsconfig.json")
+                try {
+                    basePath = require.resolve(ext, { paths: [configDir] });
+                } catch {
+                    continue;
+                }
+            }
+            // Add .json extension if not present
+            if (!basePath.endsWith('.json')) basePath += '.json';
+            if (fs.existsSync(basePath)) {
+                try {
+                    const baseResult = loadTsConfig(basePath, visited);
+                    if (baseResult) {
+                        basePaths = { ...basePaths, ...baseResult.paths };
+                        if (baseResult.baseUrl) baseUrl = baseResult.baseUrl;
+                    }
+                } catch {
+                    // Skip malformed base config
+                }
+            }
+        }
+    }
+
+    // Child config values override base config
+    const mergedPaths = { ...basePaths, ...(config.compilerOptions?.paths || {}) };
+    const compiledPaths = Object.entries(mergedPaths).map(([pattern, targets]) => ({
+        pattern,
+        regex: new RegExp('^' + pattern.replace('*', '(.*)') + '$'),
+        targets
+    }));
+
+    return {
+        configPath: tsconfigPath,
+        baseUrl: config.compilerOptions?.baseUrl
+            ? path.resolve(configDir, config.compilerOptions.baseUrl)
+            : baseUrl,
+        paths: mergedPaths,
+        compiledPaths
+    };
 }
 
 /**
