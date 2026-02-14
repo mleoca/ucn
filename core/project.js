@@ -389,13 +389,15 @@ class ProjectIndex {
      */
     matchesFilters(filePath, filters = {}) {
         // Check exclusions (patterns like 'test', 'mock', 'spec')
-        // Uses path-segment boundary matching to avoid false positives
-        // (e.g. 'test' should NOT match 'backtester', but should match 'tests/', 'test_foo', '_test.')
+        // Requires the pattern to be bounded on BOTH sides by path separators (/, ., _, -)
+        // or start/end of string, with optional plural 's' suffix.
+        // e.g. 'test' matches 'tests/', 'test_foo', '_test.', but NOT 'backtester' or 'contest'
+        // e.g. 'spec' matches 'spec/', 'file.spec.js', but NOT 'spectrum' or 'inspector'
         if (filters.exclude && filters.exclude.length > 0) {
             const lowerPath = filePath.toLowerCase();
             for (const pattern of filters.exclude) {
                 const escaped = pattern.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                const regex = new RegExp(`(^|/)${escaped}|[_.\\-]${escaped}([_.\\-/]|$)`);
+                const regex = new RegExp(`(^|[/._\\-])${escaped}s?([/._\\-]|$)`);
                 if (regex.test(lowerPath)) {
                     return false;
                 }
@@ -1126,6 +1128,19 @@ class ProjectIndex {
                         } else if (bindings.length !== 0) {
                             isUncertain = true;
                         }
+                        // Method call with no binding for the method name (JS/TS/Python only):
+                        // Mark uncertain unless receiver has binding evidence in file scope.
+                        // Go/Java/Rust excluded: callers are used for impact analysis where
+                        // over-reporting is preferred to losing callers. These languages' nominal
+                        // type systems also make method links more reliable.
+                        if (bindings.length === 0 && call.isMethod &&
+                            fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
+                            const hasReceiverEvidence = call.receiver &&
+                                (fileEntry.bindings || []).some(b => b.name === call.receiver);
+                            if (!hasReceiverEvidence) {
+                                isUncertain = true;
+                            }
+                        }
                     }
 
                     // Smart method call handling — do this BEFORE uncertain check so
@@ -1387,11 +1402,26 @@ class ProjectIndex {
                             }
                         }
                     }
-                    // If still no binding and call is a method call with multiple definitions, mark uncertain
+                    // Method call with no binding for the method name:
+                    // Different strategies by language family:
                     if (bindings.length === 0 && call.isMethod) {
-                        const defs = this.symbols.get(call.name);
-                        if (defs && defs.length > 1) {
-                            isUncertain = true;
+                        if (language !== 'go' && language !== 'java' && language !== 'rust') {
+                            // JS/TS/Python: mark uncertain unless receiver has import/binding
+                            // evidence in file scope. Prevents false positives like m.get() →
+                            // repository.get() when m is just a parameter with no type info.
+                            const hasReceiverEvidence = call.receiver &&
+                                fileEntry?.bindings?.some(b => b.name === call.receiver);
+                            if (!hasReceiverEvidence) {
+                                isUncertain = true;
+                            }
+                        } else {
+                            // Go/Java/Rust: nominal type systems make single-def method links
+                            // reliable. Only mark uncertain when multiple definitions exist
+                            // (cross-type ambiguity, e.g. TypeA.Length vs TypeB.Length).
+                            const defs = this.symbols.get(call.name);
+                            if (defs && defs.length > 1) {
+                                isUncertain = true;
+                            }
                         }
                     }
                     if (bindings.length === 1) {
