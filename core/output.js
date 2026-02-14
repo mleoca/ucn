@@ -1276,6 +1276,647 @@ function formatAboutJson(about) {
     return JSON.stringify(about, null, 2);
 }
 
+/**
+ * Format example result as text
+ */
+function formatExample(result, name) {
+    if (!result) return `No call examples found for "${name}"`;
+
+    const best = result.best;
+    const lines = [];
+    lines.push(`Best example of "${name}":`);
+    lines.push('═'.repeat(60));
+    lines.push(`${best.relativePath}:${best.line}`);
+    lines.push('');
+
+    if (best.before) {
+        for (let i = 0; i < best.before.length; i++) {
+            const ln = best.line - best.before.length + i;
+            lines.push(`${ln.toString().padStart(4)}| ${best.before[i]}`);
+        }
+    }
+
+    lines.push(`${best.line.toString().padStart(4)}| ${best.content}  <--`);
+
+    if (best.after) {
+        for (let i = 0; i < best.after.length; i++) {
+            const ln = best.line + i + 1;
+            lines.push(`${ln.toString().padStart(4)}| ${best.after[i]}`);
+        }
+    }
+
+    lines.push('');
+    lines.push(`Score: ${best.score} (${result.totalCalls} total calls)`);
+    lines.push(`Why: ${best.reasons.length > 0 ? best.reasons.join(', ') : 'first available call'}`);
+
+    return lines.join('\n');
+}
+
+// ============================================================================
+// TEXT FORMATTERS (shared between CLI and MCP)
+// ============================================================================
+
+/**
+ * Format toc command output
+ * @param {object} toc - TOC data
+ * @param {object} [options] - Formatting options
+ * @param {string} [options.detailedHint] - Custom hint text for non-detailed mode
+ * @param {string} [options.uncertainHint] - Custom hint text for uncertain references
+ */
+function formatToc(toc, options = {}) {
+    const lines = [];
+    const t = toc.totals;
+    lines.push(`PROJECT: ${t.files} files, ${t.lines} lines`);
+    lines.push(`  ${t.functions} functions, ${t.classes} types (classes/interfaces/enums), ${t.state} state objects`);
+
+    const meta = toc.meta || {};
+    const warnings = [];
+    if (meta.dynamicImports) warnings.push(`${meta.dynamicImports} dynamic import(s)`);
+    if (meta.uncertain) warnings.push(`${meta.uncertain} uncertain reference(s)`);
+    if (warnings.length) {
+        const uncertainSuffix = meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
+        lines.push(`  Note: ${warnings.join(', ')}${uncertainSuffix}`);
+    }
+
+    if (toc.summary) {
+        if (toc.summary.topFunctionFiles?.length) {
+            const hint = toc.summary.topFunctionFiles.map(f => `${f.file} (${f.functions})`).join(', ');
+            lines.push(`  Most functions: ${hint}`);
+        }
+        if (toc.summary.topLineFiles?.length) {
+            const hint = toc.summary.topLineFiles.map(f => `${f.file} (${f.lines})`).join(', ');
+            lines.push(`  Largest files: ${hint}`);
+        }
+        if (toc.summary.entryFiles?.length) {
+            lines.push(`  Entry points: ${toc.summary.entryFiles.join(', ')}`);
+        }
+    }
+
+    lines.push('═'.repeat(60));
+    const hasDetail = toc.files.some(f => f.symbols);
+    for (const file of toc.files) {
+        const parts = [`${file.lines} lines`];
+        if (file.functions) parts.push(`${file.functions} fn`);
+        if (file.classes) parts.push(`${file.classes} types`);
+        if (file.state) parts.push(`${file.state} state`);
+
+        if (hasDetail) {
+            lines.push(`\n${file.file} (${parts.join(', ')})`);
+            if (file.symbols) {
+                for (const fn of file.symbols.functions) {
+                    lines.push(`  ${lineRange(fn.startLine, fn.endLine)} ${formatFunctionSignature(fn)}`);
+                }
+                for (const cls of file.symbols.classes) {
+                    lines.push(`  ${lineRange(cls.startLine, cls.endLine)} ${formatClassSignature(cls)}`);
+                }
+            }
+        } else {
+            lines.push(`  ${file.file} — ${parts.join(', ')}`);
+        }
+    }
+
+    if (!hasDetail) {
+        const hint = options.detailedHint || 'Use detailed=true to list all functions and classes.';
+        lines.push(`\n${hint}`);
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format find command output
+ */
+function formatFind(symbols, query, top) {
+    if (symbols.length === 0) {
+        return `No symbols found for "${query}"`;
+    }
+
+    const lines = [];
+    const limit = (top && top > 0) ? Math.min(symbols.length, top) : Math.min(symbols.length, 10);
+    const hidden = symbols.length - limit;
+
+    if (hidden > 0) {
+        lines.push(`Found ${symbols.length} match(es) for "${query}" (showing top ${limit}):`);
+    } else {
+        lines.push(`Found ${symbols.length} match(es) for "${query}":`);
+    }
+    lines.push('─'.repeat(60));
+
+    for (let i = 0; i < limit; i++) {
+        const s = symbols[i];
+        const sig = s.params !== undefined
+            ? formatFunctionSignature(s)
+            : formatClassSignature(s);
+        lines.push(`${s.relativePath}:${s.startLine}  ${sig}`);
+        if (s.usageCounts !== undefined) {
+            const c = s.usageCounts;
+            const parts = [];
+            if (c.calls > 0) parts.push(`${c.calls} calls`);
+            if (c.definitions > 0) parts.push(`${c.definitions} def`);
+            if (c.imports > 0) parts.push(`${c.imports} imports`);
+            if (c.references > 0) parts.push(`${c.references} refs`);
+            lines.push(`  (${c.total} usages: ${parts.join(', ')})`);
+        } else if (s.usageCount !== undefined) {
+            lines.push(`  (${s.usageCount} usages)`);
+        }
+    }
+
+    if (hidden > 0) {
+        lines.push(`... ${hidden} more result(s).`);
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format usages command output
+ */
+function formatUsages(usages, name) {
+    const defs = usages.filter(u => u.isDefinition);
+    const calls = usages.filter(u => u.usageType === 'call');
+    const imports = usages.filter(u => u.usageType === 'import');
+    const refs = usages.filter(u => !u.isDefinition && u.usageType === 'reference');
+
+    const lines = [];
+    lines.push(`Usages of "${name}": ${defs.length} definitions, ${calls.length} calls, ${imports.length} imports, ${refs.length} references`);
+    lines.push('═'.repeat(60));
+
+    function renderContextLines(usage) {
+        if (usage.before && usage.before.length > 0) {
+            for (const line of usage.before) {
+                lines.push(`      ${line}`);
+            }
+        }
+    }
+
+    function renderAfterLines(usage) {
+        if (usage.after && usage.after.length > 0) {
+            for (const line of usage.after) {
+                lines.push(`      ${line}`);
+            }
+        }
+    }
+
+    if (defs.length > 0) {
+        lines.push('\nDEFINITIONS:');
+        for (const d of defs) {
+            lines.push(`  ${d.relativePath}:${d.line || d.startLine}`);
+            if (d.signature) lines.push(`    ${d.signature}`);
+        }
+    }
+
+    if (calls.length > 0) {
+        lines.push('\nCALLS:');
+        for (const c of calls) {
+            lines.push(`  ${c.relativePath}:${c.line}`);
+            renderContextLines(c);
+            lines.push(`    ${c.content.trim()}`);
+            renderAfterLines(c);
+        }
+    }
+
+    if (imports.length > 0) {
+        lines.push('\nIMPORTS:');
+        for (const i of imports) {
+            lines.push(`  ${i.relativePath}:${i.line}`);
+            lines.push(`    ${i.content.trim()}`);
+        }
+    }
+
+    if (refs.length > 0) {
+        lines.push('\nREFERENCES:');
+        for (const r of refs) {
+            lines.push(`  ${r.relativePath}:${r.line}`);
+            renderContextLines(r);
+            lines.push(`    ${r.content.trim()}`);
+            renderAfterLines(r);
+        }
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format context command output
+ * Returns { text, expandable } where expandable is an array of items for ucn_expand
+ * @param {object} ctx - Context data
+ * @param {object} [options] - Formatting options
+ * @param {string} [options.methodsHint] - Custom hint for excluded method calls
+ * @param {string} [options.expandHint] - Custom hint for expand command
+ * @param {string} [options.uncertainHint] - Custom hint for uncertain calls
+ */
+function formatContext(ctx, options = {}) {
+    if (!ctx) return { text: 'Symbol not found.', expandable: [] };
+
+    const expandHint = options.expandHint || 'Use ucn_expand with item number to see code for any item.';
+    const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded. Use include_methods=true to include them.';
+
+    const lines = [];
+    const expandable = [];
+    let itemNum = 1;
+
+    // Handle struct/interface types
+    if (ctx.type && ['class', 'struct', 'interface', 'type'].includes(ctx.type)) {
+        lines.push(`Context for ${ctx.type} ${ctx.name}:`);
+        lines.push('═'.repeat(60));
+
+        if (ctx.warnings && ctx.warnings.length > 0) {
+            for (const w of ctx.warnings) {
+                lines.push(`  Note: ${w.message}`);
+            }
+        }
+
+        const methods = ctx.methods || [];
+        lines.push(`\nMETHODS (${methods.length}):`);
+        for (const m of methods) {
+            const receiver = m.receiver ? `(${m.receiver}) ` : '';
+            const params = m.params || '...';
+            const returnType = m.returnType ? `: ${m.returnType}` : '';
+            lines.push(`  [${itemNum}] ${receiver}${m.name}(${params})${returnType}`);
+            lines.push(`    ${m.file}:${m.line}`);
+            expandable.push({
+                num: itemNum++,
+                type: 'method',
+                name: m.name,
+                file: m.file,
+                relativePath: m.file,
+                startLine: m.line,
+                endLine: m.endLine || m.line
+            });
+        }
+
+        const callers = ctx.callers || [];
+        lines.push(`\nCALLERS (${callers.length}):`);
+        for (const c of callers) {
+            const callerName = c.callerName ? ` [${c.callerName}]` : '';
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
+            lines.push(`    ${c.content.trim()}`);
+            expandable.push({
+                num: itemNum++,
+                type: 'caller',
+                name: c.callerName || '(module level)',
+                file: c.callerFile || c.file,
+                relativePath: c.relativePath,
+                line: c.line,
+                startLine: c.callerStartLine || c.line,
+                endLine: c.callerEndLine || c.line
+            });
+        }
+
+        if (expandable.length > 0) {
+            lines.push(`\n${expandHint}`);
+        }
+
+        return { text: lines.join('\n'), expandable };
+    }
+
+    // Standard function/method context
+    lines.push(`Context for ${ctx.function}:`);
+    lines.push('═'.repeat(60));
+
+    if (ctx.meta) {
+        const notes = [];
+        if (ctx.meta.dynamicImports) notes.push(`${ctx.meta.dynamicImports} dynamic import(s)`);
+        if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
+        if (notes.length) {
+            const uncertainSuffix = ctx.meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
+            lines.push(`  Note: ${notes.join(', ')}${uncertainSuffix}`);
+        }
+    }
+
+    if (ctx.meta && !ctx.meta.includeMethods) {
+        lines.push(`  ${methodsHint}`);
+    }
+
+    if (ctx.warnings && ctx.warnings.length > 0) {
+        for (const w of ctx.warnings) {
+            lines.push(`  Note: ${w.message}`);
+        }
+    }
+
+    const callers = ctx.callers || [];
+    lines.push(`\nCALLERS (${callers.length}):`);
+    for (const c of callers) {
+        const callerName = c.callerName ? ` [${c.callerName}]` : '';
+        lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
+        lines.push(`    ${c.content.trim()}`);
+        expandable.push({
+            num: itemNum++,
+            type: 'caller',
+            name: c.callerName || '(module level)',
+            file: c.callerFile || c.file,
+            relativePath: c.relativePath,
+            line: c.line,
+            startLine: c.callerStartLine || c.line,
+            endLine: c.callerEndLine || c.line
+        });
+    }
+
+    const callees = ctx.callees || [];
+    lines.push(`\nCALLEES (${callees.length}):`);
+    for (const c of callees) {
+        const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
+        lines.push(`  [${itemNum}] ${c.name}${weight} - ${c.relativePath}:${c.startLine}`);
+        expandable.push({
+            num: itemNum++,
+            type: 'callee',
+            name: c.name,
+            file: c.file,
+            relativePath: c.relativePath,
+            startLine: c.startLine,
+            endLine: c.endLine
+        });
+    }
+
+    if (expandable.length > 0) {
+        lines.push(`\n${expandHint}`);
+    }
+
+    return { text: lines.join('\n'), expandable };
+}
+
+/**
+ * Format smart command output
+ * @param {object} smart - Smart extraction result
+ * @param {object} [options] - Formatting options
+ * @param {string} [options.uncertainHint] - Custom hint for uncertain calls
+ */
+function formatSmart(smart, options = {}) {
+    if (!smart) return 'Function not found.';
+
+    const lines = [];
+    lines.push(`${smart.target.name} (${smart.target.file}:${smart.target.startLine})`);
+    lines.push('═'.repeat(60));
+
+    if (smart.meta) {
+        const notes = [];
+        if (smart.meta.dynamicImports) notes.push(`${smart.meta.dynamicImports} dynamic import(s)`);
+        if (smart.meta.uncertain) notes.push(`${smart.meta.uncertain} uncertain call(s) skipped`);
+        if (notes.length) {
+            const uncertainSuffix = smart.meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
+            lines.push(`  Note: ${notes.join(', ')}${uncertainSuffix}`);
+        }
+    }
+
+    lines.push(smart.target.code);
+
+    if (smart.dependencies.length > 0) {
+        lines.push('\n─── DEPENDENCIES ───');
+        for (const dep of smart.dependencies) {
+            const weight = dep.weight && dep.weight !== 'normal' ? ` [${dep.weight}]` : '';
+            lines.push(`\n// ${dep.name}${weight} (${dep.relativePath}:${dep.startLine})`);
+            lines.push(dep.code);
+        }
+    }
+
+    if (smart.types && smart.types.length > 0) {
+        lines.push('\n─── TYPES ───');
+        for (const t of smart.types) {
+            lines.push(`\n// ${t.name} (${t.relativePath}:${t.startLine})`);
+            lines.push(t.code);
+        }
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format deadcode command output
+ * @param {Array} results - Dead code results
+ * @param {object} [options] - Formatting options
+ * @param {string} [options.exportedHint] - Hint about exported symbols exclusion
+ */
+function formatDeadcode(results, options = {}) {
+    if (results.length === 0) return 'No dead code found.';
+
+    const lines = [];
+    lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
+
+    let currentFile = null;
+    for (const item of results) {
+        if (item.file !== currentFile) {
+            currentFile = item.file;
+            lines.push(item.file);
+        }
+        const exported = item.isExported ? ' [exported]' : '';
+        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}`);
+    }
+
+    if (options.exportedHint) {
+        lines.push(`\n${options.exportedHint}`);
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format fn command output
+ */
+function formatFn(match, fnCode) {
+    const lines = [];
+    lines.push(`${match.relativePath}:${match.startLine}`);
+    lines.push(`${lineRange(match.startLine, match.endLine)} ${formatFunctionSignature(match)}`);
+    lines.push('─'.repeat(60));
+    lines.push(fnCode);
+    return lines.join('\n');
+}
+
+/**
+ * Format class command output
+ */
+function formatClass(cls, clsCode) {
+    const lines = [];
+    lines.push(`${cls.relativePath || cls.file}:${cls.startLine}`);
+    lines.push(`${lineRange(cls.startLine, cls.endLine)} ${formatClassSignature(cls)}`);
+    lines.push('─'.repeat(60));
+    lines.push(clsCode);
+    return lines.join('\n');
+}
+
+/**
+ * Format graph command output
+ * @param {object} graph - Graph data
+ * @param {object} [options] - Formatting options
+ * @param {boolean} [options.showAll] - Show all children (no truncation)
+ * @param {number} [options.maxDepth] - Maximum depth for tree traversal
+ */
+function formatGraph(graph, options = {}) {
+    // Support legacy signature: formatGraph(graph, showAll)
+    if (typeof options === 'boolean') {
+        options = { showAll: options };
+    }
+    if (graph.nodes.length === 0) {
+        const file = options.file || graph.root || '';
+        return file ? `File not found: ${file}` : 'File not found.';
+    }
+
+    const rootEntry = graph.nodes.find(n => n.file === graph.root);
+    const rootRelPath = rootEntry ? rootEntry.relativePath : graph.root;
+    const lines = [];
+
+    const showAll = options.showAll || false;
+    const maxChildren = showAll ? Infinity : 8;
+    const maxDepth = options.maxDepth !== undefined ? options.maxDepth : Infinity;
+
+    function printTree(nodes, edges, rootFile) {
+        const visited = new Set();     // all nodes ever printed (for diamond dep detection)
+        const ancestors = new Set();   // current path from root (for true circular detection)
+        let truncatedNodes = 0;
+        let depthLimited = false;
+
+        function printNode(file, indent = 0) {
+            const fileEntry = nodes.find(n => n.file === file);
+            const relPath = fileEntry ? fileEntry.relativePath : file;
+            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
+
+            if (ancestors.has(file)) {
+                lines.push(`${prefix}${relPath} (circular)`);
+                return;
+            }
+            if (visited.has(file)) {
+                lines.push(`${prefix}${relPath} (already shown)`);
+                return;
+            }
+            visited.add(file);
+
+            if (indent > maxDepth) {
+                depthLimited = true;
+                lines.push(`${prefix}${relPath} ...`);
+                return;
+            }
+
+            lines.push(`${prefix}${relPath}`);
+
+            ancestors.add(file);
+            const fileEdges = edges.filter(e => e.from === file);
+            const displayEdges = fileEdges.slice(0, maxChildren);
+            const hiddenCount = fileEdges.length - displayEdges.length;
+
+            for (const edge of displayEdges) {
+                printNode(edge.to, indent + 1);
+            }
+            ancestors.delete(file);
+
+            if (hiddenCount > 0) {
+                truncatedNodes += hiddenCount;
+                lines.push(`${'  '.repeat(indent)}└── ... and ${hiddenCount} more`);
+            }
+        }
+
+        printNode(rootFile);
+        return { truncatedNodes, depthLimited };
+    }
+
+    if (graph.direction === 'both' && graph.imports && graph.importers) {
+        const importCount = graph.imports.edges.filter(e => e.from === graph.root).length;
+        const importerCount = graph.importers.edges.filter(e => e.from === graph.root).length;
+
+        lines.push(`Dependency graph for ${rootRelPath}`);
+        lines.push('═'.repeat(60));
+
+        lines.push(`\nIMPORTS (what this file depends on): ${importCount} files`);
+        if (importCount > 0) {
+            printTree(graph.imports.nodes, graph.imports.edges, graph.root);
+        } else {
+            lines.push('  (none)');
+        }
+
+        lines.push(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
+        if (importerCount > 0) {
+            printTree(graph.importers.nodes, graph.importers.edges, graph.root);
+        } else {
+            lines.push('  (none)');
+        }
+    } else {
+        lines.push(`Dependency graph for ${rootRelPath}`);
+        lines.push('═'.repeat(60));
+
+        const { truncatedNodes, depthLimited } = printTree(graph.nodes, graph.edges, graph.root);
+
+        if (depthLimited || truncatedNodes > 0) {
+            lines.push('\n' + '─'.repeat(60));
+            if (depthLimited) {
+                lines.push(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
+            }
+            if (truncatedNodes > 0) {
+                lines.push(`${truncatedNodes} nodes hidden. Use --all to show all children. Graph has ${graph.nodes.length} total files.`);
+            }
+        }
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format search command output
+ */
+function formatSearch(results, term) {
+    const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+    if (totalMatches === 0) return `No matches found for "${term}"`;
+
+    const lines = [];
+    lines.push(`Found ${totalMatches} matches for "${term}" in ${results.length} files:`);
+    lines.push('═'.repeat(60));
+
+    for (const result of results) {
+        lines.push(`\n${result.file}`);
+        for (const m of result.matches) {
+            lines.push(`  ${m.line}: ${m.content.trim()}`);
+            if (m.before && m.before.length > 0) {
+                for (const line of m.before) {
+                    lines.push(`      ... ${line.trim()}`);
+                }
+            }
+            if (m.after && m.after.length > 0) {
+                for (const line of m.after) {
+                    lines.push(`      ... ${line.trim()}`);
+                }
+            }
+        }
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format file-exports command output
+ */
+function formatFileExports(exports, filePath) {
+    if (exports.length === 0) return `No exports found in ${filePath}`;
+
+    const lines = [];
+    lines.push(`Exports from ${filePath}:\n`);
+    for (const exp of exports) {
+        lines.push(`  ${lineRange(exp.startLine, exp.endLine)} ${exp.signature || exp.name}`);
+    }
+    return lines.join('\n');
+}
+
+/**
+ * Format stats command output
+ */
+function formatStats(stats) {
+    const lines = [];
+    lines.push('PROJECT STATISTICS');
+    lines.push('═'.repeat(60));
+    lines.push(`Root: ${stats.root}`);
+    lines.push(`Files: ${stats.files}`);
+    lines.push(`Symbols: ${stats.symbols}`);
+    lines.push(`Build time: ${stats.buildTime}ms`);
+
+    lines.push('\nBy Language:');
+    for (const [lang, info] of Object.entries(stats.byLanguage)) {
+        lines.push(`  ${lang}: ${info.files} files, ${info.lines} lines, ${info.symbols} symbols`);
+    }
+
+    lines.push('\nBy Type:');
+    for (const [type, count] of Object.entries(stats.byType)) {
+        lines.push(`  ${type}: ${count}`);
+    }
+
+    return lines.join('\n');
+}
+
 module.exports = {
     // Utilities
     normalizeParams,
@@ -1339,5 +1980,22 @@ module.exports = {
 
     // Related command
     formatRelated,
-    formatRelatedJson
+    formatRelatedJson,
+
+    // Example command
+    formatExample,
+
+    // Shared text formatters (CLI + MCP)
+    formatToc,
+    formatFind,
+    formatUsages,
+    formatContext,
+    formatSmart,
+    formatDeadcode,
+    formatFn,
+    formatClass,
+    formatGraph,
+    formatSearch,
+    formatFileExports,
+    formatStats
 };

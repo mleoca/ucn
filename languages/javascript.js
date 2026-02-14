@@ -349,6 +349,7 @@ function findClasses(code, parser) {
                 const { startLine, endLine } = nodeToLocation(node, code);
                 const members = extractClassMembers(node, code);
                 const docstring = extractJSDocstring(code, startLine);
+                const generics = extractGenerics(node);
                 const extendsInfo = extractExtends(node);
                 const implementsInfo = extractImplements(node);
 
@@ -359,6 +360,7 @@ function findClasses(code, parser) {
                     type: 'class',
                     members,
                     ...(docstring && { docstring }),
+                    ...(generics && { generics }),
                     ...(extendsInfo && { extends: extendsInfo }),
                     ...(implementsInfo.length > 0 && { implements: implementsInfo })
                 });
@@ -372,6 +374,7 @@ function findClasses(code, parser) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(node, code);
                 const docstring = extractJSDocstring(code, startLine);
+                const generics = extractGenerics(node);
                 const extendsInfo = extractInterfaceExtends(node);
 
                 classes.push({
@@ -381,6 +384,7 @@ function findClasses(code, parser) {
                     type: 'interface',
                     members: [],
                     ...(docstring && { docstring }),
+                    ...(generics && { generics }),
                     ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
                 });
             }
