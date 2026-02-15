@@ -4598,6 +4598,81 @@ export { App, EnvironmentsPage };
         }
     });
 
+    it('should detect JSX prop function references (onClick={handler})', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-jsx-prop-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), `{"name": "test"}`);
+
+            fs.writeFileSync(path.join(tmpDir, 'clipboard.tsx'), `
+function handlePaste() {
+  console.log('pasted');
+}
+
+function handleCopy() {
+  console.log('copied');
+}
+
+function ClipboardPanel() {
+  const userName = "test";
+  return (
+    <div>
+      <button onClick={handlePaste}>Paste</button>
+      <button onClick={handleCopy}>Copy</button>
+      <span title={userName}>Name</span>
+    </div>
+  );
+}
+
+export { handlePaste, handleCopy, ClipboardPanel };
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.tsx', { quiet: true });
+
+            // handlePaste should be detected as called by ClipboardPanel (via JSX prop)
+            const callers = index.findCallers('handlePaste');
+            assert.ok(callers.length >= 1, 'Should find at least 1 caller for handlePaste');
+            assert.ok(callers.some(c => c.callerName === 'ClipboardPanel'),
+                'ClipboardPanel should be detected as caller of handlePaste via onClick prop');
+
+            // handleCopy too
+            const copyCallers = index.findCallers('handleCopy');
+            assert.ok(copyCallers.length >= 1, 'Should find at least 1 caller for handleCopy');
+
+            // userName should NOT be detected as a function reference (it's a string variable)
+            const userCallers = index.findCallers('userName');
+            assert.strictEqual(userCallers.length, 0, 'userName should not be detected as a function call');
+
+            // handlePaste should NOT show up as dead code
+            const dead = index.deadcode();
+            const deadNames = dead.map(d => d.name);
+            assert.ok(!deadNames.includes('handlePaste'), 'handlePaste should not be dead code');
+            assert.ok(!deadNames.includes('handleCopy'), 'handleCopy should not be dead code');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('should detect JSX prop member expression references (onClick={utils.handler})', () => {
+        const code = `
+import { handlers } from './handlers';
+
+function App() {
+  return <button onClick={handlers.submit}>Submit</button>;
+}
+`;
+        const parser = require('../languages').getParser('tsx');
+        const { findCallsInCode } = require('../languages/javascript');
+        const calls = findCallsInCode(code, parser);
+
+        // The member expression reference should be detected as a call
+        const submitRef = calls.find(c => c.name === 'submit' && c.isFunctionReference);
+        assert.ok(submitRef, 'Should detect handlers.submit as a function reference in JSX prop');
+        assert.strictEqual(submitRef.isMethod, true, 'Should be marked as method call');
+        assert.strictEqual(submitRef.receiver, 'handlers', 'Should have handlers as receiver');
+        assert.strictEqual(submitRef.isPotentialCallback, true, 'Should be marked as potential callback');
+    });
+
     it('should detect Rust method calls in usages', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-method-'));
         try {
@@ -7378,6 +7453,120 @@ public class App {}
         }
 
         fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
+describe('Regression: Java wildcard package imports classified as INTERNAL', () => {
+    it('should resolve import com.pkg.model.* as INTERNAL when model/ is a project directory', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-java-wildcard-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project/>');
+
+            // Create the package directory with files
+            const modelDir = path.join(tmpDir, 'src/main/java/com/example/model');
+            fs.mkdirSync(modelDir, { recursive: true });
+            fs.writeFileSync(path.join(modelDir, 'User.java'), `
+package com.example.model;
+public class User { }
+`);
+            fs.writeFileSync(path.join(modelDir, 'Product.java'), `
+package com.example.model;
+public class Product { }
+`);
+
+            // Create a file that uses wildcard import
+            const serviceDir = path.join(tmpDir, 'src/main/java/com/example/service');
+            fs.mkdirSync(serviceDir, { recursive: true });
+            fs.writeFileSync(path.join(serviceDir, 'Service.java'), `
+package com.example.service;
+import com.example.model.*;
+public class Service {
+    public User getUser() { return new User(); }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.java', { quiet: true });
+
+            const imports = index.imports('src/main/java/com/example/service/Service.java');
+            const wildcardImport = imports.find(i => i.module === 'com.example.model.*');
+            assert.ok(wildcardImport, 'should find wildcard import');
+            assert.strictEqual(wildcardImport.isExternal, false,
+                'wildcard import com.example.model.* should be INTERNAL, not EXTERNAL');
+            assert.ok(wildcardImport.resolved,
+                'wildcard import should have a resolved path');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Regression: Java cross-class method caller disambiguation', () => {
+    it('should not report obj.method() as caller when receiver matches a different class', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-java-receiver-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project/>');
+
+            const srcDir = path.join(tmpDir, 'src/main/java/com/example');
+            fs.mkdirSync(srcDir, { recursive: true });
+
+            fs.writeFileSync(path.join(srcDir, 'UploadService.java'), `
+package com.example;
+public class UploadService {
+    public void createDataFile(String name) { }
+}
+`);
+
+            fs.writeFileSync(path.join(srcDir, 'JavascriptFileService.java'), `
+package com.example;
+public class JavascriptFileService {
+    public void createDataFile(String name, String type) { }
+}
+`);
+
+            fs.writeFileSync(path.join(srcDir, 'Controller.java'), `
+package com.example;
+import com.example.UploadService;
+import com.example.JavascriptFileService;
+public class Controller {
+    private UploadService uploadService;
+    private JavascriptFileService javascriptFileService;
+
+    public void handleUpload() {
+        uploadService.createDataFile("test");
+    }
+
+    public void handleJsUpload() {
+        javascriptFileService.createDataFile("test", "js");
+    }
+}
+`);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.java', { quiet: true });
+
+            // Find the UploadService definition
+            const defs = index.find('createDataFile');
+            const uploadDef = defs.find(d => d.file.includes('UploadService'));
+            assert.ok(uploadDef, 'Should find UploadService.createDataFile definition');
+
+            // Get callers scoped to UploadService definition
+            const callers = index.findCallers('createDataFile', {
+                targetDefinitions: [uploadDef]
+            });
+
+            // uploadService.createDataFile() should be a caller
+            const uploadCaller = callers.find(c => c.content && c.content.includes('uploadService.createDataFile'));
+            assert.ok(uploadCaller, 'uploadService.createDataFile() should be a caller');
+
+            // javascriptFileService.createDataFile() should NOT be a caller
+            // (receiver "javascriptFileService" matches class JavascriptFileService, not UploadService)
+            const jsCaller = callers.find(c => c.content && c.content.includes('javascriptFileService.createDataFile'));
+            assert.ok(!jsCaller,
+                'javascriptFileService.createDataFile() should NOT be reported as caller of UploadService.createDataFile');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
     });
 });
 
