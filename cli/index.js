@@ -121,10 +121,10 @@ if (unknownFlags.length > 0) {
 
 // Remove flags from args, then add args after -- (which are all positional)
 const positionalArgs = [
-    ...args.filter(a =>
+    ...args.filter((a, idx) =>
         !a.startsWith('--') &&
         a !== '-i' &&
-        !(args.indexOf(a) > 0 && args[args.indexOf(a) - 1] === '--file')
+        !(idx > 0 && args[idx - 1] === '--file')
     ),
     ...argsAfterDoubleDash
 ];
@@ -340,7 +340,14 @@ function runFileCommand(filePath, command, arg) {
         case 'imports':
         case 'what-imports':
         case 'exporters':
-        case 'who-imports': {
+        case 'who-imports':
+        case 'verify':
+        case 'plan':
+        case 'expand':
+        case 'stacktrace':
+        case 'stack':
+        case 'file-exports':
+        case 'what-exports': {
             // Auto-detect project root and route to project mode
             const projectRoot = findProjectRoot(path.dirname(filePath));
 
@@ -348,7 +355,8 @@ function runFileCommand(filePath, command, arg) {
             let effectiveArg = arg;
             if ((command === 'imports' || command === 'what-imports' ||
                  command === 'exporters' || command === 'who-imports' ||
-                 command === 'graph') && !arg) {
+                 command === 'graph' || command === 'file-exports' ||
+                 command === 'what-exports') && !arg) {
                 effectiveArg = filePath;
             }
 
@@ -784,7 +792,7 @@ function runProjectCommand(rootDir, command, arg) {
                 console.error(`Invalid item number: "${arg}"`);
                 process.exit(1);
             }
-            const cached = loadExpandableItems();
+            const cached = loadExpandableItems(index.root);
             if (!cached || !cached.items || cached.items.length === 0) {
                 console.error('No expandable items found. Run "ucn . context <name>" first.');
                 process.exit(1);
@@ -852,7 +860,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'trace': {
             requireArg(arg, 'Usage: ucn . trace <name>');
             const traceDepth = flags.depth ? parseInt(flags.depth) : 3;
-            const depthExplicit = flags.depth !== undefined;
+            const depthExplicit = flags.depth !== null;
             const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file, all: flags.all || depthExplicit, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain });
             printOutput(traceResult, output.formatTraceJson, output.formatTrace);
             break;
@@ -1295,9 +1303,9 @@ function saveExpandableItems(items, root) {
 /**
  * Load expandable items from cache
  */
-function loadExpandableItems() {
+function loadExpandableItems(root) {
     try {
-        const cachePath = path.join('.ucn-cache', 'expandable.json');
+        const cachePath = path.join(root || '.', '.ucn-cache', 'expandable.json');
         if (fs.existsSync(cachePath)) {
             return JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
         }
@@ -1459,7 +1467,7 @@ function findInGlobFiles(files, name) {
 
 function searchGlobFiles(files, term) {
     const results = [];
-    const regex = new RegExp(escapeRegExp(term), 'gi');
+    const regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
 
     for (const file of files) {
         try {
@@ -1510,7 +1518,7 @@ function searchGlobFiles(files, term) {
 // ============================================================================
 
 function searchFile(filePath, lines, term) {
-    const regex = new RegExp(escapeRegExp(term), 'gi');
+    const regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
     const matches = [];
 
     lines.forEach((line, idx) => {

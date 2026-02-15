@@ -321,18 +321,22 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
         return resolveRustModulePath(cargo.srcDir, segments);
     }
 
-    // super:: paths - resolve relative to parent directory
+    // super:: paths - resolve relative to parent module
     if (importPath.startsWith('super::')) {
         let dir = fromDir;
         let rest = importPath;
+        // Count super:: prefixes
+        let superCount = 0;
         while (rest.startsWith('super::')) {
-            // If current file is mod.rs, go up one more directory
-            const basename = path.basename(fromFile);
-            if (basename === 'mod.rs' && dir === fromDir) {
-                dir = path.dirname(dir);
-            }
-            dir = path.dirname(dir);
+            superCount++;
             rest = rest.slice('super::'.length);
+        }
+        // For mod.rs: module IS the directory, so super:: goes up N levels
+        // For regular .rs: file is a submodule of the directory, so super:: goes up (N-1) levels
+        const isMod = path.basename(fromFile) === 'mod.rs';
+        const ups = isMod ? superCount : superCount - 1;
+        for (let i = 0; i < ups; i++) {
+            dir = path.dirname(dir);
         }
         const segments = rest.split('::');
         return resolveRustModulePath(dir, segments);
@@ -342,9 +346,12 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
     if (importPath.startsWith('self::')) {
         const rest = importPath.slice('self::'.length);
         const segments = rest.split('::');
-        // If current file is mod.rs, resolve relative to its directory
         const basename = path.basename(fromFile);
-        const dir = basename === 'mod.rs' ? fromDir : path.dirname(fromDir);
+        // For mod.rs: self:: resolves within the directory containing mod.rs
+        // For regular .rs: self:: resolves within a subdirectory named after the file stem
+        const dir = basename === 'mod.rs'
+            ? fromDir
+            : path.join(fromDir, path.basename(fromFile, '.rs'));
         return resolveRustModulePath(dir, segments);
     }
 
@@ -499,7 +506,7 @@ function loadTsConfig(tsconfigPath, visited) {
     const mergedPaths = { ...basePaths, ...(config.compilerOptions?.paths || {}) };
     const compiledPaths = Object.entries(mergedPaths).map(([pattern, targets]) => ({
         pattern,
-        regex: new RegExp('^' + pattern.replace('*', '(.*)') + '$'),
+        regex: new RegExp('^' + pattern.replace(/[.+^$[\]\\{}()|]/g, '\\$&').replace('*', '(.*)') + '$'),
         targets
     }));
 
@@ -517,10 +524,44 @@ function loadTsConfig(tsconfigPath, visited) {
  * Strip JSON comments
  */
 function stripJsonComments(content) {
-    return content
-        .replace(/\/\*[\s\S]*?\*\//g, '')
-        .replace(/\/\/.*/g, '')
-        .replace(/,(\s*[}\]])/g, '$1');
+    let result = '';
+    let i = 0;
+    while (i < content.length) {
+        // Skip strings (preserve their content)
+        if (content[i] === '"') {
+            result += '"';
+            i++;
+            while (i < content.length && content[i] !== '"') {
+                if (content[i] === '\\') {
+                    result += content[i] + (content[i + 1] || '');
+                    i += 2;
+                } else {
+                    result += content[i];
+                    i++;
+                }
+            }
+            if (i < content.length) {
+                result += '"';
+                i++;
+            }
+        }
+        // Strip line comments
+        else if (content[i] === '/' && content[i + 1] === '/') {
+            while (i < content.length && content[i] !== '\n') i++;
+        }
+        // Strip block comments
+        else if (content[i] === '/' && content[i + 1] === '*') {
+            i += 2;
+            while (i < content.length && !(content[i] === '*' && content[i + 1] === '/')) i++;
+            i += 2;
+        }
+        else {
+            result += content[i];
+            i++;
+        }
+    }
+    // Strip trailing commas
+    return result.replace(/,(\s*[}\]])/g, '$1');
 }
 
 module.exports = {

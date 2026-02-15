@@ -157,16 +157,16 @@ function subheader(title) {
  */
 function printUsage(usage, relativePath) {
     const file = relativePath || usage.file;
-    // FULL content - this is the key improvement
-    console.log(`  ${file}:${usage.line}`);
-    console.log(`    ${usage.content.trim()}`);
-
-    // Context lines if provided
+    // Context before the match
     if (usage.before && usage.before.length > 0) {
         for (const line of usage.before) {
             console.log(`    ... ${line.trim()}`);
         }
     }
+    // FULL content - this is the key improvement
+    console.log(`  ${file}:${usage.line}`);
+    console.log(`    ${usage.content.trim()}`);
+    // Context after the match
     if (usage.after && usage.after.length > 0) {
         for (const line of usage.after) {
             console.log(`    ... ${line.trim()}`);
@@ -1895,12 +1895,12 @@ function formatSearch(results, term) {
     for (const result of results) {
         lines.push(`\n${result.file}`);
         for (const m of result.matches) {
-            lines.push(`  ${m.line}: ${m.content.trim()}`);
             if (m.before && m.before.length > 0) {
                 for (const line of m.before) {
                     lines.push(`      ... ${line.trim()}`);
                 }
             }
+            lines.push(`  ${m.line}: ${m.content.trim()}`);
             if (m.after && m.after.length > 0) {
                 for (const line of m.after) {
                     lines.push(`      ... ${line.trim()}`);
