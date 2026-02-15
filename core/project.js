@@ -8,7 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile } = require('./discovery');
+const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parseFile } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse } = require('../languages');
@@ -83,9 +83,11 @@ class ProjectIndex {
             followSymlinks: options.followSymlinks
         };
 
-        // Merge .ucn.json exclude into file discovery
-        if (this.config.exclude && this.config.exclude.length > 0) {
-            globOpts.ignores = [...require('./discovery').DEFAULT_IGNORES, ...this.config.exclude];
+        // Merge .gitignore and .ucn.json exclude into file discovery
+        const gitignorePatterns = parseGitignore(this.root);
+        const configExclude = this.config.exclude || [];
+        if (gitignorePatterns.length > 0 || configExclude.length > 0) {
+            globOpts.ignores = [...require('./discovery').DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
         }
 
         const files = expandGlob(pattern, globOpts);
@@ -923,8 +925,14 @@ class ProjectIndex {
         }
 
         const stats = { uncertain: 0 };
-        const callers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, targetDefinitions: [def] });
-        const callees = this.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+        let callers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, targetDefinitions: [def] });
+        let callees = this.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+
+        // Apply exclude filter
+        if (options.exclude && options.exclude.length > 0) {
+            callers = callers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            callees = callees.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
+        }
 
         const filesInScope = new Set([def.file]);
         callers.forEach(c => filesInScope.add(c.file));
@@ -2544,6 +2552,14 @@ class ProjectIndex {
                 if (!options.includeTests && isTestFile(symbol.relativePath, lang)) {
                     continue;
                 }
+
+                // Apply exclude filter
+                if (options.exclude && options.exclude.length > 0) {
+                    if (!this.matchesFilters(symbol.relativePath, { exclude: options.exclude })) {
+                        continue;
+                    }
+                }
+
                 const mods = symbol.modifiers || [];
 
                 // Language-specific entry points (called by runtime, no AST-visible callers)
@@ -3152,9 +3168,15 @@ class ProjectIndex {
         }
         this._clearTreeCache();
 
+        // Apply exclude filter
+        let filteredSites = callSites;
+        if (options.exclude && options.exclude.length > 0) {
+            filteredSites = callSites.filter(s => this.matchesFilters(s.file, { exclude: options.exclude }));
+        }
+
         // Group by file
         const byFile = new Map();
-        for (const site of callSites) {
+        for (const site of filteredSites) {
             if (!byFile.has(site.file)) {
                 byFile.set(site.file, []);
             }
@@ -3162,7 +3184,7 @@ class ProjectIndex {
         }
 
         // Identify patterns
-        const patterns = this.identifyCallPatterns(callSites, name);
+        const patterns = this.identifyCallPatterns(filteredSites, name);
 
         return {
             function: name,
@@ -3171,7 +3193,7 @@ class ProjectIndex {
             signature: this.formatSignature(def),
             params: def.params,
             paramsStructured: def.paramsStructured,
-            totalCallSites: callSites.length,
+            totalCallSites: filteredSites.length,
             byFile: Array.from(byFile.entries()).map(([file, sites]) => ({
                 file,
                 count: sites.length,
@@ -3941,6 +3963,10 @@ class ProjectIndex {
         let allCallees = null;
         if (primary.type === 'function' || primary.params !== undefined) {
             allCallers = this.findCallers(symbolName, { includeMethods });
+            // Apply exclude filter before slicing
+            if (options.exclude && options.exclude.length > 0) {
+                allCallers = allCallers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            }
             callers = allCallers.slice(0, maxCallers).map(c => ({
                 file: c.relativePath,
                 line: c.line,
@@ -3949,6 +3975,10 @@ class ProjectIndex {
             }));
 
             allCallees = this.findCallees(primary, { includeMethods });
+            // Apply exclude filter before slicing
+            if (options.exclude && options.exclude.length > 0) {
+                allCallees = allCallees.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            }
             callees = allCallees.slice(0, maxCallees).map(c => ({
                 name: c.name,
                 file: c.relativePath,

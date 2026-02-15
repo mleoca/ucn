@@ -10618,5 +10618,182 @@ it('FIX 101 — CLI positional args uses index not indexOf for duplicate args', 
     }
 });
 
+// FIX 102: --exclude flag works on about, impact, context, and deadcode
+it('FIX 102 — exclude filter works on about, impact, context, deadcode', () => {
+    const tmpDir = path.join(require('os').tmpdir(), `ucn-test-exclude-${Date.now()}`);
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'test'), { recursive: true });
+
+    fs.writeFileSync(path.join(tmpDir, 'src', 'lib.js'), `
+function greet(name) {
+    return "Hello " + name;
+}
+module.exports = { greet };
+`);
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), `
+const { greet } = require('./lib');
+function main() {
+    console.log(greet("World"));
+}
+`);
+    fs.writeFileSync(path.join(tmpDir, 'test', 'lib.test.js'), `
+const { greet } = require('../src/lib');
+function testGreet() {
+    greet("Test");
+}
+`);
+
+    try {
+        const index = new ProjectIndex(tmpDir);
+        index.build('**/*.js', { quiet: true });
+
+        // about: without exclude, should have callers from both src and test
+        const aboutAll = index.about('greet');
+        assert.ok(aboutAll.found, 'Should find greet');
+        const allCallerFiles = aboutAll.callers.top.map(c => c.file);
+        assert.ok(allCallerFiles.some(f => f.includes('test')), 'Without exclude, should have test callers');
+        assert.ok(allCallerFiles.some(f => f.includes('src')), 'Without exclude, should have src callers');
+
+        // about: with exclude=test, should only have src callers
+        const aboutExcl = index.about('greet', { exclude: ['test'] });
+        assert.ok(aboutExcl.found, 'Should find greet with exclude');
+        const exclCallerFiles = aboutExcl.callers.top.map(c => c.file);
+        assert.ok(!exclCallerFiles.some(f => f.includes('test')), 'With exclude=test, should have no test callers');
+        assert.ok(aboutExcl.callers.total < aboutAll.callers.total, 'Excluded callers count should be less');
+
+        // impact: without exclude, should have call sites from both
+        const impactAll = index.impact('greet');
+        assert.ok(impactAll.totalCallSites >= 2, 'Should have at least 2 call sites');
+
+        // impact: with exclude=test, should have fewer call sites
+        const impactExcl = index.impact('greet', { exclude: ['test'] });
+        assert.ok(impactExcl.totalCallSites < impactAll.totalCallSites, 'Excluded impact should have fewer call sites');
+        const impactFiles = impactExcl.byFile.map(f => f.file);
+        assert.ok(!impactFiles.some(f => f.includes('test')), 'Excluded impact should not have test files');
+
+        // context: with exclude=test, should filter callers
+        const ctxAll = index.context('greet');
+        const ctxExcl = index.context('greet', { exclude: ['test'] });
+        assert.ok(ctxExcl.callers.length < ctxAll.callers.length, 'Excluded context should have fewer callers');
+
+        // deadcode: add an unused function in test dir
+        fs.writeFileSync(path.join(tmpDir, 'test', 'helper.js'), `
+function testHelper() { return 1; }
+`);
+        const index2 = new ProjectIndex(tmpDir);
+        index2.build('**/*.js', { quiet: true });
+
+        const deadAll = index2.deadcode({ includeTests: true });
+        const deadExcl = index2.deadcode({ includeTests: true, exclude: ['test'] });
+        const deadAllNames = deadAll.map(d => d.name);
+        const deadExclNames = deadExcl.map(d => d.name);
+        // testHelper should be in deadAll (includeTests) but not in deadExcl
+        if (deadAllNames.includes('testHelper')) {
+            assert.ok(!deadExclNames.includes('testHelper'), 'Excluded deadcode should not include test functions');
+        }
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 103: parseGitignore reads .gitignore and returns compatible patterns
+it('FIX 103 — parseGitignore extracts patterns from .gitignore', () => {
+    const { parseGitignore, DEFAULT_IGNORES } = require('../core/discovery');
+
+    const tmpDir = path.join(require('os').tmpdir(), `ucn-test-gitignore-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    // Create a .gitignore with various pattern types
+    fs.writeFileSync(path.join(tmpDir, '.gitignore'), `
+# Comment line
+node_modules/
+
+# Custom directories
+public/
+next.lock/
+.cache
+
+# Glob patterns
+*.log
+*.bak
+
+# Negation (should be skipped)
+!important.log
+
+# Path patterns (should be skipped — shouldIgnore matches by name)
+src/generated/output.js
+config/local.json
+
+# Root-relative (slash stripped)
+/tmp_build
+
+# Empty lines above
+`);
+
+    try {
+        const patterns = parseGitignore(tmpDir);
+
+        // Should include simple directory names
+        assert.ok(patterns.includes('public'), 'Should include public');
+        assert.ok(patterns.includes('next.lock'), 'Should include next.lock');
+        assert.ok(patterns.includes('.cache'), 'Should include .cache');
+        assert.ok(patterns.includes('tmp_build'), 'Should include tmp_build (leading / stripped)');
+
+        // Should include globs
+        assert.ok(patterns.includes('*.bak'), 'Should include *.bak glob');
+
+        // Should NOT include patterns already in DEFAULT_IGNORES
+        assert.ok(!patterns.includes('node_modules'), 'Should skip node_modules (already in DEFAULT_IGNORES)');
+
+        // Should NOT include negation patterns
+        assert.ok(!patterns.includes('!important.log'), 'Should skip negation patterns');
+        assert.ok(!patterns.includes('important.log'), 'Should skip negation patterns');
+
+        // Should NOT include path patterns with /
+        assert.ok(!patterns.some(p => p.includes('/')), 'Should skip patterns with path separators');
+
+        // *.log should be included (not in DEFAULT_IGNORES)
+        assert.ok(patterns.includes('*.log'), 'Should include *.log');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 104: .gitignore patterns are used during project build
+it('FIX 104 — .gitignore patterns exclude files during build', () => {
+    const tmpDir = path.join(require('os').tmpdir(), `ucn-test-gitignore-build-${Date.now()}`);
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'generated'), { recursive: true });
+
+    // .gitignore excludes generated/
+    fs.writeFileSync(path.join(tmpDir, '.gitignore'), 'generated/\n');
+    // package.json so project detection works
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), `
+function realFunc() { return 1; }
+module.exports = { realFunc };
+`);
+    fs.writeFileSync(path.join(tmpDir, 'generated', 'bundle.js'), `
+function generatedFunc() { return 2; }
+module.exports = { generatedFunc };
+`);
+
+    try {
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // Should find realFunc from src/
+        const real = index.find('realFunc');
+        assert.ok(real.length > 0, 'Should find realFunc from src/');
+
+        // Should NOT find generatedFunc from generated/ (excluded by .gitignore)
+        const gen = index.find('generatedFunc');
+        assert.strictEqual(gen.length, 0, 'Should not find generatedFunc (excluded by .gitignore)');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

@@ -236,16 +236,17 @@ server.registerTool(
             project_dir: projectDirParam,
             name: nameParam,
             file: fileParam,
+            exclude: excludeParam,
             with_types: z.boolean().optional().describe('Include related type definitions in output'),
             include_methods: z.boolean().optional().describe('Include obj.method() calls in caller/callee analysis (default: true)')
         })
     },
-    async ({ project_dir, name, file, with_types, include_methods }) => {
+    async ({ project_dir, name, file, exclude, with_types, include_methods }) => {
         const err = requireName(name);
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const result = index.about(name, { file, withTypes: with_types || false, includeMethods: include_methods ?? undefined });
+            const result = index.about(name, { file, exclude: parseExclude(exclude), withTypes: with_types || false, includeMethods: include_methods ?? undefined });
             return toolResult(output.formatAbout(result));
         } catch (e) {
             return toolError(e.message);
@@ -262,11 +263,12 @@ server.registerTool(
             project_dir: projectDirParam,
             name: nameParam,
             file: fileParam,
+            exclude: excludeParam,
             include_methods: includeMethodsParam,
             include_uncertain: includeUncertainParam
         })
     },
-    async ({ project_dir, name, file, include_methods, include_uncertain }) => {
+    async ({ project_dir, name, file, exclude, include_methods, include_uncertain }) => {
         const err = requireName(name);
         if (err) return err;
         try {
@@ -274,7 +276,8 @@ server.registerTool(
             const ctx = index.context(name, {
                 includeMethods: include_methods,
                 includeUncertain: include_uncertain || false,
-                file
+                file,
+                exclude: parseExclude(exclude)
             });
             const { text, expandable } = output.formatContext(ctx);
             if (expandable.length > 0) {
@@ -309,15 +312,16 @@ server.registerTool(
         inputSchema: z.object({
             project_dir: projectDirParam,
             name: nameParam,
-            file: fileParam
+            file: fileParam,
+            exclude: excludeParam
         })
     },
-    async ({ project_dir, name, file }) => {
+    async ({ project_dir, name, file, exclude }) => {
         const err = requireName(name);
         if (err) return err;
         try {
             const index = getIndex(project_dir);
-            const result = index.impact(name, { file });
+            const result = index.impact(name, { file, exclude: parseExclude(exclude) });
             return toolResult(output.formatImpact(result));
         } catch (e) {
             return toolError(e.message);
@@ -425,15 +429,17 @@ server.registerTool(
         description: 'Find dead code: functions and classes with zero callers anywhere in the project. Use during cleanup to identify code that can be safely deleted. By default excludes exported symbols (they may be used externally), decorated/annotated symbols (likely framework-registered), and test files. Use include flags to expand results.',
         inputSchema: z.object({
             project_dir: projectDirParam,
+            exclude: excludeParam,
             include_exported: z.boolean().optional().describe('Include exported symbols (excluded by default)'),
             include_decorated: z.boolean().optional().describe('Include decorated/annotated symbols like @router.get, @Bean (excluded by default as they are typically framework-registered)'),
             include_tests: includeTestsParam
         })
     },
-    async ({ project_dir, include_exported, include_decorated, include_tests }) => {
+    async ({ project_dir, exclude, include_exported, include_decorated, include_tests }) => {
         try {
             const index = getIndex(project_dir);
             const result = index.deadcode({
+                exclude: parseExclude(exclude),
                 includeExported: include_exported || false,
                 includeDecorated: include_decorated || false,
                 includeTests: include_tests || false
