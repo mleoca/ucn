@@ -112,6 +112,52 @@ const TEST_PATTERNS = {
     ]
 };
 
+/**
+ * Parse .gitignore file and return patterns compatible with shouldIgnore().
+ * Handles simple directory/file patterns. Skips negation patterns and comments.
+ *
+ * @param {string} projectRoot - Project root directory
+ * @returns {string[]} - Array of ignore patterns (directory/file names and globs)
+ */
+function parseGitignore(projectRoot) {
+    const gitignorePath = path.join(projectRoot, '.gitignore');
+    if (!fs.existsSync(gitignorePath)) return [];
+
+    let content;
+    try {
+        content = fs.readFileSync(gitignorePath, 'utf-8');
+    } catch (e) {
+        return [];
+    }
+
+    const patterns = [];
+    for (const rawLine of content.split('\n')) {
+        const line = rawLine.trim();
+        // Skip empty lines, comments, negation patterns
+        if (!line || line.startsWith('#') || line.startsWith('!')) continue;
+
+        // Strip trailing slash (directory indicator) — shouldIgnore checks names, not types
+        let pattern = line.endsWith('/') ? line.slice(0, -1) : line;
+
+        // Strip leading slash (root-relative indicator) — we only match by name
+        if (pattern.startsWith('/')) pattern = pattern.slice(1);
+
+        // Skip patterns with path separators — shouldIgnore matches single name segments,
+        // not full paths. Patterns like "foo/bar" would need walkDir-level support.
+        if (pattern.includes('/')) continue;
+
+        // Skip empty after stripping
+        if (!pattern) continue;
+
+        // Avoid duplicating built-in ignores
+        if (DEFAULT_IGNORES.includes(pattern)) continue;
+
+        patterns.push(pattern);
+    }
+
+    return patterns;
+}
+
 function compareNames(a, b) {
     const aLower = a.toLowerCase();
     const bLower = b.toLowerCase();
@@ -529,6 +575,7 @@ module.exports = {
     getFileStats,
     isTestFile,
     findTestFileFor,
+    parseGitignore,
     DEFAULT_IGNORES,
     PROJECT_MARKERS,
     TEST_PATTERNS

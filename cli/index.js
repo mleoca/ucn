@@ -740,7 +740,8 @@ function runProjectCommand(rootDir, command, arg) {
             const ctx = index.context(arg, {
                 includeMethods: flags.includeMethods,
                 includeUncertain: flags.includeUncertain,
-                file: flags.file
+                file: flags.file,
+                exclude: flags.exclude
             });
             if (!ctx) {
                 console.log(`Symbol "${arg}" not found.`);
@@ -825,7 +826,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods });
+            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods, exclude: flags.exclude });
             printOutput(aboutResult,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
@@ -835,7 +836,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'impact': {
             requireArg(arg, 'Usage: ucn . impact <name>');
-            const impactResult = index.impact(arg, { file: flags.file });
+            const impactResult = index.impact(arg, { file: flags.file, exclude: flags.exclude });
             printOutput(impactResult, output.formatImpactJson, output.formatImpact);
             break;
         }
@@ -966,7 +967,8 @@ function runProjectCommand(rootDir, command, arg) {
             const deadcodeResults = index.deadcode({
                 includeExported: flags.includeExported,
                 includeDecorated: flags.includeDecorated,
-                includeTests: flags.includeTests
+                includeTests: flags.includeTests,
+                exclude: flags.exclude
             });
             printOutput(deadcodeResults,
                 r => JSON.stringify({ deadcode: r }, null, 2),
