@@ -215,8 +215,9 @@ function globToRegex(glob) {
         return '(' + alternatives.join('|') + ')';
     });
 
-    regex = regex.replace(/\*\*/g, '.*');
+    regex = regex.replace(/\*\*/g, '\0GLOBSTAR\0');
     regex = regex.replace(/\*/g, '[^/]*');
+    regex = regex.replace(/\0GLOBSTAR\0/g, '.*');
     regex = regex.replace(/\?/g, '.');
 
     return new RegExp('^' + regex + '$');

@@ -280,10 +280,6 @@ class ProjectIndex {
         this.importGraph.clear();
         this.exportGraph.clear();
 
-        // Build Java suffix lookup for package import resolution
-        // Maps "com/google/gson/Gson.java" -> absolute path
-        let javaSuffixMap = null;
-
         for (const [filePath, fileEntry] of this.files) {
             const importedFiles = [];
             const seenModules = new Set();
@@ -1209,7 +1205,8 @@ class ProjectIndex {
                                         if (matchesDef) break;
                                     }
                                     if (!matchesDef) {
-                                        const nextParent = parents.find(p => !visited.has(p)) || parents[0];
+                                        const nextParent = parents.find(p => !visited.has(p));
+                                        if (!nextParent) break;
                                         parents = this.extendsGraph.get(nextParent);
                                     }
                                 }
@@ -1366,7 +1363,7 @@ class ProjectIndex {
                         // self.method() / cls.method() / this.method() — resolve to same-class method below
                     } else if (call.receiver === 'super') {
                         // super().method() — resolve to parent class method below
-                    } else if (language !== 'go' && language !== 'java' && !options.includeMethods) {
+                    } else if (language !== 'go' && language !== 'java' && language !== 'rust' && !options.includeMethods) {
                         continue;
                     }
                 }
@@ -1575,7 +1572,8 @@ class ProjectIndex {
                             }
                             if (!match) {
                                 // Follow first parent's chain (simplified MRO)
-                                const nextParent = parents.find(p => !visited.has(p)) || parents[0];
+                                const nextParent = parents.find(p => !visited.has(p));
+                                if (!nextParent) break;
                                 parents = this.extendsGraph.get(nextParent);
                             }
                         }
@@ -1908,18 +1906,19 @@ class ProjectIndex {
         const fileEntry = this.files.get(filePath);
         if (!fileEntry) return null;
 
-        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl']);
+        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl', 'enum', 'trait']);
+        let best = null;
         for (const symbol of fileEntry.symbols) {
             if (!nonCallableTypes.has(symbol.type) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {
-                if (returnSymbol) {
-                    return symbol;
+                if (!best || (symbol.endLine - symbol.startLine) < (best.endLine - best.startLine)) {
+                    best = symbol;
                 }
-                return symbol.name;
             }
         }
-        return null;
+        if (!best) return null;
+        return returnSymbol ? best : best.name;
     }
 
     /**
@@ -2226,10 +2225,6 @@ class ProjectIndex {
      */
     api(filePath, options = {}) {
         const results = [];
-
-        const filesToCheck = filePath
-            ? [this.findFile(filePath)].filter(Boolean)
-            : Array.from(this.files.entries());
 
         for (const [absPath, fileEntry] of (filePath ? [[this.findFile(filePath), this.files.get(this.findFile(filePath))]] : this.files.entries())) {
             if (!fileEntry) continue;
@@ -2708,7 +2703,7 @@ class ProjectIndex {
      * @returns {object} - Graph structure with root, nodes, edges
      */
     graph(filePath, options = {}) {
-        const direction = options.direction || 'imports';
+        const direction = options.direction || 'both';
         // Sanitize depth: use default for null/undefined, clamp negative to 0
         const rawDepth = options.maxDepth ?? 5;
         const maxDepth = Math.max(0, rawDepth);

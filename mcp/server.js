@@ -272,13 +272,13 @@ server.registerTool(
         try {
             const index = getIndex(project_dir);
             const ctx = index.context(name, {
-                includeMethods: include_methods || false,
+                includeMethods: include_methods,
                 includeUncertain: include_uncertain || false,
                 file
             });
             const { text, expandable } = output.formatContext(ctx);
             if (expandable.length > 0) {
-                const cacheKey = `${index.root}:${name}`;
+                const cacheKey = `${index.root}:${name}:${file || ''}`;
                 // LRU eviction for expandCache
                 if (expandCache.size >= MAX_EXPAND_CACHE_SIZE && !expandCache.has(cacheKey)) {
                     let oldestKey = null;
@@ -347,7 +347,7 @@ server.registerTool(
             const result = index.smart(name, {
                 file,
                 withTypes: with_types || false,
-                includeMethods: include_methods || false,
+                includeMethods: include_methods,
                 includeUncertain: include_uncertain || false
             });
             return toolResult(output.formatSmart(result));

@@ -672,9 +672,15 @@ function findUsagesInCode(code, name, parser) {
             // Definition: variable name in short var declaration
             else if (parent.type === 'short_var_declaration') {
                 const left = parent.childForFieldName('left');
-                if (left && (left === node || left.text.includes(name))) {
+                if (left && (left === node || left.namedChildren?.some(c => c === node))) {
                     usageType = 'definition';
                 }
+            }
+            // Multi-var: x, err := foo() — identifier parent is expression_list
+            else if (parent.type === 'expression_list' &&
+                     parent.parent?.type === 'short_var_declaration' &&
+                     parent.parent.childForFieldName('left') === parent) {
+                usageType = 'definition';
             }
             // Definition: const/var spec
             else if (parent.type === 'const_spec' || parent.type === 'var_spec') {

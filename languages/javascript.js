@@ -545,7 +545,7 @@ function extractClassMembers(classNode, code) {
                     memberType = 'override';
                 }
 
-                const isAsync = text.match(/^\s*(?:static\s+)?(?:override\s+)?async\s/) !== null;
+                const isAsync = text.match(/^\s*(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:override\s+)?async\s/) !== null;
                 const returnType = extractReturnType(child);
                 const docstring = extractJSDocstring(code, startLine);
 
@@ -852,7 +852,9 @@ function findCallsInCode(code, parser) {
             const enclosingFunction = getCurrentEnclosingFunction();
             let uncertain = false;
             // optional chaining implies possible non-call
-            if (node.type === 'call_expression' && node.text.includes('?.')) uncertain = true;
+            // Only check text before the opening paren to avoid false positives from arguments like foo(bar?.baz)
+            const parenIdx = node.text.indexOf('(');
+            if (parenIdx > 0 && node.text.slice(0, parenIdx).includes('?.')) uncertain = true;
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()

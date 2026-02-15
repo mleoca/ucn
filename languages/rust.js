@@ -775,7 +775,7 @@ function findImportsInCode(code, parser) {
     traverseTree(tree.rootNode, (node) => {
         if (node.type === 'macro_invocation') {
             const nameNode = node.childForFieldName('macro');
-            if (nameNode && /^include(_str|_bytes)?!$/.test(nameNode.text)) {
+            if (nameNode && /^include(_str|_bytes)?$/.test(nameNode.text)) {
                 const argsNode = node.childForFieldName('argument_list');
                 const arg = argsNode?.namedChild(0);
                 const dynamic = !arg || arg.type !== 'string_literal';

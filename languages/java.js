@@ -840,13 +840,16 @@ function findUsagesInCode(code, name, parser) {
                      parent.childForFieldName('name') === node) {
                 usageType = 'definition';
             }
-            // Definition: parameter
-            else if (parent.type === 'formal_parameter' ||
-                     parent.type === 'spread_parameter') {
+            // Definition: parameter (name field only, not the type)
+            else if ((parent.type === 'formal_parameter' ||
+                     parent.type === 'spread_parameter') &&
+                     parent.childForFieldName('name') === node) {
                 usageType = 'definition';
             }
-            // Definition: field
-            else if (parent.type === 'field_declaration') {
+            // Definition: field (declarator name only, not the type)
+            else if (parent.type === 'field_declaration' &&
+                     node.type === 'identifier' &&
+                     parent.descendantsOfType('variable_declarator').some(d => d.childForFieldName('name') === node)) {
                 usageType = 'definition';
             }
             // Object creation: new ClassName()
