@@ -647,6 +647,13 @@ function apiInFile(result, filePath) {
 function runProjectCommand(rootDir, command, arg) {
     const index = new ProjectIndex(rootDir);
 
+    // Detect subdirectory scope: if rootDir resolves to a subdirectory of the project root,
+    // use it as an implicit scope filter (e.g., "ucn src deadcode" → scope to src/)
+    const resolvedTarget = path.resolve(rootDir);
+    const subdirScope = resolvedTarget !== index.root && resolvedTarget.startsWith(index.root + path.sep)
+        ? path.relative(index.root, resolvedTarget)
+        : null;
+
     // Clear cache if requested
     if (flags.clearCache) {
         const cacheDir = path.join(index.root, '.ucn-cache');
@@ -968,7 +975,8 @@ function runProjectCommand(rootDir, command, arg) {
                 includeExported: flags.includeExported,
                 includeDecorated: flags.includeDecorated,
                 includeTests: flags.includeTests,
-                exclude: flags.exclude
+                exclude: flags.exclude,
+                in: flags.in || subdirScope
             });
             printOutput(deadcodeResults,
                 r => JSON.stringify({ deadcode: r }, null, 2),

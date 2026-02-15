@@ -430,16 +430,18 @@ server.registerTool(
         inputSchema: z.object({
             project_dir: projectDirParam,
             exclude: excludeParam,
+            in: z.string().optional().describe('Only report dead code in this directory path (e.g. "src")'),
             include_exported: z.boolean().optional().describe('Include exported symbols (excluded by default)'),
             include_decorated: z.boolean().optional().describe('Include decorated/annotated symbols like @router.get, @Bean (excluded by default as they are typically framework-registered)'),
             include_tests: includeTestsParam
         })
     },
-    async ({ project_dir, exclude, include_exported, include_decorated, include_tests }) => {
+    async ({ project_dir, exclude, in: inPath, include_exported, include_decorated, include_tests }) => {
         try {
             const index = getIndex(project_dir);
             const result = index.deadcode({
                 exclude: parseExclude(exclude),
+                in: inPath || undefined,
                 includeExported: include_exported || false,
                 includeDecorated: include_decorated || false,
                 includeTests: include_tests || false

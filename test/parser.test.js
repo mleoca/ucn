@@ -10735,7 +10735,8 @@ config/local.json
 
         // Should include simple directory names
         assert.ok(patterns.includes('public'), 'Should include public');
-        assert.ok(patterns.includes('next.lock'), 'Should include next.lock');
+        // next.lock is now in DEFAULT_IGNORES, so it should be deduped out
+        assert.ok(!patterns.includes('next.lock'), 'Should skip next.lock (already in DEFAULT_IGNORES)');
         assert.ok(patterns.includes('.cache'), 'Should include .cache');
         assert.ok(patterns.includes('tmp_build'), 'Should include tmp_build (leading / stripped)');
 
@@ -10790,6 +10791,118 @@ module.exports = { generatedFunc };
         // Should NOT find generatedFunc from generated/ (excluded by .gitignore)
         const gen = index.find('generatedFunc');
         assert.strictEqual(gen.length, 0, 'Should not find generatedFunc (excluded by .gitignore)');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 105: deadcode skips bundled/minified files (webpack bundles, minified code)
+it('FIX 105 — deadcode skips bundled/minified files', () => {
+    const tmpDir = path.join(require('os').tmpdir(), `ucn-test-bundled-${Date.now()}`);
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'public'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+    // Real source file with an unused function
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), `
+function usedFunc() { return 1; }
+function unusedReal() { return 2; }
+module.exports = { usedFunc };
+`);
+
+    // Webpack bundle (contains __webpack_require__)
+    fs.writeFileSync(path.join(tmpDir, 'public', 'bundle.js'), `
+var __webpack_modules__ = {};
+function __webpack_require__(moduleId) { return __webpack_modules__[moduleId]; }
+function de() { return 1; }
+function ge() { return 2; }
+function ve() { return 3; }
+`);
+
+    // Minified file (very long lines)
+    const longLine = 'function a(){return 1}' + ';var b=2'.repeat(200);
+    fs.writeFileSync(path.join(tmpDir, 'public', 'min.js'), longLine + '\n');
+
+    try {
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const dead = index.deadcode({ includeExported: true });
+        const deadNames = dead.map(d => d.name);
+
+        // Should find the real unused function
+        assert.ok(deadNames.includes('unusedReal'), 'Should find unusedReal from source');
+
+        // Should NOT report webpack internals
+        assert.ok(!deadNames.includes('__webpack_require__'), 'Should skip webpack __webpack_require__');
+        assert.ok(!deadNames.includes('de'), 'Should skip minified function de from bundle');
+        assert.ok(!deadNames.includes('ge'), 'Should skip minified function ge from bundle');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 106: deadcode respects target path scoping (ucn src deadcode)
+it('FIX 106 — deadcode respects --in option for path scoping', () => {
+    const tmpDir = path.join(require('os').tmpdir(), `ucn-test-deadcode-scope-${Date.now()}`);
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), `
+function srcUnused() { return 1; }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'lib', 'helper.js'), `
+function libUnused() { return 2; }
+`);
+
+    try {
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // Without --in: should find both
+        const allDead = index.deadcode({ includeExported: true });
+        const allNames = allDead.map(d => d.name);
+        assert.ok(allNames.includes('srcUnused'), 'Should find srcUnused');
+        assert.ok(allNames.includes('libUnused'), 'Should find libUnused');
+
+        // With in: 'src': should only find srcUnused
+        const srcDead = index.deadcode({ includeExported: true, in: 'src' });
+        const srcNames = srcDead.map(d => d.name);
+        assert.ok(srcNames.includes('srcUnused'), 'Should find srcUnused in src scope');
+        assert.ok(!srcNames.includes('libUnused'), 'Should NOT find libUnused when scoped to src');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 107: CLI target path routes to deadcode --in scope
+it('FIX 107 — CLI ucn <subdir> deadcode scopes to subdirectory', () => {
+    const tmpDir = path.join(require('os').tmpdir(), `ucn-test-cli-scope-${Date.now()}`);
+    fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+    fs.mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
+    fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+
+    fs.writeFileSync(path.join(tmpDir, 'src', 'app.js'), `
+function srcDead() { return 1; }
+`);
+    fs.writeFileSync(path.join(tmpDir, 'lib', 'helper.js'), `
+function libDead() { return 2; }
+`);
+
+    try {
+        const { execSync } = require('child_process');
+        const cliPath = path.join(__dirname, '..', 'cli', 'index.js');
+
+        // ucn <project> deadcode → should find both
+        const allOut = execSync(`node ${cliPath} ${tmpDir} deadcode --include-exported 2>&1`, { timeout: 30000 }).toString();
+        assert.ok(allOut.includes('srcDead'), 'Full project should include srcDead');
+        assert.ok(allOut.includes('libDead'), 'Full project should include libDead');
+
+        // ucn <project>/src deadcode → should only find srcDead
+        const srcOut = execSync(`node ${cliPath} ${path.join(tmpDir, 'src')} deadcode --include-exported 2>&1`, { timeout: 30000 }).toString();
+        assert.ok(srcOut.includes('srcDead'), 'src scope should include srcDead');
+        assert.ok(!srcOut.includes('libDead'), 'src scope should NOT include libDead');
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }

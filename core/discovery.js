@@ -33,6 +33,7 @@ const DEFAULT_IGNORES = [
     'build',
     'out',
     '.next',
+    'next.lock',
     '.nuxt',
     '.output',
     '.vercel',
