@@ -153,11 +153,27 @@ class ProjectIndex {
         const { imports, dynamicCount, importAliases } = extractImports(content, language);
         const { exports } = extractExports(content, language);
 
+        // Detect bundled/minified files (webpack bundles, minified code)
+        // These are build artifacts, not user-written source code
+        const contentLines = content.split('\n');
+        const isBundled = (() => {
+            // Webpack bundles contain __webpack_require__ or __webpack_modules__
+            if (content.includes('__webpack_require__') || content.includes('__webpack_modules__')) return true;
+            // Minified files: very few lines but large content (avg > 500 chars/line)
+            if (contentLines.length > 0 && contentLines.length < 50 && content.length / contentLines.length > 500) return true;
+            // Very long single lines (> 1000 chars) in most of the file suggest minification
+            if (contentLines.length > 0) {
+                const longLines = contentLines.filter(l => l.length > 1000).length;
+                if (longLines > 0 && longLines / contentLines.length > 0.3) return true;
+            }
+            return false;
+        })();
+
         const fileEntry = {
             path: filePath,
             relativePath: path.relative(this.root, filePath),
             language,
-            lines: content.split('\n').length,
+            lines: contentLines.length,
             hash,
             mtime: stat.mtimeMs,
             size: stat.size,
@@ -166,7 +182,8 @@ class ProjectIndex {
             exportDetails: exports,
             symbols: [],
             bindings: [],
-            ...(importAliases && { importAliases })
+            ...(importAliases && { importAliases }),
+            ...(isBundled && { isBundled: true })
         };
         fileEntry.dynamicImports = dynamicCount || 0;
 
@@ -2548,14 +2565,19 @@ class ProjectIndex {
                 const fileEntry = this.files.get(symbol.file);
                 const lang = fileEntry?.language;
 
+                // Skip bundled/minified files (webpack bundles, build artifacts)
+                if (fileEntry?.isBundled) {
+                    continue;
+                }
+
                 // Skip test files unless requested
                 if (!options.includeTests && isTestFile(symbol.relativePath, lang)) {
                     continue;
                 }
 
-                // Apply exclude filter
-                if (options.exclude && options.exclude.length > 0) {
-                    if (!this.matchesFilters(symbol.relativePath, { exclude: options.exclude })) {
+                // Apply exclude and in filters
+                if ((options.exclude && options.exclude.length > 0) || options.in) {
+                    if (!this.matchesFilters(symbol.relativePath, { exclude: options.exclude, in: options.in })) {
                         continue;
                     }
                 }
