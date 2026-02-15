@@ -275,8 +275,9 @@ class ProjectIndex {
      * Progressively strips trailing segments to find the class file.
      */
     _resolveJavaPackageImport(importModule) {
+        const isWildcard = importModule.endsWith('.*');
         // Strip wildcard suffix (e.g., "com.pkg.Class.*" -> "com.pkg.Class")
-        const mod = importModule.endsWith('.*') ? importModule.slice(0, -2) : importModule;
+        const mod = isWildcard ? importModule.slice(0, -2) : importModule;
         const segments = mod.split('.');
 
         // Try progressively shorter paths: full path, then strip last segment, etc.
@@ -289,6 +290,18 @@ class ProjectIndex {
                 }
             }
         }
+
+        // For wildcard imports (com.pkg.model.*), the package may be a directory
+        // containing .java files. Check if any file lives under this package path.
+        if (isWildcard) {
+            const dirSuffix = '/' + segments.join('/') + '/';
+            for (const absPath of this.files.keys()) {
+                if (absPath.includes(dirSuffix)) {
+                    return absPath;
+                }
+            }
+        }
+
         return null;
     }
 
@@ -1263,6 +1276,38 @@ class ProjectIndex {
                     const targetBindingIds = new Set(targetDefs.map(d => d.bindingId).filter(Boolean));
                     if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
                         continue;
+                    }
+
+                    // Java/Go/Rust receiver-class disambiguation:
+                    // When targetDefinitions narrows to specific class(es) and the call has a
+                    // receiver (e.g. javascriptFileService.createDataFile()), check if the
+                    // receiver name better matches a non-target class definition.
+                    // This prevents false positives like reporting obj.save() as a caller of
+                    // TargetClass.save() when obj is clearly a different type.
+                    if (call.isMethod && call.receiver && !resolvedBySameClass && !bindingId &&
+                        options.targetDefinitions && definitions.length > 1 &&
+                        (fileEntry.language === 'java' || fileEntry.language === 'go' || fileEntry.language === 'rust')) {
+                        const targetClassNames = new Set(targetDefs.map(d => d.className).filter(Boolean));
+                        if (targetClassNames.size > 0) {
+                            const receiverLower = call.receiver.toLowerCase();
+                            // Check if receiver matches any target class (camelCase convention)
+                            const matchesTarget = [...targetClassNames].some(cn => cn.toLowerCase() === receiverLower);
+                            if (!matchesTarget) {
+                                // Check if receiver matches a non-target class instead
+                                const nonTargetClasses = definitions
+                                    .filter(d => d.className && !targetClassNames.has(d.className))
+                                    .map(d => d.className);
+                                const matchesOther = nonTargetClasses.some(cn => cn.toLowerCase() === receiverLower);
+                                if (matchesOther) {
+                                    // Receiver clearly belongs to a different class
+                                    isUncertain = true;
+                                    if (!options.includeUncertain) {
+                                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // Find the enclosing function (get full symbol info)

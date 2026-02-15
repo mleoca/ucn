@@ -1098,6 +1098,42 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
+        // Handle JSX attribute function references: onClick={handlePaste}, onSubmit={utils.handler}
+        // Only captures bare identifiers/member expressions (not calls like onClick={handlePaste()})
+        if (node.type === 'jsx_expression') {
+            const parent = node.parent;
+            if (parent?.type === 'jsx_attribute' && node.namedChildCount === 1) {
+                const child = node.namedChild(0);
+                if (child.type === 'identifier' && !SKIP_IDENTS.has(child.text) && !nonCallableNames.has(child.text)) {
+                    const enclosingFunction = getCurrentEnclosingFunction();
+                    calls.push({
+                        name: child.text,
+                        line: child.startPosition.row + 1,
+                        isMethod: false,
+                        isFunctionReference: true,
+                        isPotentialCallback: true,
+                        enclosingFunction
+                    });
+                } else if (child.type === 'member_expression') {
+                    const propNode = child.childForFieldName('property');
+                    const objNode = child.childForFieldName('object');
+                    if (propNode && !SKIP_IDENTS.has(propNode.text)) {
+                        const enclosingFunction = getCurrentEnclosingFunction();
+                        calls.push({
+                            name: propNode.text,
+                            line: child.startPosition.row + 1,
+                            isMethod: true,
+                            receiver: objNode?.type === 'identifier' ? objNode.text : undefined,
+                            isFunctionReference: true,
+                            isPotentialCallback: true,
+                            enclosingFunction
+                        });
+                    }
+                }
+            }
+            return true;
+        }
+
         return true;
     }, {
         onLeave: (node) => {
