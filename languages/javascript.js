@@ -842,6 +842,11 @@ function findCallsInCode(code, parser) {
             if (nameNode?.type === 'identifier' && initNode && isNonCallableInit(initNode)) {
                 nonCallableNames.add(nameNode.text);
             }
+            // Track new expression results: const request = new Foo()
+            // Constructor results are object instances, not callable functions
+            if (nameNode?.type === 'identifier' && initNode?.type === 'new_expression') {
+                nonCallableNames.add(nameNode.text);
+            }
         }
 
         // Handle regular function calls: foo(), obj.foo(), foo.call()

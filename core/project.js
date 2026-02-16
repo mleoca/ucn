@@ -1409,11 +1409,14 @@ class ProjectIndex {
             const fileEntry = this.files.get(def.file);
             const language = fileEntry?.language;
 
-            // Build list of inner callable symbols (functions/methods defined inside def)
-            // to exclude calls that belong to nested named functions
+            // Build list of inner class/struct method ranges to exclude from callee detection.
+            // Only class methods are excluded — they are independently addressable symbols.
+            // Calls within closures (named functions without className) ARE included as
+            // callees of the parent function, since closures are part of the parent's behavior.
             const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl']);
             const innerSymbolRanges = fileEntry ? fileEntry.symbols
                 .filter(s => !nonCallableTypes.has(s.type) &&
+                        s.className &&  // Only exclude class methods, not closures
                         s.startLine > def.startLine && s.endLine <= def.endLine &&
                         s.startLine !== def.startLine)
                 .map(s => [s.startLine, s.endLine]) : [];
@@ -1467,10 +1470,18 @@ class ProjectIndex {
 
                 // For potential callbacks (identifier args to non-HOF calls),
                 // only include if name exists as a function in symbol table
+                // AND has binding/import evidence or same-file definition.
+                // Prevents local variables (request, context) from matching
+                // unrelated functions defined elsewhere (especially test files).
                 if (call.isPotentialCallback) {
                     const syms = this.symbols.get(effectiveName);
                     if (!syms || !syms.some(s =>
                         ['function', 'method', 'constructor', 'static', 'public', 'abstract'].includes(s.type))) {
+                        continue;
+                    }
+                    const hasBinding = fileEntry?.bindings?.some(b => b.name === call.name);
+                    const inSameFile = syms.some(s => s.file === def.file);
+                    if (!hasBinding && !inSameFile) {
                         continue;
                     }
                 }
@@ -1580,7 +1591,17 @@ class ProjectIndex {
                                 isUncertain = true;
                             }
                         } else {
-                            isUncertain = true;
+                            // Try to resolve to a binding defined within the parent function's
+                            // scope (inner closure). E.g., hookRunnerApplication defines next()
+                            // internally — prefer that over other next() in the same file.
+                            const innerBinding = bindings.find(b =>
+                                b.startLine > def.startLine && b.startLine <= def.endLine);
+                            if (innerBinding) {
+                                bindingResolved = innerBinding.id;
+                                calleeKey = bindingResolved;
+                            } else {
+                                isUncertain = true;
+                            }
                         }
                     }
                 }
@@ -1682,9 +1703,12 @@ class ProjectIndex {
 
             // Look up each callee in the symbol table
             // For methods, prefer callees from: 1) same file, 2) same package, 3) same receiver type
+            // Also deprioritize test-file definitions when caller is in production code
             const result = [];
             const defDir = path.dirname(def.file);
             const defReceiver = def.receiver;
+            const defFileEntry = fileEntry;
+            const callerIsTest = defFileEntry && isTestFile(defFileEntry.relativePath, defFileEntry.language);
 
             for (const { name: calleeName, bindingId, count } of callees.values()) {
                 const symbols = this.symbols.get(calleeName);
@@ -1717,6 +1741,26 @@ class ProjectIndex {
                                     callee = sameReceiver;
                                 }
                             }
+                        }
+                        // Priority 4: If default (symbols[0]) is a test file, prefer non-test
+                        if (!bindingId) {
+                            const calleeFileEntry = this.files.get(callee.file);
+                            if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {
+                                const nonTest = symbols.find(s => {
+                                    const fe = this.files.get(s.file);
+                                    return fe && !isTestFile(fe.relativePath, fe.language);
+                                });
+                                if (nonTest) callee = nonTest;
+                            }
+                        }
+                    }
+
+                    // Skip test-file callees when caller is production code and
+                    // there's no binding (import) evidence linking them
+                    if (!callerIsTest && !bindingId) {
+                        const calleeFileEntry = this.files.get(callee.file);
+                        if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {
+                            continue;
                         }
                     }
 
@@ -4069,7 +4113,7 @@ class ProjectIndex {
                 callerName: c.callerName
             }));
 
-            allCallees = this.findCallees(primary, { includeMethods });
+            allCallees = this.findCallees(primary, { includeMethods, includeUncertain: options.includeUncertain });
             // Apply exclude filter before slicing
             if (options.exclude && options.exclude.length > 0) {
                 allCallees = allCallees.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
@@ -4377,6 +4421,21 @@ class ProjectIndex {
             .filter(f => entryPattern.test(f.file))
             .slice(0, options.all ? Infinity : 5)
             .map(f => f.file);
+
+        // Also detect entry points from package.json main/exports fields
+        const pkgJsonPath = path.join(this.root, 'package.json');
+        try {
+            const pkgJson = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+            const mainField = pkgJson.main || pkgJson.module;
+            if (mainField) {
+                const mainFile = path.relative(this.root, path.resolve(this.root, mainField));
+                if (files.some(f => f.file === mainFile) && !entryFiles.includes(mainFile)) {
+                    entryFiles.unshift(mainFile);
+                }
+            }
+        } catch {
+            // No package.json or invalid JSON — skip
+        }
 
         // Apply top limit for detailed mode to avoid massive output
         const top = options.top > 0 ? options.top : (options.detailed && !options.all ? 50 : Infinity);
