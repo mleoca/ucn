@@ -149,7 +149,7 @@ function toolResult(text) {
         // Cut at last newline to avoid breaking mid-line
         const lastNewline = truncated.lastIndexOf('\n');
         const cleanCut = lastNewline > MAX_OUTPUT_CHARS * 0.8 ? truncated.substring(0, lastNewline) : truncated;
-        return { content: [{ type: 'text', text: cleanCut + '\n\n... (output truncated — refine query or use --file/--in to narrow scope)' }] };
+        return { content: [{ type: 'text', text: cleanCut + '\n\n... (output truncated — refine query or use file/in/exclude parameters to narrow scope)' }] };
     }
     return { content: [{ type: 'text', text }] };
 }
@@ -286,8 +286,11 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.about(name, { file, exclude: parseExclude(exclude), withTypes: with_types || false, includeMethods: include_methods ?? undefined });
-                return toolResult(output.formatAbout(result));
+                const result = index.about(name, { file, exclude: parseExclude(exclude), withTypes: with_types || false, includeMethods: include_methods ?? undefined, maxCallers: top, maxCallees: top });
+                return toolResult(output.formatAbout(result, {
+                    allHint: 'Repeat with top set higher to show all.',
+                    methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.'
+                }));
             }
 
             case 'context': {
@@ -300,7 +303,9 @@ server.registerTool(
                     file,
                     exclude: parseExclude(exclude)
                 });
-                const { text, expandable } = output.formatContext(ctx);
+                const { text, expandable } = output.formatContext(ctx, {
+                    expandHint: 'Use expand command with item number to see code for any item.'
+                });
                 if (expandable.length > 0) {
                     const cacheKey = `${index.root}:${name}:${file || ''}`;
                     // LRU eviction for expandCache
@@ -346,8 +351,11 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.trace(name, { depth: depth ?? 3, file, all: depth !== undefined, includeMethods: include_methods, includeUncertain: include_uncertain });
-                return toolResult(output.formatTrace(result));
+                const result = index.trace(name, { depth: depth ?? 3, file, all: depth !== undefined, includeMethods: include_methods, includeUncertain: include_uncertain || false });
+                return toolResult(output.formatTrace(result, {
+                    allHint: 'Set depth to expand all children.',
+                    methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
+                }));
             }
 
             case 'example': {
@@ -361,8 +369,11 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.related(name, { file });
-                return toolResult(output.formatRelated(result));
+                const result = index.related(name, { file, all: top !== undefined });
+                return toolResult(output.formatRelated(result, {
+                    showAll: top !== undefined,
+                    allHint: 'Repeat with top set higher to show all.'
+                }));
             }
 
             // ==================================================================
@@ -656,7 +667,12 @@ server.registerTool(
                 }
                 const index = getIndex(project_dir);
                 const result = index.graph(file, { direction: direction || 'both', maxDepth: depth ?? 2 });
-                return toolResult(output.formatGraph(result, { showAll: depth !== undefined, file }));
+                return toolResult(output.formatGraph(result, {
+                    showAll: depth !== undefined,
+                    file,
+                    depthHint: 'Set depth parameter for deeper graph.',
+                    allHint: 'Set depth to expand all children.'
+                }));
             }
 
             // ==================================================================
