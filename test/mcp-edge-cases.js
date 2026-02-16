@@ -2,10 +2,10 @@
 
 /**
  * MCP Server Edge Case Test Suite
- * 
+ *
  * Tests UCN MCP tools with null/crash safety, input validation,
  * and normal operation edge cases.
- * 
+ *
  * Communicates with the MCP server over stdio using newline-delimited JSON-RPC.
  */
 
@@ -147,118 +147,118 @@ const tests = [
     // ========================================================================
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_about',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'about - nonexistent symbol',
+        args: { command: 'about', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_context',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'context - nonexistent symbol',
+        args: { command: 'context', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_impact',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'impact - nonexistent symbol',
+        args: { command: 'impact', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_smart',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'smart - nonexistent symbol',
+        args: { command: 'smart', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_trace',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'trace - nonexistent symbol',
+        args: { command: 'trace', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_verify',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'verify - nonexistent symbol',
+        args: { command: 'verify', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_related',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'related - nonexistent symbol',
+        args: { command: 'related', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_example',
-        desc: 'nonexistent symbol',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        tool: 'ucn',
+        desc: 'example - nonexistent symbol',
+        args: { command: 'example', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_fn',
-        desc: 'nonexistent function',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_function_xyz' }
+        tool: 'ucn',
+        desc: 'fn - nonexistent function',
+        args: { command: 'fn', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_function_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_class',
-        desc: 'nonexistent class',
-        args: { project_dir: PROJECT_DIR, name: 'ZzzNonexistentClassXyz' }
+        tool: 'ucn',
+        desc: 'class - nonexistent class',
+        args: { command: 'class', project_dir: PROJECT_DIR, name: 'ZzzNonexistentClassXyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_tests',
-        desc: 'nonexistent name',
-        args: { project_dir: PROJECT_DIR, name: 'zzz_nonexistent_test_xyz' }
+        tool: 'ucn',
+        desc: 'tests - nonexistent name',
+        args: { command: 'tests', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_test_xyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_typedef',
-        desc: 'nonexistent type',
-        args: { project_dir: PROJECT_DIR, name: 'ZzzNonexistentTypeXyz' }
+        tool: 'ucn',
+        desc: 'typedef - nonexistent type',
+        args: { command: 'typedef', project_dir: PROJECT_DIR, name: 'ZzzNonexistentTypeXyz' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_graph',
-        desc: 'nonexistent file',
-        args: { project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        tool: 'ucn',
+        desc: 'graph - nonexistent file',
+        args: { command: 'graph', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_file_exports',
-        desc: 'nonexistent file',
-        args: { project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        tool: 'ucn',
+        desc: 'file_exports - nonexistent file',
+        args: { command: 'file_exports', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_imports',
-        desc: 'nonexistent file',
-        args: { project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        tool: 'ucn',
+        desc: 'imports - nonexistent file',
+        args: { command: 'imports', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_exporters',
-        desc: 'nonexistent file',
-        args: { project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        tool: 'ucn',
+        desc: 'exporters - nonexistent file',
+        args: { command: 'exporters', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
 
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_api',
-        desc: 'nonexistent file',
-        args: { project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        tool: 'ucn',
+        desc: 'api - nonexistent file',
+        args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_lines',
-        desc: 'nonexistent file',
-        args: { project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js', range: '1-10' }
+        tool: 'ucn',
+        desc: 'lines - nonexistent file',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js', range: '1-10' }
     },
     {
         category: 'Null/Crash Safety',
-        tool: 'ucn_expand',
-        desc: 'no prior context call',
-        args: { project_dir: PROJECT_DIR, number: 1 }
+        tool: 'ucn',
+        desc: 'expand - no prior context call',
+        args: { command: 'expand', project_dir: PROJECT_DIR, item: 1 }
     },
 
     // ========================================================================
@@ -266,51 +266,51 @@ const tests = [
     // ========================================================================
     {
         category: 'Input Validation',
-        tool: 'ucn_find',
-        desc: 'whitespace-only name',
-        args: { project_dir: PROJECT_DIR, name: '   ' }
+        tool: 'ucn',
+        desc: 'find - whitespace-only name',
+        args: { command: 'find', project_dir: PROJECT_DIR, name: '   ' }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_about',
-        desc: 'name with special chars "foo()"',
-        args: { project_dir: PROJECT_DIR, name: 'foo()' }
+        tool: 'ucn',
+        desc: 'about - name with special chars "foo()"',
+        args: { command: 'about', project_dir: PROJECT_DIR, name: 'foo()' }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_search',
-        desc: 'regex special chars "[test"',
-        args: { project_dir: PROJECT_DIR, term: '[test' }
+        tool: 'ucn',
+        desc: 'search - regex special chars "[test"',
+        args: { command: 'search', project_dir: PROJECT_DIR, term: '[test' }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_plan',
-        desc: 'no operation specified',
-        args: { project_dir: PROJECT_DIR, name: 'getIndex' }
+        tool: 'ucn',
+        desc: 'plan - no operation specified',
+        args: { command: 'plan', project_dir: PROJECT_DIR, name: 'getIndex' }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_stacktrace',
-        desc: 'empty stack',
-        args: { project_dir: PROJECT_DIR, stack: '' }
+        tool: 'ucn',
+        desc: 'stacktrace - empty stack',
+        args: { command: 'stacktrace', project_dir: PROJECT_DIR, stack: '' }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_toc',
-        desc: 'nonexistent project_dir',
-        args: { project_dir: '/nonexistent/fake/directory/abc123' }
+        tool: 'ucn',
+        desc: 'toc - nonexistent project_dir',
+        args: { command: 'toc', project_dir: '/nonexistent/fake/directory/abc123' }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_find',
-        desc: 'top=0',
-        args: { project_dir: PROJECT_DIR, name: 'getIndex', top: 0 }
+        tool: 'ucn',
+        desc: 'find - top=0',
+        args: { command: 'find', project_dir: PROJECT_DIR, name: 'getIndex', top: 0 }
     },
     {
         category: 'Input Validation',
-        tool: 'ucn_find',
-        desc: 'top=-1',
-        args: { project_dir: PROJECT_DIR, name: 'getIndex', top: -1 }
+        tool: 'ucn',
+        desc: 'find - top=-1',
+        args: { command: 'find', project_dir: PROJECT_DIR, name: 'getIndex', top: -1 }
     },
 
     // ========================================================================
@@ -318,45 +318,45 @@ const tests = [
     // ========================================================================
     {
         category: 'Normal Operations',
-        tool: 'ucn_toc',
-        desc: 'project overview',
-        args: { project_dir: PROJECT_DIR }
+        tool: 'ucn',
+        desc: 'toc - project overview',
+        args: { command: 'toc', project_dir: PROJECT_DIR }
     },
     {
         category: 'Normal Operations',
-        tool: 'ucn_find',
-        desc: 'find "getIndex"',
-        args: { project_dir: PROJECT_DIR, name: 'getIndex' }
+        tool: 'ucn',
+        desc: 'find - find "getIndex"',
+        args: { command: 'find', project_dir: PROJECT_DIR, name: 'getIndex' }
     },
     {
         category: 'Normal Operations',
-        tool: 'ucn_deadcode',
-        desc: 'find dead code',
-        args: { project_dir: PROJECT_DIR }
+        tool: 'ucn',
+        desc: 'deadcode - find dead code',
+        args: { command: 'deadcode', project_dir: PROJECT_DIR }
     },
     {
         category: 'Normal Operations',
-        tool: 'ucn_search',
-        desc: 'search for "TODO"',
-        args: { project_dir: PROJECT_DIR, term: 'TODO' }
+        tool: 'ucn',
+        desc: 'search - search for "TODO"',
+        args: { command: 'search', project_dir: PROJECT_DIR, term: 'TODO' }
     },
     {
         category: 'Normal Operations',
-        tool: 'ucn_api',
-        desc: 'project API',
-        args: { project_dir: PROJECT_DIR }
+        tool: 'ucn',
+        desc: 'api - project API',
+        args: { command: 'api', project_dir: PROJECT_DIR }
     },
     {
         category: 'Normal Operations',
-        tool: 'ucn_stats',
-        desc: 'project stats',
-        args: { project_dir: PROJECT_DIR }
+        tool: 'ucn',
+        desc: 'stats - project stats',
+        args: { command: 'stats', project_dir: PROJECT_DIR }
     },
     {
         category: 'Normal Operations',
-        tool: 'ucn_lines',
-        desc: 'extract lines 1-5 from discovery.js',
-        args: { project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-5' }
+        tool: 'ucn',
+        desc: 'lines - extract lines 1-5 from discovery.js',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-5' }
     },
 ];
 
@@ -384,7 +384,7 @@ async function run() {
     // Run tests sequentially
     for (let i = 0; i < tests.length; i++) {
         const t = tests[i];
-        const label = `[${i + 1}/${tests.length}] ${t.tool} - ${t.desc}`;
+        const label = `[${i + 1}/${tests.length}] ${t.tool} ${t.args.command} - ${t.desc}`;
         process.stdout.write(`  ${label} ... `);
 
         const startTime = Date.now();
@@ -426,6 +426,7 @@ async function run() {
             num: i + 1,
             category: t.category,
             tool: t.tool,
+            command: t.args.command,
             desc: t.desc,
             status,
             detail
@@ -442,12 +443,12 @@ async function run() {
     console.log('='.repeat(140));
 
     const categories = [...new Set(results.map(r => r.category))];
-    
+
     for (const cat of categories) {
         console.log(`\n--- ${cat} ---`);
         console.log(
             '#'.padEnd(5) +
-            'Tool'.padEnd(22) +
+            'Command'.padEnd(22) +
             'Description'.padEnd(42) +
             'Status'.padEnd(8) +
             'Detail'
@@ -458,7 +459,7 @@ async function run() {
         for (const r of catResults) {
             console.log(
                 String(r.num).padEnd(5) +
-                r.tool.padEnd(22) +
+                r.command.padEnd(22) +
                 r.desc.padEnd(42) +
                 r.status.padEnd(8) +
                 r.detail.substring(0, 100)
@@ -477,7 +478,7 @@ async function run() {
     if (failed > 0) {
         console.log('\nFailed tests:');
         for (const r of results.filter(r => r.status === 'FAIL')) {
-            console.log(`  ${r.num}. ${r.tool} - ${r.desc}: ${r.detail}`);
+            console.log(`  ${r.num}. ${r.command} - ${r.desc}: ${r.detail}`);
         }
     }
 
