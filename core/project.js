@@ -4051,8 +4051,8 @@ class ProjectIndex {
      * @returns {object} Complete symbol info
      */
     about(name, options = {}) {
-        const maxCallers = options.all ? Infinity : (options.maxCallers || 5);
-        const maxCallees = options.all ? Infinity : (options.maxCallees || 5);
+        const maxCallers = options.all ? Infinity : (options.maxCallers || 10);
+        const maxCallees = options.all ? Infinity : (options.maxCallees || 10);
         const includeMethods = options.includeMethods ?? true;
 
         // Find symbol definition(s)
