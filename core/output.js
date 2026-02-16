@@ -699,7 +699,7 @@ function formatApiJson(symbols, filePath) {
  * Format trace command output - text
  * Shows call tree visualization
  */
-function formatTrace(trace) {
+function formatTrace(trace, options = {}) {
     if (!trace) {
         return 'Function not found.';
     }
@@ -776,11 +776,13 @@ function formatTrace(trace) {
     }
 
     if (hasTruncation) {
-        lines.push(`\nSome results truncated. Use --all to show all.`);
+        const allHint = options.allHint || 'Use --all to show all.';
+        lines.push(`\nSome results truncated. ${allHint}`);
     }
 
     if (!trace.includeMethods) {
-        lines.push(`\nNote: obj.method() calls excluded (--include-methods=false). Remove flag to include them (default).`);
+        const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded (--include-methods=false). Remove flag to include them (default).';
+        lines.push(`\n${methodsHint}`);
     }
 
     return lines.join('\n');
@@ -856,7 +858,8 @@ function formatRelated(related, options = {}) {
     }
 
     if (relatedTruncated) {
-        lines.push(`\nSome sections truncated. Use --all to show all.`);
+        const allHint = options.allHint || 'Use --all to show all.';
+        lines.push(`\nSome sections truncated. ${allHint}`);
     }
 
     return lines.join('\n');
@@ -1261,11 +1264,13 @@ function formatAbout(about, options = {}) {
     }
 
     if (aboutTruncated) {
-        lines.push(`\nSome sections truncated. Use --all to show all.`);
+        const allHint = options.allHint || 'Use --all to show all.';
+        lines.push(`\nSome sections truncated. ${allHint}`);
     }
 
     if (about.includeMethods === false) {
-        lines.push(`\nNote: obj.method() callers/callees excluded (--include-methods=false). Remove flag to include them (default).`);
+        const methodsHint = options.methodsHint || 'Note: obj.method() callers/callees excluded (--include-methods=false). Remove flag to include them (default).';
+        lines.push(`\n${methodsHint}`);
     }
 
     return lines.join('\n');
@@ -1503,7 +1508,7 @@ function formatUsages(usages, name) {
 
 /**
  * Format context command output
- * Returns { text, expandable } where expandable is an array of items for ucn_expand
+ * Returns { text, expandable } where expandable is an array of items for expand
  * @param {object} ctx - Context data
  * @param {object} [options] - Formatting options
  * @param {string} [options.methodsHint] - Custom hint for excluded method calls
@@ -1870,10 +1875,12 @@ function formatGraph(graph, options = {}) {
         if (depthLimited || truncatedNodes > 0) {
             lines.push('\n' + '─'.repeat(60));
             if (depthLimited) {
-                lines.push(`Depth limited to ${maxDepth}. Use --depth=N for deeper graph.`);
+                const depthHint = options.depthHint || `Use --depth=N for deeper graph.`;
+                lines.push(`Depth limited to ${maxDepth}. ${depthHint}`);
             }
             if (truncatedNodes > 0) {
-                lines.push(`${truncatedNodes} nodes hidden. Use --all to show all children. Graph has ${graph.nodes.length} total files.`);
+                const allHint = options.allHint || 'Use --all to show all children.';
+                lines.push(`${truncatedNodes} nodes hidden. ${allHint} Graph has ${graph.nodes.length} total files.`);
             }
         }
     }
