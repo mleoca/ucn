@@ -2079,7 +2079,7 @@ class ProjectIndex {
                     return this.imports(absPath);
                 }
             }
-            return [];
+            return { error: 'file-not-found', filePath };
         }
 
         try {
@@ -2167,6 +2167,10 @@ class ProjectIndex {
                     break;
                 }
             }
+        }
+
+        if (!this.files.has(targetPath)) {
+            return { error: 'file-not-found', filePath };
         }
 
         const importers = this.exportGraph.get(targetPath) || [];
@@ -2391,7 +2395,7 @@ class ProjectIndex {
     fileExports(filePath) {
         const absPath = this.findFile(filePath);
         if (!absPath) {
-            return [];
+            return { error: 'file-not-found', filePath };
         }
 
         const fileEntry = this.files.get(absPath);
@@ -2818,7 +2822,7 @@ class ProjectIndex {
         }
 
         if (!this.files.has(targetPath)) {
-            return { root: filePath, nodes: [], edges: [], direction };
+            return { error: 'file-not-found', filePath };
         }
 
         const buildSubgraph = (dir) => {
@@ -3106,7 +3110,7 @@ class ProjectIndex {
         // trace defaults to includeMethods=true (execution flow should show method calls)
         const includeMethods = options.includeMethods ?? true;
 
-        const { def } = this.resolveSymbol(name, { file: options.file });
+        const { def, definitions, warnings } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
             return null;
         }
@@ -3167,6 +3171,13 @@ class ProjectIndex {
             }
         }
 
+        // Add smart hint when resolved function has zero callees and alternatives exist
+        if (tree && tree.children && tree.children.length === 0 && definitions.length > 1 && !options.file) {
+            warnings.push({
+                message: `Resolved to ${def.relativePath}:${def.startLine} which has no callees. ${definitions.length - 1} other definition(s) exist — use --file to pick a different one.`
+            });
+        }
+
         return {
             root: name,
             file: def.relativePath,
@@ -3176,7 +3187,8 @@ class ProjectIndex {
             includeMethods,
             tree,
             callers: direction !== 'down' ? callers : undefined,
-            truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined
+            truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined,
+            warnings: warnings.length > 0 ? warnings : undefined
         };
     }
 
@@ -4361,6 +4373,15 @@ class ProjectIndex {
             .slice(0, options.all ? Infinity : 5)
             .map(f => f.file);
 
+        // Apply top limit for detailed mode to avoid massive output
+        const top = options.top > 0 ? options.top : (options.detailed && !options.all ? 50 : Infinity);
+        let hiddenFiles = 0;
+        let displayFiles = files;
+        if (top < files.length) {
+            hiddenFiles = files.length - top;
+            displayFiles = files.slice(0, top);
+        }
+
         return {
             meta: {
                 complete: totalDynamic === 0,
@@ -4381,7 +4402,8 @@ class ProjectIndex {
                 topLineFiles,
                 entryFiles
             },
-            files
+            files: displayFiles,
+            hiddenFiles
         };
     }
 

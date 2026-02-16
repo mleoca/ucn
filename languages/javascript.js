@@ -1067,7 +1067,7 @@ function findCallsInCode(code, parser) {
                         const enclosingFunction = getCurrentEnclosingFunction();
                         calls.push({
                             name: name,
-                            line: node.startPosition.row + 1,
+                            line: child.startPosition.row + 1,
                             isMethod: false,
                             isJsxComponent: true,
                             enclosingFunction
@@ -1085,7 +1085,7 @@ function findCallsInCode(code, parser) {
                         const enclosingFunction = getCurrentEnclosingFunction();
                         calls.push({
                             name: componentName,
-                            line: node.startPosition.row + 1,
+                            line: child.startPosition.row + 1,
                             isMethod: true,
                             receiver: parts.slice(0, -1).join('.'),
                             isJsxComponent: true,

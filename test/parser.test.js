@@ -11360,5 +11360,272 @@ it('FIX 115 — callsCache entry cleared when file symbols are removed', () => {
     }
 });
 
+// ============================================================================
+// FIX #78: File-not-found error for imports/exporters/fileExports/graph
+// ============================================================================
+
+it('fix #78: imports on nonexistent file returns error sentinel', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function hello() {}\n');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const result = index.imports('nonexistent.js');
+        assert.strictEqual(result.error, 'file-not-found');
+        assert.strictEqual(result.filePath, 'nonexistent.js');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #78: exporters on nonexistent file returns error sentinel', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function hello() {}\n');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const result = index.exporters('nonexistent.js');
+        assert.strictEqual(result.error, 'file-not-found');
+        assert.strictEqual(result.filePath, 'nonexistent.js');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #78: fileExports on nonexistent file returns error sentinel', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function hello() {}\n');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const result = index.fileExports('nonexistent.js');
+        assert.strictEqual(result.error, 'file-not-found');
+        assert.strictEqual(result.filePath, 'nonexistent.js');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #78: graph on nonexistent file returns error sentinel', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function hello() {}\n');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const result = index.graph('nonexistent.js');
+        assert.strictEqual(result.error, 'file-not-found');
+        assert.strictEqual(result.filePath, 'nonexistent.js');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #78: formatImports shows error for file-not-found', () => {
+    const { formatImports } = require('../core/output');
+    const result = formatImports({ error: 'file-not-found', filePath: 'missing.js' }, 'missing.js');
+    assert.ok(result.includes('Error: File not found in project: missing.js'));
+});
+
+it('fix #78: formatExporters shows error for file-not-found', () => {
+    const { formatExporters } = require('../core/output');
+    const result = formatExporters({ error: 'file-not-found', filePath: 'missing.js' }, 'missing.js');
+    assert.ok(result.includes('Error: File not found in project: missing.js'));
+});
+
+it('fix #78: formatFileExports shows error for file-not-found', () => {
+    const { formatFileExports } = require('../core/output');
+    const result = formatFileExports({ error: 'file-not-found', filePath: 'missing.js' }, 'missing.js');
+    assert.ok(result.includes('Error: File not found in project: missing.js'));
+});
+
+it('fix #78: formatGraph shows error for file-not-found', () => {
+    const { formatGraph } = require('../core/output');
+    const result = formatGraph({ error: 'file-not-found', filePath: 'missing.js' });
+    assert.ok(result.includes('Error: File not found in project: missing.js'));
+});
+
+// ============================================================================
+// FIX #79: toc truncation for large projects
+// ============================================================================
+
+it('fix #79: toc --detailed defaults to 50 files', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        // Create 60 files
+        for (let i = 0; i < 60; i++) {
+            fs.writeFileSync(path.join(tmpDir, `file${i}.js`), `function fn${i}() {}\n`);
+        }
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const toc = index.getToc({ detailed: true });
+        assert.strictEqual(toc.files.length, 50);
+        assert.strictEqual(toc.hiddenFiles, 10);
+        assert.strictEqual(toc.totals.files, 60);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #79: toc --detailed --all shows all files', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        for (let i = 0; i < 60; i++) {
+            fs.writeFileSync(path.join(tmpDir, `file${i}.js`), `function fn${i}() {}\n`);
+        }
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const toc = index.getToc({ detailed: true, all: true });
+        assert.strictEqual(toc.files.length, 60);
+        assert.strictEqual(toc.hiddenFiles, 0);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #79: toc --detailed --top=10 limits to 10 files', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        for (let i = 0; i < 30; i++) {
+            fs.writeFileSync(path.join(tmpDir, `file${i}.js`), `function fn${i}() {}\n`);
+        }
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const toc = index.getToc({ detailed: true, top: 10 });
+        assert.strictEqual(toc.files.length, 10);
+        assert.strictEqual(toc.hiddenFiles, 20);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #79: formatToc shows truncation hint when hiddenFiles > 0', () => {
+    const { formatToc } = require('../core/output');
+    const toc = {
+        totals: { files: 60, lines: 600, functions: 60, classes: 0, state: 0, testFiles: 0 },
+        meta: {},
+        summary: {},
+        files: [{ file: 'a.js', lines: 10, functions: 1 }],
+        hiddenFiles: 59
+    };
+    const result = formatToc(toc);
+    assert.ok(result.includes('... and 59 more files'));
+});
+
+// ============================================================================
+// FIX #80: trace silently picks wrong overload
+// ============================================================================
+
+it('fix #80: trace shows warning when resolved function has no callees and alternatives exist', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        // First file: delegation method with no callees (just returns)
+        fs.writeFileSync(path.join(tmpDir, 'delegate.js'),
+            'function doWork() { return null; }\nmodule.exports = { doWork };\n');
+        // Second file: real implementation with callees
+        fs.writeFileSync(path.join(tmpDir, 'real.js'),
+            'const helper = require("./helper");\nfunction doWork() { helper.process(); helper.validate(); }\nmodule.exports = { doWork };\n');
+        fs.writeFileSync(path.join(tmpDir, 'helper.js'),
+            'function process() {}\nfunction validate() {}\nmodule.exports = { process, validate };\n');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const result = index.trace('doWork');
+        assert.ok(result, 'trace should return a result');
+        // If resolveSymbol picked the empty one, warnings should include the hint
+        if (result.tree && result.tree.children.length === 0) {
+            assert.ok(result.warnings, 'should have warnings when picking empty overload');
+            assert.ok(result.warnings.some(w => w.message.includes('no callees')));
+            assert.ok(result.warnings.some(w => w.message.includes('--file')));
+        }
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #80: formatTrace displays warnings', () => {
+    const { formatTrace } = require('../core/output');
+    const trace = {
+        root: 'doWork',
+        file: 'delegate.js',
+        line: 1,
+        direction: 'down',
+        maxDepth: 3,
+        includeMethods: true,
+        tree: { name: 'doWork', children: [] },
+        warnings: [{ message: 'Resolved to delegate.js:1 which has no callees. 1 other definition(s) exist — use --file to pick a different one.' }]
+    };
+    const result = formatTrace(trace);
+    assert.ok(result.includes('Note: Resolved to delegate.js:1 which has no callees'));
+    assert.ok(result.includes('--file'));
+});
+
+// ============================================================================
+// FIX #81: JSX caller line attribution off-by-one
+// ============================================================================
+
+it('fix #81: JSX component caller reports correct line number', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-'));
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        // Child component on line 3, parent wrapper on line 2
+        fs.writeFileSync(path.join(tmpDir, 'App.jsx'), [
+            'function Child() { return <div/>; }',          // line 1
+            'function App() {',                              // line 2
+            '  return (',                                    // line 3
+            '    <div>',                                     // line 4
+            '      <Child />',                               // line 5
+            '    </div>',                                    // line 6
+            '  );',                                          // line 7
+            '}',                                             // line 8
+        ].join('\n'));
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const callers = index.findCallers('Child');
+        assert.ok(callers.length > 0, 'should find at least one caller');
+        const caller = callers[0];
+        assert.strictEqual(caller.line, 5, 'JSX <Child /> should be reported on line 5, not line 4 or any other');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+it('fix #81: JSX namespaced component reports correct line in findCallsInCode', () => {
+    const { findCallsInCode } = require('../languages/javascript');
+    const { getParser } = require('../languages');
+    const parser = getParser('javascript');
+    const code = [
+        'const UI = { Panel: () => <div/> };',          // line 1
+        'function App() {',                              // line 2
+        '  return (',                                    // line 3
+        '    <div>',                                     // line 4
+        '      <UI.Panel />',                            // line 5
+        '    </div>',                                    // line 6
+        '  );',                                          // line 7
+        '}',                                             // line 8
+    ].join('\n');
+
+    const calls = findCallsInCode(code, parser);
+    const panelCall = calls.find(c => c.name === 'Panel');
+    assert.ok(panelCall, 'should find Panel call');
+    assert.strictEqual(panelCall.line, 5, 'JSX <UI.Panel /> should be reported on line 5');
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
