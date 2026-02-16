@@ -9471,7 +9471,7 @@ it('formatDeadcode shows exclusion counts in hints', () => {
     const text = formatDeadcode(results);
     assert.ok(text.includes('5 decorated/annotated symbol(s) hidden'), 'Should show decorated count');
     assert.ok(text.includes('--include-decorated'), 'Should hint at --include-decorated flag');
-    assert.ok(text.includes('12 exported symbol(s) hidden'), 'Should show exported count');
+    assert.ok(text.includes('12 exported symbol(s) excluded'), 'Should show exported count');
     assert.ok(text.includes('--include-exported'), 'Should hint at --include-exported flag');
 });
 
