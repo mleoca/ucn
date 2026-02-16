@@ -11550,7 +11550,7 @@ it('fix #80: trace shows warning when resolved function has no callees and alter
         if (result.tree && result.tree.children.length === 0) {
             assert.ok(result.warnings, 'should have warnings when picking empty overload');
             assert.ok(result.warnings.some(w => w.message.includes('no callees')));
-            assert.ok(result.warnings.some(w => w.message.includes('--file')));
+            assert.ok(result.warnings.some(w => w.message.includes('specify a file')));
         }
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });

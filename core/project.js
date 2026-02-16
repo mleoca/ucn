@@ -565,7 +565,7 @@ class ProjectIndex {
         if (definitions.length > 1) {
             warnings.push({
                 type: 'ambiguous',
-                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${definitions.filter(d => d !== def).map(d => `${d.relativePath}:${d.startLine}`).join(', ')}. Use --file to disambiguate.`,
+                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${definitions.filter(d => d !== def).map(d => `${d.relativePath}:${d.startLine}`).join(', ')}. Specify a file to disambiguate.`,
                 alternatives: definitions.filter(d => d !== def).map(d => ({
                     file: d.relativePath,
                     line: d.startLine
@@ -3006,9 +3006,10 @@ class ProjectIndex {
             if (symName === name) continue;
             const symParts = symName.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase().split('_');
 
-            // Check for shared parts
+            // Check for shared parts (require ≥50% of the longer name to match)
             const sharedParts = nameParts.filter(p => symParts.includes(p) && p.length > 2);
-            if (sharedParts.length > 0) {
+            const maxParts = Math.max(nameParts.length, symParts.length);
+            if (sharedParts.length > 0 && sharedParts.length / maxParts >= 0.5) {
                 const sym = symbols[0];
                 related.similarNames.push({
                     name: symName,
@@ -3174,7 +3175,7 @@ class ProjectIndex {
         // Add smart hint when resolved function has zero callees and alternatives exist
         if (tree && tree.children && tree.children.length === 0 && definitions.length > 1 && !options.file) {
             warnings.push({
-                message: `Resolved to ${def.relativePath}:${def.startLine} which has no callees. ${definitions.length - 1} other definition(s) exist — use --file to pick a different one.`
+                message: `Resolved to ${def.relativePath}:${def.startLine} which has no callees. ${definitions.length - 1} other definition(s) exist — specify a file to pick a different one.`
             });
         }
 
