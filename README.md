@@ -13,7 +13,7 @@
   │      $ ucn about myFunc     Works standalone, no agent required.     │
   │                                                                      │
   │   2. MCP Server             Any MCP-compatible AI agent connects     │
-  │      $ ucn --mcp            and gets 27 tools automatically.         │
+  │      $ ucn --mcp            and gets 28 tools automatically.         │
   │                                                                      │
   │   3. Agent Skill            Drop-in skill for Claude Code and        │
   │      /ucn about myFunc      OpenAI Codex CLI. No server needed.      │
@@ -70,8 +70,6 @@ Instead of reading entire files, ask precise questions:
   └──────────────────────────────────────┘
 ```
 
-Use it from the terminal, as an MCP server for any AI agent, or as a skill for Claude Code and Codex.
-
 ---
 
 ## How It Works
@@ -87,7 +85,7 @@ Use it from the terminal, as an MCP server for any AI agent, or as a skill for C
                           ▼
                  ┌───────────────────┐
                  │   UCN MCP Server  │
-                 │   27 tools        │
+                 │   28 tools        │
                  │   runs locally    │
                  └────────┬──────────┘
                           │
@@ -144,6 +142,33 @@ No cloud. No API keys. Parses locally, stays local.
   8+ tool calls                            2 tool calls
   Reads thousands of lines                 Reads zero full files
   Context spent on file contents           Context spent on reasoning
+```
+
+After editing code:
+
+```
+  WITHOUT UCN                              WITH UCN
+  ──────────────────────                   ──────────────────────
+
+  git diff                                 ucn_diff_impact
+       │                                        │
+       ▼                                        ▼
+  see changed lines, but which             13 modified functions
+  functions do they belong to?             8 new functions
+       │                                   22 call sites across 9 files
+       ▼                                        │
+  read each file to map hunks                   ▼
+  to function boundaries                   Each function shown with:
+       │                                     • which lines changed
+       ▼                                     • every downstream caller
+  ucn_impact on each function                • caller context
+  you identified (repeat 5-10x)                 │
+       │                                        ▼
+       ▼                                   Done. Full blast radius.
+  hope you didn't miss one                 One command.
+
+
+  10+ tool calls                            1 tool call
 ```
 
 ---
@@ -294,6 +319,56 @@ expandGlob
     └── shouldIgnore (core/discovery.js:289) [utility] 1x
 ```
 
+See the impact of your recent edits:
+
+```
+$ ucn diff-impact --base=HEAD~1
+
+Diff Impact Analysis (vs HEAD~1)
+════════════════════════════════════════════════════════════
+3 modified, 1 new, 12 call sites across 4 files
+
+MODIFIED FUNCTIONS:
+
+  processOrder
+  src/orders/service.ts:45
+  processOrder (items: Item[], user: User): Promise<Order>
+  Lines added: 48-52
+  Lines deleted: 49
+  Callers (3):
+    src/api/checkout.ts:89 [handleCheckout]
+      await processOrder(cart.items, req.user)
+    src/workers/batch.ts:12 [batchProcess]
+      processOrder(order.items, systemUser)
+    src/jobs/daily.ts:88 [runDailyOrders]
+      results.push(await processOrder(items, admin))
+
+  validateItems
+  src/orders/validate.ts:20
+  validateItems (items: Item[]): ValidationResult
+  Lines added: 25-30
+  Callers (2):
+    src/orders/service.ts:46 [processOrder]
+      const valid = validateItems(items)
+    src/api/admin.ts:55 [bulkValidate]
+      return items.map(i => validateItems([i]))
+
+NEW FUNCTIONS:
+  calculateShipping — src/orders/shipping.ts:10
+  calculateShipping (items: Item[], region: Region): number
+
+MODULE-LEVEL CHANGES:
+  src/orders/service.ts: +5 lines, -1 lines
+```
+
+Scoped to staged changes or a specific file:
+
+```
+$ ucn diff-impact --staged                 # Only what's staged for commit
+$ ucn diff-impact --base=main              # Everything since branching from main
+$ ucn diff-impact --file=src/orders        # Only changes in this path
+```
+
 Find unused code:
 
 ```
@@ -405,6 +480,13 @@ ucn smart the_function                    # See it + its helpers
 ucn verify the_function                   # Did all call sites survive?
 ```
 
+Before committing:
+```bash
+ucn diff-impact                           # What did I change + who calls it?
+ucn diff-impact --base=main               # Full branch impact vs main
+ucn diff-impact --staged                  # Only staged changes
+```
+
 Periodic cleanup:
 ```bash
 ucn deadcode --exclude=test               # What can be deleted?
@@ -448,30 +530,31 @@ ucn toc                                   # Project overview
   │                          │                                          │
   │  First-query index time  │  Tree-sitter index is built on first     │
   │                          │  query. A few seconds on large projects. │
-  │                          │  Cached across subsequent calls.         │
+  │                          │  Cached and incrementally updated —      │
+  │                          │  only changed files are re-indexed.      │
   │                          │                                          │
   └──────────────────────────┴──────────────────────────────────────────┘
 ```
 
 ---
 
-## All 27 Tools
+## All 28 Tools
 
 ```
   UNDERSTAND                          MODIFY SAFELY
   ─────────────────────               ─────────────────────
-  ucn_about     everything in one     ucn_impact   all call sites
-                call: definition,                  with arguments
+  ucn_about     everything in one     ucn_impact      all call sites
+                call: definition,                     with arguments
                 callers, callees,
-                tests, source         ucn_verify   check all sites
-                                                   match signature
-  ucn_context   callers + callees
-                (quick overview)      ucn_plan     preview a refactor
-                                                   before doing it
-  ucn_smart     function + helpers
+                tests, source         ucn_diff_impact what changed in a
+                                                      git diff + who
+  ucn_context   callers + callees                     calls it
+                (quick overview)
+                                      ucn_verify      check all sites
+  ucn_smart     function + helpers                    match signature
                 expanded inline
-
-  ucn_trace     call tree — map
+                                      ucn_plan        preview a refactor
+  ucn_trace     call tree — map                       before doing it
                 a whole pipeline
 
 
