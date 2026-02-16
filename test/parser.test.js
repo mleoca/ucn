@@ -1761,6 +1761,48 @@ module.exports = { existingFunc };
             assert.strictEqual(typedefs.length, 0, 'Should be empty');
         });
     });
+
+    it('typedef with exact flag should not return fuzzy matches', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-typedef-exact-'));
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(tmpDir, 'types.ts'), `
+interface UserProps {
+    name: string;
+}
+
+interface AdminProps {
+    role: string;
+}
+
+type UserConfig = { key: string };
+type AdminConfig = { key: string };
+`);
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // Without exact: "Props" has no exact symbol match, so fuzzy finds UserProps + AdminProps
+        const fuzzy = index.typedef('Props');
+        assert.ok(fuzzy.length >= 2, `Should find multiple Props-like types via fuzzy, got ${fuzzy.length}: ${fuzzy.map(t => t.name).join(', ')}`);
+
+        // With exact: "Props" should return nothing (no type literally named "Props")
+        const exact = index.typedef('Props', { exact: true });
+        assert.strictEqual(exact.length, 0, `exact=true should not return fuzzy matches, got: ${exact.map(t => t.name).join(', ')}`);
+
+        // With exact: "UserProps" should only find UserProps
+        const exactUser = index.typedef('UserProps', { exact: true });
+        assert.strictEqual(exactUser.length, 1, 'Should find exactly one UserProps');
+        assert.strictEqual(exactUser[0].name, 'UserProps');
+
+        // Without exact: "Config" fuzzy-matches UserConfig + AdminConfig
+        const fuzzyConfig = index.typedef('Config');
+        assert.ok(fuzzyConfig.length >= 2, `Should find Config-like types via fuzzy, got ${fuzzyConfig.length}`);
+
+        // With exact: "Config" should return nothing (no type literally named "Config")
+        const exactConfig = index.typedef('Config', { exact: true });
+        assert.strictEqual(exactConfig.length, 0, `exact=true should not return fuzzy Config matches, got: ${exactConfig.map(t => t.name).join(', ')}`);
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
 });
 
 // ============================================================================
