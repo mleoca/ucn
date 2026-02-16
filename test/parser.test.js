@@ -11768,5 +11768,238 @@ it('fix #81: JSX namespaced component reports correct line in findCallsInCode', 
     assert.strictEqual(panelCall.line, 5, 'JSX <UI.Panel /> should be reported on line 5');
 });
 
+// ═══════════════════════════════════════════════════════════
+// Fix #87-89: Fastify review fixes
+// ═══════════════════════════════════════════════════════════
+
+describe('fix #87: new_expression results are non-callable', () => {
+    it('const x = new Foo() should not be treated as isPotentialCallback', (t) => {
+        const { getParser } = require('../languages');
+        const { findCallsInCode } = require('../languages/javascript');
+
+        const code = `
+function main() {
+    const request = new Context.Request(id, params);
+    const reply = new Context.Reply(res, request, logger);
+}
+`;
+        const parser = getParser('javascript');
+        const calls = findCallsInCode(code, parser);
+
+        // request is assigned from new expression — should be in nonCallableNames
+        // So when passed as argument to Reply(), it should NOT be isPotentialCallback
+        const requestCallback = calls.find(c =>
+            c.name === 'request' && c.isPotentialCallback);
+        assert.ok(!requestCallback,
+            'request (from new expression) should NOT be flagged as potential callback');
+    });
+});
+
+describe('fix #88: isPotentialCallback requires binding evidence', () => {
+    it('identifier args without binding/same-file evidence are filtered', (t) => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-fix88-'));
+        fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+const { execute } = require('./runner');
+
+function handler(req, res, context) {
+    const reply = execute(context, req);
+}
+
+module.exports = { handler };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'runner.js'), `
+function execute(ctx, request) { return ctx; }
+module.exports = { execute };
+`);
+        // context function exists only in test file
+        fs.writeFileSync(path.join(tmpDir, 'test.test.js'), `
+function context() { return {}; }
+function req() { return {}; }
+module.exports = { context, req };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const defs = index.find('handler');
+        assert.ok(defs.length > 0);
+        const callees = index.findCallees(defs[0]);
+        const calleeNames = callees.map(c => c.name);
+
+        // execute should be a callee (has binding via import)
+        assert.ok(calleeNames.includes('execute'),
+            `execute should be callee (got: ${calleeNames.join(', ')})`);
+        // context should NOT be a callee (no binding, only in test file)
+        assert.ok(!calleeNames.includes('context'),
+            `context (test-only) should NOT be callee (got: ${calleeNames.join(', ')})`);
+        // req should NOT be a callee (no binding, only in test file)
+        assert.ok(!calleeNames.includes('req'),
+            `req (test-only) should NOT be callee (got: ${calleeNames.join(', ')})`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
+describe('fix #89: nested closure callees included in parent', () => {
+    it('calls within closures are attributed to parent function', (t) => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-fix89-'));
+        fs.writeFileSync(path.join(tmpDir, 'hooks.js'), `
+const { appendTrace } = require('./errors');
+
+function hookRunner(hookName, cb) {
+    const hooks = [];
+    let i = 0;
+
+    next();
+
+    function exit(err) {
+        if (err) {
+            appendTrace(err);
+        }
+        cb(err);
+    }
+
+    function next(err) {
+        if (err) { exit(err); return; }
+        if (i < hooks.length) {
+            hooks[i++]();
+            next();
+        } else {
+            exit();
+        }
+    }
+}
+
+module.exports = { hookRunner };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'errors.js'), `
+function appendTrace(err) { return err; }
+module.exports = { appendTrace };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const defs = index.find('hookRunner');
+        assert.ok(defs.length > 0);
+        const callees = index.findCallees(defs[0]);
+        const calleeNames = callees.map(c => c.name);
+
+        // next and exit are inner closures — their calls should be included
+        assert.ok(calleeNames.includes('next'),
+            `next (closure) should be callee (got: ${calleeNames.join(', ')})`);
+        assert.ok(calleeNames.includes('exit'),
+            `exit (closure) should be callee (got: ${calleeNames.join(', ')})`);
+        // appendTrace is called from exit (nested closure) — should be included
+        assert.ok(calleeNames.includes('appendTrace'),
+            `appendTrace (via closure) should be callee (got: ${calleeNames.join(', ')})`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('inner binding resolution prefers closure within parent scope', (t) => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-fix89b-'));
+        fs.writeFileSync(path.join(tmpDir, 'hooks.js'), `
+function runnerA(cb) {
+    function next() { cb(); }
+    next();
+}
+
+function runnerB(cb) {
+    function next() { cb(); }
+    next();
+}
+
+module.exports = { runnerA, runnerB };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // runnerA should resolve next() to its own inner next, not runnerB's
+        const defsA = index.find('runnerA');
+        assert.ok(defsA.length > 0);
+        const calleesA = index.findCallees(defsA[0]);
+        const nextCallee = calleesA.find(c => c.name === 'next');
+        assert.ok(nextCallee, 'runnerA should have next as callee');
+        // next should be within runnerA's line range
+        assert.ok(nextCallee.startLine > defsA[0].startLine &&
+                  nextCallee.startLine <= defsA[0].endLine,
+            `next should be within runnerA's scope (next at ${nextCallee.startLine}, runnerA at ${defsA[0].startLine}-${defsA[0].endLine})`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
+describe('fix #89c: toc detects package.json main as entry point', () => {
+    it('package.json main field is listed as entry point', (t) => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-fix89c-'));
+        fs.mkdirSync(path.join(tmpDir, 'lib'), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'fastify.js'), `
+function createApp() { return {}; }
+module.exports = createApp;
+`);
+        fs.writeFileSync(path.join(tmpDir, 'lib', 'server.js'), `
+function start() {}
+module.exports = { start };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'),
+            JSON.stringify({ name: "myapp", main: "fastify.js" }));
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const toc = index.getToc();
+        assert.ok(toc.summary.entryFiles.includes('fastify.js'),
+            `fastify.js should be entry point (got: ${toc.summary.entryFiles.join(', ')})`);
+        // Should be first (prepended)
+        assert.strictEqual(toc.summary.entryFiles[0], 'fastify.js',
+            'package.json main should be first entry point');
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
+describe('fix #89d: test-file callee deprioritization', () => {
+    it('production callers do not get test-file callees without binding', (t) => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-fix89d-'));
+        fs.mkdirSync(path.join(tmpDir, 'test'), { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+function handler() {
+    process_data();
+}
+module.exports = { handler };
+`);
+        // process_data only exists in test file
+        fs.writeFileSync(path.join(tmpDir, 'test', 'handler.test.js'), `
+function process_data() { return 'test'; }
+module.exports = { process_data };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const defs = index.find('handler');
+        assert.ok(defs.length > 0);
+        const callees = index.findCallees(defs[0]);
+        const calleeNames = callees.map(c => c.name);
+
+        // process_data is only in test file — should be filtered
+        assert.ok(!calleeNames.includes('process_data'),
+            `test-only process_data should NOT be callee (got: ${calleeNames.join(', ')})`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

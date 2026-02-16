@@ -839,7 +839,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods, exclude: flags.exclude });
+            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain, exclude: flags.exclude });
             printOutput(aboutResult,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
