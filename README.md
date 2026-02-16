@@ -1,6 +1,6 @@
 # UCN - Universal Code Navigator
 
-### Understand your codebase without reading every file.
+UCN is designed to work with large files and codebases, helping AI agents ingest exactly the data they need. Its surgical output discourages agents from cutting corners, and without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data."
 
 ---
 
@@ -53,7 +53,7 @@ Typically, AI agents working with code do something like this:
 
 ## The Solution
 
-UCN parses your code with tree-sitter and gives you 27 semantic navigation tools.
+UCN parses the code with tree-sitter and offers semantic navigation tools.
 
 Instead of reading entire files, ask precise questions:
 
@@ -209,7 +209,7 @@ After editing code:
   └─────────────────────────────────────────────────────────────────┘
 ```
 
-The tradeoff: grep works on any language and any text. UCN only works on supported languages but gives you structural understanding within those.
+The tradeoff: grep works on any language and any text. UCN only works on supported languages but gives structural understanding within those.
 
 ---
 
