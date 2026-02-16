@@ -78,7 +78,10 @@ const flags = {
     // Graph direction (imports/importers/both)
     direction: args.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
     // Symlink handling (follow by default)
-    followSymlinks: !args.includes('--no-follow-symlinks')
+    followSymlinks: !args.includes('--no-follow-symlinks'),
+    // Diff-impact options
+    base: args.find(a => a.startsWith('--base='))?.split('=')[1] || null,
+    staged: args.includes('--staged')
 };
 
 // Handle --file flag with space
@@ -96,7 +99,8 @@ const knownFlags = new Set([
     '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed', '--calls-only',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
-    '--default', '--top', '--no-follow-symlinks'
+    '--default', '--top', '--no-follow-symlinks',
+    '--base', '--staged'
 ]);
 
 // Handle help flag
@@ -182,7 +186,8 @@ const COMMANDS = new Set([
     'toc', 'find', 'usages', 'fn', 'class', 'lines', 'search', 'typedef', 'api',
     'context', 'smart', 'about', 'impact', 'trace', 'related', 'example', 'expand',
     'tests', 'verify', 'plan', 'deadcode', 'stats', 'stacktrace', 'stack',
-    'imports', 'what-imports', 'exporters', 'who-imports', 'graph', 'file-exports', 'what-exports'
+    'imports', 'what-imports', 'exporters', 'who-imports', 'graph', 'file-exports', 'what-exports',
+    'diff-impact'
 ]);
 
 function main() {
@@ -346,6 +351,7 @@ function runFileCommand(filePath, command, arg) {
         case 'expand':
         case 'stacktrace':
         case 'stack':
+        case 'diff-impact':
         case 'file-exports':
         case 'what-exports': {
             // Auto-detect project root and route to project mode
@@ -1032,6 +1038,16 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        case 'diff-impact': {
+            const diffResult = index.diffImpact({
+                base: flags.base || 'HEAD',
+                staged: flags.staged,
+                file: flags.file
+            });
+            printOutput(diffResult, output.formatDiffImpactJson, output.formatDiffImpact);
+            break;
+        }
+
         default:
             console.error(`Unknown command: ${command}`);
             printUsage();
@@ -1705,6 +1721,7 @@ REFACTORING HELPERS
 ═══════════════════════════════════════════════════════════════════════════════
   plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to)
   verify <name>       Check all call sites match signature
+  diff-impact         What changed in git diff and who calls it (--base, --staged)
   deadcode            Find unused functions/classes
   related <name>      Find similar functions (same file, shared deps)
 
@@ -1740,6 +1757,8 @@ Common Flags:
   --detailed          List all symbols in toc (compact by default)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
+  --base=<ref>        Git ref for diff-impact (default: HEAD)
+  --staged            Analyze staged changes (diff-impact)
   --no-follow-symlinks  Don't follow symbolic links
   -i, --interactive   Keep index in memory for multiple queries
 
@@ -1804,6 +1823,7 @@ Commands:
   search <term>          Text search
   typedef <name>         Find type definitions
   api                    Show public symbols
+  diff-impact            What changed and who's affected
   stats                  Index statistics
   rebuild                Rebuild index
   quit                   Exit
@@ -1992,6 +2012,16 @@ function executeInteractiveCommand(index, command, arg) {
         case 'api': {
             const api = index.api();
             console.log(output.formatApi(api, '.'));
+            break;
+        }
+
+        case 'diff-impact': {
+            const diffResult = index.diffImpact({
+                base: flags.base || 'HEAD',
+                staged: flags.staged,
+                file: flags.file
+            });
+            console.log(output.formatDiffImpact(diffResult));
             break;
         }
 

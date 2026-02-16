@@ -1951,6 +1951,109 @@ function formatStats(stats) {
     return lines.join('\n');
 }
 
+// ============================================================================
+// DIFF IMPACT
+// ============================================================================
+
+function formatDiffImpact(result) {
+    if (!result) return 'No diff data.';
+
+    const lines = [];
+
+    lines.push(`Diff Impact Analysis (vs ${result.base})`);
+    lines.push('═'.repeat(60));
+
+    const s = result.summary;
+    const parts = [];
+    if (s.modifiedFunctions > 0) parts.push(`${s.modifiedFunctions} modified`);
+    if (s.deletedFunctions > 0) parts.push(`${s.deletedFunctions} deleted`);
+    if (s.newFunctions > 0) parts.push(`${s.newFunctions} new`);
+    parts.push(`${s.totalCallSites} call sites across ${s.affectedFiles} files`);
+    lines.push(parts.join(', '));
+    lines.push('');
+
+    // Modified functions
+    if (result.functions.length > 0) {
+        lines.push('MODIFIED FUNCTIONS:');
+        for (const fn of result.functions) {
+            lines.push(`\n  ${fn.name}`);
+            lines.push(`  ${fn.relativePath}:${fn.startLine}`);
+            lines.push(`  ${fn.signature}`);
+            if (fn.addedLines.length > 0) {
+                lines.push(`  Lines added: ${formatLineRanges(fn.addedLines)}`);
+            }
+            if (fn.deletedLines.length > 0) {
+                lines.push(`  Lines deleted: ${formatLineRanges(fn.deletedLines)}`);
+            }
+
+            if (fn.callers.length > 0) {
+                lines.push(`  Callers (${fn.callers.length}):`);
+                for (const c of fn.callers) {
+                    const caller = c.callerName ? `[${c.callerName}]` : '';
+                    lines.push(`    ${c.relativePath}:${c.line} ${caller}`);
+                    lines.push(`      ${c.content}`);
+                }
+            } else {
+                lines.push('  Callers: none found');
+            }
+        }
+    }
+
+    // New functions
+    if (result.newFunctions.length > 0) {
+        lines.push('\nNEW FUNCTIONS:');
+        for (const fn of result.newFunctions) {
+            lines.push(`  ${fn.name} — ${fn.relativePath}:${fn.startLine}`);
+            lines.push(`  ${fn.signature}`);
+        }
+    }
+
+    // Deleted functions
+    if (result.deletedFunctions.length > 0) {
+        lines.push('\nDELETED FUNCTIONS:');
+        for (const fn of result.deletedFunctions) {
+            lines.push(`  ${fn.name} — ${fn.relativePath}:${fn.startLine}`);
+        }
+    }
+
+    // Module-level changes
+    if (result.moduleLevelChanges.length > 0) {
+        lines.push('\nMODULE-LEVEL CHANGES:');
+        for (const m of result.moduleLevelChanges) {
+            const changeParts = [];
+            if (m.addedLines.length > 0) changeParts.push(`+${m.addedLines.length} lines`);
+            if (m.deletedLines.length > 0) changeParts.push(`-${m.deletedLines.length} lines`);
+            lines.push(`  ${m.relativePath}: ${changeParts.join(', ')}`);
+        }
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Compact display of line numbers, collapsing consecutive ranges
+ */
+function formatLineRanges(lineNums) {
+    if (lineNums.length === 0) return '';
+    const sorted = [...lineNums].sort((a, b) => a - b);
+    const ranges = [];
+    let start = sorted[0], end = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+        if (sorted[i] === end + 1) {
+            end = sorted[i];
+        } else {
+            ranges.push(start === end ? `${start}` : `${start}-${end}`);
+            start = end = sorted[i];
+        }
+    }
+    ranges.push(start === end ? `${start}` : `${start}-${end}`);
+    return ranges.join(', ');
+}
+
+function formatDiffImpactJson(result) {
+    return JSON.stringify(result, null, 2);
+}
+
 module.exports = {
     // Utilities
     normalizeParams,
@@ -2031,5 +2134,9 @@ module.exports = {
     formatGraph,
     formatSearch,
     formatFileExports,
-    formatStats
+    formatStats,
+
+    // Diff impact command
+    formatDiffImpact,
+    formatDiffImpactJson
 };

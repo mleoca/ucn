@@ -11097,5 +11097,268 @@ function libDead() { return 2; }
     }
 });
 
+// ============================================================================
+// DIFF IMPACT
+// ============================================================================
+
+// FIX 108: parseDiff correctly extracts file paths and line ranges
+it('FIX 108 — parseDiff extracts file paths and line ranges from unified diff', () => {
+    const { parseDiff } = require('../core/project');
+    const diffText = `diff --git a/src/app.js b/src/app.js
+index 1234567..abcdefg 100644
+--- a/src/app.js
++++ b/src/app.js
+@@ -10,3 +10,5 @@ function old() {
++added line
++another added
+@@ -25 +27 @@ function other() {
+-old line
++new line
+diff --git a/lib/utils.js b/lib/utils.js
+--- a/lib/utils.js
++++ b/lib/utils.js
+@@ -5,0 +6,2 @@
++new function added
++second line
+@@ -20,2 +23,0 @@
+`;
+
+    const changes = parseDiff(diffText, '/project');
+
+    assert.strictEqual(changes.length, 2);
+
+    // First file
+    assert.strictEqual(changes[0].relativePath, 'src/app.js');
+    assert.strictEqual(changes[0].filePath, path.join('/project', 'src/app.js'));
+    // First hunk: @@ -10,3 +10,5 @@ → deleted lines 10-12, added lines 10-14
+    assert.deepStrictEqual(changes[0].deletedLines, [10, 11, 12, 25]);
+    assert.deepStrictEqual(changes[0].addedLines, [10, 11, 12, 13, 14, 27]);
+
+    // Second file
+    assert.strictEqual(changes[1].relativePath, 'lib/utils.js');
+    // @@ -5,0 +6,2 @@ → 0 deleted, 2 added (6-7)
+    // @@ -20,2 +23,0 @@ → 2 deleted (20-21), 0 added
+    assert.deepStrictEqual(changes[1].addedLines, [6, 7]);
+    assert.deepStrictEqual(changes[1].deletedLines, [20, 21]);
+});
+
+// FIX 109: diffImpact end-to-end with temp git repo
+it('FIX 109 — diffImpact identifies changed functions and their callers', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-impact-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        // Initialize git repo
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Create initial files
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `function greet(name) {
+    return 'Hello ' + name;
+}
+
+function main() {
+    console.log(greet('world'));
+}
+`);
+
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Modify the greet function
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `function greet(name) {
+    return 'Hi ' + name + '!';
+}
+
+function main() {
+    console.log(greet('world'));
+}
+`);
+
+        // Run diff-impact
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        // Verify modified function detected
+        assert.ok(result.functions.length >= 1, 'Should detect modified function');
+        const greetFn = result.functions.find(f => f.name === 'greet');
+        assert.ok(greetFn, 'Should identify greet as modified');
+        assert.ok(greetFn.callers.length >= 1, 'greet should have at least one caller');
+        assert.ok(greetFn.callers.some(c => c.callerName === 'main'), 'main should be a caller of greet');
+
+        // Summary should be populated
+        assert.ok(result.summary.modifiedFunctions >= 1);
+        assert.ok(result.summary.totalCallSites >= 1);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 110: diffImpact handles no-changes case
+it('FIX 110 — diffImpact returns empty result when no changes', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-empty-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function a() { return 1; }\n');
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.strictEqual(result.functions.length, 0);
+        assert.strictEqual(result.newFunctions.length, 0);
+        assert.strictEqual(result.moduleLevelChanges.length, 0);
+        assert.strictEqual(result.summary.totalCallSites, 0);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 111: diffImpact works with --staged
+it('FIX 111 — diffImpact analyzes staged changes', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-staged-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function calc(x) { return x; }\nfunction run() { calc(1); }\n');
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Modify and stage
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function calc(x) { return x * 2; }\nfunction run() { calc(1); }\n');
+        execSync('git add app.js', { cwd: tmpDir, stdio: 'pipe' });
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ staged: true });
+
+        assert.ok(result.base === '(staged)');
+        assert.ok(result.functions.length >= 1, 'Should detect staged change');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 112: diffImpact errors on non-git directory
+it('FIX 112 — diffImpact throws error for non-git directory', () => {
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-nogit-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function a() {}\n');
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        assert.throws(() => {
+            index.diffImpact({ base: 'HEAD' });
+        }, /git/i);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 113: diffImpact detects new functions
+it('FIX 113 — diffImpact detects newly added functions', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-new-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function existing() { return 1; }\n');
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Add a new function
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `function existing() { return 1; }
+function brandNew(x, y) {
+    return x + y;
+}
+`);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.ok(result.newFunctions.some(f => f.name === 'brandNew'), 'Should detect brandNew as a new function');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 114: Incremental rebuild preserves unchanged file symbols
+it('FIX 114 — incremental rebuild skips unchanged files and handles deletions', () => {
+    const tmpDir = path.join(os.tmpdir(), `ucn-incr-rebuild-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a.js'), 'function alpha() { return 1; }\n');
+        fs.writeFileSync(path.join(tmpDir, 'b.js'), 'function beta() { return 2; }\n');
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        assert.ok(index.symbols.has('alpha'));
+        assert.ok(index.symbols.has('beta'));
+
+        // Delete b.js and rebuild (forceRebuild simulates cache-loaded stale state)
+        fs.unlinkSync(path.join(tmpDir, 'b.js'));
+        index.build(null, { quiet: true, forceRebuild: true });
+
+        assert.ok(index.symbols.has('alpha'), 'alpha should still be indexed');
+        assert.ok(!index.symbols.has('beta'), 'beta should be removed after file deletion');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 115: callsCache invalidated on removeFileSymbols
+it('FIX 115 — callsCache entry cleared when file symbols are removed', () => {
+    const tmpDir = path.join(os.tmpdir(), `ucn-callscache-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), 'function hello() { return 1; }\nfunction caller() { hello(); }\n');
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const filePath = path.join(tmpDir, 'app.js');
+
+        // Trigger callsCache population
+        index.findCallers('hello');
+        assert.ok(index.callsCache.has(filePath), 'callsCache should have entry after findCallers');
+
+        // Remove file symbols — should also clear callsCache
+        index.removeFileSymbols(filePath);
+        assert.ok(!index.callsCache.has(filePath), 'callsCache entry should be cleared after removeFileSymbols');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
