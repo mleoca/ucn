@@ -2218,9 +2218,9 @@ class ProjectIndex {
      * @param {string} name - Type name to find
      * @returns {Array} Matching type definitions
      */
-    typedef(name) {
+    typedef(name, options = {}) {
         const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class'];
-        const matches = this.find(name);
+        const matches = this.find(name, options);
 
         return matches.filter(m => typeKinds.includes(m.type)).map(m => ({
             ...m,

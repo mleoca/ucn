@@ -171,8 +171,10 @@ function requireName(name) {
 
 const TOOL_DESCRIPTION = `Universal Code Navigator powered by tree-sitter ASTs. Analyzes code structure — functions, callers, callees, dependencies — across JavaScript/TypeScript, Python, Go, Rust, and Java. Use instead of grep/read for code relationships.
 
+TOP 5 (covers 90% of tasks): about, impact, trace, find, deadcode
+
 QUICK GUIDE — choosing the right command:
-  Understand a symbol → about (everything), context (callers/callees only), smart (code + deps inline)
+  Understand a symbol → about (everything), context (callers/callees only), smart (code + called functions inline)
   Before modifying    → impact (all call sites with args), verify (signature check), plan (preview refactor)
   Execution flow      → trace (function call tree) or graph (file imports/exports)
   Find code           → find (by name), search (by text), toc (project overview)
@@ -184,7 +186,7 @@ UNDERSTANDING CODE:
 - about <name>: Definition, source, callers, callees, and tests — everything in one call. Replaces 3-4 grep+read cycles. Your first stop for any function or class.
 - context <name>: Who calls it and what does it call, without source code. Results are numbered for use with expand. For classes/structs, shows all methods instead.
 - impact <name>: Every call site with actual arguments passed, grouped by file. Essential before changing a function signature — shows exactly what breaks.
-- smart <name>: Get a function's source with all helper functions expanded inline. Use to understand or modify a function and its dependencies in one read.
+- smart <name>: Get a function's source with all called functions expanded inline (not constants/variables). Use to understand or modify a function and its dependencies in one read.
 - trace <name>: Call tree from a function downward. Use to understand "what happens when X runs" — maps which modules a pipeline touches without reading files. Set depth (default: 3); setting depth expands all children.
 - example <name>: Best real-world usage example. Automatically scores call sites by quality and returns the top one with context. Use to understand expected calling patterns.
 - related <name>: Sibling functions: same file, similar names, or shared callers/callees. Find companions to update together (e.g., serialize when you're changing deserialize). Name-based, not semantic.
@@ -201,12 +203,12 @@ EXTRACTING CODE (use instead of reading entire files):
 - fn <name>: Extract one function's source. Use file to disambiguate (e.g. file="parser" for parser.js).
 - class <name>: Extract a class/struct/interface with all its methods. Handles all supported types: JS/TS, Python, Go, Rust, Java. Large classes (>200 lines) show summary; use max_lines for truncated source.
 - lines: Extract specific lines (e.g. range="10-20" or just "15"). Requires file and range. Use when you know the exact line range you need.
-- expand <item>: Drill into a numbered item from the last context result. Context returns numbered callers/callees — use this to see their full source code.
+- expand <item>: Drill into a numbered item from the last context result (requires running context first in the same session). Context returns numbered callers/callees — use this to see their full source code.
 
 FILE DEPENDENCIES (require file param):
 - imports: All imports with resolved file paths. Use to understand dependencies before modifying or moving a file. Resolves relative, package, and language-specific patterns.
 - exporters: Every file that imports/depends on this file — shows dependents rather than dependencies. Use before moving, renaming, or deleting.
-- file_exports: File's public API: all exported functions, classes, variables with signatures. Use to understand what a module offers before importing.
+- file_exports: File's public API: all exported functions, classes, variables with signatures. Use to understand what a module offers before importing. Requires explicit export markers; use toc --detailed as fallback.
 - graph: File-level dependency tree. Use to understand module architecture — which files form a cluster, what the dependency chain looks like. Set direction ("imports"/"importers"/"both"). Can be noisy — use depth=1 for large codebases.
 
 REFACTORING:
@@ -728,7 +730,7 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.typedef(name);
+                const result = index.typedef(name, { exact: exact || false });
                 return toolResult(output.formatTypedef(result, name));
             }
 

@@ -938,7 +938,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'typedef': {
             requireArg(arg, 'Usage: ucn . typedef <name>');
-            const typedefs = index.typedef(arg);
+            const typedefs = index.typedef(arg, { exact: flags.exact });
             printOutput(typedefs,
                 r => output.formatTypedefJson(r, arg),
                 r => output.formatTypedef(r, arg)
