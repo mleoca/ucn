@@ -821,6 +821,105 @@ describe('Cache Behavior', () => {
             cleanup(tmpDir);
         }
     });
+
+    it('should track files that fail to index in failedFiles', () => {
+        const tmpDir = createTempDir();
+        try {
+            // Create a normal file and a file that will fail to parse
+            fs.writeFileSync(path.join(tmpDir, 'good.js'), 'function hello() { return 1; }');
+            // Create a huge minified file that exceeds tree-sitter buffer
+            const hugeLine = 'var x=' + 'a+'.repeat(600000) + '1;';
+            fs.writeFileSync(path.join(tmpDir, 'bundle.js'), hugeLine);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // good.js should be indexed
+            assert.ok(index.files.has(path.join(tmpDir, 'good.js')), 'good.js should be in files');
+            assert.ok(index.symbols.has('hello'), 'hello should be in symbols');
+
+            // bundle.js should be in failedFiles (too large for tree-sitter)
+            assert.ok(index.failedFiles.has(path.join(tmpDir, 'bundle.js')), 'bundle.js should be in failedFiles');
+            assert.ok(!index.files.has(path.join(tmpDir, 'bundle.js')), 'bundle.js should NOT be in files');
+        } finally {
+            cleanup(tmpDir);
+        }
+    });
+
+    it('should not report failedFiles as new in isCacheStale', () => {
+        const tmpDir = createTempDir();
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'good.js'), 'function hello() {}');
+            const hugeLine = 'var x=' + 'a+'.repeat(600000) + '1;';
+            fs.writeFileSync(path.join(tmpDir, 'bundle.js'), hugeLine);
+
+            // Build and save cache
+            const index1 = new ProjectIndex(tmpDir);
+            index1.build('**/*.js', { quiet: true });
+            index1.saveCache();
+
+            // isCacheStale should return false (bundle.js is in failedFiles, not "new")
+            assert.strictEqual(index1.isCacheStale(), false,
+                'Cache should not be stale — failed files are tracked');
+        } finally {
+            cleanup(tmpDir);
+        }
+    });
+
+    it('should persist failedFiles across save/load cache cycle', () => {
+        const tmpDir = createTempDir();
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'good.js'), 'function hello() {}');
+            const hugeLine = 'var x=' + 'a+'.repeat(600000) + '1;';
+            fs.writeFileSync(path.join(tmpDir, 'bundle.js'), hugeLine);
+
+            // Build and save
+            const index1 = new ProjectIndex(tmpDir);
+            index1.build('**/*.js', { quiet: true });
+            assert.ok(index1.failedFiles.size > 0, 'Should have failed files after build');
+            index1.saveCache();
+
+            // Load into new index
+            const index2 = new ProjectIndex(tmpDir);
+            const loaded = index2.loadCache();
+            assert.ok(loaded, 'Cache should load successfully');
+
+            // failedFiles should be restored
+            assert.ok(index2.failedFiles.has(path.join(tmpDir, 'bundle.js')),
+                'bundle.js should be in failedFiles after cache load');
+
+            // isCacheStale should return false
+            assert.strictEqual(index2.isCacheStale(), false,
+                'Cache should not be stale after loading with failedFiles');
+        } finally {
+            cleanup(tmpDir);
+        }
+    });
+
+    it('should remove from failedFiles if file later indexes successfully', () => {
+        const tmpDir = createTempDir();
+        try {
+            // Start with a file that fails
+            const hugeLine = 'var x=' + 'a+'.repeat(600000) + '1;';
+            fs.writeFileSync(path.join(tmpDir, 'bundle.js'), hugeLine);
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+            assert.ok(index.failedFiles.has(path.join(tmpDir, 'bundle.js')),
+                'bundle.js should fail initially');
+
+            // Replace with valid content and rebuild
+            fs.writeFileSync(path.join(tmpDir, 'bundle.js'), 'function fixed() {}');
+            index.build('**/*.js', { quiet: true, forceRebuild: true });
+
+            assert.ok(!index.failedFiles.has(path.join(tmpDir, 'bundle.js')),
+                'bundle.js should be removed from failedFiles after successful indexing');
+            assert.ok(index.files.has(path.join(tmpDir, 'bundle.js')),
+                'bundle.js should now be in files');
+        } finally {
+            cleanup(tmpDir);
+        }
+    });
 });
 
 // ============================================================================
