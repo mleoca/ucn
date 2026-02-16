@@ -381,6 +381,7 @@ function formatSearchJson(results, term) {
  * Format imports as JSON
  */
 function formatImportsJson(imports, filePath) {
+    if (imports?.error === 'file-not-found') return JSON.stringify({ found: false, error: 'File not found', file: imports.filePath }, null, 2);
     return JSON.stringify({
         file: filePath,
         importCount: imports.length,
@@ -405,6 +406,7 @@ function formatStatsJson(stats) {
  * Format dependency graph as JSON
  */
 function formatGraphJson(graph) {
+    if (graph?.error === 'file-not-found') return JSON.stringify({ found: false, error: 'File not found', file: graph.filePath }, null, 2);
     return JSON.stringify({
         file: graph.file,
         depth: graph.depth,
@@ -454,6 +456,7 @@ function formatSmartJson(result) {
  * Format imports command output - text
  */
 function formatImports(imports, filePath) {
+    if (imports?.error === 'file-not-found') return `Error: File not found in project: ${imports.filePath}`;
     const lines = [`Imports in ${filePath}:\n`];
 
     const internal = imports.filter(i => !i.isExternal && !i.isDynamic);
@@ -502,6 +505,7 @@ function formatImports(imports, filePath) {
  * Format exporters command output - text
  */
 function formatExporters(exporters, filePath) {
+    if (exporters?.error === 'file-not-found') return `Error: File not found in project: ${exporters.filePath}`;
     const lines = [`Files that import ${filePath}:\n`];
 
     if (exporters.length === 0) {
@@ -637,6 +641,7 @@ function formatDisambiguation(matches, name, command) {
  * Format exporters as JSON
  */
 function formatExportersJson(exporters, filePath) {
+    if (exporters?.error === 'file-not-found') return JSON.stringify({ found: false, error: 'File not found', file: exporters.filePath }, null, 2);
     return JSON.stringify({
         file: filePath,
         importerCount: exporters.length,
@@ -711,6 +716,13 @@ function formatTrace(trace, options = {}) {
     lines.push('═'.repeat(60));
     lines.push(`${trace.file}:${trace.line}`);
     lines.push(`Direction: ${trace.direction}, Max depth: ${trace.maxDepth}`);
+
+    if (trace.warnings && trace.warnings.length > 0) {
+        for (const w of trace.warnings) {
+            lines.push(`Note: ${w.message}`);
+        }
+    }
+
     lines.push('');
 
     // Render tree
@@ -1390,6 +1402,11 @@ function formatToc(toc, options = {}) {
         lines.push(`\n${hint}`);
     }
 
+    if (toc.hiddenFiles > 0) {
+        const topHint = options.topHint || 'Use --top=N or --all to show more.';
+        lines.push(`\n... and ${toc.hiddenFiles} more files. ${topHint}`);
+    }
+
     return lines.join('\n');
 }
 
@@ -1784,6 +1801,7 @@ function formatGraph(graph, options = {}) {
     if (typeof options === 'boolean') {
         options = { showAll: options };
     }
+    if (graph?.error === 'file-not-found') return `Error: File not found in project: ${graph.filePath}`;
     if (graph.nodes.length === 0) {
         const file = options.file || graph.root || '';
         return file ? `File not found: ${file}` : 'File not found.';
@@ -1923,6 +1941,7 @@ function formatSearch(results, term) {
  * Format file-exports command output
  */
 function formatFileExports(exports, filePath) {
+    if (exports?.error === 'file-not-found') return `Error: File not found in project: ${exports.filePath}`;
     if (exports.length === 0) return `No exports found in ${filePath}`;
 
     const lines = [];

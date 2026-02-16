@@ -405,8 +405,10 @@ server.registerTool(
 
             case 'toc': {
                 const index = getIndex(project_dir);
-                const toc = index.getToc({ detailed: detailed || false });
-                return toolResult(output.formatToc(toc));
+                const toc = index.getToc({ detailed: detailed || false, top });
+                return toolResult(output.formatToc(toc, {
+                    topHint: 'Set top=N or use detailed=false for compact view.'
+                }));
             }
 
             case 'search': {
@@ -640,6 +642,7 @@ server.registerTool(
                 }
                 const index = getIndex(project_dir);
                 const result = index.imports(file);
+                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
                 return toolResult(output.formatImports(result, file));
             }
 
@@ -649,6 +652,7 @@ server.registerTool(
                 }
                 const index = getIndex(project_dir);
                 const result = index.exporters(file);
+                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
                 return toolResult(output.formatExporters(result, file));
             }
 
@@ -658,6 +662,7 @@ server.registerTool(
                 }
                 const index = getIndex(project_dir);
                 const result = index.fileExports(file);
+                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
                 return toolResult(output.formatFileExports(result, file));
             }
 
@@ -667,6 +672,7 @@ server.registerTool(
                 }
                 const index = getIndex(project_dir);
                 const result = index.graph(file, { direction: direction || 'both', maxDepth: depth ?? 2 });
+                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
                 return toolResult(output.formatGraph(result, {
                     showAll: depth !== undefined,
                     file,

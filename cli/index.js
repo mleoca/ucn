@@ -700,7 +700,7 @@ function runProjectCommand(rootDir, command, arg) {
 
     switch (command) {
         case 'toc': {
-            const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel, all: flags.all });
+            const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel, all: flags.all, top: flags.top });
             printOutput(toc, output.formatTocJson, r => output.formatToc(r, {
                 detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
                 uncertainHint: 'use --include-uncertain to include all'
