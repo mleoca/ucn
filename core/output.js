@@ -1260,12 +1260,11 @@ function formatAbout(about, options = {}) {
         }
     }
 
-    // Completeness warnings
+    // Completeness warnings (condensed single line)
     if (about.completeness && about.completeness.warnings && about.completeness.warnings.length > 0) {
+        const parts = about.completeness.warnings.map(w => `${w.count} ${w.type.replace('_', ' ')}`);
         lines.push('');
-        for (const w of about.completeness.warnings) {
-            lines.push(`Note: ${w.message}`);
-        }
+        lines.push(`Note: Results may be incomplete (${parts.join(', ')} in project)`);
     }
 
     // Code
