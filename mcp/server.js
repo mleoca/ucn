@@ -67,6 +67,11 @@ function getIndex(projectDir) {
     } else {
         index.build(null, { quiet: true, forceRebuild: loaded });
         index.saveCache();
+        // Clear expandCache entries for this project — stale after rebuild
+        for (const [key, val] of expandCache) {
+            if (val.root === root) expandCache.delete(key);
+        }
+        lastContextKey.delete(root);
     }
 
     // LRU eviction
@@ -1029,6 +1034,34 @@ server.registerTool(
             const index = getIndex(project_dir);
             const stats = index.getStats();
             return toolResult(output.formatStats(stats));
+        } catch (e) {
+            return toolError(e.message);
+        }
+    }
+);
+
+// ── ucn_diff_impact ──────────────────────────────────────────────────────────
+
+server.registerTool(
+    'ucn_diff_impact',
+    {
+        description: 'Analyze git diff to find which functions changed and who calls them. Shows modified, new, and deleted functions with their callers. Use to understand the impact of recent code changes before committing or reviewing.',
+        inputSchema: z.object({
+            project_dir: projectDirParam,
+            base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
+            staged: z.boolean().optional().describe('Analyze staged changes instead of working tree vs base'),
+            file: z.string().optional().describe('Only analyze changes in this file path')
+        })
+    },
+    async ({ project_dir, base, staged, file }) => {
+        try {
+            const index = getIndex(project_dir);
+            const result = index.diffImpact({
+                base: base || 'HEAD',
+                staged: staged || false,
+                file: file || undefined
+            });
+            return toolResult(output.formatDiffImpact(result));
         } catch (e) {
             return toolError(e.message);
         }

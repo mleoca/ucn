@@ -84,6 +84,7 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Situation | Command | What it does |
 |-----------|---------|-------------|
 | Need function + all its helpers inline | `ucn smart <name>` | Returns function source with every helper it calls expanded below it. Use instead of `about` when you need code, not metadata |
+| What changed and who's affected | `ucn diff-impact --base=main` | Shows changed functions + their callers from git diff |
 | Checking if a refactor broke signatures | `ucn verify <name>` | Validates all call sites match the function's parameter count |
 | Understanding a file's role in the project | `ucn imports <file>` | What it depends on |
 | Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
@@ -117,6 +118,8 @@ ucn [target] <command> [name] [--flags]
 | `--all` | Expand truncated sections in `about`, `trace`, `graph`, `related` |
 | `--include-tests` | Include test files in results (excluded by default) |
 | `--include-methods` | Include `obj.method()` calls in `context`/`smart` (only direct calls shown by default) |
+| `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
+| `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |
 | `--context=N` | Lines of surrounding context in `usages`/`search` output |
 
@@ -134,6 +137,13 @@ ucn impact the_function                 # Who will break?
 ucn smart the_function                  # See it + its helpers
 # ... make your changes ...
 ucn verify the_function                 # Did all call sites survive?
+```
+
+**Before committing:**
+```bash
+ucn diff-impact                         # What changed vs HEAD + who calls it
+ucn diff-impact --base=main             # What changed vs main branch
+ucn diff-impact --staged                # Only staged changes
 ```
 
 **Periodic maintenance:**

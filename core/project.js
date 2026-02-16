@@ -8,6 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+const { execSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parseFile } = require('./parser');
@@ -97,10 +98,17 @@ class ProjectIndex {
         }
 
         if (options.forceRebuild) {
-            this.files.clear();
-            this.symbols.clear();
-            this.importGraph.clear();
-            this.exportGraph.clear();
+            // Incremental rebuild: only remove files that no longer exist on disk.
+            // indexFile() already skips unchanged files and calls removeFileSymbols()
+            // for changed files, so we don't need to clear everything.
+            const currentFileSet = new Set(files);
+            for (const cachedPath of this.files.keys()) {
+                if (!currentFileSet.has(cachedPath)) {
+                    this.removeFileSymbols(cachedPath);
+                    this.files.delete(cachedPath);
+                    this.callsCache.delete(cachedPath);
+                }
+            }
         }
 
         // Always invalidate completeness cache on rebuild
@@ -267,6 +275,9 @@ class ProjectIndex {
                 }
             }
         }
+
+        // Invalidate cached call data for this file
+        this.callsCache.delete(filePath);
     }
 
     /**
@@ -4667,6 +4678,257 @@ class ProjectIndex {
 
         return result;
     }
+
+    /**
+     * Diff-based impact analysis: find which functions changed and who calls them
+     *
+     * @param {object} options - { base, staged, file }
+     * @returns {object} - { base, functions, moduleLevelChanges, newFunctions, deletedFunctions, summary }
+     */
+    diffImpact(options = {}) {
+        const { base = 'HEAD', staged = false, file } = options;
+
+        // Verify git repo
+        let gitRoot;
+        try {
+            gitRoot = execSync('git rev-parse --show-toplevel', { cwd: this.root, encoding: 'utf-8' }).trim();
+        } catch (e) {
+            throw new Error('Not a git repository. diff-impact requires git.');
+        }
+
+        // Build git diff command
+        const diffArgs = ['git', 'diff', '--unified=0'];
+        if (staged) {
+            diffArgs.push('--staged');
+        } else {
+            diffArgs.push(base);
+        }
+        if (file) {
+            diffArgs.push('--', file);
+        }
+
+        let diffText;
+        try {
+            diffText = execSync(diffArgs.join(' '), { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
+        } catch (e) {
+            // git diff exits non-zero when there are diff errors, but also for invalid refs
+            if (e.stdout) {
+                diffText = e.stdout;
+            } else {
+                throw new Error(`git diff failed: ${e.message}`);
+            }
+        }
+
+        if (!diffText || !diffText.trim()) {
+            return {
+                base: staged ? '(staged)' : base,
+                functions: [],
+                moduleLevelChanges: [],
+                newFunctions: [],
+                deletedFunctions: [],
+                summary: { modifiedFunctions: 0, deletedFunctions: 0, newFunctions: 0, totalCallSites: 0, affectedFiles: 0 }
+            };
+        }
+
+        const changes = parseDiff(diffText, this.root);
+
+        const functions = [];
+        const moduleLevelChanges = [];
+        const newFunctions = [];
+        const deletedFunctions = [];
+        const callerFileSet = new Set();
+        let totalCallSites = 0;
+
+        for (const change of changes) {
+            const lang = detectLanguage(change.filePath);
+            if (!lang) continue;
+
+            const fileEntry = this.files.get(change.filePath);
+            if (!fileEntry) continue;
+
+            // Track which functions are affected by added/modified lines
+            const affectedSymbols = new Map(); // symbolName -> { symbol, addedLines, deletedLines }
+
+            for (const line of change.addedLines) {
+                const symbol = this.findEnclosingFunction(change.filePath, line, true);
+                if (symbol) {
+                    const key = `${symbol.name}:${symbol.startLine}`;
+                    if (!affectedSymbols.has(key)) {
+                        affectedSymbols.set(key, { symbol, addedLines: [], deletedLines: [] });
+                    }
+                    affectedSymbols.get(key).addedLines.push(line);
+                } else {
+                    // Module-level change
+                    const existing = moduleLevelChanges.find(m => m.filePath === change.filePath);
+                    if (existing) {
+                        existing.addedLines.push(line);
+                    } else {
+                        moduleLevelChanges.push({
+                            filePath: change.filePath,
+                            relativePath: change.relativePath,
+                            addedLines: [line],
+                            deletedLines: []
+                        });
+                    }
+                }
+            }
+
+            for (const line of change.deletedLines) {
+                // For deleted lines, we can't use findEnclosingFunction on the current file
+                // since those lines no longer exist. Track as module-level unless they map
+                // to a function that still exists (the function was modified, not deleted).
+                // We approximate: if a deleted line is within the range of a known symbol, it's a modification.
+                let matched = false;
+                for (const symbol of fileEntry.symbols) {
+                    const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl', 'enum', 'trait']);
+                    if (nonCallableTypes.has(symbol.type)) continue;
+                    // Use a generous range — deleted lines near a function likely belong to it
+                    if (line >= symbol.startLine - 2 && line <= symbol.endLine + 2) {
+                        const key = `${symbol.name}:${symbol.startLine}`;
+                        if (!affectedSymbols.has(key)) {
+                            affectedSymbols.set(key, { symbol, addedLines: [], deletedLines: [] });
+                        }
+                        affectedSymbols.get(key).deletedLines.push(line);
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) {
+                    const existing = moduleLevelChanges.find(m => m.filePath === change.filePath);
+                    if (existing) {
+                        existing.deletedLines.push(line);
+                    } else {
+                        moduleLevelChanges.push({
+                            filePath: change.filePath,
+                            relativePath: change.relativePath,
+                            addedLines: [],
+                            deletedLines: [line]
+                        });
+                    }
+                }
+            }
+
+            // Detect new functions: all added lines are within a single function range
+            // and the function didn't exist before (approximation: all lines in the function are added)
+            for (const [key, data] of affectedSymbols) {
+                const { symbol, addedLines } = data;
+                const fnLineCount = symbol.endLine - symbol.startLine + 1;
+                if (addedLines.length >= fnLineCount * 0.8 && data.deletedLines.length === 0) {
+                    newFunctions.push({
+                        name: symbol.name,
+                        filePath: change.filePath,
+                        relativePath: change.relativePath,
+                        startLine: symbol.startLine,
+                        endLine: symbol.endLine,
+                        signature: this.formatSignature(symbol)
+                    });
+                    affectedSymbols.delete(key);
+                }
+            }
+
+            // For each affected function, find callers
+            for (const [, data] of affectedSymbols) {
+                const { symbol, addedLines: aLines, deletedLines: dLines } = data;
+
+                // Get the specific definitions matching this symbol
+                const allDefs = this.symbols.get(symbol.name) || [];
+                const targetDefs = allDefs.filter(d => d.file === change.filePath && d.startLine === symbol.startLine);
+
+                const callers = this.findCallers(symbol.name, { targetDefinitions: targetDefs.length > 0 ? targetDefs : undefined });
+
+                for (const c of callers) {
+                    callerFileSet.add(c.file);
+                }
+                totalCallSites += callers.length;
+
+                functions.push({
+                    name: symbol.name,
+                    filePath: change.filePath,
+                    relativePath: change.relativePath,
+                    startLine: symbol.startLine,
+                    endLine: symbol.endLine,
+                    signature: this.formatSignature(symbol),
+                    addedLines: aLines,
+                    deletedLines: dLines,
+                    callers: callers.map(c => ({
+                        file: c.file,
+                        relativePath: c.relativePath,
+                        line: c.line,
+                        callerName: c.callerName,
+                        content: c.content.trim()
+                    }))
+                });
+            }
+        }
+
+        return {
+            base: staged ? '(staged)' : base,
+            functions,
+            moduleLevelChanges,
+            newFunctions,
+            deletedFunctions,
+            summary: {
+                modifiedFunctions: functions.length,
+                deletedFunctions: deletedFunctions.length,
+                newFunctions: newFunctions.length,
+                totalCallSites,
+                affectedFiles: callerFileSet.size
+            }
+        };
+    }
 }
 
-module.exports = { ProjectIndex };
+/**
+ * Parse unified diff output into structured change data
+ * @param {string} diffText - Output from `git diff --unified=0`
+ * @param {string} root - Project root directory
+ * @returns {Array<{ filePath, relativePath, addedLines, deletedLines }>}
+ */
+function parseDiff(diffText, root) {
+    const changes = [];
+    let currentFile = null;
+
+    for (const line of diffText.split('\n')) {
+        // Match file header: +++ b/path/to/file.js
+        if (line.startsWith('+++ b/')) {
+            const relativePath = line.slice(6);
+            currentFile = {
+                filePath: path.join(root, relativePath),
+                relativePath,
+                addedLines: [],
+                deletedLines: []
+            };
+            changes.push(currentFile);
+            continue;
+        }
+
+        // Match hunk header: @@ -old,count +new,count @@
+        if (line.startsWith('@@') && currentFile) {
+            const match = line.match(/@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/);
+            if (match) {
+                const oldStart = parseInt(match[1], 10);
+                const oldCount = parseInt(match[2] || '1', 10);
+                const newStart = parseInt(match[3], 10);
+                const newCount = parseInt(match[4] || '1', 10);
+
+                // Deleted lines (from old file)
+                if (oldCount > 0) {
+                    for (let i = 0; i < oldCount; i++) {
+                        currentFile.deletedLines.push(oldStart + i);
+                    }
+                }
+
+                // Added lines (in new file)
+                if (newCount > 0) {
+                    for (let i = 0; i < newCount; i++) {
+                        currentFile.addedLines.push(newStart + i);
+                    }
+                }
+            }
+        }
+    }
+
+    return changes;
+}
+
+module.exports = { ProjectIndex, parseDiff };
