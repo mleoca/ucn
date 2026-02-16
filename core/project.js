@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { execSync } = require('child_process');
-const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore } = require('./discovery');
+const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parseFile } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse } = require('../languages');
@@ -47,6 +47,7 @@ class ProjectIndex {
         this.config = this.loadConfig();
         this.buildTime = null;
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
+        this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
     }
 
     /**
@@ -88,7 +89,7 @@ class ProjectIndex {
         const gitignorePatterns = parseGitignore(this.root);
         const configExclude = this.config.exclude || [];
         if (gitignorePatterns.length > 0 || configExclude.length > 0) {
-            globOpts.ignores = [...require('./discovery').DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
+            globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
         }
 
         const files = expandGlob(pattern, globOpts);
@@ -115,11 +116,14 @@ class ProjectIndex {
         this._completenessCache = null;
 
         let indexed = 0;
+        if (!this.failedFiles) this.failedFiles = new Set();
         for (const file of files) {
             try {
                 this.indexFile(file);
                 indexed++;
+                this.failedFiles.delete(file); // Succeeded now, remove from failed
             } catch (e) {
+                this.failedFiles.add(file); // Track files that fail to index
                 if (!quiet) {
                     console.error(`  Warning: Could not index ${file}: ${e.message}`);
                 }
@@ -4452,7 +4456,8 @@ class ProjectIndex {
             exportGraph: Array.from(this.exportGraph.entries()),
             extendsGraph: Array.from(this.extendsGraph.entries()),
             extendedByGraph: Array.from(this.extendedByGraph.entries()),
-            callsCache: callsCacheData
+            callsCache: callsCacheData,
+            failedFiles: this.failedFiles ? Array.from(this.failedFiles) : []
         };
 
         fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
@@ -4514,6 +4519,11 @@ class ProjectIndex {
                 this.callsCache = new Map(cacheData.callsCache);
             }
 
+            // Restore failedFiles if present
+            if (Array.isArray(cacheData.failedFiles)) {
+                this.failedFiles = new Set(cacheData.failedFiles);
+            }
+
             // Rebuild derived graphs to ensure consistency with current config
             this.buildImportGraph();
             this.buildInheritanceGraph();
@@ -4531,12 +4541,19 @@ class ProjectIndex {
      */
     isCacheStale() {
         // Check for new files added to project
+        // Use same ignores as build() — .gitignore + .ucn.json exclude
         const pattern = detectProjectPattern(this.root);
-        const currentFiles = expandGlob(pattern, { root: this.root });
+        const globOpts = { root: this.root };
+        const gitignorePatterns = parseGitignore(this.root);
+        const configExclude = this.config.exclude || [];
+        if (gitignorePatterns.length > 0 || configExclude.length > 0) {
+            globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
+        }
+        const currentFiles = expandGlob(pattern, globOpts);
         const cachedPaths = new Set(this.files.keys());
 
         for (const file of currentFiles) {
-            if (!cachedPaths.has(file)) {
+            if (!cachedPaths.has(file) && !(this.failedFiles && this.failedFiles.has(file))) {
                 return true; // New file found
             }
         }
