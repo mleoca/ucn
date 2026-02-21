@@ -1376,7 +1376,7 @@ class Child(Base):
         } finally { rm(d); }
     });
 
-    it('LIMITATION: deep inheritance chain (3+ levels)', () => {
+    it('PASS: deep inheritance chain (3+ levels)', () => {
         const d = tmp({
             'package.json': '{"name":"t"}',
             'lib.js': `
