@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
-const { parseFile } = require('./parser');
+const { parseFile, cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 
@@ -1881,7 +1881,9 @@ class ProjectIndex {
         try {
             const content = fs.readFileSync(symbol.file, 'utf-8');
             const lines = content.split('\n');
-            return lines.slice(symbol.startLine - 1, symbol.endLine).join('\n');
+            const extracted = lines.slice(symbol.startLine - 1, symbol.endLine);
+            cleanHtmlScriptTags(extracted, detectLanguage(symbol.file));
+            return extracted.join('\n');
         } catch (e) {
             return '';
         }
@@ -2605,11 +2607,24 @@ class ProjectIndex {
                 const language = detectLanguage(filePath);
                 if (!language) continue;
 
-                const parser = getParser(language);
-                if (!parser) continue;
-
                 const content = fs.readFileSync(filePath, 'utf-8');
-                const tree = parser.parse(content, undefined, PARSE_OPTIONS);
+
+                // For HTML files, parse the virtual JS content instead of raw HTML
+                // (HTML tree-sitter sees script content as raw_text, not JS identifiers)
+                let tree;
+                if (language === 'html') {
+                    const htmlModule = getLanguageModule('html');
+                    const htmlParser = getParser('html');
+                    const jsParser = getParser('javascript');
+                    const blocks = htmlModule.extractScriptBlocks(content, htmlParser);
+                    if (blocks.length === 0) continue;
+                    const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
+                    tree = jsParser.parse(virtualJS, undefined, PARSE_OPTIONS);
+                } else {
+                    const parser = getParser(language);
+                    if (!parser) continue;
+                    tree = parser.parse(content, undefined, PARSE_OPTIONS);
+                }
 
                 // Collect all identifiers from this file in one pass
                 const traverse = (node) => {
