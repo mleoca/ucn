@@ -1,6 +1,6 @@
 {
   "name": "ucn",
-  "version": "3.7.0",
+  "version": "3.7.1",
   "description": "Universal Code Navigator — function relationships, call trees, and impact analysis across large codebases without reading entire files.",
   "main": "index.js",
   "bin": {

@@ -144,6 +144,81 @@ function extractJS(htmlContent, htmlParser) {
     return { virtualJS, jsParser, jsModule };
 }
 
+/**
+ * Extract function calls from HTML event handler attributes (onclick, onchange, etc.).
+ * Walks the HTML AST for elements with on* attributes, extracts function names
+ * from the attribute values using regex, and returns call objects.
+ *
+ * @param {string} htmlContent - Raw HTML source
+ * @param {object} htmlParser - tree-sitter parser configured for HTML
+ * @returns {Array<{name: string, line: number, isMethod: boolean, enclosingFunction: null, uncertain: boolean, isEventHandler: boolean}>}
+ */
+function extractEventHandlerCalls(htmlContent, htmlParser) {
+    const { safeParse, getParseOptions } = require('./index');
+    const tree = safeParse(htmlParser, htmlContent, undefined, getParseOptions(htmlContent.length));
+    const calls = [];
+
+    const JS_KEYWORDS = new Set([
+        'if', 'for', 'while', 'switch', 'catch', 'function', 'return',
+        'typeof', 'void', 'delete', 'new', 'throw', 'class', 'const',
+        'let', 'var', 'true', 'false', 'null', 'undefined', 'this'
+    ]);
+
+    const visit = (node) => {
+        // Skip script elements — their content is handled separately
+        if (node.type === 'script_element') return;
+
+        if (node.type === 'attribute') {
+            const nameNode = node.children.find(c => c.type === 'attribute_name');
+            if (!nameNode || !nameNode.text.toLowerCase().startsWith('on')) {
+                for (let i = 0; i < node.childCount; i++) visit(node.child(i));
+                return;
+            }
+
+            const valueNode = node.children.find(c =>
+                c.type === 'quoted_attribute_value' || c.type === 'attribute_value'
+            );
+            if (!valueNode) return;
+
+            let valueText;
+            if (valueNode.type === 'quoted_attribute_value') {
+                const inner = valueNode.children.find(c => c.type === 'attribute_value');
+                valueText = inner ? inner.text : '';
+            } else {
+                valueText = valueNode.text;
+            }
+            if (!valueText) return;
+
+            const line = nameNode.startPosition.row + 1; // 1-indexed
+
+            // Extract standalone function calls (not method calls like obj.method())
+            const regex = /([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
+            let match;
+            while ((match = regex.exec(valueText)) !== null) {
+                const fnName = match[1];
+                if (JS_KEYWORDS.has(fnName)) continue;
+                // Skip if preceded by dot (method call on object)
+                if (match.index > 0 && valueText[match.index - 1] === '.') continue;
+
+                calls.push({
+                    name: fnName,
+                    line,
+                    isMethod: false,
+                    enclosingFunction: null,
+                    uncertain: false,
+                    isEventHandler: true
+                });
+            }
+            return;
+        }
+
+        for (let i = 0; i < node.childCount; i++) visit(node.child(i));
+    };
+
+    visit(tree.rootNode);
+    return calls;
+}
+
 // ── Exported language module interface ──────────────────────────────────────
 
 function parse(code, parser) {
@@ -185,9 +260,14 @@ function findStateObjects(code, parser) {
 }
 
 function findCallsInCode(code, parser) {
-    const result = extractJS(code, parser);
-    if (!result) return [];
-    return result.jsModule.findCallsInCode(result.virtualJS, result.jsParser);
+    const scriptCalls = (() => {
+        const result = extractJS(code, parser);
+        if (!result) return [];
+        return result.jsModule.findCallsInCode(result.virtualJS, result.jsParser);
+    })();
+    const handlerCalls = extractEventHandlerCalls(code, parser);
+    if (handlerCalls.length === 0) return scriptCalls;
+    return scriptCalls.concat(handlerCalls);
 }
 
 function findCallbackUsages(code, name, parser) {
@@ -233,5 +313,6 @@ module.exports = {
     findUsagesInCode,
     // Exported for testing
     extractScriptBlocks,
-    buildVirtualJSContent
+    buildVirtualJSContent,
+    extractEventHandlerCalls
 };

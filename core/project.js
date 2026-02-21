@@ -2617,9 +2617,11 @@ class ProjectIndex {
                     const htmlParser = getParser('html');
                     const jsParser = getParser('javascript');
                     const blocks = htmlModule.extractScriptBlocks(content, htmlParser);
-                    if (blocks.length === 0) continue;
-                    const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
-                    tree = jsParser.parse(virtualJS, undefined, PARSE_OPTIONS);
+                    if (blocks.length === 0 && !htmlModule.extractEventHandlerCalls) continue;
+                    if (blocks.length > 0) {
+                        const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
+                        tree = jsParser.parse(virtualJS, undefined, PARSE_OPTIONS);
+                    }
                 } else {
                     const parser = getParser(language);
                     if (!parser) continue;
@@ -2649,7 +2651,25 @@ class ProjectIndex {
                         traverse(node.child(i));
                     }
                 };
-                traverse(tree.rootNode);
+                if (tree) traverse(tree.rootNode);
+
+                // For HTML files, also extract identifiers from event handler attributes
+                // (onclick="foo()" etc. — these are in HTML, not in <script> blocks)
+                if (language === 'html') {
+                    const htmlModule = getLanguageModule('html');
+                    const htmlParser = getParser('html');
+                    const handlerCalls = htmlModule.extractEventHandlerCalls(content, htmlParser);
+                    for (const call of handlerCalls) {
+                        if (!usageIndex.has(call.name)) {
+                            usageIndex.set(call.name, []);
+                        }
+                        usageIndex.get(call.name).push({
+                            file: filePath,
+                            line: call.line,
+                            relativePath: fileEntry.relativePath
+                        });
+                    }
+                }
             } catch (e) {
                 // Skip files that can't be processed
             }

@@ -2,6 +2,8 @@
 
 UCN is designed to work with large files and codebases, helping AI agents ingest exactly the data they need. Its surgical output discourages agents from cutting corners, and without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data."
 
+Supported languages: JS/TS, Python, Go, Rust, Java. Also parses HTML files (inline scripts and event handlers).
+
 ---
 
 ## Three Ways to Use UCN
@@ -92,7 +94,7 @@ Instead of reading entire files, ask precise questions:
                     tree-sitter AST
                           │
       ┌───────────────────┴─────────────────┐
-      │         Supported Languages         │
+      │          Supported Languages        │
       │ JS/TS, Python, Go, Rust, Java, HTML │
       └─────────────────────────────────────┘
 ```
@@ -497,7 +499,7 @@ ucn toc                                   # Project overview
   │  Limitation              │  What happens                            │
   ├──────────────────────────┼──────────────────────────────────────────┤
   │                          │                                          │
-  │  6 languages only        │  JS/TS, Python, Go, Rust, Java, HTML.    │
+  │  5 languages + HTML      │  JS/TS, Python, Go, Rust, Java.          │
   │  (no C, Ruby, PHP, etc.) │  Agents fall back to grep for the rest.  │
   │                          │  UCN complements, doesn't replace.       │
   │                          │                                          │
