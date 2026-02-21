@@ -8,10 +8,10 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync } = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
-const { parseFile, cleanHtmlScriptTags } = require('./parser');
+const { parse, parseFile, cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 
@@ -402,7 +402,15 @@ class ProjectIndex {
                         return parent;
                     });
 
-                    this.extendsGraph.set(symbol.name, resolvedParents);
+                    // Store with file scope to avoid collisions when same class name
+                    // appears in multiple files (F-002 fix)
+                    if (!this.extendsGraph.has(symbol.name)) {
+                        this.extendsGraph.set(symbol.name, []);
+                    }
+                    this.extendsGraph.get(symbol.name).push({
+                        file: filePath,
+                        parents: resolvedParents
+                    });
 
                     for (const parent of resolvedParents) {
                         if (!this.extendedByGraph.has(parent)) {
@@ -417,6 +425,66 @@ class ProjectIndex {
                 }
             }
         }
+    }
+
+    /**
+     * Get inheritance parents for a class, scoped by file to handle
+     * duplicate class names across files.
+     * @param {string} className - Class name to look up
+     * @param {string} contextFile - File path for scoping (prefer same-file match)
+     * @returns {string[]|null} Parent class names, or null if none
+     */
+    _getInheritanceParents(className, contextFile) {
+        const entries = this.extendsGraph.get(className);
+        if (!entries || entries.length === 0) return null;
+
+        // New format: array of {file, parents}
+        if (typeof entries[0] === 'object' && entries[0].file !== undefined) {
+            // Prefer same-file match
+            const match = entries.find(e => e.file === contextFile);
+            if (match) return match.parents;
+
+            // Try imported file
+            if (contextFile) {
+                const imports = this.importGraph.get(contextFile);
+                if (imports) {
+                    const imported = entries.find(e => imports.includes(e.file));
+                    if (imported) return imported.parents;
+                }
+            }
+
+            // Fallback to first entry
+            return entries[0].parents;
+        }
+
+        // Old format (cache compat): plain array of parent names
+        return entries;
+    }
+
+    /**
+     * Resolve which file a class is defined in, preferring contextFile.
+     * Used during inheritance BFS to find grandparent chains.
+     * @param {string} className - Class name to resolve
+     * @param {string} contextFile - Preferred file (e.g., child's file)
+     * @returns {string|null} Resolved file path
+     */
+    _resolveClassFile(className, contextFile) {
+        const symbols = this.symbols.get(className);
+        if (!symbols) return contextFile;
+        const classSymbols = symbols.filter(s =>
+            ['class', 'interface', 'struct', 'trait'].includes(s.type));
+        if (classSymbols.length === 0) return contextFile;
+        // Prefer same file as context
+        if (classSymbols.some(s => s.file === contextFile)) return contextFile;
+        // Prefer imported
+        if (contextFile) {
+            const imports = this.importGraph.get(contextFile);
+            if (imports) {
+                const imported = classSymbols.find(s => imports.includes(s.file));
+                if (imported) return imported.file;
+            }
+        }
+        return classSymbols[0].file;
     }
 
 
@@ -1246,21 +1314,23 @@ class ProjectIndex {
                             let matchesDef = call.receiver === 'super'
                                 ? false
                                 : definitions.some(d => d.className === callerSymbol.className);
-                            // Walk inheritance chain if not found in same class
+                            // Walk inheritance chain using BFS if not found in same class
                             if (!matchesDef) {
-                                let parents = this.extendsGraph.get(callerSymbol.className);
                                 const visited = new Set([callerSymbol.className]);
-                                while (parents && !matchesDef) {
-                                    for (const parent of parents) {
-                                        if (visited.has(parent)) continue;
-                                        visited.add(parent);
-                                        matchesDef = definitions.some(d => d.className === parent);
-                                        if (matchesDef) break;
-                                    }
+                                const callerFile = callerSymbol.file || filePath;
+                                const startParents = this._getInheritanceParents(callerSymbol.className, callerFile) || [];
+                                const queue = startParents.map(p => ({ name: p, contextFile: callerFile }));
+                                while (queue.length > 0 && !matchesDef) {
+                                    const { name: current, contextFile } = queue.shift();
+                                    if (visited.has(current)) continue;
+                                    visited.add(current);
+                                    matchesDef = definitions.some(d => d.className === current);
                                     if (!matchesDef) {
-                                        const nextParent = parents.find(p => !visited.has(p));
-                                        if (!nextParent) break;
-                                        parents = this.extendsGraph.get(nextParent);
+                                        const resolvedFile = this._resolveClassFile(current, contextFile);
+                                        const grandparents = this._getInheritanceParents(current, resolvedFile) || [];
+                                        for (const gp of grandparents) {
+                                            if (!visited.has(gp)) queue.push({ name: gp, contextFile: resolvedFile });
+                                        }
                                     }
                                 }
                             }
@@ -1665,22 +1735,23 @@ class ProjectIndex {
                         ? null
                         : symbols.find(s => s.className === def.className);
 
-                    // Walk inheritance chain if not found in same class
+                    // Walk inheritance chain using BFS if not found in same class
                     if (!match) {
-                        let parents = this.extendsGraph.get(def.className);
                         const visited = new Set([def.className]);
-                        while (parents && !match) {
-                            for (const parent of parents) {
-                                if (visited.has(parent)) continue;
-                                visited.add(parent);
-                                match = symbols.find(s => s.className === parent);
-                                if (match) break;
-                            }
+                        const defFile = def.file;
+                        const startParents = this._getInheritanceParents(def.className, defFile) || [];
+                        const queue = startParents.map(p => ({ name: p, contextFile: defFile }));
+                        while (queue.length > 0 && !match) {
+                            const { name: current, contextFile } = queue.shift();
+                            if (visited.has(current)) continue;
+                            visited.add(current);
+                            match = symbols.find(s => s.className === current);
                             if (!match) {
-                                // Follow first parent's chain (simplified MRO)
-                                const nextParent = parents.find(p => !visited.has(p));
-                                if (!nextParent) break;
-                                parents = this.extendsGraph.get(nextParent);
+                                const resolvedFile = this._resolveClassFile(current, contextFile);
+                                const grandparents = this._getInheritanceParents(current, resolvedFile) || [];
+                                for (const gp of grandparents) {
+                                    if (!visited.has(gp)) queue.push({ name: gp, contextFile: resolvedFile });
+                                }
                             }
                         }
                     }
@@ -4830,8 +4901,8 @@ class ProjectIndex {
             throw new Error('Not a git repository. diff-impact requires git.');
         }
 
-        // Build git diff command
-        const diffArgs = ['git', 'diff', '--unified=0'];
+        // Build git diff command (use execFileSync to avoid shell expansion)
+        const diffArgs = ['diff', '--unified=0'];
         if (staged) {
             diffArgs.push('--staged');
         } else {
@@ -4843,7 +4914,7 @@ class ProjectIndex {
 
         let diffText;
         try {
-            diffText = execSync(diffArgs.join(' '), { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
+            diffText = execFileSync('git', diffArgs, { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
         } catch (e) {
             // git diff exits non-zero when there are diff errors, but also for invalid refs
             if (e.stdout) {
@@ -4878,7 +4949,31 @@ class ProjectIndex {
             if (!lang) continue;
 
             const fileEntry = this.files.get(change.filePath);
-            if (!fileEntry) continue;
+
+            // Handle deleted files: entire file was removed, all functions are deleted
+            if (!fileEntry) {
+                if (change.isDeleted && change.deletedLines.length > 0) {
+                    const ref = staged ? 'HEAD' : base;
+                    try {
+                        const oldContent = execFileSync(
+                            'git', ['show', `${ref}:${change.relativePath}`],
+                            { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+                        );
+                        const oldParsed = parse(oldContent, lang);
+                        for (const oldFn of extractCallableSymbols(oldParsed)) {
+                            deletedFunctions.push({
+                                name: oldFn.name,
+                                filePath: change.filePath,
+                                relativePath: change.relativePath,
+                                startLine: oldFn.startLine
+                            });
+                        }
+                    } catch (e) {
+                        // git show failed — skip
+                    }
+                }
+                continue;
+            }
 
             // Track which functions are affected by added/modified lines
             const affectedSymbols = new Map(); // symbolName -> { symbol, addedLines, deletedLines }
@@ -4960,6 +5055,57 @@ class ProjectIndex {
                 }
             }
 
+            // Detect deleted functions: compare old file symbols with current by identity.
+            // Uses name+className counts to handle overloads (e.g. Java method overloading).
+            if (change.deletedLines.length > 0) {
+                const ref = staged ? 'HEAD' : base;
+                try {
+                    const oldContent = execFileSync(
+                        'git', ['show', `${ref}:${change.relativePath}`],
+                        { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+                    );
+                    const fileLang = detectLanguage(change.filePath);
+                    if (fileLang) {
+                        const oldParsed = parse(oldContent, fileLang);
+                        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl', 'enum', 'trait']);
+                        // Count current symbols by identity (name + className)
+                        const currentCounts = new Map();
+                        for (const s of fileEntry.symbols) {
+                            if (nonCallableTypes.has(s.type)) continue;
+                            const key = `${s.name}\0${s.className || ''}`;
+                            currentCounts.set(key, (currentCounts.get(key) || 0) + 1);
+                        }
+                        // Count old symbols by identity and detect deletions
+                        const oldCounts = new Map();
+                        const oldSymbols = extractCallableSymbols(oldParsed);
+                        for (const oldFn of oldSymbols) {
+                            const key = `${oldFn.name}\0${oldFn.className || ''}`;
+                            oldCounts.set(key, (oldCounts.get(key) || 0) + 1);
+                        }
+                        // For each identity, if old count > current count, the difference are deletions
+                        for (const [key, oldCount] of oldCounts) {
+                            const curCount = currentCounts.get(key) || 0;
+                            if (oldCount > curCount) {
+                                // Find the specific old symbols with this identity that were deleted
+                                const matching = oldSymbols.filter(s => `${s.name}\0${s.className || ''}` === key);
+                                // Report the extra ones (by startLine descending — later ones more likely deleted)
+                                const toReport = matching.slice(curCount);
+                                for (const oldFn of toReport) {
+                                    deletedFunctions.push({
+                                        name: oldFn.name,
+                                        filePath: change.filePath,
+                                        relativePath: change.relativePath,
+                                        startLine: oldFn.startLine
+                                    });
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    // File didn't exist in base, or git error — skip
+                }
+            }
+
             // For each affected function, find callers
             for (const [, data] of affectedSymbols) {
                 const { symbol, addedLines: aLines, deletedLines: dLines } = data;
@@ -5013,6 +5159,40 @@ class ProjectIndex {
 }
 
 /**
+ * Extract all callable symbols (functions + class methods) from a parse result,
+ * matching how indexFile builds the symbol list. Methods get className added.
+ * @param {object} parsed - Result from parse()
+ * @returns {Array<{name, className, startLine}>}
+ */
+function extractCallableSymbols(parsed) {
+    const symbols = [];
+    for (const fn of parsed.functions) {
+        symbols.push({ name: fn.name, className: fn.className || '', startLine: fn.startLine });
+    }
+    for (const cls of parsed.classes) {
+        if (cls.members) {
+            for (const m of cls.members) {
+                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine });
+            }
+        }
+    }
+    return symbols;
+}
+
+/**
+ * Unquote a git diff path: unescape C-style backslash sequences and strip tab metadata.
+ * Git quotes paths containing special chars as "a/path\"with\"quotes".
+ * @param {string} raw - Raw path string (may contain backslash escapes)
+ * @returns {string} Unquoted path
+ */
+function unquoteDiffPath(raw) {
+    const ESCAPES = { '\\\\': '\\', '\\"': '"', '\\n': '\n', '\\t': '\t' };
+    return raw
+        .split('\t')[0]
+        .replace(/\\[\\"nt]/g, m => ESCAPES[m]);
+}
+
+/**
  * Parse unified diff output into structured change data
  * @param {string} diffText - Output from `git diff --unified=0`
  * @param {string} root - Project root directory
@@ -5021,16 +5201,39 @@ class ProjectIndex {
 function parseDiff(diffText, root) {
     const changes = [];
     let currentFile = null;
+    let pendingOldPath = null; // Track --- a/ path for deleted files
 
     for (const line of diffText.split('\n')) {
-        // Match file header: +++ b/path/to/file.js
-        if (line.startsWith('+++ b/')) {
-            const relativePath = line.slice(6);
+        // Track old file path from --- header for deleted-file detection
+        // Handles both unquoted (--- a/path) and quoted (--- "a/path") formats
+        const oldMatch = line.match(/^--- (?:"a\/((?:[^"\\]|\\.)*)"|a\/(.+?))\s*$/);
+        if (oldMatch) {
+            const raw = oldMatch[1] !== undefined ? oldMatch[1] : oldMatch[2];
+            pendingOldPath = unquoteDiffPath(raw);
+            continue;
+        }
+
+        // Match file header: +++ b/path or +++ "b/path" or +++ /dev/null
+        if (line.startsWith('+++ ')) {
+            let relativePath;
+            const isDevNull = line.startsWith('+++ /dev/null');
+            if (isDevNull) {
+                // File was deleted — use the --- a/ path
+                if (!pendingOldPath) continue;
+                relativePath = pendingOldPath;
+            } else {
+                const newMatch = line.match(/^\+\+\+ (?:"b\/((?:[^"\\]|\\.)*)"|b\/(.+?))\s*$/);
+                if (!newMatch) continue;
+                const raw = newMatch[1] !== undefined ? newMatch[1] : newMatch[2];
+                relativePath = unquoteDiffPath(raw);
+            }
+            pendingOldPath = null;
             currentFile = {
                 filePath: path.join(root, relativePath),
                 relativePath,
                 addedLines: [],
-                deletedLines: []
+                deletedLines: [],
+                ...(isDevNull && { isDeleted: true })
             };
             changes.push(currentFile);
             continue;

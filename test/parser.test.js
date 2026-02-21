@@ -12690,5 +12690,340 @@ function doStuff() { return 42; }
     });
 });
 
+// FIX 91: Deep inheritance chain (3+ levels) — BFS traversal
+it('FIX 91 — deep inheritance chain resolves callees through 3+ levels', () => {
+    const tmpDir = path.join(os.tmpdir(), `ucn-deep-inherit-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'lib.js'), `
+class A {
+    helper() { return 1; }
+}
+class B extends A {
+    other() { return 2; }
+}
+class C extends B {
+    process() { return this.helper(); }
+}
+module.exports = { A, B, C };
+`);
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // Callees: C.process() should resolve this.helper() to A.helper via C → B → A
+        const processDef = index.symbols.get('process')?.[0];
+        const callees = index.findCallees(processDef);
+        assert.ok(callees.some(c => c.name === 'helper' && c.className === 'A'),
+            'Deep chain callees: C → B → A, this.helper() resolves to A.helper');
+
+        // Callers: A.helper should be found as called from C.process()
+        const callers = index.findCallers('helper');
+        assert.ok(callers.some(c => c.callerName === 'process'),
+            'Deep chain callers: A.helper() called from C.process() via inheritance');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 92: Inheritance graph key collision with duplicate class names across files
+it('FIX 92 — duplicate class names across files resolve independently', () => {
+    const tmpDir = path.join(os.tmpdir(), `ucn-dup-class-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a1.js'), `
+class A { helper() { return 1; } }
+class C extends A { process() { return this.helper(); } }
+module.exports = { A, C };
+`);
+        fs.writeFileSync(path.join(tmpDir, 'a2.js'), `
+class B { helper() { return 2; } }
+class C extends B { run() { return this.helper(); } }
+module.exports = { B, C };
+`);
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // C in a1.js extends A → helper should resolve to A.helper (a1.js)
+        const processDef = index.symbols.get('process').find(s => s.file.endsWith('a1.js'));
+        const processCallees = index.findCallees(processDef);
+        const helperFromProcess = processCallees.find(c => c.name === 'helper');
+        assert.ok(helperFromProcess, 'process() resolves this.helper()');
+        assert.strictEqual(helperFromProcess.className, 'A', 'process() helper is from class A');
+        assert.ok(helperFromProcess.file.endsWith('a1.js'), 'process() helper is in a1.js');
+
+        // C in a2.js extends B → helper should resolve to B.helper (a2.js)
+        const runDef = index.symbols.get('run').find(s => s.file.endsWith('a2.js'));
+        const runCallees = index.findCallees(runDef);
+        const helperFromRun = runCallees.find(c => c.name === 'helper');
+        assert.ok(helperFromRun, 'run() resolves this.helper()');
+        assert.strictEqual(helperFromRun.className, 'B', 'run() helper is from class B');
+        assert.ok(helperFromRun.file.endsWith('a2.js'), 'run() helper is in a2.js');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 93: diffImpact detects deleted functions
+it('FIX 93 — diffImpact detects deleted functions', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-del-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `function foo() { return 1; }
+function bar() { return foo(); }
+`);
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Delete foo, keep bar
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `function bar() { return 2; }
+`);
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.ok(result.deletedFunctions.length >= 1, 'Should detect deleted function');
+        assert.ok(result.deletedFunctions.some(f => f.name === 'foo'), 'foo should be in deletedFunctions');
+        assert.strictEqual(result.summary.deletedFunctions, result.deletedFunctions.length,
+            'Summary count should match deletedFunctions length');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 94: diffImpact detects deleted functions when entire file is removed
+it('FIX 94 — diffImpact detects all functions in a deleted file', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-filedel-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a.js'), 'function foo() { return 1; }\nfunction bar() { return 2; }\n');
+        fs.writeFileSync(path.join(tmpDir, 'b.js'), 'function baz() { return 3; }\n');
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Delete entire file a.js
+        fs.unlinkSync(path.join(tmpDir, 'a.js'));
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.ok(result.deletedFunctions.some(f => f.name === 'foo'), 'foo should be detected as deleted');
+        assert.ok(result.deletedFunctions.some(f => f.name === 'bar'), 'bar should be detected as deleted');
+        assert.ok(!result.deletedFunctions.some(f => f.name === 'baz'), 'baz should NOT be deleted');
+        assert.strictEqual(result.summary.deletedFunctions, 2);
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 95: diffImpact detects same-name method deletion by identity
+it('FIX 95 — diffImpact detects A.foo deleted while B.foo remains', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-samename-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+class A { foo() { return 1; } }
+class B { foo() { return 2; } }
+module.exports = { A, B };
+`);
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Delete A.foo but keep B.foo
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+class A { }
+class B { foo() { return 2; } }
+module.exports = { A, B };
+`);
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.strictEqual(result.deletedFunctions.length, 1, 'Exactly one foo should be deleted');
+        assert.strictEqual(result.deletedFunctions[0].name, 'foo');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 96: parseDiff handles filenames with spaces and tab metadata
+it('FIX 96 — diffImpact works with filenames containing spaces', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-spaces-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a b.js'), 'function spaceFn() { return 1; }\nfunction gone() { return 2; }\n');
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Modify spaceFn, delete gone
+        fs.writeFileSync(path.join(tmpDir, 'a b.js'), 'function spaceFn() { return 99; }\n');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.ok(result.functions.some(f => f.name === 'spaceFn'), 'spaceFn should be detected as modified');
+        assert.ok(result.deletedFunctions.some(f => f.name === 'gone'), 'gone should be detected as deleted');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 97: git show uses execFileSync (no shell expansion of $ in filenames)
+it('FIX 97 — diffImpact works with $ in filenames', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-dollar-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        fs.writeFileSync(path.join(tmpDir, 'a$HOME.js'), 'function dollarFn() { return 1; }\nfunction gone() { return 2; }\n');
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'a$HOME.js'), 'function dollarFn() { return 99; }\n');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.ok(result.functions.some(f => f.name === 'dollarFn'), 'dollarFn should be detected as modified');
+        assert.ok(result.deletedFunctions.some(f => f.name === 'gone'), 'gone should be detected as deleted');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 98: deleted-function identity handles overloads (same name+class, different signatures)
+it('FIX 98 — diffImpact detects deleted overload while sibling remains', () => {
+    const { execSync } = require('child_process');
+    const tmpDir = path.join(os.tmpdir(), `ucn-diff-overload-${Date.now()}`);
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    try {
+        execSync('git init', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.email "test@test.com"', { cwd: tmpDir, stdio: 'pipe' });
+        execSync('git config user.name "Test"', { cwd: tmpDir, stdio: 'pipe' });
+
+        fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>\n');
+        fs.writeFileSync(path.join(tmpDir, 'A.java'), `
+public class A {
+    public void foo(int x) { System.out.println(x); }
+    public void foo(String s) { System.out.println(s); }
+    public void bar() { foo(1); }
+}
+`);
+        execSync('git add -A && git commit -m "init"', { cwd: tmpDir, stdio: 'pipe' });
+
+        // Delete one overload
+        fs.writeFileSync(path.join(tmpDir, 'A.java'), `
+public class A {
+    public void foo(String s) { System.out.println(s); }
+    public void bar() { foo("hi"); }
+}
+`);
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+        const result = index.diffImpact({ base: 'HEAD' });
+
+        assert.strictEqual(result.deletedFunctions.length, 1, 'Exactly one overload should be deleted');
+        assert.strictEqual(result.deletedFunctions[0].name, 'foo');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+});
+
+// FIX 99: parseDiff handles quoted diff headers (special chars in filenames)
+it('FIX 99 — parseDiff handles quoted paths with special characters', () => {
+    const { parseDiff } = require('../core/project');
+
+    // Quoted path with escaped quotes
+    const diffText = `diff --git "a/a\\"b.js" "b/a\\"b.js"
+--- "a/a\\"b.js"
++++ "b/a\\"b.js"
+@@ -1 +1 @@
+`;
+    const changes = parseDiff(diffText, '/tmp/test');
+    assert.strictEqual(changes.length, 1);
+    assert.strictEqual(changes[0].relativePath, 'a"b.js');
+
+    // Quoted deleted file
+    const diffText2 = `diff --git "a/a\\"b.js" "b/a\\"b.js"
+--- "a/a\\"b.js"
++++ /dev/null
+@@ -1,2 +0,0 @@
+`;
+    const changes2 = parseDiff(diffText2, '/tmp/test');
+    assert.strictEqual(changes2.length, 1);
+    assert.strictEqual(changes2[0].isDeleted, true);
+    assert.strictEqual(changes2[0].relativePath, 'a"b.js');
+
+    // Unquoted path still works
+    const diffText3 = `diff --git a/normal.js b/normal.js
+--- a/normal.js
++++ b/normal.js
+@@ -1 +1 @@
+`;
+    const changes3 = parseDiff(diffText3, '/tmp/test');
+    assert.strictEqual(changes3.length, 1);
+    assert.strictEqual(changes3[0].relativePath, 'normal.js');
+
+    // Literal backslash+n in filename must not become a newline (single-pass unescape)
+    // Git represents a\\n.js as a\\\\n.js in quoted headers
+    const diffText4 = `diff --git "a/a\\\\n.js" "b/a\\\\n.js"
+--- "a/a\\\\n.js"
++++ "b/a\\\\n.js"
+@@ -1 +1 @@
+`;
+    const changes4 = parseDiff(diffText4, '/tmp/test');
+    assert.strictEqual(changes4.length, 1);
+    assert.strictEqual(changes4[0].relativePath, 'a\\n.js',
+        'Literal backslash-n in filename must be preserved, not converted to newline');
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');
