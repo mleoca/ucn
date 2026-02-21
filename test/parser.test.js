@@ -12535,6 +12535,159 @@ function main() { return helper(); }
 
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
+
+    // ── HTML event handler tests (fix #90) ──────────────────────────────────
+
+    it('extractEventHandlerCalls extracts calls from onclick attributes', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = '<button onclick="resetGame()">Click</button>';
+        const calls = extractEventHandlerCalls(html, parser);
+        assert.strictEqual(calls.length, 1);
+        assert.strictEqual(calls[0].name, 'resetGame');
+        assert.strictEqual(calls[0].line, 1);
+        assert.strictEqual(calls[0].isMethod, false);
+        assert.strictEqual(calls[0].isEventHandler, true);
+    });
+
+    it('extractEventHandlerCalls handles multiple calls in one handler', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = '<button onclick="validateForm(); submitData()">Go</button>';
+        const calls = extractEventHandlerCalls(html, parser);
+        assert.strictEqual(calls.length, 2);
+        assert.strictEqual(calls[0].name, 'validateForm');
+        assert.strictEqual(calls[1].name, 'submitData');
+    });
+
+    it('extractEventHandlerCalls skips method calls on objects', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = '<button onclick="event.stopPropagation(); selectCar(\'abc\')">Buy</button>';
+        const calls = extractEventHandlerCalls(html, parser);
+        const names = calls.map(c => c.name);
+        assert.ok(!names.includes('stopPropagation'), 'should skip event.stopPropagation()');
+        assert.ok(names.includes('selectCar'), 'should detect selectCar()');
+    });
+
+    it('extractEventHandlerCalls skips JS keywords', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = '<button onclick="if (confirm(\'sure?\')) deleteItem(id)">Del</button>';
+        const calls = extractEventHandlerCalls(html, parser);
+        const names = calls.map(c => c.name);
+        assert.ok(!names.includes('if'), 'should skip keyword if');
+        assert.ok(names.includes('confirm'));
+        assert.ok(names.includes('deleteItem'));
+    });
+
+    it('extractEventHandlerCalls works with various on* attributes', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = `<input onchange="updateValue()" onfocus="highlight()" onblur="unhighlight()">`;
+        const calls = extractEventHandlerCalls(html, parser);
+        const names = calls.map(c => c.name);
+        assert.ok(names.includes('updateValue'));
+        assert.ok(names.includes('highlight'));
+        assert.ok(names.includes('unhighlight'));
+    });
+
+    it('extractEventHandlerCalls does not extract from script elements', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = `<script>function foo() { bar(); }</script>
+<button onclick="foo()">Click</button>`;
+        const calls = extractEventHandlerCalls(html, parser);
+        // Should only find foo from onclick, not bar from <script>
+        assert.strictEqual(calls.length, 1);
+        assert.strictEqual(calls[0].name, 'foo');
+    });
+
+    it('extractEventHandlerCalls reports correct line numbers', () => {
+        const { extractEventHandlerCalls } = require('../languages/html');
+        const parser = getParser('html');
+        const html = `<html>
+<body>
+<div>text</div>
+<button onclick="doA()">A</button>
+<button onclick="doB()">B</button>
+</body>
+</html>`;
+        const calls = extractEventHandlerCalls(html, parser);
+        assert.strictEqual(calls.length, 2);
+        assert.strictEqual(calls[0].name, 'doA');
+        assert.strictEqual(calls[0].line, 4);
+        assert.strictEqual(calls[1].name, 'doB');
+        assert.strictEqual(calls[1].line, 5);
+    });
+
+    it('findCallsInCode includes event handler calls for HTML', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<button onclick="handleClick()">Click</button>
+<script>
+function handleClick() { doWork(); }
+function doWork() { return 42; }
+</script>`;
+        const calls = mod.findCallsInCode(html, parser);
+        const names = calls.map(c => c.name);
+        assert.ok(names.includes('handleClick'), 'should find handleClick from onclick');
+        assert.ok(names.includes('doWork'), 'should find doWork from script');
+    });
+
+    it('deadcode does not report functions called from HTML event handlers', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-onclick-'));
+        fs.writeFileSync(path.join(tmpDir, 'page.html'), `<html><body>
+<button onclick="resetGame()">Reset</button>
+<button onclick="startGame('easy')">Start</button>
+<script>
+function resetGame() { init(); }
+function startGame(mode) { setup(mode); }
+function init() { return 1; }
+function setup(m) { return m; }
+function unusedFn() { return 0; }
+</script>
+</body></html>`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name": "test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const dead = index.deadcode({ includeExported: true });
+        const deadNames = dead.map(d => d.name);
+        // resetGame and startGame are called from onclick — NOT dead
+        assert.ok(!deadNames.includes('resetGame'), 'resetGame should not be dead (called from onclick)');
+        assert.ok(!deadNames.includes('startGame'), 'startGame should not be dead (called from onclick)');
+        // init and setup are called from script — NOT dead
+        assert.ok(!deadNames.includes('init'), 'init should not be dead (called from resetGame)');
+        assert.ok(!deadNames.includes('setup'), 'setup should not be dead (called from startGame)');
+        // unusedFn has no callers — dead
+        assert.ok(deadNames.includes('unusedFn'), 'unusedFn should be dead');
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('findCallers detects callers from HTML event handlers', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-callers-'));
+        fs.writeFileSync(path.join(tmpDir, 'page.html'), `<html><body>
+<button onclick="doStuff()">Go</button>
+<script>
+function doStuff() { return 42; }
+</script>
+</body></html>`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name": "test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const callers = index.findCallers('doStuff');
+        assert.strictEqual(callers.length, 1);
+        assert.strictEqual(callers[0].line, 2);
+        assert.ok(callers[0].content.includes('onclick="doStuff()"'));
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
 });
 
 console.log('UCN v3 Test Suite');
