@@ -128,7 +128,8 @@ function extractFunction(code, language, name) {
         return { fn: null, code: '' };
     }
 
-    const fnCode = lines.slice(fn.startLine - 1, fn.endLine).join('\n');
+    const extracted = lines.slice(fn.startLine - 1, fn.endLine);
+    const fnCode = cleanHtmlScriptTags(extracted, language).join('\n');
     return { fn, code: fnCode };
 }
 
@@ -148,7 +149,8 @@ function extractClass(code, language, name) {
         return { cls: null, code: '' };
     }
 
-    const clsCode = lines.slice(cls.startLine - 1, cls.endLine).join('\n');
+    const extracted = lines.slice(cls.startLine - 1, cls.endLine);
+    const clsCode = cleanHtmlScriptTags(extracted, language).join('\n');
     return { cls, code: clsCode };
 }
 
@@ -266,6 +268,22 @@ function getExportedSymbols(result) {
     return exported;
 }
 
+/**
+ * Strip <script> and </script> tags from extracted code lines for HTML files.
+ * Only affects the first and last lines when they contain script tags alongside JS code.
+ * @param {string[]} lines - Extracted lines
+ * @param {string} language - Language name
+ * @returns {string[]} Cleaned lines (same array mutated)
+ */
+function cleanHtmlScriptTags(lines, language) {
+    if (language === 'html' && lines.length > 0) {
+        lines[0] = lines[0].replace(/^(\s*)<script[^>]*>/i, '$1');
+        const last = lines.length - 1;
+        lines[last] = lines[last].replace(/<\/script>\s*$/i, '');
+    }
+    return lines;
+}
+
 module.exports = {
     parse,
     parseFile,
@@ -274,6 +292,7 @@ module.exports = {
     getToc,
     findSymbol,
     getExportedSymbols,
+    cleanHtmlScriptTags,
     detectLanguage,
     isSupported
 };

@@ -12001,5 +12001,541 @@ module.exports = { process_data };
     });
 });
 
+// ============================================================================
+// HTML PARSING
+// ============================================================================
+
+describe('HTML Parsing', () => {
+    const { getParser, getLanguageModule } = require('../languages');
+
+    function getHtmlTools() {
+        return {
+            parser: getParser('html'),
+            mod: getLanguageModule('html')
+        };
+    }
+
+    // -- Language detection --
+
+    it('detects HTML files', () => {
+        assert.strictEqual(detectLanguage('file.html'), 'html');
+        assert.strictEqual(detectLanguage('page.htm'), 'html');
+        assert.strictEqual(detectLanguage('INDEX.HTML'), 'html');
+    });
+
+    // -- Script extraction basics --
+
+    it('finds functions in a single script block', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<html><body><script>\nfunction hello() { return 1; }\n</script></body></html>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'hello');
+    });
+
+    it('finds functions from multiple script blocks', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script>
+function foo() {}
+</script>
+<div>content</div>
+<script>
+function bar() {}
+</script>`;
+        const fns = mod.findFunctions(html, parser);
+        const names = fns.map(f => f.name);
+        assert.ok(names.includes('foo'), `Expected foo in ${names}`);
+        assert.ok(names.includes('bar'), `Expected bar in ${names}`);
+    });
+
+    it('returns empty results for HTML with no script tags', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<html><body><h1>Hello</h1></body></html>';
+        const result = mod.parse(html, parser);
+        assert.strictEqual(result.functions.length, 0);
+        assert.strictEqual(result.classes.length, 0);
+        assert.strictEqual(result.language, 'html');
+    });
+
+    it('returns empty results for empty script tag', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<html><body><script></script></body></html>';
+        const result = mod.parse(html, parser);
+        assert.strictEqual(result.functions.length, 0);
+    });
+
+    it('returns empty results when only external scripts present', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script src="app.js"></script>\n<script src="vendor.js"></script>';
+        const result = mod.parse(html, parser);
+        assert.strictEqual(result.functions.length, 0);
+    });
+
+    // -- Type attribute filtering --
+
+    it('parses type="module" scripts', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script type="module">\nfunction modFn() {}\n</script>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'modFn');
+    });
+
+    it('parses type="text/javascript" scripts', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script type="text/javascript">\nfunction textJsFn() {}\n</script>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'textJsFn');
+    });
+
+    it('parses type="application/javascript" scripts', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script type="application/javascript">\nfunction appJsFn() {}\n</script>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'appJsFn');
+    });
+
+    it('skips type="application/json" scripts', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script type="application/json">{"key": "value"}</script>\n<script>\nfunction realFn() {}\n</script>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'realFn');
+    });
+
+    it('skips type="importmap" scripts', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script type="importmap">{"imports": {}}</script>';
+        const result = mod.parse(html, parser);
+        assert.strictEqual(result.functions.length, 0);
+    });
+
+    it('parses scripts with no type attribute (default is JS)', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script>\nfunction defaultFn() {}\n</script>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'defaultFn');
+    });
+
+    it('skips scripts with src attribute', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script src="app.js"></script>\n<script>\nfunction inlineFn() {}\n</script>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'inlineFn');
+    });
+
+    // -- Line number accuracy --
+
+    it('reports correct line numbers for functions', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<html>
+<head>
+  <title>Test</title>
+</head>
+<body>
+  <script>
+    function atLine7() { return 1; }
+    function atLine8() { return 2; }
+  </script>
+</body>
+</html>`;
+        const fns = mod.findFunctions(html, parser);
+        const fn7 = fns.find(f => f.name === 'atLine7');
+        const fn8 = fns.find(f => f.name === 'atLine8');
+        assert.ok(fn7, 'atLine7 should be found');
+        assert.ok(fn8, 'atLine8 should be found');
+        assert.strictEqual(fn7.startLine, 7, `atLine7 should be on line 7, got ${fn7.startLine}`);
+        assert.strictEqual(fn8.startLine, 8, `atLine8 should be on line 8, got ${fn8.startLine}`);
+    });
+
+    it('reports correct line numbers across multiple script blocks with HTML gaps', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script>
+function first() {}
+</script>
+<div>gap line 4</div>
+<div>gap line 5</div>
+<script>
+function second() {}
+</script>`;
+        const fns = mod.findFunctions(html, parser);
+        const first = fns.find(f => f.name === 'first');
+        const second = fns.find(f => f.name === 'second');
+        assert.ok(first && second, 'Both functions should be found');
+        assert.strictEqual(first.startLine, 2, `first should be at line 2, got ${first.startLine}`);
+        assert.strictEqual(second.startLine, 7, `second should be at line 7, got ${second.startLine}`);
+    });
+
+    it('reports correct line numbers for classes', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<html>
+<body>
+<script>
+class MyApp {
+    constructor() {}
+    render() {}
+}
+</script>
+</body>
+</html>`;
+        const classes = mod.findClasses(html, parser);
+        assert.strictEqual(classes.length, 1);
+        assert.strictEqual(classes[0].name, 'MyApp');
+        assert.strictEqual(classes[0].startLine, 4, `MyApp should start at line 4, got ${classes[0].startLine}`);
+    });
+
+    it('reports correct line numbers for state objects', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<html>
+<head>
+<script>
+const CONFIG = { debug: true, version: '1.0' };
+</script>
+</head>
+</html>`;
+        const states = mod.findStateObjects(html, parser);
+        const config = states.find(s => s.name === 'CONFIG');
+        assert.ok(config, 'CONFIG should be found');
+        assert.strictEqual(config.startLine, 4, `CONFIG should be at line 4, got ${config.startLine}`);
+    });
+
+    // -- Feature integration --
+
+    it('detects function calls between functions', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script>
+function initApp() { renderUI(); loadData(); }
+function renderUI() { console.log('render'); }
+function loadData() { fetch('/api'); }
+</script>`;
+        const calls = mod.findCallsInCode(html, parser);
+        const callNames = calls.map(c => c.name);
+        assert.ok(callNames.includes('renderUI'), `Expected renderUI call, got: ${callNames}`);
+        assert.ok(callNames.includes('loadData'), `Expected loadData call, got: ${callNames}`);
+    });
+
+    it('detects cross-block function calls', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script>
+function initApp() { renderUI(); }
+</script>
+<div>separator</div>
+<script>
+function renderUI() { console.log('render'); }
+</script>`;
+        const calls = mod.findCallsInCode(html, parser);
+        const callNames = calls.map(c => c.name);
+        assert.ok(callNames.includes('renderUI'), `Expected cross-block renderUI call, got: ${callNames}`);
+    });
+
+    it('finds usages within script blocks', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script>
+const API_URL = '/api';
+function fetchData() { return fetch(API_URL); }
+</script>`;
+        const usages = mod.findUsagesInCode(html, 'API_URL', parser);
+        assert.ok(usages.length >= 1, `Expected at least 1 usage of API_URL, got ${usages.length}`);
+    });
+
+    it('finds imports in type="module" scripts', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script type="module">
+import { createApp } from './app.js';
+createApp();
+</script>`;
+        const imports = mod.findImportsInCode(html, parser);
+        assert.ok(imports.length >= 1, `Expected imports, got ${imports.length}`);
+    });
+
+    it('finds classes and state objects', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script>
+const SETTINGS = { theme: 'dark', lang: 'en' };
+class GameEngine {
+    constructor() {}
+    start() {}
+}
+</script>`;
+        const result = mod.parse(html, parser);
+        assert.ok(result.classes.length >= 1, 'Should find GameEngine class');
+        assert.strictEqual(result.classes[0].name, 'GameEngine');
+        const settings = result.stateObjects.find(s => s.name === 'SETTINGS');
+        assert.ok(settings, 'Should find SETTINGS state object');
+    });
+
+    // -- Edge cases --
+
+    it('handles script content on same line as script tag (column offset)', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<div><script>function inline() { return 42; }</script></div>';
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'inline');
+    });
+
+    it('handles mixed JS and non-JS script blocks in same file', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<script type="application/json">{"not": "js"}</script>
+<script type="importmap">{"imports": {"a": "b"}}</script>
+<script>function realJS() {}</script>
+<script type="text/template"><div>{{template}}</div></script>`;
+        const fns = mod.findFunctions(html, parser);
+        assert.strictEqual(fns.length, 1);
+        assert.strictEqual(fns[0].name, 'realJS');
+    });
+
+    it('parse() returns language html', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = '<script>var x = 1;</script>';
+        const result = mod.parse(html, parser);
+        assert.strictEqual(result.language, 'html');
+    });
+
+    it('totalLines matches HTML file line count, not JS line count', () => {
+        const { parser, mod } = getHtmlTools();
+        const html = `<html>
+<head>
+  <title>Page</title>
+</head>
+<body>
+  <script>
+    var x = 1;
+  </script>
+</body>
+</html>`;
+        const result = mod.parse(html, parser);
+        assert.strictEqual(result.totalLines, 10, `Expected 10 lines, got ${result.totalLines}`);
+    });
+
+    // -- Project integration --
+
+    it('indexes HTML files in project mode', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-project-'));
+        fs.writeFileSync(path.join(tmpDir, 'index.html'), `<html>
+<body>
+<script>
+function initApp() { renderUI(); }
+function renderUI() { console.log('hello'); }
+const CONFIG = { debug: true };
+</script>
+</body>
+</html>`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // Functions should be found
+        const initDefs = index.find('initApp');
+        assert.ok(initDefs.length > 0, 'initApp should be found in project index');
+        assert.strictEqual(initDefs[0].startLine, 4, 'initApp should be at line 4');
+
+        // Callers should work
+        const renderDefs = index.find('renderUI');
+        assert.ok(renderDefs.length > 0, 'renderUI should be found');
+        const callers = index.findCallers('renderUI');
+        const callerNames = callers.map(c => c.callerName);
+        assert.ok(callerNames.includes('initApp'), `initApp should call renderUI, got: ${callerNames}`);
+
+        // State objects should be found
+        const configDefs = index.find('CONFIG');
+        assert.ok(configDefs.length > 0, 'CONFIG should be found');
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    it('extractCode works with HTML files', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-extract-'));
+        const htmlContent = `<html>
+<body>
+<script>
+function greet(name) {
+    return 'Hello ' + name;
+}
+</script>
+</body>
+</html>`;
+        fs.writeFileSync(path.join(tmpDir, 'page.html'), htmlContent);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const defs = index.find('greet');
+        assert.ok(defs.length > 0, 'greet should be found');
+        const code = index.extractCode(defs[0]);
+        assert.ok(code.includes('function greet'), `Extracted code should contain function: ${code}`);
+        assert.ok(code.includes('Hello'), `Extracted code should contain body: ${code}`);
+
+        fs.rmSync(tmpDir, { recursive: true });
+    });
+
+    // -- extractScriptBlocks and buildVirtualJSContent unit tests --
+
+    it('extractScriptBlocks returns correct block positions', () => {
+        const { extractScriptBlocks } = require('../languages/html');
+        const parser = getParser('html');
+        const html = `<html>
+<body>
+<script>
+var x = 1;
+</script>
+</body>
+</html>`;
+        const blocks = extractScriptBlocks(html, parser);
+        assert.strictEqual(blocks.length, 1);
+        assert.strictEqual(blocks[0].startRow, 2, `Block should start at row 2 (0-indexed, raw_text starts after <script> closing >), got ${blocks[0].startRow}`);
+        assert.ok(blocks[0].text.includes('var x = 1'), `Block text should contain JS: ${blocks[0].text}`);
+    });
+
+    it('buildVirtualJSContent preserves line positions', () => {
+        const { buildVirtualJSContent } = require('../languages/html');
+        const html = `line0
+line1
+<script>
+var x = 1;
+</script>
+line5`;
+        const blocks = [{ text: '\nvar x = 1;\n', startRow: 2, startCol: 8 }];
+        const virtual = buildVirtualJSContent(html, blocks);
+        const lines = virtual.split('\n');
+        assert.strictEqual(lines.length, 6, `Should have 6 lines, got ${lines.length}`);
+        assert.strictEqual(lines[0], '', 'Line 0 should be empty (HTML)');
+        assert.strictEqual(lines[1], '', 'Line 1 should be empty (HTML)');
+        assert.strictEqual(lines[3].trim(), 'var x = 1;', 'Line 3 should have JS content');
+        assert.strictEqual(lines[5], '', 'Line 5 should be empty (HTML)');
+    });
+
+    // Bug fix tests
+    // ─────────────────────────────────────────────────────────────
+
+    it('cleanHtmlScriptTags strips script tags from same-line scripts', () => {
+        const { cleanHtmlScriptTags } = require('../core/parser');
+
+        // Same-line script: <script>function foo() { return 1; }</script>
+        const lines1 = ['<script>function foo() { return 1; }</script>'];
+        cleanHtmlScriptTags(lines1, 'html');
+        assert.strictEqual(lines1[0], 'function foo() { return 1; }');
+
+        // Multi-line: only first/last lines affected
+        const lines2 = ['    <script type="module">', '        function bar() {', '        }', '    </script>'];
+        cleanHtmlScriptTags(lines2, 'html');
+        assert.strictEqual(lines2[0], '    ', 'First line should have only indentation');
+        assert.strictEqual(lines2[1], '        function bar() {', 'Middle lines unchanged');
+        assert.strictEqual(lines2[3], '    ', 'Last line should have only indentation');
+
+        // Non-HTML language: no changes
+        const lines3 = ['<script>function foo() {}</script>'];
+        cleanHtmlScriptTags(lines3, 'javascript');
+        assert.strictEqual(lines3[0], '<script>function foo() {}</script>', 'Non-HTML should be unchanged');
+
+        // Uppercase SCRIPT tag
+        const lines4 = ['<SCRIPT>function foo() {}</SCRIPT>'];
+        cleanHtmlScriptTags(lines4, 'html');
+        assert.strictEqual(lines4[0], 'function foo() {}');
+    });
+
+    it('extractCode strips script tags for HTML files', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-extract-'));
+        const htmlFile = path.join(tmpDir, 'test.html');
+        fs.writeFileSync(htmlFile, `<!DOCTYPE html>
+<html>
+<body>
+<script>function oneLiner() { return 42; }</script>
+<script>
+function multiLine() {
+    return 99;
+}
+</script>
+</body>
+</html>`);
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        // Find oneLiner and check its extracted code
+        const oneLineDefs = index.find('oneLiner');
+        assert.ok(oneLineDefs.length > 0, 'Should find oneLiner');
+        const code = index.extractCode(oneLineDefs[0]);
+        assert.ok(!code.includes('<script>'), 'extractCode should not include <script> tag');
+        assert.ok(!code.includes('</script>'), 'extractCode should not include </script> tag');
+        assert.ok(code.includes('function oneLiner'), 'extractCode should include function body');
+
+        // Multi-line function should not be affected
+        const multiDefs = index.find('multiLine');
+        assert.ok(multiDefs.length > 0, 'Should find multiLine');
+        const multiCode = index.extractCode(multiDefs[0]);
+        assert.ok(!multiCode.includes('<script>'), 'Multi-line extractCode should not include <script>');
+        assert.ok(multiCode.includes('function multiLine'), 'Multi-line extractCode should include function body');
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('smart respects --file disambiguation', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-smart-'));
+        // Create two files with same function name
+        fs.writeFileSync(path.join(tmpDir, 'a.html'), `<html><body>
+<script>
+function myFunc() { return 'from html'; }
+</script>
+</body></html>`);
+        fs.writeFileSync(path.join(tmpDir, 'b.js'), `function myFunc() { return 'from js'; }\n`);
+        // Need package.json for discovery
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name": "test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        // Without --file, picks best scoring (b.js is not in tests/ so it should win)
+        const result1 = index.smart('myFunc');
+        assert.ok(result1, 'smart should find myFunc');
+
+        // With --file=a.html, should pick the HTML file
+        const result2 = index.smart('myFunc', { file: 'a.html' });
+        assert.ok(result2, 'smart with file filter should find myFunc');
+        assert.ok(result2.target.file.endsWith('a.html'), `Should resolve to a.html, got ${result2.target.file}`);
+
+        // With --file=b.js, should pick the JS file
+        const result3 = index.smart('myFunc', { file: 'b.js' });
+        assert.ok(result3, 'smart with file filter should find myFunc in b.js');
+        assert.ok(result3.target.file.endsWith('b.js'), `Should resolve to b.js, got ${result3.target.file}`);
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('deadcode buildUsageIndex parses HTML inline scripts', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-deadcode-'));
+        fs.writeFileSync(path.join(tmpDir, 'app.html'), `<html><body>
+<script>
+function helper() { return 42; }
+function main() { return helper(); }
+</script>
+</body></html>`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name": "test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        // helper is called by main, so it should NOT be dead code
+        const dead = index.deadcode({ includeExported: true });
+        const deadNames = dead.map(d => d.name);
+        assert.ok(!deadNames.includes('helper'), `helper should not be dead code (called by main), got: ${deadNames.join(', ')}`);
+        // main has no callers, so it should be dead
+        assert.ok(deadNames.includes('main'), 'main should be dead code (no callers)');
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

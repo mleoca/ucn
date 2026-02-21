@@ -389,7 +389,7 @@ function detectProjectPattern(projectRoot) {
     // Helper to check for config files in a directory
     const checkDir = (dir) => {
         if (fs.existsSync(path.join(dir, 'package.json'))) {
-            extensions.push('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs');
+            extensions.push('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'html', 'htm');
         }
 
         if (fs.existsSync(path.join(dir, 'pyproject.toml')) ||
@@ -433,7 +433,7 @@ function detectProjectPattern(projectRoot) {
         return `**/*.{${unique.join(',')}}`;
     }
 
-    return '**/*.{js,jsx,ts,tsx,py,go,java,rs,rb,php,c,cpp,h,hpp}';
+    return '**/*.{js,jsx,ts,tsx,py,go,java,rs,rb,php,c,cpp,h,hpp,html,htm}';
 }
 
 /**

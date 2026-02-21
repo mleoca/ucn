@@ -1,13 +1,13 @@
 ---
 name: ucn
-description: "Code relationship analyzer (callers, call trees, impact, dead code) via tree-sitter AST. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on Python, JS/TS, Go, Rust, Java. Skip for plain text search or codebases under 500 LOC."
+description: "Code relationship analyzer (callers, call trees, impact, dead code) via tree-sitter AST. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on Python, JS/TS, Go, Rust, Java, HTML. Skip for plain text search or codebases under 500 LOC."
 allowed-tools: Bash(ucn *), Bash(npx ucn *)
 argument-hint: "[command] [symbol-name] [--flags]"
 ---
 
 # UCN — Universal Code Navigator
 
-Understands code structure via tree-sitter ASTs: who calls what, what breaks if you change something, full call trees, dead code. Works on Python, JS/TS, Go, Rust, Java.
+Understands code structure via tree-sitter ASTs: who calls what, what breaks if you change something, full call trees, dead code. Works on Python, JS/TS, Go, Rust, Java, HTML (inline scripts).
 
 ## When to Reach for UCN Instead of Grep/Read
 
@@ -23,7 +23,7 @@ Understands code structure via tree-sitter ASTs: who calls what, what breaks if 
 
 - Searching for a string literal, error message, TODO, or config value
 - The codebase is under 500 LOC — just read the files
-- Language not supported (only Python, JS/TS, Go, Rust, Java)
+- Language not supported (only Python, JS/TS, Go, Rust, Java, HTML)
 - Finding files by name — use glob
 
 ## The 5 Commands You'll Use Most

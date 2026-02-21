@@ -10,7 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { parse, parseFile, extractFunction, extractClass, detectLanguage, isSupported } = require('../core/parser');
+const { parse, parseFile, extractFunction, extractClass, cleanHtmlScriptTags, detectLanguage, isSupported } = require('../core/parser');
 const { getParser, getLanguageModule } = require('../languages');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot, isTestFile } = require('../core/discovery');
@@ -823,6 +823,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'smart': {
             requireArg(arg, 'Usage: ucn . smart <name>');
             const smart = index.smart(arg, {
+                file: flags.file,
                 withTypes: flags.withTypes,
                 includeMethods: flags.includeMethods,
                 includeUncertain: flags.includeUncertain
@@ -1069,7 +1070,8 @@ function extractFunctionFromProject(index, name) {
             const m = matches[i];
             const code = fs.readFileSync(m.file, 'utf-8');
             const lines = code.split('\n');
-            const fnCode = lines.slice(m.startLine - 1, m.endLine).join('\n');
+            const extracted = lines.slice(m.startLine - 1, m.endLine);
+            const fnCode = cleanHtmlScriptTags(extracted, detectLanguage(m.file)).join('\n');
             if (i > 0) console.log('');
             if (flags.json) {
                 console.log(output.formatFunctionJson(m, fnCode));
@@ -1093,7 +1095,8 @@ function extractFunctionFromProject(index, name) {
     // Extract code directly using symbol index location (works for class methods and overloads)
     const code = fs.readFileSync(match.file, 'utf-8');
     const lines = code.split('\n');
-    const fnCode = lines.slice(match.startLine - 1, match.endLine).join('\n');
+    const extracted = lines.slice(match.startLine - 1, match.endLine);
+    const fnCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 
     if (flags.json) {
         console.log(output.formatFunctionJson(match, fnCode));
@@ -1118,7 +1121,8 @@ function extractClassFromProject(index, name) {
             const m = matches[i];
             const code = fs.readFileSync(m.file, 'utf-8');
             const codeLines = code.split('\n');
-            const clsCode = codeLines.slice(m.startLine - 1, m.endLine).join('\n');
+            const extracted = codeLines.slice(m.startLine - 1, m.endLine);
+            const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(m.file)).join('\n');
             if (i > 0) console.log('');
             if (flags.json) {
                 console.log(JSON.stringify({ ...m, code: clsCode }, null, 2));
@@ -1142,7 +1146,8 @@ function extractClassFromProject(index, name) {
     // Use index data directly instead of re-parsing the file
     const code = fs.readFileSync(match.file, 'utf-8');
     const codeLines = code.split('\n');
-    const clsCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
+    const extracted = codeLines.slice(match.startLine - 1, match.endLine);
+    const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 
     if (flags.json) {
         console.log(JSON.stringify({ ...match, code: clsCode }, null, 2));
@@ -1673,7 +1678,7 @@ function isCommentOrString(line) {
 function printUsage() {
     console.log(`UCN - Universal Code Navigator
 
-Supported: JavaScript, TypeScript, Python, Go, Rust, Java
+Supported: JavaScript, TypeScript, Python, Go, Rust, Java, HTML
 
 Usage:
   ucn [command] [args]            Project mode (current directory)
@@ -1928,7 +1933,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: smart <name>');
                 return;
             }
-            const smart = index.smart(arg, { includeUncertain: flags.includeUncertain });
+            const smart = index.smart(arg, { file: flags.file, includeUncertain: flags.includeUncertain });
             if (smart) {
                 console.log(output.formatSmart(smart, {
                     uncertainHint: 'use --include-uncertain to include all'

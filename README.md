@@ -91,15 +91,9 @@ Instead of reading entire files, ask precise questions:
                           │
                     tree-sitter AST
                           │
-              ┌───────────┼───────────┐
-              │           │           │
-          ┌───┴───┐  ┌────┴────┐  ┌───┴──┐
-          │ JS/TS │  │ Python  │  │  Go  │
-          └───────┘  └─────────┘  └──────┘
-              ┌───────────┼───────────┐
-          ┌───┴───┐              ┌────┴───┐
-          │ Rust  │              │  Java  │
-          └───────┘              └────────┘
+            ┌─────────────┴─────────────┐
+            │    Supported Languages    │ 
+            └───────────────────────────┘
 ```
 
 No cloud. No API keys. Parses locally, stays local.
@@ -502,7 +496,7 @@ ucn toc                                   # Project overview
   │  Limitation              │  What happens                            │
   ├──────────────────────────┼──────────────────────────────────────────┤
   │                          │                                          │
-  │  5 languages only        │  JS/TS, Python, Go, Rust, Java.          │
+  │  6 languages only        │  JS/TS, Python, Go, Rust, Java, HTML.    │
   │  (no C, Ruby, PHP, etc.) │  Agents fall back to grep for the rest.  │
   │                          │  UCN complements, doesn't replace.       │
   │                          │                                          │

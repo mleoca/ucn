@@ -55,6 +55,12 @@ const LANGUAGES = {
         extensions: ['.java'],
         treeSitterLang: 'java',
         module: () => require('./java')
+    },
+    html: {
+        name: 'html',
+        extensions: ['.html', '.htm'],
+        treeSitterLang: 'html',
+        module: () => require('./html')
     }
 };
 
@@ -123,6 +129,9 @@ function getParser(language) {
                 break;
             case 'rust':
                 lang = require('tree-sitter-rust');
+                break;
+            case 'html':
+                lang = require('tree-sitter-html');
                 break;
             default:
                 throw new Error(`No tree-sitter grammar for: ${language}`);
@@ -238,9 +247,12 @@ function safeParse(parser, content, oldTree = undefined, options = {}) {
         } catch (e) {
             lastError = e;
             // Only retry on buffer-related errors
-            if (!e.message?.toLowerCase().includes('buffer') &&
-                !e.message?.toLowerCase().includes('memory') &&
-                !e.message?.toLowerCase().includes('alloc')) {
+            // tree-sitter throws "Invalid argument" when buffer is too small
+            const msg = e.message?.toLowerCase() || '';
+            if (!msg.includes('buffer') &&
+                !msg.includes('memory') &&
+                !msg.includes('alloc') &&
+                !msg.includes('invalid argument')) {
                 throw e; // Non-buffer error, don't retry
             }
             // Continue to next buffer size
