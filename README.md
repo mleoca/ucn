@@ -91,9 +91,10 @@ Instead of reading entire files, ask precise questions:
                           │
                     tree-sitter AST
                           │
-            ┌─────────────┴─────────────┐
-            │    Supported Languages    │ 
-            └───────────────────────────┘
+      ┌───────────────────┴─────────────────┐
+      │         Supported Languages         │
+      │ JS/TS, Python, Go, Rust, Java, HTML │
+      └─────────────────────────────────────┘
 ```
 
 No cloud. No API keys. Parses locally, stays local.
