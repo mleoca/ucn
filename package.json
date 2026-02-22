@@ -1,7 +1,7 @@
 {
   "name": "ucn",
-  "version": "3.7.2",
-  "description": "Universal Code Navigator — function relationships, call trees, and impact analysis across large codebases without reading entire files.",
+  "version": "3.7.3",
+  "description": "Universal Code Navigator — AST-based call graph analysis for AI agents. Find callers, trace impact, detect dead code across JS/TS, Python, Go, Rust, Java, and HTML. CLI, MCP server, and agent skill.",
   "main": "index.js",
   "bin": {
     "ucn": "cli/index.js",
@@ -11,19 +11,31 @@
     "test": "node --test test/parser.test.js test/accuracy.test.js test/systematic-test.js test/mcp-edge-cases.js"
   },
   "keywords": [
+    "mcp",
+    "mcp-server",
+    "model-context-protocol",
     "code-navigation",
+    "code-analysis",
+    "static-analysis",
+    "call-graph",
+    "callers",
+    "impact-analysis",
+    "dead-code",
+    "deadcode",
     "ast",
-    "parser",
     "tree-sitter",
+    "parser",
+    "skill",
+    "agent-skill",
+    "cli",
+    "ai-agent",
     "javascript",
     "typescript",
     "python",
     "go",
     "rust",
     "java",
-    "html",
-    "ai",
-    "agent"
+    "html"
   ],
   "author": "Constantin-Mihail Leoca (https://github.com/mleoca)",
   "repository": {
