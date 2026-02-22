@@ -2188,18 +2188,12 @@ class ProjectIndex {
      * @returns {Array} Imports with resolved paths
      */
     imports(filePath) {
-        const normalizedPath = path.isAbsolute(filePath)
-            ? filePath
-            : path.join(this.root, filePath);
+        const resolved = this.resolveFilePathForQuery(filePath);
+        if (typeof resolved !== 'string') return resolved;
 
+        const normalizedPath = resolved;
         const fileEntry = this.files.get(normalizedPath);
         if (!fileEntry) {
-            // Try to find by relative path
-            for (const [absPath, entry] of this.files) {
-                if (entry.relativePath === filePath || absPath.endsWith(filePath)) {
-                    return this.imports(absPath);
-                }
-            }
             return { error: 'file-not-found', filePath };
         }
 
@@ -2275,24 +2269,10 @@ class ProjectIndex {
      * @returns {Array} Files that import this file
      */
     exporters(filePath) {
-        const normalizedPath = path.isAbsolute(filePath)
-            ? filePath
-            : path.join(this.root, filePath);
+        const resolved = this.resolveFilePathForQuery(filePath);
+        if (typeof resolved !== 'string') return resolved;
 
-        // Try to find the file
-        let targetPath = normalizedPath;
-        if (!this.files.has(normalizedPath)) {
-            for (const [absPath, entry] of this.files) {
-                if (entry.relativePath === filePath || absPath.endsWith(filePath)) {
-                    targetPath = absPath;
-                    break;
-                }
-            }
-        }
-
-        if (!this.files.has(targetPath)) {
-            return { error: 'file-not-found', filePath };
-        }
+        const targetPath = resolved;
 
         const importers = this.exportGraph.get(targetPath) || [];
 
@@ -2432,7 +2412,18 @@ class ProjectIndex {
     api(filePath, options = {}) {
         const results = [];
 
-        for (const [absPath, fileEntry] of (filePath ? [[this.findFile(filePath), this.files.get(this.findFile(filePath))]] : this.files.entries())) {
+        let fileIterator;
+        if (filePath) {
+            const resolved = this.resolveFilePathForQuery(filePath);
+            if (typeof resolved !== 'string') return resolved;
+            const fileEntry = this.files.get(resolved);
+            if (!fileEntry) return { error: 'file-not-found', filePath };
+            fileIterator = [[resolved, fileEntry]];
+        } else {
+            fileIterator = this.files.entries();
+        }
+
+        for (const [absPath, fileEntry] of fileIterator) {
             if (!fileEntry) continue;
 
             // Skip test files by default (test classes aren't part of public API)
@@ -2487,9 +2478,12 @@ class ProjectIndex {
     }
 
     /**
-     * Find a file by path (supports partial paths)
+     * Resolve a file path query to an indexed file (with ambiguity detection)
+     * @param {string} filePath - File path to resolve
+     * @returns {string|{error: string, filePath: string, candidates?: string[]}}
      */
-    findFile(filePath) {
+    resolveFilePathForQuery(filePath) {
+        // 1. Exact absolute/relative path match
         const normalizedPath = path.isAbsolute(filePath)
             ? filePath
             : path.join(this.root, filePath);
@@ -2498,13 +2492,34 @@ class ProjectIndex {
             return normalizedPath;
         }
 
-        // Try partial match
+        // 2. Collect ALL suffix/partial candidates
+        const candidates = [];
         for (const [absPath, entry] of this.files) {
-            if (entry.relativePath === filePath || absPath.endsWith(filePath)) {
-                return absPath;
+            if (entry.relativePath === filePath || absPath.endsWith('/' + filePath)) {
+                candidates.push(absPath);
             }
         }
 
+        if (candidates.length === 0) {
+            return { error: 'file-not-found', filePath };
+        }
+        if (candidates.length === 1) {
+            return candidates[0];
+        }
+        return {
+            error: 'file-ambiguous',
+            filePath,
+            candidates: candidates.map(c => this.files.get(c)?.relativePath || path.relative(this.root, c))
+        };
+    }
+
+    /**
+     * Find a file by path (supports partial paths)
+     * Backward-compatible wrapper — returns null on error.
+     */
+    findFile(filePath) {
+        const result = this.resolveFilePathForQuery(filePath);
+        if (typeof result === 'string') return result;
         return null;
     }
 
@@ -2514,11 +2529,10 @@ class ProjectIndex {
      * @returns {Array} Exported symbols from that file
      */
     fileExports(filePath) {
-        const absPath = this.findFile(filePath);
-        if (!absPath) {
-            return { error: 'file-not-found', filePath };
-        }
+        const resolved = this.resolveFilePathForQuery(filePath);
+        if (typeof resolved !== 'string') return resolved;
 
+        const absPath = resolved;
         const fileEntry = this.files.get(absPath);
         if (!fileEntry) {
             return [];
@@ -2960,24 +2974,10 @@ class ProjectIndex {
         const rawDepth = options.maxDepth ?? 5;
         const maxDepth = Math.max(0, rawDepth);
 
-        const absPath = path.isAbsolute(filePath)
-            ? filePath
-            : path.resolve(this.root, filePath);
+        const resolved = this.resolveFilePathForQuery(filePath);
+        if (typeof resolved !== 'string') return resolved;
 
-        // Try to find file if not exact match
-        let targetPath = absPath;
-        if (!this.files.has(absPath)) {
-            for (const [p, entry] of this.files) {
-                if (entry.relativePath === filePath || p.endsWith(filePath)) {
-                    targetPath = p;
-                    break;
-                }
-            }
-        }
-
-        if (!this.files.has(targetPath)) {
-            return { error: 'file-not-found', filePath };
-        }
+        const targetPath = resolved;
 
         const buildSubgraph = (dir) => {
             const visited = new Set();
@@ -3176,7 +3176,8 @@ class ProjectIndex {
         }
         // Sort by number of shared parts
         related.similarNames.sort((a, b) => b.sharedParts.length - a.sharedParts.length);
-        if (!options.all) related.similarNames = related.similarNames.slice(0, 10);
+        const similarLimit = options.top || (options.all ? Infinity : 10);
+        if (related.similarNames.length > similarLimit) related.similarNames = related.similarNames.slice(0, similarLimit);
 
         // 3. Shared callers - functions called by the same callers
         const myCallers = new Set(this.findCallers(name).map(c => c.callerName).filter(Boolean));
@@ -3194,7 +3195,7 @@ class ProjectIndex {
                 }
             }
             // Sort by shared caller count
-            const maxShared = options.all ? Infinity : 5;
+            const maxShared = options.top || (options.all ? Infinity : 5);
             const sorted = Array.from(callerCounts.entries())
                 .sort((a, b) => b[1] - a[1])
                 .slice(0, maxShared);
@@ -3230,7 +3231,7 @@ class ProjectIndex {
                 // Sort by shared callee count
                 const sorted = Array.from(calleeCounts.entries())
                     .sort((a, b) => b[1] - a[1])
-                    .slice(0, options.all ? Infinity : 5);
+                    .slice(0, options.top || (options.all ? Infinity : 5));
                 for (const [symName, count] of sorted) {
                     const sym = this.symbols.get(symName)?.[0];
                     if (sym) {
