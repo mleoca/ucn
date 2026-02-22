@@ -829,7 +829,7 @@ function formatRelated(related, options = {}) {
     // Same file
     let relatedTruncated = false;
     if (related.sameFile.length > 0) {
-        const maxSameFile = options.showAll ? Infinity : 8;
+        const maxSameFile = options.top || (options.showAll ? Infinity : 8);
         lines.push(`SAME FILE (${related.sameFile.length}):`);
         for (const f of related.sameFile.slice(0, maxSameFile)) {
             const params = f.params ? `(${f.params})` : '';

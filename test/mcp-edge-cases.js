@@ -358,6 +358,59 @@ const tests = [
         desc: 'lines - extract lines 1-5 from discovery.js',
         args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-5' }
     },
+
+    // ========================================================================
+    // Correctness Assertions
+    // ========================================================================
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'api(file=nonexistent) returns isError',
+        args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' },
+        assert: (res, text, isError) => isError === true || 'Expected isError: true for nonexistent file'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'api(file=nonexistent) message contains "not found"',
+        args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent.js' },
+        assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected file-not-found error message'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'lines(range="5-0") returns validation error',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '5-0' },
+        assert: (res, text, isError) => isError === true || 'Expected isError: true for invalid range'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'class(max_lines=-1) returns validation error',
+        args: { command: 'class', project_dir: PROJECT_DIR, name: 'ProjectIndex', max_lines: -1 },
+        assert: (res, text, isError) => isError === true || 'Expected isError: true for negative max_lines'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'lines - unique partial file resolves successfully',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-3' },
+        assert: (res, text, isError) => isError === false || 'Expected success for unique partial file'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'file_exports(file=utils.js) returns ambiguity error',
+        args: { command: 'file_exports', project_dir: PROJECT_DIR, file: 'utils.js' },
+        assert: (res, text, isError) => (isError && /ambiguous/i.test(text)) || 'Expected file-ambiguous error for utils.js'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'imports(file=utils.js) returns ambiguity error',
+        args: { command: 'imports', project_dir: PROJECT_DIR, file: 'utils.js' },
+        assert: (res, text, isError) => (isError && /ambiguous/i.test(text)) || 'Expected file-ambiguous error for utils.js'
+    },
 ];
 
 // ============================================================================
@@ -406,6 +459,15 @@ async function run() {
                 const preview = text.substring(0, 120).replace(/\n/g, '\\n');
                 status = 'PASS';
                 detail = `${isError ? 'ERROR response' : 'OK'}: "${preview}" (${elapsed}ms)`;
+
+                // Run assertion if provided
+                if (t.assert && status === 'PASS') {
+                    const assertResult = t.assert(res, text, isError);
+                    if (assertResult !== true) {
+                        status = 'FAIL';
+                        detail = `ASSERTION: ${assertResult} (${elapsed}ms)`;
+                    }
+                }
             } else {
                 status = 'PASS';
                 detail = `Empty result (${elapsed}ms)`;

@@ -371,9 +371,10 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.related(name, { file, all: top !== undefined });
+                const result = index.related(name, { file, top, all: top !== undefined });
                 return toolResult(output.formatRelated(result, {
                     showAll: top !== undefined,
+                    top,
                     allHint: 'Repeat with top set higher to show all.'
                 }));
             }
@@ -499,6 +500,10 @@ server.registerTool(
                     note = `Note: Found ${matches.length} definitions for "${name}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n\n`;
                 }
 
+                if (max_lines !== undefined && (!Number.isInteger(max_lines) || max_lines < 1)) {
+                    return toolError(`Invalid max_lines: ${max_lines}. Must be a positive integer.`);
+                }
+
                 const classLineCount = match.endLine - match.startLine + 1;
 
                 // Large class: show summary by default, truncated source with max_lines
@@ -537,10 +542,14 @@ server.registerTool(
                     return toolError('Line range is required (e.g. "10-20" or "15").');
                 }
                 const index = getIndex(project_dir);
-                const filePath = index.findFile(file);
-                if (!filePath) {
+                const resolved = index.resolveFilePathForQuery(file);
+                if (typeof resolved !== 'string') {
+                    if (resolved.error === 'file-ambiguous') {
+                        return toolError(`Ambiguous file "${file}". Candidates:\n${resolved.candidates.map(c => '  ' + c).join('\n')}`);
+                    }
                     return toolError(`File not found: ${file}`);
                 }
+                const filePath = resolved;
 
                 const parts = range.split('-');
                 const start = parseInt(parts[0], 10);
@@ -552,12 +561,18 @@ server.registerTool(
                 if (start < 1) {
                     return toolError(`Invalid start line: ${start}. Line numbers must be >= 1`);
                 }
+                if (end < 1) {
+                    return toolError(`Invalid end line: ${end}. Line numbers must be >= 1`);
+                }
+                if (end < start) {
+                    return toolError(`Invalid range: end line (${end}) must be >= start line (${start})`);
+                }
 
                 const content = fs.readFileSync(filePath, 'utf-8');
                 const fileLines = content.split('\n');
 
-                const startLine = Math.min(start, end);
-                const endLine = Math.max(start, end);
+                const startLine = start;
+                const endLine = end;
 
                 if (startLine > fileLines.length) {
                     return toolError(`Line ${startLine} is out of bounds. File has ${fileLines.length} lines.`);
@@ -645,6 +660,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const result = index.imports(file);
                 if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
+                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
                 return toolResult(output.formatImports(result, file));
             }
 
@@ -655,6 +671,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const result = index.exporters(file);
                 if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
+                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
                 return toolResult(output.formatExporters(result, file));
             }
 
@@ -665,6 +682,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const result = index.fileExports(file);
                 if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
+                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
                 return toolResult(output.formatFileExports(result, file));
             }
 
@@ -675,6 +693,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const result = index.graph(file, { direction: direction || 'both', maxDepth: depth ?? 2 });
                 if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
+                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
                 return toolResult(output.formatGraph(result, {
                     showAll: depth !== undefined,
                     file,
@@ -745,8 +764,10 @@ server.registerTool(
 
             case 'api': {
                 const index = getIndex(project_dir);
-                const symbols = index.api(file || undefined);
-                return toolResult(output.formatApi(symbols, file || '.'));
+                const result = index.api(file || undefined);
+                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
+                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
+                return toolResult(output.formatApi(result, file || '.'));
             }
 
             case 'stats': {

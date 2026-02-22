@@ -4,9 +4,37 @@ UCN gives AI agents call-graph-level understanding of code. Instead of reading e
 
 Designed for large codebases where agents waste context on reading large files. UCN's surgical output means agents spend tokens on reasoning, not on ingesting thousands of lines to find three callers, discourages agents from cutting corners, as without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data".
 
+Everything runs locally on your machine and nothing leaves your project.
+
 ---
 
-## Three Ways to it: ucn mcp, ucn skill, ucn cli 
+## What UCN does
+
+Precise answers without reading files.
+
+```
+  TASK                                    COMMAND
+  ─────────────────────                   ─────────────────────
+
+  Pull one function from                  $ ucn fn handleRequest
+  a 2000-line file                        → 20 lines, just that function
+
+  Who calls this? Will they               $ ucn impact handleRequest
+  break if I change it?                   → 8 call sites, with arguments
+
+  What happens when                       $ ucn trace main --depth=3
+  main() runs?                            → full call tree, no file reads
+
+  What can I safely delete?               $ ucn deadcode
+                                          → unused functions, AST-verified
+
+  What depends on this file               $ ucn graph src/routes.ts
+  before I move it?                       → imports and importers tree
+```
+
+---
+
+## Three Ways to it: ucn mcp, ucn skill, ucn cli
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -15,7 +43,7 @@ Designed for large codebases where agents waste context on reading large files. 
   │      $ ucn about myFunc     Works standalone, no agent required.     │
   │                                                                      │
   │   2. MCP Server             Any MCP-compatible AI agent connects     │
-  │      $ ucn --mcp            and gets 28 tools automatically.         │
+  │      $ ucn --mcp            and gets 28 commands automatically.         │
   │                                                                      │
   │   3. Agent Skill            Drop-in skill for Claude Code and        │
   │      /ucn about myFunc      OpenAI Codex CLI. No server needed.      │
@@ -66,7 +94,7 @@ AI agents working with code typically do this:
                           ▼
                  ┌───────────────────┐
                  │   UCN MCP Server  │
-                 │   28 tools        │
+                 │   28 commands     │
                  │   runs locally    │
                  └────────┬──────────┘
                           │
@@ -78,8 +106,6 @@ AI agents working with code typically do this:
         └─────────────────────────────────────┘
 ```
 
-No cloud. No API keys. Parses locally, stays local.
-
 ---
 
 ## Before and after UCN
@@ -88,7 +114,7 @@ No cloud. No API keys. Parses locally, stays local.
   WITHOUT UCN                              WITH UCN
   ──────────────────────                   ──────────────────────
 
-  grep "processOrder"                      ucn_impact "processOrder"
+  grep "processOrder"                      ucn impact "processOrder"
        │                                        │
        ▼                                        ▼
   34 matches, mostly noise                 8 call sites, grouped by file,
@@ -97,7 +123,7 @@ No cloud. No API keys. Parses locally, stays local.
   read service.ts  (800 lines)                  │
        │                                        │
        ▼                                        │
-  read handler.ts  (600 lines)             ucn_smart "processOrder"
+  read handler.ts  (600 lines)             ucn smart "processOrder"
        │                                        │
        ▼                                        ▼
   read batch.ts    (400 lines)             function + all dependencies
@@ -126,7 +152,7 @@ After editing code, before committing:
   WITHOUT UCN                              WITH UCN
   ──────────────────────                   ──────────────────────
 
-  git diff                                 ucn_diff_impact
+  git diff                                 ucn diff_impact
        │                                        │
        ▼                                        ▼
   see changed lines, but which             13 modified functions
@@ -137,7 +163,7 @@ After editing code, before committing:
   to function boundaries                   Each function shown with:
        │                                     • which lines changed
        ▼                                     • every downstream caller
-  ucn_impact on each function                • caller context
+  ucn impact on each function                • caller context
   you identified (repeat 5-10x)                 │
        │                                        ▼
        ▼                                   Done. Full blast radius.
@@ -169,7 +195,7 @@ After editing code, before committing:
 
 
   ┌─────────────────────────────────────────────────────────────────┐
-  │  ucn_context "processOrder"                                     │
+  │  ucn context "processOrder"                                     │
   │                                                                 │
   │    Callers:                                                     │
   │      handleCheckout    src/api/checkout.ts:45                   │
@@ -515,38 +541,40 @@ ucn toc                                   # Project overview
 
 ---
 
-## All 28 UCN tools
+## All 28 Commands
+
+All commands are accessible through a single `ucn` MCP tool with a `command` parameter.
 
 ```
   UNDERSTAND                          MODIFY SAFELY
   ─────────────────────               ─────────────────────
-  ucn_about     everything in one     ucn_impact      all call sites
+  about         everything in one     impact          all call sites
                 call: definition,                     with arguments
                 callers, callees,
-                tests, source         ucn_diff_impact what changed in a
+                tests, source         diff_impact     what changed in a
                                                       git diff + who
-  ucn_context   callers + callees                     calls it
+  context       callers + callees                     calls it
                 (quick overview)
-                                      ucn_verify      check all sites
-  ucn_smart     function + helpers                    match signature
+                                      verify          check all sites
+  smart         function + helpers                    match signature
                 expanded inline
-                                      ucn_plan        preview a refactor
-  ucn_trace     call tree — map                       before doing it
+                                      plan            preview a refactor
+  trace         call tree — map                       before doing it
                 a whole pipeline
 
 
   FIND & NAVIGATE                     ARCHITECTURE
   ─────────────────────               ─────────────────────
-  ucn_find      locate definitions    ucn_imports     file dependencies
-  ucn_usages    all occurrences       ucn_exporters   who depends on it
-  ucn_fn        extract a function    ucn_graph       dependency tree
-  ucn_class     extract a class       ucn_related     sibling functions
-  ucn_toc       project overview      ucn_tests       find tests
-  ucn_deadcode  unused functions      ucn_stacktrace  error trace context
-  ucn_search    text search           ucn_api         public API surface
-  ucn_example   best usage example    ucn_typedef     type definitions
-  ucn_lines     extract line range    ucn_file_exports file's exports
-  ucn_expand    drill into context    ucn_stats       project size stats
+  find          locate definitions    imports         file dependencies
+  usages        all occurrences       exporters       who depends on it
+  fn            extract a function    graph           dependency tree
+  class         extract a class       related         sibling functions
+  toc           project overview      tests           find tests
+  deadcode      unused functions      stacktrace      error trace context
+  search        text search           api             public API surface
+  example       best usage example    typedef         type definitions
+  lines         extract line range    file_exports    file's exports
+  expand        drill into context    stats           project size stats
 ```
 
 ---
