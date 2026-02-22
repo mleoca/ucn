@@ -5,6 +5,7 @@ UCN gives AI agents call-graph-level understanding of code. Instead of reading e
 Designed for large codebases where agents waste context on reading large files. UCN's surgical output means agents spend tokens on reasoning, not on ingesting thousands of lines to find three callers, discourages agents from cutting corners, as without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data".
 
 Everything runs locally on your machine and nothing leaves your project.
+The ucn mcp is kept light, as all 28 commands ship as a single MCP tool, under 2k tokens total.
 
 ---
 
@@ -43,7 +44,7 @@ Precise answers without reading files.
   │      $ ucn about myFunc     Works standalone, no agent required.     │
   │                                                                      │
   │   2. MCP Server             Any MCP-compatible AI agent connects     │
-  │      $ ucn --mcp            and gets 28 commands automatically.         │
+  │      $ ucn --mcp            and gets 28 commands automatically.      │
   │                                                                      │
   │   3. Agent Skill            Drop-in skill for Claude Code and        │
   │      /ucn about myFunc      OpenAI Codex CLI. No server needed.      │
