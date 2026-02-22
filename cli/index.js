@@ -1819,14 +1819,21 @@ Commands:
   about <name>           Everything about a symbol
   usages <name>          All usages grouped by type
   context <name>         Callers + callees
+  expand <N>             Show code for item N from context
   smart <name>           Function + dependencies
   impact <name>          What breaks if changed
   trace <name>           Call tree
+  example <name>         Best usage example
+  related <name>         Sibling functions
   imports <file>         What file imports
   exporters <file>       Who imports file
   tests <name>           Find tests
   search <term>          Text search
   typedef <name>         Find type definitions
+  deadcode               Find unused functions/classes
+  verify <name>          Check call sites match signature
+  plan <name>            Preview refactoring
+  stacktrace <text>      Parse a stack trace
   api                    Show public symbols
   diff-impact            What changed and who's affected
   stats                  Index statistics
@@ -1913,7 +1920,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: context <name>');
                 return;
             }
-            const ctx = index.context(arg, { includeUncertain: flags.includeUncertain });
+            const ctx = index.context(arg, { includeUncertain: flags.includeUncertain, includeMethods: flags.includeMethods });
             if (!ctx) {
                 console.log(`Symbol "${arg}" not found.`);
             } else {
@@ -2033,6 +2040,100 @@ function executeInteractiveCommand(index, command, arg) {
         case 'stats': {
             const stats = index.getStats();
             console.log(output.formatStats(stats));
+            break;
+        }
+
+        case 'expand': {
+            if (!arg) {
+                console.log('Usage: expand <number>');
+                return;
+            }
+            const expandNum = parseInt(arg, 10);
+            if (isNaN(expandNum)) {
+                console.log(`Invalid item number: "${arg}"`);
+                return;
+            }
+            const cached = loadExpandableItems(index.root);
+            if (!cached || !cached.items || cached.items.length === 0) {
+                console.log('No expandable items. Run context first.');
+                return;
+            }
+            const expandMatch = cached.items.find(i => i.num === expandNum);
+            if (!expandMatch) {
+                console.log(`Item ${expandNum} not found. Available: 1-${cached.items.length}`);
+                return;
+            }
+            printExpandedItem(expandMatch, cached.root || index.root);
+            break;
+        }
+
+        case 'deadcode': {
+            const deadResult = index.deadcode({
+                includeExported: flags.includeExported,
+                includeDecorated: flags.includeDecorated,
+                includeTests: flags.includeTests
+            });
+            console.log(output.formatDeadcode(deadResult));
+            break;
+        }
+
+        case 'related': {
+            if (!arg) {
+                console.log('Usage: related <name>');
+                return;
+            }
+            const relResult = index.related(arg, { file: flags.file });
+            console.log(output.formatRelated(relResult));
+            break;
+        }
+
+        case 'example': {
+            if (!arg) {
+                console.log('Usage: example <name>');
+                return;
+            }
+            console.log(output.formatExample(index.example(arg), arg));
+            break;
+        }
+
+        case 'plan': {
+            if (!arg) {
+                console.log('Usage: plan <name> [--add-param=x] [--remove-param=x] [--rename-to=x]');
+                return;
+            }
+            if (!flags.addParam && !flags.removeParam && !flags.renameTo) {
+                console.log('Plan requires an operation: --add-param, --remove-param, or --rename-to');
+                return;
+            }
+            const planResult = index.plan(arg, {
+                addParam: flags.addParam,
+                removeParam: flags.removeParam,
+                renameTo: flags.renameTo,
+                defaultValue: flags.defaultValue,
+                file: flags.file
+            });
+            console.log(output.formatPlan(planResult));
+            break;
+        }
+
+        case 'verify': {
+            if (!arg) {
+                console.log('Usage: verify <name>');
+                return;
+            }
+            const verifyResult = index.verify(arg, { file: flags.file });
+            console.log(output.formatVerify(verifyResult));
+            break;
+        }
+
+        case 'stacktrace':
+        case 'stack': {
+            if (!arg) {
+                console.log('Usage: stacktrace <stack text>');
+                return;
+            }
+            const stackResult = index.parseStackTrace(arg);
+            console.log(output.formatStackTrace(stackResult));
             break;
         }
 
