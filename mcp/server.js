@@ -158,6 +158,31 @@ function toolError(message) {
     return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
 }
 
+/**
+ * Resolve a file path via index and validate it's within the project root.
+ * Returns the resolved absolute path string, or a toolError response.
+ */
+function resolveAndValidatePath(index, file) {
+    const resolved = index.resolveFilePathForQuery(file);
+    if (typeof resolved !== 'string') {
+        if (resolved.error === 'file-ambiguous') {
+            return toolError(`Ambiguous file "${file}". Candidates:\n${resolved.candidates.map(c => '  ' + c).join('\n')}`);
+        }
+        return toolError(`File not found: ${file}`);
+    }
+    // Path boundary check: ensure resolved path is within the project root
+    try {
+        const realPath = fs.realpathSync(resolved);
+        const realRoot = fs.realpathSync(index.root);
+        if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
+            return toolError(`File is outside project root: ${file}`);
+        }
+    } catch (e) {
+        return toolError(`Cannot resolve file path: ${file}`);
+    }
+    return resolved;
+}
+
 function requireName(name) {
     if (!name || !name.trim()) {
         return toolError('Symbol name is required.');
@@ -465,6 +490,9 @@ server.registerTool(
                 }
 
                 const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
+                // Validate file is within project root
+                const fnPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
+                if (typeof fnPathCheck !== 'string') return fnPathCheck;
                 const code = fs.readFileSync(match.file, 'utf-8');
                 const codeLines = code.split('\n');
                 const fnCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
@@ -490,6 +518,9 @@ server.registerTool(
                 }
 
                 const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
+                // Validate file is within project root
+                const clsPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
+                if (typeof clsPathCheck !== 'string') return clsPathCheck;
 
                 const code = fs.readFileSync(match.file, 'utf-8');
                 const codeLines = code.split('\n');
@@ -542,13 +573,8 @@ server.registerTool(
                     return toolError('Line range is required (e.g. "10-20" or "15").');
                 }
                 const index = getIndex(project_dir);
-                const resolved = index.resolveFilePathForQuery(file);
-                if (typeof resolved !== 'string') {
-                    if (resolved.error === 'file-ambiguous') {
-                        return toolError(`Ambiguous file "${file}". Candidates:\n${resolved.candidates.map(c => '  ' + c).join('\n')}`);
-                    }
-                    return toolError(`File not found: ${file}`);
-                }
+                const resolved = resolveAndValidatePath(index, file);
+                if (typeof resolved !== 'string') return resolved; // toolError response
                 const filePath = resolved;
 
                 const parts = range.split('-');
@@ -630,6 +656,16 @@ server.registerTool(
                 const filePath = match.file || (index.root && match.relativePath ? path.join(index.root, match.relativePath) : null);
                 if (!filePath || !fs.existsSync(filePath)) {
                     return toolError(`Cannot locate file for ${match.name}`);
+                }
+                // Validate file is within project root
+                try {
+                    const realPath = fs.realpathSync(filePath);
+                    const realRoot = fs.realpathSync(index.root);
+                    if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
+                        return toolError(`File is outside project root: ${match.name}`);
+                    }
+                } catch (e) {
+                    return toolError(`Cannot resolve file path for ${match.name}`);
                 }
 
                 const content = fs.readFileSync(filePath, 'utf-8');
@@ -732,6 +768,10 @@ server.registerTool(
             }
 
             case 'diff_impact': {
+                // Validate git ref format to prevent argument injection
+                if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {
+                    return toolError(`Invalid git ref format: ${base}`);
+                }
                 const index = getIndex(project_dir);
                 const result = index.diffImpact({
                     base: base || 'HEAD',

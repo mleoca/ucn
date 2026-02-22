@@ -13025,5 +13025,59 @@ it('FIX 99 — parseDiff handles quoted paths with special characters', () => {
         'Literal backslash-n in filename must be preserved, not converted to newline');
 });
 
+// ============================================================================
+// Interactive Mode Tests (Fix #100 — missing commands)
+// ============================================================================
+
+describe('Interactive Mode', () => {
+    const { execFileSync } = require('child_process');
+    const cliPath = path.join(__dirname, '..', 'cli', 'index.js');
+
+    it('supports all commands without errors', () => {
+        // Test each previously-missing command by piping into interactive mode
+        // Each should not crash and should produce some output (not "Unknown command")
+        const commands = [
+            'deadcode',
+            'related processData',
+            'example processData',
+            'verify processData',
+            'expand 1',  // Will say "no expandable items" but won't crash
+        ];
+
+        const input = commands.join('\n') + '\nquit\n';
+
+        const result = execFileSync('node', [cliPath, '--interactive', '.'], {
+            input,
+            encoding: 'utf-8',
+            cwd: path.join(__dirname, '..'),
+            timeout: 30000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        // Verify no "Unknown command" errors for the previously-missing commands
+        assert.ok(!result.includes('Unknown command: deadcode'), 'deadcode should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: related'), 'related should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: example'), 'example should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: verify'), 'verify should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: expand'), 'expand should be recognized in interactive mode');
+    });
+
+    it('help lists all commands', () => {
+        const result = execFileSync('node', [cliPath, '--interactive', '.'], {
+            input: 'help\nquit\n',
+            encoding: 'utf-8',
+            cwd: path.join(__dirname, '..'),
+            timeout: 30000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        // Verify the help text includes all commands (including newly added ones)
+        const expectedCommands = ['expand', 'deadcode', 'related', 'example', 'verify', 'plan', 'stacktrace'];
+        for (const cmd of expectedCommands) {
+            assert.ok(result.includes(cmd), `Interactive help should list "${cmd}"`);
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

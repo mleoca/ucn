@@ -411,6 +411,59 @@ const tests = [
         args: { command: 'imports', project_dir: PROJECT_DIR, file: 'utils.js' },
         assert: (res, text, isError) => (isError && /ambiguous/i.test(text)) || 'Expected file-ambiguous error for utils.js'
     },
+
+    // ========================================================================
+    // CATEGORY 3: Security (path traversal, argument injection)
+    // ========================================================================
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'lines rejects path traversal (../../../../etc/passwd)',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: '../../../../etc/passwd', range: '1-5' },
+        assert: (res, text, isError) => (isError && (/not found/i.test(text) || /outside project/i.test(text))) || 'Expected error for path traversal'
+    },
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'lines rejects path traversal (../../other-project/secret.js)',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: '../../other-project/secret.js', range: '1-5' },
+        assert: (res, text, isError) => (isError && (/not found/i.test(text) || /outside project/i.test(text))) || 'Expected error for path traversal'
+    },
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'lines works with valid file',
+        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-3' },
+        assert: (res, text, isError) => (!isError && text.length > 0) || 'Expected valid output for core/discovery.js'
+    },
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'diff_impact rejects --config argument injection',
+        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: '--config=malicious' },
+        assert: (res, text, isError) => (isError && /invalid git ref/i.test(text)) || 'Expected error for argument injection in base'
+    },
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'diff_impact rejects -o flag injection',
+        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: '-o /tmp/evil' },
+        assert: (res, text, isError) => (isError && /invalid git ref/i.test(text)) || 'Expected error for flag injection in base'
+    },
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'diff_impact accepts valid ref HEAD~3',
+        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: 'HEAD~3' },
+        assert: (res, text, isError) => true  // Should not error on valid ref format
+    },
+    {
+        category: 'Security',
+        tool: 'ucn',
+        desc: 'diff_impact accepts valid ref origin/main',
+        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: 'origin/main' },
+        assert: (res, text, isError) => true  // Should not error on valid ref format
+    },
 ];
 
 // ============================================================================

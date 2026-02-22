@@ -1412,7 +1412,8 @@ class ProjectIndex {
                     });
                 }
             } catch (e) {
-                // Skip files that can't be processed
+                // Expected: minified files exceed tree-sitter buffer, binary files fail to parse.
+                // These are not actionable errors — silently skip.
             }
         }
 
@@ -1848,6 +1849,8 @@ class ProjectIndex {
 
             return result;
         } catch (e) {
+            // Expected: file read/parse failures (minified, binary, buffer exceeded).
+            // Return empty callees rather than crashing the entire query.
             return [];
         }
     }
@@ -1956,6 +1959,8 @@ class ProjectIndex {
             cleanHtmlScriptTags(extracted, detectLanguage(symbol.file));
             return extracted.join('\n');
         } catch (e) {
+            // Expected: file may have been deleted or become unreadable since indexing.
+            // Return empty string rather than crashing.
             return '';
         }
     }
@@ -2354,6 +2359,9 @@ class ProjectIndex {
         // Note: no 'g' flag - we only need to test for presence per line
         // The 'i' flag is kept for case-insensitive matching
         const regex = new RegExp('\\b' + escapeRegExp(searchTerm) + '\\b', 'i');
+        // Pre-compile patterns used inside per-line loop
+        const callPattern = new RegExp(escapeRegExp(searchTerm) + '\\s*\\(');
+        const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
 
         for (const { path: testPath, entry } of testFiles) {
             try {
@@ -2368,12 +2376,11 @@ class ProjectIndex {
                             matchType = 'test-case';
                         } else if (/\b(import|require|from)\b/.test(line)) {
                             matchType = 'import';
-                        } else if (new RegExp(searchTerm + '\\s*\\(').test(line)) {
+                        } else if (callPattern.test(line)) {
                             matchType = 'call';
                         }
                         // Detect if the match is inside a string literal (e.g., 'parseFile' or "parseFile")
                         if (matchType === 'reference' || matchType === 'call') {
-                            const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
                             if (strPattern.test(line)) {
                                 matchType = 'string-ref';
                             }
@@ -4409,7 +4416,8 @@ class ProjectIndex {
                     });
                 }
             } catch (e) {
-                // Skip unreadable files
+                // Expected: binary/minified files fail to read or parse.
+                // These are not actionable errors — silently skip.
             }
         }
 
