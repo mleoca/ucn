@@ -279,7 +279,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'interface',
-                    members: [],
+                    members: extractClassMembers(node, code),
                     modifiers,
                     ...(docstring && { docstring }),
                     ...(generics && { generics }),
@@ -307,7 +307,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'enum',
-                    members: [],
+                    members: extractEnumConstants(node, code),
                     modifiers,
                     ...(docstring && { docstring }),
                     ...(annotations.length > 0 && { annotations })
@@ -403,6 +403,82 @@ function extractInterfaceExtends(interfaceNode) {
         return interfaces;
     }
     return [];
+}
+
+/**
+ * Extract enum constants from enum body
+ */
+function extractEnumConstants(enumNode, code) {
+    const constants = [];
+    const bodyNode = enumNode.childForFieldName('body');
+    if (!bodyNode) return constants;
+
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const child = bodyNode.namedChild(i);
+        if (child.type === 'enum_constant') {
+            const nameNode = child.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                const argsNode = child.childForFieldName('arguments');
+                constants.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    memberType: 'constant',
+                    ...(argsNode && { params: argsNode.text.slice(1, -1) })
+                });
+            }
+        }
+    }
+
+    // Also extract methods from enum_body_declarations
+    if (bodyNode) {
+        for (let i = 0; i < bodyNode.namedChildCount; i++) {
+            const child = bodyNode.namedChild(i);
+            if (child.type === 'enum_body_declarations') {
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const member = child.namedChild(j);
+                    if (member.type === 'method_declaration') {
+                        const nameNode = member.childForFieldName('name');
+                        const paramsNode = member.childForFieldName('parameters');
+                        if (nameNode) {
+                            const { startLine, endLine } = nodeToLocation(member, code);
+                            const modifiers = extractModifiers(member);
+                            const returnType = extractReturnType(member);
+                            constants.push({
+                                name: nameNode.text,
+                                params: extractJavaParams(paramsNode),
+                                startLine,
+                                endLine,
+                                memberType: modifiers.includes('static') ? 'static' : 'method',
+                                modifiers,
+                                isMethod: true,
+                                ...(returnType && { returnType })
+                            });
+                        }
+                    } else if (member.type === 'constructor_declaration') {
+                        const nameNode = member.childForFieldName('name');
+                        const paramsNode = member.childForFieldName('parameters');
+                        if (nameNode) {
+                            const { startLine, endLine } = nodeToLocation(member, code);
+                            const modifiers = extractModifiers(member);
+                            constants.push({
+                                name: nameNode.text,
+                                params: extractJavaParams(paramsNode),
+                                startLine,
+                                endLine,
+                                memberType: 'constructor',
+                                modifiers,
+                                isMethod: true
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    return constants;
 }
 
 /**

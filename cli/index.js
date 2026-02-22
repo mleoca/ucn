@@ -15,6 +15,7 @@ const { getParser, getLanguageModule } = require('../languages');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot, isTestFile } = require('../core/discovery');
 const output = require('../core/output');
+const { pickBestDefinition, addTestExclusions } = require('../core/shared');
 
 // ============================================================================
 // ARGUMENT PARSING
@@ -141,13 +142,6 @@ const positionalArgs = [
  * Add test file patterns to exclusion list
  * Used by find/usages when --include-tests is not specified
  */
-function addTestExclusions(exclude) {
-    const testPatterns = ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'];
-    const existing = new Set(exclude.map(e => e.toLowerCase()));
-    const additions = testPatterns.filter(p => !existing.has(p));
-    return [...exclude, ...additions];
-}
-
 /**
  * Validate required argument and exit with usage if missing
  * @param {string} arg - The argument to validate
@@ -740,13 +734,15 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
-        case 'example':
-            if (!arg) {
-                console.error('Usage: ucn . example <name>');
-                process.exit(1);
-            }
-            console.log(output.formatExample(index.example(arg), arg));
+        case 'example': {
+            requireArg(arg, 'Usage: ucn . example <name>');
+            const exampleResult = index.example(arg);
+            printOutput(exampleResult,
+                r => output.formatExampleJson(r, arg),
+                r => output.formatExample(r, arg)
+            );
             break;
+        }
 
         case 'context': {
             requireArg(arg, 'Usage: ucn . context <name>');
@@ -868,7 +864,7 @@ function runProjectCommand(rootDir, command, arg) {
                 defaultValue: flags.defaultValue,
                 file: flags.file
             });
-            printOutput(planResult, r => JSON.stringify(r, null, 2), output.formatPlan);
+            printOutput(planResult, output.formatPlanJson, output.formatPlan);
             break;
         }
 
@@ -885,14 +881,14 @@ function runProjectCommand(rootDir, command, arg) {
         case 'stack': {
             requireArg(arg, 'Usage: ucn . stacktrace "<stack trace text>"\nExample: ucn . stacktrace "Error: failed\\n    at parseFile (core/parser.js:90:5)"');
             const stackResult = index.parseStackTrace(arg);
-            printOutput(stackResult, r => JSON.stringify(r, null, 2), output.formatStackTrace);
+            printOutput(stackResult, output.formatStackTraceJson, output.formatStackTrace);
             break;
         }
 
         case 'verify': {
             requireArg(arg, 'Usage: ucn . verify <name>');
             const verifyResult = index.verify(arg, { file: flags.file });
-            printOutput(verifyResult, r => JSON.stringify(r, null, 2), output.formatVerify);
+            printOutput(verifyResult, output.formatVerifyJson, output.formatVerify);
             break;
         }
 
@@ -986,7 +982,7 @@ function runProjectCommand(rootDir, command, arg) {
                 in: flags.in || subdirScope
             });
             printOutput(deadcodeResults,
-                r => JSON.stringify({ deadcode: r }, null, 2),
+                output.formatDeadcodeJson,
                 r => output.formatDeadcode(r)
             );
             break;
@@ -1056,15 +1052,16 @@ function runProjectCommand(rootDir, command, arg) {
     }
 }
 
-function extractFunctionFromProject(index, name) {
-    const matches = index.find(name, { file: flags.file }).filter(m => m.type === 'function' || m.params !== undefined);
+function extractFunctionFromProject(index, name, overrideFlags) {
+    const f = overrideFlags || flags;
+    const matches = index.find(name, { file: f.file }).filter(m => m.type === 'function' || m.params !== undefined);
 
     if (matches.length === 0) {
         console.error(`Function "${name}" not found`);
         return;
     }
 
-    if (matches.length > 1 && !flags.file && flags.all) {
+    if (matches.length > 1 && !f.file && f.all) {
         // Show all definitions
         for (let i = 0; i < matches.length; i++) {
             const m = matches[i];
@@ -1073,7 +1070,7 @@ function extractFunctionFromProject(index, name) {
             const extracted = lines.slice(m.startLine - 1, m.endLine);
             const fnCode = cleanHtmlScriptTags(extracted, detectLanguage(m.file)).join('\n');
             if (i > 0) console.log('');
-            if (flags.json) {
+            if (f.json) {
                 console.log(output.formatFunctionJson(m, fnCode));
             } else {
                 console.log(output.formatFn(m, fnCode));
@@ -1083,7 +1080,7 @@ function extractFunctionFromProject(index, name) {
     }
 
     let match;
-    if (matches.length > 1 && !flags.file) {
+    if (matches.length > 1 && !f.file) {
         // Auto-select best match using same scoring as resolveSymbol
         match = pickBestDefinition(matches);
         const others = matches.filter(m => m !== match).map(m => `${m.relativePath}:${m.startLine}`).join(', ');
@@ -1098,15 +1095,16 @@ function extractFunctionFromProject(index, name) {
     const extracted = lines.slice(match.startLine - 1, match.endLine);
     const fnCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 
-    if (flags.json) {
+    if (f.json) {
         console.log(output.formatFunctionJson(match, fnCode));
     } else {
         console.log(output.formatFn(match, fnCode));
     }
 }
 
-function extractClassFromProject(index, name) {
-    const matches = index.find(name, { file: flags.file }).filter(m =>
+function extractClassFromProject(index, name, overrideFlags) {
+    const f = overrideFlags || flags;
+    const matches = index.find(name, { file: f.file }).filter(m =>
         ['class', 'interface', 'type', 'enum', 'struct', 'trait'].includes(m.type)
     );
 
@@ -1115,7 +1113,7 @@ function extractClassFromProject(index, name) {
         return;
     }
 
-    if (matches.length > 1 && !flags.file && flags.all) {
+    if (matches.length > 1 && !f.file && f.all) {
         // Show all definitions using index data (no re-parsing)
         for (let i = 0; i < matches.length; i++) {
             const m = matches[i];
@@ -1124,7 +1122,7 @@ function extractClassFromProject(index, name) {
             const extracted = codeLines.slice(m.startLine - 1, m.endLine);
             const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(m.file)).join('\n');
             if (i > 0) console.log('');
-            if (flags.json) {
+            if (f.json) {
                 console.log(JSON.stringify({ ...m, code: clsCode }, null, 2));
             } else {
                 console.log(output.formatClass(m, clsCode));
@@ -1134,7 +1132,7 @@ function extractClassFromProject(index, name) {
     }
 
     let match;
-    if (matches.length > 1 && !flags.file) {
+    if (matches.length > 1 && !f.file) {
         // Auto-select best match using same scoring as resolveSymbol
         match = pickBestDefinition(matches);
         const others = matches.filter(m => m !== match).map(m => `${m.relativePath}:${m.startLine}`).join(', ');
@@ -1149,7 +1147,7 @@ function extractClassFromProject(index, name) {
     const extracted = codeLines.slice(match.startLine - 1, match.endLine);
     const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 
-    if (flags.json) {
+    if (f.json) {
         console.log(JSON.stringify({ ...match, code: clsCode }, null, 2));
     } else {
         console.log(output.formatClass(match, clsCode));
@@ -1628,30 +1626,6 @@ function printLines(lines, range) {
     }
 }
 
-/**
- * Pick the best definition from multiple matches using same scoring as resolveSymbol.
- * Prefers lib/src/core over test/examples/vendor directories.
- */
-function pickBestDefinition(matches) {
-    const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
-    const scored = matches.map(m => {
-        let score = 0;
-        const rp = m.relativePath || '';
-        // Prefer class/struct/interface types (+1000) - same as resolveSymbol
-        if (typeOrder.has(m.type)) score += 1000;
-        if (isTestFile(rp, detectLanguage(m.file))) score -= 500;
-        if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
-        if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
-        // Tiebreaker: prefer larger function bodies (more important/complex)
-        if (m.startLine && m.endLine) {
-            score += Math.min(m.endLine - m.startLine, 100);
-        }
-        return { match: m, score };
-    });
-    scored.sort((a, b) => b.score - a.score);
-    return scored[0].match;
-}
-
 function suggestSimilar(query, names) {
     const lower = query.toLowerCase();
     const similar = names.filter(n => n.toLowerCase().includes(lower));
@@ -1814,31 +1788,38 @@ function runInteractive(rootDir) {
         if (input === 'help') {
             console.log(`
 Commands:
-  toc                    Project overview
-  find <name>            Find symbol
+  toc                    Project overview (--detailed)
+  find <name>            Find symbol (--exact, --file=)
   about <name>           Everything about a symbol
   usages <name>          All usages grouped by type
   context <name>         Callers + callees
   expand <N>             Show code for item N from context
   smart <name>           Function + dependencies
   impact <name>          What breaks if changed
-  trace <name>           Call tree
+  trace <name>           Call tree (--depth=N)
   example <name>         Best usage example
   related <name>         Sibling functions
+  fn <name>              Extract function code (--file=)
+  class <name>           Extract class code (--file=)
+  lines <range>          Extract lines (--file= required)
+  graph <file>           File dependency tree (--direction=, --depth=)
+  file-exports <file>    File's exported symbols
   imports <file>         What file imports
   exporters <file>       Who imports file
-  tests <name>           Find tests
-  search <term>          Text search
+  tests <name>           Find tests (--calls-only)
+  search <term>          Text search (--code-only, --case-sensitive)
   typedef <name>         Find type definitions
   deadcode               Find unused functions/classes
   verify <name>          Check call sites match signature
-  plan <name>            Preview refactoring
+  plan <name>            Preview refactoring (--add-param=, --remove-param=, --rename-to=)
   stacktrace <text>      Parse a stack trace
   api                    Show public symbols
   diff-impact            What changed and who's affected
   stats                  Index statistics
   rebuild                Rebuild index
   quit                   Exit
+
+Flags can be added per-command: context myFunc --include-methods
 `);
             rl.prompt();
             return;
@@ -1852,13 +1833,16 @@ Commands:
             return;
         }
 
-        // Parse command
-        const parts = input.split(/\s+/);
-        const command = parts[0];
-        const arg = parts.slice(1).join(' ');
+        // Parse command, flags, and arg from interactive input
+        const tokens = input.split(/\s+/);
+        const command = tokens[0];
+        const flagTokens = tokens.filter(t => t.startsWith('--'));
+        const argTokens = tokens.slice(1).filter(t => !t.startsWith('--'));
+        const arg = argTokens.join(' ');
+        const iflags = parseInteractiveFlags(flagTokens);
 
         try {
-            executeInteractiveCommand(index, command, arg);
+            executeInteractiveCommand(index, command, arg, iflags);
         } catch (e) {
             console.error(`Error: ${e.message}`);
         }
@@ -1871,12 +1855,48 @@ Commands:
     });
 }
 
-function executeInteractiveCommand(index, command, arg) {
+/**
+ * Parse flags from interactive command tokens.
+ * Returns a flags object similar to the global flags but scoped to this command.
+ */
+function parseInteractiveFlags(tokens) {
+    return {
+        file: tokens.find(a => a.startsWith('--file='))?.split('=')[1] || null,
+        exclude: tokens.find(a => a.startsWith('--exclude=') || a.startsWith('--not='))?.split('=')[1]?.split(',') || [],
+        in: tokens.find(a => a.startsWith('--in='))?.split('=')[1] || null,
+        includeTests: tokens.includes('--include-tests'),
+        includeExported: tokens.includes('--include-exported'),
+        includeDecorated: tokens.includes('--include-decorated'),
+        includeUncertain: tokens.includes('--include-uncertain'),
+        includeMethods: tokens.includes('--include-methods=false') ? false : tokens.includes('--include-methods') ? true : undefined,
+        detailed: tokens.includes('--detailed'),
+        all: tokens.includes('--all'),
+        exact: tokens.includes('--exact'),
+        callsOnly: tokens.includes('--calls-only'),
+        codeOnly: tokens.includes('--code-only'),
+        caseSensitive: tokens.includes('--case-sensitive'),
+        withTypes: tokens.includes('--with-types'),
+        expand: tokens.includes('--expand'),
+        depth: tokens.find(a => a.startsWith('--depth='))?.split('=')[1] || null,
+        top: parseInt(tokens.find(a => a.startsWith('--top='))?.split('=')[1] || '0'),
+        context: parseInt(tokens.find(a => a.startsWith('--context='))?.split('=')[1] || '0'),
+        direction: tokens.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
+        addParam: tokens.find(a => a.startsWith('--add-param='))?.split('=')[1] || null,
+        removeParam: tokens.find(a => a.startsWith('--remove-param='))?.split('=')[1] || null,
+        renameTo: tokens.find(a => a.startsWith('--rename-to='))?.split('=')[1] || null,
+        defaultValue: tokens.find(a => a.startsWith('--default='))?.split('=')[1] || null,
+        base: tokens.find(a => a.startsWith('--base='))?.split('=')[1] || null,
+        staged: tokens.includes('--staged'),
+        maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null,
+    };
+}
+
+function executeInteractiveCommand(index, command, arg, iflags = {}) {
     switch (command) {
         case 'toc': {
-            const toc = index.getToc();
+            const toc = index.getToc({ detailed: iflags.detailed });
             console.log(output.formatToc(toc, {
-                detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol'
+                detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol'
             }));
             break;
         }
@@ -1886,11 +1906,11 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: find <name>');
                 return;
             }
-            const found = index.find(arg, {});
+            const found = index.find(arg, { exact: iflags.exact, exclude: iflags.exclude, in: iflags.in, includeTests: iflags.includeTests });
             if (found.length === 0) {
                 console.log(`No symbols found for "${arg}"`);
             } else {
-                printSymbols(found, arg, {});
+                printSymbols(found, arg, { top: iflags.top });
             }
             break;
         }
@@ -1900,8 +1920,8 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: about <name>');
                 return;
             }
-            const aboutResult = index.about(arg, { includeMethods: flags.includeMethods });
-            console.log(output.formatAbout(aboutResult, { expand: flags.expand, root: index.root }));
+            const aboutResult = index.about(arg, { includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain, file: iflags.file, exclude: iflags.exclude });
+            console.log(output.formatAbout(aboutResult, { expand: iflags.expand, root: index.root, showAll: iflags.all }));
             break;
         }
 
@@ -1910,7 +1930,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: usages <name>');
                 return;
             }
-            const usages = index.usages(arg, {});
+            const usages = index.usages(arg, { context: iflags.context, codeOnly: iflags.codeOnly, includeTests: iflags.includeTests });
             console.log(output.formatUsages(usages, arg));
             break;
         }
@@ -1920,13 +1940,13 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: context <name>');
                 return;
             }
-            const ctx = index.context(arg, { includeUncertain: flags.includeUncertain, includeMethods: flags.includeMethods });
+            const ctx = index.context(arg, { includeUncertain: iflags.includeUncertain, includeMethods: iflags.includeMethods, file: iflags.file, exclude: iflags.exclude });
             if (!ctx) {
                 console.log(`Symbol "${arg}" not found.`);
             } else {
                 const { text, expandable } = output.formatContext(ctx, {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
-                    expandHint: 'Use "ucn . expand <N>" to see code for item N',
+                    expandHint: 'Use "expand <N>" to see code for item N',
                     uncertainHint: 'use --include-uncertain to include all'
                 });
                 console.log(text);
@@ -1940,7 +1960,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: smart <name>');
                 return;
             }
-            const smart = index.smart(arg, { file: flags.file, includeUncertain: flags.includeUncertain });
+            const smart = index.smart(arg, { file: iflags.file, includeUncertain: iflags.includeUncertain, withTypes: iflags.withTypes });
             if (smart) {
                 console.log(output.formatSmart(smart, {
                     uncertainHint: 'use --include-uncertain to include all'
@@ -1956,7 +1976,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: impact <name>');
                 return;
             }
-            const impactResult = index.impact(arg);
+            const impactResult = index.impact(arg, { file: iflags.file });
             console.log(output.formatImpact(impactResult));
             break;
         }
@@ -1966,12 +1986,70 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: trace <name>');
                 return;
             }
-            const traceResult = index.trace(arg, { depth: 3 });
+            const traceDepth = iflags.depth ? parseInt(iflags.depth) : 3;
+            const traceResult = index.trace(arg, { depth: traceDepth, file: iflags.file, all: iflags.all || !!iflags.depth, includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain });
             console.log(output.formatTrace(traceResult));
             break;
         }
 
-        case 'imports': {
+        case 'fn': {
+            if (!arg) {
+                console.log('Usage: fn <name> [--file=<pattern>]');
+                return;
+            }
+            extractFunctionFromProject(index, arg, iflags);
+            break;
+        }
+
+        case 'class': {
+            if (!arg) {
+                console.log('Usage: class <name> [--file=<pattern>]');
+                return;
+            }
+            extractClassFromProject(index, arg, iflags);
+            break;
+        }
+
+        case 'lines': {
+            if (!arg || !iflags.file) {
+                console.log('Usage: lines <range> --file=<file>');
+                return;
+            }
+            const filePath = index.findFile(iflags.file);
+            if (!filePath) {
+                console.log(`File not found: ${iflags.file}`);
+                return;
+            }
+            const fileContent = fs.readFileSync(filePath, 'utf-8');
+            printLines(fileContent.split('\n'), arg);
+            break;
+        }
+
+        case 'graph': {
+            if (!arg) {
+                console.log('Usage: graph <file> [--direction=imports|importers|both] [--depth=N]');
+                return;
+            }
+            const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
+            const graphDirection = iflags.direction || 'both';
+            const graphResult = index.graph(arg, { direction: graphDirection, maxDepth: graphDepth });
+            console.log(output.formatGraph(graphResult, { showAll: iflags.all, maxDepth: graphDepth }));
+            break;
+        }
+
+        case 'file-exports':
+        case 'what-exports': {
+            if (!arg) {
+                console.log('Usage: file-exports <file>');
+                return;
+            }
+            const fileExports = index.fileExports(arg);
+            console.log(output.formatFileExports(fileExports, arg));
+            break;
+        }
+
+        case 'imports':
+        case 'what-imports': {
             if (!arg) {
                 console.log('Usage: imports <file>');
                 return;
@@ -1981,7 +2059,8 @@ function executeInteractiveCommand(index, command, arg) {
             break;
         }
 
-        case 'exporters': {
+        case 'exporters':
+        case 'who-imports': {
             if (!arg) {
                 console.log('Usage: exporters <file>');
                 return;
@@ -1996,7 +2075,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: tests <name>');
                 return;
             }
-            const tests = index.tests(arg, { callsOnly: flags.callsOnly });
+            const tests = index.tests(arg, { callsOnly: iflags.callsOnly });
             console.log(output.formatTests(tests, arg));
             break;
         }
@@ -2006,7 +2085,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: search <term>');
                 return;
             }
-            const results = index.search(arg, {});
+            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context });
             console.log(output.formatSearch(results, arg));
             break;
         }
@@ -2029,9 +2108,9 @@ function executeInteractiveCommand(index, command, arg) {
 
         case 'diff-impact': {
             const diffResult = index.diffImpact({
-                base: flags.base || 'HEAD',
-                staged: flags.staged,
-                file: flags.file
+                base: iflags.base || 'HEAD',
+                staged: iflags.staged,
+                file: iflags.file
             });
             console.log(output.formatDiffImpact(diffResult));
             break;
@@ -2069,9 +2148,11 @@ function executeInteractiveCommand(index, command, arg) {
 
         case 'deadcode': {
             const deadResult = index.deadcode({
-                includeExported: flags.includeExported,
-                includeDecorated: flags.includeDecorated,
-                includeTests: flags.includeTests
+                includeExported: iflags.includeExported,
+                includeDecorated: iflags.includeDecorated,
+                includeTests: iflags.includeTests,
+                exclude: iflags.exclude,
+                in: iflags.in
             });
             console.log(output.formatDeadcode(deadResult));
             break;
@@ -2082,8 +2163,8 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: related <name>');
                 return;
             }
-            const relResult = index.related(arg, { file: flags.file });
-            console.log(output.formatRelated(relResult));
+            const relResult = index.related(arg, { file: iflags.file, all: iflags.all });
+            console.log(output.formatRelated(relResult, { showAll: iflags.all }));
             break;
         }
 
@@ -2098,19 +2179,19 @@ function executeInteractiveCommand(index, command, arg) {
 
         case 'plan': {
             if (!arg) {
-                console.log('Usage: plan <name> [--add-param=x] [--remove-param=x] [--rename-to=x]');
+                console.log('Usage: plan <name> --add-param=x | --remove-param=x | --rename-to=x');
                 return;
             }
-            if (!flags.addParam && !flags.removeParam && !flags.renameTo) {
+            if (!iflags.addParam && !iflags.removeParam && !iflags.renameTo) {
                 console.log('Plan requires an operation: --add-param, --remove-param, or --rename-to');
                 return;
             }
             const planResult = index.plan(arg, {
-                addParam: flags.addParam,
-                removeParam: flags.removeParam,
-                renameTo: flags.renameTo,
-                defaultValue: flags.defaultValue,
-                file: flags.file
+                addParam: iflags.addParam,
+                removeParam: iflags.removeParam,
+                renameTo: iflags.renameTo,
+                defaultValue: iflags.defaultValue,
+                file: iflags.file
             });
             console.log(output.formatPlan(planResult));
             break;
@@ -2121,7 +2202,7 @@ function executeInteractiveCommand(index, command, arg) {
                 console.log('Usage: verify <name>');
                 return;
             }
-            const verifyResult = index.verify(arg, { file: flags.file });
+            const verifyResult = index.verify(arg, { file: iflags.file });
             console.log(output.formatVerify(verifyResult));
             break;
         }

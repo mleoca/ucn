@@ -379,6 +379,34 @@ const tests = [
     {
         category: 'Correctness',
         tool: 'ucn',
+        desc: 'smart(nonexistent) returns "not found" message',
+        args: { command: 'smart', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent smart target'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'context(nonexistent) returns "not found" message',
+        args: { command: 'context', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent context target'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'example(nonexistent) returns "no examples" message',
+        args: { command: 'example', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        assert: (res, text, isError) => (!isError && /no .* examples found|not found/i.test(text)) || 'Expected "no examples found" message for nonexistent example target'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
+        desc: 'related(nonexistent) returns "not found" message',
+        args: { command: 'related', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent related target'
+    },
+    {
+        category: 'Correctness',
+        tool: 'ucn',
         desc: 'lines(range="5-0") returns validation error',
         args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '5-0' },
         assert: (res, text, isError) => isError === true || 'Expected isError: true for invalid range'

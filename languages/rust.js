@@ -232,7 +232,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'enum',
-                    members: [],
+                    members: extractEnumVariants(node, code),
                     modifiers: visibility ? [visibility] : [],
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
@@ -258,7 +258,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'trait',
-                    members: [],
+                    members: extractTraitMembers(node, code),
                     modifiers: visibility ? [visibility] : [],
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
@@ -441,6 +441,75 @@ function extractImplInfo(implNode) {
     }
 
     return { name, traitName, typeName };
+}
+
+/**
+ * Extract enum variants
+ */
+function extractEnumVariants(enumNode, code) {
+    const variants = [];
+    const bodyNode = enumNode.childForFieldName('body');
+    if (!bodyNode) return variants;
+
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const child = bodyNode.namedChild(i);
+        if (child.type === 'enum_variant') {
+            const nameNode = child.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                // Check for tuple/struct variant data
+                let params = undefined;
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const variantChild = child.namedChild(j);
+                    if (variantChild.type === 'field_declaration_list' || variantChild.type === 'ordered_field_declaration_list') {
+                        params = variantChild.text.slice(1, -1);
+                    }
+                }
+                variants.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    memberType: 'variant',
+                    ...(params !== undefined && { params })
+                });
+            }
+        }
+    }
+    return variants;
+}
+
+/**
+ * Extract trait method signatures
+ */
+function extractTraitMembers(traitNode, code) {
+    const members = [];
+    const bodyNode = traitNode.childForFieldName('body');
+    if (!bodyNode) return members;
+
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const child = bodyNode.namedChild(i);
+        if (child.type === 'function_item' || child.type === 'function_signature_item') {
+            const nameNode = child.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                const paramsNode = child.childForFieldName('parameters');
+                const returnType = extractReturnType(child);
+                const hasSelf = paramsNode && paramsNode.text.includes('self');
+
+                members.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    memberType: 'method',
+                    isMethod: true,
+                    ...(paramsNode && { params: extractRustParams(paramsNode) }),
+                    ...(returnType && { returnType }),
+                    ...(hasSelf && { receiver: 'self' })
+                });
+            }
+        }
+    }
+    return members;
 }
 
 /**

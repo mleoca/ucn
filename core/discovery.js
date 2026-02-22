@@ -335,11 +335,17 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
  * @param {string[]} ignores - Patterns to always ignore
  * @param {string} [parentDir] - Parent directory path (for conditional checks)
  */
+const _globRegexCache = new Map();
+
 function shouldIgnore(name, ignores, parentDir) {
     // Check unconditional ignores
     for (const pattern of ignores) {
         if (pattern.includes('*')) {
-            const regex = globToRegex(pattern);
+            let regex = _globRegexCache.get(pattern);
+            if (!regex) {
+                regex = globToRegex(pattern);
+                _globRegexCache.set(pattern, regex);
+            }
             if (regex.test(name)) return true;
         } else if (name === pattern) {
             return true;
@@ -408,7 +414,7 @@ function detectProjectPattern(projectRoot) {
 
         if (fs.existsSync(path.join(dir, 'pom.xml')) ||
             fs.existsSync(path.join(dir, 'build.gradle'))) {
-            extensions.push('java', 'kt');
+            extensions.push('java');
         }
     };
 

@@ -2078,6 +2078,157 @@ function formatLineRanges(lineNums) {
     return ranges.join(', ');
 }
 
+/**
+ * Format plan command output - JSON
+ */
+function formatPlanJson(plan) {
+    if (!plan) {
+        return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
+    }
+    if (!plan.found) {
+        return JSON.stringify({
+            found: false,
+            error: plan.error || `Function "${plan.function}" not found.`,
+            ...(plan.currentParams && { currentParams: plan.currentParams })
+        }, null, 2);
+    }
+
+    return JSON.stringify({
+        found: true,
+        function: plan.function,
+        file: plan.file,
+        startLine: plan.startLine,
+        operation: plan.operation,
+        before: { signature: plan.before.signature },
+        after: { signature: plan.after.signature },
+        totalChanges: plan.totalChanges,
+        filesAffected: plan.filesAffected,
+        changes: plan.changes.map(c => ({
+            file: c.file,
+            line: c.line,
+            expression: c.expression,
+            suggestion: c.suggestion
+        }))
+    }, null, 2);
+}
+
+/**
+ * Format stack trace command output - JSON
+ */
+function formatStackTraceJson(result) {
+    if (!result || result.frameCount === 0) {
+        return JSON.stringify({ frameCount: 0, frames: [] }, null, 2);
+    }
+
+    return JSON.stringify({
+        frameCount: result.frameCount,
+        frames: result.frames.map(f => ({
+            function: f.function || null,
+            file: f.file,
+            line: f.line,
+            found: !!f.found,
+            ...(f.resolvedFile && { resolvedFile: f.resolvedFile }),
+            ...(f.context && { context: f.context.map(c => ({
+                line: c.line,
+                code: c.code,
+                isCurrent: !!c.isCurrent
+            })) }),
+            ...(f.functionInfo && { functionInfo: {
+                name: f.functionInfo.name,
+                params: f.functionInfo.params || null,
+                startLine: f.functionInfo.startLine,
+                endLine: f.functionInfo.endLine
+            } }),
+            ...(f.raw && { raw: f.raw })
+        }))
+    }, null, 2);
+}
+
+/**
+ * Format verify command output - JSON
+ */
+function formatVerifyJson(result) {
+    if (!result) {
+        return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
+    }
+    if (!result.found) {
+        return JSON.stringify({ found: false, error: `Function "${result.function}" not found.` }, null, 2);
+    }
+
+    return JSON.stringify({
+        found: true,
+        function: result.function,
+        file: result.file,
+        startLine: result.startLine,
+        signature: result.signature,
+        expectedArgs: result.expectedArgs,
+        totalCalls: result.totalCalls,
+        valid: result.valid,
+        mismatches: result.mismatches,
+        uncertain: result.uncertain,
+        mismatchDetails: result.mismatchDetails.map(m => ({
+            file: m.file,
+            line: m.line,
+            expression: m.expression,
+            expected: m.expected,
+            actual: m.actual,
+            args: m.args || []
+        })),
+        uncertainDetails: result.uncertainDetails.map(u => ({
+            file: u.file,
+            line: u.line,
+            expression: u.expression,
+            reason: u.reason
+        }))
+    }, null, 2);
+}
+
+/**
+ * Format example command output - JSON
+ */
+function formatExampleJson(result, name) {
+    if (!result) {
+        return JSON.stringify({ found: false, query: name, error: `No call examples found for "${name}"` }, null, 2);
+    }
+
+    const best = result.best;
+    return JSON.stringify({
+        found: true,
+        query: name,
+        totalCalls: result.totalCalls,
+        best: {
+            file: best.relativePath || best.file,
+            line: best.line,
+            content: best.content,
+            score: best.score,
+            reasons: best.reasons || [],
+            ...(best.before && best.before.length > 0 && { before: best.before }),
+            ...(best.after && best.after.length > 0 && { after: best.after })
+        }
+    }, null, 2);
+}
+
+/**
+ * Format deadcode command output - JSON
+ */
+function formatDeadcodeJson(results) {
+    return JSON.stringify({
+        count: results.length,
+        ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
+        ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
+        symbols: results.map(item => ({
+            name: item.name,
+            type: item.type,
+            file: item.file,
+            startLine: item.startLine,
+            endLine: item.endLine,
+            ...(item.isExported && { isExported: true }),
+            ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
+            ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations })
+        }))
+    }, null, 2);
+}
+
 function formatDiffImpactJson(result) {
     return JSON.stringify(result, null, 2);
 }
@@ -2132,12 +2283,15 @@ module.exports = {
 
     // Plan command
     formatPlan,
+    formatPlanJson,
 
     // Stack trace command
     formatStackTrace,
+    formatStackTraceJson,
 
     // Verify command
     formatVerify,
+    formatVerifyJson,
 
     // Trace command
     formatTrace,
@@ -2149,6 +2303,10 @@ module.exports = {
 
     // Example command
     formatExample,
+    formatExampleJson,
+
+    // Deadcode command
+    formatDeadcodeJson,
 
     // Shared text formatters (CLI + MCP)
     formatToc,

@@ -3817,6 +3817,164 @@ function helper() { return 42; }
     });
 });
 
+describe('related() optimization', () => {
+    it('sharedCallees uses reverse lookup instead of scanning all symbols', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-related-'));
+        try {
+            // Create a project where multiple functions share callees
+            fs.writeFileSync(path.join(tmpDir, 'shared.js'), `
+function helper() { return 1; }
+function utility() { return 2; }
+`);
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function funcA() { helper(); utility(); }
+`);
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), `
+function funcB() { helper(); utility(); }
+`);
+            fs.writeFileSync(path.join(tmpDir, 'c.js'), `
+function funcC() { helper(); }
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const result = index.related('funcA');
+            assert.ok(result, 'related should return result');
+
+            // funcB shares both callees (helper, utility), funcC shares one (helper)
+            assert.ok(result.sharedCallees.length > 0, 'Should find shared callees');
+            const funcBEntry = result.sharedCallees.find(s => s.name === 'funcB');
+            const funcCEntry = result.sharedCallees.find(s => s.name === 'funcC');
+            assert.ok(funcBEntry, 'funcB should be in shared callees');
+            assert.strictEqual(funcBEntry.sharedCalleeCount, 2, 'funcB shares 2 callees');
+            if (funcCEntry) {
+                assert.strictEqual(funcCEntry.sharedCalleeCount, 1, 'funcC shares 1 callee');
+            }
+            // Should be sorted: funcB (2) before funcC (1)
+            if (funcCEntry) {
+                const bIdx = result.sharedCallees.indexOf(funcBEntry);
+                const cIdx = result.sharedCallees.indexOf(funcCEntry);
+                assert.ok(bIdx < cIdx, 'Higher shared count should come first');
+            }
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+describe('Per-operation file content cache', () => {
+    it('_readFile returns same content and uses cache within _beginOp/_endOp', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-opcache-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), 'function a() { b(); }\n');
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), 'function b() { return 1; }\n');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const fileA = path.join(tmpDir, 'a.js');
+
+            // Without op cache, _readFile works normally
+            const content1 = index._readFile(fileA);
+            assert.ok(content1.includes('function a'), 'Should read file content');
+            assert.strictEqual(index._opContentCache, null, 'No cache active outside op');
+
+            // With op cache, repeated reads return cached content
+            index._beginOp();
+            const content2 = index._readFile(fileA);
+            const content3 = index._readFile(fileA);
+            assert.strictEqual(content2, content3, 'Should return same cached content');
+            assert.strictEqual(index._opContentCache.size, 1, 'Cache should have 1 entry');
+            index._endOp();
+            assert.strictEqual(index._opContentCache, null, 'Cache cleared after op');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('about() activates op cache (nested methods share reads)', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-opcache-'));
+        try {
+            // Create files that will be read multiple times during about()
+            fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+function processData(input) {
+    const result = helper(input);
+    return transform(result);
+}
+`);
+            fs.writeFileSync(path.join(tmpDir, 'helper.js'), `
+function helper(x) { return x * 2; }
+function transform(x) { return x + 1; }
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // Monkey-patch fs.readFileSync to count actual disk reads
+            let diskReads = 0;
+            const origRead = fs.readFileSync;
+            fs.readFileSync = function(p, ...args) {
+                if (typeof p === 'string' && p.startsWith(tmpDir)) diskReads++;
+                return origRead.call(fs, p, ...args);
+            };
+
+            const result = index.about('processData');
+            fs.readFileSync = origRead; // restore immediately
+
+            assert.ok(result, 'about should return result');
+            assert.ok(result.found, 'Should find processData');
+
+            // about() calls usages, findCallers, findCallees, tests, detectCompleteness
+            // Each iterates all files. Without cache: 2 files * 5+ methods = 10+ reads
+            // With cache: significant reduction due to shared reads across sub-methods
+            // Some extra reads come from getCachedCalls (mtime-based), so allow headroom
+            const fileCount = index.files.size;
+            assert.ok(diskReads < fileCount * 5,
+                `Disk reads (${diskReads}) should be significantly less than uncached (files=${fileCount}, worst case ${fileCount * 8}+)`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('op cache survives errors in methods (try/finally)', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-opcache-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'test.js'), 'function foo() {}\n');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // about() with non-existent symbol should not leave cache dangling
+            index.about('zzz_nonexistent_xyz');
+            assert.strictEqual(index._opContentCache, null, 'Cache should be cleaned up even after non-match');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('nested _beginOp calls do not reset cache', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-opcache-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'test.js'), 'function foo() { bar(); }\nfunction bar() {}\n');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const filePath = path.join(tmpDir, 'test.js');
+
+            index._beginOp();
+            index._readFile(filePath);
+            assert.strictEqual(index._opContentCache.size, 1, 'Should have 1 entry');
+
+            // Nested _beginOp should NOT reset the cache
+            index._beginOp();
+            assert.strictEqual(index._opContentCache.size, 1, 'Nested beginOp should not reset cache');
+            index._endOp();
+            // After first endOp, cache is cleared (outermost owns it)
+            // This is acceptable — inner methods just don't call _endOp
+            // The design is: only top-level method clears
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
 // ============================================================================
 // REGRESSION TESTS: Go-specific bug fixes (2026-02)
 // ============================================================================
@@ -9965,6 +10123,27 @@ describe('Regression: F-001 matchesFilters boundary matching', () => {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     });
+    it('matchesFilters caches compiled regexes across calls', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-regex-cache-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'src.js'), 'function foo() {}');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // First call should create the cache
+            index.matchesFilters('src/foo.js', { exclude: ['test', 'mock'] });
+            assert.ok(index._excludeRegexCache, 'Regex cache should be created');
+            assert.strictEqual(index._excludeRegexCache.size, 2, 'Should cache both patterns');
+
+            // Second call with same patterns should reuse cached regexes
+            const cached1 = index._excludeRegexCache.get('test');
+            index.matchesFilters('src/bar.js', { exclude: ['test', 'mock'] });
+            const cached2 = index._excludeRegexCache.get('test');
+            assert.strictEqual(cached1, cached2, 'Should reuse same regex object');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
 });
 
 // ============================================================================
@@ -10919,14 +11098,11 @@ it('FIX 99 — dead code: javaSuffixMap and filesToCheck removed', () => {
 
 it('FIX 100 — findEnclosingFunction excludes enum and trait', () => {
     const projectCode = fs.readFileSync(path.join(__dirname, '..', 'core', 'project.js'), 'utf-8');
-    // The nonCallableTypes set should include enum and trait
-    assert.ok(projectCode.includes("'enum'") && projectCode.includes("'trait'"),
-        'nonCallableTypes should include enum and trait');
-    // More specifically, check the set in findEnclosingFunction
-    const match = projectCode.match(/nonCallableTypes\s*=\s*new Set\(\[([^\]]+)\]\)/);
-    assert.ok(match, 'nonCallableTypes Set should exist');
-    assert.ok(match[1].includes("'enum'"), 'enum should be in nonCallableTypes');
-    assert.ok(match[1].includes("'trait'"), 'trait should be in nonCallableTypes');
+    // NON_CALLABLE_TYPES module constant should include enum and trait
+    const match = projectCode.match(/NON_CALLABLE_TYPES\s*=\s*new Set\(\[([^\]]+)\]\)/);
+    assert.ok(match, 'NON_CALLABLE_TYPES constant should exist');
+    assert.ok(match[1].includes("'enum'"), 'enum should be in NON_CALLABLE_TYPES');
+    assert.ok(match[1].includes("'trait'"), 'trait should be in NON_CALLABLE_TYPES');
 });
 
 it('FIX 101 — CLI positional args uses index not indexOf for duplicate args', () => {
@@ -13072,11 +13248,332 @@ describe('Interactive Mode', () => {
         });
 
         // Verify the help text includes all commands (including newly added ones)
-        const expectedCommands = ['expand', 'deadcode', 'related', 'example', 'verify', 'plan', 'stacktrace'];
+        const expectedCommands = ['expand', 'deadcode', 'related', 'example', 'verify', 'plan', 'stacktrace', 'fn', 'class', 'lines', 'graph', 'file-exports'];
         for (const cmd of expectedCommands) {
             assert.ok(result.includes(cmd), `Interactive help should list "${cmd}"`);
         }
     });
+
+    it('supports fn, class, lines, graph, file-exports commands', () => {
+        const commands = [
+            'fn formatToc',
+            'class ProjectIndex',
+            'lines 1-3 --file=core/output.js',
+            'graph core/output.js',
+            'file-exports core/output.js',
+        ];
+
+        const input = commands.join('\n') + '\nquit\n';
+        const result = execFileSync('node', [cliPath, '--interactive', '.'], {
+            input,
+            encoding: 'utf-8',
+            cwd: path.join(__dirname, '..'),
+            timeout: 30000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        assert.ok(!result.includes('Unknown command: fn'), 'fn should be recognized');
+        assert.ok(!result.includes('Unknown command: class'), 'class should be recognized');
+        assert.ok(!result.includes('Unknown command: lines'), 'lines should be recognized');
+        assert.ok(!result.includes('Unknown command: graph'), 'graph should be recognized');
+        assert.ok(!result.includes('Unknown command: file-exports'), 'file-exports should be recognized');
+        // Verify actual output happened
+        assert.ok(result.includes('formatToc'), 'fn command should output formatToc');
+        assert.ok(result.includes('ProjectIndex'), 'class command should output ProjectIndex');
+    });
+
+    it('parses flags per-command (not frozen)', () => {
+        // Run two find commands with different flags in the same session
+        const commands = [
+            'find formatToc --exact',
+            'find format',  // without --exact, should find more results
+        ];
+
+        const input = commands.join('\n') + '\nquit\n';
+        const result = execFileSync('node', [cliPath, '--interactive', '.'], {
+            input,
+            encoding: 'utf-8',
+            cwd: path.join(__dirname, '..'),
+            timeout: 30000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+
+        // The second find (without --exact) should find more results than the first
+        // Both should succeed without error
+        assert.ok(!result.includes('Error'), 'Neither find should error');
+        assert.ok(result.includes('formatToc'), 'First find should include formatToc');
+    });
+});
+
+// ============================================================================
+// JSON FORMATTERS
+// ============================================================================
+
+describe('JSON formatters', () => {
+    const output = require('../core/output');
+
+    it('formatPlanJson structures output correctly', () => {
+        const plan = {
+            found: true,
+            function: 'myFunc',
+            file: 'src/app.js',
+            startLine: 10,
+            operation: 'add-param',
+            before: { signature: 'myFunc(a, b)' },
+            after: { signature: 'myFunc(a, b, c)' },
+            totalChanges: 2,
+            filesAffected: 1,
+            changes: [
+                { file: 'src/app.js', line: 20, expression: 'myFunc(1, 2)', suggestion: 'myFunc(1, 2, undefined)', _internal: 'leaked' }
+            ]
+        };
+        const json = JSON.parse(output.formatPlanJson(plan));
+        assert.strictEqual(json.found, true);
+        assert.strictEqual(json.function, 'myFunc');
+        assert.strictEqual(json.totalChanges, 2);
+        assert.strictEqual(json.changes[0].suggestion, 'myFunc(1, 2, undefined)');
+        // Internal fields should not leak
+        assert.strictEqual(json.changes[0]._internal, undefined);
+    });
+
+    it('formatPlanJson handles not-found', () => {
+        const json = JSON.parse(output.formatPlanJson(null));
+        assert.strictEqual(json.found, false);
+    });
+
+    it('formatStackTraceJson structures output correctly', () => {
+        const result = {
+            frameCount: 1,
+            frames: [{
+                function: 'doWork',
+                file: 'src/worker.js',
+                line: 42,
+                found: true,
+                resolvedFile: '/abs/src/worker.js',
+                context: [{ line: 41, code: 'function doWork() {', isCurrent: false }, { line: 42, code: '  throw new Error();', isCurrent: true }],
+                functionInfo: { name: 'doWork', params: '', startLine: 41, endLine: 50 },
+                raw: '    at doWork (src/worker.js:42:5)'
+            }]
+        };
+        const json = JSON.parse(output.formatStackTraceJson(result));
+        assert.strictEqual(json.frameCount, 1);
+        assert.strictEqual(json.frames[0].found, true);
+        assert.strictEqual(json.frames[0].context[1].isCurrent, true);
+        assert.strictEqual(json.frames[0].functionInfo.name, 'doWork');
+    });
+
+    it('formatStackTraceJson handles empty result', () => {
+        const json = JSON.parse(output.formatStackTraceJson(null));
+        assert.strictEqual(json.frameCount, 0);
+    });
+
+    it('formatVerifyJson structures output correctly', () => {
+        const result = {
+            found: true,
+            function: 'parse',
+            file: 'src/parser.js',
+            startLine: 5,
+            signature: 'parse(input, options)',
+            expectedArgs: { min: 1, max: 2 },
+            totalCalls: 3,
+            valid: 2,
+            mismatches: 1,
+            uncertain: 0,
+            mismatchDetails: [{ file: 'src/main.js', line: 10, expression: 'parse()', expected: '1-2', actual: 0, args: [] }],
+            uncertainDetails: []
+        };
+        const json = JSON.parse(output.formatVerifyJson(result));
+        assert.strictEqual(json.found, true);
+        assert.strictEqual(json.mismatches, 1);
+        assert.strictEqual(json.mismatchDetails[0].actual, 0);
+    });
+
+    it('formatExampleJson structures output correctly', () => {
+        const result = {
+            best: {
+                relativePath: 'src/main.js',
+                line: 15,
+                content: 'parse(data, { strict: true })',
+                score: 85,
+                reasons: ['has named args', 'in src/'],
+                before: ['const data = load();'],
+                after: ['console.log(result);']
+            },
+            totalCalls: 5
+        };
+        const json = JSON.parse(output.formatExampleJson(result, 'parse'));
+        assert.strictEqual(json.found, true);
+        assert.strictEqual(json.query, 'parse');
+        assert.strictEqual(json.totalCalls, 5);
+        assert.strictEqual(json.best.score, 85);
+        assert.ok(Array.isArray(json.best.reasons));
+    });
+
+    it('formatExampleJson handles not-found', () => {
+        const json = JSON.parse(output.formatExampleJson(null, 'missing'));
+        assert.strictEqual(json.found, false);
+        assert.strictEqual(json.query, 'missing');
+    });
+
+    it('formatDeadcodeJson structures output correctly', () => {
+        const results = [
+            { name: 'unusedFn', type: 'function', file: 'src/utils.js', startLine: 10, endLine: 20 },
+            { name: 'OldClass', type: 'class', file: 'src/old.js', startLine: 1, endLine: 50, isExported: true, decorators: ['deprecated'] }
+        ];
+        results.excludedExported = 3;
+        results.excludedDecorated = 1;
+        const json = JSON.parse(output.formatDeadcodeJson(results));
+        assert.strictEqual(json.count, 2);
+        assert.strictEqual(json.excludedExported, 3);
+        assert.strictEqual(json.excludedDecorated, 1);
+        assert.strictEqual(json.symbols[0].name, 'unusedFn');
+        assert.strictEqual(json.symbols[1].decorators[0], 'deprecated');
+    });
+
+    it('example --json flag works via CLI', () => {
+        const { execFileSync } = require('child_process');
+        const cliPath = path.join(__dirname, '..', 'cli', 'index.js');
+        // Run CLI with --json flag to ensure example command goes through printOutput
+        const result = execFileSync('node', [cliPath, '.', 'example', 'formatExample', '--json'], {
+            encoding: 'utf-8',
+            cwd: path.join(__dirname, '..'),
+            timeout: 30000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        const json = JSON.parse(result);
+        // Should have structured output, not raw formatExample text
+        assert.ok(json.found !== undefined || json.query !== undefined, 'JSON output should have structured fields');
+    });
+});
+
+// ============================================================================
+// Member extraction for Go interfaces, Rust traits/enums, Java enums/interfaces
+// ============================================================================
+
+describe('Type member extraction', () => {
+    it('Go interface extracts method signatures', () => {
+        const goCode = `
+package main
+
+type Reader interface {
+    Read(p []byte) (n int, err error)
+    Close() error
+}
+`;
+        const goParser = require('../languages/go');
+        const { getParser } = require('../languages');
+        const parser = getParser('go');
+        const result = goParser.parse(goCode, parser);
+        const iface = result.classes.find(c => c.name === 'Reader');
+        assert.ok(iface, 'Reader interface should be found');
+        assert.strictEqual(iface.members.length, 2, 'Should have 2 methods');
+        assert.strictEqual(iface.members[0].name, 'Read');
+        assert.strictEqual(iface.members[0].memberType, 'method');
+        assert.ok(iface.members[0].params.includes('[]byte'), 'Read params should include []byte');
+        assert.strictEqual(iface.members[1].name, 'Close');
+    });
+
+    it('Rust enum extracts variants', () => {
+        const rustCode = `
+enum Color {
+    Red,
+    Green,
+    Blue(u8, u8, u8),
+}
+`;
+        const rustParser = require('../languages/rust');
+        const { getParser } = require('../languages');
+        const parser = getParser('rust');
+        const result = rustParser.parse(rustCode, parser);
+        const enumDef = result.classes.find(c => c.name === 'Color');
+        assert.ok(enumDef, 'Color enum should be found');
+        assert.strictEqual(enumDef.members.length, 3, 'Should have 3 variants');
+        assert.strictEqual(enumDef.members[0].name, 'Red');
+        assert.strictEqual(enumDef.members[0].memberType, 'variant');
+        assert.strictEqual(enumDef.members[2].name, 'Blue');
+        assert.ok(enumDef.members[2].params, 'Blue should have params');
+    });
+
+    it('Rust trait extracts method signatures', () => {
+        const rustCode = `
+trait Drawable {
+    fn draw(&self);
+    fn resize(&mut self, width: u32, height: u32) -> bool;
+}
+`;
+        const rustParser = require('../languages/rust');
+        const { getParser } = require('../languages');
+        const parser = getParser('rust');
+        const result = rustParser.parse(rustCode, parser);
+        const trait = result.classes.find(c => c.name === 'Drawable');
+        assert.ok(trait, 'Drawable trait should be found');
+        assert.strictEqual(trait.members.length, 2, 'Should have 2 methods');
+        assert.strictEqual(trait.members[0].name, 'draw');
+        assert.strictEqual(trait.members[0].memberType, 'method');
+        assert.strictEqual(trait.members[1].name, 'resize');
+        assert.ok(trait.members[1].returnType, 'resize should have return type');
+    });
+
+    it('Java enum extracts constants', () => {
+        const javaCode = `
+public enum Day {
+    MONDAY,
+    TUESDAY,
+    WEDNESDAY;
+
+    public String label() { return name().toLowerCase(); }
+}
+`;
+        const javaParser = require('../languages/java');
+        const { getParser } = require('../languages');
+        const parser = getParser('java');
+        const result = javaParser.parse(javaCode, parser);
+        const enumDef = result.classes.find(c => c.name === 'Day');
+        assert.ok(enumDef, 'Day enum should be found');
+        const constants = enumDef.members.filter(m => m.memberType === 'constant');
+        assert.strictEqual(constants.length, 3, 'Should have 3 constants');
+        assert.strictEqual(constants[0].name, 'MONDAY');
+        // Also check that the method is extracted
+        const methods = enumDef.members.filter(m => m.memberType === 'method');
+        assert.strictEqual(methods.length, 1, 'Should have 1 method');
+        assert.strictEqual(methods[0].name, 'label');
+    });
+
+    it('Java interface extracts method declarations', () => {
+        const javaCode = `
+public interface Comparable<T> {
+    int compareTo(T other);
+    default boolean isGreaterThan(T other) { return compareTo(other) > 0; }
+}
+`;
+        const javaParser = require('../languages/java');
+        const { getParser } = require('../languages');
+        const parser = getParser('java');
+        const result = javaParser.parse(javaCode, parser);
+        const iface = result.classes.find(c => c.name === 'Comparable');
+        assert.ok(iface, 'Comparable interface should be found');
+        assert.ok(iface.members.length >= 1, 'Should have at least 1 method');
+        const compareTo = iface.members.find(m => m.name === 'compareTo');
+        assert.ok(compareTo, 'compareTo method should be found');
+    });
+});
+
+// ============================================================================
+// Discovery: .kt removal
+// ============================================================================
+
+it('detectProjectPattern does not include .kt for Gradle/Maven projects', () => {
+    const discovery = require('../core/discovery');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-kt-'));
+    try {
+        // Create a build.gradle to trigger Java detection
+        fs.writeFileSync(path.join(tmpDir, 'build.gradle'), 'plugins {}');
+        const result = discovery.detectProjectPattern(tmpDir);
+        assert.ok(result.includes('java'), 'Should include java');
+        assert.ok(!result.includes('kt'), 'Should NOT include kt (no Kotlin parser)');
+    } finally {
+        fs.rmSync(tmpDir, { recursive: true });
+    }
 });
 
 console.log('UCN v3 Test Suite');
