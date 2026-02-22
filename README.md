@@ -1,12 +1,12 @@
 # UCN - Universal Code Navigator
 
-UCN is designed to work with large files and codebases, helping AI agents ingest exactly the data they need. Its surgical output discourages agents from cutting corners, and without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data."
+UCN gives AI agents call-graph-level understanding of code. Instead of reading entire files, agents ask structural questions like: "who calls this function", "what breaks if I change it", "what's unused", and get precise, AST-verified answers. UCN parses JS/TS, Python, Go, Rust, Java, and HTML inline scripts with tree-sitter, then exposes 28 navigation commands as a CLI tool, MCP server, or agent skill.
 
-Supported languages: JS/TS, Python, Go, Rust, Java. Also parses HTML files (inline scripts and event handlers).
+Designed for large codebases where agents waste context on reading large files. UCN's surgical output means agents spend tokens on reasoning, not on ingesting thousands of lines to find three callers, discourages agents from cutting corners, as without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data".
 
 ---
 
-## Three Ways to Use UCN
+## Three Ways to it: ucn mcp, ucn skill, ucn cli 
 
 ```
   ┌──────────────────────────────────────────────────────────────────────┐
@@ -25,9 +25,9 @@ Supported languages: JS/TS, Python, Go, Rust, Java. Also parses HTML files (inli
 
 ---
 
-## The Problem
+## How agents understand code today
 
-Typically, AI agents working with code do something like this:
+AI agents working with code typically do this:
 
 ```
   grep "functionName"      →  47 matches, 23 files
@@ -53,28 +53,7 @@ Typically, AI agents working with code do something like this:
 
 ---
 
-## The Solution
-
-UCN parses the code with tree-sitter and offers semantic navigation tools.
-
-Instead of reading entire files, ask precise questions:
-
-```
-  ┌──────────────────────────────────────┐
-  │                                      │
-  │   "Who calls this function?"         │──→  list of actual callers
-  │                                      │
-  │   "What breaks if I change this?"    │──→  every call site, with arguments
-  │                                      │
-  │   "Show me this function and         │──→  source + dependencies inline
-  │    everything it depends on"         │
-  │                                      │
-  └──────────────────────────────────────┘
-```
-
----
-
-## How It Works
+## How UCN works: tree-sitter, locally
 
 ```
   ┌──────────────────────────────────────────────┐
@@ -93,17 +72,17 @@ Instead of reading entire files, ask precise questions:
                           │
                     tree-sitter AST
                           │
-      ┌───────────────────┴─────────────────┐
-      │          Supported Languages        │
-      │ JS/TS, Python, Go, Rust, Java, HTML │
-      └─────────────────────────────────────┘
+        ┌─────────────────┴───────────────────┐
+        │          Supported Languages        │
+        │ JS/TS, Python, Go, Rust, Java, HTML │
+        └─────────────────────────────────────┘
 ```
 
 No cloud. No API keys. Parses locally, stays local.
 
 ---
 
-## Before & After
+## Before and after UCN
 
 ```
   WITHOUT UCN                              WITH UCN
@@ -141,7 +120,7 @@ No cloud. No API keys. Parses locally, stays local.
   Context spent on file contents           Context spent on reasoning
 ```
 
-After editing code:
+After editing code, before committing:
 
 ```
   WITHOUT UCN                              WITH UCN
@@ -170,7 +149,7 @@ After editing code:
 
 ---
 
-## grep vs AST
+## Text search vs AST
 
 ```
   Code: processOrder(items, user)
@@ -206,11 +185,11 @@ After editing code:
   └─────────────────────────────────────────────────────────────────┘
 ```
 
-The tradeoff: grep works on any language and any text. UCN only works on supported languages but gives structural understanding within those.
+The tradeoff: text search works on any language and any text. UCN only works on 5 languages + HTML, but gives structural understanding within those.
 
 ---
 
-## See It in Action
+## UCN commands in action
 
 Extract a function from a large file without reading it:
 
@@ -461,7 +440,7 @@ ucn --interactive                   # Multiple queries, index stays in memory
 
 ---
 
-## Workflows
+## UCN workflows
 
 Investigating a bug:
 ```bash
@@ -492,7 +471,7 @@ ucn toc                                   # Project overview
 
 ---
 
-## Limitations (and how we handle them)
+## Limitations
 
 ```
   ┌──────────────────────────┬──────────────────────────────────────────┐
@@ -500,8 +479,9 @@ ucn toc                                   # Project overview
   ├──────────────────────────┼──────────────────────────────────────────┤
   │                          │                                          │
   │  5 languages + HTML      │  JS/TS, Python, Go, Rust, Java.          │
-  │  (no C, Ruby, PHP, etc.) │  Agents fall back to grep for the rest.  │
-  │                          │  UCN complements, doesn't replace.       │
+  │  (no C, Ruby, PHP, etc.) │  Agents fall back to text search for     │
+  │                          │  the rest. UCN complements, doesn't      │
+  │                          │  replace.                                │
   │                          │                                          │
   ├──────────────────────────┼──────────────────────────────────────────┤
   │                          │                                          │
@@ -535,7 +515,7 @@ ucn toc                                   # Project overview
 
 ---
 
-## All 28 Tools
+## All 28 UCN tools
 
 ```
   UNDERSTAND                          MODIFY SAFELY
