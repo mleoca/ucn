@@ -451,6 +451,7 @@ server.registerTool(
                     includeTests: include_tests || false
                 });
                 return toolResult(output.formatDeadcode(result, {
+                    top: top || 0,
                     decoratedHint: !include_decorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
                     exportedHint: !include_exported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined
                 }));

@@ -9647,6 +9647,34 @@ it('formatDeadcode handles zero exclusions without hints', () => {
     assert.ok(text.includes('helper'), 'Should still show the result');
 });
 
+it('formatDeadcode respects --top option', () => {
+    const { formatDeadcode } = require('../core/output');
+
+    const results = [
+        { name: 'a', type: 'function', file: 'a.js', startLine: 1, endLine: 3, isExported: false },
+        { name: 'b', type: 'function', file: 'b.js', startLine: 1, endLine: 3, isExported: false },
+        { name: 'c', type: 'function', file: 'c.js', startLine: 1, endLine: 3, isExported: false },
+        { name: 'd', type: 'function', file: 'd.js', startLine: 1, endLine: 3, isExported: false },
+        { name: 'e', type: 'function', file: 'e.js', startLine: 1, endLine: 3, isExported: false }
+    ];
+    results.excludedDecorated = 0;
+    results.excludedExported = 0;
+
+    // With top=2, should show only 2 results
+    const text = formatDeadcode(results, { top: 2 });
+    assert.ok(text.includes('(showing 2)'), 'Should indicate showing 2');
+    assert.ok(text.includes('a (function)'), 'Should show first result');
+    assert.ok(text.includes('b (function)'), 'Should show second result');
+    assert.ok(!text.includes('c (function)'), 'Should not show third result');
+    assert.ok(text.includes('3 more result(s) not shown'), 'Should show hidden count');
+
+    // Without top, should show all results
+    const textAll = formatDeadcode(results);
+    assert.ok(!textAll.includes('showing'), 'Should not indicate partial results');
+    assert.ok(textAll.includes('e (function)'), 'Should show all results');
+    assert.ok(!textAll.includes('more result(s) not shown'), 'Should not show hidden hint');
+});
+
 it('deadcode Python: simple decorators NOT excluded (only attribute access)', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-dc-simple-deco-'));
     try {
