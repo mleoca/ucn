@@ -12871,6 +12871,32 @@ function unusedFn() { return 0; }
         fs.rmSync(tmpDir, { recursive: true, force: true });
     });
 
+    it('verify/impact analyzeCallSite works for HTML inline scripts', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-verify-'));
+        fs.writeFileSync(path.join(tmpDir, 'game.html'), `<html><body>
+<script>
+function checkCollision(objA, objB, threshX, threshZ) { return true; }
+function update() {
+    var hitbox = { x: 1, z: 2 };
+    if (checkCollision(p, player, hitbox.x, hitbox.z)) { return; }
+}
+</script>
+</body></html>`);
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name": "test"}');
+
+        const { ProjectIndex } = require('../core/project');
+        const index = new ProjectIndex(tmpDir);
+        index.build();
+
+        const result = index.verify('checkCollision');
+        assert.ok(result.found);
+        assert.strictEqual(result.totalCalls, 1);
+        assert.strictEqual(result.valid, 1, `Expected 1 valid call, got ${result.valid} valid, ${result.uncertain} uncertain`);
+        assert.strictEqual(result.uncertain, 0, 'dot-access args should not be uncertain');
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
     it('findCallers detects callers from HTML event handlers', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-callers-'));
         fs.writeFileSync(path.join(tmpDir, 'page.html'), `<html><body>
