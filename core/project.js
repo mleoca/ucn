@@ -3206,7 +3206,7 @@ class ProjectIndex {
             sharedCallees: []
         };
 
-        // 1. Same file functions
+        // 1. Same file functions (sorted by proximity to target)
         const fileEntry = this.files.get(def.file);
         if (fileEntry) {
             for (const sym of fileEntry.symbols) {
@@ -3218,6 +3218,10 @@ class ProjectIndex {
                     });
                 }
             }
+            // Sort by distance from target function (nearest first)
+            related.sameFile.sort((a, b) =>
+                Math.abs(a.line - def.startLine) - Math.abs(b.line - def.startLine)
+            );
         }
 
         // 2. Similar names (shared prefix/suffix, camelCase similarity)
@@ -4097,14 +4101,25 @@ class ProjectIndex {
             const language = detectLanguage(call.file);
             if (!language) return { args: null, argCount: 0 };
 
-            const parser = getParser(language);
-            if (!parser) return { args: null, argCount: 0 };
-
             // Use tree cache to avoid re-parsing the same file in batch operations
             let tree = this._treeCache?.get(call.file);
             if (!tree) {
                 const content = this._readFile(call.file);
-                tree = safeParse(parser, content);
+                // HTML files need special handling: parse script blocks as JS
+                if (language === 'html') {
+                    const htmlModule = getLanguageModule('html');
+                    const htmlParser = getParser('html');
+                    const jsParser = getParser('javascript');
+                    if (!htmlParser || !jsParser) return { args: null, argCount: 0 };
+                    const blocks = htmlModule.extractScriptBlocks(content, htmlParser);
+                    if (blocks.length === 0) return { args: null, argCount: 0 };
+                    const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
+                    tree = safeParse(jsParser, virtualJS);
+                } else {
+                    const parser = getParser(language);
+                    if (!parser) return { args: null, argCount: 0 };
+                    tree = safeParse(parser, content);
+                }
                 if (!tree) return { args: null, argCount: 0 };
                 if (!this._treeCache) this._treeCache = new Map();
                 this._treeCache.set(call.file, tree);
