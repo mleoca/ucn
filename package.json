@@ -1,6 +1,7 @@
 {
   "name": "ucn",
-  "version": "3.7.9",
+  "version": "3.7.10",
+  "mcpName": "io.github.mleoca/ucn",
   "description": "Universal Code Navigator — AST-based call graph analysis for AI agents. Find callers, trace impact, detect dead code across JS/TS, Python, Go, Rust, Java, and HTML. CLI, MCP server, and agent skill.",
   "main": "index.js",
   "bin": {

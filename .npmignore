@@ -1,0 +1,7 @@
+**/.ucn-cache/
+AGENTS.md
+CLAUDE.md
+.claude/settings.local.json
+docs/
+test/
+server.json
