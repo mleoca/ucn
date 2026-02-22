@@ -8,6 +8,10 @@ AGENTS.md
 # Local Claude settings (not the skill)
 .claude/settings.local.json
 
+# MCP registry tokens
+.mcpregistry_*
+.npmrc
+
 # Test output files
 test/bugs-report.json
 test/public-repos-bugs.json
