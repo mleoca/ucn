@@ -983,7 +983,7 @@ function runProjectCommand(rootDir, command, arg) {
             });
             printOutput(deadcodeResults,
                 output.formatDeadcodeJson,
-                r => output.formatDeadcode(r)
+                r => output.formatDeadcode(r, { top: flags.top })
             );
             break;
         }
@@ -1720,7 +1720,7 @@ Common Flags:
   --depth=N           Trace/graph depth (default: 3, also expands all children)
   --direction=X       Graph direction: imports, importers, or both (default: both)
   --all               Expand truncated sections (about, trace, graph, related)
-  --top=N             Limit results (find)
+  --top=N             Limit results (find, deadcode)
   --context=N         Lines of context around matches
   --json              Machine-readable output
   --code-only         Filter out comments and strings
@@ -2154,7 +2154,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 exclude: iflags.exclude,
                 in: iflags.in
             });
-            console.log(output.formatDeadcode(deadResult));
+            console.log(output.formatDeadcode(deadResult, { top: iflags.top }));
             break;
         }
 

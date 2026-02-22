@@ -1724,12 +1724,20 @@ function formatDeadcode(results, options = {}) {
     }
 
     const lines = [];
+    const top = options.top > 0 ? options.top : 0;
+    const showing = top > 0 ? results.slice(0, top) : results;
+    const hidden = results.length - showing.length;
+
     if (results.length > 0) {
-        lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
+        if (hidden > 0) {
+            lines.push(`Dead code: ${results.length} unused symbol(s) (showing ${showing.length})\n`);
+        } else {
+            lines.push(`Dead code: ${results.length} unused symbol(s)\n`);
+        }
     }
 
     let currentFile = null;
-    for (const item of results) {
+    for (const item of showing) {
         if (item.file !== currentFile) {
             currentFile = item.file;
             lines.push(item.file);
@@ -1745,6 +1753,10 @@ function formatDeadcode(results, options = {}) {
         }
         const hintStr = hints.length > 0 ? ` [has ${hints.join(', ')}]` : '';
         lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}`);
+    }
+
+    if (hidden > 0) {
+        lines.push(`\n${hidden} more result(s) not shown. Use --top=${results.length} or --all to see all.`);
     }
 
     // Show counts of excluded items with expansion hints
