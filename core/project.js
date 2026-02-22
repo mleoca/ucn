@@ -21,6 +21,9 @@ const UCN_VERSION = require('../package.json').version;
 // Lazy-initialized per-language keyword sets (populated on first isKeyword call)
 let LANGUAGE_KEYWORDS = null;
 
+// Symbol types that are not callable (used to filter class/struct/type declarations from call analysis)
+const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl']);
+
 /**
  * Escape special regex characters
  */
@@ -48,6 +51,35 @@ class ProjectIndex {
         this.buildTime = null;
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
+        this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
+    }
+
+    /**
+     * Read file content with per-operation caching.
+     * When an operation cache is active (_opContentCache is set), reads are
+     * cached for the duration of the operation to avoid redundant disk I/O.
+     */
+    _readFile(filePath) {
+        if (this._opContentCache) {
+            const cached = this._opContentCache.get(filePath);
+            if (cached !== undefined) return cached;
+            const content = fs.readFileSync(filePath, 'utf-8');
+            this._opContentCache.set(filePath, content);
+            return content;
+        }
+        return fs.readFileSync(filePath, 'utf-8');
+    }
+
+    /** Start a per-operation content cache scope */
+    _beginOp() {
+        if (!this._opContentCache) {
+            this._opContentCache = new Map();
+        }
+    }
+
+    /** End a per-operation content cache scope */
+    _endOp() {
+        this._opContentCache = null;
     }
 
     /**
@@ -507,8 +539,14 @@ class ProjectIndex {
         if (filters.exclude && filters.exclude.length > 0) {
             const lowerPath = filePath.toLowerCase();
             for (const pattern of filters.exclude) {
-                const escaped = pattern.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-                const regex = new RegExp(`(^|[/._\\-])${escaped}s?([/._\\-]|$)`);
+                const lowerPattern = pattern.toLowerCase();
+                let regex = this._excludeRegexCache?.get(lowerPattern);
+                if (!regex) {
+                    const escaped = lowerPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    regex = new RegExp(`(^|[/._\\-])${escaped}s?([/._\\-]|$)`);
+                    if (!this._excludeRegexCache) this._excludeRegexCache = new Map();
+                    this._excludeRegexCache.set(lowerPattern, regex);
+                }
                 if (regex.test(lowerPath)) {
                     return false;
                 }
@@ -743,7 +781,7 @@ class ProjectIndex {
             if (!this.files.has(filePath)) continue;
 
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
 
                 // Try AST-based counting first
                 const language = detectLanguage(filePath);
@@ -803,6 +841,8 @@ class ProjectIndex {
      * @returns {Array} Usages grouped as definitions, calls, imports, references
      */
     usages(name, options = {}) {
+        this._beginOp();
+        try {
         const usages = [];
 
         // Get definitions (filtered)
@@ -829,7 +869,7 @@ class ProjectIndex {
             }
 
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
                 const lines = content.split('\n');
 
                 // Try AST-based detection first
@@ -947,6 +987,7 @@ class ProjectIndex {
             }
         }
         return deduped;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -1002,6 +1043,8 @@ class ProjectIndex {
      * Get context for a symbol (callers + callees)
      */
     context(name, options = {}) {
+        this._beginOp();
+        try {
         const resolved = this.resolveSymbol(name, { file: options.file });
         let { def, definitions, warnings } = resolved;
         if (!def) {
@@ -1083,6 +1126,7 @@ class ProjectIndex {
         }
 
         return result;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -1105,14 +1149,14 @@ class ProjectIndex {
                 // mtime matches - cache is likely valid
                 if (options.includeContent) {
                     // Need content, read if not cached
-                    const content = cached.content || fs.readFileSync(filePath, 'utf-8');
+                    const content = cached.content || this._readFile(filePath);
                     return { calls: cached.calls, content };
                 }
                 return cached.calls;
             }
 
             // mtime changed or no cache - need to read and possibly reparse
-            const content = fs.readFileSync(filePath, 'utf-8');
+            const content = this._readFile(filePath);
             const hash = crypto.createHash('md5').update(content).digest('hex');
 
             // Check if content actually changed (mtime can change without content change)
@@ -1159,6 +1203,8 @@ class ProjectIndex {
      * @param {boolean} [options.includeMethods] - Include method calls (default: false)
      */
     findCallers(name, options = {}) {
+        this._beginOp();
+        try {
         const callers = [];
         const stats = options.stats;
 
@@ -1418,6 +1464,7 @@ class ProjectIndex {
         }
 
         return callers;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -1471,6 +1518,8 @@ class ProjectIndex {
      * @param {boolean} [options.includeMethods] - Include method calls (default: false)
      */
     findCallees(def, options = {}) {
+        this._beginOp();
+        try {
         try {
             // Get all calls from the file's cache (now includes enclosingFunction)
             const calls = this.getCachedCalls(def.file);
@@ -1484,9 +1533,8 @@ class ProjectIndex {
             // Only class methods are excluded — they are independently addressable symbols.
             // Calls within closures (named functions without className) ARE included as
             // callees of the parent function, since closures are part of the parent's behavior.
-            const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl']);
             const innerSymbolRanges = fileEntry ? fileEntry.symbols
-                .filter(s => !nonCallableTypes.has(s.type) &&
+                .filter(s => !NON_CALLABLE_TYPES.has(s.type) &&
                         s.className &&  // Only exclude class methods, not closures
                         s.startLine > def.startLine && s.endLine <= def.endLine &&
                         s.startLine !== def.startLine)
@@ -1853,6 +1901,7 @@ class ProjectIndex {
             // Return empty callees rather than crashing the entire query.
             return [];
         }
+        } finally { this._endOp(); }
     }
 
     /**
@@ -1869,6 +1918,8 @@ class ProjectIndex {
      * Smart extraction: function + dependencies
      */
     smart(name, options = {}) {
+        this._beginOp();
+        try {
         const { def } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
             return null;
@@ -1929,6 +1980,7 @@ class ProjectIndex {
                 uncertain: stats.uncertain
             }
         };
+        } finally { this._endOp(); }
     }
 
     // ========================================================================
@@ -1940,7 +1992,7 @@ class ProjectIndex {
      */
     getLineContent(filePath, lineNum) {
         try {
-            const content = fs.readFileSync(filePath, 'utf-8');
+            const content = this._readFile(filePath);
             const lines = content.split('\n');
             return lines[lineNum - 1] || '';
         } catch (e) {
@@ -1953,7 +2005,7 @@ class ProjectIndex {
      */
     extractCode(symbol) {
         try {
-            const content = fs.readFileSync(symbol.file, 'utf-8');
+            const content = this._readFile(symbol.file);
             const lines = content.split('\n');
             const extracted = lines.slice(symbol.startLine - 1, symbol.endLine);
             cleanHtmlScriptTags(extracted, detectLanguage(symbol.file));
@@ -2113,10 +2165,9 @@ class ProjectIndex {
         const fileEntry = this.files.get(filePath);
         if (!fileEntry) return null;
 
-        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl', 'enum', 'trait']);
         let best = null;
         for (const symbol of fileEntry.symbols) {
-            if (!nonCallableTypes.has(symbol.type) &&
+            if (!NON_CALLABLE_TYPES.has(symbol.type) &&
                 symbol.startLine <= lineNum &&
                 symbol.endLine >= lineNum) {
                 if (!best || (symbol.endLine - symbol.startLine) < (best.endLine - best.startLine)) {
@@ -2145,7 +2196,7 @@ class ProjectIndex {
             if (!langModule?.findInstanceAttributeTypes) return null;
 
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
                 const parser = getParser('python');
                 fileCache = langModule.findInstanceAttributeTypes(content, parser);
                 this._attrTypeCache.set(filePath, fileCache);
@@ -2203,7 +2254,7 @@ class ProjectIndex {
         }
 
         try {
-            const content = fs.readFileSync(normalizedPath, 'utf-8');
+            const content = this._readFile(normalizedPath);
             const { imports: rawImports } = extractImports(content, fileEntry.language);
 
             return rawImports.map(imp => {
@@ -2287,7 +2338,7 @@ class ProjectIndex {
             // Find the import line
             let importLine = null;
             try {
-                const content = fs.readFileSync(importerPath, 'utf-8');
+                const content = this._readFile(importerPath);
                 const lines = content.split('\n');
                 let targetBasename = path.basename(targetPath, path.extname(targetPath));
 
@@ -2336,6 +2387,8 @@ class ProjectIndex {
      * @returns {Array} Test files and matches
      */
     tests(nameOrFile, options = {}) {
+        this._beginOp();
+        try {
         const results = [];
 
         // Check if it's a file path
@@ -2365,7 +2418,7 @@ class ProjectIndex {
 
         for (const { path: testPath, entry } of testFiles) {
             try {
-                const content = fs.readFileSync(testPath, 'utf-8');
+                const content = this._readFile(testPath);
                 const lines = content.split('\n');
                 const matches = [];
 
@@ -2409,6 +2462,7 @@ class ProjectIndex {
         }
 
         return results;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -2660,7 +2714,7 @@ class ProjectIndex {
 
         for (const [filePath, fileEntry] of this.files) {
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
                 const language = detectLanguage(filePath);
                 if (!language) continue;
 
@@ -2699,7 +2753,7 @@ class ProjectIndex {
                 const language = detectLanguage(filePath);
                 if (!language) continue;
 
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
 
                 // For HTML files, parse the virtual JS content instead of raw HTML
                 // (HTML tree-sitter sees script content as raw_text, not JS identifiers)
@@ -2776,6 +2830,8 @@ class ProjectIndex {
      * @returns {Array} Unused symbols
      */
     deadcode(options = {}) {
+        this._beginOp();
+        try {
         const results = [];
         let excludedDecorated = 0;
         let excludedExported = 0;
@@ -2967,6 +3023,7 @@ class ProjectIndex {
         results.excludedExported = excludedExported;
 
         return results;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -3069,7 +3126,7 @@ class ProjectIndex {
             if (filePath.includes('node_modules')) continue;
 
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
 
                 // Dynamic imports: import(), require(variable), __import__
                 dynamicImports += (content.match(/import\s*\([^'"]/g) || []).length;
@@ -3130,6 +3187,8 @@ class ProjectIndex {
      * @returns {object} Related functions grouped by relationship type
      */
     related(name, options = {}) {
+        this._beginOp();
+        try {
         const { def } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
             return null;
@@ -3220,19 +3279,20 @@ class ProjectIndex {
         }
 
         // 4. Shared callees - functions that call the same things
+        // Optimized: instead of computing callees for every symbol (O(N*M)),
+        // find who else calls each of our callees (O(K) where K = our callee count)
         if (def.type === 'function' || def.params !== undefined) {
-            const myCallees = new Set(this.findCallees(def).map(c => c.name));
-            if (myCallees.size > 0) {
+            const myCallees = this.findCallees(def);
+            const myCalleeNames = new Set(myCallees.map(c => c.name));
+            if (myCalleeNames.size > 0) {
                 const calleeCounts = new Map();
-                for (const [symName, symbols] of this.symbols) {
-                    if (symName === name) continue;
-                    const sym = symbols[0];
-                    if (sym.type !== 'function' && sym.params === undefined) continue;
-
-                    const theirCallees = this.findCallees(sym);
-                    const shared = theirCallees.filter(c => myCallees.has(c.name));
-                    if (shared.length > 0) {
-                        calleeCounts.set(symName, shared.length);
+                for (const calleeName of myCalleeNames) {
+                    // Find other functions that also call this callee
+                    const callers = this.findCallers(calleeName);
+                    for (const caller of callers) {
+                        if (caller.callerName && caller.callerName !== name) {
+                            calleeCounts.set(caller.callerName, (calleeCounts.get(caller.callerName) || 0) + 1);
+                        }
                     }
                 }
                 // Sort by shared callee count
@@ -3254,6 +3314,7 @@ class ProjectIndex {
         }
 
         return related;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -3265,6 +3326,8 @@ class ProjectIndex {
      * @returns {object} Call tree structure
      */
     trace(name, options = {}) {
+        this._beginOp();
+        try {
         // Sanitize depth: use default for null/undefined, clamp negative to 0
         const rawDepth = options.depth ?? 3;
         const maxDepth = Math.max(0, rawDepth);
@@ -3353,6 +3416,7 @@ class ProjectIndex {
             truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined,
             warnings: warnings.length > 0 ? warnings : undefined
         };
+        } finally { this._endOp(); }
     }
 
     /**
@@ -3364,6 +3428,8 @@ class ProjectIndex {
      * @returns {object} Impact analysis
      */
     impact(name, options = {}) {
+        this._beginOp();
+        try {
         const { def } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
             return null;
@@ -3454,6 +3520,7 @@ class ProjectIndex {
             })),
             patterns
         };
+        } finally { this._endOp(); }
     }
 
     /**
@@ -3463,6 +3530,8 @@ class ProjectIndex {
      * @returns {object} Plan with before/after signatures and affected call sites
      */
     plan(name, options = {}) {
+        this._beginOp();
+        try {
         const definitions = this.symbols.get(name);
         if (!definitions || definitions.length === 0) {
             return { found: false, function: name };
@@ -3593,6 +3662,7 @@ class ProjectIndex {
             filesAffected: new Set(changes.map(c => c.file)).size,
             changes
         };
+        } finally { this._endOp(); }
     }
 
     /**
@@ -3816,7 +3886,7 @@ class ProjectIndex {
             }
 
             try {
-                const content = fs.readFileSync(resolvedPath, 'utf-8');
+                const content = this._readFile(resolvedPath);
                 const lines = content.split('\n');
 
                 // Get the exact line
@@ -3893,6 +3963,8 @@ class ProjectIndex {
      * @returns {object} Verification results with mismatches
      */
     verify(name, options = {}) {
+        this._beginOp();
+        try {
         const { def } = this.resolveSymbol(name, { file: options.file });
         if (!def) {
             return { found: false, function: name };
@@ -4011,6 +4083,7 @@ class ProjectIndex {
             mismatchDetails: mismatches,
             uncertainDetails: uncertain
         };
+        } finally { this._endOp(); }
     }
 
     /**
@@ -4030,7 +4103,7 @@ class ProjectIndex {
             // Use tree cache to avoid re-parsing the same file in batch operations
             let tree = this._treeCache?.get(call.file);
             if (!tree) {
-                const content = fs.readFileSync(call.file, 'utf-8');
+                const content = this._readFile(call.file);
                 tree = safeParse(parser, content);
                 if (!tree) return { args: null, argCount: 0 };
                 if (!this._treeCache) this._treeCache = new Map();
@@ -4165,6 +4238,8 @@ class ProjectIndex {
      * @returns {object} Complete symbol info
      */
     about(name, options = {}) {
+        this._beginOp();
+        try {
         const maxCallers = options.all ? Infinity : (options.maxCallers || 10);
         const maxCallees = options.all ? Infinity : (options.maxCallees || 10);
         const includeMethods = options.includeMethods ?? true;
@@ -4315,6 +4390,7 @@ class ProjectIndex {
         };
 
         return result;
+        } finally { this._endOp(); }
     }
 
     /**
@@ -4323,6 +4399,8 @@ class ProjectIndex {
      * @param {object} options - { codeOnly, context }
      */
     search(term, options = {}) {
+        this._beginOp();
+        try {
         const results = [];
         // Escape the term to handle special regex characters
         const regexFlags = options.caseSensitive ? 'g' : 'gi';
@@ -4330,7 +4408,7 @@ class ProjectIndex {
 
         for (const [filePath, fileEntry] of this.files) {
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
+                const content = this._readFile(filePath);
                 const lines = content.split('\n');
                 const matches = [];
 
@@ -4422,6 +4500,7 @@ class ProjectIndex {
         }
 
         return results;
+        } finally { this._endOp(); }
     }
 
     // ========================================================================
@@ -4774,6 +4853,8 @@ class ProjectIndex {
      * @returns {{ best: object, totalCalls: number } | null}
      */
     example(name) {
+        this._beginOp();
+        try {
         const usages = this.usages(name, {
             codeOnly: true,
             exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
@@ -4823,6 +4904,7 @@ class ProjectIndex {
 
         scored.sort((a, b) => b.score - a.score);
         return { best: scored[0], totalCalls: calls.length };
+        } finally { this._endOp(); }
     }
 
     /**
@@ -4841,7 +4923,7 @@ class ProjectIndex {
             if (!language) return result;
 
             const parser = getParser(language);
-            const content = fs.readFileSync(filePath, 'utf-8');
+            const content = this._readFile(filePath);
             const tree = parser.parse(content, undefined, PARSE_OPTIONS);
 
             const row = lineNum - 1;
@@ -4900,6 +4982,8 @@ class ProjectIndex {
      * @returns {object} - { base, functions, moduleLevelChanges, newFunctions, deletedFunctions, summary }
      */
     diffImpact(options = {}) {
+        this._beginOp();
+        try {
         const { base = 'HEAD', staged = false, file } = options;
 
         // Verify git repo
@@ -5018,8 +5102,7 @@ class ProjectIndex {
                 // We approximate: if a deleted line is within the range of a known symbol, it's a modification.
                 let matched = false;
                 for (const symbol of fileEntry.symbols) {
-                    const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl', 'enum', 'trait']);
-                    if (nonCallableTypes.has(symbol.type)) continue;
+                    if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
                     // Use a generous range — deleted lines near a function likely belong to it
                     if (line >= symbol.startLine - 2 && line <= symbol.endLine + 2) {
                         const key = `${symbol.name}:${symbol.startLine}`;
@@ -5076,11 +5159,10 @@ class ProjectIndex {
                     const fileLang = detectLanguage(change.filePath);
                     if (fileLang) {
                         const oldParsed = parse(oldContent, fileLang);
-                        const nonCallableTypes = new Set(['class', 'struct', 'interface', 'type', 'state', 'impl', 'enum', 'trait']);
                         // Count current symbols by identity (name + className)
                         const currentCounts = new Map();
                         for (const s of fileEntry.symbols) {
-                            if (nonCallableTypes.has(s.type)) continue;
+                            if (NON_CALLABLE_TYPES.has(s.type)) continue;
                             const key = `${s.name}\0${s.className || ''}`;
                             currentCounts.set(key, (currentCounts.get(key) || 0) + 1);
                         }
@@ -5164,6 +5246,7 @@ class ProjectIndex {
                 affectedFiles: callerFileSet.size
             }
         };
+        } finally { this._endOp(); }
     }
 }
 

@@ -34,6 +34,7 @@ const { ProjectIndex } = require('../core/project');
 const { findProjectRoot, isTestFile } = require('../core/discovery');
 const { detectLanguage } = require('../core/parser');
 const output = require('../core/output');
+const { pickBestDefinition, addTestExclusions } = require('../core/shared');
 
 // ============================================================================
 // INDEX CACHE
@@ -98,24 +99,6 @@ function getIndex(projectDir) {
     return index;
 }
 
-function pickBestDefinition(matches) {
-    const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
-    const scored = matches.map(m => {
-        let score = 0;
-        const rp = m.relativePath || '';
-        if (typeOrder.has(m.type)) score += 1000;
-        if (isTestFile(rp, detectLanguage(m.file))) score -= 500;
-        if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
-        if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
-        if (m.startLine && m.endLine) {
-            score += Math.min(m.endLine - m.startLine, 100);
-        }
-        return { match: m, score };
-    });
-    scored.sort((a, b) => b.score - a.score);
-    return scored[0].match;
-}
-
 // ============================================================================
 // SERVER SETUP
 // ============================================================================
@@ -128,13 +111,6 @@ const server = new McpServer({
 // ============================================================================
 // TOOL HELPERS
 // ============================================================================
-
-function addTestExclusions(exclude) {
-    const testPatterns = ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'];
-    const existing = new Set((exclude || []).map(e => e.toLowerCase()));
-    const additions = testPatterns.filter(p => !existing.has(p));
-    return [...(exclude || []), ...additions];
-}
 
 function parseExclude(excludeStr) {
     if (!excludeStr) return [];
@@ -330,6 +306,7 @@ server.registerTool(
                     file,
                     exclude: parseExclude(exclude)
                 });
+                if (!ctx) return toolResult(`Symbol "${name}" not found.`);
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.'
                 });
@@ -371,6 +348,7 @@ server.registerTool(
                     includeMethods: include_methods,
                     includeUncertain: include_uncertain || false
                 });
+                if (!result) return toolResult(`Function "${name}" not found.`);
                 return toolResult(output.formatSmart(result));
             }
 
@@ -389,7 +367,9 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                return toolResult(output.formatExample(index.example(name), name));
+                const exResult = index.example(name);
+                if (!exResult) return toolResult(`No usage examples found for "${name}".`);
+                return toolResult(output.formatExample(exResult, name));
             }
 
             case 'related': {
@@ -397,6 +377,7 @@ server.registerTool(
                 if (err) return err;
                 const index = getIndex(project_dir);
                 const result = index.related(name, { file, top, all: top !== undefined });
+                if (!result) return toolResult(`Symbol "${name}" not found.`);
                 return toolResult(output.formatRelated(result, {
                     showAll: top !== undefined,
                     top,

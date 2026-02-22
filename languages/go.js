@@ -183,12 +183,16 @@ function findClasses(code, parser) {
                         // Check if exported
                         const isExported = /^[A-Z]/.test(name);
 
+                        const members = typeKind === 'struct' ? extractStructFields(typeNode, code)
+                            : typeKind === 'interface' ? extractInterfaceMembers(typeNode, code)
+                            : [];
+
                         types.push({
                             name,
                             startLine,
                             endLine,
                             type: typeKind,
-                            members: typeKind === 'struct' ? extractStructFields(typeNode, code) : [],
+                            members,
                             modifiers: isExported ? ['export'] : [],
                             ...(docstring && { docstring }),
                             ...(typeParams && { generics: typeParams })
@@ -233,6 +237,62 @@ function extractStructFields(structNode, code) {
     }
 
     return fields;
+}
+
+/**
+ * Extract interface method signatures
+ */
+function extractInterfaceMembers(interfaceNode, code) {
+    const members = [];
+    for (let i = 0; i < interfaceNode.namedChildCount; i++) {
+        const child = interfaceNode.namedChild(i);
+        // tree-sitter Go uses method_elem (or method_spec in older versions)
+        if (child.type === 'method_elem' || child.type === 'method_spec') {
+            const { startLine, endLine } = nodeToLocation(child, code);
+            // Name is in a field_identifier child
+            let nameText = null;
+            let paramsText = null;
+            let returnType = null;
+            for (let j = 0; j < child.namedChildCount; j++) {
+                const sub = child.namedChild(j);
+                if (sub.type === 'field_identifier' || sub.type === 'type_identifier') {
+                    if (!nameText) nameText = sub.text;
+                } else if (sub.type === 'parameter_list') {
+                    if (!paramsText) {
+                        paramsText = sub.text.slice(1, -1); // strip parens
+                    } else {
+                        // Second parameter_list is the return type tuple
+                        returnType = sub.text;
+                    }
+                }
+            }
+            // Also check childForFieldName for compatibility
+            if (!nameText) {
+                const nameNode = child.childForFieldName('name');
+                if (nameNode) nameText = nameNode.text;
+            }
+            if (!returnType) {
+                // Single return type (not a tuple) is a type_identifier
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const sub = child.namedChild(j);
+                    if (sub.type === 'type_identifier' && sub.text !== nameText) {
+                        returnType = sub.text;
+                    }
+                }
+            }
+            if (nameText) {
+                members.push({
+                    name: nameText,
+                    startLine,
+                    endLine,
+                    memberType: 'method',
+                    ...(paramsText !== null && { params: paramsText }),
+                    ...(returnType && { returnType })
+                });
+            }
+        }
+    }
+    return members;
 }
 
 /**
