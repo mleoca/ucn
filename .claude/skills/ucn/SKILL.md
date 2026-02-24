@@ -63,10 +63,11 @@ Shows the entire pipeline — what `generate_report` calls, what those functions
 
 ### 4. `fn` / `class` — Extract without reading the whole file
 
-Pull one function or class out of a large file. Saves hundreds of lines of context window.
+Pull one or more functions out of a large file. Supports comma-separated names for bulk extraction.
 
 ```bash
 ucn fn handle_request --file=api    # --file disambiguates when name exists in multiple files
+ucn fn parse,format,validate        # Extract multiple functions in one call
 ucn class MarketDataFetcher
 ```
 
@@ -89,6 +90,9 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Understanding a file's role in the project | `ucn imports <file>` | What it depends on |
 | Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
 | Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
+| Find by glob pattern | `ucn find "handle*"` | Locate definitions matching a glob (supports * and ?) |
+| Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |
+| Text search filtered | `ucn search term --exclude=test` | Search only in matching files |
 | Finding all usages (not just calls) | `ucn usages <name>` | Groups into: definitions, calls, imports, type references |
 | Finding sibling/related functions | `ucn related <name>` | Name-based + structural matching (same file, shared deps). Not semantic — best for parse/format pairs |
 | Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |

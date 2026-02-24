@@ -13630,5 +13630,118 @@ it('detectProjectPattern does not include .kt for Gradle/Maven projects', () => 
     }
 });
 
+// ============================================================================
+// FEATURE TESTS: search exclude/in, bulk fn, find glob
+// ============================================================================
+
+describe('Feature: search with exclude and in filters', () => {
+    it('search --exclude filters out matching files', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-search-excl-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), 'const x = "hello world";\n');
+            fs.mkdirSync(path.join(tmpDir, 'test'));
+            fs.writeFileSync(path.join(tmpDir, 'test', 'app.test.js'), 'const y = "hello world";\n');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // Without exclude: both files
+            const all = index.search('hello');
+            assert.strictEqual(all.length, 2, 'Should find in both files');
+
+            // With exclude=test: only app.js
+            const filtered = index.search('hello', { exclude: ['test'] });
+            assert.strictEqual(filtered.length, 1, 'Should find in 1 file after exclude');
+            assert.ok(filtered[0].file.includes('app.js'), 'Should be app.js');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+
+    it('search --in filters to matching directory', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-search-in-'));
+        try {
+            fs.mkdirSync(path.join(tmpDir, 'src'));
+            fs.mkdirSync(path.join(tmpDir, 'lib'));
+            fs.writeFileSync(path.join(tmpDir, 'src', 'a.js'), 'const x = "target";\n');
+            fs.writeFileSync(path.join(tmpDir, 'lib', 'b.js'), 'const y = "target";\n');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const filtered = index.search('target', { in: 'src' });
+            assert.strictEqual(filtered.length, 1, 'Should find in 1 file with --in');
+            assert.ok(filtered[0].file.includes('src'), 'Should be in src/');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+});
+
+describe('Feature: bulk fn extraction (comma-separated)', () => {
+    it('extracts multiple functions from project index', () => {
+        const index = new ProjectIndex('.');
+        index.build(null, { quiet: true });
+
+        // extractFunction is file-level; bulk is CLI/MCP level
+        // Test that find works for each name in a comma-split
+        const names = 'escapeRegExp,parseExclude';
+        const fnNames = names.split(',').map(n => n.trim());
+        for (const fnName of fnNames) {
+            const matches = index.find(fnName).filter(m => m.type === 'function' || m.params !== undefined);
+            assert.ok(matches.length > 0, `Should find function "${fnName}"`);
+        }
+    });
+});
+
+describe('Feature: find with glob patterns', () => {
+    it('finds functions matching glob pattern with *', () => {
+        const index = new ProjectIndex('.');
+        index.build(null, { quiet: true });
+
+        const results = index.find('format*Json');
+        assert.ok(results.length > 5, `Should find multiple format*Json functions, got ${results.length}`);
+        for (const r of results) {
+            assert.ok(r.name.startsWith('format') && r.name.endsWith('Json'),
+                `${r.name} should match format*Json`);
+        }
+    });
+
+    it('finds functions matching glob pattern with ?', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-glob-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function getData() { return 1; }
+function getDate() { return 2; }
+function getNode() { return 3; }
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const results = index.find('getDat?');
+            assert.strictEqual(results.length, 2, 'Should find getData and getDate');
+            const names = results.map(r => r.name).sort();
+            assert.deepStrictEqual(names, ['getData', 'getDate']);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+
+    it('glob pattern does not activate with --exact', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-glob-exact-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function getData() { return 1; }
+function getDate() { return 2; }
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const results = index.find('getDat*', { exact: true });
+            assert.strictEqual(results.length, 0, 'Glob should not activate with --exact');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

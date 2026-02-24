@@ -901,7 +901,16 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
-            extractFunctionFromProject(index, arg);
+            // Support comma-separated names for bulk extraction
+            if (arg.includes(',')) {
+                const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
+                for (let i = 0; i < fnNames.length; i++) {
+                    if (i > 0) console.log('');
+                    extractFunctionFromProject(index, fnNames[i]);
+                }
+            } else {
+                extractFunctionFromProject(index, arg);
+            }
             break;
         }
 
@@ -1006,7 +1015,8 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'search': {
             requireArg(arg, 'Usage: ucn . search <term>');
-            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive });
+            const searchExclude = flags.includeTests ? flags.exclude : addTestExclusions(flags.exclude);
+            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive, exclude: searchExclude, in: flags.in });
             printOutput(searchResults,
                 r => output.formatSearchJson(r, arg),
                 r => output.formatSearch(r, arg)
@@ -1673,16 +1683,16 @@ UNDERSTAND CODE (UCN's strength - semantic analysis)
 ═══════════════════════════════════════════════════════════════════════════════
 FIND CODE
 ═══════════════════════════════════════════════════════════════════════════════
-  find <name>         Find symbol definitions (top 5 by usage count)
+  find <name>         Find symbol definitions (supports glob: find "handle*")
   usages <name>       All usages grouped: definitions, calls, imports, references
   toc                 Table of contents (compact; --detailed lists all symbols)
-  search <term>       Text search (for simple patterns, consider grep instead)
+  search <term>       Text search (--context=N, --exclude=, --in=)
   tests <name>        Find test files for a function
 
 ═══════════════════════════════════════════════════════════════════════════════
 EXTRACT CODE
 ═══════════════════════════════════════════════════════════════════════════════
-  fn <name>           Extract function (--file to disambiguate)
+  fn <name>[,n2,...]  Extract function(s) (comma-separated for bulk, --file)
   class <name>        Extract class
   lines <range>       Extract line range (e.g., lines 50-100)
   expand <N>          Show code for item N from context output
@@ -1789,7 +1799,7 @@ function runInteractive(rootDir) {
             console.log(`
 Commands:
   toc                    Project overview (--detailed)
-  find <name>            Find symbol (--exact, --file=)
+  find <name>            Find symbol (--exact, glob: "handle*")
   about <name>           Everything about a symbol
   usages <name>          All usages grouped by type
   context <name>         Callers + callees
@@ -1799,7 +1809,7 @@ Commands:
   trace <name>           Call tree (--depth=N)
   example <name>         Best usage example
   related <name>         Sibling functions
-  fn <name>              Extract function code (--file=)
+  fn <name>[,n2,...]     Extract function(s) (--file=)
   class <name>           Extract class code (--file=)
   lines <range>          Extract lines (--file= required)
   graph <file>           File dependency tree (--direction=, --depth=)
@@ -1807,7 +1817,7 @@ Commands:
   imports <file>         What file imports
   exporters <file>       Who imports file
   tests <name>           Find tests (--calls-only)
-  search <term>          Text search (--code-only, --case-sensitive)
+  search <term>          Text search (--context=N, --exclude=, --in=)
   typedef <name>         Find type definitions
   deadcode               Find unused functions/classes
   verify <name>          Check call sites match signature
@@ -1994,10 +2004,19 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
 
         case 'fn': {
             if (!arg) {
-                console.log('Usage: fn <name> [--file=<pattern>]');
+                console.log('Usage: fn <name>[,name2,...] [--file=<pattern>]');
                 return;
             }
-            extractFunctionFromProject(index, arg, iflags);
+            // Support comma-separated names for bulk extraction
+            if (arg.includes(',')) {
+                const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
+                for (let i = 0; i < fnNames.length; i++) {
+                    if (i > 0) console.log('');
+                    extractFunctionFromProject(index, fnNames[i], iflags);
+                }
+            } else {
+                extractFunctionFromProject(index, arg, iflags);
+            }
             break;
         }
 
@@ -2085,7 +2104,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: search <term>');
                 return;
             }
-            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context });
+            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context, exclude: iflags.exclude, in: iflags.in });
             console.log(output.formatSearch(results, arg));
             break;
         }
