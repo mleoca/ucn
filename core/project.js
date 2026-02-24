@@ -687,6 +687,22 @@ class ProjectIndex {
     }
 
     find(name, options = {}) {
+        // Glob pattern matching (e.g., _update*, handle*Request, get?ata)
+        const isGlob = name.includes('*') || name.includes('?');
+        if (isGlob && !options.exact) {
+            const globRegex = new RegExp('^' + name.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
+            const matches = [];
+            for (const [symName, symbols] of this.symbols) {
+                if (globRegex.test(symName)) {
+                    for (const sym of symbols) {
+                        matches.push({ ...sym, _fuzzyScore: 800 });
+                    }
+                }
+            }
+            matches.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            return this._applyFindFilters(matches, options);
+        }
+
         const matches = this.symbols.get(name) || [];
 
         if (matches.length === 0 && !options.exact) {
@@ -705,7 +721,13 @@ class ProjectIndex {
             matches.push(...candidates);
         }
 
-        // Apply filters
+        return this._applyFindFilters(matches, options);
+    }
+
+    /**
+     * Apply file/exclude/in filters and usage counts to find results
+     */
+    _applyFindFilters(matches, options) {
         let filtered = matches;
 
         // Filter by file pattern
@@ -4411,7 +4433,7 @@ class ProjectIndex {
     /**
      * Search for text across the project
      * @param {string} term - Search term
-     * @param {object} options - { codeOnly, context }
+     * @param {object} options - { codeOnly, context, caseSensitive, exclude, in }
      */
     search(term, options = {}) {
         this._beginOp();
@@ -4422,6 +4444,12 @@ class ProjectIndex {
         const regex = new RegExp(escapeRegExp(term), regexFlags);
 
         for (const [filePath, fileEntry] of this.files) {
+            // Apply exclude/in filters
+            if ((options.exclude && options.exclude.length > 0) || options.in) {
+                if (!this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude, in: options.in })) {
+                    continue;
+                }
+            }
             try {
                 const content = this._readFile(filePath);
                 const lines = content.split('\n');

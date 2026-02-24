@@ -193,15 +193,15 @@ UNDERSTANDING CODE:
 - related <name>: Sibling functions: same file, similar names, or shared callers/callees. Find companions to update together (e.g., serialize when you're changing deserialize). Name-based, not semantic.
 
 FINDING CODE:
-- find <name>: Locate definitions ranked by usage count. Use when you know the name but not the file.
+- find <name>: Locate definitions ranked by usage count. Supports glob patterns (e.g. find "handle*" or "_update*"). Use when you know the name but not the file.
 - usages <name>: See every usage organized by type: definitions, calls, imports, references. Complete picture of how something is used. Use code_only=true to skip comments/strings.
 - toc: Get a quick overview of a project you haven't seen before — file counts, line counts, function/class counts, entry points. Use detailed=true for full symbol listing.
-- search <term>: Plain text search (like grep, respects .gitignore). For TODOs, error messages, config keys. Search is case-insensitive by default; set case_sensitive=true for exact case.
+- search <term>: Plain text search (like grep, respects .gitignore). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case.
 - tests <name>: Find test files covering a function, test case names, and how it's called in tests. Use before modifying or to find test patterns to follow.
 - deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
 
 EXTRACTING CODE (use instead of reading entire files):
-- fn <name>: Extract one function's source. Use file to disambiguate (e.g. file="parser" for parser.js).
+- fn <name>: Extract one or more functions. Comma-separated for bulk extraction (e.g. "parse,format,validate"). Use file to disambiguate.
 - class <name>: Extract a class/struct/interface with all its methods. Handles all supported types: JS/TS, Python, Go, Rust, Java. Large classes (>200 lines) show summary; use max_lines for truncated source.
 - lines: Extract specific lines (e.g. range="10-20" or just "15"). Requires file and range. Use when you know the exact line range you need.
 - expand <item>: Drill into a numbered item from the last context result (requires running context first in the same session). Context returns numbered callers/callees — use this to see their full source code.
@@ -237,7 +237,7 @@ server.registerTool(
                 'api', 'stats', 'diff_impact', 'stacktrace'
             ]),
             project_dir: z.string().describe('Absolute or relative path to the project root directory'),
-            name: z.string().optional().describe('Symbol name to analyze (function, class, method, etc.)'),
+            name: z.string().optional().describe('Symbol name to analyze. For fn: comma-separated for bulk (e.g. "parse,format"). For find: supports glob patterns (e.g. "handle*").'),
             file: z.string().optional().describe('File path (imports/exporters/graph/file_exports/lines/api/diff_impact) or filter pattern for disambiguation (e.g. "parser", "src/core")'),
             exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
@@ -425,10 +425,13 @@ server.registerTool(
                     return toolError('Search term is required.');
                 }
                 const index = getIndex(project_dir);
+                const searchExclude = include_tests ? parseExclude(exclude) : addTestExclusions(parseExclude(exclude));
                 const result = index.search(term, {
                     codeOnly: code_only || false,
                     context: ctxLines || 0,
-                    caseSensitive: case_sensitive || false
+                    caseSensitive: case_sensitive || false,
+                    exclude: searchExclude,
+                    in: inPath || undefined
                 });
                 return toolResult(output.formatSearch(result, term));
             }
@@ -465,26 +468,34 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const matches = index.find(name, { file }).filter(m => m.type === 'function' || m.params !== undefined);
 
-                if (matches.length === 0) {
-                    return toolResult(`Function "${name}" not found.`);
+                // Support comma-separated names for bulk extraction
+                const fnNames = name.includes(',') ? name.split(',').map(n => n.trim()).filter(Boolean) : [name];
+                const parts = [];
+
+                for (const fnName of fnNames) {
+                    const matches = index.find(fnName, { file }).filter(m => m.type === 'function' || m.params !== undefined);
+
+                    if (matches.length === 0) {
+                        parts.push(`Function "${fnName}" not found.`);
+                        continue;
+                    }
+
+                    const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
+                    const fnPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
+                    if (typeof fnPathCheck !== 'string') return fnPathCheck;
+                    const code = fs.readFileSync(match.file, 'utf-8');
+                    const codeLines = code.split('\n');
+                    const fnCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
+
+                    let note = '';
+                    if (matches.length > 1 && !file) {
+                        note = `Note: Found ${matches.length} definitions for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n`;
+                    }
+                    parts.push(note + output.formatFn(match, fnCode));
                 }
 
-                const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
-                // Validate file is within project root
-                const fnPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
-                if (typeof fnPathCheck !== 'string') return fnPathCheck;
-                const code = fs.readFileSync(match.file, 'utf-8');
-                const codeLines = code.split('\n');
-                const fnCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
-
-                let note = '';
-                if (matches.length > 1 && !file) {
-                    note = `Note: Found ${matches.length} definitions for "${name}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n\n`;
-                }
-
-                return toolResult(note + output.formatFn(match, fnCode));
+                return toolResult(parts.join('\n\n'));
             }
 
             case 'class': {
