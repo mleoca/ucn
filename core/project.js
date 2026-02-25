@@ -4442,7 +4442,18 @@ class ProjectIndex {
         let filesScanned = 0;
         let filesSkipped = 0;
         const regexFlags = options.caseSensitive ? 'g' : 'gi';
-        const regex = options.regex ? new RegExp(term, regexFlags) : new RegExp(escapeRegExp(term), regexFlags);
+        const useRegex = options.regex !== false; // Default: regex ON
+        let regex;
+        if (useRegex) {
+            try {
+                regex = new RegExp(term, regexFlags);
+            } catch (e) {
+                // Invalid regex — fall back to plain text
+                regex = new RegExp(escapeRegExp(term), regexFlags);
+            }
+        } else {
+            regex = new RegExp(escapeRegExp(term), regexFlags);
+        }
 
         for (const [filePath, fileEntry] of this.files) {
             // Apply exclude/in filters
@@ -4465,7 +4476,7 @@ class ProjectIndex {
                         try {
                             const parser = getParser(language);
                             const { findMatchesWithASTFilter } = require('../languages/utils');
-                            const astMatches = findMatchesWithASTFilter(content, term, parser, { codeOnly: true, regex: options.regex });
+                            const astMatches = findMatchesWithASTFilter(content, term, parser, { codeOnly: true, regex: useRegex });
 
                             for (const m of astMatches) {
                                 const match = {

@@ -83,8 +83,8 @@ const flags = {
     // Diff-impact options
     base: args.find(a => a.startsWith('--base='))?.split('=')[1] || null,
     staged: args.includes('--staged'),
-    // Regex search mode
-    regex: args.includes('--regex'),
+    // Regex search mode (default: ON; --no-regex to force plain text)
+    regex: args.includes('--no-regex') ? false : undefined,
     // Stats: per-function line counts
     functions: args.includes('--functions')
 };
@@ -106,7 +106,7 @@ const knownFlags = new Set([
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged',
-    '--regex', '--functions'
+    '--regex', '--no-regex', '--functions'
 ]);
 
 // Handle help flag
@@ -1514,7 +1514,13 @@ function findInGlobFiles(files, name) {
 
 function searchGlobFiles(files, term) {
     const results = [];
-    const regex = flags.regex ? new RegExp(term, flags.caseSensitive ? '' : 'i') : new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
+    const useRegex = flags.regex !== false; // Default: regex ON
+    let regex;
+    if (useRegex) {
+        try { regex = new RegExp(term, flags.caseSensitive ? '' : 'i'); } catch (e) { regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i'); }
+    } else {
+        regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
+    }
 
     for (const file of files) {
         try {
@@ -1565,7 +1571,13 @@ function searchGlobFiles(files, term) {
 // ============================================================================
 
 function searchFile(filePath, lines, term) {
-    const regex = flags.regex ? new RegExp(term, flags.caseSensitive ? '' : 'i') : new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
+    const useRegex = flags.regex !== false;
+    let regex;
+    if (useRegex) {
+        try { regex = new RegExp(term, flags.caseSensitive ? '' : 'i'); } catch (e) { regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i'); }
+    } else {
+        regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
+    }
     const matches = [];
 
     lines.forEach((line, idx) => {
@@ -1694,7 +1706,7 @@ FIND CODE
   find <name>         Find symbol definitions (supports glob: find "handle*")
   usages <name>       All usages grouped: definitions, calls, imports, references
   toc                 Table of contents (compact; --detailed lists all symbols)
-  search <term>       Text search (--context=N, --exclude=, --in=, --regex)
+  search <term>       Text search (regex default, --context=N, --exclude=, --in=)
   tests <name>        Find test files for a function
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1747,7 +1759,7 @@ Common Flags:
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
   --include-exported  Include exported symbols in deadcode
-  --regex             Use search term as a regex pattern
+  --no-regex          Force plain text search (regex is default)
   --functions         Show per-function line counts (stats command)
   --include-decorated Include decorated/annotated symbols in deadcode
   --exact             Exact name match only (find)
@@ -1908,7 +1920,7 @@ function parseInteractiveFlags(tokens) {
         base: tokens.find(a => a.startsWith('--base='))?.split('=')[1] || null,
         staged: tokens.includes('--staged'),
         maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null,
-        regex: tokens.includes('--regex'),
+        regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions'),
     };
 }

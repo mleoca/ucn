@@ -13815,10 +13815,10 @@ function handleResponse(res) {
         }
     });
 
-    it('plain text mode escapes regex special chars (existing behavior)', () => {
+    it('plain text mode (regex=false) escapes regex special chars', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
-            const results = idx.search('x + count');
+            const results = idx.search('x + count', { regex: false });
             const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
             assert.ok(matches >= 1, 'Should find literal "x + count"');
         } finally {
@@ -13826,12 +13826,35 @@ function handleResponse(res) {
         }
     });
 
-    it('invalid regex throws error', () => {
+    it('invalid regex auto-falls back to plain text', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
-            assert.throws(() => idx.search('[invalid', { regex: true }),
-                /Invalid regular expression/,
-                'Should throw on invalid regex');
+            // process( is invalid regex — should not throw, falls back to plain text
+            const results = idx.search('process(');
+            assert.ok(Array.isArray(results), 'Should return results array, not throw');
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('regex is default — no flag needed for patterns', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            // Should work as regex without explicit regex:true
+            const results = idx.search('handle\\w+');
+            const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(matches >= 2, `Should find handle* functions by default (found ${matches})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('invalid regex falls back to plain text (does not throw)', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            assert.doesNotThrow(() => idx.search('[invalid'));
+            const results = idx.search('[invalid');
+            assert.ok(Array.isArray(results), 'Should return array (fallback to plain text)');
         } finally {
             fs.rmSync(dir, { recursive: true });
         }
