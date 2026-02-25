@@ -1924,20 +1924,25 @@ function formatGraph(graph, options = {}) {
  * Format search command output
  */
 function formatSearch(results, term) {
+    const meta = results.meta;
+    const fallbackNote = meta && meta.regexFallback
+        ? `\nNote: Invalid regex (${meta.regexFallback}). Fell back to plain text search.`
+        : '';
+
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
     if (totalMatches === 0) {
-        const meta = results.meta;
         if (meta) {
             const scope = meta.filesSkipped > 0
                 ? `Searched ${meta.filesScanned} of ${meta.totalFiles} files (${meta.filesSkipped} excluded by filters).`
                 : `Searched ${meta.filesScanned} files.`;
-            return `No matches found for "${term}". ${scope}`;
+            return `No matches found for "${term}". ${scope}${fallbackNote}`;
         }
-        return `No matches found for "${term}"`;
+        return `No matches found for "${term}"${fallbackNote}`;
     }
 
     const lines = [];
     lines.push(`Found ${totalMatches} matches for "${term}" in ${results.length} files:`);
+    if (fallbackNote) lines.push(fallbackNote.trim());
     lines.push('═'.repeat(60));
 
     for (const result of results) {

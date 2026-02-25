@@ -13860,6 +13860,39 @@ function handleResponse(res) {
         }
     });
 
+    it('invalid regex fallback sets regexFallback in meta', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('[invalid');
+            assert.ok(results.meta, 'Results should have meta');
+            assert.ok(results.meta.regexFallback, 'meta.regexFallback should be set');
+            assert.ok(results.meta.regexFallback.includes('Invalid regular expression'),
+                `regexFallback should contain error message: "${results.meta.regexFallback}"`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('valid regex does not set regexFallback in meta', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('\\d+');
+            assert.ok(results.meta, 'Results should have meta');
+            assert.strictEqual(results.meta.regexFallback, false, 'regexFallback should be false for valid regex');
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('formatSearch shows fallback warning for invalid regex', () => {
+        const output = require('../core/output');
+        const results = [];
+        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5, regexFallback: 'Invalid regular expression: Unterminated character class' };
+        const formatted = output.formatSearch(results, '[invalid');
+        assert.ok(formatted.includes('Invalid regex'), `Should mention invalid regex: "${formatted}"`);
+        assert.ok(formatted.includes('plain text'), `Should mention plain text fallback: "${formatted}"`);
+    });
+
     it('regex mode works with case-sensitive flag', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
