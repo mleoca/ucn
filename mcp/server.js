@@ -196,7 +196,7 @@ FINDING CODE:
 - find <name>: Locate definitions ranked by usage count. Supports glob patterns (e.g. find "handle*" or "_update*"). Use when you know the name but not the file.
 - usages <name>: See every usage organized by type: definitions, calls, imports, references. Complete picture of how something is used. Use code_only=true to skip comments/strings.
 - toc: Get a quick overview of a project you haven't seen before — file counts, line counts, function/class counts, entry points. Use detailed=true for full symbol listing.
-- search <term>: Text search (like grep, respects .gitignore). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case. Set regex=true to use the term as a regex pattern (e.g. "\\d+" or "foo|bar").
+- search <term>: Text search (like grep, respects .gitignore). Supports regex by default (e.g. "\\d+" or "foo|bar"). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case. Invalid regex auto-falls back to plain text.
 - tests <name>: Find test files covering a function, test case names, and how it's called in tests. Use before modifying or to find test patterns to follow.
 - deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
 
@@ -256,8 +256,8 @@ server.registerTool(
             calls_only: z.boolean().optional().describe('Only direct calls and test-case matches (tests command)'),
             max_lines: z.number().optional().describe('Max source lines for class (large classes show summary by default)'),
             direction: z.enum(['imports', 'importers', 'both']).optional().describe('Graph direction: imports (what this file uses), importers (who uses this file), both (default: both)'),
-            term: z.string().optional().describe('Search term (plain text by default; set regex=true to use as regex pattern)'),
-            regex: z.boolean().optional().describe('Treat search term as a regex pattern (default: false, plain text)'),
+            term: z.string().optional().describe('Search term (regex by default; set regex=false to force plain text)'),
+            regex: z.boolean().optional().describe('Treat search term as a regex pattern (default: true). Set false to force plain text escaping.'),
             functions: z.boolean().optional().describe('Include per-function line counts in stats output, sorted by size (complexity audit)'),
             add_param: z.string().optional().describe('Parameter name to add (plan command)'),
             remove_param: z.string().optional().describe('Parameter name to remove (plan command)'),
@@ -434,7 +434,7 @@ server.registerTool(
                     caseSensitive: case_sensitive || false,
                     exclude: searchExclude,
                     in: inPath || undefined,
-                    regex: regex || false
+                    regex: regex
                 });
                 return toolResult(output.formatSearch(result, term));
             }

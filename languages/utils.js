@@ -417,8 +417,13 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
     const lines = content.split('\n');
     const matches = [];
 
-    // Create search pattern — use raw regex when regex mode is enabled
-    const regex = options.regex ? new RegExp(term, 'gi') : new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    // Default: regex mode ON. Use raw pattern unless regex=false.
+    let regex;
+    if (options.regex !== false) {
+        try { regex = new RegExp(term, 'gi'); } catch (e) { regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi'); }
+    } else {
+        regex = new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
+    }
 
     lines.forEach((line, idx) => {
         const lineNum = idx + 1;
