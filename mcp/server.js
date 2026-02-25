@@ -196,7 +196,7 @@ FINDING CODE:
 - find <name>: Locate definitions ranked by usage count. Supports glob patterns (e.g. find "handle*" or "_update*"). Use when you know the name but not the file.
 - usages <name>: See every usage organized by type: definitions, calls, imports, references. Complete picture of how something is used. Use code_only=true to skip comments/strings.
 - toc: Get a quick overview of a project you haven't seen before — file counts, line counts, function/class counts, entry points. Use detailed=true for full symbol listing.
-- search <term>: Plain text search (like grep, respects .gitignore). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case.
+- search <term>: Text search (like grep, respects .gitignore). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case. Set regex=true to use the term as a regex pattern (e.g. "\\d+" or "foo|bar").
 - tests <name>: Find test files covering a function, test case names, and how it's called in tests. Use before modifying or to find test patterns to follow.
 - deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
 
@@ -221,7 +221,7 @@ OTHER:
 - typedef <name>: Find type definitions matching a name: interfaces, enums, structs, traits, type aliases. See field shapes, required methods, or enum values.
 - stacktrace: Parse a stack trace, show source context per frame. Requires stack param. Handles JS, Python, Go, Rust, Java formats.
 - api: Public API surface of project or file: all exported/public symbols with signatures. Use to understand what a library exposes. Pass file to scope to one file. Python needs __all__; use toc instead.
-- stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type.`;
+- stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type. Use functions=true for per-function line counts sorted by size (complexity audit).`;
 
 server.registerTool(
     'ucn',
@@ -256,7 +256,9 @@ server.registerTool(
             calls_only: z.boolean().optional().describe('Only direct calls and test-case matches (tests command)'),
             max_lines: z.number().optional().describe('Max source lines for class (large classes show summary by default)'),
             direction: z.enum(['imports', 'importers', 'both']).optional().describe('Graph direction: imports (what this file uses), importers (who uses this file), both (default: both)'),
-            term: z.string().optional().describe('Search term (plain text, not regex)'),
+            term: z.string().optional().describe('Search term (plain text by default; set regex=true to use as regex pattern)'),
+            regex: z.boolean().optional().describe('Treat search term as a regex pattern (default: false, plain text)'),
+            functions: z.boolean().optional().describe('Include per-function line counts in stats output, sorted by size (complexity audit)'),
             add_param: z.string().optional().describe('Parameter name to add (plan command)'),
             remove_param: z.string().optional().describe('Parameter name to remove (plan command)'),
             rename_to: z.string().optional().describe('New function name (plan command)'),
@@ -276,7 +278,7 @@ server.registerTool(
                 include_exported, include_decorated, calls_only, max_lines,
                 direction, term, add_param, remove_param, rename_to,
                 default_value, stack, item, range, base, staged,
-                case_sensitive } = args;
+                case_sensitive, regex, functions } = args;
 
         try {
             switch (command) {
@@ -431,7 +433,8 @@ server.registerTool(
                     context: ctxLines || 0,
                     caseSensitive: case_sensitive || false,
                     exclude: searchExclude,
-                    in: inPath || undefined
+                    in: inPath || undefined,
+                    regex: regex || false
                 });
                 return toolResult(output.formatSearch(result, term));
             }
@@ -495,7 +498,8 @@ server.registerTool(
                     parts.push(note + output.formatFn(match, fnCode));
                 }
 
-                return toolResult(parts.join('\n\n'));
+                const separator = fnNames.length > 1 ? '\n\n' + '═'.repeat(60) + '\n\n' : '\n\n';
+                return toolResult(parts.join(separator));
             }
 
             case 'class': {
@@ -805,8 +809,8 @@ server.registerTool(
 
             case 'stats': {
                 const index = getIndex(project_dir);
-                const stats = index.getStats();
-                return toolResult(output.formatStats(stats));
+                const stats = index.getStats({ functions: functions || false });
+                return toolResult(output.formatStats(stats, { top: top || 30 }));
             }
 
             default:

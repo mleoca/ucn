@@ -92,6 +92,7 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
 | Find by glob pattern | `ucn find "handle*"` | Locate definitions matching a glob (supports * and ?) |
 | Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |
+| Regex search | `ucn search '\d+' --regex` | Search with regex patterns (alternation, character classes, etc.) |
 | Text search filtered | `ucn search term --exclude=test` | Search only in matching files |
 | Finding all usages (not just calls) | `ucn usages <name>` | Groups into: definitions, calls, imports, type references |
 | Finding sibling/related functions | `ucn related <name>` | Name-based + structural matching (same file, shared deps). Not semantic — best for parse/format pairs |
@@ -126,6 +127,8 @@ ucn [target] <command> [name] [--flags]
 | `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |
 | `--context=N` | Lines of surrounding context in `usages`/`search` output |
+| `--regex` | Use search term as a regex pattern |
+| `--functions` | Show per-function line counts in `stats` (complexity audit) |
 
 ## Workflow Integration
 

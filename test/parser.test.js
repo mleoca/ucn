@@ -13743,5 +13743,275 @@ function getDate() { return 2; }
     });
 });
 
+// ============================================================================
+// Feature: search --regex flag
+// ============================================================================
+
+describe('Feature: search --regex flag', () => {
+    function makeRegexTestIndex() {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-search-regex-'));
+        fs.writeFileSync(path.join(dir, 'app.js'), `
+function processData(x) {
+    const count = 42;
+    const total = 100;
+    const ratio = 3.14;
+    return x + count;
+}
+function handleRequest(req) {
+    const id = req.params.id;
+    return id;
+}
+function handleResponse(res) {
+    return res.status(200);
+}
+`);
+        fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"test"}');
+        const idx = new ProjectIndex(dir);
+        idx.build('**/*.js', { quiet: true });
+        return { dir, idx };
+    }
+
+    it('regex mode matches digit patterns', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('\\d+', { regex: true });
+            const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(matches >= 3, `Should find lines with numbers (found ${matches})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('regex mode matches alternation patterns', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('handleRequest|handleResponse', { regex: true });
+            const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(matches >= 2, `Should find both handle functions (found ${matches})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('regex mode matches word boundary patterns', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('\\bcount\\b', { regex: true });
+            const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(matches >= 1, `Should find "count" as whole word (found ${matches})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('regex mode matches character class patterns', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('handle[A-Z]\\w+', { regex: true });
+            const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(matches >= 2, `Should find handle* functions (found ${matches})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('plain text mode escapes regex special chars (existing behavior)', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const results = idx.search('x + count');
+            const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(matches >= 1, 'Should find literal "x + count"');
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('invalid regex throws error', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            assert.throws(() => idx.search('[invalid', { regex: true }),
+                /Invalid regular expression/,
+                'Should throw on invalid regex');
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('regex mode works with case-sensitive flag', () => {
+        const { dir, idx } = makeRegexTestIndex();
+        try {
+            const insensitive = idx.search('PROCESSDATA', { regex: true });
+            const sensitive = idx.search('PROCESSDATA', { regex: true, caseSensitive: true });
+            const insensitiveCount = insensitive.reduce((sum, r) => sum + r.matches.length, 0);
+            const sensitiveCount = sensitive.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(insensitiveCount > sensitiveCount,
+                `Case-insensitive regex (${insensitiveCount}) should find more than case-sensitive (${sensitiveCount})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+
+    it('regex mode works with codeOnly flag', () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-regex-code-'));
+        try {
+            fs.writeFileSync(path.join(dir, 'test.js'), `
+// Comment with number 42
+const x = 42;
+/* block with 100 */
+const y = 100;
+`);
+            fs.writeFileSync(path.join(dir, 'package.json'), '{"name":"test"}');
+            const idx = new ProjectIndex(dir);
+            idx.build('**/*.js', { quiet: true });
+
+            const all = idx.search('\\d+', { regex: true });
+            const codeOnly = idx.search('\\d+', { regex: true, codeOnly: true });
+            const allCount = all.reduce((sum, r) => sum + r.matches.length, 0);
+            const codeCount = codeOnly.reduce((sum, r) => sum + r.matches.length, 0);
+            assert.ok(allCount > codeCount,
+                `All matches (${allCount}) should be more than code-only (${codeCount})`);
+        } finally {
+            fs.rmSync(dir, { recursive: true });
+        }
+    });
+});
+
+// ============================================================================
+// Feature: search metadata (scope info for no-matches)
+// ============================================================================
+
+describe('Feature: search metadata in results', () => {
+    it('results include meta with filesScanned count', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-search-meta-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), 'const x = 1;\n');
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), 'const y = 2;\n');
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const results = index.search('nonexistent_term_xyz');
+            assert.ok(results.meta, 'Results should have meta property');
+            assert.strictEqual(results.meta.filesScanned, 2, 'Should have scanned 2 files');
+            assert.strictEqual(results.meta.totalFiles, 2, 'Total files should be 2');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+
+    it('meta tracks filesSkipped with exclude filter', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-search-meta2-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), 'const x = 1;\n');
+            fs.mkdirSync(path.join(tmpDir, 'test'));
+            fs.writeFileSync(path.join(tmpDir, 'test', 'app.test.js'), 'const y = 2;\n');
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            const results = index.search('nonexistent', { exclude: ['test'] });
+            assert.ok(results.meta, 'Results should have meta property');
+            assert.strictEqual(results.meta.filesScanned, 1, 'Should scan 1 file (test excluded)');
+            assert.strictEqual(results.meta.filesSkipped, 1, 'Should skip 1 file');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+
+    it('formatSearch shows scope info when no matches', () => {
+        const output = require('../core/output');
+        const results = [];
+        results.meta = { filesScanned: 15, filesSkipped: 3, totalFiles: 18 };
+        const formatted = output.formatSearch(results, 'nonexistent');
+        assert.ok(formatted.includes('Searched 15 of 18 files'), `Should mention scanned/total: "${formatted}"`);
+        assert.ok(formatted.includes('3 excluded'), `Should mention excluded: "${formatted}"`);
+    });
+
+    it('formatSearch shows simple scope when no files skipped', () => {
+        const output = require('../core/output');
+        const results = [];
+        results.meta = { filesScanned: 10, filesSkipped: 0, totalFiles: 10 };
+        const formatted = output.formatSearch(results, 'nonexistent');
+        assert.ok(formatted.includes('Searched 10 files'), `Should mention scanned count: "${formatted}"`);
+        assert.ok(!formatted.includes('excluded'), 'Should not mention excluded when none skipped');
+    });
+});
+
+// ============================================================================
+// Feature: per-function line count stats
+// ============================================================================
+
+describe('Feature: stats --functions', () => {
+    it('getStats returns functions sorted by line count', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-stats-fn-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+function shortFn() {
+    return 1;
+}
+function longFn(a, b, c) {
+    const x = a + b;
+    const y = b + c;
+    const z = x + y;
+    if (z > 10) {
+        console.log('big');
+    } else {
+        console.log('small');
+    }
+    return z;
+}
+function mediumFn(x) {
+    const result = x * 2;
+    return result;
+}
+`);
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // Without --functions: no functions array
+            const statsBasic = index.getStats();
+            assert.strictEqual(statsBasic.functions, undefined, 'Should not include functions by default');
+
+            // With --functions: sorted by line count
+            const stats = index.getStats({ functions: true });
+            assert.ok(stats.functions, 'Should include functions array');
+            assert.ok(stats.functions.length >= 3, `Should have at least 3 functions (found ${stats.functions.length})`);
+
+            // Verify sorted descending by line count
+            for (let i = 1; i < stats.functions.length; i++) {
+                assert.ok(stats.functions[i - 1].lines >= stats.functions[i].lines,
+                    `Functions should be sorted by line count desc: ${stats.functions[i - 1].name}(${stats.functions[i - 1].lines}) >= ${stats.functions[i].name}(${stats.functions[i].lines})`);
+            }
+
+            // longFn should be first (most lines)
+            assert.strictEqual(stats.functions[0].name, 'longFn', 'Longest function should be first');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true });
+        }
+    });
+
+    it('formatStats shows function listing when present', () => {
+        const output = require('../core/output');
+        const stats = {
+            root: '/test',
+            files: 2,
+            symbols: 5,
+            buildTime: 100,
+            byLanguage: { javascript: { files: 2, lines: 50, symbols: 5 } },
+            byType: { function: 3 },
+            functions: [
+                { name: 'longFn', file: 'app.js', startLine: 5, lines: 20 },
+                { name: 'mediumFn', file: 'app.js', startLine: 25, lines: 10 },
+                { name: 'shortFn', file: 'app.js', startLine: 35, lines: 3 }
+            ]
+        };
+        const formatted = output.formatStats(stats);
+        assert.ok(formatted.includes('Functions by line count'), 'Should have functions header');
+        assert.ok(formatted.includes('longFn'), 'Should list longFn');
+        assert.ok(formatted.includes('20 lines'), 'Should show line count');
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

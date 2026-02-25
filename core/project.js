@@ -4439,17 +4439,20 @@ class ProjectIndex {
         this._beginOp();
         try {
         const results = [];
-        // Escape the term to handle special regex characters
+        let filesScanned = 0;
+        let filesSkipped = 0;
         const regexFlags = options.caseSensitive ? 'g' : 'gi';
-        const regex = new RegExp(escapeRegExp(term), regexFlags);
+        const regex = options.regex ? new RegExp(term, regexFlags) : new RegExp(escapeRegExp(term), regexFlags);
 
         for (const [filePath, fileEntry] of this.files) {
             // Apply exclude/in filters
             if ((options.exclude && options.exclude.length > 0) || options.in) {
                 if (!this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude, in: options.in })) {
+                    filesSkipped++;
                     continue;
                 }
             }
+            filesScanned++;
             try {
                 const content = this._readFile(filePath);
                 const lines = content.split('\n');
@@ -4462,7 +4465,7 @@ class ProjectIndex {
                         try {
                             const parser = getParser(language);
                             const { findMatchesWithASTFilter } = require('../languages/utils');
-                            const astMatches = findMatchesWithASTFilter(content, term, parser, { codeOnly: true });
+                            const astMatches = findMatchesWithASTFilter(content, term, parser, { codeOnly: true, regex: options.regex });
 
                             for (const m of astMatches) {
                                 const match = {
@@ -4542,6 +4545,7 @@ class ProjectIndex {
             }
         }
 
+        results.meta = { filesScanned, filesSkipped, totalFiles: this.files.size };
         return results;
         } finally { this._endOp(); }
     }
@@ -4553,7 +4557,7 @@ class ProjectIndex {
     /**
      * Get project statistics
      */
-    getStats() {
+    getStats(options = {}) {
         // Count total symbols (not just unique names)
         let totalSymbols = 0;
         for (const [name, symbols] of this.symbols) {
@@ -4586,6 +4590,27 @@ class ProjectIndex {
                 }
                 stats.byType[sym.type]++;
             }
+        }
+
+        // Per-function line counts for complexity audits
+        if (options.functions) {
+            const functions = [];
+            for (const [name, symbols] of this.symbols) {
+                for (const sym of symbols) {
+                    if (sym.type === 'function' || sym.params !== undefined) {
+                        const lineCount = sym.endLine - sym.startLine + 1;
+                        const relativePath = sym.relativePath || (sym.file ? path.relative(this.root, sym.file) : '');
+                        functions.push({
+                            name: sym.className ? `${sym.className}.${sym.name}` : sym.name,
+                            file: relativePath,
+                            startLine: sym.startLine,
+                            lines: lineCount
+                        });
+                    }
+                }
+            }
+            functions.sort((a, b) => b.lines - a.lines);
+            stats.functions = functions;
         }
 
         return stats;
