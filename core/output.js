@@ -1925,7 +1925,16 @@ function formatGraph(graph, options = {}) {
  */
 function formatSearch(results, term) {
     const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
-    if (totalMatches === 0) return `No matches found for "${term}"`;
+    if (totalMatches === 0) {
+        const meta = results.meta;
+        if (meta) {
+            const scope = meta.filesSkipped > 0
+                ? `Searched ${meta.filesScanned} of ${meta.totalFiles} files (${meta.filesSkipped} excluded by filters).`
+                : `Searched ${meta.filesScanned} files.`;
+            return `No matches found for "${term}". ${scope}`;
+        }
+        return `No matches found for "${term}"`;
+    }
 
     const lines = [];
     lines.push(`Found ${totalMatches} matches for "${term}" in ${results.length} files:`);
@@ -1969,7 +1978,7 @@ function formatFileExports(exports, filePath) {
 /**
  * Format stats command output
  */
-function formatStats(stats) {
+function formatStats(stats, options = {}) {
     const lines = [];
     lines.push('PROJECT STATISTICS');
     lines.push('═'.repeat(60));
@@ -1986,6 +1995,19 @@ function formatStats(stats) {
     lines.push('\nBy Type:');
     for (const [type, count] of Object.entries(stats.byType)) {
         lines.push(`  ${type}: ${count}`);
+    }
+
+    if (stats.functions) {
+        const top = options.top || 30;
+        const shown = stats.functions.slice(0, top);
+        lines.push(`\nFunctions by line count (top ${shown.length} of ${stats.functions.length}):`);
+        for (const fn of shown) {
+            const loc = `${fn.file}:${fn.startLine}`;
+            lines.push(`  ${String(fn.lines).padStart(5)} lines  ${fn.name}  (${loc})`);
+        }
+        if (stats.functions.length > top) {
+            lines.push(`  ... ${stats.functions.length - top} more (use --top=N to show more)`);
+        }
     }
 
     return lines.join('\n');

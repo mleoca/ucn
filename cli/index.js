@@ -82,7 +82,11 @@ const flags = {
     followSymlinks: !args.includes('--no-follow-symlinks'),
     // Diff-impact options
     base: args.find(a => a.startsWith('--base='))?.split('=')[1] || null,
-    staged: args.includes('--staged')
+    staged: args.includes('--staged'),
+    // Regex search mode
+    regex: args.includes('--regex'),
+    // Stats: per-function line counts
+    functions: args.includes('--functions')
 };
 
 // Handle --file flag with space
@@ -101,7 +105,8 @@ const knownFlags = new Set([
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
-    '--base', '--staged'
+    '--base', '--staged',
+    '--regex', '--functions'
 ]);
 
 // Handle help flag
@@ -905,7 +910,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (arg.includes(',')) {
                 const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
                 for (let i = 0; i < fnNames.length; i++) {
-                    if (i > 0) console.log('');
+                    if (i > 0) console.log('\n' + '═'.repeat(60) + '\n');
                     extractFunctionFromProject(index, fnNames[i]);
                 }
             } else {
@@ -1016,7 +1021,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'search': {
             requireArg(arg, 'Usage: ucn . search <term>');
             const searchExclude = flags.includeTests ? flags.exclude : addTestExclusions(flags.exclude);
-            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive, exclude: searchExclude, in: flags.in });
+            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive, exclude: searchExclude, in: flags.in, regex: flags.regex });
             printOutput(searchResults,
                 r => output.formatSearchJson(r, arg),
                 r => output.formatSearch(r, arg)
@@ -1040,8 +1045,11 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'stats': {
-            const stats = index.getStats();
-            printOutput(stats, output.formatStatsJson, output.formatStats);
+            const stats = index.getStats({ functions: flags.functions });
+            printOutput(stats,
+                output.formatStatsJson,
+                r => output.formatStats(r, { top: flags.top })
+            );
             break;
         }
 
@@ -1506,7 +1514,7 @@ function findInGlobFiles(files, name) {
 
 function searchGlobFiles(files, term) {
     const results = [];
-    const regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
+    const regex = flags.regex ? new RegExp(term, flags.caseSensitive ? '' : 'i') : new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
 
     for (const file of files) {
         try {
@@ -1557,7 +1565,7 @@ function searchGlobFiles(files, term) {
 // ============================================================================
 
 function searchFile(filePath, lines, term) {
-    const regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
+    const regex = flags.regex ? new RegExp(term, flags.caseSensitive ? '' : 'i') : new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
     const matches = [];
 
     lines.forEach((line, idx) => {
@@ -1686,7 +1694,7 @@ FIND CODE
   find <name>         Find symbol definitions (supports glob: find "handle*")
   usages <name>       All usages grouped: definitions, calls, imports, references
   toc                 Table of contents (compact; --detailed lists all symbols)
-  search <term>       Text search (--context=N, --exclude=, --in=)
+  search <term>       Text search (--context=N, --exclude=, --in=, --regex)
   tests <name>        Find test files for a function
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1719,7 +1727,7 @@ OTHER
 ═══════════════════════════════════════════════════════════════════════════════
   api                 Show exported/public symbols
   typedef <name>      Find type definitions
-  stats               Project statistics
+  stats               Project statistics (--functions for per-function line counts)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
   example <name>      Best usage example with context
 
@@ -1739,6 +1747,8 @@ Common Flags:
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
   --include-exported  Include exported symbols in deadcode
+  --regex             Use search term as a regex pattern
+  --functions         Show per-function line counts (stats command)
   --include-decorated Include decorated/annotated symbols in deadcode
   --exact             Exact name match only (find)
   --calls-only        Only show call/test-case matches (tests)
@@ -1898,6 +1908,8 @@ function parseInteractiveFlags(tokens) {
         base: tokens.find(a => a.startsWith('--base='))?.split('=')[1] || null,
         staged: tokens.includes('--staged'),
         maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null,
+        regex: tokens.includes('--regex'),
+        functions: tokens.includes('--functions'),
     };
 }
 
@@ -2011,7 +2023,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
             if (arg.includes(',')) {
                 const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
                 for (let i = 0; i < fnNames.length; i++) {
-                    if (i > 0) console.log('');
+                    if (i > 0) console.log('\n' + '═'.repeat(60) + '\n');
                     extractFunctionFromProject(index, fnNames[i], iflags);
                 }
             } else {
@@ -2104,7 +2116,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: search <term>');
                 return;
             }
-            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context, exclude: iflags.exclude, in: iflags.in });
+            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context, exclude: iflags.exclude, in: iflags.in, regex: iflags.regex });
             console.log(output.formatSearch(results, arg));
             break;
         }
@@ -2136,8 +2148,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
         }
 
         case 'stats': {
-            const stats = index.getStats();
-            console.log(output.formatStats(stats));
+            const stats = index.getStats({ functions: iflags.functions });
+            console.log(output.formatStats(stats, { top: iflags.top }));
             break;
         }
 

@@ -417,9 +417,8 @@ function findMatchesWithASTFilter(content, term, parser, options = {}) {
     const lines = content.split('\n');
     const matches = [];
 
-    // Escape special regex characters and create pattern
-    const escapedTerm = term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    const regex = new RegExp(escapedTerm, 'gi');
+    // Create search pattern — use raw regex when regex mode is enabled
+    const regex = options.regex ? new RegExp(term, 'gi') : new RegExp(term.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'gi');
 
     lines.forEach((line, idx) => {
         const lineNum = idx + 1;
