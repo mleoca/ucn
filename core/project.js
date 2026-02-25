@@ -4444,12 +4444,14 @@ class ProjectIndex {
         const regexFlags = options.caseSensitive ? 'g' : 'gi';
         const useRegex = options.regex !== false; // Default: regex ON
         let regex;
+        let regexFallback = false;
         if (useRegex) {
             try {
                 regex = new RegExp(term, regexFlags);
             } catch (e) {
                 // Invalid regex — fall back to plain text
                 regex = new RegExp(escapeRegExp(term), regexFlags);
+                regexFallback = e.message;
             }
         } else {
             regex = new RegExp(escapeRegExp(term), regexFlags);
@@ -4556,7 +4558,7 @@ class ProjectIndex {
             }
         }
 
-        results.meta = { filesScanned, filesSkipped, totalFiles: this.files.size };
+        results.meta = { filesScanned, filesSkipped, totalFiles: this.files.size, regexFallback };
         return results;
         } finally { this._endOp(); }
     }
