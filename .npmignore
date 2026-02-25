@@ -2,6 +2,8 @@
 AGENTS.md
 CLAUDE.md
 .claude/settings.local.json
+.mcpregistry_*
+.npmrc
 docs/
 test/
 server.json
