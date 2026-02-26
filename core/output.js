@@ -8,6 +8,17 @@
 const fs = require('fs');
 const path = require('path');
 
+const FILE_ERROR_MESSAGES = {
+    'file-not-found': 'File not found in project',
+    'file-ambiguous': 'Ambiguous file match'
+};
+
+function formatFileError(errorObj, fallbackPath) {
+    const msg = FILE_ERROR_MESSAGES[errorObj.error] || errorObj.error;
+    const file = errorObj.filePath || fallbackPath || '';
+    return `Error: ${msg}: ${file}`;
+}
+
 /**
  * Normalize parameters for display
  * Collapses multiline params to single line
@@ -381,7 +392,7 @@ function formatSearchJson(results, term) {
  * Format imports as JSON
  */
 function formatImportsJson(imports, filePath) {
-    if (imports?.error === 'file-not-found') return JSON.stringify({ found: false, error: 'File not found', file: imports.filePath }, null, 2);
+    if (imports?.error) return JSON.stringify({ found: false, error: imports.error, file: imports.filePath || filePath }, null, 2);
     return JSON.stringify({
         file: filePath,
         importCount: imports.length,
@@ -406,7 +417,7 @@ function formatStatsJson(stats) {
  * Format dependency graph as JSON
  */
 function formatGraphJson(graph) {
-    if (graph?.error === 'file-not-found') return JSON.stringify({ found: false, error: 'File not found', file: graph.filePath }, null, 2);
+    if (graph?.error) return JSON.stringify({ found: false, error: graph.error, file: graph.filePath }, null, 2);
     return JSON.stringify({
         file: graph.file,
         depth: graph.depth,
@@ -456,7 +467,7 @@ function formatSmartJson(result) {
  * Format imports command output - text
  */
 function formatImports(imports, filePath) {
-    if (imports?.error === 'file-not-found') return `Error: File not found in project: ${imports.filePath}`;
+    if (imports?.error) return formatFileError(imports, filePath);
     const lines = [`Imports in ${filePath}:\n`];
 
     const internal = imports.filter(i => !i.isExternal && !i.isDynamic);
@@ -505,7 +516,7 @@ function formatImports(imports, filePath) {
  * Format exporters command output - text
  */
 function formatExporters(exporters, filePath) {
-    if (exporters?.error === 'file-not-found') return `Error: File not found in project: ${exporters.filePath}`;
+    if (exporters?.error) return formatFileError(exporters, filePath);
     const lines = [`Files that import ${filePath}:\n`];
 
     if (exporters.length === 0) {
@@ -641,7 +652,7 @@ function formatDisambiguation(matches, name, command) {
  * Format exporters as JSON
  */
 function formatExportersJson(exporters, filePath) {
-    if (exporters?.error === 'file-not-found') return JSON.stringify({ found: false, error: 'File not found', file: exporters.filePath }, null, 2);
+    if (exporters?.error) return JSON.stringify({ found: false, error: exporters.error, file: exporters.filePath || filePath }, null, 2);
     return JSON.stringify({
         file: filePath,
         importerCount: exporters.length,
@@ -1815,7 +1826,7 @@ function formatGraph(graph, options = {}) {
     if (typeof options === 'boolean') {
         options = { showAll: options };
     }
-    if (graph?.error === 'file-not-found') return `Error: File not found in project: ${graph.filePath}`;
+    if (graph?.error) return formatFileError(graph);
     if (graph.nodes.length === 0) {
         const file = options.file || graph.root || '';
         return file ? `File not found: ${file}` : 'File not found.';
@@ -1985,7 +1996,7 @@ function formatSearch(results, term) {
  * Format file-exports command output
  */
 function formatFileExports(exports, filePath) {
-    if (exports?.error === 'file-not-found') return `Error: File not found in project: ${exports.filePath}`;
+    if (exports?.error) return formatFileError(exports, filePath);
     if (exports.length === 0) return `No exports found in ${filePath}`;
 
     const lines = [];

@@ -1514,6 +1514,7 @@ class ProjectIndex {
             }
 
             const tree = safeParse(parser, content);
+            if (!tree) return false;
 
             // Find all occurrences of name in the line
             const nameRegex = new RegExp('(?<![a-zA-Z0-9_$])' + escapeRegExp(name) + '(?![a-zA-Z0-9_$])', 'g');
@@ -2120,6 +2121,7 @@ class ProjectIndex {
             }
 
             const tree = safeParse(parser, content);
+            if (!tree) return false;
             const tokenType = getTokenTypeAtPosition(tree.rootNode, lineNum, column);
             return tokenType === 'comment' || tokenType === 'string';
         } catch (e) {
@@ -5009,6 +5011,7 @@ class ProjectIndex {
             const parser = getParser(language);
             const content = this._readFile(filePath);
             const tree = safeParse(parser, content);
+            if (!tree) return result;
 
             const row = lineNum - 1;
             const node = tree.rootNode.descendantForPosition({ row, column: 0 });

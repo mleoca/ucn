@@ -845,7 +845,7 @@ function findImportsInCode(code, parser) {
         if (node.type === 'macro_invocation') {
             const nameNode = node.childForFieldName('macro');
             if (nameNode && /^include(_str|_bytes)?$/.test(nameNode.text)) {
-                const argsNode = node.childForFieldName('argument_list');
+                const argsNode = node.namedChildren.find(c => c.type === 'token_tree');
                 const arg = argsNode?.namedChild(0);
                 const dynamic = !arg || arg.type !== 'string_literal';
                 const modulePath = arg ? arg.text.replace(/^["']|["']$/g, '') : null;

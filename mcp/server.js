@@ -108,6 +108,7 @@ const server = new McpServer({
 const MAX_OUTPUT_CHARS = 100000; // ~100KB, safe for all MCP clients
 
 function toolResult(text) {
+    if (!text) return { content: [{ type: 'text', text: '(no output)' }] };
     if (text.length > MAX_OUTPUT_CHARS) {
         const truncated = text.substring(0, MAX_OUTPUT_CHARS);
         // Cut at last newline to avoid breaking mid-line

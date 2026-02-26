@@ -448,6 +448,7 @@ function findCallsInCode(code, parser) {
         if (node.type === 'short_var_declaration' || node.type === 'var_declaration') {
             // Check if RHS contains a func_literal
             const hasFunc = (n) => {
+                if (!n) return false;
                 if (n.type === 'func_literal') return true;
                 for (let i = 0; i < n.childCount; i++) {
                     if (hasFunc(n.child(i))) return true;
@@ -518,7 +519,7 @@ function findCallsInCode(code, parser) {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
                 const leaving = functionStack.pop();
-                closureScopes.delete(leaving.startLine);
+                if (leaving) closureScopes.delete(leaving.startLine);
             }
         }
     });
