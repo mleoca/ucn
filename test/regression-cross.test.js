@@ -3589,3 +3589,142 @@ it('FIX 105 — all parser.parse() calls in project.js and utils.js use safePars
 
 }); // end describe FIX 91-99
 
+// ============================================================================
+// FIX 106-111: Bug Hunt — Null Safety Across Parsers, Core, Formatters
+// ============================================================================
+
+describe('FIX 106-111: Null safety bug hunt', () => {
+
+    // FIX 106: Rust include! with dynamic args — null module crashed resolveImport
+    it('fix #106: Rust include! with dynamic args does not produce null module', () => {
+        const rustParser = require('../languages/rust');
+        const { getParser } = require('../languages');
+        const parser = getParser('rust');
+        // concat! produces a non-literal argument → dynamic include
+        const code = 'include!(concat!(env!("OUT_DIR"), "/gen.rs"));\n';
+        const imports = rustParser.findImportsInCode(code, parser);
+        for (const imp of imports) {
+            assert.notStrictEqual(imp.module, null, 'No import should have module: null');
+            assert.notStrictEqual(imp.module, undefined, 'No import should have module: undefined');
+        }
+    });
+
+    // FIX 106: Defensive null guard in buildImportGraph
+    it('fix #106: buildImportGraph skips null import modules', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-null-import-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), '[package]\nname = "test"\n');
+            fs.writeFileSync(path.join(tmpDir, 'main.rs'), 'fn main() {}\n');
+            const index = new ProjectIndex(tmpDir);
+            // Should not throw even with Rust files
+            index.build('**/*.rs', { quiet: true });
+            assert.ok(index.files.size >= 1, 'Should index at least one file');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    // FIX 107: JS dynamic import() with no args — was pushing module: null
+    it('fix #107: JS dynamic import with no string arg does not produce null module', () => {
+        const jsParser = require('../languages/javascript');
+        const { getParser } = require('../languages');
+        const parser = getParser('javascript');
+        // import() with variable arg (dynamic, no literal string)
+        const code = 'const mod = await import(modulePath);\n';
+        const imports = jsParser.findImportsInCode(code, parser);
+        for (const imp of imports) {
+            assert.notStrictEqual(imp.module, null, 'No import should have module: null');
+        }
+    });
+
+    // FIX 107: JS require() with non-string arg — was pushing module: null
+    it('fix #107: JS require with non-string arg does not produce null module', () => {
+        const jsParser = require('../languages/javascript');
+        const { getParser } = require('../languages');
+        const parser = getParser('javascript');
+        // require() with dynamic arg
+        const code = 'const x = require(getPath());\n';
+        const imports = jsParser.findImportsInCode(code, parser);
+        for (const imp of imports) {
+            assert.notStrictEqual(imp.module, null, 'No import should have module: null');
+        }
+    });
+
+    // FIX 108: MCP toolResult handles null/undefined text
+    it('fix #108: MCP toolResult does not crash on null text', () => {
+        // We test this by checking the function source pattern
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        assert.ok(serverCode.includes("if (!text) return"),
+            'toolResult should have a null guard for text parameter');
+    });
+
+    // FIX 109: Output formatters handle file-ambiguous errors
+    it('fix #109: formatImports handles file-ambiguous error', () => {
+        const result = output.formatImports({ error: 'file-ambiguous', filePath: 'util.js' }, 'util.js');
+        assert.ok(result.includes('Error:'), 'Should return error string');
+        assert.ok(!result.includes('undefined'), 'Should not contain undefined');
+    });
+
+    it('fix #109: formatExporters handles file-ambiguous error', () => {
+        const result = output.formatExporters({ error: 'file-ambiguous', filePath: 'util.js' }, 'util.js');
+        assert.ok(result.includes('Error:'), 'Should return error string');
+        assert.ok(!result.includes('undefined'), 'Should not contain undefined');
+    });
+
+    it('fix #109: formatFileExports handles file-ambiguous error', () => {
+        const result = output.formatFileExports({ error: 'file-ambiguous', filePath: 'util.js' }, 'util.js');
+        assert.ok(result.includes('Error:'), 'Should return error string');
+        assert.ok(!result.includes('undefined'), 'Should not contain undefined');
+    });
+
+    it('fix #109: formatGraph handles file-ambiguous error (text)', () => {
+        const result = output.formatGraph({ error: 'file-ambiguous', filePath: 'util.js' });
+        assert.ok(result.includes('Error:'), 'Should return error string');
+    });
+
+    it('fix #109: formatImportsJson handles file-ambiguous error', () => {
+        const result = output.formatImportsJson({ error: 'file-ambiguous', filePath: 'util.js' }, 'util.js');
+        const parsed = JSON.parse(result);
+        assert.strictEqual(parsed.found, false);
+        assert.strictEqual(parsed.error, 'file-ambiguous');
+    });
+
+    it('fix #109: formatExportersJson handles file-ambiguous error', () => {
+        const result = output.formatExportersJson({ error: 'file-ambiguous', filePath: 'util.js' }, 'util.js');
+        const parsed = JSON.parse(result);
+        assert.strictEqual(parsed.found, false);
+        assert.strictEqual(parsed.error, 'file-ambiguous');
+    });
+
+    it('fix #109: formatGraphJson handles file-ambiguous error', () => {
+        const result = output.formatGraphJson({ error: 'file-ambiguous', filePath: 'util.js' });
+        const parsed = JSON.parse(result);
+        assert.strictEqual(parsed.found, false);
+        assert.strictEqual(parsed.error, 'file-ambiguous');
+    });
+
+    // FIX 110: parser.js parse() guards against null language
+    it('fix #110: parse() throws descriptive error for null language', () => {
+        assert.throws(() => parse('const x = 1;', null), /Language parameter is required/);
+        assert.throws(() => parse('const x = 1;', undefined), /Language parameter is required/);
+    });
+
+    // FIX 111: Go parser defensive guards
+    it('fix #111: Go hasFunc handles null child nodes defensively', () => {
+        const goParser = require('../languages/go');
+        const { getParser } = require('../languages');
+        const parser = getParser('go');
+        // Closure assignment should parse without crash (hasFunc traverses child nodes)
+        const code = `package main
+func main() {
+    fn := func() { println("hi") }
+    fn()
+}
+`;
+        // Should not throw — the fix guards against null nodes in hasFunc recursion
+        const calls = goParser.findCallsInCode(code, parser);
+        assert.ok(Array.isArray(calls), 'Should return array without crashing');
+    });
+});
+

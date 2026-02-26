@@ -67,6 +67,9 @@ const { detectLanguage, getParser, getLanguageModule, isSupported, PARSE_OPTIONS
  * @returns {ParseResult}
  */
 function parse(code, language) {
+    if (!language) {
+        throw new Error('Language parameter is required');
+    }
     // Detect language if file path provided
     if (language.includes('.') || language.includes('/')) {
         language = detectLanguage(language);

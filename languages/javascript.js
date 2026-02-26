@@ -1453,7 +1453,9 @@ function findImportsInCode(code, parser) {
                         }
                     }
 
-                    imports.push({ module: modulePath, names, type: 'require', line, dynamic });
+                    if (modulePath) {
+                        imports.push({ module: modulePath, names, type: 'require', line, dynamic });
+                    }
                 }
             }
 
@@ -1466,8 +1468,8 @@ function findImportsInCode(code, parser) {
                     if (firstArg && firstArg.type === 'string') {
                         const modulePath = firstArg.text.slice(1, -1);
                         imports.push({ module: modulePath, names: [], type: 'dynamic', line, dynamic: false });
-                    } else {
-                        imports.push({ module: firstArg ? firstArg.text : null, names: [], type: 'dynamic', line, dynamic: true });
+                    } else if (firstArg) {
+                        imports.push({ module: firstArg.text, names: [], type: 'dynamic', line, dynamic: true });
                     }
                 }
             }
