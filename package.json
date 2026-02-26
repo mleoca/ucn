@@ -9,7 +9,7 @@
     "ucn-mcp": "mcp/server.js"
   },
   "scripts": {
-    "test": "node --test test/parser.test.js test/accuracy.test.js test/systematic-test.js test/mcp-edge-cases.js"
+    "test": "node --test test/parser.test.js test/accuracy.test.js test/systematic-test.js test/mcp-edge-cases.js test/parity-test.js"
   },
   "keywords": [
     "mcp",
