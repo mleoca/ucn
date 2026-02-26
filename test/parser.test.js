@@ -13991,6 +13991,89 @@ describe('Feature: search metadata in results', () => {
         assert.ok(formatted.includes('Searched 10 files'), `Should mention scanned count: "${formatted}"`);
         assert.ok(!formatted.includes('excluded'), 'Should not mention excluded when none skipped');
     });
+
+    it('formatSearch uses singular "file" when 1 file matches', () => {
+        const output = require('../core/output');
+        const results = [{ file: 'test.js', matches: [{ line: 1, content: 'foo' }] }];
+        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5 };
+        const formatted = output.formatSearch(results, 'foo');
+        assert.ok(formatted.includes('in 1 file:'), `Should say "1 file" not "1 files": "${formatted}"`);
+    });
+
+    it('formatSearch uses plural "files" when multiple files match', () => {
+        const output = require('../core/output');
+        const results = [
+            { file: 'a.js', matches: [{ line: 1, content: 'foo' }] },
+            { file: 'b.js', matches: [{ line: 2, content: 'foo' }] }
+        ];
+        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5 };
+        const formatted = output.formatSearch(results, 'foo');
+        assert.ok(formatted.includes('in 2 files:'), `Should say "2 files": "${formatted}"`);
+    });
+
+    it('formatSearch uses singular "match" when 1 match found', () => {
+        const output = require('../core/output');
+        const results = [{ file: 'test.js', matches: [{ line: 1, content: 'foo' }] }];
+        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5 };
+        const formatted = output.formatSearch(results, 'foo');
+        assert.ok(formatted.includes('Found 1 match for'), `Should say "1 match" not "1 matches": "${formatted}"`);
+    });
+
+    it('detectDoubleEscaping detects double-escaped dot', () => {
+        const output = require('../core/output');
+        const hint = output.detectDoubleEscaping('CONFIG\\\\.speed');
+        assert.ok(hint.includes('\\\\.' ), `Should mention \\\\.: "${hint}"`);
+        assert.ok(hint.includes('\\.'), `Should suggest \\.: "${hint}"`);
+        assert.ok(hint.includes('single backslash'), `Should mention single backslash: "${hint}"`);
+    });
+
+    it('detectDoubleEscaping detects double-escaped \\d', () => {
+        const output = require('../core/output');
+        const hint = output.detectDoubleEscaping('\\\\d+');
+        assert.ok(hint.includes('\\\\d'), `Should mention \\\\d: "${hint}"`);
+        assert.ok(hint.includes('\\d'), `Should suggest \\d: "${hint}"`);
+    });
+
+    it('detectDoubleEscaping returns empty for normal patterns', () => {
+        const output = require('../core/output');
+        assert.strictEqual(output.detectDoubleEscaping('CONFIG.speed'), '');
+        assert.strictEqual(output.detectDoubleEscaping('foo'), '');
+        assert.strictEqual(output.detectDoubleEscaping('\\.speed'), '');
+    });
+
+    it('formatSearch shows double-escaping hint on 0 results', () => {
+        const output = require('../core/output');
+        const results = [];
+        results.meta = { filesScanned: 10, filesSkipped: 0, totalFiles: 10 };
+        const formatted = output.formatSearch(results, 'CONFIG\\\\.speed');
+        assert.ok(formatted.includes('No matches'), `Should show no matches: "${formatted}"`);
+        assert.ok(formatted.includes('Hint:'), `Should show hint: "${formatted}"`);
+        assert.ok(formatted.includes('single backslash'), `Should mention single backslash: "${formatted}"`);
+    });
+
+    it('formatSearch does not show hint when matches exist', () => {
+        const output = require('../core/output');
+        const results = [{ file: 'test.js', matches: [{ line: 1, content: 'x' }] }];
+        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5 };
+        const formatted = output.formatSearch(results, 'CONFIG\\\\.speed');
+        assert.ok(!formatted.includes('Hint:'), `Should not show hint when matches exist: "${formatted}"`);
+    });
+
+    it('formatSearch does not show hint on 0 results without double-escaping', () => {
+        const output = require('../core/output');
+        const results = [];
+        results.meta = { filesScanned: 10, filesSkipped: 0, totalFiles: 10 };
+        const formatted = output.formatSearch(results, 'nonexistent');
+        assert.ok(!formatted.includes('Hint:'), `Should not show hint for normal pattern: "${formatted}"`);
+    });
+
+    it('formatSearch scope uses singular "file" when 1 file scanned', () => {
+        const output = require('../core/output');
+        const results = [];
+        results.meta = { filesScanned: 1, filesSkipped: 0, totalFiles: 1 };
+        const formatted = output.formatSearch(results, 'nonexistent');
+        assert.ok(formatted.includes('Searched 1 file.'), `Should say "1 file" not "1 files": "${formatted}"`);
+    });
 });
 
 // ============================================================================
