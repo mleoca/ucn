@@ -199,8 +199,9 @@ class McpClient {
         const res = await this.send('tools/call', { name: 'ucn', arguments: nameOrArgs });
         if (res.error) return { error: res.error };
         const content = res.result?.content;
-        if (content && content.length > 0) return { text: content[0].text, isError: content[0].isError };
-        return { text: '', isError: false };
+        const isError = res.result?.isError === true;
+        if (content && content.length > 0) return { text: content[0].text, isError };
+        return { text: '', isError };
     }
 
     stop() {

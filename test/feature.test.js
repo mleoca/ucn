@@ -1026,7 +1026,7 @@ describe('Feature: bulk fn extraction (comma-separated)', () => {
 
         // extractFunction is file-level; bulk is CLI/MCP level
         // Test that find works for each name in a comma-split
-        const names = 'escapeRegExp,parseExclude';
+        const names = 'escapeRegExp,toolResult';
         const fnNames = names.split(',').map(n => n.trim());
         for (const fnName of fnNames) {
             const matches = index.find(fnName).filter(m => m.type === 'function' || m.params !== undefined);
@@ -1371,26 +1371,24 @@ describe('MCP parameter parity: all and top_level', () => {
         assert.ok(serverCode.includes('functions, all, top_level }'), 'Should destructure all and top_level');
     });
 
-    it('MCP about handler passes all and includeUncertain', () => {
-        // about should pass all: all || false and includeUncertain
-        assert.ok(serverCode.includes('all: all || false, maxCallers: top, maxCallees: top'),
-            'about handler should pass all parameter');
-        assert.ok(serverCode.includes('includeUncertain: include_uncertain || false, all: all || false'),
-            'about handler should pass includeUncertain');
+    it('MCP about handler passes all and includeUncertain via executor', () => {
+        // about should pass all and include_uncertain to executor via normalizeParams
+        assert.ok(serverCode.includes('with_types, all, include_methods, include_uncertain, top'),
+            'about handler should pass all and include_uncertain to executor');
     });
 
     it('MCP related handler uses explicit all parameter', () => {
         // related should NOT auto-infer all from top
         assert.ok(!serverCode.includes('all: top !== undefined'),
             'related handler should NOT auto-infer all from top');
-        // Should use explicit all parameter
-        assert.ok(serverCode.includes("index.related(name, { file, top, all: all || false })"),
-            'related handler should pass explicit all parameter');
+        // Should pass explicit all to executor
+        assert.ok(serverCode.includes("execute(index, 'related', { name, file, top, all })"),
+            'related handler should pass explicit all parameter to executor');
     });
 
-    it('MCP toc handler passes all and topLevel', () => {
-        assert.ok(serverCode.includes('topLevel: top_level || false, all: all || false, top'),
-            'toc handler should pass topLevel and all');
+    it('MCP toc handler passes all and topLevel via executor', () => {
+        assert.ok(serverCode.includes('detailed, top_level, all, top'),
+            'toc handler should pass topLevel and all to executor');
     });
 
     it('MCP graph handler respects all in showAll', () => {

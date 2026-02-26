@@ -13,9 +13,12 @@ const path = require('path');
 const { parse, parseFile, extractFunction, extractClass, cleanHtmlScriptTags, detectLanguage, isSupported } = require('../core/parser');
 const { getParser, getLanguageModule } = require('../languages');
 const { ProjectIndex } = require('../core/project');
-const { expandGlob, findProjectRoot, isTestFile } = require('../core/discovery');
+const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { pickBestDefinition, addTestExclusions } = require('../core/shared');
+const { pickBestDefinition } = require('../core/shared');
+const { getCliCommandSet, resolveCommand } = require('../core/registry');
+const { execute } = require('../core/execute');
+const { ExpandCache, renderExpandItem } = require('../core/expand-cache');
 
 // ============================================================================
 // ARGUMENT PARSING
@@ -183,14 +186,8 @@ function printOutput(result, jsonFn, textFn) {
 // MAIN
 // ============================================================================
 
-// All valid commands - used to detect if first arg is command vs path
-const COMMANDS = new Set([
-    'toc', 'find', 'usages', 'fn', 'class', 'lines', 'search', 'typedef', 'api',
-    'context', 'smart', 'about', 'impact', 'trace', 'related', 'example', 'expand',
-    'tests', 'verify', 'plan', 'deadcode', 'stats', 'stacktrace', 'stack',
-    'imports', 'what-imports', 'exporters', 'who-imports', 'graph', 'file-exports', 'what-exports',
-    'diff-impact'
-]);
+// All valid commands - derived from canonical registry
+const COMMANDS = getCliCommandSet();
 
 function main() {
     // Determine target and command based on positional args
@@ -360,16 +357,15 @@ function runFileCommand(filePath, command, arg) {
             const projectRoot = findProjectRoot(path.dirname(filePath));
 
             // For file-specific commands (imports/exporters/graph), use the target file as arg if no arg given
+            const fileCanonical = resolveCommand(command, 'cli') || command;
             let effectiveArg = arg;
-            if ((command === 'imports' || command === 'what-imports' ||
-                 command === 'exporters' || command === 'who-imports' ||
-                 command === 'graph' || command === 'file-exports' ||
-                 command === 'what-exports') && !arg) {
+            if ((fileCanonical === 'imports' || fileCanonical === 'exporters' ||
+                 fileCanonical === 'fileExports' || fileCanonical === 'graph') && !arg) {
                 effectiveArg = filePath;
             }
 
             // For stats/deadcode, no arg needed
-            if (command === 'stats' || command === 'deadcode') {
+            if (fileCanonical === 'stats' || fileCanonical === 'deadcode') {
                 effectiveArg = arg;  // may be undefined, that's ok
             }
 
@@ -700,10 +696,17 @@ function runProjectCommand(rootDir, command, arg) {
         }
     }
 
-    switch (command) {
+    try {
+    // Resolve CLI aliases to canonical command names — dispatch on canonical
+    const canonical = resolveCommand(command, 'cli') || command;
+
+    switch (canonical) {
+        // ── Commands using shared executor ───────────────────────────────
+
         case 'toc': {
-            const toc = index.getToc({ detailed: flags.detailed, topLevel: flags.topLevel, all: flags.all, top: flags.top });
-            printOutput(toc, output.formatTocJson, r => output.formatToc(r, {
+            const { ok, result, error } = execute(index, 'toc', flags);
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatTocJson, r => output.formatToc(r, {
                 detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
                 uncertainHint: 'use --include-uncertain to include all'
             }));
@@ -711,15 +714,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'find': {
-            requireArg(arg, 'Usage: ucn . find <name>');
-            const findExclude = flags.includeTests ? flags.exclude : addTestExclusions(flags.exclude);
-            const found = index.find(arg, {
-                file: flags.file,
-                exact: flags.exact,
-                exclude: findExclude,
-                in: flags.in
-            });
-            printOutput(found,
+            const { ok, result, error } = execute(index, 'find', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
                 r => output.formatSymbolJson(r, arg),
                 r => { printSymbols(r, arg, { depth: flags.depth, top: flags.top, all: flags.all }); }
             );
@@ -727,15 +724,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'usages': {
-            requireArg(arg, 'Usage: ucn . usages <name>');
-            const usagesExclude = flags.includeTests ? flags.exclude : addTestExclusions(flags.exclude);
-            const usages = index.usages(arg, {
-                codeOnly: flags.codeOnly,
-                context: flags.context,
-                exclude: usagesExclude,
-                in: flags.in
-            });
-            printOutput(usages,
+            const { ok, result, error } = execute(index, 'usages', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
                 r => output.formatUsagesJson(r, arg),
                 r => output.formatUsages(r, arg)
             );
@@ -743,9 +734,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'example': {
-            requireArg(arg, 'Usage: ucn . example <name>');
-            const exampleResult = index.example(arg);
-            printOutput(exampleResult,
+            const { ok, result, error } = execute(index, 'example', { name: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
                 r => output.formatExampleJson(r, arg),
                 r => output.formatExample(r, arg)
             );
@@ -753,17 +744,8 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'context': {
-            requireArg(arg, 'Usage: ucn . context <name>');
-            const ctx = index.context(arg, {
-                includeMethods: flags.includeMethods,
-                includeUncertain: flags.includeUncertain,
-                file: flags.file,
-                exclude: flags.exclude
-            });
-            if (!ctx) {
-                console.log(`Symbol "${arg}" not found.`);
-                break;
-            }
+            const { ok, result: ctx, error } = execute(index, 'context', { name: arg, ...flags });
+            if (!ok) { console.log(error); break; }
             if (flags.json) {
                 console.log(output.formatContextJson(ctx));
             } else {
@@ -825,27 +807,18 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'smart': {
-            requireArg(arg, 'Usage: ucn . smart <name>');
-            const smart = index.smart(arg, {
-                file: flags.file,
-                withTypes: flags.withTypes,
-                includeMethods: flags.includeMethods,
-                includeUncertain: flags.includeUncertain
-            });
-            if (smart) {
-                printOutput(smart, output.formatSmartJson, r => output.formatSmart(r, {
-                    uncertainHint: 'use --include-uncertain to include all'
-                }));
-            } else {
-                console.error(`Function "${arg}" not found`);
-            }
+            const { ok, result, error } = execute(index, 'smart', { name: arg, ...flags });
+            if (!ok) { console.error(error); break; }
+            printOutput(result, output.formatSmartJson, r => output.formatSmart(r, {
+                uncertainHint: 'use --include-uncertain to include all'
+            }));
             break;
         }
 
         case 'about': {
-            requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain, exclude: flags.exclude, maxCallers: flags.top || undefined, maxCallees: flags.top || undefined });
-            printOutput(aboutResult,
+            const { ok, result, error } = execute(index, 'about', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
             );
@@ -853,63 +826,51 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'impact': {
-            requireArg(arg, 'Usage: ucn . impact <name>');
-            const impactResult = index.impact(arg, { file: flags.file, exclude: flags.exclude });
-            printOutput(impactResult, output.formatImpactJson, output.formatImpact);
+            const { ok, result, error } = execute(index, 'impact', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatImpactJson, output.formatImpact);
             break;
         }
 
         case 'plan': {
-            requireArg(arg, 'Usage: ucn . plan <name> [--add-param=name] [--remove-param=name] [--rename-to=name]');
-            if (!flags.addParam && !flags.removeParam && !flags.renameTo) {
-                console.error('Plan requires an operation: --add-param, --remove-param, or --rename-to');
-                process.exit(1);
-            }
-            const planResult = index.plan(arg, {
-                addParam: flags.addParam,
-                removeParam: flags.removeParam,
-                renameTo: flags.renameTo,
-                defaultValue: flags.defaultValue,
-                file: flags.file
-            });
-            printOutput(planResult, output.formatPlanJson, output.formatPlan);
+            const { ok, result, error } = execute(index, 'plan', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatPlanJson, output.formatPlan);
             break;
         }
 
         case 'trace': {
-            requireArg(arg, 'Usage: ucn . trace <name>');
-            const traceDepth = flags.depth ? parseInt(flags.depth) : 3;
-            const depthExplicit = flags.depth !== null;
-            const traceResult = index.trace(arg, { depth: traceDepth, file: flags.file, all: flags.all || depthExplicit, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain });
-            printOutput(traceResult, output.formatTraceJson, output.formatTrace);
+            const { ok, result, error } = execute(index, 'trace', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatTraceJson, output.formatTrace);
             break;
         }
 
-        case 'stacktrace':
-        case 'stack': {
-            requireArg(arg, 'Usage: ucn . stacktrace "<stack trace text>"\nExample: ucn . stacktrace "Error: failed\\n    at parseFile (core/parser.js:90:5)"');
-            const stackResult = index.parseStackTrace(arg);
-            printOutput(stackResult, output.formatStackTraceJson, output.formatStackTrace);
+        case 'stacktrace': {
+            const { ok, result, error } = execute(index, 'stacktrace', { stack: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatStackTraceJson, output.formatStackTrace);
             break;
         }
 
         case 'verify': {
-            requireArg(arg, 'Usage: ucn . verify <name>');
-            const verifyResult = index.verify(arg, { file: flags.file });
-            printOutput(verifyResult, output.formatVerifyJson, output.formatVerify);
+            const { ok, result, error } = execute(index, 'verify', { name: arg, file: flags.file });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatVerifyJson, output.formatVerify);
             break;
         }
 
         case 'related': {
-            requireArg(arg, 'Usage: ucn . related <name>');
-            const relatedResult = index.related(arg, { file: flags.file, top: flags.top, all: flags.all });
-            printOutput(relatedResult, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all, top: flags.top }));
+            const { ok, result, error } = execute(index, 'related', { name: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all, top: flags.top }));
             break;
         }
 
+        // ── Commands staying in adapter (complex I/O) ───────────────────
+
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
-            // Support comma-separated names for bulk extraction
             if (arg.includes(',')) {
                 const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
                 for (let i = 0; i < fnNames.length; i++) {
@@ -928,114 +889,6 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
-        case 'imports':
-        case 'what-imports': {
-            requireArg(arg, 'Usage: ucn . imports <file>');
-            const imports = index.imports(arg);
-            printOutput(imports,
-                r => output.formatImportsJson(r, arg),
-                r => output.formatImports(r, arg)
-            );
-            break;
-        }
-
-        case 'exporters':
-        case 'who-imports': {
-            requireArg(arg, 'Usage: ucn . exporters <file>');
-            const exporters = index.exporters(arg);
-            printOutput(exporters,
-                r => output.formatExportersJson(r, arg),
-                r => output.formatExporters(r, arg)
-            );
-            break;
-        }
-
-        case 'typedef': {
-            requireArg(arg, 'Usage: ucn . typedef <name>');
-            const typedefs = index.typedef(arg, { exact: flags.exact });
-            printOutput(typedefs,
-                r => output.formatTypedefJson(r, arg),
-                r => output.formatTypedef(r, arg)
-            );
-            break;
-        }
-
-        case 'tests': {
-            requireArg(arg, 'Usage: ucn . tests <name>');
-            const tests = index.tests(arg, { callsOnly: flags.callsOnly });
-            printOutput(tests,
-                r => output.formatTestsJson(r, arg),
-                r => output.formatTests(r, arg)
-            );
-            break;
-        }
-
-        case 'api': {
-            const api = index.api(arg);  // arg is optional file path
-            printOutput(api,
-                r => output.formatApiJson(r, arg),
-                r => output.formatApi(r, arg)
-            );
-            break;
-        }
-
-        case 'file-exports':
-        case 'what-exports': {
-            requireArg(arg, 'Usage: ucn . file-exports <file>');
-            const fileExports = index.fileExports(arg);
-            printOutput(fileExports,
-                r => JSON.stringify({ file: arg, exports: r }, null, 2),
-                r => output.formatFileExports(r, arg)
-            );
-            break;
-        }
-
-        case 'deadcode': {
-            const deadcodeResults = index.deadcode({
-                includeExported: flags.includeExported,
-                includeDecorated: flags.includeDecorated,
-                includeTests: flags.includeTests,
-                exclude: flags.exclude,
-                in: flags.in || subdirScope
-            });
-            printOutput(deadcodeResults,
-                output.formatDeadcodeJson,
-                r => output.formatDeadcode(r, {
-                    top: flags.top,
-                    decoratedHint: !flags.includeDecorated && deadcodeResults.excludedDecorated > 0 ? `${deadcodeResults.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
-                    exportedHint: !flags.includeExported && deadcodeResults.excludedExported > 0 ? `${deadcodeResults.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
-                })
-            );
-            break;
-        }
-
-        case 'graph': {
-            requireArg(arg, 'Usage: ucn . graph <file>');
-            const graphDepth = flags.depth ?? 2;  // Default to 2 for cleaner output
-            const graphDirection = flags.direction || 'both';
-            const graphResult = index.graph(arg, { direction: graphDirection, maxDepth: graphDepth });
-            printOutput(graphResult,
-                r => JSON.stringify({
-                    root: path.relative(index.root, r.root),
-                    nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
-                    edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
-                }, null, 2),
-                r => output.formatGraph(r, { showAll: flags.all || flags.depth !== undefined, maxDepth: graphDepth, file: arg })
-            );
-            break;
-        }
-
-        case 'search': {
-            requireArg(arg, 'Usage: ucn . search <term>');
-            const searchExclude = flags.includeTests ? flags.exclude : addTestExclusions(flags.exclude);
-            const searchResults = index.search(arg, { codeOnly: flags.codeOnly, context: flags.context, caseSensitive: flags.caseSensitive, exclude: searchExclude, in: flags.in, regex: flags.regex });
-            printOutput(searchResults,
-                r => output.formatSearchJson(r, arg),
-                r => output.formatSearch(r, arg)
-            );
-            break;
-        }
-
         case 'lines': {
             if (!arg || !flags.file) {
                 console.error('Usage: ucn . lines <range> --file <path>');
@@ -1051,29 +904,133 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        // ── File dependency commands ────────────────────────────────────
+
+        case 'imports': {
+            const { ok, result, error } = execute(index, 'imports', { file: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => output.formatImportsJson(r, arg),
+                r => output.formatImports(r, arg)
+            );
+            break;
+        }
+
+        case 'exporters': {
+            const { ok, result, error } = execute(index, 'exporters', { file: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => output.formatExportersJson(r, arg),
+                r => output.formatExporters(r, arg)
+            );
+            break;
+        }
+
+        case 'fileExports': {
+            const { ok, result, error } = execute(index, 'fileExports', { file: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => JSON.stringify({ file: arg, exports: r }, null, 2),
+                r => output.formatFileExports(r, arg)
+            );
+            break;
+        }
+
+        case 'graph': {
+            const { ok, result, error } = execute(index, 'graph', { file: arg, direction: flags.direction, depth: flags.depth, all: flags.all });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => JSON.stringify({
+                    root: path.relative(index.root, r.root),
+                    nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
+                    edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
+                }, null, 2),
+                r => output.formatGraph(r, { showAll: flags.all || flags.depth !== undefined, maxDepth: flags.depth ?? 2, file: arg })
+            );
+            break;
+        }
+
+        // ── Remaining commands ──────────────────────────────────────────
+
+        case 'typedef': {
+            const { ok, result, error } = execute(index, 'typedef', { name: arg, exact: flags.exact });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => output.formatTypedefJson(r, arg),
+                r => output.formatTypedef(r, arg)
+            );
+            break;
+        }
+
+        case 'tests': {
+            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => output.formatTestsJson(r, arg),
+                r => output.formatTests(r, arg)
+            );
+            break;
+        }
+
+        case 'api': {
+            const { ok, result, error } = execute(index, 'api', { file: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => output.formatApiJson(r, arg),
+                r => output.formatApi(r, arg)
+            );
+            break;
+        }
+
+        case 'search': {
+            const { ok, result, error } = execute(index, 'search', { term: arg, ...flags });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                r => output.formatSearchJson(r, arg),
+                r => output.formatSearch(r, arg)
+            );
+            break;
+        }
+
+        case 'deadcode': {
+            const { ok, result, error } = execute(index, 'deadcode', { ...flags, in: flags.in || subdirScope });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
+                output.formatDeadcodeJson,
+                r => output.formatDeadcode(r, {
+                    top: flags.top,
+                    decoratedHint: !flags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
+                    exportedHint: !flags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
+                })
+            );
+            break;
+        }
+
         case 'stats': {
-            const stats = index.getStats({ functions: flags.functions });
-            printOutput(stats,
+            const { ok, result, error } = execute(index, 'stats', { functions: flags.functions });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result,
                 output.formatStatsJson,
                 r => output.formatStats(r, { top: flags.top })
             );
             break;
         }
 
-        case 'diff-impact': {
-            const diffResult = index.diffImpact({
-                base: flags.base || 'HEAD',
-                staged: flags.staged,
-                file: flags.file
-            });
-            printOutput(diffResult, output.formatDiffImpactJson, output.formatDiffImpact);
+        case 'diffImpact': {
+            const { ok, result, error } = execute(index, 'diffImpact', { base: flags.base, staged: flags.staged, file: flags.file });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
             break;
         }
 
         default:
-            console.error(`Unknown command: ${command}`);
+            console.error(`Unknown command: ${canonical}`);
             printUsage();
             process.exit(1);
+    }
+    } catch (e) {
+        console.error(`Error: ${e.message}`);
+        process.exit(1);
     }
 }
 
@@ -1745,6 +1702,8 @@ UNDERSTAND CODE (UCN's strength - semantic analysis)
   smart <name>        Function + all dependencies inline
   impact <name>       What breaks if changed (call sites grouped by file)
   trace <name>        Call tree visualization (--depth=N expands all children)
+  related <name>      Find similar functions (same file, shared deps)
+  example <name>      Best usage example with context
 
 ═══════════════════════════════════════════════════════════════════════════════
 FIND CODE
@@ -1778,7 +1737,6 @@ REFACTORING HELPERS
   verify <name>       Check all call sites match signature
   diff-impact         What changed in git diff and who calls it (--base, --staged)
   deadcode            Find unused functions/classes
-  related <name>      Find similar functions (same file, shared deps)
 
 ═══════════════════════════════════════════════════════════════════════════════
 OTHER
@@ -1787,7 +1745,6 @@ OTHER
   typedef <name>      Find type definitions
   stats               Project statistics (--functions for per-function line counts)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
-  example <name>      Best usage example with context
 
 Common Flags:
   --file <pattern>    Filter by file path (e.g., --file=routes)
@@ -1812,6 +1769,8 @@ Common Flags:
   --calls-only        Only show call/test-case matches (tests)
   --case-sensitive    Case-sensitive text search (search)
   --detailed          List all symbols in toc (compact by default)
+  --top-level         Show only top-level functions in toc
+  --max-lines=N       Max source lines for class (large classes show summary)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
   --base=<ref>        Git ref for diff-impact (default: HEAD)
@@ -1838,6 +1797,7 @@ function runInteractive(rootDir) {
     console.log('Building index...');
     const index = new ProjectIndex(rootDir);
     index.build(null, { quiet: true });
+    const iExpandCache = new ExpandCache({ maxSize: 20 });
     console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
     console.log('Type commands (e.g., "find parseFile", "about main", "toc")');
     console.log('Type "help" for commands, "quit" to exit\n');
@@ -1920,7 +1880,8 @@ Flags can be added per-command: context myFunc --include-methods
         const iflags = parseInteractiveFlags(flagTokens);
 
         try {
-            executeInteractiveCommand(index, command, arg, iflags);
+            const iCanonical = resolveCommand(command, 'cli') || command;
+            executeInteractiveCommand(index, iCanonical, arg, iflags, iExpandCache);
         } catch (e) {
             console.error(`Error: ${e.message}`);
         }
@@ -1972,109 +1933,10 @@ function parseInteractiveFlags(tokens) {
     };
 }
 
-function executeInteractiveCommand(index, command, arg, iflags = {}) {
+function executeInteractiveCommand(index, command, arg, iflags = {}, cache = null) {
     switch (command) {
-        case 'toc': {
-            const toc = index.getToc({ detailed: iflags.detailed, topLevel: iflags.topLevel, all: iflags.all, top: iflags.top });
-            console.log(output.formatToc(toc, {
-                detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol',
-                uncertainHint: 'use --include-uncertain to include all'
-            }));
-            break;
-        }
 
-        case 'find': {
-            if (!arg) {
-                console.log('Usage: find <name>');
-                return;
-            }
-            const findExclude = iflags.includeTests ? iflags.exclude : addTestExclusions(iflags.exclude);
-            const found = index.find(arg, { file: iflags.file, exact: iflags.exact, exclude: findExclude, in: iflags.in });
-            if (found.length === 0) {
-                console.log(`No symbols found for "${arg}"`);
-            } else {
-                printSymbols(found, arg, { top: iflags.top });
-            }
-            break;
-        }
-
-        case 'about': {
-            if (!arg) {
-                console.log('Usage: about <name>');
-                return;
-            }
-            const aboutResult = index.about(arg, { withTypes: iflags.withTypes, file: iflags.file, all: iflags.all, includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain, exclude: iflags.exclude, maxCallers: iflags.top || undefined, maxCallees: iflags.top || undefined });
-            console.log(output.formatAbout(aboutResult, { expand: iflags.expand, root: index.root, showAll: iflags.all }));
-            break;
-        }
-
-        case 'usages': {
-            if (!arg) {
-                console.log('Usage: usages <name>');
-                return;
-            }
-            const usagesExclude = iflags.includeTests ? iflags.exclude : addTestExclusions(iflags.exclude);
-            const usages = index.usages(arg, { codeOnly: iflags.codeOnly, context: iflags.context, exclude: usagesExclude, in: iflags.in });
-            console.log(output.formatUsages(usages, arg));
-            break;
-        }
-
-        case 'context': {
-            if (!arg) {
-                console.log('Usage: context <name>');
-                return;
-            }
-            const ctx = index.context(arg, { includeUncertain: iflags.includeUncertain, includeMethods: iflags.includeMethods, file: iflags.file, exclude: iflags.exclude });
-            if (!ctx) {
-                console.log(`Symbol "${arg}" not found.`);
-            } else {
-                const { text, expandable } = output.formatContext(ctx, {
-                    methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
-                    expandHint: 'Use "expand <N>" to see code for item N',
-                    uncertainHint: 'use --include-uncertain to include all'
-                });
-                console.log(text);
-                saveExpandableItems(expandable, index.root);
-            }
-            break;
-        }
-
-        case 'smart': {
-            if (!arg) {
-                console.log('Usage: smart <name>');
-                return;
-            }
-            const smart = index.smart(arg, { file: iflags.file, withTypes: iflags.withTypes, includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain });
-            if (smart) {
-                console.log(output.formatSmart(smart, {
-                    uncertainHint: 'use --include-uncertain to include all'
-                }));
-            } else {
-                console.log(`Function "${arg}" not found`);
-            }
-            break;
-        }
-
-        case 'impact': {
-            if (!arg) {
-                console.log('Usage: impact <name>');
-                return;
-            }
-            const impactResult = index.impact(arg, { file: iflags.file, exclude: iflags.exclude });
-            console.log(output.formatImpact(impactResult));
-            break;
-        }
-
-        case 'trace': {
-            if (!arg) {
-                console.log('Usage: trace <name>');
-                return;
-            }
-            const traceDepth = iflags.depth ? parseInt(iflags.depth) : 3;
-            const traceResult = index.trace(arg, { depth: traceDepth, file: iflags.file, all: iflags.all || !!iflags.depth, includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain });
-            console.log(output.formatTrace(traceResult));
-            break;
-        }
+        // ── Special commands (complex I/O, stay in adapter) ──────────────
 
         case 'fn': {
             if (!arg) {
@@ -2118,104 +1980,6 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
             break;
         }
 
-        case 'graph': {
-            if (!arg) {
-                console.log('Usage: graph <file> [--direction=imports|importers|both] [--depth=N]');
-                return;
-            }
-            const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
-            const graphDirection = iflags.direction || 'both';
-            const graphResult = index.graph(arg, { direction: graphDirection, maxDepth: graphDepth });
-            console.log(output.formatGraph(graphResult, { showAll: iflags.all || !!iflags.depth, maxDepth: graphDepth, file: arg }));
-            break;
-        }
-
-        case 'file-exports':
-        case 'what-exports': {
-            if (!arg) {
-                console.log('Usage: file-exports <file>');
-                return;
-            }
-            const fileExports = index.fileExports(arg);
-            console.log(output.formatFileExports(fileExports, arg));
-            break;
-        }
-
-        case 'imports':
-        case 'what-imports': {
-            if (!arg) {
-                console.log('Usage: imports <file>');
-                return;
-            }
-            const imports = index.imports(arg);
-            console.log(output.formatImports(imports, arg));
-            break;
-        }
-
-        case 'exporters':
-        case 'who-imports': {
-            if (!arg) {
-                console.log('Usage: exporters <file>');
-                return;
-            }
-            const exporters = index.exporters(arg);
-            console.log(output.formatExporters(exporters, arg));
-            break;
-        }
-
-        case 'tests': {
-            if (!arg) {
-                console.log('Usage: tests <name>');
-                return;
-            }
-            const tests = index.tests(arg, { callsOnly: iflags.callsOnly });
-            console.log(output.formatTests(tests, arg));
-            break;
-        }
-
-        case 'search': {
-            if (!arg) {
-                console.log('Usage: search <term>');
-                return;
-            }
-            const searchExclude = iflags.includeTests ? iflags.exclude : addTestExclusions(iflags.exclude);
-            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context, exclude: searchExclude, in: iflags.in, regex: iflags.regex });
-            console.log(output.formatSearch(results, arg));
-            break;
-        }
-
-        case 'typedef': {
-            if (!arg) {
-                console.log('Usage: typedef <name>');
-                return;
-            }
-            const types = index.typedef(arg, { exact: iflags.exact });
-            console.log(output.formatTypedef(types, arg));
-            break;
-        }
-
-        case 'api': {
-            const api = index.api(arg);
-            console.log(output.formatApi(api, arg || '.'));
-            break;
-        }
-
-        case 'diff-impact': {
-            const diffResult = index.diffImpact({
-                base: iflags.base || 'HEAD',
-                staged: iflags.staged,
-                file: iflags.file
-            });
-            console.log(output.formatDiffImpact(diffResult));
-            break;
-        }
-
-        case 'stats': {
-            const stats = index.getStats({ functions: iflags.functions });
-            console.log(output.formatStats(stats, { top: iflags.top }));
-            break;
-        }
-
         case 'expand': {
             if (!arg) {
                 console.log('Usage: expand <number>');
@@ -2226,93 +1990,233 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log(`Invalid item number: "${arg}"`);
                 return;
             }
-            const cached = loadExpandableItems(index.root);
-            if (!cached || !cached.items || cached.items.length === 0) {
-                console.log('No expandable items. Run context first.');
-                return;
+            if (cache) {
+                const { match, itemCount } = cache.lookup(index.root, expandNum);
+                if (!match && itemCount === 0) {
+                    console.log('No expandable items. Run context first.');
+                    return;
+                }
+                if (!match) {
+                    console.log(`Item ${expandNum} not found. Available: 1-${itemCount}`);
+                    return;
+                }
+                const rendered = renderExpandItem(match, index.root);
+                if (!rendered.ok) { console.log(rendered.error); return; }
+                console.log(rendered.text);
+            } else {
+                // Fallback to file-based cache (CLI one-shot)
+                const cached = loadExpandableItems(index.root);
+                if (!cached || !cached.items || cached.items.length === 0) {
+                    console.log('No expandable items. Run context first.');
+                    return;
+                }
+                const expandMatch = cached.items.find(i => i.num === expandNum);
+                if (!expandMatch) {
+                    console.log(`Item ${expandNum} not found. Available: 1-${cached.items.length}`);
+                    return;
+                }
+                printExpandedItem(expandMatch, cached.root || index.root);
             }
-            const expandMatch = cached.items.find(i => i.num === expandNum);
-            if (!expandMatch) {
-                console.log(`Item ${expandNum} not found. Available: 1-${cached.items.length}`);
-                return;
-            }
-            printExpandedItem(expandMatch, cached.root || index.root);
             break;
         }
 
-        case 'deadcode': {
-            const deadResult = index.deadcode({
-                includeExported: iflags.includeExported,
-                includeDecorated: iflags.includeDecorated,
-                includeTests: iflags.includeTests,
-                exclude: iflags.exclude,
-                in: iflags.in
+        // ── find: uses printSymbols (interactive-only formatter) ─────────
+
+        case 'find': {
+            const { ok, result, error } = execute(index, 'find', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            if (result.length === 0) {
+                console.log(`No symbols found for "${arg}"`);
+            } else {
+                printSymbols(result, arg, { top: iflags.top });
+            }
+            break;
+        }
+
+        // ── context: needs expandable items cache ────────────────────────
+
+        case 'context': {
+            const { ok, result, error } = execute(index, 'context', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            const { text, expandable } = output.formatContext(result, {
+                methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
+                expandHint: 'Use "expand <N>" to see code for item N',
+                uncertainHint: 'use --include-uncertain to include all'
             });
-            console.log(output.formatDeadcode(deadResult, {
+            console.log(text);
+            if (cache) {
+                cache.save(index.root, arg, iflags.file, expandable);
+            } else {
+                saveExpandableItems(expandable, index.root);
+            }
+            break;
+        }
+
+        // ── deadcode: needs result fields for hint construction ──────────
+
+        case 'deadcode': {
+            const { ok, result, error } = execute(index, 'deadcode', iflags);
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatDeadcode(result, {
                 top: iflags.top,
-                decoratedHint: !iflags.includeDecorated && deadResult.excludedDecorated > 0 ? `${deadResult.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
-                exportedHint: !iflags.includeExported && deadResult.excludedExported > 0 ? `${deadResult.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
+                decoratedHint: !iflags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
+                exportedHint: !iflags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
             }));
             break;
         }
 
+        // ── Standard commands routed through execute() ───────────────────
+
+        case 'toc': {
+            const { ok, result, error } = execute(index, 'toc', iflags);
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatToc(result, {
+                detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol',
+                uncertainHint: 'use --include-uncertain to include all'
+            }));
+            break;
+        }
+
+        case 'about': {
+            const { ok, result, error } = execute(index, 'about', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatAbout(result, { expand: iflags.expand, root: index.root, showAll: iflags.all }));
+            break;
+        }
+
+        case 'usages': {
+            const { ok, result, error } = execute(index, 'usages', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatUsages(result, arg));
+            break;
+        }
+
+        case 'smart': {
+            const { ok, result, error } = execute(index, 'smart', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatSmart(result, {
+                uncertainHint: 'use --include-uncertain to include all'
+            }));
+            break;
+        }
+
+        case 'impact': {
+            const { ok, result, error } = execute(index, 'impact', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatImpact(result));
+            break;
+        }
+
+        case 'trace': {
+            const { ok, result, error } = execute(index, 'trace', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatTrace(result));
+            break;
+        }
+
+        case 'graph': {
+            const { ok, result, error } = execute(index, 'graph', { file: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
+            console.log(output.formatGraph(result, { showAll: iflags.all || !!iflags.depth, maxDepth: graphDepth, file: arg }));
+            break;
+        }
+
+        case 'fileExports': {
+            const { ok, result, error } = execute(index, 'fileExports', { file: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatFileExports(result, arg));
+            break;
+        }
+
+        case 'imports': {
+            const { ok, result, error } = execute(index, 'imports', { file: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatImports(result, arg));
+            break;
+        }
+
+        case 'exporters': {
+            const { ok, result, error } = execute(index, 'exporters', { file: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatExporters(result, arg));
+            break;
+        }
+
+        case 'tests': {
+            const { ok, result, error } = execute(index, 'tests', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatTests(result, arg));
+            break;
+        }
+
+        case 'search': {
+            const { ok, result, error } = execute(index, 'search', { term: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatSearch(result, arg));
+            break;
+        }
+
+        case 'typedef': {
+            const { ok, result, error } = execute(index, 'typedef', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatTypedef(result, arg));
+            break;
+        }
+
+        case 'api': {
+            const { ok, result, error } = execute(index, 'api', { file: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatApi(result, arg || '.'));
+            break;
+        }
+
+        case 'diffImpact': {
+            const { ok, result, error } = execute(index, 'diffImpact', iflags);
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatDiffImpact(result));
+            break;
+        }
+
+        case 'stats': {
+            const { ok, result, error } = execute(index, 'stats', iflags);
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatStats(result, { top: iflags.top }));
+            break;
+        }
+
         case 'related': {
-            if (!arg) {
-                console.log('Usage: related <name>');
-                return;
-            }
-            const relResult = index.related(arg, { file: iflags.file, top: iflags.top, all: iflags.all });
-            console.log(output.formatRelated(relResult, { showAll: iflags.all, top: iflags.top }));
+            const { ok, result, error } = execute(index, 'related', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatRelated(result, { showAll: iflags.all, top: iflags.top }));
             break;
         }
 
         case 'example': {
-            if (!arg) {
-                console.log('Usage: example <name>');
-                return;
-            }
-            console.log(output.formatExample(index.example(arg), arg));
+            const { ok, result, error } = execute(index, 'example', { name: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatExample(result, arg));
             break;
         }
 
         case 'plan': {
-            if (!arg) {
-                console.log('Usage: plan <name> --add-param=x | --remove-param=x | --rename-to=x');
-                return;
-            }
-            if (!iflags.addParam && !iflags.removeParam && !iflags.renameTo) {
-                console.log('Plan requires an operation: --add-param, --remove-param, or --rename-to');
-                return;
-            }
-            const planResult = index.plan(arg, {
-                addParam: iflags.addParam,
-                removeParam: iflags.removeParam,
-                renameTo: iflags.renameTo,
-                defaultValue: iflags.defaultValue,
-                file: iflags.file
-            });
-            console.log(output.formatPlan(planResult));
+            const { ok, result, error } = execute(index, 'plan', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatPlan(result));
             break;
         }
 
         case 'verify': {
-            if (!arg) {
-                console.log('Usage: verify <name>');
-                return;
-            }
-            const verifyResult = index.verify(arg, { file: iflags.file });
-            console.log(output.formatVerify(verifyResult));
+            const { ok, result, error } = execute(index, 'verify', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatVerify(result));
             break;
         }
 
-        case 'stacktrace':
-        case 'stack': {
-            if (!arg) {
-                console.log('Usage: stacktrace <stack text>');
-                return;
-            }
-            const stackResult = index.parseStackTrace(arg);
-            console.log(output.formatStackTrace(stackResult));
+        case 'stacktrace': {
+            const { ok, result, error } = execute(index, 'stacktrace', { stack: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatStackTrace(result));
             break;
         }
 

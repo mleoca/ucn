@@ -84,12 +84,15 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 
 | Situation | Command | What it does |
 |-----------|---------|-------------|
+| Quick callers + callees list | `ucn context <name>` | Who calls it and what it calls. Results are numbered for `expand`. Use instead of `about` when you just need the call graph, not source code |
 | Need function + all its helpers inline | `ucn smart <name>` | Returns function source with every helper it calls expanded below it. Use instead of `about` when you need code, not metadata |
 | What changed and who's affected | `ucn diff-impact --base=main` | Shows changed functions + their callers from git diff |
 | Checking if a refactor broke signatures | `ucn verify <name>` | Validates all call sites match the function's parameter count |
 | Understanding a file's role in the project | `ucn imports <file>` | What it depends on |
 | Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
+| See what a file exports | `ucn file-exports <file>` | All exported functions, classes, variables with signatures |
 | Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
+| Project complexity stats | `ucn stats` | File counts, symbol counts, lines by language. `--functions` for per-function line counts |
 | Find by glob pattern | `ucn find "handle*"` | Locate definitions matching a glob (supports * and ?) |
 | Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |
 | Regex search (default) | `ucn search '\d+'` | Search supports regex by default (alternation, character classes, etc.) |
@@ -140,7 +143,9 @@ ucn [target] <command> [name] [--flags]
 | `--code-only` | Exclude matches in comments and strings (`search`/`usages`) |
 | `--with-types` | Include related type definitions in `smart`/`about` output |
 | `--detailed` | Show full symbol listing per file in `toc` |
+| `--top-level` | Show only top-level functions in `toc` (exclude nested/indented) |
 | `--top=N` | Limit result count (default: 10 for most commands) |
+| `--max-lines=N` | Max source lines for `class` (large classes show summary by default) |
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
 | `--exact` | Exact name match only in `find`/`typedef` (no substring) |
 | `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |

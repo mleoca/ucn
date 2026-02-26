@@ -19,6 +19,7 @@ const fs = require('fs');
 const os = require('os');
 
 const { McpClient, runCli, runInteractive, FIXTURES_PATH: BASE_FIXTURES } = require('./helpers');
+const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP } = require('../core/registry');
 const FIXTURES_PATH = path.join(BASE_FIXTURES, 'javascript');
 
 // ============================================================================
@@ -618,5 +619,215 @@ function testProcessData() {
             assert.ok(intOut.length > 0, 'Interactive class should produce output');
             assert.ok(!mcpRes.isError, 'MCP class should not error');
         });
+    });
+
+    // ========================================================================
+    // P1 Bug Fixes
+    // ========================================================================
+
+    describe('P1 fix: MCP trace honors all parameter', () => {
+        it('MCP trace with all=true should expand truncated sections', async () => {
+            const resDefault = await mcpClient.callTool({ command: 'trace', project_dir: FIXTURES_PATH, name: 'processData' });
+            const resAll = await mcpClient.callTool({ command: 'trace', project_dir: FIXTURES_PATH, name: 'processData', all: true });
+            assert.ok(!resDefault.isError, 'Default trace should not error');
+            assert.ok(!resAll.isError, 'Trace with all=true should not error');
+            // all=true output should be >= default (never shorter)
+            assert.ok(resAll.text.length >= resDefault.text.length, 'all=true should produce output at least as long as default');
+        });
+
+        it('CLI trace --all parity with MCP trace all=true', async () => {
+            const cliAll = runCli(FIXTURES_PATH, 'trace', ['processData'], ['--all']);
+            const mcpAll = await mcpClient.callTool({ command: 'trace', project_dir: FIXTURES_PATH, name: 'processData', all: true });
+            assert.ok(cliAll.length > 0, 'CLI trace --all should produce output');
+            assert.ok(!mcpAll.isError, 'MCP trace all=true should not error');
+            assert.ok(mcpAll.text.length > 0, 'MCP trace all=true should produce output');
+        });
+    });
+
+    describe('P1 fix: McpClient.callTool propagates isError', () => {
+        it('callTool shorthand returns isError=true for tool errors', async () => {
+            // api with nonexistent file should return isError=true
+            const res = await mcpClient.callTool({ command: 'api', project_dir: FIXTURES_PATH, file: 'nonexistent/path.js' });
+            assert.strictEqual(res.isError, true, 'Should propagate isError from MCP result');
+        });
+
+        it('callTool shorthand returns isError=false for valid calls', async () => {
+            const res = await mcpClient.callTool({ command: 'toc', project_dir: FIXTURES_PATH });
+            assert.strictEqual(res.isError, false, 'Should return isError=false for valid call');
+        });
+    });
+
+    describe('P1 fix: diff-impact base ref validation', () => {
+        it('CLI rejects invalid base ref with clean error', () => {
+            const output = runCli(FIXTURES_PATH, 'diff-impact', [], ['--base=; rm -rf /']);
+            assert.ok(output.includes('Invalid git ref'), 'CLI should reject invalid base ref');
+            assert.ok(!output.includes('at '), 'Should not show stack trace');
+        });
+
+        it('MCP rejects invalid base ref', async () => {
+            const res = await mcpClient.callTool({ command: 'diff_impact', project_dir: FIXTURES_PATH, base: '$(evil)' });
+            assert.strictEqual(res.isError, true, 'Should return isError for invalid base ref');
+            assert.ok(res.text.includes('Invalid git ref'), 'Should mention invalid ref');
+        });
+    });
+
+    // ========================================================================
+    // Registry consistency
+    // ========================================================================
+
+    describe('Registry consistency', () => {
+        it('all CLI aliases resolve to canonical commands', () => {
+            for (const [alias, canonical] of Object.entries(CLI_ALIASES)) {
+                assert.ok(CANONICAL_COMMANDS.includes(canonical),
+                    `CLI alias "${alias}" resolves to "${canonical}" which is not in CANONICAL_COMMANDS`);
+            }
+        });
+
+        it('all MCP aliases resolve to canonical commands', () => {
+            for (const [alias, canonical] of Object.entries(MCP_ALIASES)) {
+                assert.ok(CANONICAL_COMMANDS.includes(canonical),
+                    `MCP alias "${alias}" resolves to "${canonical}" which is not in CANONICAL_COMMANDS`);
+            }
+        });
+
+        it('CLI command set includes all canonical commands (hyphenated)', () => {
+            const cliSet = getCliCommandSet();
+            for (const cmd of CANONICAL_COMMANDS) {
+                const hyphenated = cmd.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+                assert.ok(cliSet.has(hyphenated),
+                    `Canonical "${cmd}" → CLI "${hyphenated}" missing from getCliCommandSet()`);
+            }
+        });
+
+        it('MCP enum includes all canonical commands (snake_cased)', () => {
+            const mcpEnum = getMcpCommandEnum();
+            for (const cmd of CANONICAL_COMMANDS) {
+                const snaked = cmd.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+                assert.ok(mcpEnum.includes(snaked),
+                    `Canonical "${cmd}" → MCP "${snaked}" missing from getMcpCommandEnum()`);
+            }
+        });
+
+        it('MCP enum has exactly 28 commands', () => {
+            assert.strictEqual(getMcpCommandEnum().length, 28);
+        });
+
+        it('resolveCommand handles all aliases', () => {
+            assert.strictEqual(resolveCommand('diff-impact', 'cli'), 'diffImpact');
+            assert.strictEqual(resolveCommand('diff_impact', 'mcp'), 'diffImpact');
+            assert.strictEqual(resolveCommand('file-exports', 'cli'), 'fileExports');
+            assert.strictEqual(resolveCommand('file_exports', 'mcp'), 'fileExports');
+            assert.strictEqual(resolveCommand('stack', 'cli'), 'stacktrace');
+            assert.strictEqual(resolveCommand('what-imports', 'cli'), 'imports');
+            assert.strictEqual(resolveCommand('who-imports', 'cli'), 'exporters');
+            assert.strictEqual(resolveCommand('what-exports', 'cli'), 'fileExports');
+            assert.strictEqual(resolveCommand('about'), 'about'); // canonical passthrough
+            assert.strictEqual(resolveCommand('bogus'), null);
+        });
+
+        it('normalizeParams converts all known snake_case params', () => {
+            const input = {};
+            for (const key of Object.keys(PARAM_MAP)) {
+                input[key] = true;
+            }
+            const result = normalizeParams(input);
+            for (const [snake, camel] of Object.entries(PARAM_MAP)) {
+                assert.ok(camel in result, `${snake} should normalize to ${camel}`);
+            }
+        });
+
+        it('normalizeParams passes through unknown params', () => {
+            const result = normalizeParams({ depth: 3, name: 'foo', unknown_param: 'bar' });
+            assert.strictEqual(result.depth, 3);
+            assert.strictEqual(result.name, 'foo');
+            assert.strictEqual(result.unknown_param, 'bar');
+        });
+    });
+});
+
+// ============================================================================
+// Architecture Guard Tests
+// ============================================================================
+
+describe('Architecture Guards', () => {
+
+    it('MCP switch has no duplicate case labels', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        // Extract all case 'xxx': labels from the switch
+        const caseRegex = /case\s+'([^']+)':/g;
+        const cases = [];
+        let match;
+        while ((match = caseRegex.exec(serverCode)) !== null) {
+            cases.push(match[1]);
+        }
+        const seen = new Set();
+        const duplicates = [];
+        for (const c of cases) {
+            if (seen.has(c)) duplicates.push(c);
+            seen.add(c);
+        }
+        assert.deepStrictEqual(duplicates, [],
+            `MCP server has duplicate case labels: ${duplicates.join(', ')}`);
+    });
+
+    it('CLI runProjectCommand dispatches on canonical (not raw command)', () => {
+        const cliCode = fs.readFileSync(path.join(__dirname, '..', 'cli', 'index.js'), 'utf-8');
+        // Find the runProjectCommand function and verify it switches on canonical
+        const fnMatch = cliCode.match(/function runProjectCommand[\s\S]*?switch\s*\((\w+)\)/);
+        assert.ok(fnMatch, 'Should find switch in runProjectCommand');
+        assert.strictEqual(fnMatch[1], 'canonical',
+            'runProjectCommand should switch on canonical, not command');
+    });
+
+    it('every canonical command has a handler in execute.js', () => {
+        const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
+        // Adapter-only commands that are NOT in execute.js
+        const adapterOnly = new Set(['fn', 'class', 'lines', 'expand']);
+
+        for (const cmd of CANONICAL_COMMANDS) {
+            if (adapterOnly.has(cmd)) continue;
+            // execute() should accept the command (not return "Unknown command")
+            const result = execute({}, cmd, {});
+            // It may fail with a validation error (e.g. "name required"), but NOT "Unknown command"
+            if (!result.ok) {
+                assert.ok(!result.error.startsWith('Unknown command'),
+                    `Command "${cmd}" should have a handler in execute.js, got: ${result.error}`);
+            }
+        }
+    });
+
+    it('adapter-only commands (fn, class, lines, expand) are NOT in execute.js', () => {
+        const { execute, ADAPTER_ONLY_COMMANDS } = require(path.join(__dirname, '..', 'core', 'execute'));
+        const adapterOnly = [...ADAPTER_ONLY_COMMANDS];
+
+        for (const cmd of adapterOnly) {
+            const result = execute({}, cmd, {});
+            assert.ok(!result.ok && result.error === `Unknown command: ${cmd}`,
+                `"${cmd}" should NOT be in execute.js (adapter-only)`);
+        }
+    });
+
+    it('every MCP command enum value maps to a handler in the switch', () => {
+        const mcpCommands = getMcpCommandEnum();
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+
+        for (const cmd of mcpCommands) {
+            assert.ok(serverCode.includes(`case '${cmd}':`),
+                `MCP command "${cmd}" should have a case in the server switch`);
+        }
+    });
+
+    it('all CLI aliases resolve to valid canonical commands', () => {
+        for (const [alias, canonical] of Object.entries(CLI_ALIASES)) {
+            assert.ok(CANONICAL_COMMANDS.includes(canonical),
+                `CLI alias "${alias}" → "${canonical}" should map to a canonical command`);
+        }
+    });
+
+    it('all MCP aliases resolve to valid canonical commands', () => {
+        for (const [alias, canonical] of Object.entries(MCP_ALIASES)) {
+            assert.ok(CANONICAL_COMMANDS.includes(canonical),
+                `MCP alias "${alias}" → "${canonical}" should map to a canonical command`);
+        }
     });
 });
