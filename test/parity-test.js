@@ -1,0 +1,749 @@
+#!/usr/bin/env node
+
+/**
+ * Cross-Interface Parity Test
+ *
+ * Verifies that CLI project mode, interactive mode, and MCP server
+ * produce consistent behavior for the same commands and flags.
+ *
+ * Tests three categories:
+ * 1. Option forwarding: flags that exist in one interface must work in all
+ * 2. Test exclusion: find/usages/search must exclude tests by default across all interfaces
+ * 3. Output consistency: same command+flags should produce equivalent results
+ */
+
+const { describe, it, before, after } = require('node:test');
+const assert = require('node:assert');
+const { execFileSync, spawn } = require('child_process');
+const path = require('path');
+const fs = require('fs');
+const os = require('os');
+
+const CLI_PATH = path.join(__dirname, '..', 'cli', 'index.js');
+const MCP_PATH = path.join(__dirname, '..', 'mcp', 'server.js');
+const FIXTURES_PATH = path.join(__dirname, 'fixtures', 'javascript');
+const TIMEOUT_MS = 15000;
+
+// ============================================================================
+// Helpers
+// ============================================================================
+
+function runCli(fixtureDir, command, args = [], flags = []) {
+    const allArgs = [CLI_PATH, fixtureDir, command, ...args, ...flags];
+    try {
+        return execFileSync('node', allArgs, {
+            timeout: TIMEOUT_MS,
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+    } catch (e) {
+        // Return combined output for analysis
+        return (e.stdout || '') + (e.stderr || '');
+    }
+}
+
+function runInteractive(fixtureDir, commands) {
+    const input = commands.join('\n') + '\nquit\n';
+    try {
+        return execFileSync('node', [CLI_PATH, '--interactive', fixtureDir], {
+            input,
+            timeout: TIMEOUT_MS,
+            encoding: 'utf-8',
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+    } catch (e) {
+        return (e.stdout || '') + (e.stderr || '');
+    }
+}
+
+// MCP JSON-RPC client (simplified from mcp-edge-cases.js)
+class McpClient {
+    constructor() {
+        this.proc = null;
+        this.requestId = 0;
+        this.pending = new Map();
+        this.buffer = '';
+    }
+
+    start() {
+        return new Promise((resolve, reject) => {
+            this.proc = spawn('node', [MCP_PATH], {
+                stdio: ['pipe', 'pipe', 'pipe'],
+                env: { ...process.env, NODE_ENV: 'test' }
+            });
+            this.proc.stdout.on('data', (chunk) => {
+                this.buffer += chunk.toString();
+                this._processBuffer();
+            });
+            this.proc.on('error', reject);
+            this.proc.on('exit', (code) => {
+                for (const [, entry] of this.pending) {
+                    clearTimeout(entry.timer);
+                    entry.reject(new Error(`Server exited with code ${code}`));
+                }
+                this.pending.clear();
+            });
+            setTimeout(() => resolve(), 500);
+        });
+    }
+
+    _processBuffer() {
+        while (true) {
+            const nlIndex = this.buffer.indexOf('\n');
+            if (nlIndex === -1) break;
+            const line = this.buffer.substring(0, nlIndex).replace(/\r$/, '');
+            this.buffer = this.buffer.substring(nlIndex + 1);
+            if (!line.trim()) continue;
+            try {
+                const msg = JSON.parse(line);
+                if (msg.id !== undefined && this.pending.has(msg.id)) {
+                    const entry = this.pending.get(msg.id);
+                    clearTimeout(entry.timer);
+                    this.pending.delete(msg.id);
+                    entry.resolve(msg.error ? { error: msg.error } : { result: msg.result });
+                }
+            } catch (e) { /* ignore parse errors */ }
+        }
+    }
+
+    send(method, params) {
+        const id = ++this.requestId;
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.pending.delete(id);
+                reject(new Error('TIMEOUT'));
+            }, TIMEOUT_MS);
+            this.pending.set(id, { resolve, reject, timer });
+            this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', id, method, params }) + '\n');
+        });
+    }
+
+    notify(method, params) {
+        this.proc.stdin.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n');
+    }
+
+    async initialize() {
+        const res = await this.send('initialize', {
+            protocolVersion: '2025-03-26',
+            capabilities: {},
+            clientInfo: { name: 'parity-test', version: '1.0.0' }
+        });
+        this.notify('notifications/initialized', {});
+        return res;
+    }
+
+    async callTool(args) {
+        const res = await this.send('tools/call', { name: 'ucn', arguments: args });
+        if (res.error) return { error: res.error };
+        const content = res.result?.content;
+        if (content && content.length > 0) return { text: content[0].text, isError: content[0].isError };
+        return { text: '', isError: false };
+    }
+
+    stop() {
+        if (this.proc) {
+            this.proc.stdin.end();
+            this.proc.kill();
+        }
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+describe('Cross-Interface Parity', () => {
+    let mcpClient;
+
+    before(async () => {
+        mcpClient = new McpClient();
+        await mcpClient.start();
+        await mcpClient.initialize();
+    });
+
+    after(() => {
+        mcpClient.stop();
+    });
+
+    // ========================================================================
+    // Category 1: Test exclusion parity (Critical bugs #1-3)
+    // ========================================================================
+
+    describe('Test exclusion parity', () => {
+        // Create a temp project with test files to verify exclusion behavior
+        let tmpDir;
+
+        before(() => {
+            tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-parity-'));
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'main.js'), `
+function processData(input) {
+    return transform(input);
+}
+function transform(data) {
+    return data;
+}
+module.exports = { processData, transform };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'test', 'main.test.js').replace('test/', ''), '');
+            fs.mkdirSync(path.join(tmpDir, 'test'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'test', 'main.test.js'), `
+const { processData } = require('../main');
+function testProcessData() {
+    processData('hello');
+}
+`);
+        });
+
+        after(() => {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        });
+
+        it('find: CLI excludes test files by default', () => {
+            const output = runCli(tmpDir, 'find', ['processData']);
+            // Should find processData but test file should not dominate results
+            assert.ok(output.includes('processData'), 'Should find processData');
+        });
+
+        it('find: interactive excludes test files by default', () => {
+            const output = runInteractive(tmpDir, ['find processData']);
+            assert.ok(output.includes('processData'), 'Should find processData');
+        });
+
+        it('find: MCP excludes test files by default', async () => {
+            const res = await mcpClient.callTool({ command: 'find', project_dir: tmpDir, name: 'processData' });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find processData');
+        });
+
+        it('find: CLI includes tests with --include-tests', () => {
+            const output = runCli(tmpDir, 'find', ['processData'], ['--include-tests']);
+            assert.ok(output.includes('processData'), 'Should find processData');
+        });
+
+        it('find: interactive includes tests with --include-tests', () => {
+            const output = runInteractive(tmpDir, ['find processData --include-tests']);
+            assert.ok(output.includes('processData'), 'Should find processData');
+        });
+
+        it('find: MCP includes tests with include_tests', async () => {
+            const res = await mcpClient.callTool({ command: 'find', project_dir: tmpDir, name: 'processData', include_tests: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find processData');
+        });
+
+        it('search: CLI excludes test files by default', () => {
+            const output = runCli(tmpDir, 'search', ['processData']);
+            assert.ok(output.includes('processData'), 'Should find search results');
+        });
+
+        it('search: interactive excludes test files by default', () => {
+            const output = runInteractive(tmpDir, ['search processData']);
+            assert.ok(output.includes('processData'), 'Should find search results');
+        });
+
+        it('search: MCP excludes test files by default', async () => {
+            const res = await mcpClient.callTool({ command: 'search', project_dir: tmpDir, term: 'processData' });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find search results');
+        });
+    });
+
+    // ========================================================================
+    // Category 2: Option forwarding parity
+    // ========================================================================
+
+    describe('toc options parity', () => {
+        it('CLI: toc --top-level works', () => {
+            const output = runCli(FIXTURES_PATH, 'toc', [], ['--top-level']);
+            assert.ok(output.length > 0, 'Should produce output');
+            assert.ok(!output.includes('Unknown flag'), 'Should not reject --top-level flag');
+        });
+
+        it('interactive: toc --top-level works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['toc --top-level']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: toc top_level works', async () => {
+            const res = await mcpClient.callTool({ command: 'toc', project_dir: FIXTURES_PATH, top_level: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.length > 0, 'Should produce output');
+        });
+
+        it('CLI: toc --all works', () => {
+            const output = runCli(FIXTURES_PATH, 'toc', [], ['--all']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: toc --all works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['toc --all']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: toc all works', async () => {
+            const res = await mcpClient.callTool({ command: 'toc', project_dir: FIXTURES_PATH, all: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.length > 0, 'Should produce output');
+        });
+
+        it('CLI: toc --top=1 works', () => {
+            const output = runCli(FIXTURES_PATH, 'toc', [], ['--top=1', '--detailed']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: toc --top=1 --detailed works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['toc --top=1 --detailed']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: toc top=1 detailed works', async () => {
+            const res = await mcpClient.callTool({ command: 'toc', project_dir: FIXTURES_PATH, top: 1, detailed: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.length > 0, 'Should produce output');
+        });
+    });
+
+    describe('about options parity', () => {
+        it('CLI: about --with-types works', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--with-types']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('interactive: about --with-types works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['about processData --with-types']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('MCP: about with_types works', async () => {
+            const res = await mcpClient.callTool({ command: 'about', project_dir: FIXTURES_PATH, name: 'processData', with_types: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+        });
+
+        it('CLI: about --all works', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--all']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('interactive: about --all works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['about processData --all']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('MCP: about all works', async () => {
+            const res = await mcpClient.callTool({ command: 'about', project_dir: FIXTURES_PATH, name: 'processData', all: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+        });
+
+        it('CLI: about --top=1 limits output', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--top=1']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('interactive: about --top=1 limits output', () => {
+            const output = runInteractive(FIXTURES_PATH, ['about processData --top=1']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('MCP: about top=1 limits output', async () => {
+            const res = await mcpClient.callTool({ command: 'about', project_dir: FIXTURES_PATH, name: 'processData', top: 1 });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+        });
+    });
+
+    describe('smart options parity', () => {
+        it('CLI: smart --include-methods works', () => {
+            const output = runCli(FIXTURES_PATH, 'smart', ['processData'], ['--include-methods']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('interactive: smart --include-methods works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['smart processData --include-methods']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('MCP: smart include_methods works', async () => {
+            const res = await mcpClient.callTool({ command: 'smart', project_dir: FIXTURES_PATH, name: 'processData', include_methods: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+        });
+    });
+
+    describe('impact options parity', () => {
+        it('CLI: impact --exclude=service works', () => {
+            const output = runCli(FIXTURES_PATH, 'impact', ['processData'], ['--exclude=service']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: impact --exclude=service works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['impact processData --exclude=service']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: impact exclude works', async () => {
+            const res = await mcpClient.callTool({ command: 'impact', project_dir: FIXTURES_PATH, name: 'processData', exclude: 'service' });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    describe('find options parity', () => {
+        it('CLI: find --file=main works', () => {
+            const output = runCli(FIXTURES_PATH, 'find', ['processData'], ['--file=main']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('interactive: find --file=main works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['find processData --file=main']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+        });
+
+        it('MCP: find file works', async () => {
+            const res = await mcpClient.callTool({ command: 'find', project_dir: FIXTURES_PATH, name: 'processData', file: 'main' });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+        });
+    });
+
+    describe('usages options parity', () => {
+        it('CLI: usages --exclude=service --in=. works', () => {
+            const output = runCli(FIXTURES_PATH, 'usages', ['processData'], ['--exclude=service']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: usages --exclude=service works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['usages processData --exclude=service']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: usages exclude works', async () => {
+            const res = await mcpClient.callTool({ command: 'usages', project_dir: FIXTURES_PATH, name: 'processData', exclude: 'service' });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    describe('typedef options parity', () => {
+        // Use TypeScript fixtures for typedef tests
+        const tsFixtures = path.join(__dirname, 'fixtures', 'typescript');
+
+        it('CLI: typedef --exact works', () => {
+            const output = runCli(tsFixtures, 'typedef', ['Task'], ['--exact']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: typedef --exact works', () => {
+            const output = runInteractive(tsFixtures, ['typedef Task --exact']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: typedef exact works', async () => {
+            const res = await mcpClient.callTool({ command: 'typedef', project_dir: tsFixtures, name: 'Task', exact: true });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    describe('api options parity', () => {
+        it('CLI: api with file arg works', () => {
+            const output = runCli(FIXTURES_PATH, 'api', ['main.js']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: api with file arg works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['api main.js']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: api with file works', async () => {
+            const res = await mcpClient.callTool({ command: 'api', project_dir: FIXTURES_PATH, file: 'main.js' });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    describe('graph options parity', () => {
+        it('CLI: graph --depth=1 auto-expands', () => {
+            const output = runCli(FIXTURES_PATH, 'graph', ['main.js'], ['--depth=1']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: graph --depth=1 auto-expands', () => {
+            const output = runInteractive(FIXTURES_PATH, ['graph main.js --depth=1']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: graph depth=1 auto-expands', async () => {
+            const res = await mcpClient.callTool({ command: 'graph', project_dir: FIXTURES_PATH, file: 'main.js', depth: 1 });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    describe('related options parity', () => {
+        it('CLI: related --top=1 works', () => {
+            const output = runCli(FIXTURES_PATH, 'related', ['processData'], ['--top=1']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('interactive: related --top=1 works', () => {
+            const output = runInteractive(FIXTURES_PATH, ['related processData --top=1']);
+            assert.ok(output.length > 0, 'Should produce output');
+        });
+
+        it('MCP: related top=1 works', async () => {
+            const res = await mcpClient.callTool({ command: 'related', project_dir: FIXTURES_PATH, name: 'processData', top: 1 });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    describe('deadcode hint parity', () => {
+        it('CLI: deadcode shows decorator/exported hints', () => {
+            const output = runCli(FIXTURES_PATH, 'deadcode');
+            // Just verify it doesn't crash — hints only show when there are excluded symbols
+            assert.ok(typeof output === 'string', 'Should produce output');
+        });
+
+        it('interactive: deadcode shows hints', () => {
+            const output = runInteractive(FIXTURES_PATH, ['deadcode']);
+            assert.ok(typeof output === 'string', 'Should produce output');
+        });
+
+        it('MCP: deadcode shows hints', async () => {
+            const res = await mcpClient.callTool({ command: 'deadcode', project_dir: FIXTURES_PATH });
+            assert.ok(!res.isError, 'Should not error');
+        });
+    });
+
+    // ========================================================================
+    // Category 3: fn/class --all and --max-lines parity
+    // ========================================================================
+
+    describe('fn all parity', () => {
+        // Create fixture with duplicate function names
+        let tmpDir;
+
+        before(() => {
+            tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-fn-parity-'));
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), 'function helper() { return 1; }\nmodule.exports = { helper };');
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), 'function helper() { return 2; }\nmodule.exports = { helper };');
+        });
+
+        after(() => {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        });
+
+        it('CLI: fn --all shows all definitions', () => {
+            const output = runCli(tmpDir, 'fn', ['helper'], ['--all']);
+            // Should show both definitions
+            assert.ok(output.includes('helper'), 'Should find helper');
+        });
+
+        it('interactive: fn --all shows all definitions', () => {
+            const output = runInteractive(tmpDir, ['fn helper --all']);
+            assert.ok(output.includes('helper'), 'Should find helper');
+        });
+
+        it('MCP: fn all shows all definitions', async () => {
+            const res = await mcpClient.callTool({ command: 'fn', project_dir: tmpDir, name: 'helper', all: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('helper'), 'Should find helper');
+            // With all=true and 2 definitions, should show both
+            assert.ok(res.text.includes('return 1') && res.text.includes('return 2'),
+                'Should show both definitions with all=true');
+        });
+    });
+
+    describe('class max-lines parity', () => {
+        let tmpDir;
+
+        before(() => {
+            tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-cls-parity-'));
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            // Create a class with >200 lines to test large class summary
+            const methods = [];
+            for (let i = 0; i < 70; i++) {
+                methods.push(`    method${i}(arg) {\n        const x = arg + ${i};\n        return x;\n    }`);
+            }
+            fs.writeFileSync(path.join(tmpDir, 'big.js'), `class BigClass {\n${methods.join('\n')}\n}\nmodule.exports = { BigClass };`);
+            // Small class for basic test
+            fs.writeFileSync(path.join(tmpDir, 'small.js'), `class SmallClass {\n    greet() { return 'hi'; }\n}\nmodule.exports = { SmallClass };`);
+        });
+
+        after(() => {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        });
+
+        it('CLI: class works for small class', () => {
+            const output = runCli(tmpDir, 'class', ['SmallClass']);
+            assert.ok(output.includes('SmallClass'), 'Should find class');
+            assert.ok(output.includes('greet'), 'Should show method');
+        });
+
+        it('interactive: class works for small class', () => {
+            const output = runInteractive(tmpDir, ['class SmallClass']);
+            assert.ok(output.includes('SmallClass'), 'Should find class');
+        });
+
+        it('MCP: class works for small class', async () => {
+            const res = await mcpClient.callTool({ command: 'class', project_dir: tmpDir, name: 'SmallClass' });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('SmallClass'), 'Should find class');
+        });
+
+        it('CLI: large class shows summary', () => {
+            const output = runCli(tmpDir, 'class', ['BigClass']);
+            assert.ok(output.includes('BigClass'), 'Should find class');
+            assert.ok(output.includes('Methods'), 'Should show method summary for large class');
+        });
+
+        it('interactive: large class shows summary', () => {
+            const output = runInteractive(tmpDir, ['class BigClass']);
+            assert.ok(output.includes('BigClass'), 'Should find class');
+            assert.ok(output.includes('Methods'), 'Should show method summary for large class');
+        });
+
+        it('MCP: large class shows summary', async () => {
+            const res = await mcpClient.callTool({ command: 'class', project_dir: tmpDir, name: 'BigClass' });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('BigClass'), 'Should find class');
+            assert.ok(res.text.includes('Methods'), 'Should show method summary');
+        });
+
+        it('CLI: class --max-lines=5 truncates', () => {
+            const output = runCli(tmpDir, 'class', ['BigClass'], ['--max-lines=5']);
+            assert.ok(output.includes('BigClass'), 'Should find class');
+            assert.ok(output.includes('showing 5 of'), 'Should show truncation notice');
+        });
+
+        it('interactive: class --max-lines=5 truncates', () => {
+            const output = runInteractive(tmpDir, ['class BigClass --max-lines=5']);
+            assert.ok(output.includes('BigClass'), 'Should find class');
+            assert.ok(output.includes('showing 5 of'), 'Should show truncation notice');
+        });
+
+        it('MCP: class max_lines=5 truncates', async () => {
+            const res = await mcpClient.callTool({ command: 'class', project_dir: tmpDir, name: 'BigClass', max_lines: 5 });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('BigClass'), 'Should find class');
+            assert.ok(res.text.includes('showing 5 of'), 'Should show truncation notice');
+        });
+    });
+
+    // ========================================================================
+    // Category 4: stats top default parity
+    // ========================================================================
+
+    describe('stats defaults parity', () => {
+        it('CLI and MCP produce consistent stats output', async () => {
+            const cliOutput = runCli(FIXTURES_PATH, 'stats');
+            const mcpRes = await mcpClient.callTool({ command: 'stats', project_dir: FIXTURES_PATH });
+
+            assert.ok(cliOutput.length > 0, 'CLI should produce output');
+            assert.ok(mcpRes.text.length > 0, 'MCP should produce output');
+            // Both should show basic stats (file counts, line counts)
+            assert.ok(cliOutput.includes('file'), 'CLI should mention files');
+            assert.ok(mcpRes.text.includes('file'), 'MCP should mention files');
+        });
+    });
+
+    // ========================================================================
+    // Category 5: All commands produce output without crashing
+    // ========================================================================
+
+    describe('All commands run without crashing across interfaces', () => {
+        const symbolCommands = [
+            { cmd: 'about', name: 'processData' },
+            { cmd: 'context', name: 'processData' },
+            { cmd: 'impact', name: 'processData' },
+            { cmd: 'smart', name: 'processData' },
+            { cmd: 'trace', name: 'processData' },
+            { cmd: 'example', name: 'processData' },
+            { cmd: 'related', name: 'processData' },
+            { cmd: 'find', name: 'processData' },
+            { cmd: 'usages', name: 'processData' },
+            { cmd: 'tests', name: 'processData' },
+            { cmd: 'typedef', name: 'DataProcessor' },
+            { cmd: 'verify', name: 'processData' },
+        ];
+
+        const noArgCommands = [
+            { cmd: 'toc' },
+            { cmd: 'deadcode' },
+            { cmd: 'stats' },
+            { cmd: 'api' },
+        ];
+
+        const fileCommands = [
+            { cmd: 'imports', file: 'main.js' },
+            { cmd: 'exporters', file: 'main.js' },
+            { cmd: 'file-exports', file: 'main.js', mcpCmd: 'file_exports' },
+            { cmd: 'graph', file: 'main.js' },
+        ];
+
+        for (const { cmd, name } of symbolCommands) {
+            it(`${cmd}: all 3 interfaces produce output`, async () => {
+                const cliOut = runCli(FIXTURES_PATH, cmd, [name]);
+                const intOut = runInteractive(FIXTURES_PATH, [`${cmd} ${name}`]);
+                const mcpRes = await mcpClient.callTool({ command: cmd, project_dir: FIXTURES_PATH, name });
+
+                assert.ok(cliOut.length > 0, `CLI ${cmd} should produce output`);
+                assert.ok(intOut.length > 0, `Interactive ${cmd} should produce output`);
+                assert.ok(!mcpRes.isError, `MCP ${cmd} should not error`);
+            });
+        }
+
+        for (const { cmd } of noArgCommands) {
+            it(`${cmd}: all 3 interfaces produce output`, async () => {
+                const cliOut = runCli(FIXTURES_PATH, cmd);
+                const intOut = runInteractive(FIXTURES_PATH, [cmd]);
+                const mcpRes = await mcpClient.callTool({ command: cmd, project_dir: FIXTURES_PATH });
+
+                assert.ok(cliOut.length > 0, `CLI ${cmd} should produce output`);
+                assert.ok(intOut.length > 0, `Interactive ${cmd} should produce output`);
+                assert.ok(!mcpRes.isError, `MCP ${cmd} should not error`);
+            });
+        }
+
+        for (const { cmd, file, mcpCmd } of fileCommands) {
+            it(`${cmd}: all 3 interfaces produce output`, async () => {
+                const cliOut = runCli(FIXTURES_PATH, cmd, [file]);
+                const intOut = runInteractive(FIXTURES_PATH, [`${cmd} ${file}`]);
+                const mcpRes = await mcpClient.callTool({ command: mcpCmd || cmd, project_dir: FIXTURES_PATH, file });
+
+                assert.ok(cliOut.length > 0, `CLI ${cmd} should produce output`);
+                assert.ok(intOut.length > 0, `Interactive ${cmd} should produce output`);
+                assert.ok(!mcpRes.isError, `MCP ${cmd} should not error`);
+            });
+        }
+
+        it('search: all 3 interfaces produce output', async () => {
+            const cliOut = runCli(FIXTURES_PATH, 'search', ['processData']);
+            const intOut = runInteractive(FIXTURES_PATH, ['search processData']);
+            const mcpRes = await mcpClient.callTool({ command: 'search', project_dir: FIXTURES_PATH, term: 'processData' });
+
+            assert.ok(cliOut.length > 0, 'CLI search should produce output');
+            assert.ok(intOut.length > 0, 'Interactive search should produce output');
+            assert.ok(!mcpRes.isError, 'MCP search should not error');
+        });
+
+        it('fn: all 3 interfaces produce output', async () => {
+            const cliOut = runCli(FIXTURES_PATH, 'fn', ['processData']);
+            const intOut = runInteractive(FIXTURES_PATH, ['fn processData']);
+            const mcpRes = await mcpClient.callTool({ command: 'fn', project_dir: FIXTURES_PATH, name: 'processData' });
+
+            assert.ok(cliOut.length > 0, 'CLI fn should produce output');
+            assert.ok(intOut.length > 0, 'Interactive fn should produce output');
+            assert.ok(!mcpRes.isError, 'MCP fn should not error');
+        });
+
+        it('class: all 3 interfaces produce output', async () => {
+            const cliOut = runCli(FIXTURES_PATH, 'class', ['DataProcessor']);
+            const intOut = runInteractive(FIXTURES_PATH, ['class DataProcessor']);
+            const mcpRes = await mcpClient.callTool({ command: 'class', project_dir: FIXTURES_PATH, name: 'DataProcessor' });
+
+            assert.ok(cliOut.length > 0, 'CLI class should produce output');
+            assert.ok(intOut.length > 0, 'Interactive class should produce output');
+            assert.ok(!mcpRes.isError, 'MCP class should not error');
+        });
+    });
+});

@@ -86,7 +86,9 @@ const flags = {
     // Regex search mode (default: ON; --no-regex to force plain text)
     regex: args.includes('--no-regex') ? false : undefined,
     // Stats: per-function line counts
-    functions: args.includes('--functions')
+    functions: args.includes('--functions'),
+    // Class: max lines to show (0 = no limit)
+    maxLines: parseInt(args.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null
 };
 
 // Handle --file flag with space
@@ -106,7 +108,8 @@ const knownFlags = new Set([
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged',
-    '--regex', '--no-regex', '--functions'
+    '--regex', '--no-regex', '--functions',
+    '--max-lines'
 ]);
 
 // Handle help flag
@@ -841,7 +844,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             requireArg(arg, 'Usage: ucn . about <name>');
-            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain, exclude: flags.exclude });
+            const aboutResult = index.about(arg, { withTypes: flags.withTypes, file: flags.file, all: flags.all, includeMethods: flags.includeMethods, includeUncertain: flags.includeUncertain, exclude: flags.exclude, maxCallers: flags.top || undefined, maxCallees: flags.top || undefined });
             printOutput(aboutResult,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
@@ -899,8 +902,8 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'related': {
             requireArg(arg, 'Usage: ucn . related <name>');
-            const relatedResult = index.related(arg, { file: flags.file, all: flags.all });
-            printOutput(relatedResult, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all }));
+            const relatedResult = index.related(arg, { file: flags.file, top: flags.top, all: flags.all });
+            printOutput(relatedResult, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all, top: flags.top }));
             break;
         }
 
@@ -997,7 +1000,11 @@ function runProjectCommand(rootDir, command, arg) {
             });
             printOutput(deadcodeResults,
                 output.formatDeadcodeJson,
-                r => output.formatDeadcode(r, { top: flags.top })
+                r => output.formatDeadcode(r, {
+                    top: flags.top,
+                    decoratedHint: !flags.includeDecorated && deadcodeResults.excludedDecorated > 0 ? `${deadcodeResults.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
+                    exportedHint: !flags.includeExported && deadcodeResults.excludedExported > 0 ? `${deadcodeResults.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
+                })
             );
             break;
         }
@@ -1162,6 +1169,45 @@ function extractClassFromProject(index, name, overrideFlags) {
     // Use index data directly instead of re-parsing the file
     const code = fs.readFileSync(match.file, 'utf-8');
     const codeLines = code.split('\n');
+    const classLineCount = match.endLine - match.startLine + 1;
+
+    // Large class summary (>200 lines) when no --max-lines specified
+    if (classLineCount > 200 && !f.maxLines) {
+        if (f.json) {
+            const extracted = codeLines.slice(match.startLine - 1, match.endLine);
+            const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
+            console.log(JSON.stringify({ ...match, code: clsCode }, null, 2));
+        } else {
+            const lines = [];
+            lines.push(`${match.relativePath}:${match.startLine}`);
+            lines.push(`${output.lineRange(match.startLine, match.endLine)} ${output.formatClassSignature(match)}`);
+            lines.push('\u2500'.repeat(60));
+            const methods = index.findMethodsForType(match.name);
+            if (methods.length > 0) {
+                lines.push(`\nMethods (${methods.length}):`);
+                for (const m of methods) {
+                    lines.push(`  ${output.formatFunctionSignature(m)}  [line ${m.startLine}]`);
+                }
+            }
+            lines.push(`\nClass is ${classLineCount} lines. Use --max-lines=N to see source, or "fn <method>" for individual methods.`);
+            console.log(lines.join('\n'));
+        }
+        return;
+    }
+
+    // Truncated source with --max-lines
+    if (f.maxLines && classLineCount > f.maxLines) {
+        const truncated = codeLines.slice(match.startLine - 1, match.startLine - 1 + f.maxLines);
+        const truncatedCode = cleanHtmlScriptTags(truncated, detectLanguage(match.file)).join('\n');
+        if (f.json) {
+            console.log(JSON.stringify({ ...match, code: truncatedCode, truncated: true, totalLines: classLineCount }, null, 2));
+        } else {
+            console.log(output.formatClass(match, truncatedCode));
+            console.log(`\n... showing ${f.maxLines} of ${classLineCount} lines`);
+        }
+        return;
+    }
+
     const extracted = codeLines.slice(match.startLine - 1, match.endLine);
     const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 
@@ -1902,6 +1948,7 @@ function parseInteractiveFlags(tokens) {
         includeUncertain: tokens.includes('--include-uncertain'),
         includeMethods: tokens.includes('--include-methods=false') ? false : tokens.includes('--include-methods') ? true : undefined,
         detailed: tokens.includes('--detailed'),
+        topLevel: tokens.includes('--top-level'),
         all: tokens.includes('--all'),
         exact: tokens.includes('--exact'),
         callsOnly: tokens.includes('--calls-only'),
@@ -1928,9 +1975,10 @@ function parseInteractiveFlags(tokens) {
 function executeInteractiveCommand(index, command, arg, iflags = {}) {
     switch (command) {
         case 'toc': {
-            const toc = index.getToc({ detailed: iflags.detailed });
+            const toc = index.getToc({ detailed: iflags.detailed, topLevel: iflags.topLevel, all: iflags.all, top: iflags.top });
             console.log(output.formatToc(toc, {
-                detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol'
+                detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol',
+                uncertainHint: 'use --include-uncertain to include all'
             }));
             break;
         }
@@ -1940,7 +1988,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: find <name>');
                 return;
             }
-            const found = index.find(arg, { exact: iflags.exact, exclude: iflags.exclude, in: iflags.in, includeTests: iflags.includeTests });
+            const findExclude = iflags.includeTests ? iflags.exclude : addTestExclusions(iflags.exclude);
+            const found = index.find(arg, { file: iflags.file, exact: iflags.exact, exclude: findExclude, in: iflags.in });
             if (found.length === 0) {
                 console.log(`No symbols found for "${arg}"`);
             } else {
@@ -1954,7 +2003,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: about <name>');
                 return;
             }
-            const aboutResult = index.about(arg, { includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain, file: iflags.file, exclude: iflags.exclude });
+            const aboutResult = index.about(arg, { withTypes: iflags.withTypes, file: iflags.file, all: iflags.all, includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain, exclude: iflags.exclude, maxCallers: iflags.top || undefined, maxCallees: iflags.top || undefined });
             console.log(output.formatAbout(aboutResult, { expand: iflags.expand, root: index.root, showAll: iflags.all }));
             break;
         }
@@ -1964,7 +2013,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: usages <name>');
                 return;
             }
-            const usages = index.usages(arg, { context: iflags.context, codeOnly: iflags.codeOnly, includeTests: iflags.includeTests });
+            const usagesExclude = iflags.includeTests ? iflags.exclude : addTestExclusions(iflags.exclude);
+            const usages = index.usages(arg, { codeOnly: iflags.codeOnly, context: iflags.context, exclude: usagesExclude, in: iflags.in });
             console.log(output.formatUsages(usages, arg));
             break;
         }
@@ -1994,7 +2044,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: smart <name>');
                 return;
             }
-            const smart = index.smart(arg, { file: iflags.file, includeUncertain: iflags.includeUncertain, withTypes: iflags.withTypes });
+            const smart = index.smart(arg, { file: iflags.file, withTypes: iflags.withTypes, includeMethods: iflags.includeMethods, includeUncertain: iflags.includeUncertain });
             if (smart) {
                 console.log(output.formatSmart(smart, {
                     uncertainHint: 'use --include-uncertain to include all'
@@ -2010,7 +2060,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: impact <name>');
                 return;
             }
-            const impactResult = index.impact(arg, { file: iflags.file });
+            const impactResult = index.impact(arg, { file: iflags.file, exclude: iflags.exclude });
             console.log(output.formatImpact(impactResult));
             break;
         }
@@ -2076,7 +2126,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
             const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
             const graphDirection = iflags.direction || 'both';
             const graphResult = index.graph(arg, { direction: graphDirection, maxDepth: graphDepth });
-            console.log(output.formatGraph(graphResult, { showAll: iflags.all, maxDepth: graphDepth }));
+            console.log(output.formatGraph(graphResult, { showAll: iflags.all || !!iflags.depth, maxDepth: graphDepth, file: arg }));
             break;
         }
 
@@ -2128,7 +2178,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: search <term>');
                 return;
             }
-            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context, exclude: iflags.exclude, in: iflags.in, regex: iflags.regex });
+            const searchExclude = iflags.includeTests ? iflags.exclude : addTestExclusions(iflags.exclude);
+            const results = index.search(arg, { codeOnly: iflags.codeOnly, caseSensitive: iflags.caseSensitive, context: iflags.context, exclude: searchExclude, in: iflags.in, regex: iflags.regex });
             console.log(output.formatSearch(results, arg));
             break;
         }
@@ -2138,14 +2189,14 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: typedef <name>');
                 return;
             }
-            const types = index.typedef(arg);
+            const types = index.typedef(arg, { exact: iflags.exact });
             console.log(output.formatTypedef(types, arg));
             break;
         }
 
         case 'api': {
-            const api = index.api();
-            console.log(output.formatApi(api, '.'));
+            const api = index.api(arg);
+            console.log(output.formatApi(api, arg || '.'));
             break;
         }
 
@@ -2197,7 +2248,11 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 exclude: iflags.exclude,
                 in: iflags.in
             });
-            console.log(output.formatDeadcode(deadResult, { top: iflags.top }));
+            console.log(output.formatDeadcode(deadResult, {
+                top: iflags.top,
+                decoratedHint: !iflags.includeDecorated && deadResult.excludedDecorated > 0 ? `${deadResult.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
+                exportedHint: !iflags.includeExported && deadResult.excludedExported > 0 ? `${deadResult.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
+            }));
             break;
         }
 
@@ -2206,8 +2261,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
                 console.log('Usage: related <name>');
                 return;
             }
-            const relResult = index.related(arg, { file: iflags.file, all: iflags.all });
-            console.log(output.formatRelated(relResult, { showAll: iflags.all }));
+            const relResult = index.related(arg, { file: iflags.file, top: iflags.top, all: iflags.all });
+            console.log(output.formatRelated(relResult, { showAll: iflags.all, top: iflags.top }));
             break;
         }
 

@@ -486,6 +486,19 @@ server.registerTool(
                         continue;
                     }
 
+                    // Show all definitions when all=true and multiple matches
+                    if (matches.length > 1 && !file && all) {
+                        for (const m of matches) {
+                            const mPathCheck = resolveAndValidatePath(index, m.relativePath || path.relative(index.root, m.file));
+                            if (typeof mPathCheck !== 'string') return mPathCheck;
+                            const mCode = fs.readFileSync(m.file, 'utf-8');
+                            const mLines = mCode.split('\n');
+                            const mFnCode = mLines.slice(m.startLine - 1, m.endLine).join('\n');
+                            parts.push(output.formatFn(m, mFnCode));
+                        }
+                        continue;
+                    }
+
                     const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
                     const fnPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
                     if (typeof fnPathCheck !== 'string') return fnPathCheck;
@@ -495,7 +508,7 @@ server.registerTool(
 
                     let note = '';
                     if (matches.length > 1 && !file) {
-                        note = `Note: Found ${matches.length} definitions for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n`;
+                        note = `Note: Found ${matches.length} definitions for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Use file parameter or all=true to show all.\n`;
                     }
                     parts.push(note + output.formatFn(match, fnCode));
                 }
@@ -514,6 +527,20 @@ server.registerTool(
 
                 if (matches.length === 0) {
                     return toolResult(`Class "${name}" not found.`);
+                }
+
+                // Show all definitions when all=true and multiple matches
+                if (matches.length > 1 && !file && all) {
+                    const allParts = [];
+                    for (const m of matches) {
+                        const mPathCheck = resolveAndValidatePath(index, m.relativePath || path.relative(index.root, m.file));
+                        if (typeof mPathCheck !== 'string') return mPathCheck;
+                        const mCode = fs.readFileSync(m.file, 'utf-8');
+                        const mLines = mCode.split('\n');
+                        const clsCode = mLines.slice(m.startLine - 1, m.endLine).join('\n');
+                        allParts.push(output.formatClass(m, clsCode));
+                    }
+                    return toolResult(allParts.join('\n\n'));
                 }
 
                 const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
@@ -731,6 +758,7 @@ server.registerTool(
                 if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
                 return toolResult(output.formatGraph(result, {
                     showAll: all || depth !== undefined,
+                    maxDepth: depth ?? 2,
                     file,
                     depthHint: 'Set depth parameter for deeper graph.',
                     allHint: 'Set depth to expand all children.'
@@ -812,7 +840,7 @@ server.registerTool(
             case 'stats': {
                 const index = getIndex(project_dir);
                 const stats = index.getStats({ functions: functions || false });
-                return toolResult(output.formatStats(stats, { top: top || 30 }));
+                return toolResult(output.formatStats(stats, { top: top || 0 }));
             }
 
             default:
