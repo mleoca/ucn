@@ -1712,41 +1712,30 @@ describe('MCP Issues Fixes', () => {
 
     // Issue 1: expand cache was keyed by project only, losing previous context results
     it('expand cache supports multiple symbols per project (issue 1)', () => {
-        // Simulate the expand cache behavior
-        const expandCache = new Map();
+        const { ExpandCache } = require(path.join(PROJECT_DIR, 'core', 'expand-cache'));
+        const cache = new ExpandCache();
         const projectRoot = '/fake/project';
 
         // Store context for symbol A
-        expandCache.set(`${projectRoot}:funcA`, {
-            items: [{ num: 1, name: 'callerOfA', type: 'function' }],
-            root: projectRoot,
-            symbolName: 'funcA'
-        });
+        cache.save(projectRoot, 'funcA', null, [{ num: 1, name: 'callerOfA', type: 'function' }]);
 
         // Store context for symbol B (should NOT overwrite A)
-        expandCache.set(`${projectRoot}:funcB`, {
-            items: [{ num: 1, name: 'callerOfB', type: 'function' }],
-            root: projectRoot,
-            symbolName: 'funcB'
-        });
+        cache.save(projectRoot, 'funcB', null, [{ num: 1, name: 'callerOfB', type: 'function' }]);
 
-        // Both should be retrievable
-        const cachedA = expandCache.get(`${projectRoot}:funcA`);
-        const cachedB = expandCache.get(`${projectRoot}:funcB`);
-        assert.ok(cachedA, 'funcA cache should still exist');
-        assert.ok(cachedB, 'funcB cache should exist');
-        assert.strictEqual(cachedA.items[0].name, 'callerOfA');
-        assert.strictEqual(cachedB.items[0].name, 'callerOfB');
+        // Both should be retrievable — funcB is most recent, but funcA's items are still findable
+        const lookupB = cache.lookup(projectRoot, 1);
+        assert.ok(lookupB.match, 'should find item 1 from most recent context (funcB)');
+        assert.strictEqual(lookupB.match.name, 'callerOfB', 'most recent should be funcB');
 
-        // Search across all entries for a project (like expand handler does)
-        let found = null;
-        for (const [key, cached] of expandCache) {
-            if (cached.root === projectRoot) {
-                const match = cached.items.find(i => i.num === 1 && i.name === 'callerOfA');
-                if (match) { found = match; break; }
-            }
-        }
-        assert.ok(found, 'should find item from funcA when searching all project caches');
+        // Item with a unique number in funcA should be findable via fallback
+        cache.save(projectRoot, 'funcA', null, [
+            { num: 1, name: 'callerOfA', type: 'function' },
+            { num: 2, name: 'otherCallerOfA', type: 'function' }
+        ]);
+        // funcA is now most recent, so item 2 should be found
+        const lookupA2 = cache.lookup(projectRoot, 2);
+        assert.ok(lookupA2.match, 'should find item 2 from funcA');
+        assert.strictEqual(lookupA2.match.name, 'otherCallerOfA');
     });
 
     // Issue 2: example() method moved to core/project.js
@@ -2736,9 +2725,9 @@ public class Example {
     assert.strictEqual(defs.length, 0, 'String should not be classified as a definition in formal_parameter');
 });
 
-it('FIX 95 — MCP expandCache key includes file for disambiguation', () => {
-    const serverCode = fs.readFileSync(path.join(PROJECT_DIR, 'mcp', 'server.js'), 'utf-8');
-    assert.ok(serverCode.includes('`${index.root}:${name}:${file || \'\'}`'),
+it('FIX 95 — ExpandCache key includes file for disambiguation', () => {
+    const cacheCode = fs.readFileSync(path.join(PROJECT_DIR, 'core', 'expand-cache.js'), 'utf-8');
+    assert.ok(cacheCode.includes('`${root}:${name}:${file || \'\'}`'),
         'expandCache key should include file parameter');
 });
 
@@ -3581,6 +3570,21 @@ it('FIX 99 — parseDiff handles quoted paths with special characters', () => {
     assert.strictEqual(changes4.length, 1);
     assert.strictEqual(changes4[0].relativePath, 'a\\n.js',
         'Literal backslash-n in filename must be preserved, not converted to newline');
+});
+
+it('FIX 105 — all parser.parse() calls in project.js and utils.js use safeParse', () => {
+    const projectCode = fs.readFileSync(path.join(PROJECT_DIR, 'core', 'project.js'), 'utf-8');
+    const utilsCode = fs.readFileSync(path.join(PROJECT_DIR, 'languages', 'utils.js'), 'utf-8');
+
+    // Match parser.parse( but not safeParse( or comment lines
+    const directParseRegex = /(?<!safe)parser\.parse\s*\(/g;
+    const projectMatches = projectCode.match(directParseRegex);
+    const utilsMatches = utilsCode.match(directParseRegex);
+
+    assert.strictEqual(projectMatches, null,
+        'project.js should not have direct parser.parse() calls — use safeParse() instead');
+    assert.strictEqual(utilsMatches, null,
+        'utils.js should not have direct parser.parse() calls — use safeParse() instead');
 });
 
 }); // end describe FIX 91-99

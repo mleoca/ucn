@@ -12,7 +12,7 @@ const { execSync, execFileSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parse, parseFile, cleanHtmlScriptTags } = require('./parser');
-const { detectLanguage, getParser, getLanguageModule, PARSE_OPTIONS, safeParse } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 
 // Read UCN version for cache invalidation
@@ -1510,7 +1510,7 @@ class ProjectIndex {
                 return false;
             }
 
-            const tree = parser.parse(content, undefined, PARSE_OPTIONS);
+            const tree = safeParse(parser, content);
 
             // Find all occurrences of name in the line
             const nameRegex = new RegExp('(?<![a-zA-Z0-9_$])' + escapeRegExp(name) + '(?![a-zA-Z0-9_$])', 'g');
@@ -2116,7 +2116,7 @@ class ProjectIndex {
                 return false;
             }
 
-            const tree = parser.parse(content, undefined, PARSE_OPTIONS);
+            const tree = safeParse(parser, content);
             const tokenType = getTokenTypeAtPosition(tree.rootNode, lineNum, column);
             return tokenType === 'comment' || tokenType === 'string';
         } catch (e) {
@@ -2788,12 +2788,12 @@ class ProjectIndex {
                     if (blocks.length === 0 && !htmlModule.extractEventHandlerCalls) continue;
                     if (blocks.length > 0) {
                         const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
-                        tree = jsParser.parse(virtualJS, undefined, PARSE_OPTIONS);
+                        tree = safeParse(jsParser, virtualJS);
                     }
                 } else {
                     const parser = getParser(language);
                     if (!parser) continue;
-                    tree = parser.parse(content, undefined, PARSE_OPTIONS);
+                    tree = safeParse(parser, content);
                 }
 
                 // Collect all identifiers from this file in one pass
@@ -5005,7 +5005,7 @@ class ProjectIndex {
 
             const parser = getParser(language);
             const content = this._readFile(filePath);
-            const tree = parser.parse(content, undefined, PARSE_OPTIONS);
+            const tree = safeParse(parser, content);
 
             const row = lineNum - 1;
             const node = tree.rootNode.descendantForPosition({ row, column: 0 });
@@ -5066,6 +5066,11 @@ class ProjectIndex {
         this._beginOp();
         try {
         const { base = 'HEAD', staged = false, file } = options;
+
+        // Validate base ref format to prevent argument injection
+        if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {
+            throw new Error(`Invalid git ref format: ${base}`);
+        }
 
         // Verify git repo
         let gitRoot;

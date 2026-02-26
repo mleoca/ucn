@@ -31,20 +31,20 @@ try {
 // ============================================================================
 
 const { ProjectIndex } = require('../core/project');
-const { findProjectRoot, isTestFile } = require('../core/discovery');
-const { detectLanguage } = require('../core/parser');
+const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { pickBestDefinition, addTestExclusions } = require('../core/shared');
+const { pickBestDefinition } = require('../core/shared');
+const { getMcpCommandEnum, normalizeParams } = require('../core/registry');
+const { execute } = require('../core/execute');
+const { ExpandCache, renderExpandItem } = require('../core/expand-cache');
 
 // ============================================================================
 // INDEX CACHE
 // ============================================================================
 
 const indexCache = new Map(); // projectDir → { index, checkedAt }
-const expandCache = new Map(); // projectDir:symbolName → { items, root, symbolName, usedAt }
-const lastContextKey = new Map(); // projectRoot → expandCache key
 const MAX_CACHE_SIZE = 10;
-const MAX_EXPAND_CACHE_SIZE = 50;
+const expandCacheInstance = new ExpandCache();
 
 function getIndex(projectDir) {
     const absDir = path.resolve(projectDir);
@@ -68,11 +68,8 @@ function getIndex(projectDir) {
     } else {
         index.build(null, { quiet: true, forceRebuild: loaded });
         index.saveCache();
-        // Clear expandCache entries for this project — stale after rebuild
-        for (const [key, val] of expandCache) {
-            if (val.root === root) expandCache.delete(key);
-        }
-        lastContextKey.delete(root);
+        // Clear expand cache entries for this project — stale after rebuild
+        expandCacheInstance.clearForRoot(root);
     }
 
     // LRU eviction
@@ -87,11 +84,7 @@ function getIndex(projectDir) {
         }
         if (oldestKey) {
             indexCache.delete(oldestKey);
-            // Clean up associated expandCache and lastContextKey entries
-            for (const [key, val] of expandCache) {
-                if (val.root === oldestKey) expandCache.delete(key);
-            }
-            lastContextKey.delete(oldestKey);
+            expandCacheInstance.clearForRoot(oldestKey);
         }
     }
 
@@ -111,11 +104,6 @@ const server = new McpServer({
 // ============================================================================
 // TOOL HELPERS
 // ============================================================================
-
-function parseExclude(excludeStr) {
-    if (!excludeStr) return [];
-    return excludeStr.split(',').map(s => s.trim()).filter(Boolean);
-}
 
 const MAX_OUTPUT_CHARS = 100000; // ~100KB, safe for all MCP clients
 
@@ -228,14 +216,7 @@ server.registerTool(
     {
         description: TOOL_DESCRIPTION,
         inputSchema: z.object({
-            command: z.enum([
-                'about', 'context', 'impact', 'smart', 'trace',
-                'find', 'usages', 'fn', 'class', 'example',
-                'related', 'tests', 'verify', 'plan', 'typedef',
-                'expand', 'toc', 'search', 'deadcode',
-                'imports', 'exporters', 'file_exports', 'graph', 'lines',
-                'api', 'stats', 'diff_impact', 'stacktrace'
-            ]),
+            command: z.enum(getMcpCommandEnum()),
             project_dir: z.string().describe('Absolute or relative path to the project root directory'),
             name: z.string().optional().describe('Symbol name to analyze. For fn: comma-separated for bulk (e.g. "parse,format"). For find: supports glob patterns (e.g. "handle*").'),
             file: z.string().optional().describe('File path (imports/exporters/graph/file_exports/lines/api/diff_impact) or filter pattern for disambiguation (e.g. "parser", "src/core")'),
@@ -289,11 +270,13 @@ server.registerTool(
             // UNDERSTANDING CODE
             // ==================================================================
 
+            // ── Commands using shared executor ─────────────────────────
+
             case 'about': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.about(name, { file, exclude: parseExclude(exclude), withTypes: with_types || false, includeMethods: include_methods ?? undefined, includeUncertain: include_uncertain || false, all: all || false, maxCallers: top, maxCallees: top });
+                const ep = normalizeParams({ name, file, exclude, with_types, all, include_methods, include_uncertain, top });
+                const { ok, result, error } = execute(index, 'about', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.'
@@ -301,66 +284,38 @@ server.registerTool(
             }
 
             case 'context': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const ctx = index.context(name, {
-                    includeMethods: include_methods,
-                    includeUncertain: include_uncertain || false,
-                    file,
-                    exclude: parseExclude(exclude)
-                });
-                if (!ctx) return toolResult(`Symbol "${name}" not found.`);
+                const ep = normalizeParams({ name, file, exclude, include_methods, include_uncertain });
+                const { ok, result: ctx, error } = execute(index, 'context', ep);
+                if (!ok) return toolResult(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.'
                 });
-                if (expandable.length > 0) {
-                    const cacheKey = `${index.root}:${name}:${file || ''}`;
-                    // LRU eviction for expandCache
-                    if (expandCache.size >= MAX_EXPAND_CACHE_SIZE && !expandCache.has(cacheKey)) {
-                        let oldestKey = null;
-                        let oldestTime = Infinity;
-                        for (const [key, val] of expandCache) {
-                            if ((val.usedAt || 0) < oldestTime) {
-                                oldestTime = val.usedAt || 0;
-                                oldestKey = key;
-                            }
-                        }
-                        if (oldestKey) expandCache.delete(oldestKey);
-                    }
-                    expandCache.set(cacheKey, { items: expandable, root: index.root, symbolName: name, usedAt: Date.now() });
-                    lastContextKey.set(index.root, cacheKey);
-                }
+                expandCacheInstance.save(index.root, name, file, expandable);
                 return toolResult(text);
             }
 
             case 'impact': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.impact(name, { file, exclude: parseExclude(exclude) });
+                const ep = normalizeParams({ name, file, exclude });
+                const { ok, result, error } = execute(index, 'impact', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatImpact(result));
             }
 
             case 'smart': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.smart(name, {
-                    file,
-                    withTypes: with_types || false,
-                    includeMethods: include_methods,
-                    includeUncertain: include_uncertain || false
-                });
-                if (!result) return toolResult(`Function "${name}" not found.`);
+                const ep = normalizeParams({ name, file, with_types, include_methods, include_uncertain });
+                const { ok, result, error } = execute(index, 'smart', ep);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatSmart(result));
             }
 
             case 'trace': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.trace(name, { depth: depth ?? 3, file, all: depth !== undefined, includeMethods: include_methods, includeUncertain: include_uncertain || false });
+                const ep = normalizeParams({ name, file, depth, all, include_methods, include_uncertain });
+                const { ok, result, error } = execute(index, 'trace', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
@@ -368,96 +323,73 @@ server.registerTool(
             }
 
             case 'example': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const exResult = index.example(name);
-                if (!exResult) return toolResult(`No usage examples found for "${name}".`);
-                return toolResult(output.formatExample(exResult, name));
+                const { ok, result, error } = execute(index, 'example', { name });
+                if (!ok) return toolError(error);
+                if (!result) return toolResult(`No usage examples found for "${name}".`);
+                return toolResult(output.formatExample(result, name));
             }
 
             case 'related': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.related(name, { file, top, all: all || false });
+                const { ok, result, error } = execute(index, 'related', { name, file, top, all });
+                if (!ok) return toolError(error);
                 if (!result) return toolResult(`Symbol "${name}" not found.`);
                 return toolResult(output.formatRelated(result, {
-                    showAll: all || false,
-                    top,
+                    showAll: all || false, top,
                     allHint: 'Repeat with all=true to show all.'
                 }));
             }
 
-            // ==================================================================
-            // FINDING CODE
-            // ==================================================================
+            // ── Finding Code ────────────────────────────────────────────
 
             case 'find': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const excludeArr = include_tests ? parseExclude(exclude) : addTestExclusions(parseExclude(exclude));
-                const found = index.find(name, { file, exclude: excludeArr, exact: exact || false, in: inPath });
-                return toolResult(output.formatFind(found, name, top));
+                const ep = normalizeParams({ name, file, exclude, include_tests, exact, in: inPath });
+                const { ok, result, error } = execute(index, 'find', ep);
+                if (!ok) return toolError(error);
+                return toolResult(output.formatFind(result, name, top));
             }
 
             case 'usages': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const excludeArr = include_tests ? parseExclude(exclude) : addTestExclusions(parseExclude(exclude));
-                const result = index.usages(name, {
-                    exclude: excludeArr,
-                    codeOnly: code_only || false,
-                    context: ctxLines || 0,
-                    in: inPath
-                });
+                const ep = normalizeParams({ name, exclude, include_tests, code_only, context: ctxLines, in: inPath });
+                const { ok, result, error } = execute(index, 'usages', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatUsages(result, name));
             }
 
             case 'toc': {
                 const index = getIndex(project_dir);
-                const toc = index.getToc({ detailed: detailed || false, topLevel: top_level || false, all: all || false, top });
-                return toolResult(output.formatToc(toc, {
+                const ep = normalizeParams({ detailed, top_level, all, top });
+                const { ok, result, error } = execute(index, 'toc', ep);
+                if (!ok) return toolError(error);
+                return toolResult(output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 }));
             }
 
             case 'search': {
-                if (!term || !term.trim()) {
-                    return toolError('Search term is required.');
-                }
                 const index = getIndex(project_dir);
-                const searchExclude = include_tests ? parseExclude(exclude) : addTestExclusions(parseExclude(exclude));
-                const result = index.search(term, {
-                    codeOnly: code_only || false,
-                    context: ctxLines || 0,
-                    caseSensitive: case_sensitive || false,
-                    exclude: searchExclude,
-                    in: inPath || undefined,
-                    regex: regex
-                });
+                const ep = normalizeParams({ term, exclude, include_tests, code_only, context: ctxLines, case_sensitive, in: inPath, regex });
+                const { ok, result, error } = execute(index, 'search', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatSearch(result, term));
             }
 
             case 'tests': {
-                const err = requireName(name);
-                if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.tests(name, { callsOnly: calls_only });
+                const ep = normalizeParams({ name, calls_only });
+                const { ok, result, error } = execute(index, 'tests', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatTests(result, name));
             }
 
             case 'deadcode': {
                 const index = getIndex(project_dir);
-                const result = index.deadcode({
-                    exclude: parseExclude(exclude),
-                    in: inPath || undefined,
-                    includeExported: include_exported || false,
-                    includeDecorated: include_decorated || false,
-                    includeTests: include_tests || false
-                });
+                const ep = normalizeParams({ exclude, in: inPath, include_exported, include_decorated, include_tests });
+                const { ok, result, error } = execute(index, 'deadcode', ep);
+                if (!ok) return toolError(error);
                 return toolResult(output.formatDeadcode(result, {
                     top: top || 0,
                     decoratedHint: !include_decorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
@@ -465,9 +397,96 @@ server.registerTool(
                 }));
             }
 
-            // ==================================================================
-            // EXTRACTING CODE
-            // ==================================================================
+            // ── File Dependencies ───────────────────────────────────────
+
+            case 'imports': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'imports', { file });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatImports(result, file));
+            }
+
+            case 'exporters': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'exporters', { file });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatExporters(result, file));
+            }
+
+            case 'file_exports': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'fileExports', { file });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatFileExports(result, file));
+            }
+
+            case 'graph': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'graph', { file, direction, depth, all });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatGraph(result, {
+                    showAll: all || depth !== undefined,
+                    maxDepth: depth ?? 2, file,
+                    depthHint: 'Set depth parameter for deeper graph.',
+                    allHint: 'Set depth to expand all children.'
+                }));
+            }
+
+            // ── Refactoring ─────────────────────────────────────────────
+
+            case 'verify': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'verify', { name, file });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatVerify(result));
+            }
+
+            case 'plan': {
+                const index = getIndex(project_dir);
+                const ep = normalizeParams({ name, add_param, remove_param, rename_to, default_value, file });
+                const { ok, result, error } = execute(index, 'plan', ep);
+                if (!ok) return toolError(error);
+                return toolResult(output.formatPlan(result));
+            }
+
+            case 'diff_impact': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'diffImpact', { base, staged, file });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatDiffImpact(result));
+            }
+
+            // ── Other ───────────────────────────────────────────────────
+
+            case 'typedef': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'typedef', { name, exact });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatTypedef(result, name));
+            }
+
+            case 'stacktrace': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'stacktrace', { stack });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatStackTrace(result));
+            }
+
+            case 'api': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'api', { file });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatApi(result, file || '.'));
+            }
+
+            case 'stats': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'stats', { functions });
+                if (!ok) return toolError(error);
+                return toolResult(output.formatStats(result, { top: top || 0 }));
+            }
+
+            // ── Extracting Code (adapter-specific) ──────────────────────
 
             case 'fn': {
                 const err = requireName(name);
@@ -647,200 +666,19 @@ server.registerTool(
                     return toolError('Item number is required (e.g. item=1).');
                 }
                 const index = getIndex(project_dir);
-                // Look up from the most recent context call for this project
-                const recentKey = lastContextKey.get(index.root);
-                const recentCache = recentKey ? expandCache.get(recentKey) : null;
+                const { match, itemCount, symbolName } = expandCacheInstance.lookup(index.root, item);
 
-                let match = null;
-                let cachedItemCount = 0;
-
-                if (recentCache && recentCache.items) {
-                    // Strict: only expand from the most recent context call
-                    recentCache.usedAt = Date.now(); // LRU: refresh on access
-                    cachedItemCount = recentCache.items.length;
-                    match = recentCache.items.find(i => i.num === item);
-                } else {
-                    // No recent context — fallback to any cached context for this project
-                    for (const [key, cached] of expandCache) {
-                        if (cached.root === index.root && cached.items) {
-                            cached.usedAt = Date.now(); // LRU: refresh on access
-                            cachedItemCount = Math.max(cachedItemCount, cached.items.length);
-                            const found = cached.items.find(i => i.num === item);
-                            if (found) { match = found; break; }
-                        }
-                    }
-                }
-
-                if (!match && cachedItemCount === 0) {
+                if (!match && itemCount === 0) {
                     return toolError('No expandable items found. Run context command first to get numbered items.');
                 }
                 if (!match) {
-                    const scopeHint = recentCache ? ` (from last context for "${recentCache.symbolName}")` : '';
-                    return toolError(`Item ${item} not found${scopeHint}. Available items: 1-${cachedItemCount}`);
+                    const scopeHint = symbolName ? ` (from last context for "${symbolName}")` : '';
+                    return toolError(`Item ${item} not found${scopeHint}. Available items: 1-${itemCount}`);
                 }
 
-                const filePath = match.file || (index.root && match.relativePath ? path.join(index.root, match.relativePath) : null);
-                if (!filePath || !fs.existsSync(filePath)) {
-                    return toolError(`Cannot locate file for ${match.name}`);
-                }
-                // Validate file is within project root
-                try {
-                    const realPath = fs.realpathSync(filePath);
-                    const realRoot = fs.realpathSync(index.root);
-                    if (realPath !== realRoot && !realPath.startsWith(realRoot + path.sep)) {
-                        return toolError(`File is outside project root: ${match.name}`);
-                    }
-                } catch (e) {
-                    return toolError(`Cannot resolve file path for ${match.name}`);
-                }
-
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const fileLines = content.split('\n');
-                const startLine = match.startLine || match.line || 1;
-                const endLine = match.endLine || startLine + 20;
-
-                const lines = [];
-                lines.push(`[${match.num}] ${match.name} (${match.type})`);
-                lines.push(`${match.relativePath}:${startLine}-${endLine}`);
-                lines.push('\u2550'.repeat(60));
-
-                for (let i = startLine - 1; i < Math.min(endLine, fileLines.length); i++) {
-                    lines.push(fileLines[i]);
-                }
-
-                return toolResult(lines.join('\n'));
-            }
-
-            // ==================================================================
-            // FILE DEPENDENCIES
-            // ==================================================================
-
-            case 'imports': {
-                if (!file) {
-                    return toolError('File parameter is required for imports command.');
-                }
-                const index = getIndex(project_dir);
-                const result = index.imports(file);
-                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
-                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
-                return toolResult(output.formatImports(result, file));
-            }
-
-            case 'exporters': {
-                if (!file) {
-                    return toolError('File parameter is required for exporters command.');
-                }
-                const index = getIndex(project_dir);
-                const result = index.exporters(file);
-                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
-                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
-                return toolResult(output.formatExporters(result, file));
-            }
-
-            case 'file_exports': {
-                if (!file) {
-                    return toolError('File parameter is required for file_exports command.');
-                }
-                const index = getIndex(project_dir);
-                const result = index.fileExports(file);
-                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
-                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
-                return toolResult(output.formatFileExports(result, file));
-            }
-
-            case 'graph': {
-                if (!file) {
-                    return toolError('File parameter is required for graph command.');
-                }
-                const index = getIndex(project_dir);
-                const result = index.graph(file, { direction: direction || 'both', maxDepth: depth ?? 2 });
-                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
-                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
-                return toolResult(output.formatGraph(result, {
-                    showAll: all || depth !== undefined,
-                    maxDepth: depth ?? 2,
-                    file,
-                    depthHint: 'Set depth parameter for deeper graph.',
-                    allHint: 'Set depth to expand all children.'
-                }));
-            }
-
-            // ==================================================================
-            // REFACTORING
-            // ==================================================================
-
-            case 'verify': {
-                const err = requireName(name);
-                if (err) return err;
-                const index = getIndex(project_dir);
-                const result = index.verify(name, { file });
-                return toolResult(output.formatVerify(result));
-            }
-
-            case 'plan': {
-                const err = requireName(name);
-                if (err) return err;
-                if (!add_param && !remove_param && !rename_to) {
-                    return toolError('Plan requires an operation: add_param, remove_param, or rename_to');
-                }
-                const index = getIndex(project_dir);
-                const result = index.plan(name, {
-                    addParam: add_param,
-                    removeParam: remove_param,
-                    renameTo: rename_to,
-                    defaultValue: default_value,
-                    file
-                });
-                return toolResult(output.formatPlan(result));
-            }
-
-            case 'diff_impact': {
-                // Validate git ref format to prevent argument injection
-                if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {
-                    return toolError(`Invalid git ref format: ${base}`);
-                }
-                const index = getIndex(project_dir);
-                const result = index.diffImpact({
-                    base: base || 'HEAD',
-                    staged: staged || false,
-                    file: file || undefined
-                });
-                return toolResult(output.formatDiffImpact(result));
-            }
-
-            // ==================================================================
-            // OTHER
-            // ==================================================================
-
-            case 'typedef': {
-                const err = requireName(name);
-                if (err) return err;
-                const index = getIndex(project_dir);
-                const result = index.typedef(name, { exact: exact || false });
-                return toolResult(output.formatTypedef(result, name));
-            }
-
-            case 'stacktrace': {
-                if (!stack || !stack.trim()) {
-                    return toolError('Stack trace text is required.');
-                }
-                const index = getIndex(project_dir);
-                const result = index.parseStackTrace(stack);
-                return toolResult(output.formatStackTrace(result));
-            }
-
-            case 'api': {
-                const index = getIndex(project_dir);
-                const result = index.api(file || undefined);
-                if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
-                if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
-                return toolResult(output.formatApi(result, file || '.'));
-            }
-
-            case 'stats': {
-                const index = getIndex(project_dir);
-                const stats = index.getStats({ functions: functions || false });
-                return toolResult(output.formatStats(stats, { top: top || 0 }));
+                const rendered = renderExpandItem(match, index.root, { validateRoot: true });
+                if (!rendered.ok) return toolError(rendered.error);
+                return toolResult(rendered.text);
             }
 
             default:

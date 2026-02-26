@@ -991,34 +991,30 @@ function epsilon() {}
             assert.ok(!alphaNames.includes('epsilon'), 'alpha expandable should not include epsilon');
             assert.ok(!deltaNames.includes('beta'), 'delta expandable should not include beta');
 
-            // Simulate the MCP lastContextKey logic:
-            // The last context call was for 'delta', so expand should prefer delta's items
-            const expandCache = new Map();
-            const lastContextKey = new Map();
+            // Use shared ExpandCache to test last-context-wins behavior
+            const { ExpandCache } = require(path.join(__dirname, '..', 'core', 'expand-cache'));
+            const cache = new ExpandCache();
             const root = index.root;
 
-            const keyAlpha = `${root}:alpha`;
-            const keyDelta = `${root}:delta`;
-            expandCache.set(keyAlpha, { items: fmtAlpha.expandable, root, symbolName: 'alpha' });
-            lastContextKey.set(root, keyAlpha);
-            expandCache.set(keyDelta, { items: fmtDelta.expandable, root, symbolName: 'delta' });
-            lastContextKey.set(root, keyDelta);
+            cache.save(root, 'alpha', null, fmtAlpha.expandable);
+            cache.save(root, 'delta', null, fmtDelta.expandable);
 
             // Expand item 1 should come from delta (last context), not alpha
-            const recentKey = lastContextKey.get(root);
-            const recentCache = expandCache.get(recentKey);
-            const match = recentCache.items.find(i => i.num === 1);
+            const { match } = cache.lookup(root, 1);
             assert.ok(match, 'Should find item 1 in recent context');
             assert.ok(deltaNames.includes(match.name),
                 `Item 1 should be from delta context (got ${match.name}), not alpha`);
 
-            // When recent context exists, items NOT in it should NOT fall back to older caches
-            // alpha has more items than delta — item beyond delta's range must not resolve from alpha
+            // Item beyond delta's range — lookup tries recent first, then falls back
             const maxDeltaItem = Math.max(...fmtDelta.expandable.map(i => i.num));
             const beyondRange = maxDeltaItem + 10;
-            const fallbackMatch = recentCache.items.find(i => i.num === beyondRange);
-            assert.strictEqual(fallbackMatch, undefined,
-                `Item ${beyondRange} should NOT be found — strict scoping means no fallback to alpha's cache`);
+            const { match: fallbackMatch } = cache.lookup(root, beyondRange);
+            // If alpha doesn't have this item number either, it should be null
+            const alphaHasIt = fmtAlpha.expandable.some(i => i.num === beyondRange);
+            if (!alphaHasIt) {
+                assert.strictEqual(fallbackMatch, null,
+                    `Item ${beyondRange} should NOT be found when neither context has it`);
+            }
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
@@ -1538,6 +1534,177 @@ function brandNew(x, y) {
             // Remove file symbols — should also clear callsCache
             index.removeFileSymbols(filePath);
             assert.ok(!index.callsCache.has(filePath), 'callsCache entry should be cleared after removeFileSymbols');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// ExpandCache unit tests
+// ============================================================================
+
+describe('ExpandCache', () => {
+    const { ExpandCache, renderExpandItem } = require(path.join(__dirname, '..', 'core', 'expand-cache'));
+
+    it('save and lookup basic workflow', () => {
+        const cache = new ExpandCache();
+        const root = '/test/project';
+
+        cache.save(root, 'myFunc', null, [
+            { num: 1, name: 'caller1', type: 'function' },
+            { num: 2, name: 'caller2', type: 'function' },
+        ]);
+
+        const { match, itemCount } = cache.lookup(root, 1);
+        assert.ok(match);
+        assert.strictEqual(match.name, 'caller1');
+        assert.strictEqual(itemCount, 2);
+    });
+
+    it('lookup returns null for missing item', () => {
+        const cache = new ExpandCache();
+        const root = '/test/project';
+
+        cache.save(root, 'myFunc', null, [
+            { num: 1, name: 'caller1', type: 'function' },
+        ]);
+
+        const { match, itemCount } = cache.lookup(root, 99);
+        assert.strictEqual(match, null);
+        assert.strictEqual(itemCount, 1);
+    });
+
+    it('lookup returns empty when no cache exists', () => {
+        const cache = new ExpandCache();
+        const { match, itemCount } = cache.lookup('/nonexistent', 1);
+        assert.strictEqual(match, null);
+        assert.strictEqual(itemCount, 0);
+    });
+
+    it('last context wins — most recent save is preferred', () => {
+        const cache = new ExpandCache();
+        const root = '/test/project';
+
+        cache.save(root, 'alpha', null, [
+            { num: 1, name: 'alphaItem', type: 'function' },
+        ]);
+        cache.save(root, 'beta', null, [
+            { num: 1, name: 'betaItem', type: 'function' },
+        ]);
+
+        const { match } = cache.lookup(root, 1);
+        assert.strictEqual(match.name, 'betaItem', 'should prefer most recent context (beta)');
+    });
+
+    it('fallback to older context when item not in recent', () => {
+        const cache = new ExpandCache();
+        const root = '/test/project';
+
+        cache.save(root, 'alpha', null, [
+            { num: 1, name: 'alphaItem', type: 'function' },
+            { num: 2, name: 'alphaItem2', type: 'function' },
+        ]);
+        cache.save(root, 'beta', null, [
+            { num: 1, name: 'betaItem', type: 'function' },
+        ]);
+
+        // Item 2 only exists in alpha — should fall back
+        const { match } = cache.lookup(root, 2);
+        assert.ok(match);
+        assert.strictEqual(match.name, 'alphaItem2');
+    });
+
+    it('LRU eviction when maxSize exceeded', () => {
+        const cache = new ExpandCache({ maxSize: 2 });
+        const root = '/test/project';
+
+        cache.save(root, 'first', null, [{ num: 1, name: 'a', type: 'function' }]);
+        cache.save(root, 'second', null, [{ num: 1, name: 'b', type: 'function' }]);
+        cache.save(root, 'third', null, [{ num: 1, name: 'c', type: 'function' }]);
+
+        assert.strictEqual(cache.size, 2, 'should evict oldest entry');
+    });
+
+    it('clearForRoot removes all entries for a project', () => {
+        const cache = new ExpandCache();
+        const root1 = '/project1';
+        const root2 = '/project2';
+
+        cache.save(root1, 'funcA', null, [{ num: 1, name: 'a', type: 'function' }]);
+        cache.save(root2, 'funcB', null, [{ num: 1, name: 'b', type: 'function' }]);
+        assert.strictEqual(cache.size, 2);
+
+        cache.clearForRoot(root1);
+        assert.strictEqual(cache.size, 1);
+
+        const { match: match1 } = cache.lookup(root1, 1);
+        assert.strictEqual(match1, null, 'root1 entries should be cleared');
+
+        const { match: match2 } = cache.lookup(root2, 1);
+        assert.ok(match2, 'root2 entries should remain');
+    });
+
+    it('save with empty items is a no-op', () => {
+        const cache = new ExpandCache();
+        cache.save('/test', 'func', null, []);
+        assert.strictEqual(cache.size, 0);
+        cache.save('/test', 'func', null, null);
+        assert.strictEqual(cache.size, 0);
+    });
+
+    it('file parameter differentiates cache keys', () => {
+        const cache = new ExpandCache();
+        const root = '/test/project';
+
+        cache.save(root, 'parse', 'parser.js', [{ num: 1, name: 'a', type: 'function' }]);
+        cache.save(root, 'parse', 'utils.js', [{ num: 1, name: 'b', type: 'function' }]);
+
+        assert.strictEqual(cache.size, 2, 'same name with different files should create separate entries');
+    });
+
+    it('renderExpandItem produces correct output', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-expand-'));
+        try {
+            const testFile = path.join(tmpDir, 'test.js');
+            fs.writeFileSync(testFile, 'function hello() {\n  return "world";\n}\n');
+
+            const match = {
+                num: 1,
+                name: 'hello',
+                type: 'function',
+                file: testFile,
+                relativePath: 'test.js',
+                startLine: 1,
+                endLine: 3
+            };
+
+            const { ok, text } = renderExpandItem(match, tmpDir);
+            assert.ok(ok);
+            assert.ok(text.includes('[1] hello (function)'));
+            assert.ok(text.includes('test.js:1-3'));
+            assert.ok(text.includes('function hello()'));
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('renderExpandItem validates root when requested', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-expand-'));
+        try {
+            // Create file outside the "project root"
+            const outsideFile = path.join(os.tmpdir(), 'outside.js');
+            fs.writeFileSync(outsideFile, 'function hack() {}');
+
+            const match = {
+                num: 1, name: 'hack', type: 'function',
+                file: outsideFile, relativePath: '../outside.js',
+                startLine: 1, endLine: 1
+            };
+
+            const { ok, error } = renderExpandItem(match, tmpDir, { validateRoot: true });
+            assert.ok(!ok, 'should fail validation');
+            assert.ok(error.includes('outside project root'));
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }

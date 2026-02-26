@@ -412,8 +412,8 @@ function isMatchInCommentOrString(rootNode, line, lineContent, term) {
  * @returns {Array<{line: number, content: string, column: number}>}
  */
 function findMatchesWithASTFilter(content, term, parser, options = {}) {
-    const { PARSE_OPTIONS } = require('./index');
-    const tree = parser.parse(content, undefined, PARSE_OPTIONS);
+    const { safeParse } = require('./index');
+    const tree = safeParse(parser, content);
     const lines = content.split('\n');
     const matches = [];
 
