@@ -99,6 +99,12 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |
 | File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Setting `--depth=N` expands all children. Can be noisy — use depth=1 for large projects. For function-level flow, use `trace` instead |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
+| Extract specific lines from a file | `ucn lines --file=<file> --range=10-20` | Pull a line range without reading the whole file |
+| Find type definitions | `ucn typedef <name>` | Interfaces, enums, structs, traits, type aliases |
+| See a project's public API | `ucn api` or `ucn api --file=<file>` | All exported/public symbols with signatures |
+| Drill into context results | `ucn expand <N>` | Show source code for item N from a previous `context` call |
+| Best usage example of a function | `ucn example <name>` | Finds and scores the best call site with surrounding context |
+| Debug a stack trace | `ucn stacktrace --stack="<trace>"` | Parses stack frames and shows source context per frame |
 
 ## Command Format
 
@@ -126,9 +132,20 @@ ucn [target] <command> [name] [--flags]
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |
+| `--clear-cache` | Delete cached index entirely before running |
 | `--context=N` | Lines of surrounding context in `usages`/`search` output |
 | `--no-regex` | Force plain text search (regex is default) |
 | `--functions` | Show per-function line counts in `stats` (complexity audit) |
+| `--json` | Machine-readable JSON output (wrapped in `{meta, data}`) |
+| `--code-only` | Exclude matches in comments and strings (`search`/`usages`) |
+| `--with-types` | Include related type definitions in `smart`/`about` output |
+| `--detailed` | Show full symbol listing per file in `toc` |
+| `--top=N` | Limit result count (default: 10 for most commands) |
+| `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
+| `--exact` | Exact name match only in `find`/`typedef` (no substring) |
+| `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |
+| `--include-exported` | Include exported symbols in `deadcode` results |
+| `--include-decorated` | Include decorated/annotated symbols in `deadcode` results |
 
 ## Workflow Integration
 

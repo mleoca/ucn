@@ -14152,5 +14152,134 @@ function mediumFn(x) {
     });
 });
 
+// ============================================================================
+// MCP `all` and `top_level` parameter parity (bug hunt 2026-02-26)
+// ============================================================================
+
+describe('MCP parameter parity: all and top_level', () => {
+    const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+
+    it('MCP schema includes all and top_level parameters', () => {
+        assert.ok(serverCode.includes("all: z.boolean().optional()"), 'Schema should have all parameter');
+        assert.ok(serverCode.includes("top_level: z.boolean().optional()"), 'Schema should have top_level parameter');
+    });
+
+    it('MCP destructures all and top_level from args', () => {
+        assert.ok(serverCode.includes('functions, all, top_level }'), 'Should destructure all and top_level');
+    });
+
+    it('MCP about handler passes all and includeUncertain', () => {
+        // about should pass all: all || false and includeUncertain
+        assert.ok(serverCode.includes('all: all || false, maxCallers: top, maxCallees: top'),
+            'about handler should pass all parameter');
+        assert.ok(serverCode.includes('includeUncertain: include_uncertain || false, all: all || false'),
+            'about handler should pass includeUncertain');
+    });
+
+    it('MCP related handler uses explicit all parameter', () => {
+        // related should NOT auto-infer all from top
+        assert.ok(!serverCode.includes('all: top !== undefined'),
+            'related handler should NOT auto-infer all from top');
+        // Should use explicit all parameter
+        assert.ok(serverCode.includes("index.related(name, { file, top, all: all || false })"),
+            'related handler should pass explicit all parameter');
+    });
+
+    it('MCP toc handler passes all and topLevel', () => {
+        assert.ok(serverCode.includes('topLevel: top_level || false, all: all || false, top'),
+            'toc handler should pass topLevel and all');
+    });
+
+    it('MCP graph handler respects all in showAll', () => {
+        assert.ok(serverCode.includes('showAll: all || depth !== undefined'),
+            'graph handler should include all in showAll');
+    });
+
+    // Behavioral tests: verify all parameter works correctly in core
+
+    it('about() with all=true returns unlimited callers', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-about-all-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+        // Create a function called by many callers
+        let code = 'function target() { return 1; }\n';
+        for (let i = 0; i < 15; i++) {
+            code += `function caller${i}() { return target(); }\n`;
+        }
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), code);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        // Without all — callers.top limited to 10
+        const limited = index.about('target', { all: false });
+        assert.ok(limited.callers.top.length <= 10, 'Without all, callers.top should be limited to 10');
+        assert.strictEqual(limited.callers.total, 15, 'Total should still report 15');
+
+        // With all — should show everything
+        const unlimited = index.about('target', { all: true });
+        assert.strictEqual(unlimited.callers.top.length, 15, 'With all=true, all 15 callers should be shown');
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('getToc() with topLevel=true filters nested functions', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-toc-toplevel-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+        fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+function outer() {
+    function inner() {
+        return 1;
+    }
+    return inner();
+}
+function another() { return 2; }
+`);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const tocAll = index.getToc({ detailed: true, topLevel: false });
+        const tocTopLevel = index.getToc({ detailed: true, topLevel: true });
+
+        // topLevel should have fewer functions (excludes inner)
+        const allFns = tocAll.files[0]?.symbols?.functions || [];
+        const topFns = tocTopLevel.files[0]?.symbols?.functions || [];
+        assert.ok(allFns.length > topFns.length,
+            `topLevel should filter nested functions (all: ${allFns.length}, topLevel: ${topFns.length})`);
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+
+    it('related() with all=true expands all results', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-related-all-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{}');
+        // Many functions in the same file to generate related results
+        let code = '';
+        for (let i = 0; i < 20; i++) {
+            code += `function handler${i}() { return ${i}; }\n`;
+        }
+        fs.writeFileSync(path.join(tmpDir, 'handlers.js'), code);
+
+        const index = new ProjectIndex(tmpDir);
+        index.build(null, { quiet: true });
+
+        const limited = index.related('handler0', { all: false });
+        const expanded = index.related('handler0', { all: true });
+
+        // With all, should return more (or equal) results
+        assert.ok(expanded, 'related with all=true should return results');
+        assert.ok(limited, 'related with all=false should return results');
+        const limitedTotal = (limited.sameFile?.length || 0) + (limited.similarName?.length || 0) + (limited.sharedDeps?.length || 0);
+        const expandedTotal = (expanded.sameFile?.length || 0) + (expanded.similarName?.length || 0) + (expanded.sharedDeps?.length || 0);
+        assert.ok(expandedTotal >= limitedTotal,
+            `all=true should return >= results (expanded: ${expandedTotal}, limited: ${limitedTotal})`);
+
+        fs.rmSync(tmpDir, { recursive: true, force: true });
+    });
+});
+
 console.log('UCN v3 Test Suite');
 console.log('Run with: node --test test/parser.test.js');

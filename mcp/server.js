@@ -268,7 +268,9 @@ server.registerTool(
             range: z.string().optional().describe('Line range to extract, e.g. "10-20" or "15" (lines command)'),
             base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
             staged: z.boolean().optional().describe('Analyze staged changes (diff_impact command)'),
-            case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)')
+            case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
+            all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
+            top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)')
         })
     },
     async (args) => {
@@ -278,7 +280,7 @@ server.registerTool(
                 include_exported, include_decorated, calls_only, max_lines,
                 direction, term, add_param, remove_param, rename_to,
                 default_value, stack, item, range, base, staged,
-                case_sensitive, regex, functions } = args;
+                case_sensitive, regex, functions, all, top_level } = args;
 
         try {
             switch (command) {
@@ -291,9 +293,9 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.about(name, { file, exclude: parseExclude(exclude), withTypes: with_types || false, includeMethods: include_methods ?? undefined, maxCallers: top, maxCallees: top });
+                const result = index.about(name, { file, exclude: parseExclude(exclude), withTypes: with_types || false, includeMethods: include_methods ?? undefined, includeUncertain: include_uncertain || false, all: all || false, maxCallers: top, maxCallees: top });
                 return toolResult(output.formatAbout(result, {
-                    allHint: 'Repeat with top set higher to show all.',
+                    allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.'
                 }));
             }
@@ -378,12 +380,12 @@ server.registerTool(
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const result = index.related(name, { file, top, all: top !== undefined });
+                const result = index.related(name, { file, top, all: all || false });
                 if (!result) return toolResult(`Symbol "${name}" not found.`);
                 return toolResult(output.formatRelated(result, {
-                    showAll: top !== undefined,
+                    showAll: all || false,
                     top,
-                    allHint: 'Repeat with top set higher to show all.'
+                    allHint: 'Repeat with all=true to show all.'
                 }));
             }
 
@@ -416,7 +418,7 @@ server.registerTool(
 
             case 'toc': {
                 const index = getIndex(project_dir);
-                const toc = index.getToc({ detailed: detailed || false, top });
+                const toc = index.getToc({ detailed: detailed || false, topLevel: top_level || false, all: all || false, top });
                 return toolResult(output.formatToc(toc, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 }));
@@ -728,7 +730,7 @@ server.registerTool(
                 if (result?.error === 'file-not-found') return toolError(`File not found in project: ${file}`);
                 if (result?.error === 'file-ambiguous') return toolError(`Ambiguous file "${file}". Candidates:\n${result.candidates.map(c => '  ' + c).join('\n')}`);
                 return toolResult(output.formatGraph(result, {
-                    showAll: depth !== undefined,
+                    showAll: all || depth !== undefined,
                     file,
                     depthHint: 'Set depth parameter for deeper graph.',
                     allHint: 'Set depth to expand all children.'
