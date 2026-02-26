@@ -1921,6 +1921,20 @@ function formatGraph(graph, options = {}) {
 }
 
 /**
+ * Detect common double-escaping patterns in regex search terms.
+ * When MCP/JSON transport is involved, agents often write \\.  when they mean \. (literal dot).
+ * Returns a hint string if double-escaping is suspected, empty string otherwise.
+ */
+function detectDoubleEscaping(term) {
+    // Look for \\. \\d \\w \\s \\b \\D \\W \\S \\B \\( \\) \\[ \\] — common double-escaped sequences
+    const doubleEscaped = term.match(/\\\\[.dDwWsSbB()\[\]*+?^${}|]/g);
+    if (!doubleEscaped) return '';
+    const examples = [...new Set(doubleEscaped)].slice(0, 3);
+    const fixed = examples.map(e => e.slice(1)); // remove one backslash
+    return `\nHint: Pattern contains ${examples.join(', ')} which matches literal backslash(es). If you meant ${fixed.join(', ')}, use a single backslash (MCP/JSON parameters are already raw strings).`;
+}
+
+/**
  * Format search command output
  */
 function formatSearch(results, term) {
@@ -1933,15 +1947,17 @@ function formatSearch(results, term) {
     if (totalMatches === 0) {
         if (meta) {
             const scope = meta.filesSkipped > 0
-                ? `Searched ${meta.filesScanned} of ${meta.totalFiles} files (${meta.filesSkipped} excluded by filters).`
-                : `Searched ${meta.filesScanned} files.`;
-            return `No matches found for "${term}". ${scope}${fallbackNote}`;
+                ? `Searched ${meta.filesScanned} of ${meta.totalFiles} file${meta.totalFiles === 1 ? '' : 's'} (${meta.filesSkipped} excluded by filters).`
+                : `Searched ${meta.filesScanned} file${meta.filesScanned === 1 ? '' : 's'}.`;
+            const escapingHint = detectDoubleEscaping(term);
+            return `No matches found for "${term}". ${scope}${fallbackNote}${escapingHint}`;
         }
         return `No matches found for "${term}"${fallbackNote}`;
     }
 
     const lines = [];
-    lines.push(`Found ${totalMatches} matches for "${term}" in ${results.length} files:`);
+    const fileWord = results.length === 1 ? 'file' : 'files';
+    lines.push(`Found ${totalMatches} match${totalMatches === 1 ? '' : 'es'} for "${term}" in ${results.length} ${fileWord}:`);
     if (fallbackNote) lines.push(fallbackNote.trim());
     lines.push('═'.repeat(60));
 
@@ -2358,6 +2374,7 @@ module.exports = {
     formatClass,
     formatGraph,
     formatSearch,
+    detectDoubleEscaping,
     formatFileExports,
     formatStats,
 
