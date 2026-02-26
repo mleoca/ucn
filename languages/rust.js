@@ -848,13 +848,16 @@ function findImportsInCode(code, parser) {
                 const argsNode = node.childForFieldName('argument_list');
                 const arg = argsNode?.namedChild(0);
                 const dynamic = !arg || arg.type !== 'string_literal';
-                imports.push({
-                    module: arg ? arg.text.replace(/^["']|["']$/g, '') : null,
-                    names: [],
-                    type: 'include',
-                    dynamic,
-                    line: node.startPosition.row + 1
-                });
+                const modulePath = arg ? arg.text.replace(/^["']|["']$/g, '') : null;
+                if (modulePath) {
+                    imports.push({
+                        module: modulePath,
+                        names: [],
+                        type: 'include',
+                        dynamic,
+                        line: node.startPosition.row + 1
+                    });
+                }
             }
         }
         return true;
