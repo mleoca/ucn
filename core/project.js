@@ -364,6 +364,9 @@ class ProjectIndex {
             const seenModules = new Set();
 
             for (const importModule of fileEntry.imports) {
+                // Skip null modules (e.g., dynamic include! macros in Rust)
+                if (!importModule) continue;
+
                 // Deduplicate: same module imported multiple times in one file
                 // (e.g., lazy imports inside different functions)
                 if (seenModules.has(importModule)) continue;
