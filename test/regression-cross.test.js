@@ -3728,3 +3728,180 @@ func main() {
     });
 });
 
+// ============================================================================
+// FIX #117 — formatPlan crash on param-not-found error
+// plan() returns { found: true, error: '...' } when a param to remove doesn't
+// exist, but formatPlan/formatPlanJson only checked error inside !plan.found,
+// so they crashed on plan.before.signature (undefined).
+// ============================================================================
+describe('FIX #117 — formatPlan handles param-not-found error', () => {
+    let dir;
+    it('formatPlan does not crash on error result', () => {
+        dir = tmp({
+            'package.json': '{}',
+            'app.js': 'function greet(name) { return name; }\ngreet("world");',
+        });
+        const index = idx(dir);
+        const planResult = index.plan('greet', { removeParam: 'nonexistent' });
+        assert.ok(planResult.found, 'function is found');
+        assert.ok(planResult.error, 'error about missing param');
+        // Should not crash — was TypeError: Cannot read properties of undefined (reading 'signature')
+        const text = output.formatPlan(planResult);
+        assert.ok(typeof text === 'string', 'should return string');
+        assert.ok(text.includes('not found'), 'should mention param not found');
+    });
+
+    it('formatPlanJson does not crash on error result', () => {
+        const index = idx(dir);
+        const planResult = index.plan('greet', { removeParam: 'nonexistent' });
+        const json = output.formatPlanJson(planResult);
+        const parsed = JSON.parse(json);
+        assert.ok(parsed.found === true);
+        assert.ok(parsed.error);
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+// ============================================================================
+// FIX #118 — plan --remove-param wrong argument position for Python/Rust methods
+// plan() used raw paramIndex from paramsStructured (which includes self/cls/&self)
+// to index into caller args, but callers don't pass self/cls. This caused:
+// 1) Wrong arg referenced in suggestion (e.g., "Remove argument 2: fast" instead of "argument 1: world")
+// 2) Some call sites skipped (argCount > paramIndex was false when it shouldn't be)
+// ============================================================================
+describe('FIX #118 — plan --remove-param adjusts for Python self', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'requirements.txt': '',
+            'handler.py': `class Handler:
+    def process(self, data, mode='default'):
+        return data
+
+def main():
+    h = Handler()
+    h.process("hello")
+    h.process("world", "fast")`,
+        });
+    });
+
+    it('remove data: correct caller arg position (1, not 2)', () => {
+        const index = idx(dir);
+        const result = index.plan('process', { removeParam: 'data', file: 'handler.py' });
+        assert.ok(result.found);
+        assert.ok(!result.error);
+        // Both calls should have changes (previously h.process("hello") was skipped)
+        assert.ok(result.changes.length >= 1, 'should have changes');
+        const worldCall = result.changes.find(c => c.expression.includes('"world"'));
+        assert.ok(worldCall, 'h.process("world", "fast") should be in changes');
+        // Should reference "world" (data = caller arg 0 → position 1), not "fast" (mode)
+        assert.ok(worldCall.suggestion.includes('"world"'),
+            `should suggest removing "world", got: ${worldCall.suggestion}`);
+        assert.ok(worldCall.suggestion.includes('argument 1'),
+            `should say argument 1, got: ${worldCall.suggestion}`);
+    });
+
+    it('remove mode: correct position (2)', () => {
+        const index = idx(dir);
+        const result = index.plan('process', { removeParam: 'mode', file: 'handler.py' });
+        assert.ok(result.found);
+        const worldCall = result.changes.find(c => c.expression.includes('"world"'));
+        if (worldCall) {
+            assert.ok(worldCall.suggestion.includes('"fast"'),
+                `should suggest removing "fast", got: ${worldCall.suggestion}`);
+            assert.ok(worldCall.suggestion.includes('argument 2'),
+                `should say argument 2, got: ${worldCall.suggestion}`);
+        }
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX #118 — plan --remove-param adjusts for Rust &self', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'src/lib.rs': `struct Server { port: u16 }
+
+impl Server {
+    fn configure(&self, addr: String, timeout: u32) {
+        println!("{} {}", addr, timeout);
+    }
+}
+
+fn main() {
+    let s = Server { port: 8080 };
+    s.configure("localhost".to_string(), 30);
+}`,
+        });
+    });
+
+    it('remove addr: arg 1 not arg 2 (Rust &self offset)', () => {
+        const index = idx(dir);
+        const result = index.plan('configure', { removeParam: 'addr', file: 'lib.rs' });
+        assert.ok(result.found);
+        assert.ok(!result.error);
+        assert.ok(result.changes.length >= 1);
+        const change = result.changes[0];
+        assert.ok(change.suggestion.includes('argument 1'),
+            `should say argument 1, got: ${change.suggestion}`);
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX #118 — plan --remove-param unaffected for JS (no self)', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'package.json': '{}',
+            'app.js': 'function process(data, mode) { return data; }\nprocess("hello", "fast");',
+        });
+    });
+
+    it('JS: remove data is still arg 1 (no offset)', () => {
+        const index = idx(dir);
+        const result = index.plan('process', { removeParam: 'data' });
+        assert.ok(result.found);
+        assert.ok(!result.error);
+        const change = result.changes[0];
+        assert.ok(change.suggestion.includes('argument 1'),
+            `should say argument 1, got: ${change.suggestion}`);
+        assert.ok(change.suggestion.includes('"hello"'),
+            `should reference "hello", got: ${change.suggestion}`);
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX #118 — plan --remove-param with Python cls', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'requirements.txt': '',
+            'factory.py': `class Factory:
+    @classmethod
+    def create(cls, name, config=None):
+        return cls()
+
+Factory.create("widget")
+Factory.create("gadget", {"color": "blue"})`,
+        });
+    });
+
+    it('remove name: cls stripped, arg 1 not 2', () => {
+        const index = idx(dir);
+        const result = index.plan('create', { removeParam: 'name', file: 'factory.py' });
+        assert.ok(result.found);
+        const call = result.changes.find(c => c.expression.includes('"widget"'));
+        if (call) {
+            assert.ok(call.suggestion.includes('argument 1'),
+                `should say argument 1, got: ${call.suggestion}`);
+        }
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+

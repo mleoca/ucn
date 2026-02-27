@@ -754,10 +754,13 @@ function formatTrace(trace, options = {}) {
         if (node.callCount) {
             label += ` ${node.callCount}x`;
         }
+        if (node.alreadyShown) {
+            label += ' (see above)';
+        }
 
         lines.push(prefix + connector + label);
 
-        if (node.children) {
+        if (node.children && !node.alreadyShown) {
             const hasMore = node.truncatedChildren > 0;
             for (let i = 0; i < node.children.length; i++) {
                 const isChildLast = !hasMore && i === node.children.length - 1;
@@ -971,10 +974,10 @@ function formatPlan(plan, options = {}) {
         return 'Function not found.';
     }
     if (!plan.found) {
-        if (plan.error) {
-            return `Error: ${plan.error}\nCurrent parameters: ${plan.currentParams?.join(', ') || 'none'}`;
-        }
         return `Function "${plan.function}" not found.`;
+    }
+    if (plan.error) {
+        return `Error: ${plan.error}\nCurrent parameters: ${plan.currentParams?.join(', ') || 'none'}`;
     }
 
     const lines = [];
@@ -2155,6 +2158,13 @@ function formatPlanJson(plan) {
         return JSON.stringify({
             found: false,
             error: plan.error || `Function "${plan.function}" not found.`,
+            ...(plan.currentParams && { currentParams: plan.currentParams })
+        }, null, 2);
+    }
+    if (plan.error) {
+        return JSON.stringify({
+            found: true,
+            error: plan.error,
             ...(plan.currentParams && { currentParams: plan.currentParams })
         }, null, 2);
     }
