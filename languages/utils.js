@@ -81,6 +81,13 @@ function parseStructuredParams(paramsNode, language) {
 
         if (paramInfo.name) {
             params.push(paramInfo);
+            // Go multi-name declarations: `a, b int` → expand additional params
+            if (paramInfo._additionalNames) {
+                for (const extraName of paramInfo._additionalNames) {
+                    params.push({ name: extraName, type: paramInfo.type });
+                }
+                delete paramInfo._additionalNames;
+            }
         }
     }
 
@@ -96,8 +103,9 @@ function parseJSParam(param, info) {
         if (patternNode) info.name = patternNode.text;
         if (typeNode) info.type = typeNode.text.replace(/^:\s*/, '');
         if (param.type === 'optional_parameter') info.optional = true;
-    } else if (param.type === 'rest_parameter') {
-        const patternNode = param.childForFieldName('pattern');
+    } else if (param.type === 'rest_parameter' || param.type === 'rest_pattern') {
+        // rest_parameter = TypeScript, rest_pattern = JavaScript
+        const patternNode = param.childForFieldName('pattern') || param.namedChild(0);
         if (patternNode) info.name = patternNode.text;
         info.rest = true;
     } else if (param.type === 'assignment_pattern') {
@@ -105,6 +113,9 @@ function parseJSParam(param, info) {
         const rightNode = param.childForFieldName('right');
         if (leftNode) info.name = leftNode.text;
         if (rightNode) info.default = rightNode.text;
+    } else if (param.type === 'object_pattern' || param.type === 'array_pattern') {
+        // Destructured params: { name, value } or [a, b]
+        info.name = param.text;
     }
 }
 
@@ -130,10 +141,30 @@ function parsePythonParam(param, info) {
 
 function parseGoParam(param, info) {
     if (param.type === 'parameter_declaration') {
+        const typeNode = param.childForFieldName('type');
+        // Go allows multiple names per declaration: `a, b int`
+        // Collect all identifier children (names come before the type)
+        const names = [];
+        for (let i = 0; i < param.namedChildCount; i++) {
+            const child = param.namedChild(i);
+            if (child && child.type === 'identifier') {
+                names.push(child.text);
+            }
+        }
+        if (names.length > 0) info.name = names[0];
+        if (typeNode) info.type = typeNode.text;
+        // Store additional names for multi-param declarations (handled by parseStructuredParams)
+        if (names.length > 1) {
+            info._additionalNames = names.slice(1);
+        }
+    } else if (param.type === 'variadic_parameter_declaration') {
+        // Go variadic: `args ...int`
         const nameNode = param.childForFieldName('name');
         const typeNode = param.childForFieldName('type');
         if (nameNode) info.name = nameNode.text;
-        if (typeNode) info.type = typeNode.text;
+        else info.name = '...';
+        if (typeNode) info.type = '...' + typeNode.text;
+        info.rest = true;
     }
 }
 

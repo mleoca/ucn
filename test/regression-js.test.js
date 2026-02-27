@@ -2617,3 +2617,205 @@ module.exports = { process_data };
         fs.rmSync(tmpDir, { recursive: true });
     });
 });
+
+// ============================================================================
+// Fix #112: verify should handle rest/spread parameters correctly
+// ============================================================================
+
+describe('fix #112: verify handles rest parameters', () => {
+    it('rest param calls should not be flagged as mismatches', () => {
+        const tmpDir = tmp('verify-rest');
+        fs.writeFileSync(path.join(tmpDir, 'rest.js'),
+            'function withRest(a, ...rest) { return a + rest.length; }\n' +
+            'withRest(1, 2, 3, 4);\n' +
+            'withRest(1);\n' +
+            'withRest();\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('withRest');
+        assert.ok(result.found, 'should find withRest');
+        // withRest(1, 2, 3, 4) and withRest(1) should be valid (>= 1 required arg)
+        // withRest() should be a mismatch (0 args, needs at least 1)
+        assert.strictEqual(result.mismatches, 1,
+            `expected 1 mismatch (withRest()), got ${result.mismatches}`);
+        assert.strictEqual(result.valid, 2,
+            `expected 2 valid calls, got ${result.valid}`);
+        rm(tmpDir);
+    });
+
+    it('Python *args and **kwargs should be rest params', () => {
+        const tmpDir = tmp('verify-rest-py');
+        fs.writeFileSync(path.join(tmpDir, 'rest.py'),
+            'def variadic(a, *args, **kwargs):\n' +
+            '    return a\n\n' +
+            'variadic(1)\n' +
+            'variadic(1, 2, 3)\n' +
+            'variadic(1, 2, key="val")\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('variadic');
+        assert.ok(result.found, 'should find variadic');
+        // All calls have at least 1 arg (for param 'a'), rest params accept anything
+        assert.strictEqual(result.mismatches, 0,
+            `expected 0 mismatches, got ${result.mismatches}`);
+        rm(tmpDir);
+    });
+});
+
+// ============================================================================
+// Fix #113: deadcode --include-exported detects unused exports
+// ============================================================================
+
+describe('fix #113: deadcode --include-exported finds unused exports', () => {
+    it('exported but never-imported function should be dead with --include-exported', () => {
+        const tmpDir = tmp('deadcode-exports');
+        fs.writeFileSync(path.join(tmpDir, 'utils.js'),
+            'function helperA() { return 1; }\n' +
+            'function helperB() { return 2; }\n' +
+            'function helperC() { return 3; }\n' +
+            'module.exports = { helperA, helperB, helperC };\n'
+        );
+        fs.writeFileSync(path.join(tmpDir, 'index.js'),
+            'const { helperA, helperB } = require("./utils");\n' +
+            'function main() { return helperA() + helperB(); }\n' +
+            'main();\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.deadcode({ includeExported: true });
+        const deadNames = result.map(r => r.name);
+        assert.ok(deadNames.includes('helperC'),
+            `helperC should be dead code (got: ${deadNames.join(', ')})`);
+        assert.ok(!deadNames.includes('helperA'),
+            'helperA should NOT be dead code (it is imported and called)');
+        assert.ok(!deadNames.includes('helperB'),
+            'helperB should NOT be dead code (it is imported and called)');
+        rm(tmpDir);
+    });
+
+    it('exported function with internal callers should NOT be dead', () => {
+        const tmpDir = tmp('deadcode-exports-internal');
+        fs.writeFileSync(path.join(tmpDir, 'mod.js'),
+            'function helper() { return 1; }\n' +
+            'function main() { return helper(); }\n' +
+            'module.exports = { helper, main };\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.deadcode({ includeExported: true });
+        const deadNames = result.map(r => r.name);
+        assert.ok(!deadNames.includes('helper'),
+            'helper should NOT be dead code (called by main in same file)');
+        rm(tmpDir);
+    });
+});
+
+// ============================================================================
+// Fix #114: trace shows direct callees even when shared with transitive paths
+// ============================================================================
+
+describe('fix #114: trace shows all direct callees including shared ones', () => {
+    it('direct callee should appear even if also a transitive callee', () => {
+        const tmpDir = tmp('trace-shared');
+        fs.writeFileSync(path.join(tmpDir, 'chain.js'),
+            'function root() { return alpha() + shared(); }\n' +
+            'function alpha() { return shared(); }\n' +
+            'function shared() { return 42; }\n' +
+            'root();\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.trace('root', { depth: 3 });
+        assert.ok(result, 'trace should return result');
+        const rootChildren = result.tree.children.map(c => c.name);
+        assert.ok(rootChildren.includes('alpha'),
+            `root should show alpha as child (got: ${rootChildren.join(', ')})`);
+        assert.ok(rootChildren.includes('shared'),
+            `root should show shared as direct child (got: ${rootChildren.join(', ')})`);
+        // The shared node under root should be marked as alreadyShown
+        const sharedChild = result.tree.children.find(c => c.name === 'shared');
+        assert.ok(sharedChild.alreadyShown,
+            'shared under root should be marked alreadyShown');
+        rm(tmpDir);
+    });
+
+    it('circular calls should not cause infinite loop', () => {
+        const tmpDir = tmp('trace-circular');
+        fs.writeFileSync(path.join(tmpDir, 'circ.js'),
+            'function ping() { return pong(); }\n' +
+            'function pong() { return ping(); }\n' +
+            'ping();\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.trace('ping', { depth: 5 });
+        assert.ok(result, 'trace should return result');
+        // Should terminate without infinite loop
+        const formatted = output.formatTrace(result);
+        assert.ok(formatted.includes('(see above)'),
+            'circular reference should show (see above)');
+        rm(tmpDir);
+    });
+});
+
+// ============================================================================
+// Fix #115: JS destructured params not parsed in parseJSParam
+// object_pattern and array_pattern should be recognized as params
+// ============================================================================
+describe('fix #115: verify handles JS destructured params', () => {
+    it('object_pattern destructured param counted as 1 param', () => {
+        const tmpDir = tmp('destruct-obj');
+        fs.writeFileSync(path.join(tmpDir, 'lib.js'),
+            'function processConfig({ name, value }) {\n' +
+            '    return name + value;\n' +
+            '}\n' +
+            'processConfig({ name: "x", value: 1 });\n' +
+            'processConfig();\n' +
+            'processConfig({ name: "y" }, "extra");\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('processConfig');
+        assert.ok(result, 'verify should return result');
+        // Function has 1 destructured param
+        assert.equal(result.mismatches, 2,
+            'should flag 0-arg call and 2-arg call as mismatches');
+        // Check mismatch details
+        const details = result.mismatchDetails || [];
+        const zeroArg = details.find(d => d.actual === 0);
+        assert.ok(zeroArg, 'should flag the 0-arg call');
+        const twoArg = details.find(d => d.actual === 2);
+        assert.ok(twoArg, 'should flag the 2-arg call');
+        rm(tmpDir);
+    });
+
+    it('array_pattern destructured param counted as 1 param', () => {
+        const tmpDir = tmp('destruct-arr');
+        fs.writeFileSync(path.join(tmpDir, 'lib.js'),
+            'function swap([a, b]) {\n' +
+            '    return [b, a];\n' +
+            '}\n' +
+            'swap([1, 2]);\n' +
+            'swap();\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('swap');
+        assert.ok(result, 'verify should return result');
+        assert.equal(result.mismatches, 1,
+            'should flag 0-arg call as mismatch');
+        rm(tmpDir);
+    });
+
+    it('plan with destructured params shows correct before/after', () => {
+        const tmpDir = tmp('destruct-plan');
+        fs.writeFileSync(path.join(tmpDir, 'lib.js'),
+            'function process({ name }) { return name; }\n' +
+            'process({ name: "x" });\n'
+        );
+        const index = idx(tmpDir);
+        const plan = index.plan('process', { addParam: 'options' });
+        assert.ok(plan.found, 'plan should find function');
+        assert.ok(plan.before.params.length >= 1,
+            'before should have at least 1 param (the destructured one)');
+        assert.ok(plan.after.params.includes('options'),
+            'after should include new param');
+        assert.ok(plan.after.params.length > plan.before.params.length,
+            'after should have more params than before');
+        rm(tmpDir);
+    });
+});

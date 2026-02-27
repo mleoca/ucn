@@ -3007,9 +3007,29 @@ class ProjectIndex {
                 // Filter out usages that are at the definition location
                 // nameLine: when decorators/annotations are present, startLine is the decorator line
                 // but the name identifier is on a different line (nameLine). Check both.
-                const nonDefUsages = allUsages.filter(u =>
+                let nonDefUsages = allUsages.filter(u =>
                     !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine))
                 );
+
+                // For exported symbols in --include-exported mode, also filter out export-site
+                // references (e.g., `module.exports = { helperC }` or `export { helperC }`).
+                // These are just re-statements of the export, not actual consumption.
+                if (isExported && options.includeExported) {
+                    nonDefUsages = nonDefUsages.filter(u => {
+                        if (u.file !== symbol.file) return true; // cross-file usage always counts
+                        // Check if same-file usage is on an export line
+                        const content = this._readFile(u.file);
+                        if (!content) return true;
+                        const lines = content.split('\n');
+                        const line = lines[u.line - 1] || '';
+                        const trimmed = line.trim();
+                        // CJS: module.exports = { ... } or exports.name = ...
+                        if (trimmed.startsWith('module.exports') || /^exports\.\w+\s*=/.test(trimmed)) return false;
+                        // ESM: export { ... } or export default
+                        if (/^export\s*\{/.test(trimmed) || /^export\s+default\s/.test(trimmed)) return false;
+                        return true;
+                    });
+                }
 
                 // Total includes all usage types (calls, references, callbacks, re-exports)
                 const totalUsages = nonDefUsages.length;
@@ -3376,10 +3396,22 @@ class ProjectIndex {
 
         const buildTree = (funcDef, currentDepth, dir) => {
             const funcName = funcDef.name;
-            if (currentDepth > maxDepth || visited.has(`${funcDef.file}:${funcDef.startLine}`)) {
+            const key = `${funcDef.file}:${funcDef.startLine}`;
+            if (currentDepth > maxDepth) {
                 return null;
             }
-            visited.add(`${funcDef.file}:${funcDef.startLine}`);
+            if (visited.has(key)) {
+                // Already explored — show as leaf node without recursing (prevents infinite loops)
+                return {
+                    name: funcName,
+                    file: funcDef.relativePath,
+                    line: funcDef.startLine,
+                    type: funcDef.type,
+                    children: [],
+                    alreadyShown: true
+                };
+            }
+            visited.add(key);
 
             const node = {
                 name: funcName,
@@ -3637,15 +3669,28 @@ class ProjectIndex {
             newSignature = `${name}(${paramsList})`;
             if (def.returnType) newSignature += `: ${def.returnType}`;
 
+            // For Python/Rust methods, self/cls/&self/&mut self is in paramsStructured
+            // but callers don't pass it. Adjust paramIndex to caller-side position.
+            const fileEntry = this.files.get(def.file);
+            const lang = fileEntry?.language;
+            let selfOffset = 0;
+            if ((lang === 'python' || lang === 'rust') && currentParams.length > 0) {
+                const firstName = currentParams[0].name;
+                if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self') {
+                    selfOffset = 1;
+                }
+            }
+            const callerArgIndex = paramIndex - selfOffset;
+
             // Describe changes at each call site
             for (const fileGroup of impact.byFile) {
                 for (const site of fileGroup.sites) {
-                    if (site.args && site.argCount > paramIndex) {
+                    if (site.args && site.argCount > callerArgIndex) {
                         changes.push({
                             file: site.file,
                             line: site.line,
                             expression: site.expression,
-                            suggestion: `Remove argument ${paramIndex + 1}: ${site.args[paramIndex] || '?'}`,
+                            suggestion: `Remove argument ${callerArgIndex + 1}: ${site.args[callerArgIndex] || '?'}`,
                             args: site.args
                         });
                     }
@@ -4011,10 +4056,12 @@ class ProjectIndex {
                 params = params.slice(1);
             }
         }
-        const expectedParamCount = params.length;
-        const optionalCount = params.filter(p => p.optional || p.default !== undefined).length;
-        const minArgs = expectedParamCount - optionalCount;
         const hasRest = params.some(p => p.rest);
+        // Rest params don't count toward expected/min — they accept 0+ extra args
+        const nonRestParams = params.filter(p => !p.rest);
+        const expectedParamCount = nonRestParams.length;
+        const optionalCount = nonRestParams.filter(p => p.optional || p.default !== undefined).length;
+        const minArgs = expectedParamCount - optionalCount;
 
         // Get all call sites
         const usages = this.usages(name, { codeOnly: true });

@@ -475,3 +475,72 @@ func doSomething() (int, error) { return 0, nil }
 });
 
 }); // end describe('Go Fix Regressions')
+
+// ============================================================================
+// Fix #116: Go multi-name params and variadic params not parsed
+// `a, b int` should count as 2 params, `args ...int` should be rest param
+// ============================================================================
+describe('fix #116: verify handles Go multi-name and variadic params', () => {
+    it('multi-name params a, b int counted as 2 params', () => {
+        const tmpDir = tmp('go-multiname');
+        fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\ngo 1.21');
+        fs.writeFileSync(path.join(tmpDir, 'main.go'),
+            'package main\n\n' +
+            'func Add(a, b int) int { return a + b }\n\n' +
+            'func main() {\n' +
+            '    Add(1, 2)\n' +
+            '    Add(1, 2, 3)\n' +
+            '}\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('Add');
+        assert.ok(result, 'verify should return result');
+        // Add has 2 params (a and b), not 1
+        assert.equal(result.mismatches, 1,
+            'only Add(1, 2, 3) should mismatch (3 args for 2 params)');
+        const detail = result.mismatchDetails[0];
+        assert.equal(detail.actual, 3, 'mismatched call has 3 args');
+        rm(tmpDir);
+    });
+
+    it('three-name params a, b, c int counted as 3 params', () => {
+        const tmpDir = tmp('go-threename');
+        fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\ngo 1.21');
+        fs.writeFileSync(path.join(tmpDir, 'main.go'),
+            'package main\n\n' +
+            'func Multi(a, b, c int, d string) string { return d }\n\n' +
+            'func main() {\n' +
+            '    Multi(1, 2, 3, "hello")\n' +
+            '    Multi(1, 2)\n' +
+            '}\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('Multi');
+        assert.ok(result, 'verify should return result');
+        // Multi has 4 params (a, b, c, d)
+        assert.equal(result.mismatches, 1,
+            'Multi(1, 2) should mismatch (2 args for 4 params)');
+        rm(tmpDir);
+    });
+
+    it('variadic param args ...int recognized as rest param', () => {
+        const tmpDir = tmp('go-variadic');
+        fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\ngo 1.21');
+        fs.writeFileSync(path.join(tmpDir, 'main.go'),
+            'package main\n\n' +
+            'func Printf(format string, args ...interface{}) { }\n\n' +
+            'func main() {\n' +
+            '    Printf("%s %s", "hello", "world")\n' +
+            '    Printf("%d", 42)\n' +
+            '    Printf("no args")\n' +
+            '}\n'
+        );
+        const index = idx(tmpDir);
+        const result = index.verify('Printf');
+        assert.ok(result, 'verify should return result');
+        // Printf has 1 required param (format) + variadic (args)
+        assert.equal(result.mismatches, 0,
+            'all calls should be valid (variadic accepts 0+ extra args)');
+        rm(tmpDir);
+    });
+});
