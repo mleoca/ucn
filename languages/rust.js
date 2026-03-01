@@ -103,16 +103,16 @@ function findFunctions(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
-            // Skip functions inside impl blocks (they're extracted as impl members)
+            // Skip functions inside impl/trait blocks (they're extracted as members)
             let parent = node.parent;
-            if (parent && (parent.type === 'impl_item' || parent.type === 'declaration_list')) {
-                // declaration_list is the body of an impl block
+            if (parent && (parent.type === 'impl_item' || parent.type === 'trait_item' || parent.type === 'declaration_list')) {
+                // declaration_list is the body of an impl/trait block
                 const grandparent = parent.parent;
-                if (grandparent && grandparent.type === 'impl_item') {
-                    return true;  // Skip - this is an impl method
+                if (grandparent && (grandparent.type === 'impl_item' || grandparent.type === 'trait_item')) {
+                    return true;  // Skip - this is an impl/trait method
                 }
-                if (parent.type === 'impl_item') {
-                    return true;  // Skip - this is an impl method
+                if (parent.type === 'impl_item' || parent.type === 'trait_item') {
+                    return true;  // Skip - this is an impl/trait method
                 }
             }
 

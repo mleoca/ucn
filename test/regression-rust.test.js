@@ -790,3 +790,52 @@ describe('Bug Hunt: Rust super:: resolution for lib.rs and main.rs', () => {
         rm(dir2);
     });
 });
+
+describe('Bug Hunt: Rust trait default implementations not double-counted', () => {
+    it('should not list trait default methods as standalone functions', () => {
+        const code = `
+trait Drawable {
+    fn draw(&self);
+
+    fn default_color(&self) -> &str {
+        "black"
+    }
+}
+
+struct Circle {
+    radius: f64,
+}
+
+impl Drawable for Circle {
+    fn draw(&self) {
+        println!("Drawing circle");
+    }
+}
+
+fn main() {
+    let c = Circle { radius: 5.0 };
+    c.draw();
+}
+`;
+        const result = parse(code, 'rust');
+        const fnNames = result.functions.map(f => f.name);
+
+        // main should be a standalone function
+        assert.ok(fnNames.includes('main'), 'main should be found');
+
+        // default_color is a trait default impl — should NOT appear as standalone
+        assert.ok(!fnNames.includes('default_color'),
+            `Trait default method 'default_color' should not appear as standalone function, got: [${fnNames.join(', ')}]`);
+
+        // draw should not appear as standalone either (it's in impl block)
+        assert.ok(!fnNames.includes('draw'),
+            `Impl method 'draw' should not appear as standalone function`);
+
+        // But both should appear as class members
+        const traitClass = result.classes.find(c => c.name === 'Drawable');
+        assert.ok(traitClass, 'Drawable trait should be found as a class');
+        const traitMembers = traitClass.members.map(m => m.name);
+        assert.ok(traitMembers.includes('default_color'),
+            'default_color should be a member of Drawable trait');
+    });
+});

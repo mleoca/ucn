@@ -4575,3 +4575,67 @@ describe('Bug Hunt: findTsConfig does not escape project root', () => {
     });
 });
 
+describe('Bug Hunt: execute.js null-checking consistency', () => {
+    const { execute } = require('../core/execute');
+
+    it('about returns ok:false for non-existent symbol', () => {
+        const dir = tmp({
+            'index.js': 'function hello() { return 1; }',
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        const { ok, error } = execute(index, 'about', { name: 'nonExistentSymbol12345' });
+        assert.strictEqual(ok, false, 'should return ok:false for non-existent symbol');
+        assert.ok(error, 'should include error message');
+        rm(dir);
+    });
+
+    it('impact returns ok:false for non-existent function', () => {
+        const dir = tmp({
+            'index.js': 'function hello() { return 1; }',
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        const { ok, error } = execute(index, 'impact', { name: 'nonExistentSymbol12345' });
+        assert.strictEqual(ok, false, 'should return ok:false');
+        assert.ok(error, 'should include error message');
+        rm(dir);
+    });
+
+    it('trace returns ok:false for non-existent function', () => {
+        const dir = tmp({
+            'index.js': 'function hello() { return 1; }',
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        const { ok, error } = execute(index, 'trace', { name: 'nonExistentSymbol12345' });
+        assert.strictEqual(ok, false, 'should return ok:false');
+        assert.ok(error, 'should include error message');
+        rm(dir);
+    });
+
+    it('example returns ok:false for non-existent function', () => {
+        const dir = tmp({
+            'index.js': 'function hello() { return 1; }',
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        const { ok, error } = execute(index, 'example', { name: 'nonExistentSymbol12345' });
+        assert.strictEqual(ok, false, 'should return ok:false');
+        assert.ok(error, 'should include error message');
+        rm(dir);
+    });
+
+    it('related returns ok:false for non-existent function', () => {
+        const dir = tmp({
+            'index.js': 'function hello() { return 1; }',
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        const { ok, error } = execute(index, 'related', { name: 'nonExistentSymbol12345' });
+        assert.strictEqual(ok, false, 'should return ok:false');
+        assert.ok(error, 'should include error message');
+        rm(dir);
+    });
+});
+

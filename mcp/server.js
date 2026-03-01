@@ -73,7 +73,7 @@ function getIndex(projectDir) {
     }
 
     // LRU eviction
-    if (indexCache.size >= MAX_CACHE_SIZE) {
+    if (indexCache.size >= MAX_CACHE_SIZE && !indexCache.has(root)) {
         let oldestKey = null;
         let oldestTime = Infinity;
         for (const [key, val] of indexCache) {

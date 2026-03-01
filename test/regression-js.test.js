@@ -2884,3 +2884,71 @@ function resetApp() { initApp(); }
         assert.ok(usages.some(u => u.line >= 8), 'should have usage from onload event handler');
     });
 });
+
+describe('Bug Hunt: JS extractModifiers substring false positives', () => {
+    it('should not detect "default" modifier in variable names containing "default"', () => {
+        const code = `
+const handle_default = () => {
+    return true;
+};
+
+function process_export_data() {
+    return handle_default();
+}
+
+const my_async_helper = 42;
+`;
+        const result = parse(code, 'javascript');
+
+        const handleDefault = result.functions.find(f => f.name === 'handle_default');
+        assert.ok(handleDefault, 'handle_default should be found');
+        assert.ok(!handleDefault.modifiers.includes('default'),
+            `handle_default should not have 'default' modifier, got: [${handleDefault.modifiers.join(', ')}]`);
+        assert.ok(!handleDefault.modifiers.includes('export'),
+            `handle_default should not have 'export' modifier`);
+
+        const processExport = result.functions.find(f => f.name === 'process_export_data');
+        assert.ok(processExport, 'process_export_data should be found');
+        assert.ok(!processExport.modifiers.includes('export'),
+            `process_export_data should not have 'export' modifier, got: [${processExport.modifiers.join(', ')}]`);
+    });
+
+    it('should still detect real export/async/default modifiers', () => {
+        const code = `
+export default async function main() {
+    return true;
+}
+
+export function helper() {}
+`;
+        const result = parse(code, 'javascript');
+
+        const main = result.functions.find(f => f.name === 'main');
+        assert.ok(main, 'main should be found');
+        assert.ok(main.modifiers.includes('export'), 'main should have export');
+        assert.ok(main.modifiers.includes('default'), 'main should have default');
+        assert.ok(main.modifiers.includes('async'), 'main should have async');
+
+        const helper = result.functions.find(f => f.name === 'helper');
+        assert.ok(helper, 'helper should be found');
+        assert.ok(helper.modifiers.includes('export'), 'helper should have export');
+        assert.ok(!helper.modifiers.includes('default'), 'helper should not have default');
+    });
+});
+
+describe('Bug Hunt: HTML handler usages include column field', () => {
+    it('should include column in handler usage results', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('html');
+        const htmlMod = getLanguageModule('html');
+        const code = `<html><body>
+<button onclick="handleClick()">Click</button>
+</body></html>`;
+
+        const usages = htmlMod.findUsagesInCode(code, 'handleClick', parser);
+        const handlerUsage = usages.find(u => u.usageType === 'call');
+        assert.ok(handlerUsage, 'should find handler call usage');
+        assert.ok(handlerUsage.column !== undefined,
+            `handler usage should include column field, got: ${JSON.stringify(handlerUsage)}`);
+    });
+});

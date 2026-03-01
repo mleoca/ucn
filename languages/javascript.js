@@ -80,9 +80,9 @@ function getAssignmentName(leftNode) {
 function extractModifiers(text) {
     const mods = [];
     const firstLine = text.split('\n')[0];
-    if (firstLine.includes('export ')) mods.push('export');
-    if (firstLine.includes('async ')) mods.push('async');
-    if (firstLine.includes('default ')) mods.push('default');
+    if (/\bexport\b/.test(firstLine)) mods.push('export');
+    if (/\basync\b/.test(firstLine)) mods.push('async');
+    if (/\bdefault\b/.test(firstLine)) mods.push('default');
     return mods;
 }
 

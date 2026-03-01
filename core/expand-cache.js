@@ -47,7 +47,13 @@ class ExpandCache {
                     oldestKey = k;
                 }
             }
-            if (oldestKey) this.entries.delete(oldestKey);
+            if (oldestKey) {
+                this.entries.delete(oldestKey);
+                // Clean up lastKey if it pointed to the evicted entry
+                for (const [r, k] of this.lastKey) {
+                    if (k === oldestKey) { this.lastKey.delete(r); break; }
+                }
+            }
         }
 
         this.entries.set(key, { items, root, symbolName: name, usedAt: Date.now() });
@@ -68,9 +74,9 @@ class ExpandCache {
         const recent = recentKey ? this.entries.get(recentKey) : null;
 
         if (recent && recent.items) {
-            recent.usedAt = Date.now();
             const match = recent.items.find(i => i.num === itemNum);
             if (match) {
+                recent.usedAt = Date.now();
                 return { match, itemCount: recent.items.length, symbolName: recent.symbolName };
             }
         }

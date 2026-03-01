@@ -96,6 +96,7 @@ const HANDLERS = {
             maxCallers: num(p.top, undefined),
             maxCallees: num(p.top, undefined),
         });
+        if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
         return { ok: true, result };
     },
 
@@ -119,6 +120,7 @@ const HANDLERS = {
             file: p.file,
             exclude: toExcludeArray(p.exclude),
         });
+        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
     },
 
@@ -146,6 +148,7 @@ const HANDLERS = {
             includeMethods: p.includeMethods,
             includeUncertain: p.includeUncertain || false,
         });
+        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
     },
 
@@ -153,6 +156,7 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         const result = index.example(p.name);
+        if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
         return { ok: true, result };
     },
 
@@ -164,6 +168,7 @@ const HANDLERS = {
             top: num(p.top, undefined),
             all: p.all,
         });
+        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
     },
 
