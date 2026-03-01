@@ -295,9 +295,18 @@ function findExportsInCode(code, parser) {
 }
 
 function findUsagesInCode(code, name, parser) {
-    const result = extractJS(code, parser);
-    if (!result) return [];
-    return result.jsModule.findUsagesInCode(result.virtualJS, name, result.jsParser);
+    const jsUsages = (() => {
+        const result = extractJS(code, parser);
+        if (!result) return [];
+        return result.jsModule.findUsagesInCode(result.virtualJS, name, result.jsParser);
+    })();
+    // Also check event handler attributes (onclick="foo()", onload="bar()")
+    const handlerCalls = extractEventHandlerCalls(code, parser);
+    const handlerUsages = handlerCalls
+        .filter(c => c.name === name)
+        .map(c => ({ line: c.line, usageType: 'call' }));
+    if (handlerUsages.length === 0) return jsUsages;
+    return jsUsages.concat(handlerUsages);
 }
 
 module.exports = {

@@ -1554,18 +1554,23 @@ function findExportsInCode(code, parser) {
                 }
             }
 
-            // Named exports: export function/class/const
+            // Named/default exports: export function/class/const, export default function/class
+            // Check if this is a default export by looking for the 'default' token
+            let isDefaultExport = false;
+            for (let ci = 0; ci < node.childCount; ci++) {
+                if (node.child(ci).type === 'default') { isDefaultExport = true; break; }
+            }
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
                 if (child.type === 'function_declaration' || child.type === 'generator_function_declaration') {
                     const nameNode = child.childForFieldName('name');
                     if (nameNode) {
-                        exports.push({ name: nameNode.text, type: 'named', line });
+                        exports.push({ name: nameNode.text, type: isDefaultExport ? 'default' : 'named', line });
                     }
                 } else if (child.type === 'class_declaration') {
                     const nameNode = child.childForFieldName('name');
                     if (nameNode) {
-                        exports.push({ name: nameNode.text, type: 'named', line });
+                        exports.push({ name: nameNode.text, type: isDefaultExport ? 'default' : 'named', line });
                     }
                 } else if (child.type === 'type_alias_declaration') {
                     // export type X = ...

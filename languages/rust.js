@@ -666,10 +666,15 @@ function findCallsInCode(code, parser) {
             });
         }
 
-        // Handle function calls: foo(), obj.method(), Type::func()
+        // Handle function calls: foo(), obj.method(), Type::func(), foo::<T>()
         if (node.type === 'call_expression') {
-            const funcNode = node.childForFieldName('function');
+            let funcNode = node.childForFieldName('function');
             if (!funcNode) return true;
+
+            // Unwrap turbofish: parse::<i32>() has generic_function wrapping the actual function
+            if (funcNode.type === 'generic_function') {
+                funcNode = funcNode.childForFieldName('function') || funcNode;
+            }
 
             const enclosingFunction = getCurrentEnclosingFunction();
 

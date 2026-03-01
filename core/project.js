@@ -565,9 +565,12 @@ class ProjectIndex {
             }
         }
 
-        // Check inclusion (must be within specified directory)
+        // Check inclusion (must be within specified directory, path-boundary-aware)
         if (filters.in) {
-            if (!filePath.includes(filters.in)) {
+            const inPattern = filters.in;
+            // Match at path boundaries: start of string or after /
+            // e.g. --in=src matches "src/foo.js" and "lib/src/foo.js" but NOT "my-src-backup/foo.js"
+            if (!(filePath.startsWith(inPattern + '/') || filePath.includes('/' + inPattern + '/'))) {
                 return false;
             }
         }
@@ -702,6 +705,11 @@ class ProjectIndex {
         // Glob pattern matching (e.g., _update*, handle*Request, get?ata)
         const isGlob = name.includes('*') || name.includes('?');
         if (isGlob && !options.exact) {
+            // Guard against bare wildcards that would match everything
+            const stripped = name.replace(/[*?]/g, '');
+            if (stripped.length === 0) {
+                return [];
+            }
             const globRegex = new RegExp('^' + name.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
             const matches = [];
             for (const [symName, symbols] of this.symbols) {

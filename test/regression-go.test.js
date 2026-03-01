@@ -544,3 +544,69 @@ describe('fix #116: verify handles Go multi-name and variadic params', () => {
         rm(tmpDir);
     });
 });
+
+// ============================================================================
+// Bug Hunt: Go struct fields extraction
+// ============================================================================
+
+describe('Bug Hunt: Go struct fields should be extracted', () => {
+    it('should extract struct field members with types', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `type Config struct {
+    Name   string
+    Port   int
+    Debug  bool
+}`;
+        const classes = goMod.findClasses(code, parser);
+        assert.ok(classes.length > 0, 'Config should be found');
+        const config = classes[0];
+        assert.ok(config.members && config.members.length === 3, `should have 3 members, got ${config.members?.length}`);
+        assert.strictEqual(config.members[0].name, 'Name');
+        assert.strictEqual(config.members[0].fieldType, 'string');
+        assert.strictEqual(config.members[1].name, 'Port');
+        assert.strictEqual(config.members[2].name, 'Debug');
+    });
+
+    it('should register struct fields as symbols in the index', () => {
+        const dir = tmp({
+            'main.go': `
+package main
+
+type Config struct {
+    Name   string
+    Port   int
+}
+
+func main() {}
+`,
+            'go.mod': 'module test\ngo 1.21'
+        });
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+        // Fields are stored as separate symbols with className
+        const nameSyms = index.symbols.get('Name');
+        assert.ok(nameSyms && nameSyms.length > 0, 'Name field should be indexed');
+        assert.strictEqual(nameSyms[0].className, 'Config');
+        const portSyms = index.symbols.get('Port');
+        assert.ok(portSyms && portSyms.length > 0, 'Port field should be indexed');
+        rm(dir);
+    });
+});
+
+// ============================================================================
+// Bug Hunt: Go raw string literal imports
+// ============================================================================
+
+describe('Bug Hunt: Go raw string literal imports', () => {
+    it('should detect imports using backtick strings', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = 'import `fmt`';
+        const imports = goMod.findImportsInCode(code, parser);
+        assert.ok(imports.length > 0, 'should detect raw string import');
+        assert.strictEqual(imports[0].module, 'fmt');
+    });
+});

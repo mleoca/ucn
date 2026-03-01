@@ -2819,3 +2819,68 @@ describe('fix #115: verify handles JS destructured params', () => {
         rm(tmpDir);
     });
 });
+
+// ============================================================================
+// Bug Hunt: JS export default function type classification
+// ============================================================================
+
+describe('Bug Hunt: JS export default function/class type', () => {
+    it('should classify export default function as type "default"', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('javascript');
+        const jsMod = getLanguageModule('javascript');
+        const code = 'export default function processData() { return 42; }';
+        const exports = jsMod.findExportsInCode(code, parser);
+        assert.ok(exports.length === 1, 'should have 1 export');
+        assert.strictEqual(exports[0].name, 'processData');
+        assert.strictEqual(exports[0].type, 'default', 'should be default, not named');
+    });
+
+    it('should classify export default class as type "default"', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('javascript');
+        const jsMod = getLanguageModule('javascript');
+        const code = 'export default class MyClass { }';
+        const exports = jsMod.findExportsInCode(code, parser);
+        assert.ok(exports.length === 1, 'should have 1 export');
+        assert.strictEqual(exports[0].name, 'MyClass');
+        assert.strictEqual(exports[0].type, 'default', 'should be default, not named');
+    });
+
+    it('should still classify regular export function as type "named"', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('javascript');
+        const jsMod = getLanguageModule('javascript');
+        const code = 'export function processData() { return 42; }';
+        const exports = jsMod.findExportsInCode(code, parser);
+        assert.strictEqual(exports[0].type, 'named');
+    });
+});
+
+// ============================================================================
+// Bug Hunt: HTML findUsagesInCode includes event handler calls
+// ============================================================================
+
+describe('Bug Hunt: HTML usages include event handler attributes', () => {
+    it('should detect function calls in onclick/onload attributes', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('html');
+        const htmlMod = getLanguageModule('html');
+        const code = `<!DOCTYPE html>
+<html>
+<head><script>
+function initApp() { loadData(); }
+function loadData() { return []; }
+function resetApp() { initApp(); }
+</script></head>
+<body onload="initApp()">
+<button onclick="resetApp()">Reset</button>
+</body></html>`;
+        const usages = htmlMod.findUsagesInCode(code, 'initApp', parser);
+        // Should find: definition in script, call in script (from resetApp), call from onload
+        const callUsages = usages.filter(u => u.usageType === 'call');
+        assert.ok(callUsages.length >= 2, `should have at least 2 call usages (script + event handler), got ${callUsages.length}`);
+        // Check that we have an event handler usage (line with onload)
+        assert.ok(usages.some(u => u.line >= 8), 'should have usage from onload event handler');
+    });
+});

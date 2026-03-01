@@ -215,7 +215,17 @@ function findClasses(code, parser) {
  */
 function extractStructFields(structNode, code) {
     const fields = [];
-    const fieldListNode = structNode.childForFieldName('body') || structNode;
+    // struct_type contains a field_declaration_list child (not a 'body' field)
+    let fieldListNode = structNode.childForFieldName('body');
+    if (!fieldListNode) {
+        for (let i = 0; i < structNode.namedChildCount; i++) {
+            if (structNode.namedChild(i).type === 'field_declaration_list') {
+                fieldListNode = structNode.namedChild(i);
+                break;
+            }
+        }
+    }
+    if (!fieldListNode) fieldListNode = structNode;
 
     for (let i = 0; i < fieldListNode.namedChildCount; i++) {
         const field = fieldListNode.namedChild(i);
@@ -546,8 +556,8 @@ function findImportsInCode(code, parser) {
 
         for (let i = 0; i < spec.namedChildCount; i++) {
             const child = spec.namedChild(i);
-            if (child.type === 'interpreted_string_literal') {
-                // Remove quotes
+            if (child.type === 'interpreted_string_literal' || child.type === 'raw_string_literal') {
+                // Remove quotes (double quotes or backticks)
                 modulePath = child.text.slice(1, -1);
             } else if (child.type === 'package_identifier') {
                 alias = child.text;
