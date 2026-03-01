@@ -46,11 +46,11 @@ const flags = {
     exact: args.includes('--exact'),
     cache: !args.includes('--no-cache'),
     clearCache: args.includes('--clear-cache'),
-    context: parseInt(args.find(a => a.startsWith('--context='))?.split('=')[1] || '0'),
-    file: args.find(a => a.startsWith('--file='))?.split('=')[1] || null,
+    context: parseInt(args.find(a => a.startsWith('--context='))?.split('=').slice(1).join('=') || '0'),
+    file: args.find(a => a.startsWith('--file='))?.split('=').slice(1).join('=') || null,
     // Semantic filters (--not is alias for --exclude)
-    exclude: args.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=')[1].split(','))  || [],
-    in: args.find(a => a.startsWith('--in='))?.split('=')[1] || null,
+    exclude: args.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=').slice(1).join('=').split(','))  || [],
+    in: args.find(a => a.startsWith('--in='))?.split('=').slice(1).join('=') || null,
     // Test file inclusion (by default, tests are excluded from usages/find)
     includeTests: args.includes('--include-tests'),
     // Deadcode options
@@ -61,18 +61,18 @@ const flags = {
     // Detailed listing (e.g. toc with all symbols)
     detailed: args.includes('--detailed'),
     // Output depth
-    depth: args.find(a => a.startsWith('--depth='))?.split('=')[1] || null,
+    depth: args.find(a => a.startsWith('--depth='))?.split('=').slice(1).join('=') || null,
     // Inline expansion for callees
     expand: args.includes('--expand'),
     // Interactive REPL mode
     interactive: args.includes('--interactive') || args.includes('-i'),
     // Plan command options
-    addParam: args.find(a => a.startsWith('--add-param='))?.split('=')[1] || null,
-    removeParam: args.find(a => a.startsWith('--remove-param='))?.split('=')[1] || null,
-    renameTo: args.find(a => a.startsWith('--rename-to='))?.split('=')[1] || null,
-    defaultValue: args.find(a => a.startsWith('--default='))?.split('=')[1] || null,
+    addParam: args.find(a => a.startsWith('--add-param='))?.split('=').slice(1).join('=') || null,
+    removeParam: args.find(a => a.startsWith('--remove-param='))?.split('=').slice(1).join('=') || null,
+    renameTo: args.find(a => a.startsWith('--rename-to='))?.split('=').slice(1).join('=') || null,
+    defaultValue: args.find(a => a.startsWith('--default='))?.split('=').slice(1).join('=') || null,
     // Smart filtering for find results
-    top: parseInt(args.find(a => a.startsWith('--top='))?.split('=')[1] || '0'),
+    top: parseInt(args.find(a => a.startsWith('--top='))?.split('=').slice(1).join('=') || '0'),
     all: args.includes('--all'),
     // Include method calls in caller/callee analysis
     // Tri-state: true (--include-methods), false (--include-methods=false), undefined (let command decide default)
@@ -80,23 +80,23 @@ const flags = {
     // Tests: only show call/test-case matches
     callsOnly: args.includes('--calls-only'),
     // Graph direction (imports/importers/both)
-    direction: args.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
+    direction: args.find(a => a.startsWith('--direction='))?.split('=').slice(1).join('=') || null,
     // Symlink handling (follow by default)
     followSymlinks: !args.includes('--no-follow-symlinks'),
     // Diff-impact options
-    base: args.find(a => a.startsWith('--base='))?.split('=')[1] || null,
+    base: args.find(a => a.startsWith('--base='))?.split('=').slice(1).join('=') || null,
     staged: args.includes('--staged'),
     // Regex search mode (default: ON; --no-regex to force plain text)
     regex: args.includes('--no-regex') ? false : undefined,
     // Stats: per-function line counts
     functions: args.includes('--functions'),
     // Class: max lines to show (0 = no limit)
-    maxLines: parseInt(args.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null
+    maxLines: parseInt(args.find(a => a.startsWith('--max-lines='))?.split('=').slice(1).join('=') || '0') || null
 };
 
 // Handle --file flag with space
 const fileArgIdx = args.indexOf('--file');
-if (fileArgIdx !== -1 && args[fileArgIdx + 1]) {
+if (fileArgIdx !== -1 && args[fileArgIdx + 1] && !args[fileArgIdx + 1].startsWith('-')) {
     flags.file = args[fileArgIdx + 1];
 }
 
@@ -384,7 +384,7 @@ function printFileToc(result, filePath) {
     // Filter for top-level only if flag is set
     let functions = result.functions;
     if (flags.topLevel) {
-        functions = functions.filter(fn => !fn.isNested && fn.indent === 0);
+        functions = functions.filter(fn => !fn.isNested && (!fn.indent || fn.indent === 0));
     }
 
     if (flags.json) {
@@ -1920,7 +1920,7 @@ function parseInteractiveFlags(tokens) {
     // Helper: get value for a flag that supports both --flag=value and --flag value forms
     function getValueFlag(flagName) {
         const eqForm = tokens.find(a => a.startsWith(flagName + '='));
-        if (eqForm) return eqForm.split('=')[1];
+        if (eqForm) return eqForm.split('=').slice(1).join('=');
         const idx = tokens.indexOf(flagName);
         if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
             return tokens[idx + 1];
@@ -1929,7 +1929,7 @@ function parseInteractiveFlags(tokens) {
     }
     return {
         file: getValueFlag('--file'),
-        exclude: tokens.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=')[1].split(',')) || [],
+        exclude: tokens.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=').slice(1).join('=').split(',')) || [],
         in: getValueFlag('--in'),
         includeTests: tokens.includes('--include-tests'),
         includeExported: tokens.includes('--include-exported'),
@@ -1945,17 +1945,17 @@ function parseInteractiveFlags(tokens) {
         caseSensitive: tokens.includes('--case-sensitive'),
         withTypes: tokens.includes('--with-types'),
         expand: tokens.includes('--expand'),
-        depth: tokens.find(a => a.startsWith('--depth='))?.split('=')[1] || null,
-        top: parseInt(tokens.find(a => a.startsWith('--top='))?.split('=')[1] || '0'),
-        context: parseInt(tokens.find(a => a.startsWith('--context='))?.split('=')[1] || '0'),
-        direction: tokens.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
+        depth: tokens.find(a => a.startsWith('--depth='))?.split('=').slice(1).join('=') || null,
+        top: parseInt(tokens.find(a => a.startsWith('--top='))?.split('=').slice(1).join('=') || '0'),
+        context: parseInt(tokens.find(a => a.startsWith('--context='))?.split('=').slice(1).join('=') || '0'),
+        direction: tokens.find(a => a.startsWith('--direction='))?.split('=').slice(1).join('=') || null,
         addParam: getValueFlag('--add-param'),
         removeParam: getValueFlag('--remove-param'),
         renameTo: getValueFlag('--rename-to'),
         defaultValue: getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged'),
-        maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null,
+        maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=').slice(1).join('=') || '0') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions'),
     };
@@ -2258,7 +2258,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
 // ============================================================================
 
 if (flags.interactive) {
-    const target = positionalArgs[0] || '.';
+    let target = positionalArgs[0] || '.';
+    if (COMMANDS.has(target)) target = '.';
     runInteractive(target);
 } else {
     main();

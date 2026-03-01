@@ -1152,12 +1152,12 @@ function formatAbout(about, options = {}) {
     const { expand, root, depth } = options;
 
     // Depth=0: location only
-    if (depth === '0') {
+    if (depth !== null && depth !== undefined && Number(depth) === 0) {
         return `${sym.file}:${sym.startLine}`;
     }
 
     // Depth=1: location + signature + usage counts
-    if (depth === '1') {
+    if (depth !== null && depth !== undefined && Number(depth) === 1) {
         lines.push(`${sym.file}:${sym.startLine}`);
         if (sym.signature) {
             lines.push(sym.signature);
@@ -1454,7 +1454,9 @@ function formatFind(symbols, query, top) {
             if (c.definitions > 0) parts.push(`${c.definitions} def`);
             if (c.imports > 0) parts.push(`${c.imports} imports`);
             if (c.references > 0) parts.push(`${c.references} refs`);
-            lines.push(`  (${c.total} usages: ${parts.join(', ')})`);
+            lines.push(parts.length > 0
+                ? `  (${c.total} usages: ${parts.join(', ')})`
+                : `  (${c.total} usages)`);
         } else if (s.usageCount !== undefined) {
             lines.push(`  (${s.usageCount} usages)`);
         }
@@ -1848,10 +1850,11 @@ function formatGraph(graph, options = {}) {
         let truncatedNodes = 0;
         let depthLimited = false;
 
-        function printNode(file, indent = 0) {
+        function printNode(file, indent = 0, isLast = true) {
             const fileEntry = nodes.find(n => n.file === file);
             const relPath = fileEntry ? fileEntry.relativePath : file;
-            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + '├── ';
+            const connector = isLast ? '└── ' : '├── ';
+            const prefix = indent === 0 ? '' : '  '.repeat(indent - 1) + connector;
 
             if (ancestors.has(file)) {
                 lines.push(`${prefix}${relPath} (circular)`);
@@ -1876,8 +1879,9 @@ function formatGraph(graph, options = {}) {
             const displayEdges = fileEdges.slice(0, maxChildren);
             const hiddenCount = fileEdges.length - displayEdges.length;
 
-            for (const edge of displayEdges) {
-                printNode(edge.to, indent + 1);
+            for (let i = 0; i < displayEdges.length; i++) {
+                const childIsLast = i === displayEdges.length - 1 && hiddenCount === 0;
+                printNode(displayEdges[i].to, indent + 1, childIsLast);
             }
             ancestors.delete(file);
 

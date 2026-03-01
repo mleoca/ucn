@@ -1689,6 +1689,49 @@ describe('ExpandCache', () => {
         }
     });
 
+    it('LRU eviction cleans up stale lastKey pointing to evicted entry', () => {
+        const cache = new ExpandCache({ maxSize: 2 });
+        const root1 = '/project1';
+        const root2 = '/project2';
+        const root3 = '/project3';
+
+        cache.save(root1, 'funcA', null, [{ num: 1, name: 'a', type: 'function' }]);
+        cache.save(root2, 'funcB', null, [{ num: 1, name: 'b', type: 'function' }]);
+
+        // root1 is the oldest — saving root3 should evict root1
+        cache.save(root3, 'funcC', null, [{ num: 1, name: 'c', type: 'function' }]);
+
+        assert.strictEqual(cache.size, 2);
+
+        // lastKey for root1 should be cleaned up (not pointing to evicted entry)
+        const result = cache.lookup(root1, 1);
+        assert.strictEqual(result.match, null, 'evicted root should not return stale lastKey match');
+    });
+
+    it('lookup only refreshes usedAt on actual hit, not miss', () => {
+        const cache = new ExpandCache({ maxSize: 3 });
+        const root = '/test';
+
+        cache.save(root, 'alpha', null, [{ num: 1, name: 'a', type: 'function' }]);
+        const entryKey = `${root}:alpha:`;
+
+        // Record initial usedAt
+        const initialUsedAt = cache.entries.get(entryKey).usedAt;
+
+        // Lookup a non-existent item number — should NOT refresh usedAt
+        // (need a small delay to distinguish timestamps)
+        const before = Date.now();
+        cache.lookup(root, 999);
+        const afterMiss = cache.entries.get(entryKey).usedAt;
+        assert.strictEqual(afterMiss, initialUsedAt, 'usedAt should not change on miss');
+
+        // Now lookup a valid item — should refresh usedAt
+        cache.entries.get(entryKey).usedAt = before - 1000; // force old timestamp
+        cache.lookup(root, 1);
+        const afterHit = cache.entries.get(entryKey).usedAt;
+        assert.ok(afterHit >= before, 'usedAt should be refreshed on hit');
+    });
+
     it('renderExpandItem validates root when requested', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-expand-'));
         try {

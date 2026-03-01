@@ -1905,3 +1905,67 @@ describe('Additional Formatter Coverage', () => {
         });
     });
 });
+
+describe('Bug Hunt: Formatter regressions', () => {
+    it('formatFind shows clean output when all usage counts are zero', () => {
+        const results = [{
+            relativePath: 'test.js',
+            startLine: 1,
+            name: 'test',
+            type: 'function',
+            params: 'a',
+            usageCounts: { calls: 0, definitions: 0, imports: 0, references: 0, total: 0 }
+        }];
+        const text = output.formatFind(results, 'test');
+        assert.ok(!text.includes('usages: )'), 'should not have trailing colon-space before paren');
+        assert.ok(text.includes('(0 usages)'), 'should show clean (0 usages) without breakdown');
+    });
+
+    it('formatAbout depth works with both string and numeric values', () => {
+        const about = {
+            found: true,
+            symbol: { name: 'hello', type: 'function', file: 'test.js', startLine: 1, endLine: 3 },
+            source: 'function hello() {}',
+            callers: [],
+            callees: [],
+            tests: [],
+            usages: { calls: 0, imports: 0, references: 0 },
+            totalUsages: 0,
+        };
+
+        // String depth (from CLI) should work
+        const textStr = output.formatAbout(about, { depth: '0' });
+        assert.ok(textStr.includes('test.js:1'), 'string depth 0 should return location');
+        assert.ok(!textStr.includes('═'), 'string depth 0 should be compact');
+
+        // Numeric depth (from MCP) should also work
+        const textNum = output.formatAbout(about, { depth: 0 });
+        assert.ok(textNum.includes('test.js:1'), 'numeric depth 0 should return location');
+        assert.ok(!textNum.includes('═'), 'numeric depth 0 should be compact');
+
+        // Numeric depth 1 should also work
+        const textNum1 = output.formatAbout(about, { depth: 1 });
+        assert.ok(textNum1.includes('test.js:1'), 'numeric depth 1 should include location');
+        assert.ok(textNum1.includes('usages'), 'numeric depth 1 should include usage counts');
+    });
+
+    it('formatGraph uses correct tree connectors (last child gets └──)', () => {
+        const graph = {
+            root: '/project/src/index.js',
+            nodes: [
+                { file: '/project/src/index.js', relativePath: 'src/index.js' },
+                { file: '/project/src/a.js', relativePath: 'src/a.js' },
+                { file: '/project/src/b.js', relativePath: 'src/b.js' },
+            ],
+            edges: [
+                { from: '/project/src/index.js', to: '/project/src/a.js' },
+                { from: '/project/src/index.js', to: '/project/src/b.js' },
+            ]
+        };
+        const text = output.formatGraph(graph, { showAll: true });
+        // Last child (b.js) should use └── connector
+        assert.ok(text.includes('└── src/b.js'), `last child should use └── connector, got:\n${text}`);
+        // First child (a.js) should use ├── connector
+        assert.ok(text.includes('├── src/a.js'), `non-last child should use ├── connector, got:\n${text}`);
+    });
+});

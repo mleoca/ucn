@@ -190,6 +190,7 @@ function extractEventHandlerCalls(htmlContent, htmlParser) {
             if (!valueText) return;
 
             const line = nameNode.startPosition.row + 1; // 1-indexed
+            const column = nameNode.startPosition.column;
 
             // Extract standalone function calls (not method calls like obj.method())
             const regex = /([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(/g;
@@ -203,6 +204,7 @@ function extractEventHandlerCalls(htmlContent, htmlParser) {
                 calls.push({
                     name: fnName,
                     line,
+                    column,
                     isMethod: false,
                     enclosingFunction: null,
                     uncertain: false,
@@ -304,7 +306,7 @@ function findUsagesInCode(code, name, parser) {
     const handlerCalls = extractEventHandlerCalls(code, parser);
     const handlerUsages = handlerCalls
         .filter(c => c.name === name)
-        .map(c => ({ line: c.line, usageType: 'call' }));
+        .map(c => ({ line: c.line, column: c.column || 0, usageType: 'call' }));
     if (handlerUsages.length === 0) return jsUsages;
     return jsUsages.concat(handlerUsages);
 }

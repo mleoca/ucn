@@ -1358,8 +1358,6 @@ class ProjectIndex {
                             // Multiple method bindings (e.g. Go String() on Reader vs Writer):
                             // Don't mark uncertain — include them even if conflated.
                             // Better to over-report than lose all callers.
-                        } else if (bindings.length !== 0) {
-                            isUncertain = true;
                         }
                         // Method call with no binding for the method name (JS/TS/Python only):
                         // Mark uncertain unless receiver has binding evidence in file scope.
