@@ -463,6 +463,28 @@ function extractExtends(classNode) {
 }
 
 /**
+ * Split comma-separated type names, respecting angle bracket nesting.
+ * "Bar<A, B>, Baz" → ["Bar<A, B>", "Baz"]
+ */
+function splitTypeList(text) {
+    const result = [];
+    let depth = 0;
+    let current = '';
+    for (const ch of text) {
+        if (ch === '<') depth++;
+        else if (ch === '>') depth--;
+        if (ch === ',' && depth === 0) {
+            result.push(current.trim());
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    if (current.trim()) result.push(current.trim());
+    return result;
+}
+
+/**
  * Extract implements clause from class
  */
 function extractImplements(classNode) {
@@ -472,7 +494,7 @@ function extractImplements(classNode) {
         if (child.type === 'class_heritage') {
             const implMatch = child.text.match(/implements\s+([^{]+)/);
             if (implMatch) {
-                const names = implMatch[1].split(',').map(n => n.trim());
+                const names = splitTypeList(implMatch[1]);
                 implements_.push(...names);
             }
         }
@@ -488,9 +510,9 @@ function extractInterfaceExtends(interfaceNode) {
     for (let i = 0; i < interfaceNode.namedChildCount; i++) {
         const child = interfaceNode.namedChild(i);
         if (child.type === 'extends_type_clause') {
-            // Parse comma-separated type names
+            // Parse comma-separated type names respecting generics
             const text = child.text.replace(/^extends\s+/, '');
-            const names = text.split(',').map(n => n.trim());
+            const names = splitTypeList(text);
             extends_.push(...names);
         }
     }

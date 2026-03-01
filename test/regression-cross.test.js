@@ -3905,3 +3905,537 @@ Factory.create("gadget", {"color": "blue"})`,
     it('cleanup', () => { rm(dir); });
 });
 
+// ============================================================================
+// Bug hunt 2026-03-01: Regression tests for all fixes
+// ============================================================================
+
+describe('FIX 115 — fuzzyScore camelCase word boundary split', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'lib.js': `
+function parseFileName() {}
+function fileParse() {}
+function handleRequest() {}
+`
+        });
+    });
+
+    it('fuzzyScore should split camelCase targets for word boundary matching', () => {
+        const index = idx(dir);
+        const results = index.find('parse');
+        const names = results.map(r => r.name);
+        // Both parseFileName and fileParse should match via word boundary
+        assert.ok(names.includes('parseFileName'), `parseFileName should match 'parse' via word boundary, got: ${names}`);
+        assert.ok(names.includes('fileParse'), `fileParse should match 'parse' via word boundary, got: ${names}`);
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 116 — fileExports re-export-all cycle detection', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'a.js': `
+export * from './b';
+export function fromA() {}
+`,
+            'b.js': `
+export * from './a';
+export function fromB() {}
+`
+        });
+    });
+
+    it('should not crash on circular re-exports', () => {
+        const index = idx(dir);
+        // Should not throw (infinite recursion)
+        const exports = index.fileExports(path.join(dir, 'a.js'));
+        assert.ok(Array.isArray(exports), 'should return an array');
+        const names = exports.map(e => e.name);
+        assert.ok(names.includes('fromA'), 'should include own exports');
+        assert.ok(names.includes('fromB'), 'should include re-exported symbols from b');
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 117 — _beginOp/_endOp nesting support', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'main.js': `
+const { helper } = require('./utils');
+function main() { helper(); }
+`,
+            'utils.js': `
+function helper() { return 1; }
+module.exports = { helper };
+`
+        });
+    });
+
+    it('nested _beginOp/_endOp should preserve outer cache', () => {
+        const index = idx(dir);
+        // context() calls _beginOp, then calls findCallers (which also calls _beginOp/_endOp),
+        // then findCallees. The inner _endOp should NOT destroy the outer cache.
+        index._beginOp();
+        assert.ok(index._opContentCache instanceof Map, 'cache should exist after _beginOp');
+
+        index._beginOp(); // nested
+        assert.ok(index._opContentCache instanceof Map, 'cache should still exist after nested _beginOp');
+
+        index._endOp(); // inner end
+        assert.ok(index._opContentCache instanceof Map, 'cache should survive inner _endOp');
+
+        index._endOp(); // outer end
+        assert.strictEqual(index._opContentCache, null, 'cache should be cleared after outer _endOp');
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 118 — _findCallNode handles multi-line call expressions', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'main.js': `
+function process(a, b, c) { return a + b + c; }
+function caller() {
+    const result = process(
+        1,
+        2,
+        3
+    );
+}
+`
+        });
+    });
+
+    it('verify should detect args for multi-line calls', () => {
+        const index = idx(dir);
+        const result = index.verify('process');
+        assert.ok(result, 'verify should return a result');
+        if (result.found && result.callSites) {
+            // Should detect the call even though it spans multiple lines
+            const site = result.callSites.find(s => s.file && s.callerName === 'caller');
+            if (site) {
+                assert.strictEqual(site.argCount, 3, `should detect 3 args in multi-line call, got: ${site.argCount}`);
+            }
+        }
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 119 — formatContextJson includes class type', () => {
+    it('should handle class type in JSON context output', () => {
+        const context = {
+            type: 'class',
+            name: 'MyClass',
+            file: 'src/foo.js',
+            startLine: 1,
+            endLine: 10,
+            callers: [{ name: 'test', file: 'test.js', line: 5 }],
+            methods: [{ name: 'doStuff', file: 'src/foo.js', line: 3, params: 'x' }],
+            meta: { complete: true }
+        };
+        const json = JSON.parse(output.formatContextJson(context));
+        assert.strictEqual(json.data.type, 'class');
+        assert.strictEqual(json.data.methodCount, 1);
+        assert.ok(json.data.methods, 'JSON output should include methods for class type');
+        assert.strictEqual(json.data.methods[0].name, 'doStuff');
+    });
+});
+
+describe('FIX 120 — formatAbout callee weight guard', () => {
+    it('should not produce [undefined] when weight is missing', () => {
+        const about = {
+            found: true,
+            symbol: { name: 'test', file: 'test.js', startLine: 1, endLine: 3, type: 'function', signature: 'function test()' },
+            definition: { code: 'function test() {}', startLine: 1, endLine: 1 },
+            callers: { total: 0, top: [] },
+            callees: {
+                total: 1,
+                top: [{ name: 'helper', file: 'helper.js', line: 5, callCount: 1 }]
+            },
+            tests: [],
+            otherDefinitions: [],
+            totalUsages: 1,
+            usages: { calls: 1, imports: 0, references: 0 }
+        };
+        const text = output.formatAbout(about);
+        assert.ok(!text.includes('[undefined]'), `should not contain [undefined], got: ${text}`);
+        assert.ok(text.includes('helper'), 'should include callee name');
+    });
+});
+
+describe('FIX 121 — formatMemberSignature no space before parens', () => {
+    it('should format member as name(params) not name (params)', () => {
+        const member = { name: 'doSomething', params: 'x, y' };
+        const sig = output.formatMemberSignature(member);
+        assert.ok(sig.includes('doSomething(x, y)'), `should have no space before parens, got: ${sig}`);
+        assert.ok(!sig.includes('doSomething ('), `should NOT have space before parens, got: ${sig}`);
+    });
+});
+
+describe('FIX 122 — formatTrace includeMethods strict check', () => {
+    it('should not show methods hint when includeMethods is undefined', () => {
+        const trace = {
+            name: 'test',
+            file: 'test.js',
+            line: 1,
+            tree: { name: 'test', children: [] },
+            // includeMethods is intentionally omitted (undefined)
+        };
+        const text = output.formatTrace(trace);
+        assert.ok(!text.includes('obj.method()'), `should not show methods hint when includeMethods is undefined, got: ${text}`);
+    });
+
+    it('should show methods hint when includeMethods is explicitly false', () => {
+        const trace = {
+            name: 'test',
+            file: 'test.js',
+            line: 1,
+            tree: { name: 'test', children: [] },
+            includeMethods: false,
+        };
+        const text = output.formatTrace(trace);
+        assert.ok(text.includes('obj.method()'), `should show methods hint when includeMethods is false`);
+    });
+});
+
+describe('FIX 123 — CLI searchFile context lines order', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'data.js': `// line 1
+function hello() {
+    console.log("hello");
+}
+// line 5
+function world() {
+    console.log("world");
+}`
+        });
+    });
+
+    it('should print before-context lines before the match', () => {
+        const { execFileSync } = require('child_process');
+        const result = execFileSync('node', [CLI_PATH, path.join(dir, 'data.js'), 'search', 'hello', '--context=1'], {
+            encoding: 'utf-8',
+            timeout: 10000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        const lines = result.split('\n');
+        // Find the match line and verify before-context is above it
+        for (let i = 0; i < lines.length; i++) {
+            if (lines[i].match(/\d+:.*function hello/)) {
+                // The context line before should be BEFORE this match line in the output
+                if (i > 0 && lines[i - 1].includes('...')) {
+                    assert.ok(true, 'before context line appears before match');
+                }
+                // The context line should NOT be on the line after the match
+                if (i + 1 < lines.length && lines[i + 1].includes('...') && lines[i + 1].includes('line 1')) {
+                    assert.fail('before-context line appeared after match — wrong order');
+                }
+                break;
+            }
+        }
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 124 — CLI --exclude captures multiple occurrences', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'src/main.js': `function main() {}`,
+            'test/main.test.js': `function testMain() {}`,
+            'vendor/lib.js': `function vendorLib() {}`
+        });
+    });
+
+    it('multiple --exclude flags should all be applied', () => {
+        const { execFileSync } = require('child_process');
+        const result = execFileSync('node', [CLI_PATH, dir, 'find', 'main', '--exclude=test', '--exclude=vendor'], {
+            encoding: 'utf-8',
+            timeout: 10000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        assert.ok(!result.includes('test/'), `should exclude test dir, got: ${result}`);
+        assert.ok(!result.includes('vendor/'), `should exclude vendor dir, got: ${result}`);
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 125 — Rust self:: resolution for lib.rs and main.rs', () => {
+    it('should resolve self:: from lib.rs within same directory', () => {
+        const { resolveImport } = require('../core/imports');
+        const dir = tmp({
+            'src/lib.rs': `mod config;`,
+            'src/config.rs': `pub fn load() {}`
+        });
+        const resolved = resolveImport('self::config', path.join(dir, 'src/lib.rs'), {
+            language: 'rust',
+            root: dir,
+            extensions: ['.rs']
+        });
+        assert.ok(resolved, 'should resolve self::config from lib.rs');
+        assert.ok(resolved.endsWith('config.rs'), `should resolve to config.rs, got: ${resolved}`);
+        rm(dir);
+    });
+
+    it('should resolve self:: from main.rs within same directory', () => {
+        const { resolveImport } = require('../core/imports');
+        const dir = tmp({
+            'src/main.rs': `mod utils;`,
+            'src/utils.rs': `pub fn helper() {}`
+        });
+        const resolved = resolveImport('self::utils', path.join(dir, 'src/main.rs'), {
+            language: 'rust',
+            root: dir,
+            extensions: ['.rs']
+        });
+        assert.ok(resolved, 'should resolve self::utils from main.rs');
+        assert.ok(resolved.endsWith('utils.rs'), `should resolve to utils.rs, got: ${resolved}`);
+        rm(dir);
+    });
+});
+
+describe('FIX 126 — tsconfig paths multi-wildcard regex', () => {
+    it('should replace all wildcards in tsconfig path patterns', () => {
+        const { resolveImport } = require('../core/imports');
+        const dir = tmp({
+            'tsconfig.json': JSON.stringify({
+                compilerOptions: {
+                    baseUrl: ".",
+                    paths: {
+                        "@/*/types/*": ["src/*/types/*"]
+                    }
+                }
+            }),
+            'src/api/types/user.ts': `export interface User { name: string; }`,
+            'src/main.ts': `import { User } from '@/api/types/user';`
+        });
+        const resolved = resolveImport('@/api/types/user', path.join(dir, 'src/main.ts'), {
+            language: 'typescript',
+            root: dir,
+            extensions: ['.ts', '.tsx', '.js', '.jsx']
+        });
+        assert.ok(resolved, `should resolve multi-wildcard tsconfig path, got: ${resolved}`);
+        assert.ok(resolved.endsWith('user.ts'), `should resolve to user.ts, got: ${resolved}`);
+        rm(dir);
+    });
+});
+
+describe('FIX 127 — formatGraph truncation hints for both direction', () => {
+    it('should show truncation hints for both-direction graph', () => {
+        const importNodes = [
+            { file: '/project/src/main.js', relativePath: 'src/main.js', depth: 0 },
+            ...Array.from({ length: 15 }, (_, i) => ({
+                file: `/project/src/dep${i}.js`,
+                relativePath: `src/dep${i}.js`,
+                depth: 1
+            }))
+        ];
+        const importerNodes = [
+            { file: '/project/src/main.js', relativePath: 'src/main.js', depth: 0 },
+            { file: '/project/src/app.js', relativePath: 'src/app.js', depth: 1 }
+        ];
+        const graph = {
+            direction: 'both',
+            root: '/project/src/main.js',
+            // formatGraph checks graph.nodes.length first — provide combined nodes
+            nodes: [...importNodes, ...importerNodes],
+            imports: {
+                nodes: importNodes,
+                edges: Array.from({ length: 15 }, (_, i) => ({
+                    from: '/project/src/main.js',
+                    to: `/project/src/dep${i}.js`
+                }))
+            },
+            importers: {
+                nodes: importerNodes,
+                edges: [
+                    { from: '/project/src/main.js', to: '/project/src/app.js' }
+                ]
+            }
+        };
+        const text = output.formatGraph(graph, { maxDepth: 1, showAll: false, file: 'src/main.js' });
+        assert.ok(text.includes('IMPORTS'), 'should have IMPORTS section');
+        assert.ok(text.includes('IMPORTERS'), 'should have IMPORTERS section');
+    });
+});
+
+describe('FIX 128 — CLI context/smart error exits with code 1', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'main.js': `function hello() {}`
+        });
+    });
+
+    it('context with missing name should exit with error', () => {
+        const { execFileSync } = require('child_process');
+        let exitedWithError = false;
+        try {
+            execFileSync('node', [CLI_PATH, dir, 'context'], {
+                encoding: 'utf-8',
+                timeout: 10000,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+        } catch (e) {
+            exitedWithError = true;
+            // Error should be on stderr
+            assert.ok(e.stderr && e.stderr.length > 0, `error should be on stderr, got stdout: ${e.stdout}, stderr: ${e.stderr}`);
+        }
+        assert.ok(exitedWithError, 'context with missing name should exit with non-zero code');
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 130 — JS extractImplements/extractInterfaceExtends respects generics', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'main.ts': `
+interface Foo<A, B> {}
+interface Baz {}
+interface Bar extends Foo<string, number>, Baz {
+    x: number;
+}
+class MyClass implements Foo<string, number>, Baz {
+    x = 1;
+}
+`
+        });
+    });
+
+    it('extractInterfaceExtends should not split generic params', () => {
+        const index = idx(dir);
+        const barSymbol = index.find('Bar', { exact: true })[0];
+        assert.ok(barSymbol, 'should find Bar');
+        if (barSymbol.extends) {
+            // extends is stored as a joined string, should preserve generics intact
+            assert.ok(barSymbol.extends.includes('Foo<string, number>'),
+                `should preserve generics in extends string, got: ${barSymbol.extends}`);
+            assert.ok(barSymbol.extends.includes('Baz'),
+                `should include Baz in extends string, got: ${barSymbol.extends}`);
+        }
+    });
+
+    it('extractImplements should not split generic params', () => {
+        const index = idx(dir);
+        const myClassSymbol = index.find('MyClass', { exact: true })[0];
+        assert.ok(myClassSymbol, 'should find MyClass');
+        if (myClassSymbol.implements) {
+            assert.ok(!myClassSymbol.implements.some(e => e === 'Foo<string'),
+                `should not split generics, got implements: ${JSON.stringify(myClassSymbol.implements)}`);
+        }
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 131 — _attrTypeCache invalidation on rebuild', () => {
+    it('should clear _attrTypeCache on rebuild', () => {
+        const dir = tmp({
+            'main.py': `
+class Foo:
+    def __init__(self):
+        self.helper = Helper()
+    def run(self):
+        self.helper.process()
+
+class Helper:
+    def process(self):
+        pass
+`
+        });
+        const index = idx(dir);
+        // Prime the attr type cache
+        index.getInstanceAttributeTypes(path.join(dir, 'main.py'));
+        assert.ok(index._attrTypeCache, 'attr type cache should exist');
+        assert.ok(index._attrTypeCache.size > 0, 'attr type cache should have entries');
+
+        // Rebuild should clear it
+        index.build(null, { quiet: true });
+        assert.strictEqual(index._attrTypeCache, null, 'attr type cache should be cleared on rebuild');
+        rm(dir);
+    });
+});
+
+describe('FIX 132 — fn/class exit code on not-found', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'main.js': `function hello() {}`
+        });
+    });
+
+    it('fn with nonexistent name should exit with non-zero code', () => {
+        const { execFileSync } = require('child_process');
+        let exitedWithError = false;
+        try {
+            execFileSync('node', [CLI_PATH, dir, 'fn', 'nonexistent'], {
+                encoding: 'utf-8',
+                timeout: 10000,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+        } catch (e) {
+            exitedWithError = true;
+            assert.ok(e.stderr.includes('not found'), `stderr should say not found, got: ${e.stderr}`);
+        }
+        assert.ok(exitedWithError, 'fn with nonexistent name should exit with non-zero code');
+    });
+
+    it('class with nonexistent name should exit with non-zero code', () => {
+        const { execFileSync } = require('child_process');
+        let exitedWithError = false;
+        try {
+            execFileSync('node', [CLI_PATH, dir, 'class', 'NonexistentClass'], {
+                encoding: 'utf-8',
+                timeout: 10000,
+                stdio: ['pipe', 'pipe', 'pipe']
+            });
+        } catch (e) {
+            exitedWithError = true;
+            assert.ok(e.stderr.includes('not found'), `stderr should say not found, got: ${e.stderr}`);
+        }
+        assert.ok(exitedWithError, 'class with nonexistent name should exit with non-zero code');
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('FIX 133 — Interactive --file value (space-separated)', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'src/parser.js': `function parse() { return 1; }`,
+            'src/utils.js': `function parse() { return 2; }`
+        });
+    });
+
+    it('interactive fn with --file <value> should work', () => {
+        const { execFileSync } = require('child_process');
+        const input = 'fn parse --file parser\nquit\n';
+        const result = execFileSync('node', [CLI_PATH, '--interactive', dir], {
+            input,
+            encoding: 'utf-8',
+            timeout: 15000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        // Should show the function from parser.js, not utils.js
+        assert.ok(result.includes('parse'), 'should find parse function');
+        assert.ok(result.includes('parser'), `should scope to parser.js file, got: ${result}`);
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+

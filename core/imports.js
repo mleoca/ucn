@@ -101,7 +101,9 @@ function resolveImport(importPath, fromFile, config = {}) {
                         const match = importPath.match(regex);
                         if (match) {
                             for (const target of targets) {
-                                const resolved = target.replace('*', match[1] || '');
+                                let resolved = target;
+                            let groupIdx = 1;
+                            resolved = resolved.replace(/\*/g, () => match[groupIdx++] || '');
                                 const basePath = tsconfig.baseUrl || path.dirname(tsconfig.configPath);
                                 const fullPath = path.join(basePath, resolved);
                                 const result = resolveFilePath(fullPath, config.extensions || getExtensions(config.language));
@@ -347,9 +349,9 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
         const rest = importPath.slice('self::'.length);
         const segments = rest.split('::');
         const basename = path.basename(fromFile);
-        // For mod.rs: self:: resolves within the directory containing mod.rs
+        // For mod.rs/lib.rs/main.rs: self:: resolves within the directory containing the file
         // For regular .rs: self:: resolves within a subdirectory named after the file stem
-        const dir = basename === 'mod.rs'
+        const dir = (basename === 'mod.rs' || basename === 'lib.rs' || basename === 'main.rs')
             ? fromDir
             : path.join(fromDir, path.basename(fromFile, '.rs'));
         return resolveRustModulePath(dir, segments);
@@ -506,7 +508,7 @@ function loadTsConfig(tsconfigPath, visited) {
     const mergedPaths = { ...basePaths, ...(config.compilerOptions?.paths || {}) };
     const compiledPaths = Object.entries(mergedPaths).map(([pattern, targets]) => ({
         pattern,
-        regex: new RegExp('^' + pattern.replace(/[.+^$[\]\\{}()|]/g, '\\$&').replace('*', '(.*)') + '$'),
+        regex: new RegExp('^' + pattern.replace(/[.+^$[\]\\{}()|]/g, '\\$&').replace(/\*/g, '(.*)') + '$'),
         targets
     }));
 
