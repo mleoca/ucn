@@ -333,9 +333,10 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
             superCount++;
             rest = rest.slice('super::'.length);
         }
-        // For mod.rs: module IS the directory, so super:: goes up N levels
+        // For mod.rs/lib.rs/main.rs: module IS the directory, so super:: goes up N levels
         // For regular .rs: file is a submodule of the directory, so super:: goes up (N-1) levels
-        const isMod = path.basename(fromFile) === 'mod.rs';
+        const basename = path.basename(fromFile);
+        const isMod = basename === 'mod.rs' || basename === 'lib.rs' || basename === 'main.rs';
         const ups = isMod ? superCount : superCount - 1;
         for (let i = 0; i < ups; i++) {
             dir = path.dirname(dir);
@@ -437,6 +438,9 @@ function findTsConfig(fromDir, rootDir) {
     const normalizedRoot = rootDir ? path.resolve(rootDir) : null;
 
     while (true) {
+        // Check boundary BEFORE loading — don't escape the project root
+        if (normalizedRoot && !currentDir.startsWith(normalizedRoot + path.sep) && currentDir !== normalizedRoot) break;
+
         const tsconfigPath = path.join(currentDir, 'tsconfig.json');
         if (fs.existsSync(tsconfigPath)) {
             try {
@@ -450,7 +454,6 @@ function findTsConfig(fromDir, rootDir) {
 
         const parent = path.dirname(currentDir);
         if (parent === currentDir) break;
-        if (normalizedRoot && !currentDir.startsWith(normalizedRoot)) break;
         currentDir = parent;
     }
 

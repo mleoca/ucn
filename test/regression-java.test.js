@@ -1139,3 +1139,39 @@ public class Application {
         fs.rmSync(tmpDir, { recursive: true });
     });
 });
+
+// ============================================================================
+// Bug Hunt: Java final parameter modifier false positive
+// ============================================================================
+
+describe('Bug Hunt: Java final in params not misclassified as method modifier', () => {
+    it('should not report "final" on method when only parameter is final', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('java');
+        const javaMod = getLanguageModule('java');
+        const code = `public class Foo {
+    void doWork(final String name, final int count) {}
+    public static final void doStatic() {}
+}`;
+        const classes = javaMod.findClasses(code, parser);
+        assert.ok(classes.length > 0, 'should find class Foo');
+        const doWork = classes[0].members.find(m => m.name === 'doWork');
+        assert.ok(doWork, 'should find doWork method');
+        assert.ok(!doWork.modifiers || !doWork.modifiers.includes('final'),
+            `doWork should NOT have 'final' modifier from params, got: ${JSON.stringify(doWork.modifiers)}`);
+    });
+
+    it('should keep "final" on method when it IS a method modifier', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('java');
+        const javaMod = getLanguageModule('java');
+        const code = `public class Foo {
+    public final void locked() {}
+}`;
+        const classes = javaMod.findClasses(code, parser);
+        const locked = classes[0].members.find(m => m.name === 'locked');
+        assert.ok(locked, 'should find locked method');
+        assert.ok(locked.modifiers && locked.modifiers.includes('final'),
+            `locked should have 'final' modifier, got: ${JSON.stringify(locked.modifiers)}`);
+    });
+});

@@ -58,12 +58,14 @@ function extractModifiers(node) {
         }
     }
 
-    // Also check first line for modifiers
+    // Also check text before parameter list for modifiers (avoid matching keywords in params)
     const text = node.text;
     const firstLine = text.split('\n')[0];
+    const parenIdx = firstLine.indexOf('(');
+    const preParams = parenIdx >= 0 ? firstLine.substring(0, parenIdx) : firstLine;
     const keywords = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default'];
     for (const kw of keywords) {
-        if (firstLine.includes(kw + ' ') && !modifiers.includes(kw)) {
+        if (preParams.includes(kw + ' ') && !modifiers.includes(kw)) {
             modifiers.push(kw);
         }
     }

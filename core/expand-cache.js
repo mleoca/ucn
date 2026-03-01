@@ -77,15 +77,20 @@ class ExpandCache {
 
         // Fallback: scan all entries for this project
         let maxCount = recent?.items?.length || 0;
+        let foundEntry = null;
         for (const [, cached] of this.entries) {
             if (cached.root === root && cached.items) {
-                cached.usedAt = Date.now();
                 maxCount = Math.max(maxCount, cached.items.length);
                 const found = cached.items.find(i => i.num === itemNum);
-                if (found) {
-                    return { match: found, itemCount: maxCount, symbolName: cached.symbolName };
+                if (found && !foundEntry) {
+                    foundEntry = { match: found, cached };
                 }
             }
+        }
+        if (foundEntry) {
+            // Only refresh the entry that actually contains the match
+            foundEntry.cached.usedAt = Date.now();
+            return { match: foundEntry.match, itemCount: maxCount, symbolName: foundEntry.cached.symbolName };
         }
 
         return {

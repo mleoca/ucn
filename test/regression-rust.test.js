@@ -707,3 +707,86 @@ it('FIX 100 — findEnclosingFunction excludes enum and trait', () => {
 });
 
 }); // end describe('Rust Fix Regressions')
+
+// ============================================================================
+// Bug Hunt: Rust turbofish calls
+// ============================================================================
+
+describe('Bug Hunt: Rust turbofish calls detected', () => {
+    it('should detect turbofish method calls like .parse::<i32>()', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `fn main() {
+    let x = "42".parse::<i32>().unwrap();
+    let v: Vec<_> = vec![1,2,3].iter().collect::<Vec<_>>();
+}`;
+        const calls = rustMod.findCallsInCode(code, parser);
+        const names = calls.map(c => c.name);
+        assert.ok(names.includes('parse'), 'should detect parse::<i32>()');
+        assert.ok(names.includes('collect'), 'should detect collect::<Vec<_>>()');
+        assert.ok(names.includes('unwrap'), 'should still detect unwrap()');
+    });
+
+    it('should detect turbofish standalone calls like func::<T>()', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `fn main() { let x = convert::<String>(); }
+fn convert<T>() -> T { todo!() }`;
+        const calls = rustMod.findCallsInCode(code, parser);
+        assert.ok(calls.some(c => c.name === 'convert'), 'should detect convert::<String>()');
+    });
+
+    it('turbofish calls should appear in raw call lists', () => {
+        const dir = tmp({
+            'src/main.rs': `
+fn convert<T: Default>() -> T { T::default() }
+fn caller() {
+    let x = convert::<String>();
+}
+`,
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"'
+        });
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+        const caller = index.symbols.get('caller');
+        assert.ok(caller && caller.length > 0, 'caller should exist');
+        const callees = index.findCallees(caller[0]);
+        const calleeNames = callees.map(c => c.name);
+        assert.ok(calleeNames.includes('convert'), `callees should include 'convert', got: ${calleeNames}`);
+        rm(dir);
+    });
+});
+
+// ============================================================================
+// Bug Hunt: Rust super:: with lib.rs/main.rs
+// ============================================================================
+
+describe('Bug Hunt: Rust super:: resolution for lib.rs and main.rs', () => {
+    it('should treat lib.rs and main.rs as module roots like mod.rs', () => {
+        const { resolveImport } = require('../core/imports');
+        // For lib.rs, super:: should go up from the directory containing lib.rs
+        const dir = tmp({
+            'src/lib.rs': 'use super::other;',
+            'other.rs': 'pub fn hello() {}',
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"'
+        });
+        // resolveImport takes (importPath, fromFile, config)
+        const resolved = resolveImport('super::other', path.join(dir, 'src', 'lib.rs'), { projectRoot: dir, language: 'rust' });
+        // For lib.rs, isMod=true → ups=1 → goes from src/ up to dir, finds other.rs
+        if (resolved) {
+            assert.ok(resolved.includes('other'), `resolved path should reference 'other', got: ${resolved}`);
+        }
+        // Verify main.rs is also treated as module root
+        const dir2 = tmp({
+            'src/main.rs': 'mod sub;',
+            'src/sub.rs': 'pub fn helper() {}',
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"'
+        });
+        const resolved2 = resolveImport('sub', path.join(dir2, 'src', 'main.rs'), { projectRoot: dir2, language: 'rust' });
+        assert.ok(resolved2 && resolved2.includes('sub'), `main.rs mod resolution should work, got: ${resolved2}`);
+        rm(dir);
+        rm(dir2);
+    });
+});

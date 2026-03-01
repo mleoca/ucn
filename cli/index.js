@@ -947,7 +947,7 @@ function runProjectCommand(rootDir, command, arg) {
                     nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
                     edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
                 }, null, 2),
-                r => output.formatGraph(r, { showAll: flags.all || flags.depth !== undefined, maxDepth: flags.depth != null ? parseInt(flags.depth, 10) : 2, file: arg })
+                r => output.formatGraph(r, { showAll: flags.all || flags.depth != null, maxDepth: flags.depth != null ? parseInt(flags.depth, 10) : 2, file: arg })
             );
             break;
         }
@@ -1917,18 +1917,20 @@ Flags can be added per-command: context myFunc --include-methods
  * Returns a flags object similar to the global flags but scoped to this command.
  */
 function parseInteractiveFlags(tokens) {
-    // Handle --file <value> (space-separated) in addition to --file=value
-    let fileValue = tokens.find(a => a.startsWith('--file='))?.split('=')[1] || null;
-    if (!fileValue) {
-        const fileIdx = tokens.indexOf('--file');
-        if (fileIdx !== -1 && fileIdx + 1 < tokens.length && !tokens[fileIdx + 1].startsWith('-')) {
-            fileValue = tokens[fileIdx + 1];
+    // Helper: get value for a flag that supports both --flag=value and --flag value forms
+    function getValueFlag(flagName) {
+        const eqForm = tokens.find(a => a.startsWith(flagName + '='));
+        if (eqForm) return eqForm.split('=')[1];
+        const idx = tokens.indexOf(flagName);
+        if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
+            return tokens[idx + 1];
         }
+        return null;
     }
     return {
-        file: fileValue,
+        file: getValueFlag('--file'),
         exclude: tokens.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=')[1].split(',')) || [],
-        in: tokens.find(a => a.startsWith('--in='))?.split('=')[1] || null,
+        in: getValueFlag('--in'),
         includeTests: tokens.includes('--include-tests'),
         includeExported: tokens.includes('--include-exported'),
         includeDecorated: tokens.includes('--include-decorated'),
@@ -1947,11 +1949,11 @@ function parseInteractiveFlags(tokens) {
         top: parseInt(tokens.find(a => a.startsWith('--top='))?.split('=')[1] || '0'),
         context: parseInt(tokens.find(a => a.startsWith('--context='))?.split('=')[1] || '0'),
         direction: tokens.find(a => a.startsWith('--direction='))?.split('=')[1] || null,
-        addParam: tokens.find(a => a.startsWith('--add-param='))?.split('=')[1] || null,
-        removeParam: tokens.find(a => a.startsWith('--remove-param='))?.split('=')[1] || null,
-        renameTo: tokens.find(a => a.startsWith('--rename-to='))?.split('=')[1] || null,
-        defaultValue: tokens.find(a => a.startsWith('--default='))?.split('=')[1] || null,
-        base: tokens.find(a => a.startsWith('--base='))?.split('=')[1] || null,
+        addParam: getValueFlag('--add-param'),
+        removeParam: getValueFlag('--remove-param'),
+        renameTo: getValueFlag('--rename-to'),
+        defaultValue: getValueFlag('--default'),
+        base: getValueFlag('--base'),
         staged: tokens.includes('--staged'),
         maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=')[1] || '0') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,

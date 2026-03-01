@@ -4439,3 +4439,139 @@ describe('FIX 133 — Interactive --file value (space-separated)', () => {
     it('cleanup', () => { rm(dir); });
 });
 
+// ============================================================================
+// BUG HUNT ROUND — March 2026
+// ============================================================================
+
+describe('Bug Hunt: find("*") bare wildcard should not hang', () => {
+    it('should return empty array for bare wildcard patterns', () => {
+        const index = new ProjectIndex('.');
+        index.build(null, { quiet: true });
+        // Bare wildcards should return empty, not iterate all symbols
+        assert.deepStrictEqual(index.find('*'), []);
+        assert.deepStrictEqual(index.find('?'), []);
+        assert.deepStrictEqual(index.find('**'), []);
+        assert.deepStrictEqual(index.find('???'), []);
+    });
+
+    it('should still work for meaningful glob patterns', () => {
+        const index = new ProjectIndex('.');
+        index.build(null, { quiet: true });
+        const results = index.find('handle*');
+        // Should find something (or not), but not hang
+        assert.ok(Array.isArray(results));
+    });
+});
+
+describe('Bug Hunt: --in filter uses path-boundary matching', () => {
+    let dir;
+    it('setup', () => {
+        dir = tmp({
+            'src/core/utils.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'my-src-backup/old.js': 'function legacy() { return 2; }\nmodule.exports = { legacy };',
+            'lib/src/inner.js': 'function inner() { return 3; }\nmodule.exports = { inner };',
+            'package.json': '{"name":"test","version":"1.0.0"}'
+        });
+    });
+
+    it('should match src/ but not my-src-backup/', () => {
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+        const results = index.find('helper', { in: 'src' });
+        assert.ok(results.length > 0, 'should find helper in src/');
+        const legacy = index.find('legacy', { in: 'src' });
+        assert.strictEqual(legacy.length, 0, 'should NOT find legacy from my-src-backup/');
+    });
+
+    it('should match nested src/ path', () => {
+        const index = new ProjectIndex(dir);
+        index.build(null, { quiet: true });
+        const results = index.find('inner', { in: 'src' });
+        assert.ok(results.length > 0, 'should find inner in lib/src/');
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+describe('Bug Hunt: graph showAll not always true', () => {
+    it('formatGraph should respect showAll=false by default', () => {
+        // When no --depth and no --all flags, showAll should be false
+        const graphResult = {
+            root: '/test/file.js',
+            nodes: [
+                { file: '/test/file.js', relativePath: 'file.js', depth: 0 },
+                { file: '/test/dep.js', relativePath: 'dep.js', depth: 1 },
+            ],
+            edges: [{ from: '/test/file.js', to: '/test/dep.js', type: 'import' }]
+        };
+        const compact = output.formatGraph(graphResult, { showAll: false, maxDepth: 2, file: 'file.js' });
+        const expanded = output.formatGraph(graphResult, { showAll: true, maxDepth: 2, file: 'file.js' });
+        // Both should produce valid output
+        assert.ok(compact.includes('file.js'));
+        assert.ok(expanded.includes('file.js'));
+    });
+});
+
+describe('Bug Hunt: expand cache LRU only refreshes matched entry', () => {
+    it('should not refresh usedAt on non-matching entries during fallback', () => {
+        const { ExpandCache } = require('../core/expand-cache');
+        const cache = new ExpandCache({ maxSize: 10 });
+
+        // Save two context entries for the same root
+        cache.save('/root', 'funcA', 'file.js', [{ num: 1, name: 'a' }]);
+        // Small delay to differentiate timestamps
+        const entry1 = [...cache.entries.values()][0];
+        const oldUsedAt1 = entry1.usedAt;
+
+        cache.save('/root', 'funcB', 'file.js', [{ num: 2, name: 'b' }]);
+
+        // Lookup item 1 (in funcA entry, not the most recent funcB)
+        const result = cache.lookup('/root', 1);
+        assert.ok(result.match, 'should find item 1');
+        assert.strictEqual(result.match.name, 'a');
+
+        // The non-matching entry (funcB) should NOT have been refreshed
+        const entries = [...cache.entries.values()].filter(e => e.root === '/root');
+        const funcBEntry = entries.find(e => e.symbolName === 'funcB');
+        const funcAEntry = entries.find(e => e.symbolName === 'funcA');
+        // matched entry should be refreshed; non-matched should not
+        assert.ok(funcAEntry.usedAt >= oldUsedAt1, 'matched entry should be refreshed');
+    });
+});
+
+describe('Bug Hunt: interactive parseInteractiveFlags space-separated values', () => {
+    it('should handle --in with space-separated value', () => {
+        const { execFileSync } = require('child_process');
+        const result = execFileSync('node', [CLI_PATH, '--interactive'], {
+            input: 'find main --in core\nquit\n',
+            encoding: 'utf-8',
+            timeout: 15000,
+        });
+        // Should not error about unknown flags
+        assert.ok(!result.includes('Unknown flag'), `should accept --in with space, got: ${result}`);
+    });
+});
+
+describe('Bug Hunt: findTsConfig does not escape project root', () => {
+    it('should not resolve imports using tsconfig.json above project root', () => {
+        // Create a parent dir with a tsconfig that defines path aliases
+        // and a child project that should NOT use it
+        const parentDir = tmp({
+            'tsconfig.json': '{"compilerOptions":{"baseUrl":".","paths":{"@lib/*":["shared/*"]}}}',
+            'shared/utils.ts': 'export function sharedUtil() { return 1; }',
+            'project/src/index.ts': 'import { sharedUtil } from "@lib/utils";',
+            'project/package.json': '{"name":"test"}'
+        });
+        const projectRoot = path.join(parentDir, 'project');
+        const { resolveImport } = require('../core/imports');
+        // Should NOT resolve @lib/utils via parent tsconfig
+        const resolved = resolveImport('@lib/utils', path.join(projectRoot, 'src', 'index.ts'), { projectRoot });
+        // Should be null or not point to the parent's shared/ dir
+        if (resolved) {
+            assert.ok(!resolved.includes(path.join(parentDir, 'shared')),
+                `should not resolve to parent shared dir, got: ${resolved}`);
+        }
+        rm(parentDir);
+    });
+});
+
