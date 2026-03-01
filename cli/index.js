@@ -49,7 +49,7 @@ const flags = {
     context: parseInt(args.find(a => a.startsWith('--context='))?.split('=')[1] || '0'),
     file: args.find(a => a.startsWith('--file='))?.split('=')[1] || null,
     // Semantic filters (--not is alias for --exclude)
-    exclude: args.find(a => a.startsWith('--exclude=') || a.startsWith('--not='))?.split('=')[1]?.split(',') || [],
+    exclude: args.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=')[1].split(','))  || [],
     in: args.find(a => a.startsWith('--in='))?.split('=')[1] || null,
     // Test file inclusion (by default, tests are excluded from usages/find)
     includeTests: args.includes('--include-tests'),
@@ -745,7 +745,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'context': {
             const { ok, result: ctx, error } = execute(index, 'context', { name: arg, ...flags });
-            if (!ok) { console.log(error); break; }
+            if (!ok) { console.error(error); process.exit(1); }
             if (flags.json) {
                 console.log(output.formatContextJson(ctx));
             } else {
@@ -808,7 +808,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'smart': {
             const { ok, result, error } = execute(index, 'smart', { name: arg, ...flags });
-            if (!ok) { console.error(error); break; }
+            if (!ok) { console.error(error); process.exit(1); }
             printOutput(result, output.formatSmartJson, r => output.formatSmart(r, {
                 uncertainHint: 'use --include-uncertain to include all'
             }));
@@ -873,19 +873,21 @@ function runProjectCommand(rootDir, command, arg) {
             requireArg(arg, 'Usage: ucn . fn <name>');
             if (arg.includes(',')) {
                 const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
+                let anyNotFound = false;
                 for (let i = 0; i < fnNames.length; i++) {
                     if (i > 0) console.log('\n' + '═'.repeat(60) + '\n');
-                    extractFunctionFromProject(index, fnNames[i]);
+                    if (extractFunctionFromProject(index, fnNames[i]) === false) anyNotFound = true;
                 }
+                if (anyNotFound) process.exit(1);
             } else {
-                extractFunctionFromProject(index, arg);
+                if (extractFunctionFromProject(index, arg) === false) process.exit(1);
             }
             break;
         }
 
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
-            extractClassFromProject(index, arg);
+            if (extractClassFromProject(index, arg) === false) process.exit(1);
             break;
         }
 
@@ -945,7 +947,7 @@ function runProjectCommand(rootDir, command, arg) {
                     nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
                     edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
                 }, null, 2),
-                r => output.formatGraph(r, { showAll: flags.all || flags.depth !== undefined, maxDepth: flags.depth ?? 2, file: arg })
+                r => output.formatGraph(r, { showAll: flags.all || flags.depth !== undefined, maxDepth: flags.depth != null ? parseInt(flags.depth, 10) : 2, file: arg })
             );
             break;
         }
@@ -1040,7 +1042,7 @@ function extractFunctionFromProject(index, name, overrideFlags) {
 
     if (matches.length === 0) {
         console.error(`Function "${name}" not found`);
-        return;
+        return false;
     }
 
     if (matches.length > 1 && !f.file && f.all) {
@@ -1092,7 +1094,7 @@ function extractClassFromProject(index, name, overrideFlags) {
 
     if (matches.length === 0) {
         console.error(`Class "${name}" not found`);
-        return;
+        return false;
     }
 
     if (matches.length > 1 && !f.file && f.all) {
@@ -1611,12 +1613,12 @@ function searchFile(filePath, lines, term) {
     } else {
         console.log(`Found ${matches.length} matches for "${term}" in ${filePath}:`);
         for (const m of matches) {
-            console.log(`  ${m.line}: ${m.content.trim()}`);
             if (m.before && m.before.length > 0) {
                 for (const line of m.before) {
                     console.log(`      ... ${line.trim()}`);
                 }
             }
+            console.log(`  ${m.line}: ${m.content.trim()}`);
             if (m.after && m.after.length > 0) {
                 for (const line of m.after) {
                     console.log(`      ... ${line.trim()}`);
@@ -1874,8 +1876,24 @@ Flags can be added per-command: context myFunc --include-methods
         // Parse command, flags, and arg from interactive input
         const tokens = input.split(/\s+/);
         const command = tokens[0];
-        const flagTokens = tokens.filter(t => t.startsWith('--'));
-        const argTokens = tokens.slice(1).filter(t => !t.startsWith('--'));
+        // Flags that take a space-separated value (--flag value)
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default']);
+        const flagTokens = [];
+        const argTokens = [];
+        const skipNext = new Set();
+        for (let i = 1; i < tokens.length; i++) {
+            if (skipNext.has(i)) { continue; }
+            if (tokens[i].startsWith('--')) {
+                flagTokens.push(tokens[i]);
+                // If it's a value-flag without = and next token exists and isn't a flag, consume it too
+                if (valueFlagNames.has(tokens[i]) && !tokens[i].includes('=') && i + 1 < tokens.length && !tokens[i + 1].startsWith('--')) {
+                    flagTokens.push(tokens[i + 1]);
+                    skipNext.add(i + 1);
+                }
+            } else {
+                argTokens.push(tokens[i]);
+            }
+        }
         const arg = argTokens.join(' ');
         const iflags = parseInteractiveFlags(flagTokens);
 
@@ -1899,9 +1917,17 @@ Flags can be added per-command: context myFunc --include-methods
  * Returns a flags object similar to the global flags but scoped to this command.
  */
 function parseInteractiveFlags(tokens) {
+    // Handle --file <value> (space-separated) in addition to --file=value
+    let fileValue = tokens.find(a => a.startsWith('--file='))?.split('=')[1] || null;
+    if (!fileValue) {
+        const fileIdx = tokens.indexOf('--file');
+        if (fileIdx !== -1 && fileIdx + 1 < tokens.length && !tokens[fileIdx + 1].startsWith('-')) {
+            fileValue = tokens[fileIdx + 1];
+        }
+    }
     return {
-        file: tokens.find(a => a.startsWith('--file='))?.split('=')[1] || null,
-        exclude: tokens.find(a => a.startsWith('--exclude=') || a.startsWith('--not='))?.split('=')[1]?.split(',') || [],
+        file: fileValue,
+        exclude: tokens.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=')[1].split(',')) || [],
         in: tokens.find(a => a.startsWith('--in='))?.split('=')[1] || null,
         includeTests: tokens.includes('--include-tests'),
         includeExported: tokens.includes('--include-exported'),
@@ -2028,7 +2054,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             if (result.length === 0) {
                 console.log(`No symbols found for "${arg}"`);
             } else {
-                printSymbols(result, arg, { top: iflags.top });
+                printSymbols(result, arg, { depth: iflags.depth, top: iflags.top, all: iflags.all });
             }
             break;
         }
@@ -2080,7 +2106,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         case 'about': {
             const { ok, result, error } = execute(index, 'about', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            console.log(output.formatAbout(result, { expand: iflags.expand, root: index.root, showAll: iflags.all }));
+            console.log(output.formatAbout(result, { expand: iflags.expand, root: index.root, showAll: iflags.all, depth: iflags.depth }));
             break;
         }
 

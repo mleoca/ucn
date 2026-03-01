@@ -70,16 +70,21 @@ class ProjectIndex {
         return fs.readFileSync(filePath, 'utf-8');
     }
 
-    /** Start a per-operation content cache scope */
+    /** Start a per-operation content cache scope (supports nesting) */
     _beginOp() {
         if (!this._opContentCache) {
             this._opContentCache = new Map();
+            this._opDepth = 0;
         }
+        this._opDepth++;
     }
 
-    /** End a per-operation content cache scope */
+    /** End a per-operation content cache scope (only clears when outermost scope ends) */
     _endOp() {
-        this._opContentCache = null;
+        if (--this._opDepth <= 0) {
+            this._opContentCache = null;
+            this._opDepth = 0;
+        }
     }
 
     /**
@@ -144,8 +149,9 @@ class ProjectIndex {
             }
         }
 
-        // Always invalidate completeness cache on rebuild
+        // Always invalidate caches on rebuild
         this._completenessCache = null;
+        this._attrTypeCache = null;
 
         let indexed = 0;
         if (!this.failedFiles) this.failedFiles = new Set();
@@ -314,6 +320,9 @@ class ProjectIndex {
 
         // Invalidate cached call data for this file
         this.callsCache.delete(filePath);
+
+        // Invalidate attribute type cache for this file
+        if (this._attrTypeCache) this._attrTypeCache.delete(filePath);
     }
 
     /**
@@ -602,7 +611,7 @@ class ProjectIndex {
         if (lowerTarget.includes(lowerQuery)) return 400 + (query.length / target.length) * 100;
 
         // Word boundary match (parse -> parseFile, fileParse)
-        const words = lowerTarget.split(/(?=[A-Z])|_|-/);
+        const words = target.split(/(?=[A-Z])|_|-/).map(w => w.toLowerCase());
         if (words.some(w => w.startsWith(lowerQuery))) return 300;
 
         return 0;
@@ -2616,11 +2625,15 @@ class ProjectIndex {
      * @param {string} filePath - File path
      * @returns {Array} Exported symbols from that file
      */
-    fileExports(filePath) {
+    fileExports(filePath, _visited) {
         const resolved = this.resolveFilePathForQuery(filePath);
         if (typeof resolved !== 'string') return resolved;
 
         const absPath = resolved;
+        const visited = _visited || new Set();
+        if (visited.has(absPath)) return [];
+        visited.add(absPath);
+
         const fileEntry = this.files.get(absPath);
         if (!fileEntry) {
             return [];
@@ -2683,7 +2696,7 @@ class ProjectIndex {
                         if (sourceEntry) {
                             // For star re-exports, include all exported symbols from source
                             if (exp.type === 're-export-all') {
-                                const sourceExports = this.fileExports(resolved);
+                                const sourceExports = this.fileExports(resolved, visited);
                                 for (const srcExp of sourceExports) {
                                     if (!matchedNames.has(srcExp.name)) {
                                         matchedNames.add(srcExp.name);
@@ -4250,7 +4263,7 @@ class ProjectIndex {
             return null; // Skip nodes that don't contain the target line
         }
 
-        if (callTypes.has(node.type) && node.startPosition.row === targetRow) {
+        if (callTypes.has(node.type) && node.startPosition.row <= targetRow && node.endPosition.row >= targetRow) {
             // Java constructor: new ClassName(args) — name is in 'type' field
             if (node.type === 'object_creation_expression') {
                 const typeNode = node.childForFieldName('type');

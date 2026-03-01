@@ -130,13 +130,12 @@ function formatMemberSignature(member) {
     // Generator
     if (member.isGenerator) parts.push('*');
 
-    // Name
-    parts.push(member.name);
-
-    // Parameters
+    // Name + Parameters (no space between name and parens)
     if (member.params !== undefined) {
         const params = normalizeParams(member.params);
-        parts.push(`(${params})`);
+        parts.push(`${member.name}(${params})`);
+    } else {
+        parts.push(member.name);
     }
 
     // Return type
@@ -289,7 +288,7 @@ function formatUsagesJson(usages, name) {
 function formatContextJson(context) {
     const meta = context.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 };
     // Handle struct/interface types differently
-    if (context.type && ['struct', 'interface', 'type'].includes(context.type)) {
+    if (context.type && ['class', 'struct', 'interface', 'type'].includes(context.type)) {
         const callers = context.callers || [];
         const methods = context.methods || [];
         return JSON.stringify({
@@ -806,7 +805,7 @@ function formatTrace(trace, options = {}) {
         lines.push(`\nSome results truncated. ${allHint}`);
     }
 
-    if (!trace.includeMethods) {
+    if (trace.includeMethods === false) {
         const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded (--include-methods=false). Remove flag to include them (default).';
         lines.push(`\n${methodsHint}`);
     }
@@ -1217,8 +1216,8 @@ function formatAbout(about, options = {}) {
             lines.push(`CALLEES (${about.callees.total}):`);
         }
         for (const c of about.callees.top) {
-            const weight = c.weight !== 'normal' ? `[${c.weight}]` : '';
-            lines.push(`  ${c.name} ${weight} - ${c.file}:${c.line} (${c.callCount}x)`);
+            const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
+            lines.push(`  ${c.name}${weight} - ${c.file}:${c.line} (${c.callCount}x)`);
 
             // Inline expansion: show first 3 lines of callee code
             if (expand && root && c.file && c.startLine) {
@@ -1899,18 +1898,37 @@ function formatGraph(graph, options = {}) {
         lines.push(`Dependency graph for ${rootRelPath}`);
         lines.push('═'.repeat(60));
 
+        let totalTruncated = 0;
+        let anyDepthLimited = false;
+
         lines.push(`\nIMPORTS (what this file depends on): ${importCount} files`);
         if (importCount > 0) {
-            printTree(graph.imports.nodes, graph.imports.edges, graph.root);
+            const r = printTree(graph.imports.nodes, graph.imports.edges, graph.root);
+            totalTruncated += r.truncatedNodes;
+            anyDepthLimited = anyDepthLimited || r.depthLimited;
         } else {
             lines.push('  (none)');
         }
 
         lines.push(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
         if (importerCount > 0) {
-            printTree(graph.importers.nodes, graph.importers.edges, graph.root);
+            const r = printTree(graph.importers.nodes, graph.importers.edges, graph.root);
+            totalTruncated += r.truncatedNodes;
+            anyDepthLimited = anyDepthLimited || r.depthLimited;
         } else {
             lines.push('  (none)');
+        }
+
+        if (anyDepthLimited || totalTruncated > 0) {
+            lines.push('\n' + '─'.repeat(60));
+            if (anyDepthLimited) {
+                const depthHint = options.depthHint || `Use --depth=N for deeper graph.`;
+                lines.push(`Depth limited to ${maxDepth}. ${depthHint}`);
+            }
+            if (totalTruncated > 0) {
+                const allHint = options.allHint || 'Use --all to show all children.';
+                lines.push(`${totalTruncated} nodes hidden. ${allHint}`);
+            }
         }
     } else {
         lines.push(`Dependency graph for ${rootRelPath}`);
