@@ -1969,3 +1969,21 @@ describe('Bug Hunt: Formatter regressions', () => {
         assert.ok(text.includes('├── src/a.js'), `non-last child should use ├── connector, got:\n${text}`);
     });
 });
+
+// ============================================================================
+// BUG HUNT: FORMATTER REGRESSION TESTS (2026-03-02)
+// ============================================================================
+
+describe('Bug Hunt: formatDiffImpact null summary guard', () => {
+    it('should not crash when result.summary is missing', () => {
+        const result = output.formatDiffImpact({
+            base: 'HEAD',
+            functions: [],
+            newFunctions: [],
+            deletedFunctions: [],
+            moduleLevelChanges: []
+        });
+        assert.ok(typeof result === 'string', 'should return a string');
+        assert.ok(result.includes('Diff Impact Analysis'), 'should include header');
+    });
+});

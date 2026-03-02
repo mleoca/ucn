@@ -110,7 +110,7 @@ const knownFlags = new Set([
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
-    '--base', '--staged',
+    '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions',
     '--max-lines'
 ]);
@@ -1442,22 +1442,21 @@ function runGlobCommand(pattern, command, arg) {
                 }
             }
 
-            const tocRaw = { totalFiles: files.length, totalLines, totalFunctions, totalClasses, totalState, byFile };
+            // Convert glob toc to shared formatter format
+            const toc = {
+                totals: { files: files.length, lines: totalLines, functions: totalFunctions, classes: totalClasses, state: totalState },
+                files: byFile.map(f => ({
+                    file: f.file,
+                    lines: f.lines,
+                    functions: f.functions.length,
+                    classes: f.classes.length,
+                    state: f.stateObjects ? f.stateObjects.length : (f.state ? f.state.length : 0)
+                })),
+                meta: {}
+            };
             if (flags.json) {
-                console.log(output.formatTocJson(tocRaw));
+                console.log(output.formatTocJson(toc));
             } else {
-                // Convert glob toc to shared formatter format
-                const toc = {
-                    totals: { files: files.length, lines: totalLines, functions: totalFunctions, classes: totalClasses, state: totalState },
-                    files: byFile.map(f => ({
-                        file: f.file,
-                        lines: f.lines,
-                        functions: f.functions.length,
-                        classes: f.classes.length,
-                        state: f.stateObjects ? f.stateObjects.length : (f.state ? f.state.length : 0)
-                    })),
-                    meta: {}
-                };
                 console.log(output.formatToc(toc, {
                     detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol'
                 }));
@@ -1945,17 +1944,17 @@ function parseInteractiveFlags(tokens) {
         caseSensitive: tokens.includes('--case-sensitive'),
         withTypes: tokens.includes('--with-types'),
         expand: tokens.includes('--expand'),
-        depth: tokens.find(a => a.startsWith('--depth='))?.split('=').slice(1).join('=') || null,
-        top: parseInt(tokens.find(a => a.startsWith('--top='))?.split('=').slice(1).join('=') || '0'),
-        context: parseInt(tokens.find(a => a.startsWith('--context='))?.split('=').slice(1).join('=') || '0'),
-        direction: tokens.find(a => a.startsWith('--direction='))?.split('=').slice(1).join('=') || null,
+        depth: getValueFlag('--depth'),
+        top: parseInt(getValueFlag('--top') || '0'),
+        context: parseInt(getValueFlag('--context') || '0'),
+        direction: getValueFlag('--direction'),
         addParam: getValueFlag('--add-param'),
         removeParam: getValueFlag('--remove-param'),
         renameTo: getValueFlag('--rename-to'),
         defaultValue: getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged'),
-        maxLines: parseInt(tokens.find(a => a.startsWith('--max-lines='))?.split('=').slice(1).join('=') || '0') || null,
+        maxLines: parseInt(getValueFlag('--max-lines') || '0') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions'),
     };

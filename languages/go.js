@@ -657,7 +657,7 @@ function findExportsInCode(code, parser) {
                         exports.push({
                             name: nameNode.text,
                             type: 'type',
-                            line: node.startPosition.row + 1
+                            line: spec.startPosition.row + 1
                         });
                     }
                 }
@@ -675,7 +675,7 @@ function findExportsInCode(code, parser) {
                         exports.push({
                             name: nameNode.text,
                             type: node.type === 'const_declaration' ? 'const' : 'var',
-                            line: node.startPosition.row + 1
+                            line: spec.startPosition.row + 1
                         });
                     }
                 }
