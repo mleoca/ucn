@@ -1329,7 +1329,7 @@ function formatAboutJson(about) {
  * Format example result as text
  */
 function formatExample(result, name) {
-    if (!result) return `No call examples found for "${name}"`;
+    if (!result || !result.best) return `No call examples found for "${name}"`;
 
     const best = result.best;
     const lines = [];
@@ -1640,7 +1640,7 @@ function formatContext(ctx, options = {}) {
         }
     }
 
-    if (ctx.meta && !ctx.meta.includeMethods) {
+    if (ctx.meta && ctx.meta.includeMethods === false) {
         lines.push(`  ${methodsHint}`);
     }
 
@@ -2097,12 +2097,12 @@ function formatDiffImpact(result) {
     lines.push(`Diff Impact Analysis (vs ${result.base})`);
     lines.push('═'.repeat(60));
 
-    const s = result.summary;
+    const s = result.summary || {};
     const parts = [];
     if (s.modifiedFunctions > 0) parts.push(`${s.modifiedFunctions} modified`);
     if (s.deletedFunctions > 0) parts.push(`${s.deletedFunctions} deleted`);
     if (s.newFunctions > 0) parts.push(`${s.newFunctions} new`);
-    parts.push(`${s.totalCallSites} call sites across ${s.affectedFiles} files`);
+    parts.push(`${s.totalCallSites || 0} call sites across ${s.affectedFiles || 0} files`);
     lines.push(parts.join(', '));
     lines.push('');
 

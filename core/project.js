@@ -2299,16 +2299,30 @@ class ProjectIndex {
             const content = this._readFile(normalizedPath);
             const { imports: rawImports } = extractImports(content, fileEntry.language);
 
+            const contentLines = content.split('\n');
+
             return rawImports.map(imp => {
+                // Skip imports with null module (e.g. Rust include! with dynamic path)
+                if (!imp.module) {
+                    return {
+                        module: null,
+                        names: imp.names,
+                        type: imp.type,
+                        resolved: null,
+                        isExternal: false,
+                        isDynamic: true,
+                        line: null
+                    };
+                }
+
                 // Dynamic imports with variable path (e.g. require(varName), import(varExpr)) can't be resolved.
                 // Only JS/TS require()/import() with dynamic=true has unresolvable paths.
                 // Go side-effect/dot imports and Rust glob uses also set dynamic=true but have valid module paths.
                 const isUnresolvableDynamic = imp.dynamic && (imp.type === 'require' || imp.type === 'dynamic');
                 if (isUnresolvableDynamic) {
-                    const lines = content.split('\n');
                     let line = null;
-                    for (let i = 0; i < lines.length; i++) {
-                        if (lines[i].includes(imp.module || 'require')) {
+                    for (let i = 0; i < contentLines.length; i++) {
+                        if (contentLines[i].includes(imp.module || 'require')) {
                             line = i + 1;
                             break;
                         }
@@ -2337,10 +2351,9 @@ class ProjectIndex {
                 }
 
                 // Find line number of import
-                const lines = content.split('\n');
                 let line = null;
-                for (let i = 0; i < lines.length; i++) {
-                    if (lines[i].includes(imp.module)) {
+                for (let i = 0; i < contentLines.length; i++) {
+                    if (contentLines[i].includes(imp.module)) {
                         line = i + 1;
                         break;
                     }
@@ -4682,7 +4695,8 @@ class ProjectIndex {
             const functions = [];
             for (const [name, symbols] of this.symbols) {
                 for (const sym of symbols) {
-                    if (sym.type === 'function' || sym.params !== undefined) {
+                    if (sym.type === 'function' || sym.type === 'method' || sym.type === 'static' ||
+                        sym.type === 'constructor' || sym.type === 'public' || sym.type === 'abstract') {
                         const lineCount = sym.endLine - sym.startLine + 1;
                         const relativePath = sym.relativePath || (sym.file ? path.relative(this.root, sym.file) : '');
                         functions.push({
@@ -4715,7 +4729,8 @@ class ProjectIndex {
 
         for (const [filePath, fileEntry] of this.files) {
             let functions = fileEntry.symbols.filter(s =>
-                s.type === 'function' || s.type === 'method' || s.type === 'static' || s.type === 'constructor'
+                s.type === 'function' || s.type === 'method' || s.type === 'static' ||
+                s.type === 'constructor' || s.type === 'public' || s.type === 'abstract'
             );
             const classes = fileEntry.symbols.filter(s =>
                 ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'impl'].includes(s.type)

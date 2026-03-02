@@ -69,7 +69,7 @@ function extractAttributes(node, code) {
     const startLine = node.startPosition.row;
     for (let i = startLine - 1; i >= 0 && i >= startLine - 5; i--) {
         const line = lines[i]?.trim();
-        if (!line) continue;
+        if (!line) break;
         if (line.startsWith('#[')) {
             // Extract attribute name (e.g., #[test] -> test, #[tokio::main] -> tokio::main)
             const match = line.match(/#\[([^\]]+)\]/);

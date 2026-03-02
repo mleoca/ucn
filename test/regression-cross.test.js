@@ -15,7 +15,7 @@ const { parse, parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob } = require('../core/discovery');
 const output = require('../core/output');
-const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PATH } = require('./helpers');
+const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PATH, runCli, runInteractive } = require('./helpers');
 
 // ============================================================================
 // STATS SYMBOL COUNT CONSISTENCY
@@ -4845,6 +4845,286 @@ function caller() { const f = new Foo(); f.bar(); }
         // Both should not error
         assert.ok(!resultTrue.includes('Unknown flag'), 'should accept --include-methods=true');
         assert.ok(!resultFalse.includes('Unknown flag'), 'should accept --include-methods=false');
+        rm(dir);
+    });
+});
+
+// ============================================================================
+// BUG HUNT: REGRESSION TESTS (2026-03-02)
+// ============================================================================
+
+describe('Bug Hunt: imports() null module crash', () => {
+    it('should not crash when import has null module (Rust include! macro)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'src/main.rs': `
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+
+fn main() {
+    println!("hello");
+}
+`
+        });
+        const index = idx(dir);
+        // This should not throw
+        const result = index.imports('src/main.rs');
+        assert.ok(Array.isArray(result), 'should return an array');
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: getToc Java function count', () => {
+    it('should count public and abstract methods in Java function totals', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'src/Service.java': `
+package com.example;
+
+public abstract class Service {
+    public void handleRequest() {
+        System.out.println("handling");
+    }
+
+    public abstract void processData();
+
+    private void helper() {
+        System.out.println("helper");
+    }
+}
+`
+        });
+        const index = idx(dir);
+        const toc = index.getToc();
+        // Should count all methods: handleRequest (public), processData (abstract), helper (method)
+        assert.ok(toc.totals.functions >= 3,
+            `should count public/abstract methods, got ${toc.totals.functions}`);
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: getStats --functions filter consistency', () => {
+    it('should use same callable types as getToc for --functions', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'src/App.java': `
+package com.example;
+
+public class App {
+    public void serve() {
+        System.out.println("serving");
+    }
+
+    public static void main(String[] args) {
+        new App().serve();
+    }
+}
+`
+        });
+        const index = idx(dir);
+        const stats = index.getStats({ functions: true });
+        const toc = index.getToc();
+        // stats --functions should include the same callable symbols as toc
+        assert.ok(stats.functions.length >= toc.totals.functions,
+            `stats functions (${stats.functions.length}) should be >= toc functions (${toc.totals.functions})`);
+        // Class symbols should NOT appear in functions list
+        const classEntries = stats.functions.filter(f => f.name === 'App');
+        assert.strictEqual(classEntries.length, 0,
+            'class symbols should not appear in --functions output');
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: Go grouped declaration export line numbers', () => {
+    it('should report correct line numbers for grouped type declarations via findExportsInCode', () => {
+        const { findExportsInCode } = require('../languages/go');
+        const { getParser } = require('../languages');
+        const code = `package main
+
+type (
+    Foo struct{}
+    Bar struct{}
+    Baz interface{}
+)
+
+func main() {}
+`;
+        const parser = getParser('go');
+        const exports = findExportsInCode(code, parser);
+        const fooExport = exports.find(e => e.name === 'Foo');
+        const barExport = exports.find(e => e.name === 'Bar');
+        const bazExport = exports.find(e => e.name === 'Baz');
+        // Each should have its own line, not the group declaration line
+        assert.ok(fooExport, 'Foo should be exported');
+        assert.ok(barExport, 'Bar should be exported');
+        assert.ok(bazExport, 'Baz should be exported');
+        assert.notStrictEqual(fooExport.line, barExport.line,
+            `Foo (line ${fooExport.line}) and Bar (line ${barExport.line}) should have different line numbers`);
+    });
+
+    it('should report correct line numbers for grouped const declarations via findExportsInCode', () => {
+        const { findExportsInCode } = require('../languages/go');
+        const { getParser } = require('../languages');
+        const code = `package main
+
+const (
+    MaxSize = 100
+    MinSize = 10
+)
+
+func main() {}
+`;
+        const parser = getParser('go');
+        const exports = findExportsInCode(code, parser);
+        const maxExport = exports.find(e => e.name === 'MaxSize');
+        const minExport = exports.find(e => e.name === 'MinSize');
+        assert.ok(maxExport, 'MaxSize should be exported');
+        assert.ok(minExport, 'MinSize should be exported');
+        assert.notStrictEqual(maxExport.line, minExport.line,
+            `MaxSize (line ${maxExport.line}) and MinSize (line ${minExport.line}) should have different line numbers`);
+    });
+});
+
+describe('Bug Hunt: Rust extractAttributes blank line handling', () => {
+    it('should not pick up attributes from a previous item across blank lines', () => {
+        const { parse } = require('../core/parser');
+        const code = `
+#[test]
+fn test_foo() {
+    assert!(true);
+}
+
+fn regular_function() {
+    println!("not a test");
+}
+`;
+        const result = parse(code, 'rust');
+        const regular = result.functions.find(f => f.name === 'regular_function');
+        assert.ok(regular, 'regular_function should be found');
+        // regular_function should NOT have #[test] attribute
+        assert.ok(!regular.decorators || !regular.decorators.includes('test'),
+            `regular_function should not have #[test] attribute, got: ${JSON.stringify(regular.decorators)}`);
+    });
+});
+
+describe('Bug Hunt: --stack flag accepted in CLI', () => {
+    it('should accept --stack flag without error', () => {
+        const result = runCli('.', 'stacktrace', ['test trace'], ['--stack=Error at line 1']);
+        assert.ok(!result.includes('Unknown flag'), `--stack should be a known flag, got: ${result.substring(0, 200)}`);
+    });
+});
+
+describe('Bug Hunt: glob mode toc --json output', () => {
+    it('should produce valid JSON with totals and files fields', () => {
+        const { execFileSync } = require('child_process');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/a.js': 'function foo() { return 1; }\nfunction bar() { return 2; }',
+            'src/b.js': 'function baz() { return 3; }'
+        });
+        // Glob pattern needs to be passed as a single positional arg (no shell expansion)
+        const globPattern = path.join(dir, 'src', '*.js');
+        let result;
+        try {
+            result = execFileSync('node', [CLI_PATH, globPattern, 'toc', '--json'], {
+                timeout: 30000,
+                encoding: 'utf-8'
+            });
+        } catch (e) {
+            result = (e.stdout || '') + (e.stderr || '');
+        }
+        let parsed;
+        try {
+            parsed = JSON.parse(result.trim());
+        } catch (e) {
+            assert.fail(`glob toc --json should produce valid JSON, got: ${result.substring(0, 300)}`);
+        }
+        assert.ok(parsed.totals, 'JSON should have totals field');
+        assert.ok(parsed.totals.files >= 2, `should have at least 2 files, got ${parsed.totals.files}`);
+        assert.ok(parsed.totals.functions >= 3, `should have at least 3 functions, got ${parsed.totals.functions}`);
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: formatContext method exclusion hint', () => {
+    it('should not show method exclusion hint when includeMethods is undefined', () => {
+        const ctx = {
+            name: 'testFn',
+            type: 'function',
+            file: 'test.js',
+            startLine: 1,
+            endLine: 5,
+            callers: [],
+            callees: [],
+            meta: { dynamicImports: 0, uncertain: 0 },
+            warnings: []
+        };
+        const { text } = output.formatContext(ctx);
+        assert.ok(!text.includes('obj.method()'),
+            'should not show method exclusion hint when includeMethods is not set');
+    });
+
+    it('should show method exclusion hint when includeMethods is explicitly false', () => {
+        const ctx = {
+            name: 'testFn',
+            type: 'function',
+            file: 'test.js',
+            startLine: 1,
+            endLine: 5,
+            callers: [],
+            callees: [],
+            meta: { dynamicImports: 0, uncertain: 0, includeMethods: false },
+            warnings: []
+        };
+        const { text } = output.formatContext(ctx);
+        assert.ok(text.includes('obj.method()'),
+            'should show method exclusion hint when includeMethods is false');
+    });
+});
+
+describe('Bug Hunt: formatExample null best guard', () => {
+    it('should not crash when result.best is null', () => {
+        const result = output.formatExample({ best: null }, 'testFn');
+        assert.ok(result.includes('No call examples found'), 'should return not-found message');
+    });
+
+    it('should not crash when result.best is undefined', () => {
+        const result = output.formatExample({}, 'testFn');
+        assert.ok(result.includes('No call examples found'), 'should return not-found message');
+    });
+});
+
+describe('Bug Hunt: interactive mode space-separated value flags', () => {
+    it('should handle --depth with space-separated value', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/a.js': `
+function root() { child(); }
+function child() { leaf(); }
+function leaf() { return 1; }
+`
+        });
+        const result = runInteractive(dir, ['trace root --depth 2']);
+        // Should show at least child as a callee (depth > 0)
+        assert.ok(result.includes('child') || result.includes('leaf'),
+            `--depth 2 should expand trace tree, got:\n${result.substring(0, 500)}`);
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: imports content.split performance', () => {
+    it('should not crash with many imports (regression for content.split optimization)', () => {
+        const imports = Array.from({length: 50}, (_, i) =>
+            `const m${i} = require('./mod${i}');`
+        ).join('\n');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'index.js': imports + '\nfunction main() {}\n',
+        });
+        const index = idx(dir);
+        // Should not crash or timeout
+        const result = index.imports('index.js');
+        assert.ok(Array.isArray(result), 'should return imports array');
+        assert.ok(result.length >= 50, `should have at least 50 imports, got ${result.length}`);
         rm(dir);
     });
 });
