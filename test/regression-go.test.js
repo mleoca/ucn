@@ -610,3 +610,121 @@ describe('Bug Hunt: Go raw string literal imports', () => {
         assert.strictEqual(imports[0].module, 'fmt');
     });
 });
+
+// ============================================================================
+// FIX #116: Go extractReceiver wrong for unnamed and generic receivers
+// ============================================================================
+
+describe('Bug Hunt: Go unnamed and generic receivers', () => {
+    it('should extract correct receiver for unnamed receiver', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+func (Router) Handle() {}
+func (r Router) Get() {}
+`;
+        const fns = goMod.findFunctions(code, parser);
+        const handle = fns.find(f => f.name === 'Handle');
+        const get = fns.find(f => f.name === 'Get');
+        assert.ok(handle, 'Handle should be found');
+        assert.ok(get, 'Get should be found');
+        assert.strictEqual(handle.receiver, 'Router', 'unnamed receiver should be Router');
+        assert.strictEqual(get.receiver, 'Router', 'named receiver should be Router');
+    });
+
+    it('should extract correct receiver for pointer unnamed receiver', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+func (*Router) Handle() {}
+`;
+        const fns = goMod.findFunctions(code, parser);
+        const handle = fns.find(f => f.name === 'Handle');
+        assert.ok(handle, 'Handle should be found');
+        assert.strictEqual(handle.receiver, '*Router', 'unnamed pointer receiver should be *Router');
+    });
+
+    it('should extract correct receiver for generic receiver', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+func (r *Router[T]) Post() {}
+func (r Cache[K, V]) Get() {}
+`;
+        const fns = goMod.findFunctions(code, parser);
+        const post = fns.find(f => f.name === 'Post');
+        const get = fns.find(f => f.name === 'Get');
+        assert.ok(post, 'Post should be found');
+        assert.ok(get, 'Get should be found');
+        assert.ok(post.receiver.includes('Router'), 'generic pointer receiver should include Router');
+        assert.ok(get.receiver.includes('Cache'), 'generic receiver should include Cache');
+    });
+
+    it('should associate unnamed receiver methods with their struct', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-unnamed-recv-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module example.com/test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+type Router struct{}
+
+func (Router) Handle() {}
+func (r Router) Get() {}
+`);
+            const index = idx(tmpDir);
+            const methods = index.findMethodsForType('Router');
+            const names = methods.map(m => m.name);
+            assert.ok(names.includes('Handle'), 'Handle should be a method of Router');
+            assert.ok(names.includes('Get'), 'Get should be a method of Router');
+        } finally {
+            rm(tmpDir);
+        }
+    });
+});
+
+// ============================================================================
+// FIX #117: Go var-declaration closures not tracked
+// ============================================================================
+
+describe('Bug Hunt: Go var-declared closures tracked', () => {
+    it('should filter var-declared closure calls from callees', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+
+func outer() {
+    var handler = func() {
+        doWork()
+    }
+    handler()
+}
+`;
+        const result = goMod.findCallsInCode(code, parser);
+        const callNames = result.map(c => c.name);
+        assert.ok(callNames.includes('doWork'), 'doWork should be in calls');
+        assert.ok(!callNames.includes('handler'), 'handler should be filtered as local closure');
+    });
+
+    it('should filter short-var closures the same as var closures', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+
+func outer() {
+    handler := func() {
+        doWork()
+    }
+    handler()
+}
+`;
+        const result = goMod.findCallsInCode(code, parser);
+        const callNames = result.map(c => c.name);
+        assert.ok(callNames.includes('doWork'), 'doWork should be in calls');
+        assert.ok(!callNames.includes('handler'), 'handler should be filtered as local closure');
+    });
+});

@@ -768,7 +768,22 @@ function findImportsInCode(code, parser) {
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
 
-                if (child.type === 'scoped_identifier' || child.type === 'identifier') {
+                if (child.type === 'use_as_clause') {
+                    // use foo::bar as baz
+                    const pathNode = child.namedChild(0); // the original path
+                    const aliasNode = child.childForFieldName('alias');
+                    if (pathNode) {
+                        const originalPath = pathNode.text;
+                        const alias = aliasNode ? aliasNode.text : originalPath.split('::').pop();
+                        imports.push({
+                            module: originalPath,
+                            names: [alias],
+                            type: 'use',
+                            dynamic: false,
+                            line
+                        });
+                    }
+                } else if (child.type === 'scoped_identifier' || child.type === 'identifier') {
                     // use std::io or use foo
                     const path = child.text;
                     const segments = path.split('::');
@@ -805,8 +820,11 @@ function findImportsInCode(code, parser) {
                             if (item.type === 'identifier') {
                                 names.push(item.text);
                             } else if (item.type === 'use_as_clause') {
-                                const nameNode = item.namedChild(0);
-                                if (nameNode) names.push(nameNode.text);
+                                const aliasNode = item.childForFieldName('alias');
+                                const pathItem = item.namedChild(0);
+                                names.push(aliasNode ? aliasNode.text : (pathItem ? pathItem.text : item.text));
+                            } else if (item.type === 'scoped_identifier') {
+                                names.push(item.text);
                             }
                         }
                         imports.push({

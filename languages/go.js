@@ -45,8 +45,13 @@ function extractGoParams(paramsNode) {
 function extractReceiver(receiverNode) {
     if (!receiverNode) return null;
     const text = receiverNode.text;
-    const match = text.match(/\(\s*\w*\s*(\*?\w+)\s*\)/);
-    return match ? match[1] : text.replace(/^\(|\)$/g, '').trim();
+    // Match named receiver: (r *Router) or (r Router[T])
+    const namedMatch = text.match(/\(\s*\w+\s+(\*?\w+(?:\[[\w,\s]+\])?)\s*\)/);
+    if (namedMatch) return namedMatch[1];
+    // Match unnamed receiver: (Router) or (*Router) or (Router[T])
+    const unnamedMatch = text.match(/\(\s*(\*?\w+(?:\[[\w,\s]+\])?)\s*\)/);
+    if (unnamedMatch) return unnamedMatch[1];
+    return text.replace(/^\(|\)$/g, '').trim();
 }
 
 /**
@@ -454,7 +459,7 @@ function findCallsInCode(code, parser) {
             });
         }
 
-        // Track local closures: atoi := func(...) { ... }
+        // Track local closures: atoi := func(...) { ... } or var handler = func(...) { ... }
         if (node.type === 'short_var_declaration' || node.type === 'var_declaration') {
             // Check if RHS contains a func_literal
             const hasFunc = (n) => {
@@ -467,17 +472,31 @@ function findCallsInCode(code, parser) {
             };
             if (hasFunc(node)) {
                 // Extract the variable name from the LHS
-                const left = node.childForFieldName('left');
-                if (left) {
-                    const names = left.type === 'expression_list'
-                        ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
-                              .filter(n => n.type === 'identifier').map(n => n.text)
-                        : left.type === 'identifier' ? [left.text] : [];
-                    if (names.length > 0 && functionStack.length > 0) {
-                        const scopeKey = functionStack[functionStack.length - 1].startLine;
-                        if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Set());
-                        for (const n of names) closureScopes.get(scopeKey).add(n);
+                let names = [];
+                if (node.type === 'short_var_declaration') {
+                    const left = node.childForFieldName('left');
+                    if (left) {
+                        names = left.type === 'expression_list'
+                            ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
+                                  .filter(n => n.type === 'identifier').map(n => n.text)
+                            : left.type === 'identifier' ? [left.text] : [];
                     }
+                } else {
+                    // var_declaration > var_spec > name (identifier)
+                    for (let i = 0; i < node.namedChildCount; i++) {
+                        const spec = node.namedChild(i);
+                        if (spec.type === 'var_spec') {
+                            const nameNode = spec.childForFieldName('name');
+                            if (nameNode && nameNode.type === 'identifier') {
+                                names.push(nameNode.text);
+                            }
+                        }
+                    }
+                }
+                if (names.length > 0 && functionStack.length > 0) {
+                    const scopeKey = functionStack[functionStack.length - 1].startLine;
+                    if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Set());
+                    for (const n of names) closureScopes.get(scopeKey).add(n);
                 }
             }
         }
