@@ -1,403 +1,109 @@
-# UCN - Universal Code Navigator
+# UCN — Universal Code Navigator
 
-UCN gives AI agents call-graph-level understanding of code. Instead of reading entire files, agents ask structural questions like: "who calls this function", "what breaks if I change it", "what's unused", and get precise, AST-verified answers. UCN parses JS/TS, Python, Go, Rust, Java, and HTML inline scripts with tree-sitter, then exposes 28 navigation commands as a CLI tool, MCP server, or agent skill.
+AST-powered code intelligence from the terminal.
 
-Designed for large codebases where agents waste context on reading large files. UCN's surgical output means agents spend tokens on reasoning, not on ingesting thousands of lines to find three callers, discourages agents from cutting corners, as without UCN, agents working with large codebases tend to skip parts of the code structure, assuming they have "enough data".
+UCN answers structural code questions instantly:
+- Who calls this function?
+- What breaks if I change this signature?
+- What changed in this diff, and who depends on it?
+- What code is safe to delete?
 
-Everything runs locally on your machine and nothing leaves your project.
-The ucn mcp is kept light, as all 28 commands ship as a single MCP tool, under 2k tokens total.
+Instead of reading full files, UCN gives precise, AST-verified answers.
 
----
-
-## What UCN does
-
-Precise answers without reading files.
-
-```
-  TASK                                    COMMAND
-  ─────────────────────                   ─────────────────────
-
-  Pull one function from                  $ ucn fn handleRequest
-  a 2000-line file                        → 20 lines, just that function
-
-  Who calls this? Will they               $ ucn impact handleRequest
-  break if I change it?                   → 8 call sites, with arguments
-
-  What happens when                       $ ucn trace main --depth=3
-  main() runs?                            → full call tree, no file reads
-
-  What can I safely delete?               $ ucn deadcode
-                                          → unused functions, AST-verified
-
-  What depends on this file               $ ucn graph src/routes.ts
-  before I move it?                       → imports and importers tree
-```
+[![npm](https://img.shields.io/npm/v/ucn)](https://www.npmjs.com/package/ucn)
+[![license](https://img.shields.io/npm/l/ucn)](LICENSE)
 
 ---
 
-## Three Ways to it: ucn mcp, ucn skill, ucn cli
-
-```
-  ┌──────────────────────────────────────────────────────────────────────┐
-  │                                                                      │
-  │   1. CLI                    Use it directly from the terminal.       │
-  │      $ ucn about myFunc     Works standalone, no agent required.     │
-  │                                                                      │
-  │   2. MCP Server             Any MCP-compatible AI agent connects     │
-  │      $ ucn --mcp            and gets 28 commands automatically.      │
-  │                                                                      │
-  │   3. Agent Skill            Drop-in skill for Claude Code and        │
-  │      /ucn about myFunc      OpenAI Codex CLI. No server needed.      │
-  │                                                                      │
-  └──────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## How agents understand code today
-
-AI agents working with code typically do this:
-
-```
-  grep "functionName"      →  47 matches, 23 files
-       │
-       ▼
-  read file1.ts            →  2000 lines... wrong function
-       │
-       ▼
-  read file2.ts            →  1500 lines... still not it
-       │
-       ▼
-  read file3.ts            →  found it, finally
-       │
-       ▼
-  grep "whoCallsThis"      →  start over
-       │
-       ▼
-  ┌─────────────────────────────────────────┐
-  │  Half the context window is gone.       │
-  │  The agent hasn't changed a single line.│
-  └─────────────────────────────────────────┘
-```
-
----
-
-## How UCN works: tree-sitter, locally
-
-```
-  ┌──────────────────────────────────────────────┐
-  │              Any AI Agent                    │
-  │  Claude Code · Cursor · Windsurf · Copilot   │
-  └───────────────────────┬──────────────────────┘
-                          │
-                         MCP
-                          │
-                          ▼
-                 ┌───────────────────┐
-                 │   UCN MCP Server  │
-                 │   28 commands     │
-                 │   runs locally    │
-                 └────────┬──────────┘
-                          │
-                    tree-sitter AST
-                          │
-        ┌─────────────────┴───────────────────┐
-        │          Supported Languages        │
-        │ JS/TS, Python, Go, Rust, Java, HTML │
-        └─────────────────────────────────────┘
-```
-
----
-
-## Before and after UCN
-
-```
-  WITHOUT UCN                              WITH UCN
-  ──────────────────────                   ──────────────────────
-
-  grep "processOrder"                      ucn impact "processOrder"
-       │                                        │
-       ▼                                        ▼
-  34 matches, mostly noise                 8 call sites, grouped by file,
-       │                                   with actual arguments passed
-       ▼                                        │
-  read service.ts  (800 lines)                  │
-       │                                        │
-       ▼                                        │
-  read handler.ts  (600 lines)             ucn smart "processOrder"
-       │                                        │
-       ▼                                        ▼
-  read batch.ts    (400 lines)             function + all dependencies
-       │                                   expanded inline
-       ▼                                        │
-  read orders.test (500 lines)                  │
-       │                                        ▼
-       ▼                                   Done. Full picture.
-  grep "import.*processOrder"              Ready to make the change.
-       │
-       ▼
-  read routes.ts   (300 lines)
-       │
-       ▼
-  ... still not sure about full impact
-
-
-  8+ tool calls                            2 tool calls
-  Reads thousands of lines                 Reads zero full files
-  Context spent on file contents           Context spent on reasoning
-```
-
-After editing code, before committing:
-
-```
-  WITHOUT UCN                              WITH UCN
-  ──────────────────────                   ──────────────────────
-
-  git diff                                 ucn diff_impact
-       │                                        │
-       ▼                                        ▼
-  see changed lines, but which             13 modified functions
-  functions do they belong to?             8 new functions
-       │                                   22 call sites across 9 files
-       ▼                                        │
-  read each file to map hunks                   ▼
-  to function boundaries                   Each function shown with:
-       │                                     • which lines changed
-       ▼                                     • every downstream caller
-  ucn impact on each function                • caller context
-  you identified (repeat 5-10x)                 │
-       │                                        ▼
-       ▼                                   Done. Full blast radius.
-  hope you didn't miss one                 One command.
-
-
-  10+ tool calls                            1 tool call
-```
-
----
-
-## Text search vs AST
-
-```
-  Code: processOrder(items, user)
-
-
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  grep "processOrder"                                            │
-  │                                                                 │
-  │    ✓  processOrder(items, user)          ← the actual call      │
-  │    ✗  // TODO: refactor processOrder     ← comment, not a call  │
-  │    ✗  const processOrder = "label"       ← string, not a call   │
-  │    ✗  order.processOrder()               ← different class      │
-  │    ✗  import { processOrder }            ← import, not a call   │
-  │                                                                 │
-  │  5 results. 1 is what you wanted.                               │
-  └─────────────────────────────────────────────────────────────────┘
-
-
-  ┌─────────────────────────────────────────────────────────────────┐
-  │  ucn context "processOrder"                                     │
-  │                                                                 │
-  │    Callers:                                                     │
-  │      handleCheckout    src/api/checkout.ts:45                   │
-  │      batchProcess      src/workers/batch.ts:12                  │
-  │      runDailyOrders    src/jobs/daily.ts:88                     │
-  │                                                                 │
-  │    Callees:                                                     │
-  │      validateItems     src/orders/validate.ts:20                │
-  │      calculateTotal    src/orders/pricing.ts:55                 │
-  │      saveOrder         src/db/orders.ts:30                      │
-  │                                                                 │
-  │  3 callers, 3 callees. Verified from the AST.                   │
-  └─────────────────────────────────────────────────────────────────┘
-```
-
-The tradeoff: text search works on any language and any text. UCN only works on 5 languages + HTML, but gives structural understanding within those.
-
----
-
-## UCN commands in action
-
-Extract a function from a large file without reading it:
-
-```
-$ ucn fn expandGlob
-
-core/discovery.js:135
-[ 135- 166] expandGlob(pattern, options = {})
-────────────────────────────────────────────────────────────
-function expandGlob(pattern, options = {}) {
-    const root = path.resolve(options.root || process.cwd());
-    const ignores = options.ignores || DEFAULT_IGNORES;
-    ...
-    return files.sort(compareNames);
-}
-```
-
-See who calls it and what it calls:
-
-```
-$ ucn context expandGlob
-
-Context for expandGlob:
-════════════════════════════════════════════════════════════
-
-CALLERS (7):
-  [1] cli/index.js:1847 [runGlobCommand]
-    const files = expandGlob(pattern);
-  [2] core/project.js:81
-    const files = expandGlob(pattern, {
-  [3] core/project.js:3434
-    const currentFiles = expandGlob(pattern, { root: this.root });
-  ...
-
-CALLEES (2):
-  [8] parseGlobPattern [utility] - core/discovery.js:171
-  [9] walkDir [utility] - core/discovery.js:227
-```
-
-See what breaks if you change it:
-
-```
-$ ucn impact shouldIgnore
-
-Impact analysis for shouldIgnore
-════════════════════════════════════════════════════════════
-core/discovery.js:289
-shouldIgnore (name, ignores, parentDir)
-
-CALL SITES: 2
-  Files affected: 1
-
-BY FILE:
-
-core/discovery.js (2 calls)
-  :255 [walkDir]
-    if (shouldIgnore(entry.name, options.ignores, dir)) continue;
-    args: entry.name, options.ignores, dir
-  :373 [detectProjectPattern]
-    !shouldIgnore(entry.name, DEFAULT_IGNORES)) {
-    args: entry.name, DEFAULT_IGNORES
-```
-
-Get a function with all its dependencies inline:
-
-```
-$ ucn smart shouldIgnore
-
-shouldIgnore (core/discovery.js:289)
-════════════════════════════════════════════════════════════
-function shouldIgnore(name, ignores, parentDir) {
-    for (const pattern of ignores) {
-        if (pattern.includes('*')) {
-            const regex = globToRegex(pattern);
-            ...
-        }
-    }
-    ...
-}
-
-─── DEPENDENCIES ───
-
-// globToRegex [utility] (core/discovery.js:208)
-function globToRegex(glob) {
-    let regex = glob.replace(/[.+^$[\]\\]/g, '\\$&');
-    ...
-    return new RegExp('^' + regex + '$');
-}
-```
-
-Trace the call tree:
-
-```
-$ ucn trace expandGlob --depth=2
-
-Call tree for expandGlob
-════════════════════════════════════════════════════════════
-
-expandGlob
-├── parseGlobPattern (core/discovery.js:171) [utility] 1x
-│   └── globToRegex (core/discovery.js:208) [utility] 1x
-└── walkDir (core/discovery.js:227) [utility] 1x
-    └── shouldIgnore (core/discovery.js:289) [utility] 1x
-```
-
-See the impact of your recent edits:
-
-```
-$ ucn diff-impact --base=HEAD~1
-
-Diff Impact Analysis (vs HEAD~1)
-════════════════════════════════════════════════════════════
-3 modified, 1 new, 12 call sites across 4 files
-
-MODIFIED FUNCTIONS:
-
-  processOrder
-  src/orders/service.ts:45
-  processOrder (items: Item[], user: User): Promise<Order>
-  Lines added: 48-52
-  Lines deleted: 49
-  Callers (3):
-    src/api/checkout.ts:89 [handleCheckout]
-      await processOrder(cart.items, req.user)
-    src/workers/batch.ts:12 [batchProcess]
-      processOrder(order.items, systemUser)
-    src/jobs/daily.ts:88 [runDailyOrders]
-      results.push(await processOrder(items, admin))
-
-  validateItems
-  src/orders/validate.ts:20
-  validateItems (items: Item[]): ValidationResult
-  Lines added: 25-30
-  Callers (2):
-    src/orders/service.ts:46 [processOrder]
-      const valid = validateItems(items)
-    src/api/admin.ts:55 [bulkValidate]
-      return items.map(i => validateItems([i]))
-
-NEW FUNCTIONS:
-  calculateShipping — src/orders/shipping.ts:10
-  calculateShipping (items: Item[], region: Region): number
-
-MODULE-LEVEL CHANGES:
-  src/orders/service.ts: +5 lines, -1 lines
-```
-
-Scoped to staged changes or a specific file:
-
-```
-$ ucn diff-impact --staged                 # Only what's staged for commit
-$ ucn diff-impact --base=main              # Everything since branching from main
-$ ucn diff-impact --file=src/orders        # Only changes in this path
-```
-
-Find unused code:
-
-```
-$ ucn deadcode
-
-Dead code: 15 unused symbol(s)
-
-cli/index.js
-  [1649-1654] extractFunctionNameFromContent (function)
-core/project.js
-  [1664-1694] findReExportsOf (method)
-  [1998-2020] withCompleteness (method)
-...
-```
-
----
-
-## Install
+## 60-Second Quickstart
 
 ```bash
 npm install -g ucn
+
+ucn about handleRequest       # full picture: definition, callers, callees, tests
+ucn impact handleRequest      # all call sites with arguments
+ucn trace main --depth=3      # call tree, no file reads
+ucn deadcode                  # unused functions, AST-verified
 ```
 
-### As an MCP Server
+Parses JS/TS, Python, Go, Rust, Java, and HTML with tree-sitter. Runs locally.
 
-One-line setup for supported clients:
+```
+  Terminal              AI Agents              Agent Skills
+       │                    │                       │
+      CLI                  MCP                    Skill
+       └────────────────────┼───────────────────────┘
+                            │
+                     ┌──────┴──────┐
+                     │ UCN Engine  │
+                     │ 28 commands │
+                     │ tree-sitter │
+                     └─────────────┘
+```
+
+---
+
+## Why UCN
+
+UCN uses tree-sitter to parse code into an AST, then builds a call graph and symbol table on top of it. Instead of matching text, it understands which functions call which, what depends on what, and what's unused. Everything runs locally.
+
+"What happens when `build()` runs?"
+
+```
+$ ucn trace build --depth=2
+
+build
+├── detectProjectPattern (discovery.js:392) 1x
+│   ├── checkDir (discovery.js:396) 2x
+│   └── shouldIgnore (discovery.js:340) 1x
+├── parseGitignore (discovery.js:123) 1x
+├── expandGlob (discovery.js:183) 1x
+│   ├── parseGlobPattern (discovery.js:219) 1x
+│   ├── walkDir (discovery.js:276) 1x
+│   └── compareNames (discovery.js:162) 1x
+├── indexFile (project.js:236) 1x
+│   ├── addSymbol (project.js:293) 4x
+│   ├── detectLanguage (languages/index.js:157) 1x
+│   ├── parseFile (parser.js:93) 1x
+│   └── extractImports (imports.js:19) 1x
+├── buildImportGraph (project.js:419) 1x
+└── buildInheritanceGraph (project.js:465) 1x
+```
+
+One command. No files opened. The full execution flow with every function located by file and line.
+
+---
+
+## What it does
+
+| Task | Command | Output |
+|------|---------|--------|
+| Understand one symbol deeply | `ucn about expandGlob` | Definition, callers, callees, tests |
+| Who calls this and what do they pass? | `ucn impact shouldIgnore` | Call sites with argument context |
+| Map an execution path | `ucn trace expandGlob --depth=2` | Call tree |
+| Extract just one function | `ucn fn expandGlob` | Surgical snippet, no file read |
+| Check all call sites match signature | `ucn verify expandGlob` | Mismatch/uncertain call sites |
+| Review branch impact | `ucn diff-impact --base=main` | Changed functions + downstream callers |
+| Find deletable code | `ucn deadcode` | Unused symbols, AST-verified |
+| Get function + helpers inline | `ucn smart shouldIgnore` | Source with dependencies expanded |
+
+---
+
+## Setup
+
+### CLI
+
+Already installed above. A few more examples:
+
+```bash
+ucn fn handleRequest --file api     # extract function from specific file
+ucn toc                             # project overview
+ucn --interactive                   # REPL mode, index stays in memory
+```
+
+### MCP Server (for AI agents)
+
+One-line setup:
 
 ```bash
 # Claude Code
@@ -410,7 +116,8 @@ codex mcp add ucn -- npx -y ucn --mcp
 code --add-mcp '{"name":"ucn","command":"npx","args":["-y","ucn","--mcp"]}'
 ```
 
-Or add to your client's MCP config file manually:
+<details>
+<summary>Or add to the MCP config file manually</summary>
 
 ```json
 {
@@ -423,8 +130,7 @@ Or add to your client's MCP config file manually:
 }
 ```
 
-<details>
-<summary>VS Code Copilot uses a slightly different format (.vscode/mcp.json)</summary>
+VS Code uses `.vscode/mcp.json`:
 
 ```json
 {
@@ -437,11 +143,14 @@ Or add to your client's MCP config file manually:
   }
 }
 ```
+
 </details>
 
-### As a Claude Code / Codex Skill
+All 28 commands ship as a single MCP tool, under 2KB of schema in the agent's context.
 
-When MCP server is not needed, drop it in as a native skill:
+### Agent Skill (no server needed)
+
+Drop-in for Claude Code or Codex CLI:
 
 ```bash
 # Claude Code
@@ -453,135 +162,155 @@ mkdir -p ~/.agents/skills
 cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
 ```
 
-### As a CLI Tool
+---
 
-Works standalone from the terminal — no agent required:
+## Examples
 
-```bash
-ucn toc                             # Project overview
-ucn about handleRequest             # Understand a function
-ucn impact handleRequest            # Before modifying
-ucn fn handleRequest --file api     # Extract specific function
-ucn --interactive                   # Multiple queries, index stays in memory
+**Extract a function** without reading the file:
+
+```
+$ ucn fn expandGlob
+
+core/discovery.js:183
+[ 183- 214] expandGlob(pattern, options = {})
+────────────────────────────────────────────────────────────
+function expandGlob(pattern, options = {}) {
+    const root = path.resolve(options.root || process.cwd());
+    const ignores = options.ignores || DEFAULT_IGNORES;
+    ...
+    return files.sort(compareNames);
+}
+```
+
+**See callers and callees:**
+
+```
+$ ucn context expandGlob
+
+CALLERS (7):
+  [1] cli/index.js:785 [runGlobCommand]
+    const files = expandGlob(pattern);
+  [2] core/cache.js:149 [isCacheStale]
+    const currentFiles = expandGlob(pattern, globOpts);
+  [3] core/project.js:171 [build]
+    const files = expandGlob(pattern, globOpts);
+  ...
+
+CALLEES (3):
+  [8] parseGlobPattern [utility] - core/discovery.js:219
+  [9] walkDir [utility] - core/discovery.js:276
+  [10] compareNames [utility] - core/discovery.js:162
+```
+
+**See impact of recent edits:**
+
+```
+$ ucn diff-impact --base=HEAD~1
+
+3 modified, 1 new, 12 call sites across 4 files
+
+MODIFIED FUNCTIONS:
+
+  processOrder
+  src/orders/service.ts:45
+  Lines added: 48-52, Lines deleted: 49
+  Callers (3):
+    src/api/checkout.ts:89 [handleCheckout]
+      await processOrder(cart.items, req.user)
+    src/workers/batch.ts:12 [batchProcess]
+      processOrder(order.items, systemUser)
+    src/jobs/daily.ts:88 [runDailyOrders]
+      results.push(await processOrder(items, admin))
+```
+
+**Trace a call tree:**
+
+```
+$ ucn trace expandGlob --depth=2
+
+expandGlob
+├── parseGlobPattern (core/discovery.js:219) [utility] 1x
+│   └── globToRegex (core/discovery.js:256) [utility] 1x
+├── walkDir (core/discovery.js:276) [utility] 1x
+│   ├── compareNames (core/discovery.js:162) [utility] 1x
+│   ├── shouldIgnore (core/discovery.js:340) [utility] 1x
+│   └── walkDir (core/discovery.js:276) [utility] 1x (see above)
+└── compareNames (core/discovery.js:162) [utility] 1x (see above)
+```
+
+**Find unused code:**
+
+```
+$ ucn deadcode --exclude=test
+
+Dead code: 1 unused symbol(s)
+
+core/discovery.js
+  [ 162- 166] legacyResolve (function)
 ```
 
 ---
 
-## UCN workflows
+## Workflows
 
-Investigating a bug:
 ```bash
-ucn about problematic_function            # Understand it fully
-ucn trace problematic_function --depth=2  # See what it calls
+# Investigating a bug
+ucn about buggyFunction                    # understand it fully
+ucn trace buggyFunction --depth=2          # see what it calls
+
+# Before modifying code
+ucn impact theFunction                     # who will break?
+ucn smart theFunction                      # function + its helpers inline
+# ... make changes ...
+ucn verify theFunction                     # do all call sites still match?
+
+# Before committing
+ucn diff-impact --staged                   # what I changed + who calls it
+
+# Cleanup
+ucn deadcode --exclude=test                # what can be deleted?
 ```
 
-Before modifying a function:
-```bash
-ucn impact the_function                   # Who will break?
-ucn smart the_function                    # See it + its helpers
-# ... make your changes ...
-ucn verify the_function                   # Did all call sites survive?
-```
+---
 
-Before committing:
-```bash
-ucn diff-impact                           # What did I change + who calls it?
-ucn diff-impact --base=main               # Full branch impact vs main
-ucn diff-impact --staged                  # Only staged changes
-```
+## All 28 commands
 
-Periodic cleanup:
-```bash
-ucn deadcode --exclude=test               # What can be deleted?
-ucn toc                                   # Project overview
+```
+  UNDERSTAND                          MODIFY SAFELY
+  ─────────────────────               ─────────────────────
+  about         full picture          impact          all call sites
+  context       callers + callees     diff-impact     git diff + callers
+  smart         function + helpers    verify          signature check
+  trace         call tree             plan            refactor preview
+
+  FIND & EXTRACT                      ARCHITECTURE
+  ─────────────────────               ─────────────────────
+  find          locate definitions    imports         file dependencies
+  usages        all occurrences       exporters       reverse dependencies
+  fn            extract function      graph           dependency tree
+  class         extract class         related         sibling functions
+  toc           project overview      tests           find test coverage
+  deadcode      unused code           stacktrace      error trace context
+  search        text search           api             public API surface
+  example       best usage example    typedef         type definitions
+  lines         extract line range    file-exports    file's exports
+  expand        drill into context    stats           project stats
 ```
 
 ---
 
 ## Limitations
 
-```
-  ┌──────────────────────────┬──────────────────────────────────────────┐
-  │  Limitation              │  What happens                            │
-  ├──────────────────────────┼──────────────────────────────────────────┤
-  │                          │                                          │
-  │  5 languages + HTML      │  JS/TS, Python, Go, Rust, Java.          │
-  │  (no C, Ruby, PHP, etc.) │  Agents fall back to text search for     │
-  │                          │  the rest. UCN complements, doesn't      │
-  │                          │  replace.                                │
-  │                          │                                          │
-  ├──────────────────────────┼──────────────────────────────────────────┤
-  │                          │                                          │
-  │  Dynamic dispatch        │  getattr(), reflection, eval() — UCN     │
-  │                          │  does static analysis and can't follow   │
-  │                          │  calls that only exist at runtime.       │
-  │                          │                                          │
-  ├──────────────────────────┼──────────────────────────────────────────┤
-  │                          │                                          │
-  │  Duck-typed methods      │  obj.method() in JS/TS/Python — when     │
-  │                          │  the receiver type is ambiguous, results │
-  │                          │  are marked "uncertain" so the agent     │
-  │                          │  knows to verify. Go/Rust/Java resolve   │
-  │                          │  with high confidence.                   │
-  │                          │                                          │
-  ├──────────────────────────┼──────────────────────────────────────────┤
-  │                          │                                          │
-  │  Single project scope    │  UCN follows imports within the project  │
-  │                          │  but stops at the boundary — no tracing  │
-  │                          │  into node_modules or site-packages.     │
-  │                          │                                          │
-  ├──────────────────────────┼──────────────────────────────────────────┤
-  │                          │                                          │
-  │  First-query index time  │  Tree-sitter index is built on first     │
-  │                          │  query. A few seconds on large projects. │
-  │                          │  Cached and incrementally updated —      │
-  │                          │  only changed files are re-indexed.      │
-  │                          │                                          │
-  └──────────────────────────┴──────────────────────────────────────────┘
-```
+UCN is static AST analysis, not runtime instrumentation.
 
----
-
-## All 28 Commands
-
-All commands are accessible through a single `ucn` MCP tool with a `command` parameter.
-
-```
-  UNDERSTAND                          MODIFY SAFELY
-  ─────────────────────               ─────────────────────
-  about         everything in one     impact          all call sites
-                call: definition,                     with arguments
-                callers, callees,
-                tests, source         diff_impact     what changed in a
-                                                      git diff + who
-  context       callers + callees                     calls it
-                (quick overview)
-                                      verify          check all sites
-  smart         function + helpers                    match signature
-                expanded inline
-                                      plan            preview a refactor
-  trace         call tree — map                       before doing it
-                a whole pipeline
-
-
-  FIND & NAVIGATE                     ARCHITECTURE
-  ─────────────────────               ─────────────────────
-  find          locate definitions    imports         file dependencies
-  usages        all occurrences       exporters       who depends on it
-  fn            extract a function    graph           dependency tree
-  class         extract a class       related         sibling functions
-  toc           project overview      tests           find tests
-  deadcode      unused functions      stacktrace      error trace context
-  search        text search           api             public API surface
-  example       best usage example    typedef         type definitions
-  lines         extract line range    file_exports    file's exports
-  expand        drill into context    stats           project size stats
-```
+- **5 languages + HTML** — JS/TS, Python, Go, Rust, Java. Falls back to text search for others.
+- **Static analysis only** — Can't follow `eval()`, `getattr()`, reflection, or other dynamic dispatch.
+- **Duck-typed methods** — `obj.method()` in JS/TS/Python is marked "uncertain" when the receiver type is ambiguous. Go/Rust/Java resolve with high confidence.
+- **Single project scope** — Follows imports within the project but not into `node_modules` or `site-packages`.
+- **First-query index time** — A few seconds on large projects. Cached incrementally after that.
 
 ---
 
 ## License
 
 MIT
-
-UCN - Universal Code Navigator
