@@ -35,7 +35,7 @@ const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
 const { getMcpCommandEnum, normalizeParams } = require('../core/registry');
 const { execute } = require('../core/execute');
-const { ExpandCache, renderExpandItem } = require('../core/expand-cache');
+const { ExpandCache } = require('../core/expand-cache');
 
 // ============================================================================
 // INDEX CACHE
@@ -539,19 +539,14 @@ server.registerTool(
                     return toolError('Item number is required (e.g. item=1).');
                 }
                 const index = getIndex(project_dir);
-                const { match, itemCount, symbolName } = expandCacheInstance.lookup(index.root, item);
-
-                if (!match && itemCount === 0) {
-                    return toolError('No expandable items found. Run context command first to get numbered items.');
-                }
-                if (!match) {
-                    const scopeHint = symbolName ? ` (from last context for "${symbolName}")` : '';
-                    return toolError(`Item ${item} not found${scopeHint}. Available items: 1-${itemCount}`);
-                }
-
-                const rendered = renderExpandItem(match, index.root, { validateRoot: true });
-                if (!rendered.ok) return toolError(rendered.error);
-                return toolResult(rendered.text);
+                const lookup = expandCacheInstance.lookup(index.root, item);
+                const { ok, result, error } = execute(index, 'expand', {
+                    match: lookup.match, itemNum: item,
+                    itemCount: lookup.itemCount, symbolName: lookup.symbolName,
+                    validateRoot: true
+                });
+                if (!ok) return toolError(error);
+                return toolResult(result.text);
             }
 
             default:
