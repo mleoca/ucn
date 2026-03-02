@@ -254,7 +254,7 @@ function parseGlobPattern(pattern, root) {
  * Convert a glob pattern to a regular expression
  */
 function globToRegex(glob) {
-    let regex = glob.replace(/[.+^$[\]\\]/g, '\\$&');
+    let regex = glob.replace(/[.+^$[\]\\()|]/g, '\\$&');
 
     // Handle brace expansion: {js,ts} -> (js|ts)
     regex = regex.replace(/\{([^}]+)\}/g, (_, group) => {

@@ -2300,7 +2300,7 @@ function formatVerifyJson(result) {
  * Format example command output - JSON
  */
 function formatExampleJson(result, name) {
-    if (!result) {
+    if (!result || !result.best) {
         return JSON.stringify({ found: false, query: name, error: `No call examples found for "${name}"` }, null, 2);
     }
 

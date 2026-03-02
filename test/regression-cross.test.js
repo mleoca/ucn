@@ -5499,3 +5499,101 @@ describe('Bug Hunt: method expand items use proper path resolution', () => {
     });
 });
 
+// Bug Hunt: plan() rename should use word-boundary regex, not plain String.replace
+describe('Bug Hunt: plan() rename uses word-boundary regex', () => {
+    it('should not corrupt signature when function name is substring of another identifier', () => {
+        const d = tmp({
+            'package.json': '{"name":"t"}',
+            'main.js': `
+function get(key) {
+    return getAll(key)[0];
+}
+function getAll(prefix) {
+    return Object.keys(data).filter(k => k.startsWith(prefix));
+}
+function caller() {
+    const val = get("test");
+    const all = getAll("test");
+}
+`
+        });
+        try {
+            const index = idx(d);
+            const result = index.plan('get', { renameTo: 'fetch' });
+            assert.ok(result, 'plan should return result');
+            // The signature should rename 'get' to 'fetch', not corrupt 'getAll'
+            assert.ok(result.after.signature.includes('fetch'), 'new signature should include fetch');
+            assert.ok(!result.after.signature.includes('fetchAll'), 'new signature should not corrupt getAll into fetchAll');
+        } finally {
+            rm(d);
+        }
+    });
+});
+
+// Bug Hunt: globToRegex should escape parentheses and pipe characters
+describe('Bug Hunt: globToRegex escapes special characters', () => {
+    it('should handle parentheses in glob pattern without regex error', () => {
+        const { globToRegex } = require(path.join(PROJECT_DIR, 'core', 'discovery'));
+        // Should not throw SyntaxError
+        const regex = globToRegex('utils(v2).js');
+        assert.ok(regex instanceof RegExp, 'should return a valid regex');
+        assert.ok(regex.test('utils(v2).js'), 'should match the literal filename');
+        assert.ok(!regex.test('utilsv2.js'), 'should not match without parentheses');
+    });
+
+    it('should handle pipe character in glob pattern', () => {
+        const { globToRegex } = require(path.join(PROJECT_DIR, 'core', 'discovery'));
+        const regex = globToRegex('a|b.js');
+        assert.ok(regex instanceof RegExp, 'should return a valid regex');
+        assert.ok(regex.test('a|b.js'), 'should match literal pipe');
+        assert.ok(!regex.test('a.js'), 'should not match just a.js');
+        assert.ok(!regex.test('b.js'), 'should not match just b.js');
+    });
+});
+
+// Bug Hunt: interactive mode --exclude and --not space-separated form
+describe('Bug Hunt: interactive --exclude/--not space form', () => {
+    it('--exclude space form should filter results in interactive mode', () => {
+        const d = tmp({
+            'package.json': '{"name":"t"}',
+            'src/main.js': `
+function processData(input) { return validate(input); }
+function validate(x) { return x != null; }
+`,
+            'test/main.test.js': `
+const { processData } = require('../src/main');
+test('works', () => { processData(1); });
+`
+        });
+        try {
+            const { runInteractive } = require('./helpers');
+            const output = runInteractive(d, ['context processData --exclude test']);
+            // With --exclude test, test files should not appear in callers
+            assert.ok(!output.includes('main.test.js'), 'test file should be excluded from context output');
+        } finally {
+            rm(d);
+        }
+    });
+
+    it('--not space form should work as alias for --exclude in interactive mode', () => {
+        const d = tmp({
+            'package.json': '{"name":"t"}',
+            'src/app.js': `
+function render() { return format(); }
+function format() { return "ok"; }
+`,
+            'test/app.test.js': `
+const { render } = require('../src/app');
+test('render', () => { render(); });
+`
+        });
+        try {
+            const { runInteractive } = require('./helpers');
+            const output = runInteractive(d, ['context render --not test']);
+            assert.ok(!output.includes('app.test.js'), '--not should exclude test files');
+        } finally {
+            rm(d);
+        }
+    });
+});
+

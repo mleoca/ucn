@@ -728,3 +728,34 @@ func outer() {
         assert.ok(!callNames.includes('handler'), 'handler should be filtered as local closure');
     });
 });
+
+// Bug Hunt: Go var_declaration closure tracking should be per-spec
+describe('Bug Hunt: Go var_declaration per-spec closure tracking', () => {
+    it('should not register non-closure vars as closures in grouped var declarations', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `
+package main
+
+func main() {
+    var (
+        count = 5
+        handler = func() { doWork() }
+    )
+    count++
+    handler()
+    process(count)
+}
+
+func doWork() {}
+func process(n int) {}
+`;
+        const result = goMod.findCallsInCode(code, parser);
+        const callNames = result.map(c => c.name);
+        // handler is a closure, so handler() should be filtered
+        assert.ok(!callNames.includes('handler'), 'handler should be filtered as local closure');
+        // process(count) should NOT be filtered — count is not a closure
+        assert.ok(callNames.includes('process'), 'process should not be filtered (count is not a closure)');
+    });
+});

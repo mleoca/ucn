@@ -549,8 +549,8 @@ function extractImplMembers(implNode, code, typeName) {
                     endLine,
                     memberType: visibility ? 'public' : 'method',
                     isAsync: firstLine.includes('async '),
-                    isMethod: true,  // Mark as method for context() lookups
-                    ...(typeName && { receiver: typeName }),  // Track which type this impl is for
+                    isMethod: hasSelf,  // Only true methods (with self) — associated functions are false
+                    ...(typeName && { receiver: typeName }),  // All impl members get receiver for findMethodsForType
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring })
                 });
@@ -1047,10 +1047,19 @@ function findUsagesInCode(code, name, parser) {
         let usageType = 'reference';
 
         if (parent) {
-            // Import: use path::name
+            // Import: use path::name (walk up scoped_identifier chain for deeply nested paths)
             if (parent.type === 'use_declaration' ||
                 parent.type === 'use_as_clause' ||
-                parent.type === 'scoped_identifier' && parent.parent?.type === 'use_declaration') {
+                parent.type === 'use_list' ||
+                (parent.type === 'scoped_identifier' && (() => {
+                    let p = parent;
+                    while (p) {
+                        if (p.type === 'use_declaration' || p.type === 'use_as_clause') return true;
+                        if (p.type !== 'scoped_identifier' && p.type !== 'scoped_use_list' && p.type !== 'use_list') return false;
+                        p = p.parent;
+                    }
+                    return false;
+                })())) {
                 usageType = 'import';
             }
             // Call: name()

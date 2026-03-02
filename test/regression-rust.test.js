@@ -872,7 +872,7 @@ use crate::utils::helper as h;
         assert.ok(names.includes('Map'), 'should include alias Map from use list');
     });
 
-    it('should resolve aliased imports in project via imports command', () => {
+    it('should resolve aliased imports in project via imports command (verified by integration)', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-alias-'));
         try {
             fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), `[package]\nname = "test"\nversion = "0.1.0"\n`);
@@ -890,5 +890,90 @@ fn main() {
         } finally {
             rm(tmpDir);
         }
+    });
+});
+
+// Bug Hunt: Rust associated functions (no self) should have isMethod=false
+describe('Bug Hunt: Rust associated functions vs methods', () => {
+    it('should distinguish associated functions (no self) from methods (with self)', () => {
+        const tmpDir = tmp({
+            'Cargo.toml': `[package]\nname = "test"\nversion = "0.1.0"\n`,
+            'lib.rs': `
+pub struct Config {
+    pub name: String,
+}
+
+impl Config {
+    pub fn new(name: String) -> Self {
+        Config { name }
+    }
+
+    pub fn default() -> Self {
+        Config::new("default".to_string())
+    }
+
+    pub fn validate(&self) -> bool {
+        !self.name.is_empty()
+    }
+
+    fn reset(&mut self) {
+        self.name = String::new();
+    }
+}
+`
+        });
+        try {
+            const index = idx(tmpDir);
+            const ctx = index.context('Config');
+            assert.ok(ctx, 'Config should be found');
+            assert.strictEqual(ctx.methods.length, 4, 'Should list all 4 impl members');
+
+            // All should have receiver pointing to Config
+            for (const m of ctx.methods) {
+                assert.strictEqual(m.receiver, 'Config', `${m.name} should have Config receiver`);
+            }
+
+            // Check the symbols directly for isMethod flag
+            const symbols = index.symbols;
+            const newFn = Array.from(symbols.values()).flat().find(s => s.name === 'new' && s.receiver === 'Config');
+            const validateFn = Array.from(symbols.values()).flat().find(s => s.name === 'validate' && s.receiver === 'Config');
+
+            assert.ok(newFn, 'new should exist in symbol index');
+            assert.ok(validateFn, 'validate should exist in symbol index');
+            assert.ok(!newFn.isMethod, 'new() without self should not have isMethod=true');
+            assert.strictEqual(validateFn.isMethod, true, 'validate(&self) should have isMethod=true');
+        } finally {
+            rm(tmpDir);
+        }
+    });
+});
+
+// Bug Hunt: Rust deeply nested use paths should classify as import
+describe('Bug Hunt: Rust nested use path import classification', () => {
+    it('should classify identifiers in deeply nested use paths as imports', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `
+use std::collections::HashMap;
+use std::io::Read;
+use crate::module::submodule::MyType;
+
+fn main() {
+    let mut map = HashMap::new();
+    let val: MyType = get_value();
+}
+`;
+        const usages = rustMod.findUsagesInCode(code, 'HashMap', parser);
+        const importUsage = usages.find(u => u.usageType === 'import');
+        assert.ok(importUsage, 'HashMap in use std::collections::HashMap should be classified as import');
+
+        const myTypeUsages = rustMod.findUsagesInCode(code, 'MyType', parser);
+        const myTypeImport = myTypeUsages.find(u => u.usageType === 'import');
+        assert.ok(myTypeImport, 'MyType in deeply nested use path should be classified as import');
+
+        const readUsages = rustMod.findUsagesInCode(code, 'Read', parser);
+        const readImport = readUsages.find(u => u.usageType === 'import');
+        assert.ok(readImport, 'Read in use std::io::Read should be classified as import');
     });
 });
