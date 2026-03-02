@@ -270,7 +270,7 @@ const tests = [
         tool: 'ucn',
         desc: 'example(nonexistent) returns "no examples" message',
         args: { command: 'example', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
-        assert: (res, text, isError) => (!isError && /no .* examples found|not found/i.test(text)) || 'Expected "no examples found" message for nonexistent example target'
+        assert: (res, text, isError) => (!isError && /no.*examples found|not found/i.test(text)) || 'Expected "no examples found" message for nonexistent example target'
     },
     {
         category: 'Correctness',

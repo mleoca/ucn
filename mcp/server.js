@@ -326,7 +326,7 @@ server.registerTool(
             case 'example': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'example', { name });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error);
                 if (!result) return toolResult(`No usage examples found for "${name}".`);
                 return toolResult(output.formatExample(result, name));
             }
@@ -334,7 +334,7 @@ server.registerTool(
             case 'related': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'related', { name, file, top, all });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error);
                 if (!result) return toolResult(`Symbol "${name}" not found.`);
                 return toolResult(output.formatRelated(result, {
                     showAll: all || false, top,
