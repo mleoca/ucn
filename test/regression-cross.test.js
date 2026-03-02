@@ -11,10 +11,12 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 
+const { execFileSync, execSync } = require('child_process');
 const { parse, parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob } = require('../core/discovery');
 const output = require('../core/output');
+const { execute } = require('../core/execute');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PATH, runCli, runInteractive } = require('./helpers');
 
 // ============================================================================
@@ -5597,3 +5599,200 @@ test('render', () => { render(); });
     });
 });
 
+// ============================================================================
+// BUG HUNT 2026-03-02 REGRESSIONS
+// ============================================================================
+
+describe('fix: diff-impact nested project root path resolution', () => {
+    it('reports modified functions when run from nested package root', () => {
+        const dir = tmp({
+            'package.json': '{"name":"root"}',
+            'pkg/package.json': '{"name":"pkg"}',
+            'pkg/a.js': 'function foo() { return 1; }\nfunction bar() { return foo(); }\nmodule.exports = { foo, bar };\n'
+        });
+        try {
+            // Initialize git repo at the top level
+            execSync('git init -q', { cwd: dir });
+            execSync('git add .', { cwd: dir });
+            execSync('git commit -qm init', { cwd: dir });
+
+            // Modify a function in the nested package
+            fs.writeFileSync(path.join(dir, 'pkg/a.js'),
+                'function foo() { return 2; }\nfunction bar() { return foo(); }\nmodule.exports = { foo, bar };\n');
+
+            // Run diff-impact from nested package root
+            const pkgDir = path.join(dir, 'pkg');
+            const index = idx(pkgDir);
+            const result = index.diffImpact({ base: 'HEAD' });
+
+            assert.ok(result.functions.length > 0 || result.summary.modifiedFunctions > 0,
+                'nested project root should still detect modified functions');
+            assert.ok(result.summary.modifiedFunctions >= 1,
+                `expected at least 1 modified function, got ${result.summary.modifiedFunctions}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: lines command rejects malformed ranges', () => {
+    it('rejects triple-segment range like 1-2-3', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'file.js': 'line1\nline2\nline3\nline4\nline5\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'lines', { range: '1-2-3', file: 'file.js' });
+            assert.strictEqual(ok, false, 'should reject malformed range');
+            assert.ok(error.includes('Invalid line range'), `error should mention invalid range, got: ${error}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('rejects range with trailing text like 1-2foo', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'file.js': 'line1\nline2\nline3\nline4\nline5\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'lines', { range: '1-2foo', file: 'file.js' });
+            assert.strictEqual(ok, false, 'should reject malformed range');
+            assert.ok(error.includes('Invalid line range'), `error should mention invalid range, got: ${error}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('still accepts valid ranges', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'file.js': 'line1\nline2\nline3\nline4\nline5\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok } = execute(index, 'lines', { range: '2-4', file: 'file.js' });
+            assert.strictEqual(ok, true, 'valid range should succeed');
+            const { ok: ok2 } = execute(index, 'lines', { range: '3', file: 'file.js' });
+            assert.strictEqual(ok2, true, 'single line should succeed');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: diff-impact suppresses git stderr in non-git directories', () => {
+    it('emits only UCN error, no raw git stderr', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function x(){}\n'
+        });
+        try {
+            const out = runCli(dir, 'diff-impact', [], ['--no-cache']);
+            // Should contain the friendly UCN error
+            assert.ok(out.includes('Not a git repository') || out.includes('diff-impact requires git'),
+                'should show UCN error message');
+            // Should NOT contain raw git fatal message
+            assert.ok(!out.includes('fatal:'),
+                `should not leak raw git stderr, got: ${out}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG HUNT 2026-03-02 ROUND 2 REGRESSIONS
+// ============================================================================
+
+describe('fix R2: nested diff-impact deleted-function detection and stderr', () => {
+    it('detects deleted functions from nested package root', () => {
+        const dir = tmp({
+            'package.json': '{"name":"root"}',
+            'pkg/package.json': '{"name":"pkg"}',
+            'pkg/a.js': 'function foo() { return 1; }\nfunction bar() { return foo(); }\nmodule.exports = { foo, bar };\n'
+        });
+        try {
+            execSync('git init -q', { cwd: dir });
+            execSync('git add .', { cwd: dir });
+            execSync('git commit -qm init', { cwd: dir });
+
+            // Delete foo, keep bar
+            fs.writeFileSync(path.join(dir, 'pkg/a.js'),
+                'function bar() { return 1; }\nmodule.exports = { bar };\n');
+
+            const pkgDir = path.join(dir, 'pkg');
+            const index = idx(pkgDir);
+            const result = index.diffImpact({ base: 'HEAD' });
+
+            assert.ok(result.deletedFunctions.length >= 1,
+                `expected at least 1 deleted function, got ${result.deletedFunctions.length}`);
+            assert.ok(result.deletedFunctions.some(f => f.name === 'foo'),
+                'should detect foo as deleted');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not leak git stderr for nested deleted-function analysis', () => {
+        const dir = tmp({
+            'package.json': '{"name":"root"}',
+            'pkg/package.json': '{"name":"pkg"}',
+            'pkg/a.js': 'function foo() { return 1; }\nmodule.exports = { foo };\n'
+        });
+        try {
+            execSync('git init -q', { cwd: dir });
+            execSync('git add .', { cwd: dir });
+            execSync('git commit -qm init', { cwd: dir });
+
+            // Delete foo
+            fs.writeFileSync(path.join(dir, 'pkg/a.js'),
+                'module.exports = {};\n');
+
+            const pkgDir = path.join(dir, 'pkg');
+            const out = runCli(pkgDir, 'diff-impact', [], ['--base=HEAD', '--no-cache']);
+            assert.ok(!out.includes('fatal:'),
+                `should not leak git stderr, got: ${out}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix R2: repeated space-form --exclude applies all values', () => {
+    it('CLI --exclude test --exclude vendor excludes both', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/a.js': 'function target() {}\nmodule.exports = { target };\n',
+            'test/a.js': 'function target() {}\n',
+            'vendor/a.js': 'function target() {}\n'
+        });
+        try {
+            const out = runCli(dir, 'find', ['target'], ['--include-tests', '--exclude', 'test', '--exclude', 'vendor', '--no-cache']);
+            assert.ok(out.includes('src/a.js'), 'should include src/a.js');
+            assert.ok(!out.includes('test/a.js'), 'should exclude test/a.js');
+            assert.ok(!out.includes('vendor/a.js'), 'should exclude vendor/a.js');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('interactive --not test --not vendor excludes both', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/a.js': 'function target() {}\nmodule.exports = { target };\n',
+            'test/a.js': 'function target() {}\n',
+            'vendor/a.js': 'function target() {}\n'
+        });
+        try {
+            const out = runInteractive(dir, ['find target --include-tests --not test --not vendor']);
+            assert.ok(out.includes('src/a.js'), 'should include src/a.js');
+            assert.ok(!out.includes('test/a.js'), 'should exclude test/a.js');
+            assert.ok(!out.includes('vendor/a.js'), 'should exclude vendor/a.js');
+        } finally {
+            rm(dir);
+        }
+    });
+});

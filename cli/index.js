@@ -57,9 +57,10 @@ function parseFlags(tokens) {
             }
         }
         for (const flag of ['--exclude', '--not']) {
-            const idx = tokens.indexOf(flag);
-            if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
-                result.push(...tokens[idx + 1].split(','));
+            for (let i = 0; i < tokens.length; i++) {
+                if (tokens[i] === flag && i + 1 < tokens.length && !tokens[i + 1].startsWith('-')) {
+                    result.push(...tokens[i + 1].split(','));
+                }
             }
         }
         return result;
@@ -92,7 +93,7 @@ function parseFlags(tokens) {
         defaultValue: getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged'),
-        maxLines: parseInt(getValueFlag('--max-lines') || '0') || null,
+        maxLines: getValueFlag('--max-lines') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions'),
     };
@@ -142,12 +143,19 @@ if (unknownFlags.length > 0) {
     process.exit(1);
 }
 
+// Value flags that consume the next token (space form: --flag value)
+const VALUE_FLAGS = new Set([
+    '--file', '--depth', '--top', '--context', '--direction',
+    '--add-param', '--remove-param', '--rename-to', '--default',
+    '--base', '--exclude', '--not', '--in', '--max-lines'
+]);
+
 // Remove flags from args, then add args after -- (which are all positional)
 const positionalArgs = [
     ...args.filter((a, idx) =>
         !a.startsWith('--') &&
         a !== '-i' &&
-        !(idx > 0 && args[idx - 1] === '--file')
+        !(idx > 0 && VALUE_FLAGS.has(args[idx - 1]) && !args[idx - 1].includes('='))
     ),
     ...argsAfterDoubleDash
 ];
