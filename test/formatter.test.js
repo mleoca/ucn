@@ -1792,9 +1792,9 @@ describe('Additional Formatter Coverage', () => {
         });
 
         it('formatGraphJson handles normal and error', () => {
-            const graph = { file: 'a.js', depth: 2, dependencies: [] };
+            const graph = { root: 'a.js', direction: 'both', nodes: [], edges: [] };
             const json = JSON.parse(output.formatGraphJson(graph));
-            assert.strictEqual(json.file, 'a.js', 'Should include file');
+            assert.strictEqual(json.root, 'a.js', 'Should include root');
 
             const errJson = JSON.parse(output.formatGraphJson({ error: 'file-not-found', filePath: 'x.js' }));
             assert.strictEqual(errJson.found, false, 'Error should set found=false');

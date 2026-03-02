@@ -76,7 +76,7 @@ const flags = {
     all: args.includes('--all'),
     // Include method calls in caller/callee analysis
     // Tri-state: true (--include-methods), false (--include-methods=false), undefined (let command decide default)
-    includeMethods: args.includes('--include-methods=false') ? false : args.includes('--include-methods') ? true : undefined,
+    includeMethods: args.some(a => a === '--include-methods=false') ? false : args.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
     // Tests: only show call/test-case matches
     callsOnly: args.includes('--calls-only'),
     // Graph direction (imports/importers/both)
@@ -799,7 +799,7 @@ function runProjectCommand(rootDir, command, arg) {
             }
             const item = cached.items.find(i => i.num === expandNum);
             if (!item) {
-                console.error(`Item ${expandNum} not found. Available: 1-${cached.items.length}`);
+                console.error(`Item ${expandNum} not found. Available: ${cached.items.map(i => i.num).join(', ')}`);
                 process.exit(1);
             }
             printExpandedItem(item, cached.root || index.root);
@@ -1877,7 +1877,7 @@ Flags can be added per-command: context myFunc --include-methods
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--stack']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -1935,7 +1935,7 @@ function parseInteractiveFlags(tokens) {
         includeExported: tokens.includes('--include-exported'),
         includeDecorated: tokens.includes('--include-decorated'),
         includeUncertain: tokens.includes('--include-uncertain'),
-        includeMethods: tokens.includes('--include-methods=false') ? false : tokens.includes('--include-methods') ? true : undefined,
+        includeMethods: tokens.some(a => a === '--include-methods=false') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
         detailed: tokens.includes('--detailed'),
         topLevel: tokens.includes('--top-level'),
         all: tokens.includes('--all'),

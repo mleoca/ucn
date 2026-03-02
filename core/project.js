@@ -3037,7 +3037,8 @@ class ProjectIndex {
                     nonDefUsages = nonDefUsages.filter(u => {
                         if (u.file !== symbol.file) return true; // cross-file usage always counts
                         // Check if same-file usage is on an export line
-                        const content = this._readFile(u.file);
+                        let content;
+                        try { content = this._readFile(u.file); } catch { return true; }
                         if (!content) return true;
                         const lines = content.split('\n');
                         const line = lines[u.line - 1] || '';
@@ -3276,7 +3277,7 @@ class ProjectIndex {
         const fileEntry = this.files.get(def.file);
         if (fileEntry) {
             for (const sym of fileEntry.symbols) {
-                if (sym.name !== name && sym.type === 'function') {
+                if (sym.name !== name && !NON_CALLABLE_TYPES.has(sym.type)) {
                     related.sameFile.push({
                         name: sym.name,
                         line: sym.startLine,

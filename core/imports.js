@@ -387,17 +387,17 @@ function resolveFilePath(basePath, extensions) {
     // Try adding extensions
     for (const ext of extensions) {
         const withExt = basePath + ext;
-        if (fs.existsSync(withExt)) return withExt;
+        try { if (fs.existsSync(withExt) && fs.statSync(withExt).isFile()) return withExt; } catch { /* skip */ }
     }
 
     // Try index files (index.js for JS/TS, __init__.py for Python)
     for (const ext of extensions) {
         const indexPath = path.join(basePath, 'index' + ext);
-        if (fs.existsSync(indexPath)) return indexPath;
+        try { if (fs.existsSync(indexPath) && fs.statSync(indexPath).isFile()) return indexPath; } catch { /* skip */ }
     }
     // Python __init__.py
     const initPath = path.join(basePath, '__init__.py');
-    if (fs.existsSync(initPath)) return initPath;
+    try { if (fs.existsSync(initPath) && fs.statSync(initPath).isFile()) return initPath; } catch { /* skip */ }
 
     return null;
 }
@@ -572,5 +572,6 @@ function stripJsonComments(content) {
 module.exports = {
     extractImports,
     extractExports,
-    resolveImport
+    resolveImport,
+    resolveFilePath
 };
