@@ -230,7 +230,8 @@ function testCommand(lang, langConfig, cmd) {
       result.error?.includes('No tests found') ||
       result.error?.includes('No related') ||
       result.error?.includes('No imports') ||
-      result.error?.includes('No deadcode');
+      result.error?.includes('No deadcode') ||
+      result.error?.includes('No examples found');
 
     if (isExpectedFailure && !cmd.expectOutput) {
       return { passed: true, name: testName, note: 'Expected no results' };

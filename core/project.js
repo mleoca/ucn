@@ -4412,7 +4412,7 @@ class ProjectIndex {
         let allCallers = null;
         let allCallees = null;
         if (primary.type === 'function' || primary.params !== undefined) {
-            allCallers = this.findCallers(symbolName, { includeMethods });
+            allCallers = this.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain });
             // Apply exclude filter before slicing
             if (options.exclude && options.exclude.length > 0) {
                 allCallers = allCallers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));

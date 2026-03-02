@@ -35,7 +35,7 @@ function extractImports(content, language) {
         }
     }
 
-    return { imports: [], dynamicCount: 0 };
+    return { imports: [], dynamicCount: 0, importAliases: null };
 }
 
 /**
@@ -83,7 +83,7 @@ function resolveImport(importPath, fromFile, config = {}) {
         // Check aliases
         if (config.aliases) {
             for (const [alias, target] of Object.entries(config.aliases)) {
-                if (importPath.startsWith(alias)) {
+                if (importPath === alias || importPath.startsWith(alias + '/')) {
                     const relativePath = importPath.slice(alias.length);
                     const targetPath = path.join(config.root || fromDir, target, relativePath);
                     return resolveFilePath(targetPath, config.extensions || getExtensions(config.language));
@@ -223,7 +223,7 @@ function resolveGoImport(importPath, fromFile, projectRoot) {
     const { modulePath, root } = goMod;
 
     // Check if the import is within this module
-    if (importPath.startsWith(modulePath)) {
+    if (importPath === modulePath || importPath.startsWith(modulePath + '/')) {
         // Convert module path to relative path
         // e.g., "github.com/user/proj/pkg/util" -> "pkg/util"
         const relativePath = importPath.slice(modulePath.length).replace(/^\//, '');
@@ -233,7 +233,7 @@ function resolveGoImport(importPath, fromFile, projectRoot) {
         if (fs.existsSync(pkgDir) && fs.statSync(pkgDir).isDirectory()) {
             // Return the first .go file in the directory (not _test.go)
             try {
-                const files = fs.readdirSync(pkgDir);
+                const files = fs.readdirSync(pkgDir).sort();
                 for (const file of files) {
                     if (file.endsWith('.go') && !file.endsWith('_test.go')) {
                         return path.join(pkgDir, file);
