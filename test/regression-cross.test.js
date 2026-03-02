@@ -4639,3 +4639,213 @@ describe('Bug Hunt: execute.js null-checking consistency', () => {
     });
 });
 
+// ============================================================================
+// BUG HUNT: MARCH 2026
+// ============================================================================
+
+describe('Bug Hunt: formatGraphJson outputs correct data shape', () => {
+    it('should include root, direction, nodes, edges (not file/depth/dependencies)', () => {
+        const graph = {
+            root: '/src/app.js',
+            direction: 'imports',
+            nodes: [{ file: '/src/app.js', relativePath: 'src/app.js', depth: 0 }],
+            edges: [{ from: '/src/app.js', to: '/src/utils.js' }]
+        };
+        const json = JSON.parse(output.formatGraphJson(graph));
+        assert.strictEqual(json.root, '/src/app.js', 'should have root');
+        assert.strictEqual(json.direction, 'imports', 'should have direction');
+        assert.ok(Array.isArray(json.nodes), 'should have nodes array');
+        assert.ok(Array.isArray(json.edges), 'should have edges array');
+        assert.strictEqual(json.file, undefined, 'should NOT have old .file field');
+        assert.strictEqual(json.depth, undefined, 'should NOT have old .depth field');
+        assert.strictEqual(json.dependencies, undefined, 'should NOT have old .dependencies field');
+    });
+
+    it('should include imports/importers for direction=both', () => {
+        const graph = {
+            root: '/src/app.js',
+            direction: 'both',
+            nodes: [],
+            edges: [],
+            imports: { nodes: [], edges: [] },
+            importers: { nodes: [], edges: [] }
+        };
+        const json = JSON.parse(output.formatGraphJson(graph));
+        assert.ok(json.imports, 'should have imports subgraph');
+        assert.ok(json.importers, 'should have importers subgraph');
+    });
+});
+
+describe('Bug Hunt: deadcode does not crash when file is deleted between index and query', () => {
+    it('should handle missing file gracefully with --include-exported', () => {
+        const dir = tmp({
+            'main.js': `
+const { helper } = require('./helper');
+module.exports = { helper };
+`,
+            'helper.js': `
+function helper() { return 1; }
+module.exports = { helper };
+`,
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        // Delete the helper file after indexing
+        fs.unlinkSync(path.join(dir, 'helper.js'));
+        // Should not throw (before fix, _readFile would throw and crash the entire deadcode call)
+        const result = index.deadcode({ includeExported: true });
+        assert.ok(Array.isArray(result), 'should return results array without crashing');
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: related() includes methods in sameFile', () => {
+    const { execute } = require('../core/execute');
+
+    it('should include class methods, not just functions', () => {
+        const dir = tmp({
+            'service.js': `
+class UserService {
+    findUser(id) { return this.query(id); }
+    deleteUser(id) { return this.query(id); }
+    query(sql) { return sql; }
+}
+`,
+            'package.json': '{"name":"test"}'
+        });
+        const index = idx(dir);
+        const { ok, result } = execute(index, 'related', { name: 'findUser' });
+        assert.strictEqual(ok, true);
+        const sameFileNames = result.sameFile.map(s => s.name);
+        assert.ok(sameFileNames.includes('deleteUser'), 'should include sibling method deleteUser');
+        assert.ok(sameFileNames.includes('query'), 'should include sibling method query');
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: interactive mode --depth space form works', () => {
+    const { runInteractive } = require('./helpers');
+
+    it('should parse --depth 2 (space form) correctly in interactive mode', () => {
+        const dir = tmp({
+            'a.js': `
+const { b } = require('./b');
+function a() { return b(); }
+module.exports = { a };
+`,
+            'b.js': `
+function b() { return 1; }
+module.exports = { b };
+`,
+            'package.json': '{"name":"test"}'
+        });
+        const result = runInteractive(dir, ['trace a --depth 2']);
+        // Should NOT contain "not found" — the function 'a' should be resolved
+        assert.ok(!result.includes('not found'), 'should find function a with --depth 2 (space form)');
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: formatSmartJson handles null result', () => {
+    it('should return found:false JSON instead of crashing', () => {
+        const json = JSON.parse(output.formatSmartJson(null));
+        assert.strictEqual(json.found, false, 'should set found=false');
+    });
+});
+
+describe('Bug Hunt: formatSearchJson includes meta information', () => {
+    it('should include filesScanned and other meta in JSON output', () => {
+        const results = [
+            { file: 'a.js', matches: [{ line: 1, content: 'hello world' }] }
+        ];
+        results.meta = { filesScanned: 10, filesSkipped: 2, totalFiles: 12 };
+        const json = JSON.parse(output.formatSearchJson(results, 'hello'));
+        assert.strictEqual(json.filesScanned, 10, 'should include filesScanned');
+        assert.strictEqual(json.filesSkipped, 2, 'should include filesSkipped');
+        assert.strictEqual(json.totalFiles, 12, 'should include totalFiles');
+    });
+
+    it('should include regexFallback when present', () => {
+        const results = [];
+        results.meta = { filesScanned: 5, filesSkipped: 0, totalFiles: 5, regexFallback: true };
+        const json = JSON.parse(output.formatSearchJson(results, 'bad[regex'));
+        assert.strictEqual(json.regexFallback, true, 'should include regexFallback');
+    });
+});
+
+describe('Bug Hunt: formatTocJson includes hiddenFiles', () => {
+    it('should include hiddenFiles count when files are truncated', () => {
+        const data = {
+            totals: { files: 100, functions: 500, classes: 20 },
+            summary: 'test summary',
+            files: [],
+            hiddenFiles: 50
+        };
+        const json = JSON.parse(output.formatTocJson(data));
+        assert.strictEqual(json.hiddenFiles, 50, 'should include hiddenFiles');
+    });
+
+    it('should not include hiddenFiles when zero', () => {
+        const data = {
+            totals: { files: 10, functions: 50, classes: 2 },
+            summary: 'test summary',
+            files: [],
+            hiddenFiles: 0
+        };
+        const json = JSON.parse(output.formatTocJson(data));
+        assert.strictEqual(json.hiddenFiles, undefined, 'should omit hiddenFiles when 0');
+    });
+});
+
+describe('Bug Hunt: resolveFilePath does not resolve directories', () => {
+    const { resolveFilePath } = require('../core/imports');
+
+    it('should not resolve a directory named like a file with extension', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}'
+        });
+        // Create a directory named utils.js
+        fs.mkdirSync(path.join(dir, 'utils.js'), { recursive: true });
+        const result = resolveFilePath(path.join(dir, 'utils'), ['.js', '.ts']);
+        // Should NOT return the directory utils.js
+        assert.notStrictEqual(result, path.join(dir, 'utils.js'), 'should not resolve directory as file');
+        rm(dir);
+    });
+
+    it('should not resolve a directory named index.js', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}'
+        });
+        // Create src/ with a directory named index.js inside
+        fs.mkdirSync(path.join(dir, 'src', 'index.js'), { recursive: true });
+        const result = resolveFilePath(path.join(dir, 'src'), ['.js']);
+        assert.notStrictEqual(result, path.join(dir, 'src', 'index.js'), 'should not resolve directory as index file');
+        rm(dir);
+    });
+});
+
+describe('Bug Hunt: --include-methods=true is correctly parsed', () => {
+    const { runCli } = require('./helpers');
+
+    it('should parse --include-methods=true as true, not undefined', () => {
+        const dir = tmp({
+            'app.js': `
+class Foo {
+    bar() { return this.baz(); }
+    baz() { return 1; }
+}
+function caller() { const f = new Foo(); f.bar(); }
+`,
+            'package.json': '{"name":"test"}'
+        });
+        // With --include-methods=true, method calls should be included
+        const resultTrue = runCli(dir, 'context', ['caller'], ['--include-methods=true']);
+        // With --include-methods=false, method calls should be excluded
+        const resultFalse = runCli(dir, 'context', ['caller'], ['--include-methods=false']);
+        // Both should not error
+        assert.ok(!resultTrue.includes('Unknown flag'), 'should accept --include-methods=true');
+        assert.ok(!resultFalse.includes('Unknown flag'), 'should accept --include-methods=false');
+        rm(dir);
+    });
+});
+

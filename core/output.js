@@ -203,12 +203,14 @@ function printDefinition(def, relativePath) {
  * Format TOC data as JSON
  */
 function formatTocJson(data) {
-    return JSON.stringify({
+    const obj = {
         meta: data.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
         totals: data.totals,
         summary: data.summary,
         files: data.files
-    });
+    };
+    if (data.hiddenFiles > 0) obj.hiddenFiles = data.hiddenFiles;
+    return JSON.stringify(obj);
 }
 
 /**
@@ -373,7 +375,8 @@ function formatFunctionJson(fn, code) {
  * Format search results as JSON
  */
 function formatSearchJson(results, term) {
-    return JSON.stringify({
+    const meta = results.meta;
+    const obj = {
         term,
         totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
         files: results.map(r => ({
@@ -384,7 +387,14 @@ function formatSearchJson(results, term) {
                 content: m.content  // FULL content
             }))
         }))
-    }, null, 2);
+    };
+    if (meta) {
+        obj.filesScanned = meta.filesScanned;
+        obj.filesSkipped = meta.filesSkipped;
+        obj.totalFiles = meta.totalFiles;
+        if (meta.regexFallback) obj.regexFallback = meta.regexFallback;
+    }
+    return JSON.stringify(obj, null, 2);
 }
 
 /**
@@ -417,11 +427,15 @@ function formatStatsJson(stats) {
  */
 function formatGraphJson(graph) {
     if (graph?.error) return JSON.stringify({ found: false, error: graph.error, file: graph.filePath }, null, 2);
-    return JSON.stringify({
-        file: graph.file,
-        depth: graph.depth,
-        dependencies: graph.dependencies
-    }, null, 2);
+    const result = {
+        root: graph.root,
+        direction: graph.direction,
+        nodes: graph.nodes,
+        edges: graph.edges
+    };
+    if (graph.imports) result.imports = graph.imports;
+    if (graph.importers) result.importers = graph.importers;
+    return JSON.stringify(result, null, 2);
 }
 
 /**
@@ -429,6 +443,7 @@ function formatGraphJson(graph) {
  * Includes function + all dependencies
  */
 function formatSmartJson(result) {
+    if (!result) return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
     const meta = result.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 };
     return JSON.stringify({
         meta,
