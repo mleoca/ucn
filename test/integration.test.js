@@ -14,7 +14,7 @@ const os = require('os');
 const { parse, parseFile, detectLanguage, isSupported } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob } = require('../core/discovery');
-const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
+const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli } = require('./helpers');
 
 // ============================================================================
 // Integration Tests
@@ -965,4 +965,48 @@ it('detectProjectPattern does not include .kt for Gradle/Maven projects', () => 
     } finally {
         fs.rmSync(tmpDir, { recursive: true });
     }
+});
+
+// ============================================================================
+// BUG HUNT 2026-03-02: CLI positional arg parsing
+// ============================================================================
+
+describe('fix: CLI value-flag args not consumed as positional', () => {
+    it('find --depth 1 without symbol name should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--depth', '1', '--no-cache']);
+        assert.ok(out.includes('required') || out.includes('Usage') || out.includes('Symbol name'),
+            `should error for missing symbol name, got: ${out.slice(0, 200)}`);
+    });
+
+    it('find --top 5 without symbol name should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--top', '5', '--no-cache']);
+        assert.ok(out.includes('required') || out.includes('Usage') || out.includes('Symbol name'),
+            `should error for missing symbol name, got: ${out.slice(0, 200)}`);
+    });
+
+    it('find --base HEAD without symbol name should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--base', 'HEAD', '--no-cache']);
+        assert.ok(out.includes('required') || out.includes('Usage') || out.includes('Symbol name'),
+            `should error for missing symbol name, got: ${out.slice(0, 200)}`);
+    });
+});
+
+describe('fix R2: CLI --max-lines rejects non-integer values', () => {
+    it('class --max-lines=abc should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'class', ['DataProcessor'], ['--max-lines=abc', '--no-cache']);
+        assert.ok(out.includes('positive integer'),
+            `should reject non-numeric max-lines, got: ${out.slice(0, 200)}`);
+    });
+
+    it('class --max-lines=1.5 should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'class', ['DataProcessor'], ['--max-lines=1.5', '--no-cache']);
+        assert.ok(out.includes('positive integer'),
+            `should reject decimal max-lines, got: ${out.slice(0, 200)}`);
+    });
+
+    it('class --max-lines=5 should succeed', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'class', ['DataProcessor'], ['--max-lines=5', '--no-cache']);
+        assert.ok(!out.includes('positive integer'),
+            `valid max-lines should not error, got: ${out.slice(0, 200)}`);
+    });
 });

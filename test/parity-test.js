@@ -817,3 +817,59 @@ describe('Architecture Guards', () => {
         }
     });
 });
+
+// ============================================================================
+// BUG HUNT 2026-03-02: max-lines validation parity
+// ============================================================================
+
+describe('fix: class --max-lines validation in core (all surfaces)', () => {
+    it('rejects negative max-lines via execute()', () => {
+        const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': 'class Foo {\n  method1() {}\n  method2() {}\n}\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'class', { name: 'Foo', maxLines: -1 });
+            assert.strictEqual(ok, false, 'should reject negative max-lines');
+            assert.ok(error.includes('positive integer'), `error should mention positive integer, got: ${error}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('rejects non-numeric max-lines via execute()', () => {
+        const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': 'class Bar {\n  method1() {}\n  method2() {}\n}\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'class', { name: 'Bar', maxLines: 'abc' });
+            assert.strictEqual(ok, false, 'should reject non-numeric max-lines');
+            assert.ok(error.includes('positive integer'), `error should mention positive integer, got: ${error}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('accepts valid positive integer max-lines', () => {
+        const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': 'class Baz {\n  method1() {}\n  method2() {}\n}\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok } = execute(index, 'class', { name: 'Baz', maxLines: 2 });
+            assert.strictEqual(ok, true, 'valid max-lines should succeed');
+        } finally {
+            rm(dir);
+        }
+    });
+});

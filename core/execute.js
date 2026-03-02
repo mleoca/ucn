@@ -318,6 +318,10 @@ const HANDLERS = {
         const notes = [];
         const maxLines = num(p.maxLines, null);
 
+        if (p.maxLines != null && (maxLines === null || !Number.isInteger(maxLines) || maxLines < 1)) {
+            return { ok: false, error: '--max-lines must be a positive integer.' };
+        }
+
         if (matches.length > 1 && !p.file && p.all) {
             for (const m of matches) {
                 const code = readAndExtract(m);
@@ -369,13 +373,14 @@ const HANDLERS = {
             return { ok: false, error: 'Line range is required (e.g. "10-20" or "15").' };
         }
 
-        const parts = p.range.split('-');
-        const rawStart = parseInt(parts[0], 10);
-        const rawEnd = parts.length > 1 ? parseInt(parts[1], 10) : rawStart;
-
-        if (isNaN(rawStart) || isNaN(rawEnd)) {
+        const rangeStr = String(p.range).trim();
+        const rangeMatch = rangeStr.match(/^(\d+)(?:-(\d+))?$/);
+        if (!rangeMatch) {
             return { ok: false, error: `Invalid line range: "${p.range}". Expected format: <start>-<end> or <line>.` };
         }
+
+        const rawStart = parseInt(rangeMatch[1], 10);
+        const rawEnd = rangeMatch[2] !== undefined ? parseInt(rangeMatch[2], 10) : rawStart;
         if (rawStart < 1 || rawEnd < 1) {
             return { ok: false, error: 'Invalid line range: line numbers must be >= 1.' };
         }

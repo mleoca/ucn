@@ -3169,7 +3169,7 @@ class ProjectIndex {
         // Verify git repo
         let gitRoot;
         try {
-            gitRoot = execSync('git rev-parse --show-toplevel', { cwd: this.root, encoding: 'utf-8' }).trim();
+            gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: this.root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
         } catch (e) {
             throw new Error('Not a git repository. diff-impact requires git.');
         }
@@ -3208,7 +3208,24 @@ class ProjectIndex {
             };
         }
 
-        const changes = parseDiff(diffText, this.root);
+        // Diff paths are git-root-relative. Resolve to this.root for file lookup.
+        // Normalize both through realpath to handle macOS /var → /private/var symlinks.
+        let realGitRoot, realProjectRoot;
+        try { realGitRoot = fs.realpathSync(gitRoot); } catch (_) { realGitRoot = gitRoot; }
+        try { realProjectRoot = fs.realpathSync(this.root); } catch (_) { realProjectRoot = this.root; }
+        const projectPrefix = realGitRoot === realProjectRoot
+            ? ''
+            : path.relative(realGitRoot, realProjectRoot);
+
+        const rawChanges = parseDiff(diffText, gitRoot);
+        // Filter to files under this.root and remap paths.
+        // Preserve gitRelativePath (repo-relative) for git show commands.
+        const changes = [];
+        for (const c of rawChanges) {
+            if (projectPrefix && !c.relativePath.startsWith(projectPrefix + '/')) continue;
+            const localRel = projectPrefix ? c.relativePath.slice(projectPrefix.length + 1) : c.relativePath;
+            changes.push({ ...c, gitRelativePath: c.relativePath, filePath: path.join(this.root, localRel), relativePath: localRel });
+        }
 
         const functions = [];
         const moduleLevelChanges = [];
@@ -3229,8 +3246,8 @@ class ProjectIndex {
                     const ref = staged ? 'HEAD' : base;
                     try {
                         const oldContent = execFileSync(
-                            'git', ['show', `${ref}:${change.relativePath}`],
-                            { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+                            'git', ['show', `${ref}:${change.gitRelativePath}`],
+                            { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                         );
                         const oldParsed = parse(oldContent, lang);
                         for (const oldFn of extractCallableSymbols(oldParsed)) {
@@ -3333,8 +3350,8 @@ class ProjectIndex {
                 const ref = staged ? 'HEAD' : base;
                 try {
                     const oldContent = execFileSync(
-                        'git', ['show', `${ref}:${change.relativePath}`],
-                        { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 }
+                        'git', ['show', `${ref}:${change.gitRelativePath}`],
+                        { cwd: this.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
                     );
                     const fileLang = detectLanguage(change.filePath);
                     if (fileLang) {
