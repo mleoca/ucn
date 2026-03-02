@@ -698,10 +698,10 @@ fn main() {
 });
 
 it('FIX 100 — findEnclosingFunction excludes enum and trait', () => {
-    const projectCode = fs.readFileSync(path.join(PROJECT_DIR, 'core', 'project.js'), 'utf-8');
-    // NON_CALLABLE_TYPES module constant should include enum and trait
-    const match = projectCode.match(/NON_CALLABLE_TYPES\s*=\s*new Set\(\[([^\]]+)\]\)/);
-    assert.ok(match, 'NON_CALLABLE_TYPES constant should exist');
+    const sharedCode = fs.readFileSync(path.join(PROJECT_DIR, 'core', 'shared.js'), 'utf-8');
+    // NON_CALLABLE_TYPES constant should include enum and trait
+    const match = sharedCode.match(/NON_CALLABLE_TYPES\s*=\s*new Set\(\[([^\]]+)\]\)/);
+    assert.ok(match, 'NON_CALLABLE_TYPES constant should exist in shared.js');
     assert.ok(match[1].includes("'enum'"), 'enum should be in NON_CALLABLE_TYPES');
     assert.ok(match[1].includes("'trait'"), 'trait should be in NON_CALLABLE_TYPES');
 });

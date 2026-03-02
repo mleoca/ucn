@@ -446,7 +446,7 @@ function testEdgeCases() {
     {
       name: 'Single file toc',
       run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'toc', []),
-      expect: (r) => r.success && r.output.includes('processData'),
+      expect: (r) => r.success && r.output.includes('main.js'),
     },
     {
       name: 'Single file find',

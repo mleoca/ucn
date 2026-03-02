@@ -10,8 +10,7 @@
 const fs = require('fs');
 const path = require('path');
 
-const { parse, parseFile, extractFunction, extractClass, detectLanguage, isSupported } = require('../core/parser');
-const { getParser, getLanguageModule } = require('../languages');
+const { parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
@@ -249,406 +248,92 @@ function main() {
 // ============================================================================
 
 function runFileCommand(filePath, command, arg) {
-    const code = fs.readFileSync(filePath, 'utf-8');
-    const lines = code.split('\n');
     const language = detectLanguage(filePath);
-
     if (!language) {
         console.error(`Unsupported file type: ${filePath}`);
         process.exit(1);
     }
 
-    const result = parse(code, language);
+    const canonical = resolveCommand(command, 'cli') || command;
 
-    switch (command) {
-        case 'toc':
-            printFileToc(result, filePath);
-            break;
+    // Commands that need full project index — auto-route to project mode
+    const fileLocalCommands = new Set(['toc', 'fn', 'class', 'find', 'usages', 'search', 'lines', 'typedef', 'api']);
 
-        case 'fn': {
-            requireArg(arg, 'Usage: ucn <file> fn <name>');
-            const { fn, code: fnCode } = extractFunction(code, language, arg);
-            if (fn) {
-                printOutput({ fn, fnCode },
-                    r => output.formatFunctionJson(r.fn, r.fnCode),
-                    r => {
-                        console.log(`${output.lineRange(r.fn.startLine, r.fn.endLine)} ${output.formatFunctionSignature(r.fn)}`);
-                        console.log('─'.repeat(60));
-                        console.log(r.fnCode);
-                    }
-                );
-            } else {
-                console.error(`Function "${arg}" not found`);
-                suggestSimilar(arg, result.functions.map(f => f.name));
-            }
-            break;
+    if (!fileLocalCommands.has(canonical)) {
+        // Auto-detect project root and route to project mode
+        const projectRoot = findProjectRoot(path.dirname(filePath));
+        let effectiveArg = arg;
+        if (['imports', 'exporters', 'fileExports', 'graph'].includes(canonical) && !arg) {
+            effectiveArg = filePath;
         }
-
-        case 'class': {
-            requireArg(arg, 'Usage: ucn <file> class <name>');
-            const { cls, code: clsCode } = extractClass(code, language, arg);
-            if (cls) {
-                printOutput({ cls, clsCode },
-                    r => JSON.stringify({ ...r.cls, code: r.clsCode }, null, 2),
-                    r => {
-                        console.log(`${output.lineRange(r.cls.startLine, r.cls.endLine)} ${output.formatClassSignature(r.cls)}`);
-                        console.log('─'.repeat(60));
-                        console.log(r.clsCode);
-                    }
-                );
-            } else {
-                console.error(`Class "${arg}" not found`);
-                suggestSimilar(arg, result.classes.map(c => c.name));
-            }
-            break;
-        }
-
-        case 'find': {
-            requireArg(arg, 'Usage: ucn <file> find <name>');
-            findInFile(result, arg, filePath);
-            break;
-        }
-
-        case 'usages': {
-            requireArg(arg, 'Usage: ucn <file> usages <name>');
-            usagesInFile(code, lines, arg, filePath, result);
-            break;
-        }
-
-        case 'search': {
-            requireArg(arg, 'Usage: ucn <file> search <term>');
-            searchFile(filePath, lines, arg);
-            break;
-        }
-
-        case 'lines': {
-            requireArg(arg, 'Usage: ucn <file> lines <start-end>');
-            printLines(lines, arg);
-            break;
-        }
-
-        case 'typedef': {
-            requireArg(arg, 'Usage: ucn <file> typedef <name>');
-            typedefInFile(result, arg, filePath);
-            break;
-        }
-
-        case 'api':
-            apiInFile(result, filePath);
-            break;
-
-        // Project commands - auto-route to project mode
-        case 'smart':
-        case 'context':
-        case 'tests':
-        case 'about':
-        case 'impact':
-        case 'trace':
-        case 'related':
-        case 'example':
-        case 'graph':
-        case 'stats':
-        case 'deadcode':
-        case 'imports':
-        case 'what-imports':
-        case 'exporters':
-        case 'who-imports':
-        case 'verify':
-        case 'plan':
-        case 'expand':
-        case 'stacktrace':
-        case 'stack':
-        case 'diff-impact':
-        case 'file-exports':
-        case 'what-exports': {
-            // Auto-detect project root and route to project mode
-            const projectRoot = findProjectRoot(path.dirname(filePath));
-
-            // For file-specific commands (imports/exporters/graph), use the target file as arg if no arg given
-            const fileCanonical = resolveCommand(command, 'cli') || command;
-            let effectiveArg = arg;
-            if ((fileCanonical === 'imports' || fileCanonical === 'exporters' ||
-                 fileCanonical === 'fileExports' || fileCanonical === 'graph') && !arg) {
-                effectiveArg = filePath;
-            }
-
-            // For stats/deadcode, no arg needed
-            if (fileCanonical === 'stats' || fileCanonical === 'deadcode') {
-                effectiveArg = arg;  // may be undefined, that's ok
-            }
-
-            runProjectCommand(projectRoot, command, effectiveArg);
-            break;
-        }
-
-        default:
-            console.error(`Unknown command: ${command}`);
-            printUsage();
-            process.exit(1);
-    }
-}
-
-function printFileToc(result, filePath) {
-    // Filter for top-level only if flag is set
-    let functions = result.functions;
-    if (flags.topLevel) {
-        functions = functions.filter(fn => !fn.isNested && (!fn.indent || fn.indent === 0));
-    }
-
-    if (flags.json) {
-        console.log(output.formatTocJson({
-            totalFiles: 1,
-            totalLines: result.totalLines,
-            totalFunctions: functions.length,
-            totalClasses: result.classes.length,
-            totalState: result.stateObjects.length,
-            byFile: [{
-                file: filePath,
-                language: result.language,
-                lines: result.totalLines,
-                functions,
-                classes: result.classes,
-                state: result.stateObjects
-            }]
-        }));
+        runProjectCommand(projectRoot, command, effectiveArg);
         return;
     }
 
-    console.log(`FILE: ${filePath} (${result.totalLines} lines)`);
-    console.log('═'.repeat(60));
-
-    if (functions.length > 0) {
-        console.log('\nFUNCTIONS:');
-        for (const fn of functions) {
-            const sig = output.formatFunctionSignature(fn);
-            console.log(`  ${output.lineRange(fn.startLine, fn.endLine)} ${sig}`);
-            if (fn.docstring) {
-                console.log(`      ${fn.docstring}`);
-            }
-        }
+    // Require arg for commands that need it
+    const needsArg = { fn: 'fn <name>', class: 'class <name>', find: 'find <name>', usages: 'usages <name>', search: 'search <term>', lines: 'lines <start-end>', typedef: 'typedef <name>' };
+    if (needsArg[canonical]) {
+        requireArg(arg, `Usage: ucn <file> ${needsArg[canonical]}`);
     }
 
-    if (result.classes.length > 0) {
-        console.log('\nCLASSES:');
-        for (const cls of result.classes) {
-            console.log(`  ${output.lineRange(cls.startLine, cls.endLine)} ${output.formatClassSignature(cls)}`);
-            if (cls.docstring) {
-                console.log(`      ${cls.docstring}`);
-            }
-            if (cls.members && cls.members.length > 0) {
-                for (const m of cls.members) {
-                    console.log(`    ${output.lineLoc(m.startLine)} ${output.formatMemberSignature(m)}`);
-                }
-            }
-        }
-    }
+    // Build single-file index and route through execute()
+    const index = new ProjectIndex(path.dirname(filePath));
+    index.buildSingleFile(filePath);
+    const relativePath = path.relative(index.root, path.resolve(filePath));
 
-    if (result.stateObjects.length > 0) {
-        console.log('\nSTATE:');
-        for (const s of result.stateObjects) {
-            console.log(`  ${output.lineRange(s.startLine, s.endLine)} ${s.name}`);
-        }
-    }
-}
+    // Map command args to execute() params
+    const paramsByCommand = {
+        toc:     { ...flags },
+        fn:      { name: arg, file: relativePath, ...flags },
+        class:   { name: arg, file: relativePath, ...flags },
+        find:    { name: arg, file: relativePath, ...flags },
+        usages:  { name: arg, ...flags },
+        search:  { term: arg, ...flags },
+        lines:   { file: relativePath, range: arg },
+        typedef: { name: arg, ...flags },
+        api:     { file: relativePath },
+    };
 
-function findInFile(result, name, filePath) {
-    const matches = [];
-    const lowerName = name.toLowerCase();
+    const { ok, result, error } = execute(index, canonical, paramsByCommand[canonical]);
+    if (!ok) { console.error(error); process.exit(1); }
 
-    for (const fn of result.functions) {
-        if (flags.exact ? fn.name === name : fn.name.toLowerCase().includes(lowerName)) {
-            matches.push({ ...fn, type: 'function' });
-        }
-    }
-
-    for (const cls of result.classes) {
-        if (flags.exact ? cls.name === name : cls.name.toLowerCase().includes(lowerName)) {
-            matches.push({ ...cls });
-        }
-    }
-
-    if (flags.json) {
-        console.log(output.formatSymbolJson(matches.map(m => ({ ...m, relativePath: filePath })), name));
-    } else {
-        if (matches.length === 0) {
-            console.log(`No symbols found for "${name}" in ${filePath}`);
-        } else {
-            console.log(`Found ${matches.length} match(es) for "${name}" in ${filePath}:`);
-            console.log('─'.repeat(60));
-            for (const m of matches) {
-                const sig = m.params !== undefined
-                    ? output.formatFunctionSignature(m)
-                    : output.formatClassSignature(m);
-                console.log(`${filePath}:${m.startLine}  ${sig}`);
-            }
-        }
-    }
-}
-
-function usagesInFile(code, lines, name, filePath, result) {
-    const usages = [];
-
-    // Get definitions
-    const defs = [];
-    for (const fn of result.functions) {
-        if (fn.name === name) {
-            defs.push({ ...fn, type: 'function', isDefinition: true, line: fn.startLine });
-        }
-    }
-    for (const cls of result.classes) {
-        if (cls.name === name) {
-            defs.push({ ...cls, isDefinition: true, line: cls.startLine });
-        }
-    }
-
-    // Try AST-based detection first
-    const lang = detectLanguage(filePath);
-    const langModule = getLanguageModule(lang);
-
-    if (langModule && typeof langModule.findUsagesInCode === 'function') {
-        try {
-            const parser = getParser(lang);
-            if (parser) {
-                const astUsages = langModule.findUsagesInCode(code, name, parser);
-
-                for (const u of astUsages) {
-                    // Skip definition lines
-                    if (defs.some(d => d.startLine === u.line)) {
-                        continue;
-                    }
-
-                    const lineContent = lines[u.line - 1] || '';
-                    const usage = {
-                        file: filePath,
-                        relativePath: filePath,
-                        line: u.line,
-                        content: lineContent,
-                        usageType: u.usageType,
-                        isDefinition: false
-                    };
-
-                    // Add context
-                    if (flags.context > 0) {
-                        const idx = u.line - 1;
-                        const before = [];
-                        const after = [];
-                        for (let i = 1; i <= flags.context; i++) {
-                            if (idx - i >= 0) before.unshift(lines[idx - i]);
-                            if (idx + i < lines.length) after.push(lines[idx + i]);
-                        }
-                        usage.before = before;
-                        usage.after = after;
-                    }
-
-                    usages.push(usage);
-                }
-
-                // Add definitions to result and output
-                const allUsages = [
-                    ...defs.map(d => ({
-                        ...d,
-                        relativePath: filePath,
-                        content: lines[d.startLine - 1],
-                        signature: d.params !== undefined
-                            ? output.formatFunctionSignature(d)
-                            : output.formatClassSignature(d)
-                    })),
-                    ...usages
-                ];
-
-                if (flags.json) {
-                    console.log(output.formatUsagesJson(allUsages, name));
-                } else {
-                    console.log(output.formatUsages(allUsages, name));
-                }
-                return;
-            }
-        } catch (e) {
-            // AST parsing failed — usages will be empty, only definitions shown
-        }
-    }
-
-    // Output definitions + any usages found via AST
-    const allUsages = [
-        ...defs.map(d => ({
-            ...d,
-            relativePath: filePath,
-            content: lines[d.startLine - 1],
-            signature: d.params !== undefined
-                ? output.formatFunctionSignature(d)
-                : output.formatClassSignature(d)
-        })),
-        ...usages
-    ];
-
-    if (flags.json) {
-        console.log(output.formatUsagesJson(allUsages, name));
-    } else {
-        console.log(output.formatUsages(allUsages, name));
-    }
-}
-
-function typedefInFile(result, name, filePath) {
-    const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class'];
-    const matches = result.classes.filter(c =>
-        typeKinds.includes(c.type) &&
-        (flags.exact ? c.name === name : c.name.toLowerCase().includes(name.toLowerCase()))
-    );
-
-    // Extract source code for each match
-    const absPath = path.resolve(filePath);
-    let fileLines = null;
-    try { fileLines = fs.readFileSync(absPath, 'utf-8').split('\n'); } catch (e) { /* ignore */ }
-    const enriched = matches.map(m => {
-        const obj = { ...m, relativePath: filePath };
-        if (fileLines && m.startLine && m.endLine) {
-            obj.code = fileLines.slice(m.startLine - 1, m.endLine).join('\n');
-        }
-        return obj;
-    });
-
-    if (flags.json) {
-        console.log(output.formatTypedefJson(enriched, name));
-    } else {
-        console.log(output.formatTypedef(enriched, name));
-    }
-}
-
-function apiInFile(result, filePath) {
-    const exported = [];
-
-    for (const fn of result.functions) {
-        if (fn.modifiers && (fn.modifiers.includes('export') || fn.modifiers.includes('public'))) {
-            exported.push({
-                name: fn.name,
-                type: 'function',
-                file: filePath,
-                startLine: fn.startLine,
-                endLine: fn.endLine,
-                params: fn.params,
-                returnType: fn.returnType,
-                signature: output.formatFunctionSignature(fn)
-            });
-        }
-    }
-
-    for (const cls of result.classes) {
-        if (cls.modifiers && (cls.modifiers.includes('export') || cls.modifiers.includes('public'))) {
-            exported.push({
-                name: cls.name,
-                type: cls.type,
-                file: filePath,
-                startLine: cls.startLine,
-                endLine: cls.endLine,
-                signature: output.formatClassSignature(cls)
-            });
-        }
-    }
-
-    if (flags.json) {
-        console.log(output.formatApiJson(exported, filePath));
-    } else {
-        console.log(output.formatApi(exported, filePath));
+    // Format output using same formatters as project mode
+    switch (canonical) {
+        case 'toc':
+            printOutput(result, output.formatTocJson, r => output.formatToc(r, {
+                detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
+                uncertainHint: 'use --include-uncertain to include all'
+            }));
+            break;
+        case 'find':
+            printOutput(result,
+                r => output.formatSymbolJson(r, arg),
+                r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all })
+            );
+            break;
+        case 'fn':
+            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
+            printOutput(result, output.formatFnResultJson, output.formatFnResult);
+            break;
+        case 'class':
+            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
+            printOutput(result, output.formatClassResultJson, output.formatClassResult);
+            break;
+        case 'lines':
+            printOutput(result, output.formatLinesJson, r => output.formatLines(r));
+            break;
+        case 'usages':
+            printOutput(result, r => output.formatUsagesJson(r, arg), r => output.formatUsages(r, arg));
+            break;
+        case 'search':
+            printOutput(result, r => output.formatSearchJson(r, arg), r => output.formatSearch(r, arg));
+            break;
+        case 'typedef':
+            printOutput(result, r => output.formatTypedefJson(r, arg), r => output.formatTypedef(r, arg));
+            break;
+        case 'api':
+            printOutput(result, r => output.formatApiJson(r, arg), r => output.formatApi(r, arg));
+            break;
     }
 }
 
@@ -1250,103 +935,6 @@ function searchGlobFiles(files, term) {
 // ============================================================================
 // HELPERS
 // ============================================================================
-
-function searchFile(filePath, lines, term) {
-    const useRegex = flags.regex !== false;
-    let regex;
-    if (useRegex) {
-        try { regex = new RegExp(term, flags.caseSensitive ? '' : 'i'); } catch (e) { regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i'); }
-    } else {
-        regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
-    }
-    const matches = [];
-
-    lines.forEach((line, idx) => {
-        if (regex.test(line)) {
-            if (flags.codeOnly && isCommentOrString(line)) {
-                return;
-            }
-
-            const match = { line: idx + 1, content: line };
-
-            if (flags.context > 0) {
-                const before = [];
-                const after = [];
-                for (let i = 1; i <= flags.context; i++) {
-                    if (idx - i >= 0) before.unshift(lines[idx - i]);
-                    if (idx + i < lines.length) after.push(lines[idx + i]);
-                }
-                match.before = before;
-                match.after = after;
-            }
-
-            matches.push(match);
-        }
-    });
-
-    if (flags.json) {
-        console.log(output.formatSearchJson([{ file: filePath, matches }], term));
-    } else {
-        console.log(`Found ${matches.length} matches for "${term}" in ${filePath}:`);
-        for (const m of matches) {
-            if (m.before && m.before.length > 0) {
-                for (const line of m.before) {
-                    console.log(`      ... ${line.trim()}`);
-                }
-            }
-            console.log(`  ${m.line}: ${m.content.trim()}`);
-            if (m.after && m.after.length > 0) {
-                for (const line of m.after) {
-                    console.log(`      ... ${line.trim()}`);
-                }
-            }
-        }
-    }
-}
-
-function printLines(lines, range) {
-    const parts = range.split('-');
-    const start = parseInt(parts[0], 10);
-    const end = parts.length > 1 ? parseInt(parts[1], 10) : start;
-
-    // Validate input
-    if (isNaN(start) || isNaN(end)) {
-        console.error(`Invalid line range: "${range}". Expected format: <start>-<end> or <line>`);
-        process.exit(1);
-    }
-
-    if (start < 1 || end < 1) {
-        console.error(`Invalid line range: line numbers must be >= 1`);
-        process.exit(1);
-    }
-
-    // Handle reversed range by swapping
-    const startLine = Math.min(start, end);
-    const endLine = Math.max(start, end);
-
-    // Check for out-of-bounds
-    if (startLine > lines.length) {
-        console.error(`Line ${startLine} is out of bounds. File has ${lines.length} lines.`);
-        process.exit(1);
-    }
-
-    // Print lines (clamping end to file length)
-    const actualEnd = Math.min(endLine, lines.length);
-    for (let i = startLine - 1; i < actualEnd; i++) {
-        console.log(`${output.lineNum(i + 1)} │ ${lines[i]}`);
-    }
-}
-
-function suggestSimilar(query, names) {
-    const lower = query.toLowerCase();
-    const similar = names.filter(n => n.toLowerCase().includes(lower));
-    if (similar.length > 0) {
-        console.log('\nDid you mean:');
-        for (const s of similar.slice(0, 5)) {
-            console.log(`  - ${s}`);
-        }
-    }
-}
 
 function escapeRegExp(text) {
     return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
