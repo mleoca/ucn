@@ -20,13 +20,13 @@ Instead of reading full files, UCN gives precise, AST-verified answers.
 ```bash
 npm install -g ucn
 
-ucn about handleRequest       # full picture: definition, callers, callees, tests
-ucn impact handleRequest      # all call sites with arguments
-ucn trace main --depth=3      # call tree, no file reads
-ucn deadcode                  # unused functions, AST-verified
-ucn fn handleRequest             # extract a function without reading the file
-ucn toc                          # project overview
-ucn --interactive                # REPL mode, index stays in memory
+ucn about handleRequest   # full picture: definition, callers, callees, tests
+ucn impact handleRequest  # all call sites with arguments
+ucn trace main --depth=3  # call tree, no file reads
+ucn deadcode              # unused functions, AST-verified
+ucn fn handleRequest      # extract a function without reading the file
+ucn toc                   # project overview
+ucn --interactive         # REPL mode, index stays in memory
 ```
 
 Parses JS/TS, Python, Go, Rust, Java, and HTML with tree-sitter. Runs locally.
