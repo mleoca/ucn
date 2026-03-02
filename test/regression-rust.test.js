@@ -839,3 +839,56 @@ fn main() {
             'default_color should be a member of Drawable trait');
     });
 });
+
+// ============================================================================
+// FIX #115: Rust `use X as Y` imports silently dropped
+// ============================================================================
+
+describe('Bug Hunt: Rust use-as imports detected', () => {
+    it('should detect use X as Y imports', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `use std::collections::HashMap as Map;
+use foo::bar::Baz as MyBaz;
+use crate::utils::helper as h;
+`;
+        const imports = rustMod.findImportsInCode(code, parser);
+        assert.strictEqual(imports.length, 3, 'should find 3 imports');
+        assert.strictEqual(imports[0].names[0], 'Map', 'alias should be Map');
+        assert.strictEqual(imports[0].module, 'std::collections::HashMap');
+        assert.strictEqual(imports[1].names[0], 'MyBaz', 'alias should be MyBaz');
+        assert.strictEqual(imports[2].names[0], 'h', 'alias should be h');
+    });
+
+    it('should detect use-as inside use lists', () => {
+        const { getParser, getLanguageModule } = require('../languages');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `use std::{io, collections::HashMap as Map};`;
+        const imports = rustMod.findImportsInCode(code, parser);
+        assert.ok(imports.length >= 1, 'should find imports');
+        const names = imports.flatMap(i => i.names);
+        assert.ok(names.includes('Map'), 'should include alias Map from use list');
+    });
+
+    it('should resolve aliased imports in project via imports command', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-alias-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'), `[package]\nname = "test"\nversion = "0.1.0"\n`);
+            fs.writeFileSync(path.join(tmpDir, 'lib.rs'), `pub fn original_fn() -> i32 { 42 }\n`);
+            fs.writeFileSync(path.join(tmpDir, 'main.rs'), `use crate::lib::original_fn as aliased;
+fn main() {
+    aliased();
+}
+`);
+            const index = idx(tmpDir);
+            const result = index.imports('main.rs');
+            assert.ok(result && result.length > 0, 'should find imports');
+            assert.ok(result.some(i => i.names && i.names.includes('aliased')),
+                'should detect aliased import name');
+        } finally {
+            rm(tmpDir);
+        }
+    });
+});

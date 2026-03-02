@@ -1097,6 +1097,12 @@ class ProjectIndex {
         if (['class', 'struct', 'interface', 'type'].includes(def.type)) {
             const methods = this.findMethodsForType(name);
 
+            let typeCallers = this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain });
+            // Apply exclude filter
+            if (options.exclude && options.exclude.length > 0) {
+                typeCallers = typeCallers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            }
+
             const result = {
                 type: def.type,
                 name: name,
@@ -1112,7 +1118,7 @@ class ProjectIndex {
                     receiver: m.receiver
                 })),
                 // Also include places where the type is used in function parameters/returns
-                callers: this.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain })
+                callers: typeCallers
             };
 
             if (warnings.length > 0) {
@@ -4412,7 +4418,7 @@ class ProjectIndex {
         let allCallers = null;
         let allCallees = null;
         if (primary.type === 'function' || primary.params !== undefined) {
-            allCallers = this.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain });
+            allCallers = this.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary] });
             // Apply exclude filter before slicing
             if (options.exclude && options.exclude.length > 0) {
                 allCallers = allCallers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));

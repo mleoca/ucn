@@ -1398,7 +1398,7 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('truncated'), 'Should indicate truncation');
         });
 
-        it('shows all with showAll option', () => {
+        it('shows all with all option', () => {
             const sameFile = [];
             for (let i = 0; i < 12; i++) {
                 sameFile.push({ name: `fn${i}`, line: i + 1 });
@@ -1410,8 +1410,8 @@ describe('New Formatter Coverage', () => {
                 sharedCallers: [],
                 sharedCallees: []
             };
-            const text = output.formatRelated(related, { showAll: true });
-            assert.ok(!text.includes('... and'), 'Should not truncate with showAll');
+            const text = output.formatRelated(related, { all: true });
+            assert.ok(!text.includes('... and'), 'Should not truncate with --all');
             assert.ok(text.includes('fn11'), 'Should show last function');
         });
 
@@ -1985,5 +1985,45 @@ describe('Bug Hunt: formatDiffImpact null summary guard', () => {
         });
         assert.ok(typeof result === 'string', 'should return a string');
         assert.ok(result.includes('Diff Impact Analysis'), 'should include header');
+    });
+});
+
+// ============================================================================
+// FIX #121: formatRelated uses options.all not options.showAll
+// ============================================================================
+
+describe('Bug Hunt: formatRelated respects --all flag', () => {
+    it('should truncate sameFile to 8 by default', () => {
+        const sameFile = [];
+        for (let i = 0; i < 12; i++) {
+            sameFile.push({ name: `fn${i}`, line: i + 1 });
+        }
+        const related = {
+            target: { name: 'main', file: 'a.js', line: 1 },
+            sameFile,
+            similarNames: [],
+            sharedCallers: [],
+            sharedCallees: []
+        };
+        const text = output.formatRelated(related, {});
+        assert.ok(text.includes('... and'), 'should truncate by default');
+        assert.ok(!text.includes('fn11'), 'should not show fn11');
+    });
+
+    it('should show all sameFile items with all: true', () => {
+        const sameFile = [];
+        for (let i = 0; i < 12; i++) {
+            sameFile.push({ name: `fn${i}`, line: i + 1 });
+        }
+        const related = {
+            target: { name: 'main', file: 'a.js', line: 1 },
+            sameFile,
+            similarNames: [],
+            sharedCallers: [],
+            sharedCallees: []
+        };
+        const text = output.formatRelated(related, { all: true });
+        assert.ok(!text.includes('... and'), 'should not truncate with all: true');
+        assert.ok(text.includes('fn11'), 'should show fn11 with all: true');
     });
 });

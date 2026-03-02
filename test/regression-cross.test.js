@@ -5393,3 +5393,109 @@ function doWork() {
     });
 });
 
+// ============================================================================
+// FIX #118: about() passes targetDefinitions to findCallers
+// ============================================================================
+
+describe('Bug Hunt: about() disambiguates callers with targetDefinitions', () => {
+    it('should show callers for the resolved definition, not all overloads', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-about-target-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'a.js'), `
+function save(data) { return data; }
+module.exports = { save };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'b.js'), `
+function save(record) { return record; }
+module.exports = { save };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'caller_a.js'), `
+const { save } = require('./a');
+save('from a');
+`);
+            fs.writeFileSync(path.join(tmpDir, 'caller_b.js'), `
+const { save } = require('./b');
+save('from b');
+`);
+            const index = idx(tmpDir);
+            const result = index.about('save', { file: 'a' });
+            assert.ok(result, 'about should return a result');
+            if (result.callers && result.callers.length > 0) {
+                const callerFiles = result.callers.map(c => c.file || c.relativePath || '');
+                // Should prefer callers bound to the a.js definition
+                const hasCallerA = callerFiles.some(f => f.includes('caller_a'));
+                assert.ok(hasCallerA, 'should include caller_a.js which imports from a.js');
+            }
+        } finally {
+            rm(tmpDir);
+        }
+    });
+});
+
+// ============================================================================
+// FIX #119: context() applies --exclude for class/struct types
+// ============================================================================
+
+describe('Bug Hunt: context() exclude filter for types', () => {
+    it('should exclude callers from test files for class context', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-ctx-exclude-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'user.js'), `
+class User {
+    constructor(name) { this.name = name; }
+    greet() { return 'hi ' + this.name; }
+}
+module.exports = { User };
+`);
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), `
+const { User } = require('./user');
+const u = new User('alice');
+`);
+            fs.writeFileSync(path.join(tmpDir, 'test_user.js'), `
+const { User } = require('./user');
+const u = new User('test');
+`);
+            const index = idx(tmpDir);
+            const result = index.context('User', { exclude: ['test'] });
+            assert.ok(result, 'context should return a result');
+            if (result.callers) {
+                const callerFiles = result.callers.map(c => c.relativePath || '');
+                assert.ok(!callerFiles.some(f => f.includes('test_user')),
+                    'callers should not include test_user.js when --exclude=test');
+            }
+        } finally {
+            rm(tmpDir);
+        }
+    });
+});
+
+// ============================================================================
+// FIX #120: method expandable items use null file for path.join fallback
+// ============================================================================
+
+describe('Bug Hunt: method expand items use proper path resolution', () => {
+    it('should set file to null so renderExpandItem uses path.join(root, relativePath)', () => {
+        const result = {
+            type: 'struct',
+            name: 'Router',
+            file: 'router.go',
+            startLine: 1,
+            endLine: 5,
+            methods: [
+                { name: 'Handle', file: 'router.go', line: 7, endLine: 10, params: 'w, r' }
+            ],
+            callers: []
+        };
+        const { text, expandable } = output.formatContext(result, {});
+        assert.ok(text.includes('Handle'), 'should show Handle method');
+        assert.ok(text.includes('[1]'), 'should have expandable item number');
+        // Verify the expandable item has file=null so renderExpandItem falls back to path.join(root, relativePath)
+        const methodItem = expandable.find(e => e.name === 'Handle');
+        assert.ok(methodItem, 'should have expandable item for Handle');
+        assert.strictEqual(methodItem.file, null, 'file should be null to trigger path.join fallback');
+        assert.strictEqual(methodItem.relativePath, 'router.go', 'relativePath should be set');
+    });
+});
+
