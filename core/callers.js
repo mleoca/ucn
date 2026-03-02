@@ -48,6 +48,7 @@ function getCachedCalls(index, filePath, options = {}) {
             // Content unchanged, just update mtime
             cached.mtime = mtime;
             cached.content = options.includeContent ? content : undefined;
+            index.callsCacheDirty = true;
             if (options.includeContent) {
                 return { calls: cached.calls, content };
             }
@@ -70,6 +71,7 @@ function getCachedCalls(index, filePath, options = {}) {
             calls,
             content: options.includeContent ? content : undefined
         });
+        index.callsCacheDirty = true;
 
         if (options.includeContent) {
             return { calls, content };

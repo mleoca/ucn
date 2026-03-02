@@ -19,6 +19,11 @@ const { getCliCommandSet, resolveCommand } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
+// Sentinel error for command failures that have already printed their message.
+// Thrown instead of process.exit(1) so finally blocks can run (cache save).
+class CommandError extends Error { constructor() { super(); } }
+function fail(msg) { console.error(msg); throw new CommandError(); }
+
 // ============================================================================
 // ARGUMENT PARSING
 // ============================================================================
@@ -175,8 +180,7 @@ const positionalArgs = [
  */
 function requireArg(arg, usage) {
     if (!arg) {
-        console.error(usage);
-        process.exit(1);
+        fail(usage);
     }
 }
 
@@ -303,7 +307,7 @@ function runFileCommand(filePath, command, arg) {
     };
 
     const { ok, result, error } = execute(index, canonical, paramsByCommand[canonical]);
-    if (!ok) { console.error(error); process.exit(1); }
+    if (!ok) fail(error);
 
     // Format output using same formatters as project mode
     switch (canonical) {
@@ -388,13 +392,10 @@ function runProjectCommand(rootDir, command, arg) {
 
     // Build/rebuild if cache not used
     // If cache was loaded but stale, force rebuild to avoid duplicates
+    let needsCacheSave = false;
     if (!usedCache) {
         index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks });
-
-        // Save cache if enabled
-        if (flags.cache) {
-            index.saveCache();
-        }
+        needsCacheSave = flags.cache;
     }
 
     try {
@@ -406,7 +407,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'toc': {
             const { ok, result, error } = execute(index, 'toc', flags);
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatTocJson, r => output.formatToc(r, {
                 detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
                 uncertainHint: 'use --include-uncertain to include all'
@@ -416,7 +417,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'find': {
             const { ok, result, error } = execute(index, 'find', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatSymbolJson(r, arg),
                 r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all })
@@ -426,7 +427,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'usages': {
             const { ok, result, error } = execute(index, 'usages', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatUsagesJson(r, arg),
                 r => output.formatUsages(r, arg)
@@ -436,7 +437,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'example': {
             const { ok, result, error } = execute(index, 'example', { name: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatExampleJson(r, arg),
                 r => output.formatExample(r, arg)
@@ -446,7 +447,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'context': {
             const { ok, result: ctx, error } = execute(index, 'context', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             if (flags.json) {
                 console.log(output.formatContextJson(ctx));
             } else {
@@ -490,8 +491,7 @@ function runProjectCommand(rootDir, command, arg) {
             requireArg(arg, 'Usage: ucn . expand <N>\nFirst run "ucn . context <name>" to get numbered items');
             const expandNum = parseInt(arg);
             if (isNaN(expandNum)) {
-                console.error(`Invalid item number: "${arg}"`);
-                process.exit(1);
+                fail(`Invalid item number: "${arg}"`);
             }
             const cached = loadExpandableItems(index.root);
             const items = cached?.items || [];
@@ -499,14 +499,14 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error } = execute(index, 'expand', {
                 match, itemNum: expandNum, itemCount: items.length
             });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             console.log(result.text);
             break;
         }
 
         case 'smart': {
             const { ok, result, error } = execute(index, 'smart', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatSmartJson, r => output.formatSmart(r, {
                 uncertainHint: 'use --include-uncertain to include all'
             }));
@@ -515,7 +515,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'about': {
             const { ok, result, error } = execute(index, 'about', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
@@ -525,42 +525,42 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'impact': {
             const { ok, result, error } = execute(index, 'impact', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatImpactJson, output.formatImpact);
             break;
         }
 
         case 'plan': {
             const { ok, result, error } = execute(index, 'plan', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatPlanJson, output.formatPlan);
             break;
         }
 
         case 'trace': {
             const { ok, result, error } = execute(index, 'trace', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatTraceJson, output.formatTrace);
             break;
         }
 
         case 'stacktrace': {
             const { ok, result, error } = execute(index, 'stacktrace', { stack: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatStackTraceJson, output.formatStackTrace);
             break;
         }
 
         case 'verify': {
             const { ok, result, error } = execute(index, 'verify', { name: arg, file: flags.file });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatVerifyJson, output.formatVerify);
             break;
         }
 
         case 'related': {
             const { ok, result, error } = execute(index, 'related', { name: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all, top: flags.top }));
             break;
         }
@@ -570,7 +570,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
             const { ok, result, error } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
             printOutput(result, output.formatFnResultJson, output.formatFnResult);
             break;
@@ -579,7 +579,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
             const { ok, result, error } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
             printOutput(result, output.formatClassResultJson, output.formatClassResult);
             break;
@@ -588,7 +588,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'lines': {
             requireArg(arg, 'Usage: ucn . lines <range> --file <path>');
             const { ok, result, error } = execute(index, 'lines', { file: flags.file, range: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatLinesJson, r => output.formatLines(r));
             break;
         }
@@ -597,7 +597,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'imports': {
             const { ok, result, error } = execute(index, 'imports', { file: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatImportsJson(r, arg),
                 r => output.formatImports(r, arg)
@@ -607,7 +607,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'exporters': {
             const { ok, result, error } = execute(index, 'exporters', { file: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatExportersJson(r, arg),
                 r => output.formatExporters(r, arg)
@@ -617,7 +617,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'fileExports': {
             const { ok, result, error } = execute(index, 'fileExports', { file: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => JSON.stringify({ file: arg, exports: r }, null, 2),
                 r => output.formatFileExports(r, arg)
@@ -627,7 +627,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'graph': {
             const { ok, result, error } = execute(index, 'graph', { file: arg, direction: flags.direction, depth: flags.depth, all: flags.all });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => JSON.stringify({
                     root: path.relative(index.root, r.root),
@@ -643,7 +643,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'typedef': {
             const { ok, result, error } = execute(index, 'typedef', { name: arg, exact: flags.exact });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatTypedefJson(r, arg),
                 r => output.formatTypedef(r, arg)
@@ -653,7 +653,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'tests': {
             const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatTestsJson(r, arg),
                 r => output.formatTests(r, arg)
@@ -663,7 +663,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'api': {
             const { ok, result, error } = execute(index, 'api', { file: arg });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatApiJson(r, arg),
                 r => output.formatApi(r, arg)
@@ -673,7 +673,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'search': {
             const { ok, result, error } = execute(index, 'search', { term: arg, ...flags });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 r => output.formatSearchJson(r, arg),
                 r => output.formatSearch(r, arg)
@@ -683,7 +683,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'deadcode': {
             const { ok, result, error } = execute(index, 'deadcode', { ...flags, in: flags.in || subdirScope });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 output.formatDeadcodeJson,
                 r => output.formatDeadcode(r, {
@@ -697,7 +697,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'stats': {
             const { ok, result, error } = execute(index, 'stats', { functions: flags.functions });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result,
                 output.formatStatsJson,
                 r => output.formatStats(r, { top: flags.top })
@@ -707,7 +707,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'diffImpact': {
             const { ok, result, error } = execute(index, 'diffImpact', { base: flags.base, staged: flags.staged, file: flags.file });
-            if (!ok) { console.error(error); process.exit(1); }
+            if (!ok) fail(error);
             printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
             break;
         }
@@ -715,11 +715,20 @@ function runProjectCommand(rootDir, command, arg) {
         default:
             console.error(`Unknown command: ${canonical}`);
             printUsage();
-            process.exit(1);
+            throw new CommandError();
     }
     } catch (e) {
-        console.error(`Error: ${e.message}`);
-        process.exit(1);
+        if (!(e instanceof CommandError)) {
+            console.error(`Error: ${e.message}`);
+        }
+        process.exitCode = 1;
+    } finally {
+        // Save cache after command execution so callsCache populated
+        // by findCallers/findCallees gets persisted to disk.
+        // On cache-hit runs, only re-save if callsCache was mutated.
+        if (flags.cache && (needsCacheSave || index.callsCacheDirty)) {
+            try { index.saveCache(); } catch (e) { /* best-effort */ }
+        }
     }
 }
 
