@@ -726,7 +726,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) { console.error(error); process.exit(1); }
             printOutput(result,
                 r => output.formatSymbolJson(r, arg),
-                r => { printSymbols(r, arg, { depth: flags.depth, top: flags.top, all: flags.all }); }
+                r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all })
             );
             break;
         }
@@ -1039,162 +1039,6 @@ function runProjectCommand(rootDir, command, arg) {
 // all surfaces now use execute(index, 'fn'/'class', params) from core/execute.js
 
 
-function printSymbols(symbols, query, options = {}) {
-    const { depth, top, all } = options;
-    const DEFAULT_LIMIT = 5;
-
-    if (symbols.length === 0) {
-        console.log(`No symbols found for "${query}"`);
-        return;
-    }
-
-    // Determine how many to show
-    const limit = all ? symbols.length : (top > 0 ? top : DEFAULT_LIMIT);
-    const showing = Math.min(limit, symbols.length);
-    const hidden = symbols.length - showing;
-
-    if (hidden > 0) {
-        console.log(`Found ${symbols.length} match(es) for "${query}" (showing top ${showing}):`);
-    } else {
-        console.log(`Found ${symbols.length} match(es) for "${query}":`);
-    }
-    console.log('─'.repeat(60));
-
-    for (let i = 0; i < showing; i++) {
-        const s = symbols[i];
-        // Depth 0: just location
-        if (depth === '0') {
-            console.log(`${s.relativePath}:${s.startLine}`);
-            continue;
-        }
-
-        // Depth 1 (default): location + signature
-        const sig = s.params !== undefined
-            ? output.formatFunctionSignature(s)
-            : output.formatClassSignature(s);
-
-        // Compute and display confidence indicator
-        const confidence = computeConfidence(s);
-        const confStr = confidence.level !== 'high' ? ` [${confidence.level}]` : '';
-
-        console.log(`${s.relativePath}:${s.startLine}  ${sig}${confStr}`);
-        if (s.usageCounts !== undefined) {
-            const c = s.usageCounts;
-            const parts = [];
-            if (c.calls > 0) parts.push(`${c.calls} calls`);
-            if (c.definitions > 0) parts.push(`${c.definitions} def`);
-            if (c.imports > 0) parts.push(`${c.imports} imports`);
-            if (c.references > 0) parts.push(`${c.references} refs`);
-            console.log(`  (${c.total} usages: ${parts.join(', ')})`);
-        } else if (s.usageCount !== undefined) {
-            console.log(`  (${s.usageCount} usages)`);
-        }
-
-        // Show confidence reason if not high
-        if (confidence.level !== 'high' && confidence.reasons.length > 0) {
-            console.log(`  ⚠ ${confidence.reasons.join(', ')}`);
-        }
-
-        // Depth 2: + first 10 lines of code
-        if (depth === '2' || depth === 'full') {
-            try {
-                const content = fs.readFileSync(s.file, 'utf-8');
-                const lines = content.split('\n');
-                const maxLines = depth === 'full' ? (s.endLine - s.startLine + 1) : 10;
-                const endLine = Math.min(s.startLine + maxLines - 1, s.endLine);
-                console.log('  ───');
-                for (let i = s.startLine - 1; i < endLine; i++) {
-                    console.log(`  ${lines[i]}`);
-                }
-                if (depth === '2' && s.endLine > endLine) {
-                    console.log(`  ... (${s.endLine - endLine} more lines)`);
-                }
-            } catch (e) {
-                // Skip code extraction on error
-            }
-        }
-        console.log('');
-    }
-
-    // Show hint about hidden results
-    if (hidden > 0) {
-        console.log(`... ${hidden} more result(s). Use --all to see all, or --top=N to see more.`);
-    }
-}
-
-/**
- * Compute confidence level for a symbol match
- * @returns {{ level: 'high'|'medium'|'low', reasons: string[] }}
- */
-function computeConfidence(symbol) {
-    const reasons = [];
-    let score = 100;
-
-    // Check function span (very long functions may have incorrect boundaries)
-    const span = (symbol.endLine || symbol.startLine) - symbol.startLine;
-    if (span > 500) {
-        score -= 30;
-        reasons.push('very long function (>500 lines)');
-    } else if (span > 200) {
-        score -= 15;
-        reasons.push('long function (>200 lines)');
-    }
-
-    // Check for complex type annotations (nested generics)
-    const params = Array.isArray(symbol.params) ? symbol.params : [];
-    const signature = params.map(p => p.type || '').join(' ') + (symbol.returnType || '');
-    const genericDepth = countNestedGenerics(signature);
-    if (genericDepth > 3) {
-        score -= 20;
-        reasons.push('complex nested generics');
-    } else if (genericDepth > 2) {
-        score -= 10;
-        reasons.push('nested generics');
-    }
-
-    // Check file size by checking if file property exists and getting line count
-    if (symbol.file) {
-        try {
-            const stats = fs.statSync(symbol.file);
-            const sizeKB = stats.size / 1024;
-            if (sizeKB > 500) {
-                score -= 20;
-                reasons.push('very large file (>500KB)');
-            } else if (sizeKB > 200) {
-                score -= 10;
-                reasons.push('large file (>200KB)');
-            }
-        } catch (e) {
-            // Skip file size check on error
-        }
-    }
-
-    // Determine level
-    let level = 'high';
-    if (score < 50) level = 'low';
-    else if (score < 80) level = 'medium';
-
-    return { level, reasons };
-}
-
-/**
- * Count depth of nested generic brackets
- */
-function countNestedGenerics(str) {
-    let maxDepth = 0;
-    let depth = 0;
-    for (const char of str) {
-        if (char === '<') {
-            depth++;
-            maxDepth = Math.max(maxDepth, depth);
-        } else if (char === '>') {
-            depth--;
-        }
-    }
-    return maxDepth;
-}
-
-
 /**
  * Save expandable items to cache file
  */
@@ -1350,7 +1194,7 @@ function findInGlobFiles(files, name) {
     if (flags.json) {
         console.log(output.formatSymbolJson(allMatches, name));
     } else {
-        printSymbols(allMatches, name, { depth: flags.depth, top: flags.top, all: flags.all });
+        console.log(output.formatFindDetailed(allMatches, name, { depth: flags.depth, top: flags.top, all: flags.all }));
     }
 }
 
@@ -1824,16 +1668,10 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
-        // ── find: uses printSymbols (interactive-only formatter) ─────────
-
         case 'find': {
             const { ok, result, error } = execute(index, 'find', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            if (result.length === 0) {
-                console.log(`No symbols found for "${arg}"`);
-            } else {
-                printSymbols(result, arg, { depth: iflags.depth, top: iflags.top, all: iflags.all });
-            }
+            console.log(output.formatFindDetailed(result, arg, { depth: iflags.depth, top: iflags.top, all: iflags.all }));
             break;
         }
 
