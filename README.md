@@ -24,6 +24,9 @@ ucn about handleRequest       # full picture: definition, callers, callees, test
 ucn impact handleRequest      # all call sites with arguments
 ucn trace main --depth=3      # call tree, no file reads
 ucn deadcode                  # unused functions, AST-verified
+ucn fn handleRequest             # extract a function without reading the file
+ucn toc                          # project overview
+ucn --interactive                # REPL mode, index stays in memory
 ```
 
 Parses JS/TS, Python, Go, Rust, Java, and HTML with tree-sitter. Runs locally.
@@ -90,16 +93,6 @@ One command. No files opened. The full execution flow with every function locate
 ---
 
 ## Setup
-
-### CLI
-
-Already installed above. A few more examples:
-
-```bash
-ucn fn handleRequest --file api     # extract function from specific file
-ucn toc                             # project overview
-ucn --interactive                   # REPL mode, index stays in memory
-```
 
 ### MCP Server (for AI agents)
 
