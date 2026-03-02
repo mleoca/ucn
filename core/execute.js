@@ -266,7 +266,7 @@ const HANDLERS = {
         const notes = [];
 
         for (const fnName of fnNames) {
-            const matches = index.find(fnName, { file: p.file })
+            const matches = index.find(fnName, { file: p.file, skipCounts: true })
                 .filter(m => m.type === 'function' || m.params !== undefined);
 
             if (matches.length === 0) {
@@ -307,7 +307,7 @@ const HANDLERS = {
         if (err) return { ok: false, error: err };
 
         const CLASS_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait'];
-        const matches = index.find(p.name, { file: p.file })
+        const matches = index.find(p.name, { file: p.file, skipCounts: true })
             .filter(m => CLASS_TYPES.includes(m.type));
 
         if (matches.length === 0) {

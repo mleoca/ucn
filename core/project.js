@@ -43,8 +43,10 @@ class ProjectIndex {
         this.config = this.loadConfig();
         this.buildTime = null;
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
+        this.callsCacheDirty = false;    // set by getCachedCalls when entries are added or mutated
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
+        this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
     }
 
     /**
@@ -67,6 +69,7 @@ class ProjectIndex {
     _beginOp() {
         if (!this._opContentCache) {
             this._opContentCache = new Map();
+            this._opUsagesCache = new Map();
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -76,7 +79,50 @@ class ProjectIndex {
     _endOp() {
         if (--this._opDepth <= 0) {
             this._opContentCache = null;
+            this._opUsagesCache = null;
             this._opDepth = 0;
+        }
+    }
+
+    /**
+     * Get findUsagesInCode results with per-operation caching.
+     * Avoids redundant tree-sitter parsing when the same (file, name) is queried
+     * multiple times within one operation (e.g., about() calls both countSymbolUsages and usages).
+     * @param {string} filePath - File to scan
+     * @param {string} name - Symbol name to find
+     * @returns {Array|null} Array of usage objects or null if parsing failed
+     */
+    _getCachedUsages(filePath, name) {
+        const cacheKey = `${filePath}\0${name}`;
+        if (this._opUsagesCache) {
+            const cached = this._opUsagesCache.get(cacheKey);
+            if (cached !== undefined) return cached;
+        }
+
+        const lang = detectLanguage(filePath);
+        const langModule = getLanguageModule(lang);
+        if (!langModule || typeof langModule.findUsagesInCode !== 'function') return null;
+
+        try {
+            // Fast pre-check: skip tree-sitter parsing if name doesn't appear in file
+            const content = this._readFile(filePath);
+            if (!content.includes(name)) {
+                const empty = [];
+                if (this._opUsagesCache) {
+                    this._opUsagesCache.set(cacheKey, empty);
+                }
+                return empty;
+            }
+
+            const parser = getParser(lang);
+            if (!parser) return null;
+            const usages = langModule.findUsagesInCode(content, name, parser);
+            if (this._opUsagesCache) {
+                this._opUsagesCache.set(cacheKey, usages);
+            }
+            return usages;
+        } catch (e) {
+            return null;
         }
     }
 
@@ -708,6 +754,8 @@ class ProjectIndex {
     }
 
     find(name, options = {}) {
+        this._beginOp();
+        try {
         // Glob pattern matching (e.g., _update*, handle*Request, get?ata)
         const isGlob = name.includes('*') || name.includes('?');
         if (isGlob && !options.exact) {
@@ -748,6 +796,7 @@ class ProjectIndex {
         }
 
         return this._applyFindFilters(matches, options);
+        } finally { this._endOp(); }
     }
 
     /**
@@ -768,6 +817,11 @@ class ProjectIndex {
             filtered = filtered.filter(m =>
                 this.matchesFilters(m.relativePath, { exclude: options.exclude, in: options.in })
             );
+        }
+
+        // Skip expensive usage counting when caller doesn't need it
+        if (options.skipCounts) {
+            return filtered;
         }
 
         // Add per-symbol usage counts for disambiguation
@@ -829,38 +883,27 @@ class ProjectIndex {
             if (!this.files.has(filePath)) continue;
 
             try {
-                const content = this._readFile(filePath);
-
-                // Try AST-based counting first
-                const language = detectLanguage(filePath);
-                const langModule = getLanguageModule(language);
-
-                if (langModule && typeof langModule.findUsagesInCode === 'function') {
-                    try {
-                        const parser = getParser(language);
-                        if (parser) {
-                            const usages = langModule.findUsagesInCode(content, name, parser);
-                            // Deduplicate same-line same-type entries (e.g., `name: obj.name` has two AST nodes)
-                            const seen = new Set();
-                            for (const u of usages) {
-                                const key = `${filePath}:${u.line}:${u.usageType}`;
-                                if (seen.has(key)) continue;
-                                seen.add(key);
-                                switch (u.usageType) {
-                                    case 'call': calls++; break;
-                                    case 'definition': definitions++; break;
-                                    case 'import': imports++; break;
-                                    default: references++; break;
-                                }
-                            }
-                            continue; // Skip to next file
+                // Try AST-based counting first (with per-operation cache)
+                const astUsages = this._getCachedUsages(filePath, name);
+                if (astUsages !== null) {
+                    // Deduplicate same-line same-type entries (e.g., `name: obj.name` has two AST nodes)
+                    const seen = new Set();
+                    for (const u of astUsages) {
+                        const key = `${filePath}:${u.line}:${u.usageType}`;
+                        if (seen.has(key)) continue;
+                        seen.add(key);
+                        switch (u.usageType) {
+                            case 'call': calls++; break;
+                            case 'definition': definitions++; break;
+                            case 'import': imports++; break;
+                            default: references++; break;
                         }
-                    } catch (e) {
-                        // Fall through to regex-based counting
                     }
+                    continue; // Skip to next file
                 }
 
                 // Fallback: count regex matches as references (unsupported language)
+                const content = this._readFile(filePath);
                 const lines = content.split('\n');
                 lines.forEach((line) => {
                     if (regex.test(line)) {
@@ -918,56 +961,48 @@ class ProjectIndex {
 
             try {
                 const content = this._readFile(filePath);
+
+                // Fast pre-check: skip if name doesn't appear in file at all
+                if (!content.includes(name)) continue;
+
                 const lines = content.split('\n');
 
-                // Try AST-based detection first
-                const lang = detectLanguage(filePath);
-                const langModule = getLanguageModule(lang);
-
-                if (langModule && typeof langModule.findUsagesInCode === 'function') {
-                    // AST-based detection
-                    try {
-                        const parser = getParser(lang);
-                        if (parser) {
-                            const astUsages = langModule.findUsagesInCode(content, name, parser);
-
-                            for (const u of astUsages) {
-                                // Skip if this is a definition line (already added above)
-                                if (definitions.some(d => d.file === filePath && d.startLine === u.line)) {
-                                    continue;
-                                }
-
-                                const lineContent = lines[u.line - 1] || '';
-
-                                const usage = {
-                                    file: filePath,
-                                    relativePath: fileEntry.relativePath,
-                                    line: u.line,
-                                    content: lineContent,
-                                    usageType: u.usageType,
-                                    isDefinition: false
-                                };
-
-                                // Add context lines if requested
-                                if (options.context && options.context > 0) {
-                                    const idx = u.line - 1;
-                                    const before = [];
-                                    const after = [];
-                                    for (let i = 1; i <= options.context; i++) {
-                                        if (idx - i >= 0) before.unshift(lines[idx - i]);
-                                        if (idx + i < lines.length) after.push(lines[idx + i]);
-                                    }
-                                    usage.before = before;
-                                    usage.after = after;
-                                }
-
-                                usages.push(usage);
-                            }
-                            continue; // Skip to next file
+                // Try AST-based detection first (with per-operation cache)
+                const astUsages = this._getCachedUsages(filePath, name);
+                if (astUsages !== null) {
+                    for (const u of astUsages) {
+                        // Skip if this is a definition line (already added above)
+                        if (definitions.some(d => d.file === filePath && d.startLine === u.line)) {
+                            continue;
                         }
-                    } catch (e) {
-                        // Fall through to regex-based detection
+
+                        const lineContent = lines[u.line - 1] || '';
+
+                        const usage = {
+                            file: filePath,
+                            relativePath: fileEntry.relativePath,
+                            line: u.line,
+                            content: lineContent,
+                            usageType: u.usageType,
+                            isDefinition: false
+                        };
+
+                        // Add context lines if requested
+                        if (options.context && options.context > 0) {
+                            const idx = u.line - 1;
+                            const before = [];
+                            const after = [];
+                            for (let i = 1; i <= options.context; i++) {
+                                if (idx - i >= 0) before.unshift(lines[idx - i]);
+                                if (idx + i < lines.length) after.push(lines[idx + i]);
+                            }
+                            usage.before = before;
+                            usage.after = after;
+                        }
+
+                        usages.push(usage);
                     }
+                    continue; // Skip to next file
                 }
 
                 // Fallback to regex-based detection
@@ -2606,10 +2641,10 @@ class ProjectIndex {
         const maxCallees = options.all ? Infinity : (options.maxCallees || 10);
         const includeMethods = options.includeMethods ?? true;
 
-        // Find symbol definition(s)
-        const definitions = this.find(name, { exact: true, file: options.file });
+        // Find symbol definition(s) — skip counts since about() computes its own via usages()
+        const definitions = this.find(name, { exact: true, file: options.file, skipCounts: true });
         if (definitions.length === 0) {
-            // Try fuzzy match
+            // Try fuzzy match (needs counts for suggestion ranking)
             const fuzzy = this.find(name, { file: options.file });
             if (fuzzy.length === 0) {
                 return null;
@@ -2743,7 +2778,7 @@ class ProjectIndex {
             otherDefinitions: (options.all ? others : others.slice(0, 3)).map(d => ({
                 file: d.relativePath,
                 line: d.startLine,
-                usageCount: d.usageCount
+                usageCount: d.usageCount ?? this.countSymbolUsages(d).total
             })),
             types,
             code,

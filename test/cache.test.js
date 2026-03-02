@@ -1753,3 +1753,165 @@ describe('ExpandCache', () => {
         }
     });
 });
+
+// ============================================================================
+// Performance optimization regression tests
+// ============================================================================
+
+describe('fix: callsCache persisted to disk after command execution', () => {
+    it('callsCache is populated and saved after findCallers runs', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }\nmodule.exports = { main };'
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.callsCache.size, 0, 'callsCache empty before findCallers');
+
+            // findCallers populates callsCache
+            index.findCallers('helper');
+            assert.ok(index.callsCache.size > 0, 'callsCache populated after findCallers');
+            assert.ok(index.callsCacheDirty, 'dirty flag set');
+
+            // Save and reload — callsCache should persist
+            index.saveCache();
+            const index2 = new ProjectIndex(dir);
+            index2.loadCache();
+            assert.ok(index2.callsCache.size > 0, 'callsCache loaded from disk');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('callsCacheDirty flag set on mtime-only update', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+        });
+        try {
+            const index = idx(dir);
+            index.findCallers('helper');
+            index.callsCacheDirty = false;
+
+            // Touch a file (change mtime without changing content)
+            const libPath = path.join(dir, 'lib.js');
+            const now = new Date();
+            fs.utimesSync(libPath, now, now);
+
+            // findCallers again — should detect mtime change and set dirty
+            index.findCallers('helper');
+            assert.ok(index.callsCacheDirty, 'dirty flag set after mtime change');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: skipCounts in find() avoids redundant usage counting', () => {
+    it('find with skipCounts returns results without usageCount', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nhelper();'
+        });
+        try {
+            const index = idx(dir);
+            const withCounts = index.find('helper');
+            const withoutCounts = index.find('helper', { skipCounts: true });
+
+            assert.ok(withCounts.length > 0, 'find returns results');
+            assert.strictEqual(withCounts.length, withoutCounts.length, 'same number of results');
+            assert.ok(withCounts[0].usageCount !== undefined, 'usageCount present without skipCounts');
+            assert.strictEqual(withoutCounts[0].usageCount, undefined, 'usageCount absent with skipCounts');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: _getCachedUsages string pre-check and per-op caching', () => {
+    it('files without symbol name are skipped (empty array, not null)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }',
+            'other.js': 'function unrelated() { return 2; }'
+        });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                const otherPath = path.join(dir, 'other.js');
+                const result = index._getCachedUsages(otherPath, 'helper');
+                assert.ok(Array.isArray(result), 'returns array, not null');
+                assert.strictEqual(result.length, 0, 'empty array for file without name');
+
+                // Verify it was cached
+                const cacheKey = `${otherPath}\0helper`;
+                assert.ok(index._opUsagesCache.has(cacheKey), 'result cached in _opUsagesCache');
+            } finally {
+                index._endOp();
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('per-operation cache is shared across find and usages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nhelper();'
+        });
+        try {
+            const index = idx(dir);
+            index._beginOp();
+            try {
+                // First call populates cache
+                index.find('helper', { exact: true });
+                const cacheSize1 = index._opUsagesCache.size;
+
+                // usages() should reuse cached entries
+                index.usages('helper', { codeOnly: true });
+                const cacheSize2 = index._opUsagesCache.size;
+
+                // Cache may grow (usages scans all files), but shouldn't re-parse already-cached files
+                assert.ok(cacheSize2 >= cacheSize1, 'cache grows or stays same');
+            } finally {
+                index._endOp();
+            }
+            // After _endOp, caches are cleared
+            assert.strictEqual(index._opUsagesCache, null, 'cache cleared after endOp');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: CLI error paths still save cache', () => {
+    it('cache is saved even when command returns error', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }'
+        });
+        try {
+            // Run a command that will fail (about with no name)
+            const cliPath = path.join(__dirname, '..', 'cli', 'index.js');
+            try {
+                execSync(`node ${cliPath} ${dir} about`, {
+                    encoding: 'utf-8',
+                    stdio: ['pipe', 'pipe', 'pipe']
+                });
+            } catch (e) {
+                // Expected to fail
+            }
+
+            // Cache should exist despite the error
+            const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+            assert.ok(fs.existsSync(cachePath), 'cache file exists after failed command');
+        } finally {
+            rm(dir);
+        }
+    });
+});
