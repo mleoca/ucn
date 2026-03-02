@@ -2460,6 +2460,167 @@ function formatLines(result) {
     return lines.join('\n');
 }
 
+// ============================================================================
+// FIND DETAILED (moved from CLI — depth/confidence features)
+// ============================================================================
+
+/**
+ * Count depth of nested generic brackets.
+ */
+function countNestedGenerics(str) {
+    let maxDepth = 0;
+    let depth = 0;
+    for (const char of str) {
+        if (char === '<') {
+            depth++;
+            maxDepth = Math.max(maxDepth, depth);
+        } else if (char === '>') {
+            depth--;
+        }
+    }
+    return maxDepth;
+}
+
+/**
+ * Compute confidence level for a symbol match.
+ * @returns {{ level: 'high'|'medium'|'low', reasons: string[] }}
+ */
+function computeConfidence(symbol) {
+    const reasons = [];
+    let score = 100;
+
+    const span = (symbol.endLine || symbol.startLine) - symbol.startLine;
+    if (span > 500) {
+        score -= 30;
+        reasons.push('very long function (>500 lines)');
+    } else if (span > 200) {
+        score -= 15;
+        reasons.push('long function (>200 lines)');
+    }
+
+    const params = Array.isArray(symbol.params) ? symbol.params : [];
+    const signature = params.map(p => p.type || '').join(' ') + (symbol.returnType || '');
+    const genericDepth = countNestedGenerics(signature);
+    if (genericDepth > 3) {
+        score -= 20;
+        reasons.push('complex nested generics');
+    } else if (genericDepth > 2) {
+        score -= 10;
+        reasons.push('nested generics');
+    }
+
+    if (symbol.file) {
+        try {
+            const stats = fs.statSync(symbol.file);
+            const sizeKB = stats.size / 1024;
+            if (sizeKB > 500) {
+                score -= 20;
+                reasons.push('very large file (>500KB)');
+            } else if (sizeKB > 200) {
+                score -= 10;
+                reasons.push('large file (>200KB)');
+            }
+        } catch (e) {
+            // Skip file size check on error
+        }
+    }
+
+    let level = 'high';
+    if (score < 50) level = 'low';
+    else if (score < 80) level = 'medium';
+
+    return { level, reasons };
+}
+
+/**
+ * Format find results with depth/confidence features (detailed view).
+ * Returns a string. Used by CLI and interactive mode.
+ *
+ * @param {Array} symbols - Find result array
+ * @param {string} query - Original search query
+ * @param {object} options - { depth, top, all }
+ */
+function formatFindDetailed(symbols, query, options = {}) {
+    const { depth, top, all } = options;
+    const DEFAULT_LIMIT = 5;
+
+    if (symbols.length === 0) {
+        return `No symbols found for "${query}"`;
+    }
+
+    const lines = [];
+    const limit = all ? symbols.length : (top > 0 ? top : DEFAULT_LIMIT);
+    const showing = Math.min(limit, symbols.length);
+    const hidden = symbols.length - showing;
+
+    if (hidden > 0) {
+        lines.push(`Found ${symbols.length} match(es) for "${query}" (showing top ${showing}):`);
+    } else {
+        lines.push(`Found ${symbols.length} match(es) for "${query}":`);
+    }
+    lines.push('─'.repeat(60));
+
+    for (let i = 0; i < showing; i++) {
+        const s = symbols[i];
+        // Depth 0: just location
+        if (depth === '0') {
+            lines.push(`${s.relativePath}:${s.startLine}`);
+            continue;
+        }
+
+        // Depth 1 (default): location + signature
+        const sig = s.params !== undefined
+            ? formatFunctionSignature(s)
+            : formatClassSignature(s);
+
+        const confidence = computeConfidence(s);
+        const confStr = confidence.level !== 'high' ? ` [${confidence.level}]` : '';
+
+        lines.push(`${s.relativePath}:${s.startLine}  ${sig}${confStr}`);
+        if (s.usageCounts !== undefined) {
+            const c = s.usageCounts;
+            const parts = [];
+            if (c.calls > 0) parts.push(`${c.calls} calls`);
+            if (c.definitions > 0) parts.push(`${c.definitions} def`);
+            if (c.imports > 0) parts.push(`${c.imports} imports`);
+            if (c.references > 0) parts.push(`${c.references} refs`);
+            lines.push(`  (${c.total} usages: ${parts.join(', ')})`);
+        } else if (s.usageCount !== undefined) {
+            lines.push(`  (${s.usageCount} usages)`);
+        }
+
+        if (confidence.level !== 'high' && confidence.reasons.length > 0) {
+            lines.push(`  ⚠ ${confidence.reasons.join(', ')}`);
+        }
+
+        // Depth 2: + first 10 lines of code
+        if (depth === '2' || depth === 'full') {
+            try {
+                const content = fs.readFileSync(s.file, 'utf-8');
+                const fileLines = content.split('\n');
+                const maxLines = depth === 'full' ? (s.endLine - s.startLine + 1) : 10;
+                const endLine = Math.min(s.startLine + maxLines - 1, s.endLine);
+                lines.push('  ───');
+                for (let j = s.startLine - 1; j < endLine; j++) {
+                    lines.push(`  ${fileLines[j]}`);
+                }
+                if (depth === '2' && s.endLine > endLine) {
+                    lines.push(`  ... (${s.endLine - endLine} more lines)`);
+                }
+            } catch (e) {
+                // Skip code extraction on error
+            }
+        }
+        lines.push('');
+    }
+
+    if (hidden > 0) {
+        lines.push(`... ${hidden} more result(s). Use --all to see all, or --top=N to see more.`);
+    }
+
+    return lines.join('\n');
+}
+
 /**
  * Format lines handler result as JSON.
  */
@@ -2565,6 +2726,9 @@ module.exports = {
     // Diff impact command
     formatDiffImpact,
     formatDiffImpactJson,
+
+    // Find detailed (depth/confidence)
+    formatFindDetailed,
 
     // Extraction commands (fn, class, lines)
     formatFnResult,
