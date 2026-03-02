@@ -779,13 +779,10 @@ describe('Architecture Guards', () => {
             'runProjectCommand should switch on canonical, not command');
     });
 
-    it('every canonical command has a handler in execute.js', () => {
+    it('every canonical command has a handler in execute.js (28/28, zero exceptions)', () => {
         const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
-        // Only expand remains adapter-only (cache is surface-specific)
-        const adapterOnly = new Set(['expand']);
 
         for (const cmd of CANONICAL_COMMANDS) {
-            if (adapterOnly.has(cmd)) continue;
             // execute() should accept the command (not return "Unknown command")
             const result = execute({}, cmd, {});
             // It may fail with a validation error (e.g. "name required"), but NOT "Unknown command"
@@ -793,21 +790,6 @@ describe('Architecture Guards', () => {
                 assert.ok(!result.error.startsWith('Unknown command'),
                     `Command "${cmd}" should have a handler in execute.js, got: ${result.error}`);
             }
-        }
-    });
-
-    it('adapter-only commands (expand) are NOT in execute.js', () => {
-        const { execute, ADAPTER_ONLY_COMMANDS } = require(path.join(__dirname, '..', 'core', 'execute'));
-        const adapterOnly = [...ADAPTER_ONLY_COMMANDS];
-
-        // Verify the set contains exactly what we expect
-        assert.deepStrictEqual(adapterOnly.sort(), ['expand'],
-            'ADAPTER_ONLY_COMMANDS should contain only expand');
-
-        for (const cmd of adapterOnly) {
-            const result = execute({}, cmd, {});
-            assert.ok(!result.ok && result.error === `Unknown command: ${cmd}`,
-                `"${cmd}" should NOT be in execute.js (adapter-only)`);
         }
     });
 

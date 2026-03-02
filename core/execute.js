@@ -14,10 +14,7 @@ const fs = require('fs');
 const path = require('path');
 const { addTestExclusions, pickBestDefinition } = require('./shared');
 const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
-
-// Commands handled directly by adapters (not in HANDLERS below).
-// expand needs per-session cache state that differs by surface.
-const ADAPTER_ONLY_COMMANDS = new Set(['expand']);
+const { renderExpandItem } = require('./expand-cache');
 
 // ============================================================================
 // HELPERS
@@ -524,6 +521,24 @@ const HANDLERS = {
         });
         return { ok: true, result };
     },
+
+    // ── Expand (context drill-down) ──────────────────────────────────────
+
+    expand: (index, p) => {
+        if (p.itemNum == null || isNaN(p.itemNum)) {
+            return { ok: false, error: 'Item number is required.' };
+        }
+        if (!p.match) {
+            if (p.itemCount > 0) {
+                const scopeHint = p.symbolName ? ` (from context for "${p.symbolName}")` : '';
+                return { ok: false, error: `Item ${p.itemNum} not found${scopeHint}. Available: 1-${p.itemCount}` };
+            }
+            return { ok: false, error: 'No expandable items. Run context first.' };
+        }
+        const rendered = renderExpandItem(p.match, index.root, { validateRoot: p.validateRoot || false });
+        if (!rendered.ok) return { ok: false, error: rendered.error };
+        return { ok: true, result: rendered };
+    },
 };
 
 // ============================================================================
@@ -550,4 +565,4 @@ function execute(index, command, params = {}) {
     }
 }
 
-module.exports = { execute, ADAPTER_ONLY_COMMANDS };
+module.exports = { execute };

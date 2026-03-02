@@ -18,7 +18,7 @@ const output = require('../core/output');
 // pickBestDefinition moved to execute.js — no longer needed here
 const { getCliCommandSet, resolveCommand } = require('../core/registry');
 const { execute } = require('../core/execute');
-const { ExpandCache, renderExpandItem } = require('../core/expand-cache');
+const { ExpandCache } = require('../core/expand-cache');
 
 // ============================================================================
 // ARGUMENT PARSING
@@ -801,18 +801,13 @@ function runProjectCommand(rootDir, command, arg) {
                 process.exit(1);
             }
             const cached = loadExpandableItems(index.root);
-            if (!cached || !cached.items || cached.items.length === 0) {
-                console.error('No expandable items found. Run "ucn . context <name>" first.');
-                process.exit(1);
-            }
-            const item = cached.items.find(i => i.num === expandNum);
-            if (!item) {
-                console.error(`Item ${expandNum} not found. Available: ${cached.items.map(i => i.num).join(', ')}`);
-                process.exit(1);
-            }
-            const rendered = renderExpandItem(item, cached.root || index.root);
-            if (!rendered.ok) { console.error(rendered.error); process.exit(1); }
-            console.log(rendered.text);
+            const items = cached?.items || [];
+            const match = items.find(i => i.num === expandNum);
+            const { ok, result, error } = execute(index, 'expand', {
+                match, itemNum: expandNum, itemCount: items.length
+            });
+            if (!ok) { console.error(error); process.exit(1); }
+            console.log(result.text);
             break;
         }
 
@@ -1075,7 +1070,7 @@ function loadExpandableItems(root) {
 /**
  * Print expanded code for a cached item
  */
-// printExpandedItem removed — all surfaces now use renderExpandItem from expand-cache.js
+// printExpandedItem removed — all surfaces now use execute(index, 'expand', ...)
 
 
 
@@ -1636,35 +1631,23 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 console.log(`Invalid item number: "${arg}"`);
                 return;
             }
+            let match, itemCount, symbolName;
             if (cache) {
-                const { match, itemCount } = cache.lookup(index.root, expandNum);
-                if (!match && itemCount === 0) {
-                    console.log('No expandable items. Run context first.');
-                    return;
-                }
-                if (!match) {
-                    console.log(`Item ${expandNum} not found. Available: 1-${itemCount}`);
-                    return;
-                }
-                const rendered = renderExpandItem(match, index.root);
-                if (!rendered.ok) { console.log(rendered.error); return; }
-                console.log(rendered.text);
+                const lookup = cache.lookup(index.root, expandNum);
+                match = lookup.match;
+                itemCount = lookup.itemCount;
+                symbolName = lookup.symbolName;
             } else {
-                // Fallback to file-based cache (CLI one-shot)
                 const cached = loadExpandableItems(index.root);
-                if (!cached || !cached.items || cached.items.length === 0) {
-                    console.log('No expandable items. Run context first.');
-                    return;
-                }
-                const expandMatch = cached.items.find(i => i.num === expandNum);
-                if (!expandMatch) {
-                    console.log(`Item ${expandNum} not found. Available: 1-${cached.items.length}`);
-                    return;
-                }
-                const rendered = renderExpandItem(expandMatch, cached.root || index.root);
-                if (!rendered.ok) { console.log(rendered.error); return; }
-                console.log(rendered.text);
+                const items = cached?.items || [];
+                match = items.find(i => i.num === expandNum);
+                itemCount = items.length;
             }
+            const { ok, result, error } = execute(index, 'expand', {
+                match, itemNum: expandNum, itemCount, symbolName
+            });
+            if (!ok) { console.log(error); return; }
+            console.log(result.text);
             break;
         }
 
