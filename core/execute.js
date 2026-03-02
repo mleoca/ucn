@@ -1,21 +1,23 @@
 /**
  * Shared Command Executor — single dispatch for CLI, MCP, and interactive mode.
  *
- * Handles: input validation, exclude normalization, test exclusion, index calls.
- * Does NOT handle: output formatting, expand caching, file I/O commands.
+ * Handles: input validation, exclude normalization, test exclusion, index calls,
+ * and code extraction (fn, class, lines).
  *
  * Each handler returns { ok: true, result } or { ok: false, error }.
- * Adapters handle formatting and surface-specific concerns.
+ * Adapters handle formatting, path security (MCP), and surface-specific concerns.
  */
 
 'use strict';
 
-const { addTestExclusions } = require('./shared');
+const fs = require('fs');
+const path = require('path');
+const { addTestExclusions, pickBestDefinition } = require('./shared');
+const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 
 // Commands handled directly by adapters (not in HANDLERS below).
-// fn, class, lines need raw file content / line-range logic.
 // expand needs per-session cache state that differs by surface.
-const ADAPTER_ONLY_COMMANDS = new Set(['fn', 'class', 'lines', 'expand']);
+const ADAPTER_ONLY_COMMANDS = new Set(['expand']);
 
 // ============================================================================
 // HELPERS
@@ -73,6 +75,14 @@ function num(val, fallback) {
     if (val == null) return fallback;
     const n = Number(val);
     return isNaN(n) ? fallback : n;
+}
+
+/** Read a file and extract lines for a symbol match, applying HTML cleanup. */
+function readAndExtract(match) {
+    const content = fs.readFileSync(match.file, 'utf-8');
+    const lines = content.split('\n');
+    const extracted = lines.slice(match.startLine - 1, match.endLine);
+    return cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 }
 
 // ============================================================================
@@ -243,6 +253,168 @@ const HANDLERS = {
             in: p.in,
         });
         return { ok: true, result };
+    },
+
+    // ── Extracting Code ─────────────────────────────────────────────────
+
+    fn: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+
+        const fnNames = p.name.includes(',')
+            ? p.name.split(',').map(n => n.trim()).filter(Boolean)
+            : [p.name];
+
+        const entries = [];
+        const notes = [];
+
+        for (const fnName of fnNames) {
+            const matches = index.find(fnName, { file: p.file })
+                .filter(m => m.type === 'function' || m.params !== undefined);
+
+            if (matches.length === 0) {
+                notes.push(`Function "${fnName}" not found.`);
+                continue;
+            }
+
+            if (matches.length > 1 && !p.file && p.all) {
+                for (const m of matches) {
+                    const code = readAndExtract(m);
+                    entries.push({ match: m, code });
+                }
+                continue;
+            }
+
+            const match = matches.length > 1 && !p.file
+                ? pickBestDefinition(matches)
+                : matches[0];
+
+            if (matches.length > 1 && !p.file) {
+                const others = matches.filter(m => m !== match)
+                    .map(m => `${m.relativePath}:${m.startLine}`).join(', ');
+                notes.push(`Found ${matches.length} definitions for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
+            }
+
+            const code = readAndExtract(match);
+            entries.push({ match, code });
+        }
+
+        if (entries.length === 0 && notes.length > 0) {
+            return { ok: false, error: notes.join('\n') };
+        }
+        return { ok: true, result: { entries, notes } };
+    },
+
+    class: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+
+        const CLASS_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait'];
+        const matches = index.find(p.name, { file: p.file })
+            .filter(m => CLASS_TYPES.includes(m.type));
+
+        if (matches.length === 0) {
+            return { ok: false, error: `Class "${p.name}" not found.` };
+        }
+
+        const entries = [];
+        const notes = [];
+        const maxLines = num(p.maxLines, null);
+
+        if (matches.length > 1 && !p.file && p.all) {
+            for (const m of matches) {
+                const code = readAndExtract(m);
+                const totalLines = m.endLine - m.startLine + 1;
+                entries.push({ match: m, code, totalLines, summaryMode: false, truncated: false });
+            }
+            return { ok: true, result: { entries, notes } };
+        }
+
+        const match = matches.length > 1 && !p.file
+            ? pickBestDefinition(matches)
+            : matches[0];
+
+        if (matches.length > 1 && !p.file) {
+            const others = matches.filter(m => m !== match)
+                .map(m => `${m.relativePath}:${m.startLine}`).join(', ');
+            notes.push(`Found ${matches.length} definitions for "${p.name}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
+        }
+
+        const totalLines = match.endLine - match.startLine + 1;
+
+        // Large class summary mode (>200 lines, no maxLines)
+        if (totalLines > 200 && !maxLines) {
+            const methods = index.findMethodsForType(match.name);
+            entries.push({ match, code: null, methods, totalLines, summaryMode: true, truncated: false });
+            return { ok: true, result: { entries, notes } };
+        }
+
+        // Truncated mode (maxLines specified and class exceeds it)
+        if (maxLines && totalLines > maxLines) {
+            const content = fs.readFileSync(match.file, 'utf-8');
+            const fileLines = content.split('\n');
+            const truncated = fileLines.slice(match.startLine - 1, match.startLine - 1 + maxLines);
+            const code = cleanHtmlScriptTags(truncated, detectLanguage(match.file)).join('\n');
+            entries.push({ match, code, totalLines, summaryMode: false, truncated: true, maxLines });
+            return { ok: true, result: { entries, notes } };
+        }
+
+        // Full extraction
+        const code = readAndExtract(match);
+        entries.push({ match, code, totalLines, summaryMode: false, truncated: false });
+        return { ok: true, result: { entries, notes } };
+    },
+
+    lines: (index, p) => {
+        const err = requireFile(p.file);
+        if (err) return { ok: false, error: err };
+        if (!p.range || (typeof p.range === 'string' && !p.range.trim())) {
+            return { ok: false, error: 'Line range is required (e.g. "10-20" or "15").' };
+        }
+
+        const parts = p.range.split('-');
+        const rawStart = parseInt(parts[0], 10);
+        const rawEnd = parts.length > 1 ? parseInt(parts[1], 10) : rawStart;
+
+        if (isNaN(rawStart) || isNaN(rawEnd)) {
+            return { ok: false, error: `Invalid line range: "${p.range}". Expected format: <start>-<end> or <line>.` };
+        }
+        if (rawStart < 1 || rawEnd < 1) {
+            return { ok: false, error: 'Invalid line range: line numbers must be >= 1.' };
+        }
+
+        // Auto-swap reversed ranges
+        const startLine = Math.min(rawStart, rawEnd);
+        const endLine = Math.max(rawStart, rawEnd);
+
+        const filePath = index.findFile(p.file);
+        if (!filePath) {
+            return { ok: false, error: `File not found in project: ${p.file}` };
+        }
+
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const fileLines = content.split('\n');
+
+        if (startLine > fileLines.length) {
+            return { ok: false, error: `Line ${startLine} is out of bounds. File has ${fileLines.length} lines.` };
+        }
+
+        const actualEnd = Math.min(endLine, fileLines.length);
+        const extracted = [];
+        for (let i = startLine - 1; i < actualEnd; i++) {
+            extracted.push(fileLines[i]);
+        }
+
+        return {
+            ok: true,
+            result: {
+                filePath,
+                relativePath: path.relative(index.root, filePath),
+                lines: extracted,
+                startLine,
+                endLine: actualEnd,
+            },
+        };
     },
 
     // ── File Dependencies ───────────────────────────────────────────────

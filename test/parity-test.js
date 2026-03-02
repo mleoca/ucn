@@ -781,8 +781,8 @@ describe('Architecture Guards', () => {
 
     it('every canonical command has a handler in execute.js', () => {
         const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
-        // Adapter-only commands that are NOT in execute.js
-        const adapterOnly = new Set(['fn', 'class', 'lines', 'expand']);
+        // Only expand remains adapter-only (cache is surface-specific)
+        const adapterOnly = new Set(['expand']);
 
         for (const cmd of CANONICAL_COMMANDS) {
             if (adapterOnly.has(cmd)) continue;
@@ -796,9 +796,13 @@ describe('Architecture Guards', () => {
         }
     });
 
-    it('adapter-only commands (fn, class, lines, expand) are NOT in execute.js', () => {
+    it('adapter-only commands (expand) are NOT in execute.js', () => {
         const { execute, ADAPTER_ONLY_COMMANDS } = require(path.join(__dirname, '..', 'core', 'execute'));
         const adapterOnly = [...ADAPTER_ONLY_COMMANDS];
+
+        // Verify the set contains exactly what we expect
+        assert.deepStrictEqual(adapterOnly.sort(), ['expand'],
+            'ADAPTER_ONLY_COMMANDS should contain only expand');
 
         for (const cmd of adapterOnly) {
             const result = execute({}, cmd, {});

@@ -10,12 +10,12 @@
 const fs = require('fs');
 const path = require('path');
 
-const { parse, parseFile, extractFunction, extractClass, cleanHtmlScriptTags, detectLanguage, isSupported } = require('../core/parser');
+const { parse, parseFile, extractFunction, extractClass, detectLanguage, isSupported } = require('../core/parser');
 const { getParser, getLanguageModule } = require('../languages');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { pickBestDefinition } = require('../core/shared');
+// pickBestDefinition moved to execute.js — no longer needed here
 const { getCliCommandSet, resolveCommand } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache, renderExpandItem } = require('../core/expand-cache');
@@ -36,69 +36,77 @@ const args = doubleDashIdx === -1 ? rawArgs : rawArgs.slice(0, doubleDashIdx);
 const argsAfterDoubleDash = doubleDashIdx === -1 ? [] : rawArgs.slice(doubleDashIdx + 1);
 
 // Parse flags
-const flags = {
-    json: args.includes('--json'),
-    quiet: !args.includes('--verbose') && !args.includes('--no-quiet'),
-    codeOnly: args.includes('--code-only'),
-    caseSensitive: args.includes('--case-sensitive'),
-    withTypes: args.includes('--with-types'),
-    topLevel: args.includes('--top-level'),
-    exact: args.includes('--exact'),
-    cache: !args.includes('--no-cache'),
-    clearCache: args.includes('--clear-cache'),
-    context: parseInt(args.find(a => a.startsWith('--context='))?.split('=').slice(1).join('=') || '0'),
-    file: args.find(a => a.startsWith('--file='))?.split('=').slice(1).join('=') || null,
-    // Semantic filters (--not is alias for --exclude)
-    exclude: args.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=').slice(1).join('=').split(','))  || [],
-    in: args.find(a => a.startsWith('--in='))?.split('=').slice(1).join('=') || null,
-    // Test file inclusion (by default, tests are excluded from usages/find)
-    includeTests: args.includes('--include-tests'),
-    // Deadcode options
-    includeExported: args.includes('--include-exported'),
-    includeDecorated: args.includes('--include-decorated'),
-    // Uncertain matches (off by default)
-    includeUncertain: args.includes('--include-uncertain'),
-    // Detailed listing (e.g. toc with all symbols)
-    detailed: args.includes('--detailed'),
-    // Output depth
-    depth: args.find(a => a.startsWith('--depth='))?.split('=').slice(1).join('=') || null,
-    // Inline expansion for callees
-    expand: args.includes('--expand'),
-    // Interactive REPL mode
-    interactive: args.includes('--interactive') || args.includes('-i'),
-    // Plan command options
-    addParam: args.find(a => a.startsWith('--add-param='))?.split('=').slice(1).join('=') || null,
-    removeParam: args.find(a => a.startsWith('--remove-param='))?.split('=').slice(1).join('=') || null,
-    renameTo: args.find(a => a.startsWith('--rename-to='))?.split('=').slice(1).join('=') || null,
-    defaultValue: args.find(a => a.startsWith('--default='))?.split('=').slice(1).join('=') || null,
-    // Smart filtering for find results
-    top: parseInt(args.find(a => a.startsWith('--top='))?.split('=').slice(1).join('=') || '0'),
-    all: args.includes('--all'),
-    // Include method calls in caller/callee analysis
-    // Tri-state: true (--include-methods), false (--include-methods=false), undefined (let command decide default)
-    includeMethods: args.some(a => a === '--include-methods=false') ? false : args.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
-    // Tests: only show call/test-case matches
-    callsOnly: args.includes('--calls-only'),
-    // Graph direction (imports/importers/both)
-    direction: args.find(a => a.startsWith('--direction='))?.split('=').slice(1).join('=') || null,
-    // Symlink handling (follow by default)
-    followSymlinks: !args.includes('--no-follow-symlinks'),
-    // Diff-impact options
-    base: args.find(a => a.startsWith('--base='))?.split('=').slice(1).join('=') || null,
-    staged: args.includes('--staged'),
-    // Regex search mode (default: ON; --no-regex to force plain text)
-    regex: args.includes('--no-regex') ? false : undefined,
-    // Stats: per-function line counts
-    functions: args.includes('--functions'),
-    // Class: max lines to show (0 = no limit)
-    maxLines: parseInt(args.find(a => a.startsWith('--max-lines='))?.split('=').slice(1).join('=') || '0') || null
-};
-
-// Handle --file flag with space
-const fileArgIdx = args.indexOf('--file');
-if (fileArgIdx !== -1 && args[fileArgIdx + 1] && !args[fileArgIdx + 1].startsWith('-')) {
-    flags.file = args[fileArgIdx + 1];
+/**
+ * Parse flags from an array of tokens. Supports both --flag=value and --flag value forms.
+ * Shared between global CLI mode and interactive mode.
+ */
+function parseFlags(tokens) {
+    function getValueFlag(flagName) {
+        const eqForm = tokens.find(a => a.startsWith(flagName + '='));
+        if (eqForm) return eqForm.split('=').slice(1).join('=');
+        const idx = tokens.indexOf(flagName);
+        if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
+            return tokens[idx + 1];
+        }
+        return null;
+    }
+    function parseExclude() {
+        const result = [];
+        for (const a of tokens) {
+            if (a.startsWith('--exclude=') || a.startsWith('--not=')) {
+                result.push(...a.split('=').slice(1).join('=').split(','));
+            }
+        }
+        for (const flag of ['--exclude', '--not']) {
+            const idx = tokens.indexOf(flag);
+            if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
+                result.push(...tokens[idx + 1].split(','));
+            }
+        }
+        return result;
+    }
+    return {
+        file: getValueFlag('--file'),
+        exclude: parseExclude(),
+        in: getValueFlag('--in'),
+        includeTests: tokens.includes('--include-tests'),
+        includeExported: tokens.includes('--include-exported'),
+        includeDecorated: tokens.includes('--include-decorated'),
+        includeUncertain: tokens.includes('--include-uncertain'),
+        includeMethods: tokens.some(a => a === '--include-methods=false') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
+        detailed: tokens.includes('--detailed'),
+        topLevel: tokens.includes('--top-level'),
+        all: tokens.includes('--all'),
+        exact: tokens.includes('--exact'),
+        callsOnly: tokens.includes('--calls-only'),
+        codeOnly: tokens.includes('--code-only'),
+        caseSensitive: tokens.includes('--case-sensitive'),
+        withTypes: tokens.includes('--with-types'),
+        expand: tokens.includes('--expand'),
+        depth: getValueFlag('--depth'),
+        top: parseInt(getValueFlag('--top') || '0'),
+        context: parseInt(getValueFlag('--context') || '0'),
+        direction: getValueFlag('--direction'),
+        addParam: getValueFlag('--add-param'),
+        removeParam: getValueFlag('--remove-param'),
+        renameTo: getValueFlag('--rename-to'),
+        defaultValue: getValueFlag('--default'),
+        base: getValueFlag('--base'),
+        staged: tokens.includes('--staged'),
+        maxLines: parseInt(getValueFlag('--max-lines') || '0') || null,
+        regex: tokens.includes('--no-regex') ? false : undefined,
+        functions: tokens.includes('--functions'),
+    };
 }
+
+// Parse shared flags from CLI args, then add global-only flags
+const flags = parseFlags(args);
+flags.json = args.includes('--json');
+flags.quiet = !args.includes('--verbose') && !args.includes('--no-quiet');
+flags.cache = !args.includes('--no-cache');
+flags.clearCache = args.includes('--clear-cache');
+flags.interactive = args.includes('--interactive') || args.includes('-i');
+flags.followSymlinks = !args.includes('--no-follow-symlinks');
 
 // Known flags for validation
 const knownFlags = new Set([
@@ -802,7 +810,9 @@ function runProjectCommand(rootDir, command, arg) {
                 console.error(`Item ${expandNum} not found. Available: ${cached.items.map(i => i.num).join(', ')}`);
                 process.exit(1);
             }
-            printExpandedItem(item, cached.root || index.root);
+            const rendered = renderExpandItem(item, cached.root || index.root);
+            if (!rendered.ok) { console.error(rendered.error); process.exit(1); }
+            console.log(rendered.text);
             break;
         }
 
@@ -867,42 +877,31 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
-        // ── Commands staying in adapter (complex I/O) ───────────────────
+        // ── Extraction commands (via execute) ────────────────────────────
 
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
-            if (arg.includes(',')) {
-                const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
-                let anyNotFound = false;
-                for (let i = 0; i < fnNames.length; i++) {
-                    if (i > 0) console.log('\n' + '═'.repeat(60) + '\n');
-                    if (extractFunctionFromProject(index, fnNames[i]) === false) anyNotFound = true;
-                }
-                if (anyNotFound) process.exit(1);
-            } else {
-                if (extractFunctionFromProject(index, arg) === false) process.exit(1);
-            }
+            const { ok, result, error } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all });
+            if (!ok) { console.error(error); process.exit(1); }
+            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
+            printOutput(result, output.formatFnResultJson, output.formatFnResult);
             break;
         }
 
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
-            if (extractClassFromProject(index, arg) === false) process.exit(1);
+            const { ok, result, error } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
+            if (!ok) { console.error(error); process.exit(1); }
+            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
+            printOutput(result, output.formatClassResultJson, output.formatClassResult);
             break;
         }
 
         case 'lines': {
-            if (!arg || !flags.file) {
-                console.error('Usage: ucn . lines <range> --file <path>');
-                process.exit(1);
-            }
-            const filePath = index.findFile(flags.file);
-            if (!filePath) {
-                console.error(`File not found: ${flags.file}`);
-                process.exit(1);
-            }
-            const fileContent = fs.readFileSync(filePath, 'utf-8');
-            printLines(fileContent.split('\n'), arg);
+            requireArg(arg, 'Usage: ucn . lines <range> --file <path>');
+            const { ok, result, error } = execute(index, 'lines', { file: flags.file, range: arg });
+            if (!ok) { console.error(error); process.exit(1); }
+            printOutput(result, output.formatLinesJson, r => output.formatLines(r));
             break;
         }
 
@@ -1036,146 +1035,8 @@ function runProjectCommand(rootDir, command, arg) {
     }
 }
 
-function extractFunctionFromProject(index, name, overrideFlags) {
-    const f = overrideFlags || flags;
-    const matches = index.find(name, { file: f.file }).filter(m => m.type === 'function' || m.params !== undefined);
-
-    if (matches.length === 0) {
-        console.error(`Function "${name}" not found`);
-        return false;
-    }
-
-    if (matches.length > 1 && !f.file && f.all) {
-        // Show all definitions
-        for (let i = 0; i < matches.length; i++) {
-            const m = matches[i];
-            const code = fs.readFileSync(m.file, 'utf-8');
-            const lines = code.split('\n');
-            const extracted = lines.slice(m.startLine - 1, m.endLine);
-            const fnCode = cleanHtmlScriptTags(extracted, detectLanguage(m.file)).join('\n');
-            if (i > 0) console.log('');
-            if (f.json) {
-                console.log(output.formatFunctionJson(m, fnCode));
-            } else {
-                console.log(output.formatFn(m, fnCode));
-            }
-        }
-        return;
-    }
-
-    let match;
-    if (matches.length > 1 && !f.file) {
-        // Auto-select best match using same scoring as resolveSymbol
-        match = pickBestDefinition(matches);
-        const others = matches.filter(m => m !== match).map(m => `${m.relativePath}:${m.startLine}`).join(', ');
-        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
-    } else {
-        match = matches[0];
-    }
-
-    // Extract code directly using symbol index location (works for class methods and overloads)
-    const code = fs.readFileSync(match.file, 'utf-8');
-    const lines = code.split('\n');
-    const extracted = lines.slice(match.startLine - 1, match.endLine);
-    const fnCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
-
-    if (f.json) {
-        console.log(output.formatFunctionJson(match, fnCode));
-    } else {
-        console.log(output.formatFn(match, fnCode));
-    }
-}
-
-function extractClassFromProject(index, name, overrideFlags) {
-    const f = overrideFlags || flags;
-    const matches = index.find(name, { file: f.file }).filter(m =>
-        ['class', 'interface', 'type', 'enum', 'struct', 'trait'].includes(m.type)
-    );
-
-    if (matches.length === 0) {
-        console.error(`Class "${name}" not found`);
-        return false;
-    }
-
-    if (matches.length > 1 && !f.file && f.all) {
-        // Show all definitions using index data (no re-parsing)
-        for (let i = 0; i < matches.length; i++) {
-            const m = matches[i];
-            const code = fs.readFileSync(m.file, 'utf-8');
-            const codeLines = code.split('\n');
-            const extracted = codeLines.slice(m.startLine - 1, m.endLine);
-            const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(m.file)).join('\n');
-            if (i > 0) console.log('');
-            if (f.json) {
-                console.log(JSON.stringify({ ...m, code: clsCode }, null, 2));
-            } else {
-                console.log(output.formatClass(m, clsCode));
-            }
-        }
-        return;
-    }
-
-    let match;
-    if (matches.length > 1 && !f.file) {
-        // Auto-select best match using same scoring as resolveSymbol
-        match = pickBestDefinition(matches);
-        const others = matches.filter(m => m !== match).map(m => `${m.relativePath}:${m.startLine}`).join(', ');
-        console.error(`Note: Found ${matches.length} definitions for "${name}". Using ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
-    } else {
-        match = matches[0];
-    }
-
-    // Use index data directly instead of re-parsing the file
-    const code = fs.readFileSync(match.file, 'utf-8');
-    const codeLines = code.split('\n');
-    const classLineCount = match.endLine - match.startLine + 1;
-
-    // Large class summary (>200 lines) when no --max-lines specified
-    if (classLineCount > 200 && !f.maxLines) {
-        if (f.json) {
-            const extracted = codeLines.slice(match.startLine - 1, match.endLine);
-            const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
-            console.log(JSON.stringify({ ...match, code: clsCode }, null, 2));
-        } else {
-            const lines = [];
-            lines.push(`${match.relativePath}:${match.startLine}`);
-            lines.push(`${output.lineRange(match.startLine, match.endLine)} ${output.formatClassSignature(match)}`);
-            lines.push('\u2500'.repeat(60));
-            const methods = index.findMethodsForType(match.name);
-            if (methods.length > 0) {
-                lines.push(`\nMethods (${methods.length}):`);
-                for (const m of methods) {
-                    lines.push(`  ${output.formatFunctionSignature(m)}  [line ${m.startLine}]`);
-                }
-            }
-            lines.push(`\nClass is ${classLineCount} lines. Use --max-lines=N to see source, or "fn <method>" for individual methods.`);
-            console.log(lines.join('\n'));
-        }
-        return;
-    }
-
-    // Truncated source with --max-lines
-    if (f.maxLines && classLineCount > f.maxLines) {
-        const truncated = codeLines.slice(match.startLine - 1, match.startLine - 1 + f.maxLines);
-        const truncatedCode = cleanHtmlScriptTags(truncated, detectLanguage(match.file)).join('\n');
-        if (f.json) {
-            console.log(JSON.stringify({ ...match, code: truncatedCode, truncated: true, totalLines: classLineCount }, null, 2));
-        } else {
-            console.log(output.formatClass(match, truncatedCode));
-            console.log(`\n... showing ${f.maxLines} of ${classLineCount} lines`);
-        }
-        return;
-    }
-
-    const extracted = codeLines.slice(match.startLine - 1, match.endLine);
-    const clsCode = cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
-
-    if (f.json) {
-        console.log(JSON.stringify({ ...match, code: clsCode }, null, 2));
-    } else {
-        console.log(output.formatClass(match, clsCode));
-    }
-}
+// extractFunctionFromProject and extractClassFromProject removed —
+// all surfaces now use execute(index, 'fn'/'class', params) from core/execute.js
 
 
 function printSymbols(symbols, query, options = {}) {
@@ -1370,30 +1231,7 @@ function loadExpandableItems(root) {
 /**
  * Print expanded code for a cached item
  */
-function printExpandedItem(item, root) {
-    const filePath = item.file || (root && item.relativePath ? path.join(root, item.relativePath) : null);
-    if (!filePath) {
-        console.error(`Cannot locate file for ${item.name}`);
-        return;
-    }
-
-    try {
-        const content = fs.readFileSync(filePath, 'utf-8');
-        const lines = content.split('\n');
-        const startLine = item.startLine || item.line || 1;
-        const endLine = item.endLine || startLine + 20;
-
-        console.log(`[${item.num}] ${item.name} (${item.type})`);
-        console.log(`${item.relativePath}:${startLine}-${endLine}`);
-        console.log('═'.repeat(60));
-
-        for (let i = startLine - 1; i < Math.min(endLine, lines.length); i++) {
-            console.log(lines[i]);
-        }
-    } catch (e) {
-        console.error(`Error reading ${filePath}: ${e.message}`);
-    }
-}
+// printExpandedItem removed — all surfaces now use renderExpandItem from expand-cache.js
 
 
 
@@ -1894,7 +1732,7 @@ Flags can be added per-command: context myFunc --include-methods
             }
         }
         const arg = argTokens.join(' ');
-        const iflags = parseInteractiveFlags(flagTokens);
+        const iflags = parseFlags(flagTokens);
 
         try {
             const iCanonical = resolveCommand(command, 'cli') || command;
@@ -1911,115 +1749,36 @@ Flags can be added per-command: context myFunc --include-methods
     });
 }
 
-/**
- * Parse flags from interactive command tokens.
- * Returns a flags object similar to the global flags but scoped to this command.
- */
-function parseInteractiveFlags(tokens) {
-    // Helper: get value for a flag that supports both --flag=value and --flag value forms
-    function getValueFlag(flagName) {
-        const eqForm = tokens.find(a => a.startsWith(flagName + '='));
-        if (eqForm) return eqForm.split('=').slice(1).join('=');
-        const idx = tokens.indexOf(flagName);
-        if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
-            return tokens[idx + 1];
-        }
-        return null;
-    }
-    return {
-        file: getValueFlag('--file'),
-        exclude: (() => {
-            const result = [];
-            // Handle --exclude=val and --not=val (equals form)
-            for (const a of tokens) {
-                if (a.startsWith('--exclude=') || a.startsWith('--not=')) {
-                    result.push(...a.split('=').slice(1).join('=').split(','));
-                }
-            }
-            // Handle --exclude val and --not val (space form)
-            for (const flag of ['--exclude', '--not']) {
-                const idx = tokens.indexOf(flag);
-                if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
-                    result.push(...tokens[idx + 1].split(','));
-                }
-            }
-            return result;
-        })(),
-        in: getValueFlag('--in'),
-        includeTests: tokens.includes('--include-tests'),
-        includeExported: tokens.includes('--include-exported'),
-        includeDecorated: tokens.includes('--include-decorated'),
-        includeUncertain: tokens.includes('--include-uncertain'),
-        includeMethods: tokens.some(a => a === '--include-methods=false') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
-        detailed: tokens.includes('--detailed'),
-        topLevel: tokens.includes('--top-level'),
-        all: tokens.includes('--all'),
-        exact: tokens.includes('--exact'),
-        callsOnly: tokens.includes('--calls-only'),
-        codeOnly: tokens.includes('--code-only'),
-        caseSensitive: tokens.includes('--case-sensitive'),
-        withTypes: tokens.includes('--with-types'),
-        expand: tokens.includes('--expand'),
-        depth: getValueFlag('--depth'),
-        top: parseInt(getValueFlag('--top') || '0'),
-        context: parseInt(getValueFlag('--context') || '0'),
-        direction: getValueFlag('--direction'),
-        addParam: getValueFlag('--add-param'),
-        removeParam: getValueFlag('--remove-param'),
-        renameTo: getValueFlag('--rename-to'),
-        defaultValue: getValueFlag('--default'),
-        base: getValueFlag('--base'),
-        staged: tokens.includes('--staged'),
-        maxLines: parseInt(getValueFlag('--max-lines') || '0') || null,
-        regex: tokens.includes('--no-regex') ? false : undefined,
-        functions: tokens.includes('--functions'),
-    };
-}
+// parseInteractiveFlags removed — both global and interactive mode now use parseFlags()
 
 function executeInteractiveCommand(index, command, arg, iflags = {}, cache = null) {
     switch (command) {
 
-        // ── Special commands (complex I/O, stay in adapter) ──────────────
+        // ── Extraction commands (via execute) ────────────────────────────
 
         case 'fn': {
-            if (!arg) {
-                console.log('Usage: fn <name>[,name2,...] [--file=<pattern>]');
-                return;
-            }
-            // Support comma-separated names for bulk extraction
-            if (arg.includes(',')) {
-                const fnNames = arg.split(',').map(n => n.trim()).filter(Boolean);
-                for (let i = 0; i < fnNames.length; i++) {
-                    if (i > 0) console.log('\n' + '═'.repeat(60) + '\n');
-                    extractFunctionFromProject(index, fnNames[i], iflags);
-                }
-            } else {
-                extractFunctionFromProject(index, arg, iflags);
-            }
+            if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>]'); return; }
+            const { ok, result, error } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all });
+            if (!ok) { console.log(error); return; }
+            if (result.notes.length) result.notes.forEach(n => console.log('Note: ' + n));
+            console.log(output.formatFnResult(result));
             break;
         }
 
         case 'class': {
-            if (!arg) {
-                console.log('Usage: class <name> [--file=<pattern>]');
-                return;
-            }
-            extractClassFromProject(index, arg, iflags);
+            if (!arg) { console.log('Usage: class <name> [--file=<pattern>]'); return; }
+            const { ok, result, error } = execute(index, 'class', { name: arg, file: iflags.file, all: iflags.all, maxLines: iflags.maxLines });
+            if (!ok) { console.log(error); return; }
+            if (result.notes.length) result.notes.forEach(n => console.log('Note: ' + n));
+            console.log(output.formatClassResult(result));
             break;
         }
 
         case 'lines': {
-            if (!arg || !iflags.file) {
-                console.log('Usage: lines <range> --file=<file>');
-                return;
-            }
-            const filePath = index.findFile(iflags.file);
-            if (!filePath) {
-                console.log(`File not found: ${iflags.file}`);
-                return;
-            }
-            const fileContent = fs.readFileSync(filePath, 'utf-8');
-            printLines(fileContent.split('\n'), arg);
+            if (!arg) { console.log('Usage: lines <range> --file=<file>'); return; }
+            const { ok, result, error } = execute(index, 'lines', { file: iflags.file, range: arg });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatLines(result));
             break;
         }
 
@@ -2058,7 +1817,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                     console.log(`Item ${expandNum} not found. Available: 1-${cached.items.length}`);
                     return;
                 }
-                printExpandedItem(expandMatch, cached.root || index.root);
+                const rendered = renderExpandItem(expandMatch, cached.root || index.root);
+                if (!rendered.ok) { console.log(rendered.error); return; }
+                console.log(rendered.text);
             }
             break;
         }

@@ -33,7 +33,6 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { pickBestDefinition } = require('../core/shared');
 const { getMcpCommandEnum, normalizeParams } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache, renderExpandItem } = require('../core/expand-cache');
@@ -487,179 +486,52 @@ server.registerTool(
                 return toolResult(output.formatStats(result, { top: top || 0 }));
             }
 
-            // ── Extracting Code (adapter-specific) ──────────────────────
+            // ── Extracting Code (via execute) ────────────────────────────
 
             case 'fn': {
                 const err = requireName(name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-
-                // Support comma-separated names for bulk extraction
-                const fnNames = name.includes(',') ? name.split(',').map(n => n.trim()).filter(Boolean) : [name];
-                const parts = [];
-
-                for (const fnName of fnNames) {
-                    const matches = index.find(fnName, { file }).filter(m => m.type === 'function' || m.params !== undefined);
-
-                    if (matches.length === 0) {
-                        parts.push(`Function "${fnName}" not found.`);
-                        continue;
-                    }
-
-                    // Show all definitions when all=true and multiple matches
-                    if (matches.length > 1 && !file && all) {
-                        for (const m of matches) {
-                            const mPathCheck = resolveAndValidatePath(index, m.relativePath || path.relative(index.root, m.file));
-                            if (typeof mPathCheck !== 'string') return mPathCheck;
-                            const mCode = fs.readFileSync(m.file, 'utf-8');
-                            const mLines = mCode.split('\n');
-                            const mFnCode = mLines.slice(m.startLine - 1, m.endLine).join('\n');
-                            parts.push(output.formatFn(m, mFnCode));
-                        }
-                        continue;
-                    }
-
-                    const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
-                    const fnPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
-                    if (typeof fnPathCheck !== 'string') return fnPathCheck;
-                    const code = fs.readFileSync(match.file, 'utf-8');
-                    const codeLines = code.split('\n');
-                    const fnCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
-
-                    let note = '';
-                    if (matches.length > 1 && !file) {
-                        note = `Note: Found ${matches.length} definitions for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Use file parameter or all=true to show all.\n`;
-                    }
-                    parts.push(note + output.formatFn(match, fnCode));
+                const ep = normalizeParams({ name, file, all });
+                const { ok, result, error } = execute(index, 'fn', ep);
+                if (!ok) return toolError(error);
+                // MCP path security: validate all result files are within project root
+                for (const entry of result.entries) {
+                    const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
+                    if (typeof check !== 'string') return check;
                 }
-
-                const separator = fnNames.length > 1 ? '\n\n' + '═'.repeat(60) + '\n\n' : '\n\n';
-                return toolResult(parts.join(separator));
+                const notes = result.notes.length ? result.notes.map(n => 'Note: ' + n).join('\n') + '\n\n' : '';
+                return toolResult(notes + output.formatFnResult(result));
             }
 
             case 'class': {
                 const err = requireName(name);
                 if (err) return err;
-                const index = getIndex(project_dir);
-                const matches = index.find(name, { file }).filter(m =>
-                    ['class', 'interface', 'type', 'enum', 'struct', 'trait'].includes(m.type)
-                );
-
-                if (matches.length === 0) {
-                    return toolResult(`Class "${name}" not found.`);
-                }
-
-                // Show all definitions when all=true and multiple matches
-                if (matches.length > 1 && !file && all) {
-                    const allParts = [];
-                    for (const m of matches) {
-                        const mPathCheck = resolveAndValidatePath(index, m.relativePath || path.relative(index.root, m.file));
-                        if (typeof mPathCheck !== 'string') return mPathCheck;
-                        const mCode = fs.readFileSync(m.file, 'utf-8');
-                        const mLines = mCode.split('\n');
-                        const clsCode = mLines.slice(m.startLine - 1, m.endLine).join('\n');
-                        allParts.push(output.formatClass(m, clsCode));
-                    }
-                    return toolResult(allParts.join('\n\n'));
-                }
-
-                const match = matches.length > 1 ? pickBestDefinition(matches) : matches[0];
-                // Validate file is within project root
-                const clsPathCheck = resolveAndValidatePath(index, match.relativePath || path.relative(index.root, match.file));
-                if (typeof clsPathCheck !== 'string') return clsPathCheck;
-
-                const code = fs.readFileSync(match.file, 'utf-8');
-                const codeLines = code.split('\n');
-                const clsCode = codeLines.slice(match.startLine - 1, match.endLine).join('\n');
-
-                let note = '';
-                if (matches.length > 1 && !file) {
-                    note = `Note: Found ${matches.length} definitions for "${name}". Showing ${match.relativePath}:${match.startLine}. Use file parameter to disambiguate.\n\n`;
-                }
-
                 if (max_lines !== undefined && (!Number.isInteger(max_lines) || max_lines < 1)) {
                     return toolError(`Invalid max_lines: ${max_lines}. Must be a positive integer.`);
                 }
-
-                const classLineCount = match.endLine - match.startLine + 1;
-
-                // Large class: show summary by default, truncated source with max_lines
-                if (classLineCount > 200 && max_lines === undefined) {
-                    const lines = [];
-                    lines.push(`${match.relativePath}:${match.startLine}`);
-                    lines.push(`${output.lineRange(match.startLine, match.endLine)} ${output.formatClassSignature(match)}`);
-                    lines.push('\u2500'.repeat(60));
-
-                    const methods = index.findMethodsForType(match.name);
-                    if (methods.length > 0) {
-                        lines.push(`\nMethods (${methods.length}):`);
-                        for (const m of methods) {
-                            lines.push(`  ${output.formatFunctionSignature(m)}  [line ${m.startLine}]`);
-                        }
-                    }
-
-                    lines.push(`\nClass is ${classLineCount} lines. Use max_lines param to see source, or fn command for individual methods.`);
-                    return toolResult(note + lines.join('\n'));
+                const index = getIndex(project_dir);
+                const ep = normalizeParams({ name, file, all, max_lines });
+                const { ok, result, error } = execute(index, 'class', ep);
+                if (!ok) return toolResult(error);  // soft error (class not found)
+                // MCP path security: validate all result files are within project root
+                for (const entry of result.entries) {
+                    const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
+                    if (typeof check !== 'string') return check;
                 }
-
-                if (max_lines !== undefined && classLineCount > max_lines) {
-                    const truncatedCode = codeLines.slice(match.startLine - 1, match.startLine - 1 + max_lines).join('\n');
-                    const result = output.formatClass(match, truncatedCode);
-                    return toolResult(note + result + `\n\n... showing ${max_lines} of ${classLineCount} lines`);
-                }
-
-                return toolResult(note + output.formatClass(match, clsCode));
+                const notes = result.notes.length ? result.notes.map(n => 'Note: ' + n).join('\n') + '\n\n' : '';
+                return toolResult(notes + output.formatClassResult(result));
             }
 
             case 'lines': {
-                if (!file) {
-                    return toolError('File parameter is required for lines command.');
-                }
-                if (!range || !range.trim()) {
-                    return toolError('Line range is required (e.g. "10-20" or "15").');
-                }
                 const index = getIndex(project_dir);
-                const resolved = resolveAndValidatePath(index, file);
-                if (typeof resolved !== 'string') return resolved; // toolError response
-                const filePath = resolved;
-
-                const parts = range.split('-');
-                const start = parseInt(parts[0], 10);
-                const end = parts.length > 1 ? parseInt(parts[1], 10) : start;
-
-                if (isNaN(start) || isNaN(end)) {
-                    return toolError(`Invalid line range: "${range}". Expected format: <start>-<end> or <line>`);
-                }
-                if (start < 1) {
-                    return toolError(`Invalid start line: ${start}. Line numbers must be >= 1`);
-                }
-                if (end < 1) {
-                    return toolError(`Invalid end line: ${end}. Line numbers must be >= 1`);
-                }
-                if (end < start) {
-                    return toolError(`Invalid range: end line (${end}) must be >= start line (${start})`);
-                }
-
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const fileLines = content.split('\n');
-
-                const startLine = start;
-                const endLine = end;
-
-                if (startLine > fileLines.length) {
-                    return toolError(`Line ${startLine} is out of bounds. File has ${fileLines.length} lines.`);
-                }
-
-                const actualEnd = Math.min(endLine, fileLines.length);
-                const lines = [];
-                const relPath = path.relative(index.root, filePath);
-                lines.push(`${relPath}:${startLine}-${actualEnd}`);
-                lines.push('\u2500'.repeat(60));
-                for (let i = startLine - 1; i < actualEnd; i++) {
-                    lines.push(`${output.lineNum(i + 1)} | ${fileLines[i]}`);
-                }
-
-                return toolResult(lines.join('\n'));
+                const ep = normalizeParams({ file, range });
+                const { ok, result, error } = execute(index, 'lines', ep);
+                if (!ok) return toolError(error);
+                // MCP path security: validate file is within project root
+                const check = resolveAndValidatePath(index, result.relativePath);
+                if (typeof check !== 'string') return check;
+                return toolResult(output.formatLines(result));
             }
 
             case 'expand': {
