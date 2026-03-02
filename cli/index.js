@@ -1638,8 +1638,8 @@ function printLines(lines, range) {
         process.exit(1);
     }
 
-    if (start < 1) {
-        console.error(`Invalid start line: ${start}. Line numbers must be >= 1`);
+    if (start < 1 || end < 1) {
+        console.error(`Invalid line range: line numbers must be >= 1`);
         process.exit(1);
     }
 
@@ -1876,7 +1876,7 @@ Flags can be added per-command: context myFunc --include-methods
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--stack']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -1928,7 +1928,23 @@ function parseInteractiveFlags(tokens) {
     }
     return {
         file: getValueFlag('--file'),
-        exclude: tokens.filter(a => a.startsWith('--exclude=') || a.startsWith('--not=')).flatMap(a => a.split('=').slice(1).join('=').split(',')) || [],
+        exclude: (() => {
+            const result = [];
+            // Handle --exclude=val and --not=val (equals form)
+            for (const a of tokens) {
+                if (a.startsWith('--exclude=') || a.startsWith('--not=')) {
+                    result.push(...a.split('=').slice(1).join('=').split(','));
+                }
+            }
+            // Handle --exclude val and --not val (space form)
+            for (const flag of ['--exclude', '--not']) {
+                const idx = tokens.indexOf(flag);
+                if (idx !== -1 && idx + 1 < tokens.length && !tokens[idx + 1].startsWith('-')) {
+                    result.push(...tokens[idx + 1].split(','));
+                }
+            }
+            return result;
+        })(),
         in: getValueFlag('--in'),
         includeTests: tokens.includes('--include-tests'),
         includeExported: tokens.includes('--include-exported'),

@@ -2027,3 +2027,17 @@ describe('Bug Hunt: formatRelated respects --all flag', () => {
         assert.ok(text.includes('fn11'), 'should show fn11 with all: true');
     });
 });
+
+// Bug Hunt: formatExampleJson crash when result.best is null
+describe('Bug Hunt: formatExampleJson null best', () => {
+    it('should not crash when result exists but result.best is null', () => {
+        const json = JSON.parse(output.formatExampleJson({ totalCalls: 0, best: null }, 'missing'));
+        assert.strictEqual(json.found, false);
+        assert.strictEqual(json.query, 'missing');
+    });
+
+    it('should not crash when result exists but result.best is undefined', () => {
+        const json = JSON.parse(output.formatExampleJson({ totalCalls: 0 }, 'missing'));
+        assert.strictEqual(json.found, false);
+    });
+});

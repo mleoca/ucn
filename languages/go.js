@@ -461,7 +461,7 @@ function findCallsInCode(code, parser) {
 
         // Track local closures: atoi := func(...) { ... } or var handler = func(...) { ... }
         if (node.type === 'short_var_declaration' || node.type === 'var_declaration') {
-            // Check if RHS contains a func_literal
+            // Check if a subtree contains a func_literal
             const hasFunc = (n) => {
                 if (!n) return false;
                 if (n.type === 'func_literal') return true;
@@ -470,10 +470,10 @@ function findCallsInCode(code, parser) {
                 }
                 return false;
             };
-            if (hasFunc(node)) {
-                // Extract the variable name from the LHS
-                let names = [];
-                if (node.type === 'short_var_declaration') {
+            let names = [];
+            if (node.type === 'short_var_declaration') {
+                // short_var_declaration checks the whole RHS
+                if (hasFunc(node)) {
                     const left = node.childForFieldName('left');
                     if (left) {
                         names = left.type === 'expression_list'
@@ -481,23 +481,30 @@ function findCallsInCode(code, parser) {
                                   .filter(n => n.type === 'identifier').map(n => n.text)
                             : left.type === 'identifier' ? [left.text] : [];
                     }
-                } else {
-                    // var_declaration > var_spec > name (identifier)
-                    for (let i = 0; i < node.namedChildCount; i++) {
-                        const spec = node.namedChild(i);
-                        if (spec.type === 'var_spec') {
-                            const nameNode = spec.childForFieldName('name');
+                }
+            } else {
+                // var_declaration: check per-spec so only names with func_literal values are tracked
+                // Handle both: var x = func(){} (var_declaration > var_spec)
+                //          and: var (\n x = func(){} \n) (var_declaration > var_spec_list > var_spec)
+                const collectClosureNames = (parent) => {
+                    for (let i = 0; i < parent.namedChildCount; i++) {
+                        const child = parent.namedChild(i);
+                        if (child.type === 'var_spec' && hasFunc(child)) {
+                            const nameNode = child.childForFieldName('name');
                             if (nameNode && nameNode.type === 'identifier') {
                                 names.push(nameNode.text);
                             }
+                        } else if (child.type === 'var_spec_list') {
+                            collectClosureNames(child);
                         }
                     }
-                }
-                if (names.length > 0 && functionStack.length > 0) {
-                    const scopeKey = functionStack[functionStack.length - 1].startLine;
-                    if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Set());
-                    for (const n of names) closureScopes.get(scopeKey).add(n);
-                }
+                };
+                collectClosureNames(node);
+            }
+            if (names.length > 0 && functionStack.length > 0) {
+                const scopeKey = functionStack[functionStack.length - 1].startLine;
+                if (!closureScopes.has(scopeKey)) closureScopes.set(scopeKey, new Set());
+                for (const n of names) closureScopes.get(scopeKey).add(n);
             }
         }
 

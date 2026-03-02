@@ -1054,7 +1054,8 @@ class ProjectIndex {
                 }
 
                 // Check Go/Rust-style receiver (e.g., func (r *Router) Method())
-                if (symbol.isMethod && symbol.receiver) {
+                // Also matches Rust associated functions (have receiver but isMethod=false)
+                if (symbol.receiver) {
                     const receiverBase = symbol.receiver.replace(/^\*/, '');
                     if (receiverBase === baseTypeName) {
                         methods.push(symbol);
@@ -3739,7 +3740,7 @@ class ProjectIndex {
 
         if (options.renameTo) {
             operation = 'rename';
-            newSignature = currentSignature.replace(name, options.renameTo);
+            newSignature = currentSignature.replace(new RegExp('\\b' + escapeRegExp(name) + '\\b'), options.renameTo);
 
             // All call sites need renaming
             for (const fileGroup of impact.byFile) {
