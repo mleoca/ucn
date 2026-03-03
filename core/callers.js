@@ -704,7 +704,18 @@ function findCallees(index, def, options = {}) {
                             }
                         }
                     }
-                    // Priority 4: If default (symbols[0]) is a test file, prefer non-test
+                    // Priority 4: If default is from a bundled/minified file, prefer non-bundled
+                    if (!bindingId) {
+                        const calleeFileEntry = index.files.get(callee.file);
+                        if (calleeFileEntry && calleeFileEntry.isBundled) {
+                            const nonBundled = symbols.find(s => {
+                                const fe = index.files.get(s.file);
+                                return fe && !fe.isBundled;
+                            });
+                            if (nonBundled) callee = nonBundled;
+                        }
+                    }
+                    // Priority 5: If default is a test file, prefer non-test
                     if (!bindingId) {
                         const calleeFileEntry = index.files.get(callee.file);
                         if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {

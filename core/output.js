@@ -613,6 +613,10 @@ function formatApi(symbols, filePath) {
 
     if (symbols.length === 0) {
         lines.push('  (none found)');
+        if (filePath && filePath.endsWith('.py')) {
+            lines.push('');
+            lines.push('Note: Python requires __all__ for export detection. Use \'toc\' command to see all functions/classes.');
+        }
     } else {
         // Group by file
         const byFile = new Map();

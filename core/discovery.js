@@ -30,6 +30,7 @@ const DEFAULT_IGNORES = [
 
     // Build outputs
     'dist',
+    '*-dist',
     'build',
     'out',
     '.next',
@@ -38,6 +39,12 @@ const DEFAULT_IGNORES = [
     '.output',
     '.vercel',
     '.netlify',
+    '.turbo',
+    '.parcel-cache',
+    '.svelte-kit',
+    '.docusaurus',
+    'storybook-static',
+    '_site',
 
     // Test/coverage
     'coverage',

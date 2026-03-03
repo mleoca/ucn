@@ -1477,42 +1477,145 @@ class ProjectIndex {
      */
     isKeyword(name, language) {
         if (!LANGUAGE_KEYWORDS) {
-            // Initialize on first use
+            // Initialize on first use — includes both keywords AND builtins
+            // to prevent cross-language false positives (e.g. Python set() → JS bundle)
             LANGUAGE_KEYWORDS = {
                 javascript: new Set([
+                    // Keywords
                     'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
                     'continue', 'return', 'function', 'class', 'const', 'let', 'var',
                     'new', 'this', 'super', 'import', 'export', 'default', 'from',
                     'try', 'catch', 'finally', 'throw', 'async', 'await', 'yield',
-                    'typeof', 'instanceof', 'in', 'of', 'delete', 'void', 'with'
+                    'typeof', 'instanceof', 'in', 'of', 'delete', 'void', 'with',
+                    // Global builtins
+                    'undefined', 'NaN', 'Infinity', 'globalThis',
+                    'parseInt', 'parseFloat', 'isNaN', 'isFinite',
+                    'encodeURI', 'decodeURI', 'encodeURIComponent', 'decodeURIComponent',
+                    'setTimeout', 'setInterval', 'clearTimeout', 'clearInterval',
+                    'console', 'JSON', 'Math', 'Date', 'RegExp',
+                    'Object', 'Array', 'String', 'Number', 'Boolean', 'Symbol', 'BigInt',
+                    'Map', 'Set', 'WeakMap', 'WeakSet', 'WeakRef',
+                    'Promise', 'Proxy', 'Reflect',
+                    'Error', 'TypeError', 'RangeError', 'ReferenceError', 'SyntaxError',
+                    'URIError', 'EvalError', 'AggregateError',
+                    'ArrayBuffer', 'SharedArrayBuffer', 'DataView',
+                    'Int8Array', 'Uint8Array', 'Int16Array', 'Uint16Array',
+                    'Int32Array', 'Uint32Array', 'Float32Array', 'Float64Array',
+                    'BigInt64Array', 'BigUint64Array',
+                    'TextEncoder', 'TextDecoder', 'URL', 'URLSearchParams',
+                    'fetch', 'Request', 'Response', 'Headers',
+                    'atob', 'btoa', 'structuredClone', 'queueMicrotask',
+                    'require'
                 ]),
                 python: new Set([
+                    // Keywords
                     'if', 'else', 'elif', 'for', 'while', 'def', 'class', 'return',
                     'import', 'from', 'try', 'except', 'finally', 'raise', 'async',
                     'await', 'yield', 'with', 'as', 'lambda', 'pass', 'break',
                     'continue', 'del', 'global', 'nonlocal', 'assert', 'is', 'not',
-                    'and', 'or', 'in', 'True', 'False', 'None', 'self', 'cls'
+                    'and', 'or', 'in', 'True', 'False', 'None', 'self', 'cls',
+                    // Type constructors
+                    'int', 'float', 'str', 'bool', 'list', 'dict', 'set', 'tuple',
+                    'bytes', 'bytearray', 'frozenset', 'complex', 'memoryview',
+                    'object', 'type',
+                    // Common builtins
+                    'print', 'len', 'range', 'abs', 'round', 'min', 'max', 'sum',
+                    'sorted', 'reversed', 'enumerate', 'zip', 'map', 'filter',
+                    'any', 'all', 'iter', 'next', 'hash', 'id', 'repr', 'format',
+                    'chr', 'ord', 'hex', 'oct', 'bin', 'pow', 'divmod',
+                    'input', 'open', 'super',
+                    // Introspection
+                    'isinstance', 'issubclass', 'hasattr', 'getattr', 'setattr',
+                    'delattr', 'callable', 'dir', 'vars', 'globals', 'locals', 'help',
+                    // Decorators / descriptors
+                    'property', 'staticmethod', 'classmethod',
+                    // Exception types
+                    'Exception', 'BaseException', 'ValueError', 'TypeError',
+                    'KeyError', 'IndexError', 'AttributeError', 'RuntimeError',
+                    'NotImplementedError', 'StopIteration', 'StopAsyncIteration',
+                    'GeneratorExit', 'OSError', 'IOError', 'FileNotFoundError',
+                    'FileExistsError', 'PermissionError', 'IsADirectoryError',
+                    'ImportError', 'ModuleNotFoundError', 'NameError',
+                    'UnboundLocalError', 'ZeroDivisionError', 'OverflowError',
+                    'FloatingPointError', 'ArithmeticError', 'LookupError',
+                    'RecursionError', 'MemoryError', 'SystemExit',
+                    'KeyboardInterrupt', 'AssertionError',
+                    'UnicodeError', 'UnicodeDecodeError', 'UnicodeEncodeError',
+                    'Warning', 'DeprecationWarning', 'FutureWarning',
+                    'UserWarning', 'SyntaxWarning', 'RuntimeWarning',
+                    'ConnectionError', 'TimeoutError', 'BrokenPipeError',
+                    // Other builtins
+                    'NotImplemented', 'Ellipsis', '__import__', '__name__',
+                    '__file__', '__doc__', '__all__', '__init__', '__new__',
+                    '__del__', '__repr__', '__str__', '__len__', '__iter__'
                 ]),
                 go: new Set([
+                    // Keywords
                     'if', 'else', 'for', 'switch', 'case', 'break', 'continue',
                     'return', 'func', 'type', 'struct', 'interface', 'package',
                     'import', 'go', 'defer', 'select', 'chan', 'map', 'range',
-                    'fallthrough', 'goto', 'var', 'const', 'default'
+                    'fallthrough', 'goto', 'var', 'const', 'default',
+                    // Builtins
+                    'append', 'cap', 'close', 'copy', 'delete', 'len', 'make',
+                    'new', 'panic', 'recover', 'print', 'println', 'complex',
+                    'real', 'imag', 'clear', 'min', 'max',
+                    // Builtin types (prevent cross-language matches)
+                    'error', 'string', 'bool', 'byte', 'rune',
+                    'int', 'int8', 'int16', 'int32', 'int64',
+                    'uint', 'uint8', 'uint16', 'uint32', 'uint64', 'uintptr',
+                    'float32', 'float64', 'complex64', 'complex128',
+                    'nil', 'true', 'false', 'iota'
                 ]),
                 rust: new Set([
+                    // Keywords
                     'if', 'else', 'for', 'while', 'loop', 'fn', 'impl', 'pub',
                     'mod', 'use', 'crate', 'self', 'super', 'match', 'unsafe',
                     'move', 'ref', 'mut', 'where', 'let', 'const', 'struct',
                     'enum', 'trait', 'async', 'await', 'return', 'break',
-                    'continue', 'type', 'as', 'in', 'dyn', 'static'
+                    'continue', 'type', 'as', 'in', 'dyn', 'static',
+                    // Macros (common calls that aren't project functions)
+                    'println', 'print', 'eprintln', 'eprint', 'format',
+                    'vec', 'panic', 'assert', 'assert_eq', 'assert_ne',
+                    'debug_assert', 'debug_assert_eq', 'debug_assert_ne',
+                    'todo', 'unimplemented', 'unreachable',
+                    'cfg', 'derive', 'include', 'include_str', 'include_bytes',
+                    'env', 'concat', 'stringify', 'file', 'line', 'column',
+                    // Std prelude types/traits
+                    'Some', 'None', 'Ok', 'Err', 'Box', 'Vec', 'String',
+                    'Option', 'Result', 'Clone', 'Copy', 'Drop',
+                    'Default', 'Debug', 'Display', 'Iterator',
+                    'From', 'Into', 'TryFrom', 'TryInto',
+                    'AsRef', 'AsMut', 'Deref', 'DerefMut',
+                    'Send', 'Sync', 'Sized', 'Unpin',
+                    'Fn', 'FnMut', 'FnOnce',
+                    'PartialEq', 'Eq', 'PartialOrd', 'Ord', 'Hash'
                 ]),
                 java: new Set([
+                    // Keywords
                     'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break',
                     'continue', 'return', 'class', 'interface', 'enum', 'extends',
                     'implements', 'new', 'this', 'super', 'import', 'package',
                     'try', 'catch', 'finally', 'throw', 'throws', 'abstract',
                     'static', 'final', 'synchronized', 'volatile', 'transient',
-                    'native', 'void', 'instanceof', 'default'
+                    'native', 'void', 'instanceof', 'default',
+                    // Primitive types
+                    'boolean', 'byte', 'char', 'short', 'int', 'long',
+                    'float', 'double', 'null', 'true', 'false',
+                    // java.lang builtins (auto-imported)
+                    'System', 'String', 'Object', 'Class', 'Integer', 'Long',
+                    'Double', 'Float', 'Boolean', 'Character', 'Byte', 'Short',
+                    'Math', 'StringBuilder', 'StringBuffer',
+                    'Thread', 'Runnable', 'Throwable',
+                    'Exception', 'RuntimeException', 'Error',
+                    'NullPointerException', 'IllegalArgumentException',
+                    'IllegalStateException', 'IndexOutOfBoundsException',
+                    'ClassCastException', 'UnsupportedOperationException',
+                    'ArithmeticException', 'SecurityException',
+                    'StackOverflowError', 'OutOfMemoryError',
+                    'Override', 'Deprecated', 'SuppressWarnings',
+                    'FunctionalInterface', 'SafeVarargs',
+                    'Iterable', 'Comparable', 'AutoCloseable', 'Cloneable',
+                    'Enum', 'Record', 'Void'
                 ])
             };
             // TypeScript/TSX share JavaScript keywords

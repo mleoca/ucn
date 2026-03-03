@@ -5796,3 +5796,142 @@ describe('fix R2: repeated space-form --exclude applies all values', () => {
         }
     });
 });
+
+// ============================================================================
+// FIX: Python builtins should not resolve to JS definitions
+// ============================================================================
+
+describe('fix: cross-language builtin false positives', () => {
+    it('Python builtins should not appear as callees from JS bundle', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'requirements.txt': '',
+            'app.py': [
+                'def analyze(data):',
+                '    s = set(data)',
+                '    v = abs(data[0])',
+                '    n = len(data)',
+                '    m = min(data)',
+                '    return sorted(s)',
+            ].join('\n'),
+            'bundle.js': [
+                'function set(o, k, v) { o[k] = v; }',
+                'function abs(x) { return x < 0 ? -x : x; }',
+                'function len(a) { return a.length; }',
+                'function min(a, b) { return a < b ? a : b; }',
+                'function sorted(a) { return a.slice().sort(); }',
+                'module.exports = { set, abs, len, min, sorted };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'analyze' });
+            assert.ok(result.ok, 'context should succeed');
+            // Python builtins should NOT resolve to bundle.js definitions
+            const callees = result.result.callees || [];
+            const jsCallees = callees.filter(c => c.file && c.file.includes('bundle.js'));
+            assert.strictEqual(jsCallees.length, 0,
+                `Python builtins should not resolve to JS definitions, got: ${jsCallees.map(c => c.name).join(', ')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Go builtins should not resolve to JS definitions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'go.mod': 'module test\ngo 1.21',
+            'main.go': [
+                'package main',
+                'func process() {',
+                '    s := make([]int, 10)',
+                '    n := len(s)',
+                '    s = append(s, 1)',
+                '    println(n)',
+                '}',
+            ].join('\n'),
+            'utils.js': [
+                'function len(a) { return a.length; }',
+                'function append(a, v) { a.push(v); return a; }',
+                'module.exports = { len, append };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'process' });
+            assert.ok(result.ok, 'context should succeed');
+            const callees = result.result.callees || [];
+            const jsCallees = callees.filter(c => c.file && c.file.includes('utils.js'));
+            assert.strictEqual(jsCallees.length, 0,
+                `Go builtins should not resolve to JS definitions, got: ${jsCallees.map(c => c.name).join(', ')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('isKeyword covers Python builtins', () => {
+        const dir = tmp({ 'package.json': '{"name":"t"}', 'a.py': 'x = 1' });
+        try {
+            const index = idx(dir);
+            for (const name of ['set', 'abs', 'len', 'min', 'max', 'sum', 'sorted', 'print',
+                'int', 'str', 'float', 'bool', 'list', 'dict', 'tuple',
+                'isinstance', 'hasattr', 'getattr', 'ValueError', 'TypeError', 'Exception']) {
+                assert.ok(index.isKeyword(name, 'python'), `${name} should be a Python keyword/builtin`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('isKeyword covers Go builtins', () => {
+        const dir = tmp({ 'package.json': '{"name":"t"}', 'a.go': 'package main' });
+        try {
+            const index = idx(dir);
+            for (const name of ['append', 'len', 'make', 'cap', 'close', 'copy', 'delete',
+                'panic', 'recover', 'println', 'print', 'nil', 'true', 'false']) {
+                assert.ok(index.isKeyword(name, 'go'), `${name} should be a Go keyword/builtin`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('isKeyword covers Java builtins', () => {
+        const dir = tmp({ 'package.json': '{"name":"t"}', 'A.java': 'class A {}' });
+        try {
+            const index = idx(dir);
+            for (const name of ['System', 'String', 'Object', 'Math', 'Integer',
+                'Exception', 'RuntimeException', 'NullPointerException', 'Override']) {
+                assert.ok(index.isKeyword(name, 'java'), `${name} should be a Java keyword/builtin`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('isKeyword covers Rust builtins', () => {
+        const dir = tmp({ 'package.json': '{"name":"t"}', 'a.rs': 'fn main() {}' });
+        try {
+            const index = idx(dir);
+            for (const name of ['println', 'vec', 'panic', 'assert', 'assert_eq',
+                'Some', 'None', 'Ok', 'Err', 'Box', 'Vec', 'String', 'Option', 'Result']) {
+                assert.ok(index.isKeyword(name, 'rust'), `${name} should be a Rust keyword/builtin`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('isKeyword covers JS builtins', () => {
+        const dir = tmp({ 'package.json': '{"name":"t"}', 'a.js': 'const x = 1;' });
+        try {
+            const index = idx(dir);
+            for (const name of ['console', 'JSON', 'Math', 'Date', 'Promise', 'Map', 'Set',
+                'Error', 'TypeError', 'parseInt', 'fetch', 'require', 'setTimeout']) {
+                assert.ok(index.isKeyword(name, 'javascript'), `${name} should be a JS keyword/builtin`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
