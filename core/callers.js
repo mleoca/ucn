@@ -386,6 +386,13 @@ function findCallees(index, def, options = {}) {
         let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
         let selfMethodCalls = null; // collected for Python self.method() resolution
 
+        // Build local variable type map for receiver resolution
+        // Scans for patterns like: bt = Backtester(...) → bt maps to Backtester
+        let localTypes = null;
+        if (language === 'python' || language === 'javascript') {
+            localTypes = _buildLocalTypeMap(index, def, calls);
+        }
+
         for (const call of calls) {
             // Filter to calls within this function's scope
             // Method 1: Direct match via enclosingFunction (fast path for direct calls)
@@ -412,6 +419,22 @@ function findCallees(index, def, options = {}) {
                     // self.method() / cls.method() / this.method() — resolve to same-class method below
                 } else if (call.receiver === 'super') {
                     // super().method() — resolve to parent class method below
+                } else if (localTypes && localTypes.has(call.receiver)) {
+                    // Resolve method calls on locally-constructed objects:
+                    // bt = Backtester(...); bt.run_backtest() → Backtester.run_backtest
+                    const className = localTypes.get(call.receiver);
+                    const symbols = index.symbols.get(call.name);
+                    const match = symbols?.find(s => s.className === className);
+                    if (match) {
+                        const key = match.bindingId || `${className}.${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                        } else {
+                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1 });
+                        }
+                    }
+                    continue;
                 } else if (language !== 'go' && language !== 'java' && language !== 'rust' && !options.includeMethods) {
                     continue;
                 }
@@ -696,11 +719,20 @@ function findCallees(index, def, options = {}) {
                         const sameDir = symbols.find(s => path.dirname(s.file) === defDir);
                         if (sameDir) {
                             callee = sameDir;
-                        } else if (defReceiver) {
-                            // Priority 3: Same receiver type (for methods)
-                            const sameReceiver = symbols.find(s => s.receiver === defReceiver);
-                            if (sameReceiver) {
-                                callee = sameReceiver;
+                        } else {
+                            // Priority 2.5: Imported file — check if the caller's file imports
+                            // from any of the candidate callee files
+                            const callerImports = fileEntry?.imports || [];
+                            const importedFiles = new Set(callerImports.map(imp => imp.resolvedPath).filter(Boolean));
+                            const importedCallee = symbols.find(s => importedFiles.has(s.file));
+                            if (importedCallee) {
+                                callee = importedCallee;
+                            } else if (defReceiver) {
+                                // Priority 3: Same receiver type (for methods)
+                                const sameReceiver = symbols.find(s => s.receiver === defReceiver);
+                                if (sameReceiver) {
+                                    callee = sameReceiver;
+                                }
                             }
                         }
                     }
@@ -787,6 +819,60 @@ function getInstanceAttributeTypes(index, filePath, className) {
     }
 
     return fileCache.get(className) || null;
+}
+
+/**
+ * Build a local variable type map for a function body.
+ * Scans for constructor-call assignments: var = ClassName(...)
+ * Returns Map<varName, className> or null if none found.
+ * @param {object} index - ProjectIndex instance
+ * @param {object} def - Function definition with file, startLine, endLine
+ * @param {Array} calls - Cached call sites for the file
+ */
+function _buildLocalTypeMap(index, def, calls) {
+    let content;
+    try {
+        content = index._readFile(def.file);
+    } catch {
+        return null;
+    }
+    const lines = content.split('\n');
+    const localTypes = new Map();
+
+    for (const call of calls) {
+        // Only look at calls within this function's scope
+        if (call.line < def.startLine || call.line > def.endLine) continue;
+        // Only direct calls (not method calls) — these are potential constructors
+        if (call.isMethod || call.isPotentialCallback) continue;
+
+        // Check if this call's name corresponds to a class in the symbol table
+        const symbols = index.symbols.get(call.name);
+        if (!symbols) continue;
+        const isClass = symbols.some(s => NON_CALLABLE_TYPES.has(s.type));
+        if (!isClass) continue;
+
+        // Check the source line for assignment pattern: var = ClassName(...)
+        const sourceLine = lines[call.line - 1];
+        if (!sourceLine) continue;
+
+        // Match: identifier = ClassName(...) or identifier: Type = ClassName(...)
+        const escapedName = call.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const assignMatch = sourceLine.match(
+            new RegExp(`(\\w+)\\s*(?::\\s*\\w+)?\\s*=\\s*${escapedName}\\s*\\(`)
+        );
+        if (assignMatch) {
+            localTypes.set(assignMatch[1], call.name);
+        }
+        // Match: with ClassName(...) as identifier:
+        const withMatch = sourceLine.match(
+            new RegExp(`with\\s+${escapedName}\\s*\\([^)]*\\)\\s+as\\s+(\\w+)`)
+        );
+        if (withMatch) {
+            localTypes.set(withMatch[1], call.name);
+        }
+    }
+
+    return localTypes.size > 0 ? localTypes : null;
 }
 
 /**

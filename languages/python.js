@@ -330,6 +330,14 @@ function findStateObjects(code, parser) {
     const objects = [];
 
     const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
+    // Pattern for UPPER_CASE constants that may have scalar values (string, number, bool, etc.)
+    const constantPattern = /^[A-Z][A-Z0-9_]{1,}$/;
+    // RHS types that are scalar/simple values (not dict/list which are handled separately)
+    const scalarTypes = new Set([
+        'string', 'concatenated_string', 'integer', 'float', 'true', 'false', 'none',
+        'unary_operator', 'binary_operator', 'tuple', 'set', 'parenthesized_expression',
+        'call', 'attribute', 'identifier', 'subscript',
+    ]);
 
     traverseTree(tree.rootNode, (node) => {
         if (node.type === 'expression_statement' && node.parent === tree.rootNode) {
@@ -346,6 +354,10 @@ function findStateObjects(code, parser) {
                     if ((isObject || isArray) && statePattern.test(name)) {
                         const { startLine, endLine } = nodeToLocation(node, code);
                         objects.push({ name, startLine, endLine });
+                    } else if (constantPattern.test(name) && scalarTypes.has(rightNode.type)) {
+                        // Module-level UPPER_CASE constants with scalar values
+                        const { startLine, endLine } = nodeToLocation(node, code);
+                        objects.push({ name, startLine, endLine, isConstant: true });
                     }
                 }
             }
@@ -487,8 +499,23 @@ function findCallsInCode(code, parser) {
                         }
                     }
                 }
-                // Track non-callable assignments: count = 5, name = "hello"
+                // Track non-callable assignments.
+                // First: explicit literal check (handles dicts-with-lambdas correctly)
                 if (right && isNonCallableInit(right)) {
+                    nonCallableNames.add(left.text);
+                }
+                // Second: function call results are generally non-callable data
+                // (e.g., close = series.dropna(), result = db.query(...))
+                // Exception: partial() already handled above via alias tracking.
+                else if (right?.type === 'call' && !aliases.has(left.text)) {
+                    nonCallableNames.add(left.text);
+                }
+                // Third: subscript/attribute access results are non-callable data
+                // (e.g., close = candles["close"].values, item = data[0])
+                else if (right && !aliases.has(left.text) &&
+                    ['subscript', 'attribute', 'binary_operator', 'comparison_operator',
+                     'unary_operator', 'conditional_expression', 'await',
+                     'parenthesized_expression', 'not_operator', 'boolean_operator'].includes(right.type)) {
                     nonCallableNames.add(left.text);
                 }
             }

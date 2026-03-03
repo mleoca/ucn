@@ -433,6 +433,29 @@ function plan(index, name, options = {}) {
                 });
             }
         }
+
+        // Also include import statements that reference the renamed function
+        const usages = index.usages(name, { codeOnly: true });
+        const importUsages = usages.filter(u => u.usageType === 'import' && !u.isDefinition);
+        for (const imp of importUsages) {
+            // Skip if already covered by a call site change in the same file:line
+            const alreadyCovered = changes.some(c =>
+                c.file === (imp.relativePath || imp.file) && c.line === imp.line
+            );
+            if (alreadyCovered) continue;
+            const newImport = imp.content.trim().replace(
+                new RegExp('\\b' + escapeRegExp(name) + '\\b'),
+                options.renameTo
+            );
+            changes.push({
+                file: imp.relativePath || imp.file,
+                line: imp.line,
+                expression: imp.content.trim(),
+                suggestion: `Update import: ${newImport}`,
+                newExpression: newImport,
+                isImport: true
+            });
+        }
     }
 
     return {

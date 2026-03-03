@@ -126,6 +126,7 @@ const HANDLERS = {
         const result = index.impact(p.name, {
             file: p.file,
             exclude: toExcludeArray(p.exclude),
+            top: num(p.top, undefined),
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
@@ -184,7 +185,13 @@ const HANDLERS = {
     find: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
-        const exclude = applyTestExclusions(p.exclude, p.includeTests);
+        // Auto-include tests when pattern clearly targets test functions
+        // But only if the user didn't explicitly set include_tests=false
+        let includeTests = p.includeTests;
+        if (includeTests === undefined && p.name && /^test[_*?]/i.test(p.name)) {
+            includeTests = true;
+        }
+        const exclude = applyTestExclusions(p.exclude, includeTests);
         const result = index.find(p.name, {
             file: p.file,
             exact: p.exact || false,

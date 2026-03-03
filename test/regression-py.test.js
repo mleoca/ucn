@@ -1055,3 +1055,213 @@ class Point:
         fs.unlinkSync(tmpFile);
     });
 });
+
+// ============================================================================
+// Evaluation report fixes (2026-03-03)
+// ============================================================================
+
+describe('fix #119: local variable name confused with method callers', () => {
+    it('should NOT report variable ref as caller when assigned from call result', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'class HttpClient:\n    def close(self):\n        pass\n\ndef analyze(data):\n    close = data.dropna()\n    if len(close) >= 50:\n        return True\n    return False\n'
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('close');
+            const falsePositive = callers.find(c =>
+                c.callerName === 'analyze' && c.content.includes('len(close)')
+            );
+            assert.ok(!falsePositive,
+                'len(close) should not be a caller of close() method');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should NOT report variable ref as caller when assigned from subscript', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'class Connection:\n    def close(self):\n        pass\n\ndef process(candles):\n    close = candles["close"].values\n    current = close[-1]\n    result = len(close)\n    return result\n'
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('close');
+            const falsePositive = callers.find(c =>
+                c.callerName === 'process'
+            );
+            assert.ok(!falsePositive,
+                'variable refs to close should not be callers of close() method');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should still detect real callback passing', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'def handler():\n    pass\n\ndef setup():\n    register(handler)\n'
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('handler');
+            assert.ok(callers.some(c => c.callerName === 'setup'),
+                'real callback passing should still be detected');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #120: local variable type inference for trace callees', () => {
+    it('should resolve method calls on locally-constructed objects', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const { findCallees } = require('../core/callers');
+        const dir = tmp({
+            'requirements.txt': '',
+            'engine.py': 'class Backtester:\n    def run_backtest(self, months=6):\n        return {}\n\nclass Rebalancer:\n    def generate_plan(self, data):\n        return {}\n\ndef generate_report():\n    bt = Backtester()\n    result = bt.run_backtest(months=6)\n    rb = Rebalancer()\n    plan = rb.generate_plan(result)\n    return plan\n'
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('generate_report')[0];
+            const callees = findCallees(index, def);
+            const names = callees.map(c => c.name);
+            assert.ok(names.includes('run_backtest'),
+                `should find run_backtest callee, got: ${names.join(', ')}`);
+            assert.ok(names.includes('generate_plan'),
+                `should find generate_plan callee, got: ${names.join(', ')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should resolve with-statement context managers', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const { findCallees } = require('../core/callers');
+        const dir = tmp({
+            'requirements.txt': '',
+            'engine.py': 'class Backtester:\n    def __enter__(self):\n        return self\n    def __exit__(self, *args):\n        pass\n    def run_backtest(self, months=6):\n        return {}\n\ndef generate_report():\n    with Backtester() as bt:\n        result = bt.run_backtest(months=6)\n    return result\n'
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('generate_report')[0];
+            const callees = findCallees(index, def);
+            const names = callees.map(c => c.name);
+            assert.ok(names.includes('run_backtest'),
+                `should find run_backtest via with-statement, got: ${names.join(', ')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #130: Python module-level constants visible to find/about
+// ============================================================================
+
+describe('fix #130: Python module-level constants', () => {
+    it('should index UPPER_CASE scalar constants', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'config.py': `
+DEFAULT_VALUE = -999.0
+MODE_ACTIVE = "active"
+MODE_IDLE = "idle"
+DATA_DIR = "/var/data/app.db"
+MAX_RETRIES = 3
+ENABLED = True
+THRESHOLD = 3.14159
+`,
+        });
+        try {
+            const index = idx(dir);
+            for (const name of ['DEFAULT_VALUE', 'MODE_ACTIVE', 'DATA_DIR', 'MAX_RETRIES', 'ENABLED']) {
+                const defs = index.symbols.get(name);
+                assert.ok(defs && defs.length > 0, `should find constant ${name}`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should NOT index lowercase or camelCase module-level assignments', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'config.py': `
+my_var = 42
+someValue = "hello"
+_private = True
+x = 1
+`,
+        });
+        try {
+            const index = idx(dir);
+            for (const name of ['my_var', 'someValue', '_private', 'x']) {
+                const defs = index.symbols.get(name);
+                assert.ok(!defs || defs.length === 0, `should NOT index ${name} as a constant`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should make constants discoverable via find glob', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'modes.py': `
+MODE_ACTIVE = "active"
+MODE_IDLE = "idle"
+MODE_ERROR = "error"
+MODE_DONE = "done"
+`,
+        });
+        try {
+            const index = idx(dir);
+            const results = index.find('MODE_*');
+            assert.ok(results.length >= 4, `should find 4 MODE_* constants, got ${results.length}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should work with about command for constants', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'config.py': `DATA_DIR = "/var/data"`,
+            'app.py': `from config import DATA_DIR
+def connect():
+    return open(DATA_DIR)
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.about('DATA_DIR');
+            assert.ok(result, 'about should find the constant');
+            assert.ok(result.symbol.name === 'DATA_DIR');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should still index dict/list state objects as before', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'config.py': `
+CONFIG = {"host": "localhost", "port": 8080}
+ALLOWED_HOSTS = ["localhost", "127.0.0.1"]
+MAX_RETRIES = 3
+`,
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(index.symbols.get('CONFIG'), 'should find dict CONFIG');
+            assert.ok(index.symbols.get('ALLOWED_HOSTS'), 'should find list ALLOWED_HOSTS');
+            assert.ok(index.symbols.get('MAX_RETRIES'), 'should find scalar MAX_RETRIES');
+        } finally {
+            rm(dir);
+        }
+    });
+});

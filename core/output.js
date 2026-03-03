@@ -938,7 +938,11 @@ function formatImpact(impact, options = {}) {
     lines.push('');
 
     // Summary
-    lines.push(`CALL SITES: ${impact.totalCallSites}`);
+    if (impact.shownCallSites !== undefined && impact.shownCallSites < impact.totalCallSites) {
+        lines.push(`CALL SITES: ${impact.shownCallSites} shown of ${impact.totalCallSites} total`);
+    } else {
+        lines.push(`CALL SITES: ${impact.totalCallSites}`);
+    }
     lines.push(`  Files affected: ${impact.byFile.length}`);
 
     // Patterns

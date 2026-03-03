@@ -2952,3 +2952,44 @@ describe('Bug Hunt: HTML handler usages include column field', () => {
             `handler usage should include column field, got: ${JSON.stringify(handlerUsage)}`);
     });
 });
+
+// ============================================================================
+// Evaluation report fixes (2026-03-03)
+// ============================================================================
+
+describe('fix #123: TS graph importers via tsconfig references', () => {
+    it('should resolve importers when paths are in referenced tsconfig', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': JSON.stringify({
+                files: [],
+                references: [{ path: './tsconfig.app.json' }]
+            }),
+            'tsconfig.app.json': JSON.stringify({
+                compilerOptions: {
+                    baseUrl: '.',
+                    paths: { '@/*': ['./src/*'] }
+                },
+                include: ['src']
+            }),
+            'src/hooks/useData.ts': 'export function useData() { return null; }',
+            'src/pages/Home.tsx': 'import { useData } from "@/hooks/useData";\nexport function Home() { return useData(); }'
+        });
+        try {
+            const index = idx(dir);
+            const graph = index.graph('src/hooks/useData.ts');
+            assert.ok(graph, 'graph should return result');
+            // graph.importers is { nodes: [...], edges: [...] }
+            const importerNodes = graph.importers.nodes.filter(n => n.depth > 0);
+            assert.ok(importerNodes.length > 0,
+                `should find importers, got ${importerNodes.length}`);
+            const hasHome = importerNodes.some(n =>
+                n.relativePath && n.relativePath.includes('Home')
+            );
+            assert.ok(hasHome, `Home.tsx should be an importer, got: ${JSON.stringify(importerNodes.map(n => n.relativePath))}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
