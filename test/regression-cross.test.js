@@ -4445,15 +4445,15 @@ describe('FIX 133 — Interactive --file value (space-separated)', () => {
 // BUG HUNT ROUND — March 2026
 // ============================================================================
 
-describe('Bug Hunt: find("*") bare wildcard should not hang', () => {
-    it('should return empty array for bare wildcard patterns', () => {
+describe('Bug Hunt: find("*") bare wildcard returns all symbols', () => {
+    it('should return all symbols for bare wildcard patterns', () => {
         const index = new ProjectIndex('.');
         index.build(null, { quiet: true });
-        // Bare wildcards should return empty, not iterate all symbols
-        assert.deepStrictEqual(index.find('*'), []);
-        assert.deepStrictEqual(index.find('?'), []);
-        assert.deepStrictEqual(index.find('**'), []);
-        assert.deepStrictEqual(index.find('???'), []);
+        // Bare wildcards should return all symbols (not hang or return empty)
+        const allStar = index.find('*');
+        assert.ok(allStar.length > 0, 'find("*") should return symbols');
+        const allQuestion = index.find('?');
+        assert.ok(allQuestion.length > 0, 'find("?") should return symbols');
     });
 
     it('should still work for meaningful glob patterns', () => {
@@ -5929,6 +5929,268 @@ describe('fix: cross-language builtin false positives', () => {
             for (const name of ['console', 'JSON', 'Math', 'Date', 'Promise', 'Map', 'Set',
                 'Error', 'TypeError', 'parseInt', 'fetch', 'require', 'setTimeout']) {
                 assert.ok(index.isKeyword(name, 'javascript'), `${name} should be a JS keyword/builtin`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug Report Round 2 — bugs #6-#12
+// ============================================================================
+
+describe('fix #124: find respects explicit include_tests=false', () => {
+    it('should filter out test functions when include_tests is explicitly false', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/lib.js': 'function testSetup() { return 1; }\nmodule.exports = { testSetup };',
+            'test/unit.test.js': 'function test_one() {}\nfunction test_two() {}',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'find', { name: 'test_*', includeTests: false });
+            assert.ok(result.ok);
+            const testFileFns = result.result.filter(m =>
+                m.relativePath && m.relativePath.includes('test/')
+            );
+            assert.strictEqual(testFileFns.length, 0, 'should not include functions from test files');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should auto-include tests when include_tests is undefined and pattern is test_*', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'test/unit.test.js': 'function test_one() {}\nfunction test_two() {}',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'find', { name: 'test_*' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length >= 2, 'should auto-include test functions');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #125: expand shows full function source', () => {
+    it('should render complete function body, not just signature', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `function compute() {
+  const a = 1;
+  const b = 2;
+  return a + b;
+}
+
+function run() {
+  return compute();
+}
+
+module.exports = { compute, run };`,
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('compute');
+            assert.ok(ctx);
+            const formatted = output.formatContext(ctx);
+            assert.ok(formatted.expandable.length > 0, 'should have expandable items');
+            const item = formatted.expandable[0];
+            const result = execute(index, 'expand', {
+                itemNum: item.num,
+                match: item,
+            });
+            assert.ok(result.ok, 'expand should succeed');
+            const lines = result.result.text.split('\n');
+            assert.ok(lines.length > 4, `should show full function body, got ${lines.length} lines`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should detect Python function end via indentation', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': `def compute():
+    a = 1
+    b = 2
+    return a + b
+
+def run():
+    return compute()
+`,
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('compute');
+            assert.ok(ctx, 'context should find compute');
+            const formatted = output.formatContext(ctx);
+            const callerItem = formatted.expandable.find(e => e.name === 'run');
+            assert.ok(callerItem, 'should have expandable caller item for run');
+            const result = execute(index, 'expand', {
+                itemNum: callerItem.num,
+                match: callerItem,
+            });
+            assert.ok(result.ok);
+            assert.ok(result.result.text.includes('return compute()'), 'should include function body');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #126: impact respects top parameter', () => {
+    it('should limit call sites when top is specified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function doWork(x) { return x; }\nmodule.exports = { doWork };',
+            'a.js': 'const { doWork } = require("./lib");\ndoWork(1);\ndoWork(2);\ndoWork(3);',
+            'b.js': 'const { doWork } = require("./lib");\ndoWork(4);\ndoWork(5);',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'impact', { name: 'doWork', top: 2 });
+            assert.ok(result.ok);
+            let shownSites = 0;
+            for (const fg of result.result.byFile) {
+                shownSites += fg.sites.length;
+            }
+            assert.ok(shownSites <= 2, `should show at most 2 sites, got ${shownSites}`);
+            assert.ok(result.result.totalCallSites >= 5, 'totalCallSites should reflect full count');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should show all sites when top is not specified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function doWork(x) { return x; }\nmodule.exports = { doWork };',
+            'a.js': 'const { doWork } = require("./lib");\ndoWork(1);\ndoWork(2);',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'impact', { name: 'doWork' });
+            assert.ok(result.ok);
+            let shownSites = 0;
+            for (const fg of result.result.byFile) {
+                shownSites += fg.sites.length;
+            }
+            assert.strictEqual(shownSites, result.result.totalCallSites, 'should show all sites');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #127: plan includes import updates for rename', () => {
+    it('should include import statement changes in rename plan', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `export function compute(x) { return x * 2; }`,
+            'app.js': `import { compute } from './lib.js';
+function run() { return compute(5); }`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'compute', renameTo: 'calculate' });
+            assert.ok(result.ok);
+            const plan = result.result;
+            assert.ok(plan.found, 'plan should find the function');
+            assert.strictEqual(plan.operation, 'rename');
+            // Check that changes cover both calls and imports
+            const importChanges = plan.changes.filter(c => c.isImport);
+            assert.ok(importChanges.length > 0, 'should include import statement changes');
+            assert.ok(importChanges[0].suggestion.includes('calculate'), 'import should reference new name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should not duplicate import changes when import line is also a call site', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function doWork() { return 1; }\nmodule.exports = { doWork };',
+            'app.js': 'const { doWork } = require("./lib");\ndoWork();\ndoWork();',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', { name: 'doWork', renameTo: 'doTask' });
+            assert.ok(result.ok);
+            const changeKeys = result.result.changes.map(c => `${c.file}:${c.line}`);
+            const uniqueKeys = new Set(changeKeys);
+            assert.strictEqual(changeKeys.length, uniqueKeys.size, 'should not have duplicate changes');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #128: cross-language name collision uses usage tiebreaker', () => {
+    it('should prefer the definition with more usages when scores tie', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'requirements.txt': '',
+            'tools/handler.py': `class Handler:
+    def __init__(self):
+        pass
+    def process(self):
+        pass
+`,
+            'svc_a.py': `from tools.handler import Handler
+h = Handler()
+h.process()
+`,
+            'svc_b.py': `from tools.handler import Handler
+h = Handler()
+`,
+            'components/Handler.tsx': `export function Handler() {
+  return <div>handler</div>;
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.resolveSymbol('Handler');
+            assert.ok(result.def, 'should resolve Handler');
+            // The Python class should win due to more usages
+            assert.ok(
+                result.def.relativePath.includes('.py'),
+                `should prefer Python class with more usages, got ${result.def.relativePath}`
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #129: trace uses import context to disambiguate callees', () => {
+    it('should prefer callee from imported file over same-name in unrelated file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'utils/format.js': `function format(data) { return JSON.stringify(data); }
+module.exports = { format };`,
+            'utils/other.js': `function format(html) { return html.trim(); }
+module.exports = { format };`,
+            'app.js': `const { format } = require('./utils/format');
+function run() {
+  return format({});
+}
+module.exports = { run };`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.trace('run', { depth: 2 });
+            assert.ok(result);
+            assert.ok(result.tree);
+            const fmtChild = result.tree.children.find(c => c.name === 'format');
+            if (fmtChild) {
+                assert.ok(
+                    fmtChild.file.includes('utils/format'),
+                    `should resolve to imported format, got ${fmtChild.file}`
+                );
             }
         } finally {
             rm(dir);

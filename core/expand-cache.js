@@ -126,6 +126,50 @@ class ExpandCache {
 }
 
 /**
+ * Detect the end of a function/method body starting from startLine.
+ * Uses brace/indent counting to find the closing boundary.
+ * Falls back to startLine + 30 if detection fails.
+ */
+function _detectFunctionEnd(fileLines, startLine) {
+    const maxScan = 500; // Avoid scanning huge files
+    const idx = startLine - 1;
+    if (idx >= fileLines.length) return startLine;
+
+    const firstLine = fileLines[idx];
+
+    // Python: indentation-based — find the first non-empty line at same or lesser indent
+    if (/^\s*def\s|^\s*class\s|^\s*async\s+def\s/.test(firstLine)) {
+        const baseIndent = firstLine.match(/^(\s*)/)[1].length;
+        let end = startLine;
+        for (let i = idx + 1; i < Math.min(idx + maxScan, fileLines.length); i++) {
+            const line = fileLines[i];
+            if (line.trim() === '') { end = i + 1; continue; } // blank lines are part of body
+            const indent = line.match(/^(\s*)/)[1].length;
+            if (indent <= baseIndent) break;
+            end = i + 1;
+        }
+        return end;
+    }
+
+    // Brace-based languages (JS/TS/Go/Java/Rust): count braces
+    let braceCount = 0;
+    let foundBrace = false;
+    for (let i = idx; i < Math.min(idx + maxScan, fileLines.length); i++) {
+        const line = fileLines[i];
+        for (const ch of line) {
+            if (ch === '{') { braceCount++; foundBrace = true; }
+            else if (ch === '}') { braceCount--; }
+        }
+        if (foundBrace && braceCount <= 0) {
+            return i + 1;
+        }
+    }
+
+    // Fallback: show 30 lines from start
+    return Math.min(startLine + 30, fileLines.length);
+}
+
+/**
  * Render an expand match to text lines.
  * Shared by MCP and interactive mode to avoid duplicated rendering logic.
  *
@@ -156,7 +200,13 @@ function renderExpandItem(match, root, { validateRoot = false } = {}) {
     const content = fs.readFileSync(filePath, 'utf-8');
     const fileLines = content.split('\n');
     const startLine = match.startLine || match.line || 1;
-    const endLine = match.endLine || startLine + 20;
+    let endLine = match.endLine;
+
+    // When endLine is missing or equals startLine, the expand would show only 1 line.
+    // Scan forward from startLine to find the actual function/method body end.
+    if (!endLine || endLine <= startLine) {
+        endLine = _detectFunctionEnd(fileLines, startLine);
+    }
 
     const lines = [];
     lines.push(`[${match.num}] ${match.name} (${match.type})`);

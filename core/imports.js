@@ -507,6 +507,32 @@ function loadTsConfig(tsconfigPath, visited) {
         }
     }
 
+    // Follow project references to collect paths from referenced configs
+    // (tsconfig.json with "references" pointing to tsconfig.app.json, tsconfig.node.json, etc.)
+    if (config.references && Array.isArray(config.references)) {
+        for (const ref of config.references) {
+            if (!ref.path) continue;
+            let refPath = path.resolve(configDir, ref.path);
+            // If reference points to a directory, look for tsconfig.json inside it
+            if (fs.existsSync(refPath) && fs.statSync(refPath).isDirectory()) {
+                refPath = path.join(refPath, 'tsconfig.json');
+            }
+            // Add .json extension if not present
+            if (!refPath.endsWith('.json')) refPath += '.json';
+            if (fs.existsSync(refPath)) {
+                try {
+                    const refResult = loadTsConfig(refPath, visited);
+                    if (refResult) {
+                        basePaths = { ...basePaths, ...refResult.paths };
+                        if (refResult.baseUrl && !baseUrl) baseUrl = refResult.baseUrl;
+                    }
+                } catch {
+                    // Skip malformed reference config
+                }
+            }
+        }
+    }
+
     // Child config values override base config
     const mergedPaths = { ...basePaths, ...(config.compilerOptions?.paths || {}) };
     const compiledPaths = Object.entries(mergedPaths).map(([pattern, targets]) => ({

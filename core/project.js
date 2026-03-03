@@ -735,6 +735,20 @@ class ProjectIndex {
         // Sort by score descending, then by index order for stability
         scored.sort((a, b) => b.score - a.score);
 
+        // Tiebreaker: when top candidates have equal score, prefer by usage count
+        if (scored.length > 1 && scored[0].score === scored[1].score) {
+            const tiedScore = scored[0].score;
+            const tiedCandidates = scored.filter(s => s.score === tiedScore);
+            for (const candidate of tiedCandidates) {
+                candidate.usageCount = this.countSymbolUsages(candidate.def).total;
+            }
+            tiedCandidates.sort((a, b) => b.usageCount - a.usageCount);
+            // Rebuild scored array: sorted tied candidates first, then rest
+            const rest = scored.filter(s => s.score !== tiedScore);
+            scored.length = 0;
+            scored.push(...tiedCandidates, ...rest);
+        }
+
         const def = scored[0].def;
 
         // Build warnings
@@ -759,10 +773,17 @@ class ProjectIndex {
         // Glob pattern matching (e.g., _update*, handle*Request, get?ata)
         const isGlob = name.includes('*') || name.includes('?');
         if (isGlob && !options.exact) {
-            // Guard against bare wildcards that would match everything
+            // Bare wildcard: return all symbols
             const stripped = name.replace(/[*?]/g, '');
             if (stripped.length === 0) {
-                return [];
+                const all = [];
+                for (const [, symbols] of this.symbols) {
+                    for (const sym of symbols) {
+                        all.push({ ...sym, _fuzzyScore: 800 });
+                    }
+                }
+                all.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+                return this._applyFindFilters(all, options);
             }
             const globRegex = new RegExp('^' + name.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
             const matches = [];
@@ -2661,6 +2682,12 @@ class ProjectIndex {
             filteredSites = callSites.filter(s => this.matchesFilters(s.file, { exclude: options.exclude }));
         }
 
+        // Apply top limit if specified (limits total call sites shown)
+        const totalBeforeLimit = filteredSites.length;
+        if (options.top && options.top > 0 && filteredSites.length > options.top) {
+            filteredSites = filteredSites.slice(0, options.top);
+        }
+
         // Group by file
         const byFile = new Map();
         for (const site of filteredSites) {
@@ -2680,7 +2707,8 @@ class ProjectIndex {
             signature: this.formatSignature(def),
             params: def.params,
             paramsStructured: def.paramsStructured,
-            totalCallSites: filteredSites.length,
+            totalCallSites: totalBeforeLimit,
+            shownCallSites: filteredSites.length,
             byFile: Array.from(byFile.entries()).map(([file, sites]) => ({
                 file,
                 count: sites.length,

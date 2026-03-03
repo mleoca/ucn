@@ -1010,3 +1010,55 @@ describe('fix R2: CLI --max-lines rejects non-integer values', () => {
             `valid max-lines should not error, got: ${out.slice(0, 200)}`);
     });
 });
+
+// ============================================================================
+// Evaluation report fixes (2026-03-03)
+// ============================================================================
+
+describe('fix #121: find("*") should return all symbols', () => {
+    it('bare wildcard returns all symbols', () => {
+        const { tmp, rm, idx } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function alpha() {}\nfunction beta() {}',
+            'b.js': 'function gamma() {}'
+        });
+        try {
+            const index = idx(dir);
+            const results = index.find('*');
+            assert.ok(results.length >= 3,
+                `find("*") should find at least 3 symbols, got ${results.length}`);
+            const names = results.map(r => r.name);
+            assert.ok(names.includes('alpha'), 'should find alpha');
+            assert.ok(names.includes('beta'), 'should find beta');
+            assert.ok(names.includes('gamma'), 'should find gamma');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #122: find("test_*") should include test files', () => {
+    it('auto-includes test files when pattern starts with test', () => {
+        const { tmp, rm } = require('./helpers');
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'requirements.txt': '',
+            'app.py': 'def main():\n    pass',
+            'tests/test_app.py': 'def test_main_works():\n    pass\ndef test_edge_case():\n    pass'
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            const { ok, result } = execute(index, 'find', { name: 'test_*' });
+            assert.ok(ok, 'find should succeed');
+            assert.ok(result.length >= 2,
+                `should find at least 2 test functions, got ${result.length}`);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('test_main_works'), 'should find test_main_works');
+            assert.ok(names.includes('test_edge_case'), 'should find test_edge_case');
+        } finally {
+            rm(dir);
+        }
+    });
+});
