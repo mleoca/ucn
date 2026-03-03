@@ -276,7 +276,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, file, exclude, with_types, all, include_methods, include_uncertain, top });
                 const { ok, result, error } = execute(index, 'about', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error — won't kill sibling calls
                 return toolResult(output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.'
@@ -299,7 +299,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, file, exclude });
                 const { ok, result, error } = execute(index, 'impact', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatImpact(result));
             }
 
@@ -315,7 +315,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, file, depth, all, include_methods, include_uncertain });
                 const { ok, result, error } = execute(index, 'trace', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
@@ -347,7 +347,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, file, exclude, include_tests, exact, in: inPath });
                 const { ok, result, error } = execute(index, 'find', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatFind(result, name, top));
             }
 
@@ -355,7 +355,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, exclude, include_tests, code_only, context: ctxLines, in: inPath });
                 const { ok, result, error } = execute(index, 'usages', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatUsages(result, name));
             }
 
@@ -363,7 +363,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ detailed, top_level, all, top });
                 const { ok, result, error } = execute(index, 'toc', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 }));
@@ -373,7 +373,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ term, exclude, include_tests, code_only, context: ctxLines, case_sensitive, in: inPath, regex });
                 const { ok, result, error } = execute(index, 'search', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatSearch(result, term));
             }
 
@@ -381,7 +381,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, calls_only });
                 const { ok, result, error } = execute(index, 'tests', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTests(result, name));
             }
 
@@ -389,7 +389,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ exclude, in: inPath, include_exported, include_decorated, include_tests });
                 const { ok, result, error } = execute(index, 'deadcode', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatDeadcode(result, {
                     top: top || 0,
                     decoratedHint: !include_decorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
@@ -402,28 +402,28 @@ server.registerTool(
             case 'imports': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'imports', { file });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatImports(result, file));
             }
 
             case 'exporters': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'exporters', { file });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatExporters(result, file));
             }
 
             case 'file_exports': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'fileExports', { file });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatFileExports(result, file));
             }
 
             case 'graph': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'graph', { file, direction, depth, all });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatGraph(result, {
                     showAll: all || depth !== undefined,
                     maxDepth: depth ?? 2, file,
@@ -437,7 +437,7 @@ server.registerTool(
             case 'verify': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'verify', { name, file });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatVerify(result));
             }
 
@@ -445,14 +445,14 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, add_param, remove_param, rename_to, default_value, file });
                 const { ok, result, error } = execute(index, 'plan', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatPlan(result));
             }
 
             case 'diff_impact': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'diffImpact', { base, staged, file });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error — e.g. "not a git repo"
                 return toolResult(output.formatDiffImpact(result));
             }
 
@@ -461,28 +461,28 @@ server.registerTool(
             case 'typedef': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'typedef', { name, exact });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTypedef(result, name));
             }
 
             case 'stacktrace': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'stacktrace', { stack });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatStackTrace(result));
             }
 
             case 'api': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'api', { file });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatApi(result, file || '.'));
             }
 
             case 'stats': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'stats', { functions });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatStats(result, { top: top || 0 }));
             }
 
@@ -494,7 +494,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, file, all });
                 const { ok, result, error } = execute(index, 'fn', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
@@ -527,7 +527,7 @@ server.registerTool(
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ file, range });
                 const { ok, result, error } = execute(index, 'lines', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 // MCP path security: validate file is within project root
                 const check = resolveAndValidatePath(index, result.relativePath);
                 if (typeof check !== 'string') return check;
@@ -545,7 +545,7 @@ server.registerTool(
                     itemCount: lookup.itemCount, symbolName: lookup.symbolName,
                     validateRoot: true
                 });
-                if (!ok) return toolError(error);
+                if (!ok) return toolResult(error); // soft error
                 return toolResult(result.text);
             }
 

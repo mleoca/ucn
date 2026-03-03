@@ -240,16 +240,16 @@ const tests = [
     {
         category: 'Correctness',
         tool: 'ucn',
-        desc: 'api(file=nonexistent) returns isError',
+        desc: 'api(file=nonexistent) returns soft error',
         args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' },
-        assert: (res, text, isError) => isError === true || 'Expected isError: true for nonexistent file'
+        assert: (res, text, isError) => isError === false || 'Expected soft error (no isError flag) for nonexistent file'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'api(file=nonexistent) message contains "not found"',
         args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent.js' },
-        assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected file-not-found error message'
+        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected file-not-found message (soft error)'
     },
     {
         category: 'Correctness',
@@ -282,9 +282,9 @@ const tests = [
     {
         category: 'Correctness',
         tool: 'ucn',
-        desc: 'lines(range="5-0") returns validation error',
+        desc: 'lines(range="5-0") returns error message',
         args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '5-0' },
-        assert: (res, text, isError) => isError === true || 'Expected isError: true for invalid range'
+        assert: (res, text, isError) => (!isError && text.length > 0) || 'Expected soft error with message for invalid range'
     },
     {
         category: 'Correctness',
@@ -305,14 +305,14 @@ const tests = [
         tool: 'ucn',
         desc: 'file_exports(file=utils.js) returns ambiguity error',
         args: { command: 'file_exports', project_dir: PROJECT_DIR, file: 'utils.js' },
-        assert: (res, text, isError) => (isError && /ambiguous/i.test(text)) || 'Expected file-ambiguous error for utils.js'
+        assert: (res, text, isError) => /ambiguous/i.test(text) || 'Expected file-ambiguous error message for utils.js'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'imports(file=utils.js) returns ambiguity error',
         args: { command: 'imports', project_dir: PROJECT_DIR, file: 'utils.js' },
-        assert: (res, text, isError) => (isError && /ambiguous/i.test(text)) || 'Expected file-ambiguous error for utils.js'
+        assert: (res, text, isError) => /ambiguous/i.test(text) || 'Expected file-ambiguous error message for utils.js'
     },
 
     // ========================================================================
@@ -323,14 +323,14 @@ const tests = [
         tool: 'ucn',
         desc: 'lines rejects path traversal (../../../../etc/passwd)',
         args: { command: 'lines', project_dir: PROJECT_DIR, file: '../../../../etc/passwd', range: '1-5' },
-        assert: (res, text, isError) => (isError && (/not found/i.test(text) || /outside project/i.test(text))) || 'Expected error for path traversal'
+        assert: (res, text, isError) => (/not found/i.test(text) || /outside project/i.test(text)) || 'Expected error message for path traversal'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'lines rejects path traversal (../../other-project/secret.js)',
         args: { command: 'lines', project_dir: PROJECT_DIR, file: '../../other-project/secret.js', range: '1-5' },
-        assert: (res, text, isError) => (isError && (/not found/i.test(text) || /outside project/i.test(text))) || 'Expected error for path traversal'
+        assert: (res, text, isError) => (/not found/i.test(text) || /outside project/i.test(text)) || 'Expected error message for path traversal'
     },
     {
         category: 'Security',
@@ -344,14 +344,14 @@ const tests = [
         tool: 'ucn',
         desc: 'diff_impact rejects --config argument injection',
         args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: '--config=malicious' },
-        assert: (res, text, isError) => (isError && /invalid git ref/i.test(text)) || 'Expected error for argument injection in base'
+        assert: (res, text, isError) => /invalid git ref/i.test(text) || 'Expected error message for argument injection in base'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'diff_impact rejects -o flag injection',
         args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: '-o /tmp/evil' },
-        assert: (res, text, isError) => (isError && /invalid git ref/i.test(text)) || 'Expected error for flag injection in base'
+        assert: (res, text, isError) => /invalid git ref/i.test(text) || 'Expected error message for flag injection in base'
     },
     {
         category: 'Security',

@@ -645,10 +645,18 @@ function testProcessData() {
     });
 
     describe('P1 fix: McpClient.callTool propagates isError', () => {
-        it('callTool shorthand returns isError=true for tool errors', async () => {
-            // api with nonexistent file should return isError=true
+        it('callTool shorthand returns soft error for analysis failures', async () => {
+            // api with nonexistent file returns a soft error (no isError flag)
+            // to avoid killing sibling calls in parallel batches
             const res = await mcpClient.callTool({ command: 'api', project_dir: FIXTURES_PATH, file: 'nonexistent/path.js' });
-            assert.strictEqual(res.isError, true, 'Should propagate isError from MCP result');
+            assert.strictEqual(res.isError, false, 'Analysis errors should be soft (no isError flag)');
+            assert.ok(res.text.includes('not found') || res.text.includes('No file'), 'Should contain error message in text');
+        });
+
+        it('callTool shorthand returns isError=true for pre-validation errors', async () => {
+            // Unknown command is a true infrastructure error — should use isError
+            const res = await mcpClient.callTool({ command: 'nonexistent_command', project_dir: FIXTURES_PATH });
+            assert.strictEqual(res.isError, true, 'Should return isError=true for unknown commands');
         });
 
         it('callTool shorthand returns isError=false for valid calls', async () => {
@@ -664,9 +672,10 @@ function testProcessData() {
             assert.ok(!output.includes('at '), 'Should not show stack trace');
         });
 
-        it('MCP rejects invalid base ref', async () => {
+        it('MCP rejects invalid base ref with soft error', async () => {
+            // Invalid ref returns soft error to avoid killing sibling calls
             const res = await mcpClient.callTool({ command: 'diff_impact', project_dir: FIXTURES_PATH, base: '$(evil)' });
-            assert.strictEqual(res.isError, true, 'Should return isError for invalid base ref');
+            assert.strictEqual(res.isError, false, 'Should be soft error (no isError flag)');
             assert.ok(res.text.includes('Invalid git ref'), 'Should mention invalid ref');
         });
     });
