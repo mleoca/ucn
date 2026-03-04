@@ -524,11 +524,18 @@ function findCallees(index, def, options = {}) {
                 if (bindings.length === 0 && call.isMethod) {
                     if (language !== 'go' && language !== 'java' && language !== 'rust') {
                         // JS/TS/Python: mark uncertain unless receiver has import/binding
-                        // evidence in file scope. Prevents false positives like m.get() →
-                        // repository.get() when m is just a parameter with no type info.
-                        const hasReceiverEvidence = call.receiver &&
-                            fileEntry?.bindings?.some(b => b.name === call.receiver);
-                        if (!hasReceiverEvidence) {
+                        // evidence in file scope AND that binding can plausibly have this method.
+                        // Prevents false positives like m.get() → repository.get() when m is
+                        // just a parameter, AND dict.get() → api.get() when dict is a state object.
+                        const receiverBinding = call.receiver &&
+                            fileEntry?.bindings?.find(b => b.name === call.receiver);
+                        if (!receiverBinding) {
+                            isUncertain = true;
+                        } else if (receiverBinding.type === 'state') {
+                            // State objects (module-level dicts/lists) don't have user-defined methods
+                            isUncertain = true;
+                        } else if (receiverBinding.type === 'function') {
+                            // Functions don't have user-defined methods (return value is unknown)
                             isUncertain = true;
                         }
                     } else {
@@ -542,6 +549,22 @@ function findCallees(index, def, options = {}) {
                     }
                 }
                 if (bindings.length === 1) {
+                    // For method calls with a receiver, verify the receiver plausibly
+                    // matches the binding's class. Prevents plt.close() → ReportGenerator.close()
+                    // when close is defined in the same file as a class method.
+                    if (call.isMethod && call.receiver && bindings[0].type === 'method' &&
+                        language !== 'go' && language !== 'java' && language !== 'rust') {
+                        // The binding is a class method — check if the receiver could be an instance
+                        const bindingSym = index.symbols.get(call.name)?.find(
+                            s => s.bindingId === bindings[0].id);
+                        if (bindingSym?.className) {
+                            // Receiver is not a known instance of this class → uncertain
+                            const receiverType = localTypes?.get(call.receiver);
+                            if (receiverType !== bindingSym.className) {
+                                isUncertain = true;
+                            }
+                        }
+                    }
                     bindingResolved = bindings[0].id;
                     calleeKey = bindingResolved;
                 } else if (bindings.length > 1) {

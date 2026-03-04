@@ -1824,6 +1824,11 @@ function findUsagesInCode(code, name, parser) {
                 } else {
                     usageType = 'reference';
                 }
+                // Track receiver for member expressions (obj.name → receiver = 'obj')
+                if (object && object.type === 'identifier') {
+                    usages.push({ line, column, usageType, receiver: object.text });
+                    return true;
+                }
             }
             // JSX component usage: <Component /> or <Component>...</Component>
             else if (parent.type === 'jsx_self_closing_element' || parent.type === 'jsx_opening_element') {

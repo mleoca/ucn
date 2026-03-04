@@ -887,6 +887,29 @@ describe('fix: class --max-lines validation in core (all surfaces)', () => {
         }
     });
 
+    it('CLI project mode commands spread all flags to execute()', () => {
+        // Guard: all symbol-accepting commands in runProjectCommand should use
+        // ...flags (not hand-picked params) to prevent drift when new flags are added.
+        const cliSource = fs.readFileSync(path.join(__dirname, '..', 'cli', 'index.js'), 'utf-8');
+
+        // Find the runProjectCommand function body — look for case statements that call execute()
+        // Commands that should use ...flags pattern:
+        const commandsNeedingFlags = [
+            'about', 'context', 'impact', 'smart', 'trace', 'related',
+            'verify', 'plan'
+        ];
+
+        for (const cmd of commandsNeedingFlags) {
+            // Find the case block for this command and check it uses ...flags
+            const caseRegex = new RegExp(`case '${cmd}':[\\s\\S]*?execute\\(index,\\s*'${cmd}',\\s*\\{[^}]*\\}\\)`, 'm');
+            const match = cliSource.match(caseRegex);
+            if (match) {
+                assert.ok(match[0].includes('...flags'),
+                    `CLI command '${cmd}' should spread ...flags to execute(), got: ${match[0].slice(-80)}`);
+            }
+        }
+    });
+
     it('accepts valid positive integer max-lines', () => {
         const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
         const { tmp, rm, idx } = require('./helpers');

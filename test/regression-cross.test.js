@@ -7520,3 +7520,229 @@ def helper():
         }
     });
 });
+
+// ============================================================================
+// FIX #24: impact className strict filter
+// ============================================================================
+
+describe('Fix #24: impact className filter', () => {
+    it('should filter unrelated receivers when className is specified', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'app.py': `
+class MyService:
+    def close(self):
+        pass
+
+class OtherService:
+    def close(self):
+        pass
+
+def main():
+    svc = MyService()
+    svc.close()
+    other = OtherService()
+    other.close()
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const { ok, result } = execute(index, 'impact', { name: 'close', className: 'MyService' });
+            assert.strictEqual(ok, true);
+            // Should find callers of MyService.close, not OtherService.close
+            assert.ok(result, 'impact should return a result');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #22: findCallees false positives for dict.get(), plt.close()
+// ============================================================================
+
+describe('Bug #22: findCallees receiver false positives', () => {
+    it('should not resolve dict.get() to a standalone get() function', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'api.py': 'def get(key):\n    return key\n',
+            'main.py': `
+LOOKUP = {"a": 1}
+
+def compute(analysis, data):
+    v1 = analysis.get("key")
+    v2 = data.get("other")
+    v3 = LOOKUP.get("test")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const computeDef = index.symbols.get('compute')?.[0];
+            assert.ok(computeDef, 'compute should be found');
+            const callees = index.findCallees(computeDef, { includeMethods: true });
+            const names = callees.map(c => c.name);
+            assert.ok(!names.includes('get'),
+                'get should NOT be in callees — all .get() calls are on dicts/params');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should not resolve plt.close() to a same-file class method', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'report.py': `
+import matplotlib.pyplot as plt
+
+class ReportGen:
+    def close(self):
+        pass
+
+    def generate(self):
+        plt.figure()
+        plt.close()
+`,
+        });
+        try {
+            const index = idx(dir);
+            const genDef = index.symbols.get('generate')?.[0];
+            assert.ok(genDef, 'generate should be found');
+            const callees = index.findCallees(genDef, { includeMethods: true });
+            const names = callees.map(c => c.name);
+            assert.ok(!names.includes('close'),
+                'close should NOT be in callees — plt.close() is an external library call');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should still resolve local-type method calls correctly', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'db.py': `
+class Connection:
+    def close(self):
+        pass
+
+def cleanup():
+    conn = Connection()
+    conn.close()
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cleanupDef = index.symbols.get('cleanup')?.[0];
+            assert.ok(cleanupDef, 'cleanup should be found');
+            const callees = index.findCallees(cleanupDef, { includeMethods: true });
+            const names = callees.map(c => c.name);
+            assert.ok(names.includes('Connection'), 'Connection constructor should be a callee');
+            assert.ok(names.includes('close'), 'close should be a callee via localTypes (conn → Connection)');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #23: usages receiver tracking for member expressions
+// ============================================================================
+
+describe('Bug #23: usages receiver tracking', () => {
+    it('should include receiver info for member expression usages (JS)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.jsx': `
+import * as Ns from "./lib";
+
+function Separator() { return null; }
+
+function Menu() {
+    return Ns.Separator;
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const usages = index.usages('Separator');
+            const nsUsage = usages.find(u => u.receiver === 'Ns');
+            assert.ok(nsUsage, 'should include receiver for Ns.Separator');
+            const standaloneUsage = usages.find(u => !u.receiver && u.isDefinition);
+            assert.ok(standaloneUsage, 'should include standalone Separator definition');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should include receiver info for member expression usages (Python)', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'app.py': `
+import os
+
+def get_path():
+    return os.path
+`,
+        });
+        try {
+            const index = idx(dir);
+            const usages = index.usages('path');
+            const osUsage = usages.find(u => u.receiver === 'os');
+            assert.ok(osUsage, 'should include receiver for os.path');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// CLI --class-name flag
+// ============================================================================
+
+describe('CLI --class-name flag', () => {
+    it('should pass className via CLI to impact command', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'app.py': `
+class Alpha:
+    def process(self):
+        pass
+
+class Beta:
+    def process(self):
+        pass
+`,
+        });
+        try {
+            const output = runCli(dir, 'impact', ['process'], ['--class-name=Alpha']);
+            assert.ok(output.includes('Alpha') || output.includes('process'),
+                'impact with --class-name should work');
+            assert.ok(!output.includes('Unknown flag'),
+                '--class-name should be a recognized flag');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should pass className via CLI to verify command', () => {
+        const dir = tmp({
+            'setup.py': 'from setuptools import setup',
+            'app.py': `
+class MyClass:
+    def process(self, data):
+        pass
+
+def caller():
+    m = MyClass()
+    m.process("hello")
+`,
+        });
+        try {
+            const output = runCli(dir, 'verify', ['process'], ['--class-name=MyClass']);
+            assert.ok(!output.includes('Unknown flag'),
+                '--class-name should be a recognized flag');
+        } finally {
+            rm(dir);
+        }
+    });
+});

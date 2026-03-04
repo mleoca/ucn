@@ -101,6 +101,7 @@ function parseFlags(tokens) {
         maxLines: getValueFlag('--max-lines') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions'),
+        className: getValueFlag('--class-name'),
     };
 }
 
@@ -125,7 +126,7 @@ const knownFlags = new Set([
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions',
-    '--max-lines'
+    '--max-lines', '--class-name'
 ]);
 
 // Handle help flag
@@ -152,7 +153,7 @@ if (unknownFlags.length > 0) {
 const VALUE_FLAGS = new Set([
     '--file', '--depth', '--top', '--context', '--direction',
     '--add-param', '--remove-param', '--rename-to', '--default',
-    '--base', '--exclude', '--not', '--in', '--max-lines'
+    '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name'
 ]);
 
 // Remove flags from args, then add args after -- (which are all positional)
@@ -554,7 +555,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'verify': {
-            const { ok, result, error } = execute(index, 'verify', { name: arg, file: flags.file });
+            const { ok, result, error } = execute(index, 'verify', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatVerifyJson, output.formatVerify);
             break;
