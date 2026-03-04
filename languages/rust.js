@@ -1135,6 +1135,12 @@ function findUsagesInCode(code, name, parser) {
                 } else {
                     usageType = 'reference';
                 }
+                // Track receiver for field expressions (obj.name → receiver = 'obj')
+                const value = parent.childForFieldName('value');
+                if (value && value.type === 'identifier') {
+                    usages.push({ line, column, usageType, receiver: value.text });
+                    return true;
+                }
             }
         }
 

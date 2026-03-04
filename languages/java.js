@@ -887,6 +887,12 @@ function findUsagesInCode(code, name, parser) {
             else if (parent.type === 'method_invocation' &&
                      parent.childForFieldName('name') === node) {
                 usageType = 'call';
+                // Track receiver for method invocations (obj.name() → receiver = 'obj')
+                const object = parent.childForFieldName('object');
+                if (object && object.type === 'identifier') {
+                    usages.push({ line, column, usageType, receiver: object.text });
+                    return true;
+                }
             }
             // Definition: method name
             else if (parent.type === 'method_declaration' &&
@@ -946,6 +952,12 @@ function findUsagesInCode(code, name, parser) {
             else if (parent.type === 'field_access' &&
                      parent.childForFieldName('field') === node) {
                 usageType = 'reference';
+                // Track receiver for field access (obj.field → receiver = 'obj')
+                const object = parent.childForFieldName('object');
+                if (object && object.type === 'identifier') {
+                    usages.push({ line, column, usageType, receiver: object.text });
+                    return true;
+                }
             }
         }
 

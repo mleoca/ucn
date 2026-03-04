@@ -1032,7 +1032,8 @@ class ProjectIndex {
                             line: u.line,
                             content: lineContent,
                             usageType: u.usageType,
-                            isDefinition: false
+                            isDefinition: false,
+                            ...(u.receiver && { receiver: u.receiver })
                         };
 
                         // Add context lines if requested
@@ -2745,9 +2746,9 @@ class ProjectIndex {
                             }
                         }
                     }
-                    // When className is explicitly set and we can't determine the receiver type,
-                    // still include the call (conservative: prefer false positives over false negatives)
-                    return true;
+                    // className explicitly set but receiver type unknown — filter it out.
+                    // User asked for a specific class; unknown receivers are likely unrelated.
+                    return false;
                 });
             }
 
