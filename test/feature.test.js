@@ -1367,33 +1367,33 @@ describe('MCP parameter parity: all and top_level', () => {
         assert.ok(serverCode.includes("top_level: z.boolean().optional()"), 'Schema should have top_level parameter');
     });
 
-    it('MCP destructures all and top_level from args', () => {
-        assert.ok(serverCode.includes('functions, all, top_level }'), 'Should destructure all and top_level');
+    it('MCP normalizes all params once at top — no per-case drift', () => {
+        // The handler should compute ep = normalizeParams(rawParams) once
+        assert.ok(serverCode.includes('const ep = normalizeParams(rawParams)'),
+            'Should normalize all params once at top');
+        // No per-case normalizeParams calls inside the switch
+        const switchStart = serverCode.indexOf('switch (command)');
+        const switchBody = serverCode.substring(switchStart);
+        assert.ok(!switchBody.includes('normalizeParams({'),
+            'Should NOT have per-case normalizeParams calls inside switch');
     });
 
-    it('MCP about handler passes all and includeUncertain via executor', () => {
-        // about should pass all and include_uncertain to executor via normalizeParams
-        assert.ok(serverCode.includes('with_types, all, include_methods, include_uncertain, top'),
-            'about handler should pass all and include_uncertain to executor');
-    });
-
-    it('MCP related handler uses explicit all parameter', () => {
-        // related should NOT auto-infer all from top
-        assert.ok(!serverCode.includes('all: top !== undefined'),
-            'related handler should NOT auto-infer all from top');
-        // Should pass explicit all to executor
-        assert.ok(serverCode.includes("execute(index, 'related', { name, file, top, all })"),
-            'related handler should pass explicit all parameter to executor');
-    });
-
-    it('MCP toc handler passes all and topLevel via executor', () => {
-        assert.ok(serverCode.includes('detailed, top_level, all, top'),
-            'toc handler should pass topLevel and all to executor');
+    it('MCP handlers pass ep to execute — not hand-picked params', () => {
+        // All standard commands should use the shared ep object
+        const standardCmds = ['about', 'context', 'impact', 'smart', 'trace', 'find',
+            'usages', 'toc', 'search', 'tests', 'deadcode', 'verify', 'plan',
+            'fn', 'class', 'lines', 'typedef', 'stacktrace', 'api', 'stats',
+            'imports', 'exporters', 'graph'];
+        for (const cmd of standardCmds) {
+            assert.ok(serverCode.includes(`execute(index, '${cmd}', ep)`) ||
+                       serverCode.includes(`execute(index, '${cmd.replace(/_([a-z])/g, (_, c) => c.toUpperCase())}', ep)`),
+                `${cmd} handler should pass ep to execute`);
+        }
     });
 
     it('MCP graph handler respects all in showAll', () => {
-        assert.ok(serverCode.includes('showAll: all || depth !== undefined'),
-            'graph handler should include all in showAll');
+        assert.ok(serverCode.includes('showAll: ep.all || ep.depth !== undefined'),
+            'graph handler should include ep.all in showAll');
     });
 
     // Behavioral tests: verify all parameter works correctly in core

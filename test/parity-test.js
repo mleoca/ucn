@@ -825,6 +825,27 @@ describe('Architecture Guards', () => {
                 `MCP alias "${alias}" → "${canonical}" should map to a canonical command`);
         }
     });
+
+    it('MCP server normalizes params once — no per-case normalizeParams drift', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        // Must have single top-level normalization
+        assert.ok(serverCode.includes('const ep = normalizeParams(rawParams)'),
+            'MCP handler should normalize all params once at top');
+        // No per-case normalizeParams calls inside switch
+        const switchStart = serverCode.indexOf('switch (command)');
+        const switchBody = serverCode.substring(switchStart);
+        const perCaseCalls = (switchBody.match(/normalizeParams\(\{/g) || []).length;
+        assert.strictEqual(perCaseCalls, 0,
+            `Found ${perCaseCalls} per-case normalizeParams calls in switch — all params should flow through the shared ep`);
+    });
+
+    it('every PARAM_MAP entry has a matching Zod schema field in MCP', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        for (const snakeKey of Object.keys(PARAM_MAP)) {
+            assert.ok(serverCode.includes(`${snakeKey}:`),
+                `PARAM_MAP key "${snakeKey}" should have a matching field in MCP Zod schema`);
+        }
+    });
 });
 
 // ============================================================================
