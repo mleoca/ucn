@@ -982,6 +982,30 @@ function findInstanceAttributeTypes(code, parser) {
             const initBody = child.childForFieldName('body');
             if (!initBody) continue;
 
+            // Build parameter type map from __init__ annotations
+            // e.g. def __init__(self, market: MarketDataFetcher = None) → {market: MarketDataFetcher}
+            const paramTypes = new Map();
+            const params = child.childForFieldName('parameters');
+            if (params) {
+                for (let p = 0; p < params.childCount; p++) {
+                    const param = params.child(p);
+                    // typed_parameter or typed_default_parameter
+                    if (param.type === 'typed_parameter' || param.type === 'typed_default_parameter') {
+                        const pName = param.childForFieldName('name') || param.child(0);
+                        const pType = param.childForFieldName('type');
+                        if (pName && pType) {
+                            const typeIdent = pType.type === 'type' ? pType.firstChild : pType;
+                            if (typeIdent?.type === 'identifier') {
+                                const tn = typeIdent.text;
+                                if (!PRIMITIVE_TYPES.has(tn) && tn[0] >= 'A' && tn[0] <= 'Z') {
+                                    paramTypes.set(pName.text, tn);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             traverseTree(initBody, (stmt) => {
                 if (stmt.type !== 'expression_statement') return true;
 
@@ -1004,6 +1028,9 @@ function findInstanceAttributeTypes(code, parser) {
                 const typeName = extractConstructorName(rhs);
                 if (typeName) {
                     attrTypes.set(attrName, typeName);
+                } else if (rhs.type === 'identifier' && paramTypes.has(rhs.text)) {
+                    // self.X = param where param has type annotation
+                    attrTypes.set(attrName, paramTypes.get(rhs.text));
                 }
 
                 return true;

@@ -306,8 +306,9 @@ function runFileCommand(filePath, command, arg) {
         api:     { file: relativePath },
     };
 
-    const { ok, result, error } = execute(index, canonical, paramsByCommand[canonical]);
+    const { ok, result, error, note } = execute(index, canonical, paramsByCommand[canonical]);
     if (!ok) fail(error);
+    if (note) console.error(note);
 
     // Format output using same formatters as project mode
     switch (canonical) {
@@ -416,8 +417,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'find': {
-            const { ok, result, error } = execute(index, 'find', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'find', { name: arg, ...flags });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result,
                 r => output.formatSymbolJson(r, arg),
                 r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all })
@@ -1257,8 +1259,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'find': {
-            const { ok, result, error } = execute(index, 'find', { name: arg, ...iflags });
+            const { ok, result, error, note } = execute(index, 'find', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
+            if (note) console.log(note);
             console.log(output.formatFindDetailed(result, arg, { depth: iflags.depth, top: iflags.top, all: iflags.all }));
             break;
         }

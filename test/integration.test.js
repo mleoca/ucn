@@ -5,7 +5,7 @@
  * Extracted from parser.test.js.
  */
 
-const { describe, it } = require('node:test');
+const { describe, it, before } = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
@@ -41,10 +41,13 @@ class Greeter {
 // ============================================================================
 
 describe('ProjectIndex', () => {
-    it('builds index and finds symbols', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
+    let index;
+    before(() => {
+        index = new ProjectIndex(PROJECT_DIR);
         index.build(null, { quiet: true });
+    });
 
+    it('builds index and finds symbols', () => {
         const stats = index.getStats();
         assert.ok(stats.files > 0, 'Should index files');
         assert.ok(stats.symbols > 0, 'Should find symbols');
@@ -54,44 +57,29 @@ describe('ProjectIndex', () => {
     });
 
     it('gets imports for a file', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const imports = index.imports('core/parser.js');
         assert.ok(imports.length > 0, 'Should find imports');
         assert.ok(imports.some(i => i.module.includes('languages')), 'Should find languages import');
     });
 
     it('gets exporters for a file', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const exporters = index.exporters('core/parser.js');
         assert.ok(exporters.length > 0, 'Should find files that import parser.js');
     });
 
     it('finds type definitions', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const types = index.typedef('ProjectIndex');
         assert.ok(types.length > 0, 'Should find ProjectIndex class');
         assert.strictEqual(types[0].type, 'class', 'Should be a class');
     });
 
     it('finds tests for a function', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const tests = index.tests('parse');
         assert.ok(tests.length > 0, 'Should find tests for parse');
         assert.ok(tests[0].matches.length > 0, 'Should have test matches');
     });
 
     it('gets usages grouped by type', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const usages = index.usages('parseFile');
         const defs = usages.filter(u => u.isDefinition);
         const calls = usages.filter(u => u.usageType === 'call');
@@ -101,9 +89,6 @@ describe('ProjectIndex', () => {
     });
 
     it('gets context (callers + callees)', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const ctx = index.context('parseFile');
         assert.strictEqual(ctx.function, 'parseFile');
         assert.ok(Array.isArray(ctx.callers), 'Should have callers array');
@@ -111,17 +96,11 @@ describe('ProjectIndex', () => {
     });
 
     it('searches across project', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const results = index.search('TODO');
         assert.ok(Array.isArray(results), 'Should return array');
     });
 
     it('gets API (exported symbols)', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const api = index.api();
         assert.ok(api.length > 0, 'Should find exported symbols');
     });
@@ -467,14 +446,17 @@ describe('main', () => {
 });
 
 // ============================================================================
-// JSON output format
+// JSON output format, Auto-routing, CLI helpers — share one ProjectIndex build
 // ============================================================================
 
-describe('JSON output format', () => {
-    it('find returns valid JSON structure', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
+describe('ProjectIndex commands (shared build)', () => {
+    let index;
+    before(() => {
+        index = new ProjectIndex(PROJECT_DIR);
         index.build(null, { quiet: true });
+    });
 
+    it('find returns valid JSON structure', () => {
         const found = index.find('parse');
         assert.ok(Array.isArray(found), 'Should be array');
         if (found.length > 0) {
@@ -484,9 +466,6 @@ describe('JSON output format', () => {
     });
 
     it('usages returns valid JSON structure', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const usages = index.usages('parse');
         assert.ok(Array.isArray(usages), 'Should be array');
         if (usages.length > 0) {
@@ -496,9 +475,6 @@ describe('JSON output format', () => {
     });
 
     it('stats returns valid JSON structure', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const stats = index.getStats();
         assert.ok(stats.root, 'Should have root');
         assert.ok(typeof stats.files === 'number', 'Should have files count');
@@ -506,73 +482,37 @@ describe('JSON output format', () => {
         assert.ok(stats.byLanguage, 'Should have byLanguage');
         assert.ok(stats.byType, 'Should have byType');
     });
-});
 
-// ============================================================================
-// Auto-routing file commands to project mode
-// ============================================================================
-
-describe('Auto-routing file commands to project mode', () => {
     it('should handle imports command on file path', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
-        // Test that imports works with a file path
         const imports = index.imports('cli/index.js');
         assert.ok(Array.isArray(imports), 'Should return imports array');
         assert.ok(imports.length > 0, 'Should have some imports');
-        // Check structure of import entry
         const hasInternal = imports.some(i => !i.isExternal);
         const hasExternal = imports.some(i => i.isExternal);
         assert.ok(hasInternal || hasExternal, 'Should have internal or external imports');
     });
 
     it('should handle exporters command on file path', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
-        // Test that exporters works with a file path
         const exporters = index.exporters('core/parser.js');
         assert.ok(Array.isArray(exporters), 'Should return exporters array');
     });
 
     it('should handle graph command on file path', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
-        // Test that graph works with a file path
         const graph = index.graph('cli/index.js', { direction: 'both', maxDepth: 2 });
         assert.ok(graph, 'Should return graph result');
         assert.ok(graph.nodes, 'Should have nodes');
         assert.ok(graph.edges, 'Should have edges');
     });
-});
-
-// ============================================================================
-// CLI helper functions
-// ============================================================================
-
-describe('CLI helper functions', () => {
-    // These test the helper behavior indirectly through the API
-    // The actual requireArg and printOutput are CLI-internal
 
     it('find should work with various options', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
-        // Test exact match
         const exactResults = index.find('parse', { exact: true });
         assert.ok(Array.isArray(exactResults), 'Should return array');
 
-        // Test file filter
         const filteredResults = index.find('parse', { file: 'parser' });
         assert.ok(Array.isArray(filteredResults), 'Should return array with file filter');
     });
 
     it('context should return proper structure', () => {
-        const index = new ProjectIndex(PROJECT_DIR);
-        index.build(null, { quiet: true });
-
         const ctx = index.context('parse');
         assert.ok(ctx, 'Should return context');
         assert.ok(ctx.function === 'parse', 'Should have function name');

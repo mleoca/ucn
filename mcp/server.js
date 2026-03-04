@@ -297,7 +297,7 @@ server.registerTool(
 
             case 'impact': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, exclude });
+                const ep = normalizeParams({ name, file, exclude, top });
                 const { ok, result, error } = execute(index, 'impact', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatImpact(result));
@@ -346,9 +346,11 @@ server.registerTool(
             case 'find': {
                 const index = getIndex(project_dir);
                 const ep = normalizeParams({ name, file, exclude, include_tests, exact, in: inPath });
-                const { ok, result, error } = execute(index, 'find', ep);
+                const { ok, result, error, note } = execute(index, 'find', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatFind(result, name, top));
+                let text = output.formatFind(result, name, top);
+                if (note) text += '\n\n' + note;
+                return toolResult(text);
             }
 
             case 'usages': {

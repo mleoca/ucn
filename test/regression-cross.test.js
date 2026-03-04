@@ -25,8 +25,7 @@ const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PA
 
 describe('Bug: stats symbol count consistency', () => {
     it('total symbols should equal sum of type counts', () => {
-        const index = new ProjectIndex('.');
-        index.build(null, { quiet: true });
+        const index = idx(FIXTURES_PATH + '/javascript');
 
         const stats = index.getStats();
 
@@ -2168,7 +2167,7 @@ public class MyClass {
 });
 
 // --- about: includeMethods default ---
-it('about includes method callers by default', () => {
+it('about excludes method callers by default (matching impact)', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-about-methods-'));
     try {
         fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
@@ -2189,16 +2188,16 @@ def run():
         const index = new ProjectIndex(tmpDir);
         index.build('**/*.py', { quiet: true });
 
-        // Default: includeMethods=true — should find callers via obj.method()
+        // Default: includeMethods=false — aligns about with impact (fix #14)
         const aboutDefault = index.about('analyze');
         assert.ok(aboutDefault, 'Should find analyze');
         assert.ok(aboutDefault.found, 'Should be found');
-        assert.ok(aboutDefault.includeMethods === true, 'includeMethods should default to true');
+        assert.ok(aboutDefault.includeMethods === false, 'includeMethods should default to false');
 
-        // Explicit false: fewer callers
-        const aboutNoMethods = index.about('analyze', { includeMethods: false });
-        assert.ok(aboutNoMethods, 'Should find analyze with includeMethods=false');
-        assert.ok(aboutNoMethods.includeMethods === false, 'includeMethods should be false');
+        // Explicit true: includes method callers (obj.method() style)
+        const aboutWithMethods = index.about('analyze', { includeMethods: true });
+        assert.ok(aboutWithMethods, 'Should find analyze with includeMethods=true');
+        assert.ok(aboutWithMethods.includeMethods === true, 'includeMethods should be true');
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -2667,13 +2666,12 @@ it('FIX 87 — search context lines appear in correct order (before, match, afte
 });
 
 it('FIX 88 — MCP context/smart pass undefined includeMethods for language default', () => {
-    const index = new ProjectIndex('.');
-    index.build(null, { quiet: true });
+    const index = idx(FIXTURES_PATH + '/javascript');
 
-    const ctx = index.context('parse', { file: 'core/parser.js' });
+    const ctx = index.context('processData');
     assert.ok(ctx, 'context should work with default includeMethods');
 
-    const smart = index.smart('parse', { file: 'core/parser.js' });
+    const smart = index.smart('processData');
     assert.ok(smart, 'smart should work with default includeMethods');
 });
 
@@ -4447,8 +4445,7 @@ describe('FIX 133 — Interactive --file value (space-separated)', () => {
 
 describe('Bug Hunt: find("*") bare wildcard returns all symbols', () => {
     it('should return all symbols for bare wildcard patterns', () => {
-        const index = new ProjectIndex('.');
-        index.build(null, { quiet: true });
+        const index = idx(FIXTURES_PATH + '/javascript');
         // Bare wildcards should return all symbols (not hang or return empty)
         const allStar = index.find('*');
         assert.ok(allStar.length > 0, 'find("*") should return symbols');
@@ -4457,8 +4454,7 @@ describe('Bug Hunt: find("*") bare wildcard returns all symbols', () => {
     });
 
     it('should still work for meaningful glob patterns', () => {
-        const index = new ProjectIndex('.');
-        index.build(null, { quiet: true });
+        const index = idx(FIXTURES_PATH + '/javascript');
         const results = index.find('handle*');
         // Should find something (or not), but not hang
         assert.ok(Array.isArray(results));
@@ -5150,7 +5146,7 @@ describe('Bug hunt 2026-03-02 regressions', () => {
 
             const res = await client.callTool('ucn', {
                 command: 'example',
-                project_dir: PROJECT_DIR,
+                project_dir: FIXTURES_PATH + '/javascript',
                 name: 'zzz_nonexistent_symbol_xyz',
             });
 
@@ -5175,7 +5171,7 @@ describe('Bug hunt 2026-03-02 regressions', () => {
 
             const res = await client.callTool('ucn', {
                 command: 'related',
-                project_dir: PROJECT_DIR,
+                project_dir: FIXTURES_PATH + '/javascript',
                 name: 'zzz_nonexistent_symbol_xyz',
             });
 
@@ -6192,6 +6188,485 @@ module.exports = { run };`,
                     `should resolve to imported format, got ${fmtChild.file}`
                 );
             }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug #8: impact top parameter ignored in MCP
+// ============================================================================
+
+describe('fix #119: impact respects top parameter', () => {
+    it('limits call sites to top N', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x) { return x + 1; }\nmodule.exports = { helper };',
+            'a.js': 'const { helper } = require("./lib");\nfunction a() { helper(1); helper(2); }',
+            'b.js': 'const { helper } = require("./lib");\nfunction b() { helper(3); }',
+            'c.js': 'const { helper } = require("./lib");\nfunction c() { helper(4); helper(5); }',
+            'd.js': 'const { helper } = require("./lib");\nfunction d() { helper(6); }',
+            'e.js': 'const { helper } = require("./lib");\nfunction e() { helper(7); helper(8); }',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'impact', { name: 'helper', top: 3 });
+            assert.ok(ok, 'impact should succeed');
+            assert.strictEqual(result.shownCallSites, 3, 'should show only 3 call sites');
+            assert.ok(result.totalCallSites > 3, `total should exceed 3, got ${result.totalCallSites}`);
+            // byFile entries should sum to 3 total sites
+            const totalShown = result.byFile.reduce((sum, f) => sum + f.count, 0);
+            assert.strictEqual(totalShown, 3, `byFile should sum to 3, got ${totalShown}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('shows all call sites when top is not specified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x) { return x + 1; }\nmodule.exports = { helper };',
+            'a.js': 'const { helper } = require("./lib");\nfunction a() { helper(1); }',
+            'b.js': 'const { helper } = require("./lib");\nfunction b() { helper(2); }',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'impact', { name: 'helper' });
+            assert.ok(ok);
+            assert.strictEqual(result.shownCallSites, result.totalCallSites, 'should show all');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug #12: trace cross-language symbol resolution
+// ============================================================================
+
+describe('fix #120: trace prefers same-language callee definitions', () => {
+    it('Python trace prefers Python class over TS component with same name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'requirements.txt': '',
+            // Python class with more usages
+            'tracker.py': [
+                'class DataProcessor:',
+                '    def __init__(self):',
+                '        self.data = []',
+                '    def process(self):',
+                '        return self.data',
+            ].join('\n'),
+            'app.py': [
+                'from tracker import DataProcessor',
+                '',
+                'def create_app():',
+                '    processor = DataProcessor()',
+                '    processor.process()',
+                '    return processor',
+            ].join('\n'),
+            // More Python files importing DataProcessor to boost usage count
+            'worker.py': [
+                'from tracker import DataProcessor',
+                'def run():',
+                '    dp = DataProcessor()',
+                '    dp.process()',
+            ].join('\n'),
+            // TS component with same name but fewer usages
+            'DataProcessor.tsx': [
+                'export function DataProcessor() {',
+                '    return <div>Data</div>;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'trace', { name: 'create_app', depth: 1 });
+            assert.ok(ok, 'trace should succeed');
+            // Find the DataProcessor callee in the tree
+            const dpChild = result.tree.children.find(c => c.name === 'DataProcessor');
+            if (dpChild) {
+                // Should resolve to Python file, not TSX
+                assert.ok(
+                    dpChild.file.includes('tracker.py'),
+                    `DataProcessor should resolve to tracker.py, got ${dpChild.file}`
+                );
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Feature: Class.method syntax for about/context/impact/find
+// ============================================================================
+
+describe('Class.method syntax support', () => {
+    it('about("ClassA.close") resolves to ClassA method only', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.js': [
+                'class HttpClient {',
+                '    close() { return "http"; }',
+                '    open() { this.close(); }',
+                '}',
+                'class DbConnection {',
+                '    close() { return "db"; }',
+                '    disconnect() { this.close(); }',
+                '}',
+                'module.exports = { HttpClient, DbConnection };',
+            ].join('\n'),
+            'app.js': [
+                'const { HttpClient } = require("./server");',
+                'const c = new HttpClient();',
+                'c.close();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // HttpClient.close
+            const { ok: ok1, result: r1 } = execute(index, 'about', { name: 'HttpClient.close' });
+            assert.ok(ok1, 'should find HttpClient.close');
+            assert.strictEqual(r1.symbol.name, 'close');
+            assert.ok(r1.symbol.file.includes('server.js'), 'should be in server.js');
+
+            // DbConnection.close
+            const { ok: ok2, result: r2 } = execute(index, 'about', { name: 'DbConnection.close' });
+            assert.ok(ok2, 'should find DbConnection.close');
+            assert.strictEqual(r2.symbol.name, 'close');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('find("MyClass.method") filters by class', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'models.js': [
+                'class User {',
+                '    save() { return "user"; }',
+                '}',
+                'class Post {',
+                '    save() { return "post"; }',
+                '}',
+                'module.exports = { User, Post };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'find', { name: 'User.save' });
+            assert.ok(ok);
+            assert.ok(result.length >= 1, 'should find at least one match');
+            assert.ok(result.every(r => r.className === 'User'), 'all results should be from User class');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('impact("Class.method") scopes to that class method', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': [
+                'class Parser {',
+                '    parse(input) { return input; }',
+                '}',
+                'class Formatter {',
+                '    parse(input) { return input.trim(); }',
+                '}',
+                'const p = new Parser();',
+                'p.parse("hello");',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'impact', { name: 'Parser.parse' });
+            assert.ok(ok, 'impact should succeed');
+            assert.strictEqual(result.function, 'parse');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Class.method ignores multi-dot names', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            const index = idx(dir);
+            // "a.b.c" should NOT be split — treated as "not found"
+            const { ok } = execute(index, 'about', { name: 'a.b.c' });
+            assert.ok(!ok, 'multi-dot name should not be found');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Class.method does not interfere with dotless names', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'about', { name: 'helper' });
+            assert.ok(ok, 'regular name should work');
+            assert.strictEqual(result.symbol.name, 'helper');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Feature: fn suggests class command
+// ============================================================================
+
+describe('fn suggests class command for class names', () => {
+    it('suggests class command when fn receives a class name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'widget.js': [
+                'class MyWidget {',
+                '    render() { return "hello"; }',
+                '}',
+                'module.exports = { MyWidget };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'fn', { name: 'MyWidget' });
+            assert.ok(!ok, 'fn should fail for a class name');
+            assert.ok(error.includes('class'), `error should suggest class command, got: ${error}`);
+            assert.ok(error.includes('MyWidget'), 'error should mention the name');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Feature: find exact=true with glob warning
+// ============================================================================
+
+describe('find exact=true glob warning', () => {
+    it('warns when exact=true and name has glob characters', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function get_data() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, note } = execute(index, 'find', { name: 'get_*', exact: true });
+            assert.ok(ok, 'find should succeed');
+            assert.ok(note, 'should have a warning note');
+            assert.ok(note.includes('exact'), `note should mention exact mode, got: ${note}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('no warning when exact=false', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function get_data() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, note } = execute(index, 'find', { name: 'get_*' });
+            assert.ok(ok);
+            assert.ok(!note, 'should not have a warning for normal glob');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Feature: about better error for nonexistent file filter
+// ============================================================================
+
+describe('about file-filter error improvement', () => {
+    it('gives helpful error when file filter misses but symbol exists elsewhere', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nhelper();',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'about', { name: 'helper', file: 'nonexistent.py' });
+            assert.ok(!ok, 'should fail');
+            assert.ok(error.includes('lib.js'), `error should mention where symbol exists, got: ${error}`);
+            assert.ok(error.includes('nonexistent.py'), 'error should mention the filter used');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('gives generic error when symbol truly does not exist', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'about', { name: 'nonexistent', file: 'lib.js' });
+            assert.ok(!ok);
+            assert.ok(error.includes('not found'), 'should give generic not found error');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #13: plan should detect existing parameters
+// ============================================================================
+
+describe('fix #13: plan rejects duplicate parameter', () => {
+    it('returns error when add_param names an existing parameter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function fetch(url, timeout) { return url; }\nmodule.exports = { fetch };',
+            'app.js': 'const { fetch } = require("./lib");\nfetch("http://x", 5000);',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'plan', { name: 'fetch', addParam: 'timeout' });
+            assert.ok(ok, 'should return ok (found the function)');
+            assert.ok(result.error, 'should have error field');
+            assert.ok(result.error.includes('already exists'), `should say "already exists", got: ${result.error}`);
+            assert.deepStrictEqual(result.currentParams, ['url', 'timeout']);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('allows adding a genuinely new parameter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function fetch(url, timeout) { return url; }\nmodule.exports = { fetch };',
+            'app.js': 'const { fetch } = require("./lib");\nfetch("http://x", 5000);',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'plan', { name: 'fetch', addParam: 'retries', defaultValue: '3' });
+            assert.ok(ok);
+            assert.ok(!result.error, 'should not have error');
+            assert.strictEqual(result.operation, 'add-param');
+            assert.ok(result.after.params.includes('retries'), 'new param should be in after.params');
+            assert.ok(result.after.signature.includes('retries'), 'new param should be in signature');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('detects duplicate even when param has default value (Python)', () => {
+        const dir = tmp({
+            'setup.py': '',
+            'lib.py': 'def transform(data, verbose=False):\n    return data\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'plan', { name: 'transform', addParam: 'verbose', defaultValue: 'True' });
+            assert.ok(ok);
+            assert.ok(result.error, 'should detect duplicate');
+            assert.ok(result.error.includes('already exists'));
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #14: about and impact caller count consistency
+// ============================================================================
+
+describe('fix #14: about and impact caller counts match by default', () => {
+    it('about excludes obj.method() callers by default (matching impact)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function parse(text) { return text; }\nmodule.exports = { parse };',
+            'direct.js': 'const { parse } = require("./lib");\nfunction run() { parse("hello"); }',
+            'method.js': 'const obj = require("./lib");\nfunction go() { obj.parse("world"); }',
+        });
+        try {
+            const index = idx(dir);
+            const aboutResult = execute(index, 'about', { name: 'parse' });
+            const impactResult = execute(index, 'impact', { name: 'parse' });
+            assert.ok(aboutResult.ok);
+            assert.ok(impactResult.ok);
+            // Both should agree on caller count by default
+            const aboutCallers = aboutResult.result.callers.total;
+            const impactCallers = impactResult.result.totalCallSites;
+            assert.strictEqual(aboutCallers, impactCallers,
+                `about (${aboutCallers}) and impact (${impactCallers}) should agree on default caller count`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('about with includeMethods=true shows more callers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function parse(text) { return text; }\nmodule.exports = { parse };',
+            'direct.js': 'const { parse } = require("./lib");\nfunction run() { parse("hello"); }',
+            'method.js': 'const obj = require("./lib");\nfunction go() { obj.parse("world"); }',
+        });
+        try {
+            const index = idx(dir);
+            const defaultResult = execute(index, 'about', { name: 'parse' });
+            const withMethods = execute(index, 'about', { name: 'parse', includeMethods: true });
+            assert.ok(defaultResult.ok);
+            assert.ok(withMethods.ok);
+            // With includeMethods=true, should have >= default callers
+            assert.ok(withMethods.result.callers.total >= defaultResult.result.callers.total,
+                'includeMethods=true should show at least as many callers as default');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// QUALITY: related SIMILAR NAMES noise reduction (short token filtering)
+// ============================================================================
+
+describe('related: short token filtering reduces noise', () => {
+    it('does not match on 3-char tokens like "get"', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function get_data() { return 1; }\nmodule.exports = { get_data };',
+            'b.js': 'function get_config() { return 2; }\nmodule.exports = { get_config };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'related', { name: 'get_data' });
+            assert.ok(ok);
+            const similarNames = result.similarNames.map(s => s.name);
+            assert.ok(!similarNames.includes('get_config'),
+                'should NOT match get_config via shared "get" token (3 chars too short)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('matches on 4+ char tokens like "data"', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function get_data() { return 1; }\nmodule.exports = { get_data };',
+            'b.js': 'function data_processor() { return 2; }\nmodule.exports = { data_processor };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'related', { name: 'get_data' });
+            assert.ok(ok);
+            const similarNames = result.similarNames.map(s => s.name);
+            assert.ok(similarNames.includes('data_processor'),
+                'should match data_processor via shared "data" token (4 chars)');
         } finally {
             rm(dir);
         }
