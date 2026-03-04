@@ -959,6 +959,11 @@ function formatImpact(impact, options = {}) {
         }
     }
 
+    // Scope pollution warning
+    if (impact.scopeWarning) {
+        lines.push(`  Note: ${impact.scopeWarning.hint}`);
+    }
+
     // By file
     lines.push('');
     lines.push('BY FILE:');
@@ -1019,6 +1024,9 @@ function formatPlan(plan, options = {}) {
     // Summary
     lines.push(`CHANGES NEEDED: ${plan.totalChanges}`);
     lines.push(`  Files affected: ${plan.filesAffected}`);
+    if (plan.scopeWarning) {
+        lines.push(`  Note: ${plan.scopeWarning.hint}`);
+    }
     lines.push('');
 
     // Group by file
@@ -1124,6 +1132,9 @@ function formatVerify(result, options = {}) {
     lines.push(`  Valid: ${result.valid}`);
     lines.push(`  Mismatches: ${result.mismatches}`);
     lines.push(`  Uncertain: ${result.uncertain}`);
+    if (result.scopeWarning) {
+        lines.push(`  Note: ${result.scopeWarning.hint}`);
+    }
 
     // Show mismatches
     if (result.mismatchDetails.length > 0) {

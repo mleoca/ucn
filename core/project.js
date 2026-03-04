@@ -617,13 +617,24 @@ class ProjectIndex {
             }
         }
 
-        // Check inclusion (must be within specified directory, path-boundary-aware)
+        // Check inclusion (directory or file path)
         if (filters.in) {
-            const inPattern = filters.in;
-            // Match at path boundaries: start of string or after /
-            // e.g. --in=src matches "src/foo.js" and "lib/src/foo.js" but NOT "my-src-backup/foo.js"
-            if (!(filePath.startsWith(inPattern + '/') || filePath.includes('/' + inPattern + '/'))) {
-                return false;
+            const inPattern = filters.in.replace(/\/$/, ''); // strip trailing slash
+            // Detect if pattern looks like a file path (has an extension)
+            const looksLikeFile = /\.\w+$/.test(inPattern);
+            if (looksLikeFile) {
+                // File path matching: exact match or suffix match
+                // e.g. --in=tools/analyzer.py matches "tools/analyzer.py"
+                // e.g. --in=analyzer.py matches "tools/analyzer.py"
+                if (!(filePath === inPattern || filePath.endsWith('/' + inPattern))) {
+                    return false;
+                }
+            } else {
+                // Directory matching: path-boundary-aware
+                // e.g. --in=src matches "src/foo.js" and "lib/src/foo.js" but NOT "my-src-backup/foo.js"
+                if (!(filePath.startsWith(inPattern + '/') || filePath.includes('/' + inPattern + '/'))) {
+                    return false;
+                }
             }
         }
 
@@ -1694,25 +1705,33 @@ class ProjectIndex {
 
     /**
      * Extract type names from a function definition
+     * Finds all word-like type identifiers from param types and return type,
+     * then filters to only those that exist in the project symbol table.
      */
     extractTypeNames(def) {
         const types = new Set();
-
-        // From params
+        // Collect all type annotation strings
+        const typeStrings = [];
         if (def.paramsStructured) {
             for (const param of def.paramsStructured) {
-                if (param.type) {
-                    // Extract base type name (before < or [)
-                    const match = param.type.match(/^([A-Z]\w*)/);
-                    if (match) types.add(match[1]);
-                }
+                if (param.type) typeStrings.push(param.type);
             }
         }
+        if (def.returnType) typeStrings.push(def.returnType);
 
-        // From return type
-        if (def.returnType) {
-            const match = def.returnType.match(/^([A-Z]\w*)/);
-            if (match) types.add(match[1]);
+        // Extract all word-like identifiers from type annotations
+        // Handles: Dict[str, Any], Optional[QuoteData], str | None, List[int], CustomType
+        for (const ts of typeStrings) {
+            const matches = ts.match(/\b([A-Za-z_]\w*)\b/g);
+            if (matches) {
+                for (const m of matches) {
+                    // Only include names that exist as type/interface/class/struct in the symbol table
+                    const syms = this.symbols.get(m);
+                    if (syms && syms.some(s => ['type', 'interface', 'class', 'struct'].includes(s.type))) {
+                        types.add(m);
+                    }
+                }
+            }
         }
 
         return types;
@@ -2716,6 +2735,24 @@ class ProjectIndex {
         // Identify patterns
         const patterns = this.identifyCallPatterns(filteredSites, name);
 
+        // Detect scope pollution: multiple class definitions for the same method name
+        let scopeWarning = null;
+        if (defIsMethod) {
+            const allDefs = this.symbols.get(name);
+            if (allDefs && allDefs.length > 1) {
+                const classNames = [...new Set(allDefs
+                    .filter(d => d.className && d.className !== def.className)
+                    .map(d => d.className))];
+                if (classNames.length > 0) {
+                    scopeWarning = {
+                        targetClass: def.className || '(unknown)',
+                        otherClasses: classNames,
+                        hint: `Results may include calls to ${classNames.join(', ')}.${name}(). Use file= or className= to narrow scope.`
+                    };
+                }
+            }
+        }
+
         return {
             function: name,
             file: def.relativePath,
@@ -2730,7 +2767,8 @@ class ProjectIndex {
                 count: sites.length,
                 sites
             })),
-            patterns
+            patterns,
+            scopeWarning
         };
         } finally { this._endOp(); }
     }
@@ -2878,7 +2916,7 @@ class ProjectIndex {
 
         // Get type definitions if requested
         let types = [];
-        if (options.withTypes && (primary.params !== undefined || primary.returnType)) {
+        if (options.withTypes) {
             const typeNames = this.extractTypeNames(primary);
             for (const typeName of typeNames) {
                 const typeSymbols = this.symbols.get(typeName);

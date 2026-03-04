@@ -336,7 +336,7 @@ server.registerTool(
                 if (!ok) return toolResult(error);
                 if (!result) return toolResult(`Symbol "${name}" not found.`);
                 return toolResult(output.formatRelated(result, {
-                    showAll: all || false, top,
+                    all: all || false, top,
                     allHint: 'Repeat with all=true to show all.'
                 }));
             }
