@@ -158,7 +158,7 @@ function requireName(name) {
 // CONSOLIDATED TOOL REGISTRATION
 // ============================================================================
 
-const TOOL_DESCRIPTION = `Universal Code Navigator powered by tree-sitter ASTs. Analyzes code structure — functions, callers, callees, dependencies — across JavaScript/TypeScript, Python, Go, Rust, Java, and HTML (inline scripts and event handlers). Use instead of grep/read for code relationships.
+const TOOL_DESCRIPTION = `Code intelligence toolkit for AI agents. Extract specific functions, trace call chains, find all callers, and detect dead code — without reading entire files or scanning full projects. Use instead of grep/read for code relationships. Supports JavaScript/TypeScript, Python, Go, Rust, Java, and HTML.
 
 TOP 5 (covers 90% of tasks): about, impact, trace, find, deadcode
 

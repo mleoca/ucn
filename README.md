@@ -1,14 +1,14 @@
-# UCN — Universal Code Navigator
+# UCN - Universal Code Navigator
 
-AST-powered code intelligence from the terminal.
+Code intelligence for AI agents and developers - understand, extract, and navigate code without reading whole files.
 
-UCN answers structural code questions instantly:
-- Who calls this function?
-- What breaks if I change this signature?
-- What changed in this diff, and who depends on it?
-- What code is safe to delete?
+Precise answers to structural code questions:
+- Who calls this function? → without grepping the whole project
+- What breaks if I change this? → every call site, with arguments
+- What does this function do? → extracted with dependencies inline
+- What code is safe to delete? → verified unused symbols
 
-Instead of reading full files, UCN gives precise, AST-verified answers.
+One command replaces 3-4 grep+read cycles. Powered by tree-sitter.
 
 [![npm](https://img.shields.io/npm/v/ucn)](https://www.npmjs.com/package/ucn)
 [![license](https://img.shields.io/npm/l/ucn)](LICENSE)
@@ -20,22 +20,21 @@ Instead of reading full files, UCN gives precise, AST-verified answers.
 ```bash
 npm install -g ucn
 
+ucn toc                   # project overview
+ucn fn handleRequest      # extract a function without reading the file
 ucn about handleRequest   # full picture: definition, callers, callees, tests
 ucn impact handleRequest  # all call sites with arguments
 ucn trace main --depth=3  # call tree, no file reads
 ucn deadcode              # unused functions, AST-verified
-ucn fn handleRequest      # extract a function without reading the file
-ucn toc                   # project overview
-ucn --interactive         # REPL mode, index stays in memory
 ```
 
-Parses JS/TS, Python, Go, Rust, Java, and HTML with tree-sitter. Runs locally.
+Supports JS/TS, Python, Go, Rust, Java, and HTML. Runs locally.
 
 ```
-  Terminal              AI Agents              Agent Skills
-       │                    │                       │
-      CLI                  MCP                    Skill
-       └────────────────────┼───────────────────────┘
+  Terminal              AI Agents           Agent Skills
+       │                    │                    │
+      CLI                  MCP                 Skill
+       └────────────────────┼────────────────────┘
                             │
                      ┌──────┴──────┐
                      │ UCN Engine  │
@@ -48,7 +47,7 @@ Parses JS/TS, Python, Go, Rust, Java, and HTML with tree-sitter. Runs locally.
 
 ## Why UCN
 
-UCN uses tree-sitter to parse code into an AST, then builds a call graph and symbol table on top of it. Instead of matching text, it understands which functions call which, what depends on what, and what's unused. Everything runs locally.
+AI agents waste tokens reading entire files to find one function, or grep for callers and miss half of them. UCN builds a structural index of the codebase - it knows which functions call which, what depends on what, and what's unused. One command gives what would take 3-4 file reads and greps.
 
 "What happens when `build()` runs?"
 
@@ -139,7 +138,7 @@ VS Code uses `.vscode/mcp.json`:
 
 </details>
 
-All 28 commands ship as a single MCP tool, under 2KB of schema in the agent's context.
+All 28 commands ship as a single MCP tool - under 2KB of context.
 
 ### Agent Skill (no server needed)
 
@@ -294,13 +293,13 @@ ucn deadcode --exclude=test                # what can be deleted?
 
 ## Limitations
 
-UCN is static AST analysis, not runtime instrumentation.
+UCN analyzes code structure statically - it doesn't run code.
 
-- **5 languages + HTML** — JS/TS, Python, Go, Rust, Java. Falls back to text search for others.
-- **Static analysis only** — Can't follow `eval()`, `getattr()`, reflection, or other dynamic dispatch.
-- **Duck-typed methods** — `obj.method()` in JS/TS/Python is marked "uncertain" when the receiver type is ambiguous. Go/Rust/Java resolve with high confidence.
-- **Single project scope** — Follows imports within the project but not into `node_modules` or `site-packages`.
-- **First-query index time** — A few seconds on large projects. Cached incrementally after that.
+- **5 languages + HTML** - JS/TS, Python, Go, Rust, Java. Falls back to text search for others.
+- **Static analysis only** - Can't follow `eval()`, `getattr()`, reflection, or other dynamic dispatch.
+- **Duck-typed methods** - `obj.method()` in JS/TS/Python is marked "uncertain" when the receiver type is ambiguous. Go/Rust/Java resolve with high confidence.
+- **Single project scope** - Follows imports within the project but not into `node_modules` or `site-packages`.
+- **First-query index time** - A few seconds on large projects. Cached incrementally after that.
 
 ---
 

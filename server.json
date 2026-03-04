@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mleoca/ucn",
-  "description": "AST-based code navigator. Analyzes callers, callees, and dependencies via tree-sitter.",
+  "description": "Code intelligence for AI agents. Extract, trace, and analyze code without reading whole files.",
   "repository": {
     "url": "https://github.com/mleoca/ucn",
     "source": "github"
   },
-  "version": "3.7.45",
+  "version": "3.7.46",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "ucn",
-      "version": "3.7.45",
+      "version": "3.7.46",
       "transport": {
         "type": "stdio"
       }

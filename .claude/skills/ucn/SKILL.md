@@ -1,17 +1,17 @@
 ---
 name: ucn
-description: "Code relationship analyzer (callers, call trees, impact, dead code) via tree-sitter AST. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on JS/TS, Python, Go, Rust, Java, HTML. Skip for plain text search or codebases under 500 LOC."
+description: "Code intelligence toolkit — extract functions, trace callers, analyze impact, detect dead code without reading whole files. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on JS/TS, Python, Go, Rust, Java, HTML. Skip for plain text search or codebases under 500 LOC."
 allowed-tools: Bash(ucn *), Bash(npx ucn *)
 argument-hint: "[command] [symbol-name] [--flags]"
 ---
 
 # UCN — Universal Code Navigator
 
-Understands code structure via tree-sitter ASTs: who calls what, what breaks if you change something, full call trees, dead code. Works on JS/TS, Python, Go, Rust, Java. Also parses HTML files (inline scripts and event handlers).
+Extract functions, trace call chains, find callers, and detect dead code — without reading entire files. Works on JS/TS, Python, Go, Rust, Java, and HTML (inline scripts and event handlers).
 
 ## When to Reach for UCN Instead of Grep/Read
 
-**Use UCN when your next action would be:**
+**Use UCN when the next action would be:**
 
 - "Let me grep for all callers of this function" → `ucn impact <name>` — finds every call site, grouped by file, with args shown
 - "Let me read this 800-line file to find one function" → `ucn fn <name> --file=<hint>` — extracts just that function
@@ -164,7 +164,7 @@ ucn trace problematic_function --depth=2  # See what it calls
 ```bash
 ucn impact the_function                 # Who will break?
 ucn smart the_function                  # See it + its helpers
-# ... make your changes ...
+# ... make changes ...
 ucn verify the_function                 # Did all call sites survive?
 ```
 
