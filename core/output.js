@@ -2048,6 +2048,10 @@ function formatSearch(results, term) {
         }
     }
 
+    if (meta && meta.truncatedMatches > 0) {
+        lines.push(`\n${results.reduce((s, r) => s + r.matches.length, 0)} shown of ${meta.totalMatches} total matches. Use top= to see more.`);
+    }
+
     return lines.join('\n');
 }
 

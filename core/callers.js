@@ -140,7 +140,12 @@ function findCallers(index, name, options = {}) {
                 // Resolve binding within this file (without mutating cached call objects)
                 let bindingId = call.bindingId;
                 let isUncertain = call.uncertain;
-                if (!bindingId) {
+                // Skip binding resolution for method calls with non-self/this/cls receivers:
+                // e.g., analyzer.analyze_instrument() should NOT resolve to a local
+                // standalone function def `analyze_instrument` — they're different symbols.
+                const selfReceivers = new Set(['self', 'cls', 'this', 'super']);
+                const skipLocalBinding = call.isMethod && call.receiver && !selfReceivers.has(call.receiver);
+                if (!bindingId && !skipLocalBinding) {
                     let bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
                     // For Go, also check sibling files in same directory (same package scope)
                     if (bindings.length === 0 && fileEntry.language === 'go') {
@@ -615,7 +620,8 @@ function findCallees(index, def, options = {}) {
         }
 
         // Second pass: resolve Python self.attr.method() calls
-        if (selfAttrCalls && def.className) {
+        // Respect includeMethods=false — skip self/this method resolution entirely
+        if (selfAttrCalls && def.className && options.includeMethods !== false) {
             const attrTypes = getInstanceAttributeTypes(index, def.file, def.className);
             if (attrTypes) {
                 for (const call of selfAttrCalls) {
@@ -646,7 +652,8 @@ function findCallees(index, def, options = {}) {
 
         // Third pass: resolve self/this/super.method() calls to same-class or parent methods
         // Falls back to walking the inheritance chain if not found in same class
-        if (selfMethodCalls && def.className) {
+        // Respect includeMethods=false — skip self/this method resolution entirely
+        if (selfMethodCalls && def.className && options.includeMethods !== false) {
             for (const call of selfMethodCalls) {
                 const symbols = index.symbols.get(call.name);
                 if (!symbols) continue;

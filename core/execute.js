@@ -306,6 +306,7 @@ const HANDLERS = {
             exclude,
             in: p.in,
             regex: p.regex,
+            top: num(p.top, undefined),
         });
         return { ok: true, result };
     },

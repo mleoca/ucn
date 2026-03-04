@@ -189,7 +189,9 @@ function createStackFrame(index, filePath, lineNum, funcName, col, rawLine) {
                 frame.context = contextLines;
             }
 
-            // Try to find function info (verify it contains the line)
+            // Try to find function info — always use AST to find enclosing function at this line,
+            // then verify against the parsed function name from the stack trace
+            const enclosing = index.findEnclosingFunction(resolvedPath, lineNum, true);
             if (funcName) {
                 const symbols = index.symbols.get(funcName);
                 if (symbols) {
@@ -205,9 +207,21 @@ function createStackFrame(index, filePath, lineNum, funcName, col, rawLine) {
                             params: funcMatch.params
                         };
                         frame.confidence = 1.0; // High confidence when function verified
+                    } else if (enclosing) {
+                        // Stack trace function name doesn't match — use AST-resolved function
+                        // (source may have changed, or the name was from a transpiled/minified trace)
+                        frame.functionInfo = {
+                            name: enclosing.name,
+                            startLine: enclosing.startLine,
+                            endLine: enclosing.endLine,
+                            params: enclosing.params,
+                            inferred: true,
+                            traceName: funcName  // preserve original name from stack trace
+                        };
+                        frame.confidence = Math.min(frame.confidence, 0.7);
                     } else {
-                        // Function exists but line doesn't match - lower confidence
-                        const anyMatch = symbols.find(s => s.file === resolvedPath);
+                        // Function name doesn't match AND no enclosing function found
+                        const anyMatch = symbols?.find(s => s.file === resolvedPath);
                         if (anyMatch) {
                             frame.functionInfo = {
                                 name: anyMatch.name,
@@ -219,19 +233,27 @@ function createStackFrame(index, filePath, lineNum, funcName, col, rawLine) {
                             frame.confidence = Math.min(frame.confidence, 0.5);
                         }
                     }
-                }
-            } else {
-                // No function name in stack - find enclosing function
-                const enclosing = index.findEnclosingFunction(resolvedPath, lineNum, true);
-                if (enclosing) {
+                } else if (enclosing) {
+                    // funcName not in symbol table — use AST enclosing function
                     frame.functionInfo = {
                         name: enclosing.name,
                         startLine: enclosing.startLine,
                         endLine: enclosing.endLine,
                         params: enclosing.params,
-                        inferred: true
+                        inferred: true,
+                        traceName: funcName
                     };
+                    frame.confidence = Math.min(frame.confidence, 0.6);
                 }
+            } else if (enclosing) {
+                // No function name in stack - find enclosing function
+                frame.functionInfo = {
+                    name: enclosing.name,
+                    startLine: enclosing.startLine,
+                    endLine: enclosing.endLine,
+                    params: enclosing.params,
+                    inferred: true
+                };
             }
         } catch (e) {
             frame.error = e.message;
