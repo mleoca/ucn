@@ -4,6 +4,7 @@ CLAUDE.md
 .claude/settings.local.json
 .mcpregistry_*
 .npmrc
+demo/
 docs/
 test/
 server.json

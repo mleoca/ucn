@@ -12,6 +12,9 @@ AGENTS.md
 .mcpregistry_*
 .npmrc
 
+# Demo scripts
+demo/
+
 # Test output files
 test/bugs-report.json
 test/public-repos-bugs.json
