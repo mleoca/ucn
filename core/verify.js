@@ -278,6 +278,24 @@ function verify(index, name, options = {}) {
     }
     clearTreeCache(index);
 
+    // Detect scope pollution for methods
+    let scopeWarning = null;
+    if (defIsMethod) {
+        const allDefs = index.symbols.get(name);
+        if (allDefs && allDefs.length > 1) {
+            const classNames = [...new Set(allDefs
+                .filter(d => d.className && d.className !== def.className)
+                .map(d => d.className))];
+            if (classNames.length > 0) {
+                scopeWarning = {
+                    targetClass: def.className || '(unknown)',
+                    otherClasses: classNames,
+                    hint: `Results may include calls to ${classNames.join(', ')}.${name}(). Use file= or className= to narrow scope.`
+                };
+            }
+        }
+    }
+
     return {
         found: true,
         function: name,
@@ -295,7 +313,8 @@ function verify(index, name, options = {}) {
         mismatches: mismatches.length,
         uncertain: uncertain.length,
         mismatchDetails: mismatches,
-        uncertainDetails: uncertain
+        uncertainDetails: uncertain,
+        scopeWarning
     };
     } finally { index._endOp(); }
 }
@@ -482,7 +501,8 @@ function plan(index, name, options = {}) {
         },
         totalChanges: changes.length,
         filesAffected: new Set(changes.map(c => c.file)).size,
-        changes
+        changes,
+        scopeWarning: impact?.scopeWarning || null
     };
     } finally { index._endOp(); }
 }

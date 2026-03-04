@@ -563,7 +563,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'related': {
             const { ok, result, error } = execute(index, 'related', { name: arg, ...flags });
             if (!ok) fail(error);
-            printOutput(result, output.formatRelatedJson, r => output.formatRelated(r, { showAll: flags.all, top: flags.top }));
+            printOutput(result, output.formatRelatedJson, r => output.formatRelated(r, { all: flags.all, top: flags.top }));
             break;
         }
 
@@ -1421,7 +1421,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         case 'related': {
             const { ok, result, error } = execute(index, 'related', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            console.log(output.formatRelated(result, { showAll: iflags.all, top: iflags.top }));
+            console.log(output.formatRelated(result, { all: iflags.all, top: iflags.top }));
             break;
         }
 

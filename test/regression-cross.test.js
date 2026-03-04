@@ -6672,3 +6672,311 @@ describe('related: short token filtering reduces noise', () => {
         }
     });
 });
+
+// ============================================================================
+// Bug #15: with_types=true should show TYPES section
+// ============================================================================
+
+describe('fix #119: about with_types=true shows related types', () => {
+    it('shows types referenced in function signature', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'types.ts': `export interface UserConfig {\n  name: string;\n  age: number;\n}`,
+            'lib.ts': `import { UserConfig } from './types';\nexport function loadConfig(name: string): UserConfig {\n  return { name, age: 0 };\n}`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.about('loadConfig', { withTypes: true });
+            assert.ok(result.found);
+            assert.ok(result.types.length > 0, 'should find UserConfig type');
+            assert.strictEqual(result.types[0].name, 'UserConfig');
+            // Verify formatter shows TYPES section
+            const text = output.formatAbout(result);
+            assert.ok(text.includes('TYPES:'), 'formatted output should show TYPES section');
+            assert.ok(text.includes('UserConfig'), 'should display type name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('shows types from Python type annotations', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'models.py': `class UserData:\n    def __init__(self, name):\n        self.name = name\n`,
+            'service.py': `from models import UserData\ndef get_user(uid: int) -> UserData:\n    return UserData("test")\n`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.about('get_user', { withTypes: true });
+            assert.ok(result && result.found);
+            assert.ok(result.types.length > 0, 'should find UserData type from return annotation');
+            assert.strictEqual(result.types[0].name, 'UserData');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('extractTypeNames filters to only project-defined types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.ts': `export function parse(data: string): number {\n  return parseInt(data);\n}`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.about('parse', { withTypes: true });
+            assert.ok(result.found);
+            assert.strictEqual(result.types.length, 0, 'built-in types should not appear');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug #16: search in= should work with file paths, not just directories
+// ============================================================================
+
+describe('fix #120: search/find in= works with file paths', () => {
+    it('search filters to a specific file path', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/util.js': 'function helper() { return "hello"; }',
+            'src/main.js': 'function main() { return "hello"; }',
+        });
+        try {
+            const index = idx(dir);
+            const results = index.search('hello', { in: 'src/util.js' });
+            assert.ok(results.length > 0, 'should find matches in the specified file');
+            assert.ok(results.every(r => r.file.includes('util.js')), 'all matches should be in util.js');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('search in= with basename-only file path works', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/util.js': 'function helper() { return "target"; }',
+            'src/main.js': 'function main() { return "target"; }',
+        });
+        try {
+            const index = idx(dir);
+            const results = index.search('target', { in: 'util.js' });
+            assert.ok(results.length > 0, 'should find matches with basename filter');
+            assert.ok(results.every(r => r.file.includes('util.js')), 'all matches should be in util.js');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('search in= still works with directory paths', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/util.js': 'function helper() { return "value"; }',
+            'lib/other.js': 'function other() { return "value"; }',
+        });
+        try {
+            const index = idx(dir);
+            const results = index.search('value', { in: 'src' });
+            assert.ok(results.length > 0, 'should find matches in directory');
+            assert.ok(results.every(r => r.file.includes('src/')), 'all matches should be in src/');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug #17: related all=true should not truncate sameFile section
+// ============================================================================
+
+describe('fix #121: related all=true fully expands sameFile', () => {
+    it('shows all same-file functions when all=true', () => {
+        // Create a file with many functions to exceed the default limit of 8
+        const funcs = Array.from({ length: 15 }, (_, i) =>
+            `function fn${i}() { return ${i}; }`
+        ).join('\n');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'big.js': funcs + '\nmodule.exports = {};',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.related('fn0', { all: true });
+            assert.ok(result);
+            // sameFile should have 14 others (fn1-fn14)
+            assert.ok(result.sameFile.length >= 14, `should have 14 same-file functions, got ${result.sameFile.length}`);
+
+            // Format with all=true should NOT truncate
+            const text = output.formatRelated(result, { all: true });
+            assert.ok(!text.includes('... and'), 'should not show truncation with all=true');
+            assert.ok(!text.includes('Some sections truncated'), 'should not show truncation hint');
+            // Verify all functions are shown
+            assert.ok(text.includes('fn14'), 'should show fn14 with all=true');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('truncates sameFile by default when there are many', () => {
+        const funcs = Array.from({ length: 15 }, (_, i) =>
+            `function fn${i}() { return ${i}; }`
+        ).join('\n');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'big.js': funcs + '\nmodule.exports = {};',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.related('fn0');
+            const text = output.formatRelated(result, {});
+            assert.ok(text.includes('... and'), 'should show truncation by default');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug #18: scope pollution warning for methods shared across classes
+// ============================================================================
+
+describe('fix #122: impact/verify/plan warn about scope pollution', () => {
+    it('impact shows scopeWarning for methods in multiple classes', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class FileService { close() { } }\nmodule.exports = { FileService };',
+            'b.js': 'class DbConn { close() { } }\nmodule.exports = { DbConn };',
+            'main.js': 'const { FileService } = require("./a");\nconst { DbConn } = require("./b");\nnew FileService().close();\nnew DbConn().close();\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.impact('close');
+            assert.ok(result);
+            assert.ok(result.scopeWarning, 'should have scope warning');
+            assert.ok(result.scopeWarning.otherClasses.length > 0, 'should list other classes');
+            assert.ok(result.scopeWarning.hint.includes('file=') || result.scopeWarning.hint.includes('className='),
+                'hint should suggest disambiguation');
+            // Verify formatter shows the warning
+            const text = output.formatImpact(result);
+            assert.ok(text.includes('Note:'), 'formatted output should show scope warning');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('verify shows scopeWarning for methods in multiple classes', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A { close(x) {} }\nmodule.exports = { A };',
+            'b.js': 'class B { close(y) {} }\nmodule.exports = { B };',
+            'main.js': 'const { A } = require("./a");\nnew A().close(1);\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('close');
+            assert.ok(result.found);
+            assert.ok(result.scopeWarning, 'verify should have scope warning');
+            // Verify formatter shows the warning
+            const text = output.formatVerify(result);
+            assert.ok(text.includes('Note:'), 'formatted verify should show scope warning');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('no scopeWarning for unique function names', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function uniqueHelper() { return 1; }\nmodule.exports = { uniqueHelper };',
+            'app.js': 'const { uniqueHelper } = require("./lib");\nuniqueHelper();',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.impact('uniqueHelper');
+            assert.ok(result);
+            assert.strictEqual(result.scopeWarning, null, 'should not warn for unique names');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug #19: React.forwardRef components should be visible to find/about
+// ============================================================================
+
+describe('fix #123: React.forwardRef/memo components detected', () => {
+    it('detects React.forwardRef component', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'Button.tsx': `import React from 'react';\nconst Button = React.forwardRef<HTMLButtonElement, {}>((props, ref) => {\n  return <button ref={ref} {...props} />;\n});\nexport default Button;\n`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('Button', { exact: true });
+            assert.ok(defs.length > 0, 'should find Button component');
+            assert.strictEqual(defs[0].name, 'Button');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('detects forwardRef without React prefix', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'Input.tsx': `import { forwardRef } from 'react';\nconst Input = forwardRef((props, ref) => {\n  return <input ref={ref} />;\n});\nexport default Input;\n`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('Input', { exact: true });
+            assert.ok(defs.length > 0, 'should find Input component');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('detects React.memo component', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'Card.tsx': `import React from 'react';\nconst Card = React.memo((props) => {\n  return <div>{props.children}</div>;\n});\nexport default Card;\n`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('Card', { exact: true });
+            assert.ok(defs.length > 0, 'should find Card component');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('detects memo without React prefix', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'List.tsx': `import { memo } from 'react';\nconst List = memo(function ListInner(props) {\n  return <ul>{props.items.map(i => <li key={i}>{i}</li>)}</ul>;\n});\nexport default List;\n`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('List', { exact: true });
+            assert.ok(defs.length > 0, 'should find List component');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('about works on forwardRef components', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'Dialog.tsx': `import React from 'react';\nconst Dialog = React.forwardRef((props, ref) => {\n  return <div ref={ref}>{props.children}</div>;\n});\nexport default Dialog;\n`,
+            'App.tsx': `import Dialog from './Dialog';\nfunction App() {\n  return <Dialog>Hello</Dialog>;\n}\n`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.about('Dialog');
+            assert.ok(result && result.found, 'about should find the forwardRef component');
+            assert.strictEqual(result.symbol.name, 'Dialog');
+        } finally {
+            rm(dir);
+        }
+    });
+});

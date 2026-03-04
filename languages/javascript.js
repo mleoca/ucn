@@ -212,6 +212,54 @@ function findFunctions(code, parser) {
                                 ...(docstring && { docstring })
                             });
                         }
+
+                        // React wrapper patterns: React.forwardRef(...), React.memo(...), forwardRef(...), memo(...)
+                        // const Button = React.forwardRef<Props, Ref>((props, ref) => ...)
+                        // const Memoized = memo((props) => ...)
+                        if (!isArrow && !isFnExpr && valueNode.type === 'call_expression') {
+                            const funcNode = valueNode.childForFieldName('function');
+                            if (funcNode) {
+                                let wrapperName = null;
+                                if (funcNode.type === 'member_expression') {
+                                    const prop = funcNode.childForFieldName('property');
+                                    wrapperName = prop?.text;
+                                } else if (funcNode.type === 'identifier') {
+                                    wrapperName = funcNode.text;
+                                }
+                                if (wrapperName === 'forwardRef' || wrapperName === 'memo') {
+                                    const argsNode = valueNode.childForFieldName('arguments');
+                                    if (argsNode && argsNode.namedChildCount > 0) {
+                                        const innerFn = argsNode.namedChild(0);
+                                        if (innerFn && (innerFn.type === 'arrow_function' || innerFn.type === 'function_expression')) {
+                                            processedRanges.add(rangeKey);
+                                            const paramsNode = innerFn.childForFieldName('parameters');
+                                            const { startLine, endLine, indent } = nodeToLocation(node, code);
+                                            const returnType = extractReturnType(innerFn);
+                                            const generics = extractGenerics(innerFn);
+                                            const docstring = extractJSDocstring(code, startLine);
+                                            const modifiers = node.parent && node.parent.type === 'export_statement'
+                                                ? extractModifiers(node.parent.text)
+                                                : extractModifiers(node.text);
+
+                                            functions.push({
+                                                name: nameNode.text,
+                                                params: extractParams(paramsNode),
+                                                paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                                                startLine,
+                                                endLine,
+                                                indent,
+                                                isArrow: innerFn.type === 'arrow_function',
+                                                isGenerator: false,
+                                                modifiers,
+                                                ...(returnType && { returnType }),
+                                                ...(generics && { generics }),
+                                                ...(docstring && { docstring })
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
