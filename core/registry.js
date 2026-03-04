@@ -63,6 +63,7 @@ const PARAM_MAP = {
     include_exported:  'includeExported',
     include_decorated: 'includeDecorated',
     calls_only:        'callsOnly',
+    class_name:        'className',
     max_lines:         'maxLines',
     add_param:         'addParam',
     remove_param:      'removeParam',

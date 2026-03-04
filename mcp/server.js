@@ -251,17 +251,18 @@ server.registerTool(
             staged: z.boolean().optional().describe('Analyze staged changes (diff_impact command)'),
             case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
             all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
-            top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)')
+            top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
+            class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)')
+
         })
     },
     async (args) => {
-        const { command, project_dir, name, file, exclude, include_tests,
-                include_methods, include_uncertain, with_types, detailed,
-                exact, in: inPath, top, depth, code_only, context: ctxLines,
-                include_exported, include_decorated, calls_only, max_lines,
-                direction, term, add_param, remove_param, rename_to,
-                default_value, stack, item, range, base, staged,
-                case_sensitive, regex, functions, all, top_level } = args;
+        const { command, project_dir } = args;
+
+        // Normalize ALL params once — execute() handlers pick what they need.
+        // This eliminates per-case param selection and prevents CLI/MCP drift.
+        const { command: _c, project_dir: _p, ...rawParams } = args;
+        const ep = normalizeParams(rawParams);
 
         try {
             switch (command) {
@@ -274,7 +275,6 @@ server.registerTool(
 
             case 'about': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, exclude, with_types, all, include_methods, include_uncertain, top });
                 const { ok, result, error } = execute(index, 'about', ep);
                 if (!ok) return toolResult(error); // soft error — won't kill sibling calls
                 return toolResult(output.formatAbout(result, {
@@ -285,19 +285,17 @@ server.registerTool(
 
             case 'context': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, exclude, include_methods, include_uncertain });
                 const { ok, result: ctx, error } = execute(index, 'context', ep);
                 if (!ok) return toolResult(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.'
                 });
-                expandCacheInstance.save(index.root, name, file, expandable);
+                expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
                 return toolResult(text);
             }
 
             case 'impact': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, exclude, top });
                 const { ok, result, error } = execute(index, 'impact', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatImpact(result));
@@ -305,7 +303,6 @@ server.registerTool(
 
             case 'smart': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, with_types, include_methods, include_uncertain });
                 const { ok, result, error } = execute(index, 'smart', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatSmart(result));
@@ -313,7 +310,6 @@ server.registerTool(
 
             case 'trace': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, depth, all, include_methods, include_uncertain });
                 const { ok, result, error } = execute(index, 'trace', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTrace(result, {
@@ -324,19 +320,19 @@ server.registerTool(
 
             case 'example': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'example', { name });
+                const { ok, result, error } = execute(index, 'example', ep);
                 if (!ok) return toolResult(error);
-                if (!result) return toolResult(`No usage examples found for "${name}".`);
-                return toolResult(output.formatExample(result, name));
+                if (!result) return toolResult(`No usage examples found for "${ep.name}".`);
+                return toolResult(output.formatExample(result, ep.name));
             }
 
             case 'related': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'related', { name, file, top, all });
+                const { ok, result, error } = execute(index, 'related', ep);
                 if (!ok) return toolResult(error);
-                if (!result) return toolResult(`Symbol "${name}" not found.`);
+                if (!result) return toolResult(`Symbol "${ep.name}" not found.`);
                 return toolResult(output.formatRelated(result, {
-                    all: all || false, top,
+                    all: ep.all || false, top: ep.top,
                     allHint: 'Repeat with all=true to show all.'
                 }));
             }
@@ -345,25 +341,22 @@ server.registerTool(
 
             case 'find': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, exclude, include_tests, exact, in: inPath });
                 const { ok, result, error, note } = execute(index, 'find', ep);
                 if (!ok) return toolResult(error); // soft error
-                let text = output.formatFind(result, name, top);
+                let text = output.formatFind(result, ep.name, ep.top);
                 if (note) text += '\n\n' + note;
                 return toolResult(text);
             }
 
             case 'usages': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, exclude, include_tests, code_only, context: ctxLines, in: inPath });
                 const { ok, result, error } = execute(index, 'usages', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatUsages(result, name));
+                return toolResult(output.formatUsages(result, ep.name));
             }
 
             case 'toc': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ detailed, top_level, all, top });
                 const { ok, result, error } = execute(index, 'toc', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatToc(result, {
@@ -373,29 +366,26 @@ server.registerTool(
 
             case 'search': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ term, exclude, include_tests, code_only, context: ctxLines, case_sensitive, in: inPath, regex });
                 const { ok, result, error } = execute(index, 'search', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatSearch(result, term));
+                return toolResult(output.formatSearch(result, ep.term));
             }
 
             case 'tests': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, calls_only });
                 const { ok, result, error } = execute(index, 'tests', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatTests(result, name));
+                return toolResult(output.formatTests(result, ep.name));
             }
 
             case 'deadcode': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ exclude, in: inPath, include_exported, include_decorated, include_tests });
                 const { ok, result, error } = execute(index, 'deadcode', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatDeadcode(result, {
-                    top: top || 0,
-                    decoratedHint: !include_decorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
-                    exportedHint: !include_exported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined
+                    top: ep.top || 0,
+                    decoratedHint: !ep.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
+                    exportedHint: !ep.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined
                 }));
             }
 
@@ -403,32 +393,32 @@ server.registerTool(
 
             case 'imports': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'imports', { file });
+                const { ok, result, error } = execute(index, 'imports', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatImports(result, file));
+                return toolResult(output.formatImports(result, ep.file));
             }
 
             case 'exporters': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'exporters', { file });
+                const { ok, result, error } = execute(index, 'exporters', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatExporters(result, file));
+                return toolResult(output.formatExporters(result, ep.file));
             }
 
             case 'file_exports': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'fileExports', { file });
+                const { ok, result, error } = execute(index, 'fileExports', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatFileExports(result, file));
+                return toolResult(output.formatFileExports(result, ep.file));
             }
 
             case 'graph': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'graph', { file, direction, depth, all });
+                const { ok, result, error } = execute(index, 'graph', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatGraph(result, {
-                    showAll: all || depth !== undefined,
-                    maxDepth: depth ?? 2, file,
+                    showAll: ep.all || ep.depth !== undefined,
+                    maxDepth: ep.depth ?? 2, file: ep.file,
                     depthHint: 'Set depth parameter for deeper graph.',
                     allHint: 'Set depth to expand all children.'
                 }));
@@ -438,14 +428,13 @@ server.registerTool(
 
             case 'verify': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'verify', { name, file });
+                const { ok, result, error } = execute(index, 'verify', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatVerify(result));
             }
 
             case 'plan': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, add_param, remove_param, rename_to, default_value, file });
                 const { ok, result, error } = execute(index, 'plan', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatPlan(result));
@@ -453,7 +442,7 @@ server.registerTool(
 
             case 'diff_impact': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'diffImpact', { base, staged, file });
+                const { ok, result, error } = execute(index, 'diffImpact', ep);
                 if (!ok) return toolResult(error); // soft error — e.g. "not a git repo"
                 return toolResult(output.formatDiffImpact(result));
             }
@@ -462,39 +451,38 @@ server.registerTool(
 
             case 'typedef': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'typedef', { name, exact });
+                const { ok, result, error } = execute(index, 'typedef', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatTypedef(result, name));
+                return toolResult(output.formatTypedef(result, ep.name));
             }
 
             case 'stacktrace': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'stacktrace', { stack });
+                const { ok, result, error } = execute(index, 'stacktrace', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatStackTrace(result));
             }
 
             case 'api': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'api', { file });
+                const { ok, result, error } = execute(index, 'api', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatApi(result, file || '.'));
+                return toolResult(output.formatApi(result, ep.file || '.'));
             }
 
             case 'stats': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'stats', { functions });
+                const { ok, result, error } = execute(index, 'stats', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatStats(result, { top: top || 0 }));
+                return toolResult(output.formatStats(result, { top: ep.top || 0 }));
             }
 
             // ── Extracting Code (via execute) ────────────────────────────
 
             case 'fn': {
-                const err = requireName(name);
+                const err = requireName(ep.name);
                 if (err) return err;
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, all });
                 const { ok, result, error } = execute(index, 'fn', ep);
                 if (!ok) return toolResult(error); // soft error
                 // MCP path security: validate all result files are within project root
@@ -507,13 +495,12 @@ server.registerTool(
             }
 
             case 'class': {
-                const err = requireName(name);
+                const err = requireName(ep.name);
                 if (err) return err;
-                if (max_lines !== undefined && (!Number.isInteger(max_lines) || max_lines < 1)) {
-                    return toolError(`Invalid max_lines: ${max_lines}. Must be a positive integer.`);
+                if (ep.maxLines !== undefined && (!Number.isInteger(ep.maxLines) || ep.maxLines < 1)) {
+                    return toolError(`Invalid max_lines: ${ep.maxLines}. Must be a positive integer.`);
                 }
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ name, file, all, max_lines });
                 const { ok, result, error } = execute(index, 'class', ep);
                 if (!ok) return toolResult(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
@@ -527,7 +514,6 @@ server.registerTool(
 
             case 'lines': {
                 const index = getIndex(project_dir);
-                const ep = normalizeParams({ file, range });
                 const { ok, result, error } = execute(index, 'lines', ep);
                 if (!ok) return toolResult(error); // soft error
                 // MCP path security: validate file is within project root
@@ -537,13 +523,13 @@ server.registerTool(
             }
 
             case 'expand': {
-                if (item === undefined || item === null) {
+                if (ep.item === undefined || ep.item === null) {
                     return toolError('Item number is required (e.g. item=1).');
                 }
                 const index = getIndex(project_dir);
-                const lookup = expandCacheInstance.lookup(index.root, item);
+                const lookup = expandCacheInstance.lookup(index.root, ep.item);
                 const { ok, result, error } = execute(index, 'expand', {
-                    match: lookup.match, itemNum: item,
+                    match: lookup.match, itemNum: ep.item,
                     itemCount: lookup.itemCount, symbolName: lookup.symbolName,
                     validateRoot: true
                 });
