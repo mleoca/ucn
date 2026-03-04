@@ -700,6 +700,14 @@ class ProjectIndex {
             return { def: null, definitions: [], warnings: [] };
         }
 
+        // Filter by class name (Class.method syntax)
+        if (options.className) {
+            const filtered = definitions.filter(d => d.className === options.className);
+            if (filtered.length > 0) {
+                definitions = filtered;
+            }
+        }
+
         // Filter by file if specified
         if (options.file) {
             const filtered = definitions.filter(d =>
@@ -825,6 +833,11 @@ class ProjectIndex {
      */
     _applyFindFilters(matches, options) {
         let filtered = matches;
+
+        // Filter by class name (Class.method syntax)
+        if (options.className) {
+            filtered = filtered.filter(m => m.className === options.className);
+        }
 
         // Filter by file pattern
         if (options.file) {
@@ -958,7 +971,10 @@ class ProjectIndex {
         const usages = [];
 
         // Get definitions (filtered)
-        const allDefinitions = this.symbols.get(name) || [];
+        let allDefinitions = this.symbols.get(name) || [];
+        if (options.className) {
+            allDefinitions = allDefinitions.filter(d => d.className === options.className);
+        }
         const definitions = options.exclude || options.in
             ? allDefinitions.filter(d => this.matchesFilters(d.relativePath, options))
             : allDefinitions;
@@ -1150,7 +1166,7 @@ class ProjectIndex {
     context(name, options = {}) {
         this._beginOp();
         try {
-        const resolved = this.resolveSymbol(name, { file: options.file });
+        const resolved = this.resolveSymbol(name, { file: options.file, className: options.className });
         let { def, definitions, warnings } = resolved;
         if (!def) {
             return null;
@@ -1310,7 +1326,7 @@ class ProjectIndex {
     smart(name, options = {}) {
         this._beginOp();
         try {
-        const { def } = this.resolveSymbol(name, { file: options.file });
+        const { def } = this.resolveSymbol(name, { file: options.file, className: options.className });
         if (!def) {
             return null;
         }
@@ -2362,7 +2378,7 @@ class ProjectIndex {
     related(name, options = {}) {
         this._beginOp();
         try {
-        const { def } = this.resolveSymbol(name, { file: options.file });
+        const { def } = this.resolveSymbol(name, { file: options.file, className: options.className });
         if (!def) {
             return null;
         }
@@ -2404,7 +2420,7 @@ class ProjectIndex {
             const symParts = symName.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase().split('_');
 
             // Check for shared parts (require ≥50% of the longer name to match)
-            const sharedParts = nameParts.filter(p => symParts.includes(p) && p.length > 2);
+            const sharedParts = nameParts.filter(p => symParts.includes(p) && p.length > 3);
             const maxParts = Math.max(nameParts.length, symParts.length);
             if (sharedParts.length > 0 && sharedParts.length / maxParts >= 0.5) {
                 const sym = symbols[0];
@@ -2513,7 +2529,7 @@ class ProjectIndex {
         // trace defaults to includeMethods=true (execution flow should show method calls)
         const includeMethods = options.includeMethods ?? true;
 
-        const { def, definitions, warnings } = this.resolveSymbol(name, { file: options.file });
+        const { def, definitions, warnings } = this.resolveSymbol(name, { file: options.file, className: options.className });
         if (!def) {
             return null;
         }
@@ -2619,7 +2635,7 @@ class ProjectIndex {
     impact(name, options = {}) {
         this._beginOp();
         try {
-        const { def } = this.resolveSymbol(name, { file: options.file });
+        const { def } = this.resolveSymbol(name, { file: options.file, className: options.className });
         if (!def) {
             return null;
         }
@@ -2770,13 +2786,13 @@ class ProjectIndex {
         try {
         const maxCallers = options.all ? Infinity : (options.maxCallers || 10);
         const maxCallees = options.all ? Infinity : (options.maxCallees || 10);
-        const includeMethods = options.includeMethods ?? true;
+        const includeMethods = options.includeMethods ?? false;
 
         // Find symbol definition(s) — skip counts since about() computes its own via usages()
-        const definitions = this.find(name, { exact: true, file: options.file, skipCounts: true });
+        const definitions = this.find(name, { exact: true, file: options.file, className: options.className, skipCounts: true });
         if (definitions.length === 0) {
             // Try fuzzy match (needs counts for suggestion ranking)
-            const fuzzy = this.find(name, { file: options.file });
+            const fuzzy = this.find(name, { file: options.file, className: options.className });
             if (fuzzy.length === 0) {
                 return null;
             }
@@ -2794,7 +2810,7 @@ class ProjectIndex {
         }
 
         // Use resolveSymbol for consistent primary selection (prefers non-test files)
-        const { def: resolved } = this.resolveSymbol(name, { file: options.file });
+        const { def: resolved } = this.resolveSymbol(name, { file: options.file, className: options.className });
         const primary = resolved || definitions[0];
         const others = definitions.filter(d =>
             d.relativePath !== primary.relativePath || d.startLine !== primary.startLine
@@ -3258,11 +3274,12 @@ class ProjectIndex {
      * @param {string} name - Symbol name
      * @returns {{ best: object, totalCalls: number } | null}
      */
-    example(name) {
+    example(name, options = {}) {
         this._beginOp();
         try {
         const usages = this.usages(name, {
             codeOnly: true,
+            className: options.className,
             exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
             context: 5
         });

@@ -177,7 +177,7 @@ function identifyCallPatterns(callSites, funcName) {
 function verify(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file });
+    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className });
     if (!def) {
         return { found: false, function: name };
     }
@@ -315,9 +315,9 @@ function plan(index, name, options = {}) {
         return { found: false, function: name };
     }
 
-    const resolved = index.resolveSymbol(name, { file: options.file });
+    const resolved = index.resolveSymbol(name, { file: options.file, className: options.className });
     const def = resolved.def || definitions[0];
-    const impact = index.impact(name, { file: options.file });
+    const impact = index.impact(name, { file: options.file, className: options.className });
     const currentParams = def.paramsStructured || [];
     const currentSignature = index.formatSignature(def);
 
@@ -327,6 +327,14 @@ function plan(index, name, options = {}) {
     let changes = [];
 
     if (options.addParam) {
+        // Check if parameter already exists
+        if (currentParams.some(p => p.name === options.addParam)) {
+            return {
+                found: true,
+                error: `Parameter "${options.addParam}" already exists in ${name}`,
+                currentParams: currentParams.map(p => p.name)
+            };
+        }
         operation = 'add-param';
         const newParam = {
             name: options.addParam,

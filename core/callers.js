@@ -227,47 +227,54 @@ function findCallers(index, name, options = {}) {
                     if (call.selfAttribute && fileEntry.language === 'python') {
                         // self.attr.method() — resolve via attribute type inference
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
-                        if (!callerSymbol?.className) continue;
-                        const attrTypes = getInstanceAttributeTypes(index, filePath, callerSymbol.className);
-                        if (!attrTypes) continue;
-                        const targetClass = attrTypes.get(call.selfAttribute);
-                        if (!targetClass) continue;
-                        // Check if any definition of searched function belongs to targetClass
-                        const matchesDef = definitions.some(d => d.className === targetClass);
-                        if (!matchesDef) continue;
-                        resolvedBySameClass = true;
-                        // Falls through to add as caller
+                        if (!callerSymbol?.className) {
+                            // Can't resolve — include only if includeMethods requested
+                            if (!options.includeMethods) continue;
+                        } else {
+                            const attrTypes = getInstanceAttributeTypes(index, filePath, callerSymbol.className);
+                            const targetClass = attrTypes?.get(call.selfAttribute);
+                            if (targetClass && definitions.some(d => d.className === targetClass)) {
+                                resolvedBySameClass = true;
+                            } else if (!options.includeMethods) {
+                                continue;
+                            }
+                        }
                     } else if (['self', 'cls', 'this', 'super'].includes(call.receiver)) {
                         // self/this/super.method() — resolve to same-class or parent method
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
-                        if (!callerSymbol?.className) continue;
-                        // For super(), skip same-class — only check parent chain
-                        let matchesDef = call.receiver === 'super'
-                            ? false
-                            : definitions.some(d => d.className === callerSymbol.className);
-                        // Walk inheritance chain using BFS if not found in same class
-                        if (!matchesDef) {
-                            const visited = new Set([callerSymbol.className]);
-                            const callerFile = callerSymbol.file || filePath;
-                            const startParents = index._getInheritanceParents(callerSymbol.className, callerFile) || [];
-                            const queue = startParents.map(p => ({ name: p, contextFile: callerFile }));
-                            while (queue.length > 0 && !matchesDef) {
-                                const { name: current, contextFile } = queue.shift();
-                                if (visited.has(current)) continue;
-                                visited.add(current);
-                                matchesDef = definitions.some(d => d.className === current);
-                                if (!matchesDef) {
-                                    const resolvedFile = index._resolveClassFile(current, contextFile);
-                                    const grandparents = index._getInheritanceParents(current, resolvedFile) || [];
-                                    for (const gp of grandparents) {
-                                        if (!visited.has(gp)) queue.push({ name: gp, contextFile: resolvedFile });
+                        if (!callerSymbol?.className) {
+                            if (!options.includeMethods) continue;
+                        } else {
+                            // For super(), skip same-class — only check parent chain
+                            let matchesDef = call.receiver === 'super'
+                                ? false
+                                : definitions.some(d => d.className === callerSymbol.className);
+                            // Walk inheritance chain using BFS if not found in same class
+                            if (!matchesDef) {
+                                const visited = new Set([callerSymbol.className]);
+                                const callerFile = callerSymbol.file || filePath;
+                                const startParents = index._getInheritanceParents(callerSymbol.className, callerFile) || [];
+                                const queue = startParents.map(p => ({ name: p, contextFile: callerFile }));
+                                while (queue.length > 0 && !matchesDef) {
+                                    const { name: current, contextFile } = queue.shift();
+                                    if (visited.has(current)) continue;
+                                    visited.add(current);
+                                    matchesDef = definitions.some(d => d.className === current);
+                                    if (!matchesDef) {
+                                        const resolvedFile = index._resolveClassFile(current, contextFile);
+                                        const grandparents = index._getInheritanceParents(current, resolvedFile) || [];
+                                        for (const gp of grandparents) {
+                                            if (!visited.has(gp)) queue.push({ name: gp, contextFile: resolvedFile });
+                                        }
                                     }
                                 }
                             }
+                            if (matchesDef) {
+                                resolvedBySameClass = true;
+                            } else if (!options.includeMethods) {
+                                continue;
+                            }
                         }
-                        if (!matchesDef) continue;
-                        resolvedBySameClass = true;
-                        // Falls through to add as caller
                     } else {
                         // Go doesn't use this/self/cls - always include Go method calls
                         // Java method calls are always obj.method() - include by default
@@ -756,6 +763,33 @@ function findCallees(index, def, options = {}) {
                                 return fe && !isTestFile(fe.relativePath, fe.language);
                             });
                             if (nonTest) callee = nonTest;
+                        }
+                    }
+                    // Priority 6: Usage-based tiebreaker for cross-language/cross-directory ambiguity
+                    // Matches resolveSymbol() scoring logic in project.js
+                    if (!bindingId && callee === symbols[0] && symbols.length > 1) {
+                        const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+                        const scored = symbols.map(s => {
+                            let score = 0;
+                            const fe = index.files.get(s.file);
+                            const rp = fe ? fe.relativePath : (s.relativePath || '');
+                            if (typeOrder.has(s.type)) score += 1000;
+                            if (isTestFile(rp, detectLanguage(s.file))) score -= 500;
+                            if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
+                            if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
+                            return { symbol: s, score };
+                        });
+                        scored.sort((a, b) => b.score - a.score);
+                        if (scored.length > 1 && scored[0].score === scored[1].score) {
+                            const tiedScore = scored[0].score;
+                            const tiedCandidates = scored.filter(s => s.score === tiedScore);
+                            for (const c of tiedCandidates) {
+                                c.usageCount = index.countSymbolUsages(c.symbol).total;
+                            }
+                            tiedCandidates.sort((a, b) => b.usageCount - a.usageCount);
+                            callee = tiedCandidates[0].symbol;
+                        } else {
+                            callee = scored[0].symbol;
                         }
                     }
                 }

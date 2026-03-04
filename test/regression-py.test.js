@@ -1265,3 +1265,47 @@ MAX_RETRIES = 3
         }
     });
 });
+
+describe('fix: self.attr type inference from __init__ parameter annotations', () => {
+    it('resolves self.attr type from typed parameter (self.x = param where param: ClassName)', () => {
+        const dir = tmp({
+            'setup.py': '',
+            'service.py': `class DataService:
+    def fetch(self, key):
+        return key
+
+    def process(self):
+        pass
+`,
+            'tracker.py': `from service import DataService
+
+class Tracker:
+    def __init__(self, svc: DataService = None):
+        self.svc = svc
+
+    def run(self):
+        return self.svc.fetch("key1")
+`,
+            'manager.py': `from service import DataService
+
+class Manager:
+    def __init__(self, config):
+        self.svc = config or DataService()
+
+    def execute(self):
+        return self.svc.fetch("key2")
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('fetch', {});
+            const callerNames = callers.map(c => c.callerName);
+            // Both should be found: tracker via param annotation, manager via constructor fallback
+            assert.ok(callerNames.includes('run'), 'should find caller via param type annotation');
+            assert.ok(callerNames.includes('execute'), 'should find caller via constructor fallback');
+            assert.strictEqual(callers.length, 2, 'should find exactly 2 callers');
+        } finally {
+            rm(dir);
+        }
+    });
+});

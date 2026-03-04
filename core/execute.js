@@ -41,6 +41,38 @@ function requireTerm(term) {
     return null;
 }
 
+/**
+ * Split Class.method syntax into className and methodName.
+ * Returns { className, methodName } or null if not applicable.
+ * Handles: "Class.method" → { className: "Class", methodName: "method" }
+ * Skips: ".method", "a.b.c" (multi-dot), names without dots
+ */
+function splitClassMethod(name) {
+    if (!name || typeof name !== 'string') return null;
+    const dotIndex = name.indexOf('.');
+    if (dotIndex <= 0 || dotIndex === name.length - 1) return null;
+    // Only split on first dot, and only if there's exactly one dot
+    if (name.indexOf('.', dotIndex + 1) !== -1) return null;
+    return {
+        className: name.substring(0, dotIndex),
+        methodName: name.substring(dotIndex + 1)
+    };
+}
+
+/**
+ * Apply Class.method syntax to params object.
+ * If name contains ".", splits it and sets p.name and p.className.
+ * Only applies if p.className is not already set.
+ */
+function applyClassMethodSyntax(p) {
+    if (p.className) return; // already set explicitly
+    const split = splitClassMethod(p.name);
+    if (split) {
+        p.name = split.methodName;
+        p.className = split.className;
+    }
+}
+
 /** Normalize exclude to an array (accepts string CSV, array, or falsy). */
 function toExcludeArray(exclude) {
     if (!exclude) return [];
@@ -93,9 +125,11 @@ const HANDLERS = {
     about: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const result = index.about(p.name, {
             withTypes: p.withTypes || false,
             file: p.file,
+            className: p.className,
             all: p.all,
             includeMethods: p.includeMethods,
             includeUncertain: p.includeUncertain || false,
@@ -103,17 +137,36 @@ const HANDLERS = {
             maxCallers: num(p.top, undefined),
             maxCallees: num(p.top, undefined),
         });
-        if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
+        if (!result) {
+            // Give better error if file/className filter is the problem
+            if (p.file || p.className) {
+                const unfiltered = index.about(p.name, {
+                    withTypes: p.withTypes || false,
+                    all: false,
+                    includeMethods: p.includeMethods,
+                    includeUncertain: p.includeUncertain || false,
+                    exclude: toExcludeArray(p.exclude),
+                });
+                if (unfiltered && unfiltered.found !== false && unfiltered.symbol) {
+                    const loc = `${unfiltered.symbol.file}:${unfiltered.symbol.startLine}`;
+                    const filterDesc = p.className ? `class "${p.className}"` : `file "${p.file}"`;
+                    return { ok: false, error: `Symbol "${p.name}" not found in ${filterDesc}. Found in: ${loc}. Use the correct --file or Class.method syntax.` };
+                }
+            }
+            return { ok: false, error: `Symbol "${p.name}" not found.` };
+        }
         return { ok: true, result };
     },
 
     context: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const result = index.context(p.name, {
             includeMethods: p.includeMethods,
             includeUncertain: p.includeUncertain || false,
             file: p.file,
+            className: p.className,
             exclude: toExcludeArray(p.exclude),
         });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
@@ -123,8 +176,10 @@ const HANDLERS = {
     impact: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const result = index.impact(p.name, {
             file: p.file,
+            className: p.className,
             exclude: toExcludeArray(p.exclude),
             top: num(p.top, undefined),
         });
@@ -135,8 +190,10 @@ const HANDLERS = {
     smart: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const result = index.smart(p.name, {
             file: p.file,
+            className: p.className,
             withTypes: p.withTypes || false,
             includeMethods: p.includeMethods,
             includeUncertain: p.includeUncertain || false,
@@ -148,10 +205,12 @@ const HANDLERS = {
     trace: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const depthVal = num(p.depth, undefined);
         const result = index.trace(p.name, {
             depth: depthVal ?? 3,
             file: p.file,
+            className: p.className,
             all: p.all || depthVal !== undefined,
             includeMethods: p.includeMethods,
             includeUncertain: p.includeUncertain || false,
@@ -163,7 +222,8 @@ const HANDLERS = {
     example: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
-        const result = index.example(p.name);
+        applyClassMethodSyntax(p);
+        const result = index.example(p.name, { file: p.file, className: p.className });
         if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
         return { ok: true, result };
     },
@@ -171,8 +231,10 @@ const HANDLERS = {
     related: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const result = index.related(p.name, {
             file: p.file,
+            className: p.className,
             top: num(p.top, undefined),
             all: p.all,
         });
@@ -185,6 +247,7 @@ const HANDLERS = {
     find: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         // Auto-include tests when pattern clearly targets test functions
         // But only if the user didn't explicitly set include_tests=false
         let includeTests = p.includeTests;
@@ -194,20 +257,28 @@ const HANDLERS = {
         const exclude = applyTestExclusions(p.exclude, includeTests);
         const result = index.find(p.name, {
             file: p.file,
+            className: p.className,
             exact: p.exact || false,
             exclude,
             in: p.in,
         });
-        return { ok: true, result };
+        // Warn if exact mode silently disables glob expansion
+        let note;
+        if (p.exact && p.name && (p.name.includes('*') || p.name.includes('?'))) {
+            note = `Note: exact=true treats "${p.name}" as a literal name (glob expansion disabled).`;
+        }
+        return { ok: true, result, note };
     },
 
     usages: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
         const result = index.usages(p.name, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
+            className: p.className,
             exclude,
             in: p.in,
         });
@@ -242,8 +313,10 @@ const HANDLERS = {
     tests: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         const result = index.tests(p.name, {
             callsOnly: p.callsOnly || false,
+            className: p.className,
         });
         return { ok: true, result };
     },
@@ -264,6 +337,7 @@ const HANDLERS = {
     fn: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
 
         const fnNames = p.name.includes(',')
             ? p.name.split(',').map(n => n.trim()).filter(Boolean)
@@ -273,11 +347,23 @@ const HANDLERS = {
         const notes = [];
 
         for (const fnName of fnNames) {
-            const matches = index.find(fnName, { file: p.file, skipCounts: true })
+            // For comma-separated names, each may have Class.method syntax
+            const fnSplit = splitClassMethod(fnName);
+            const actualName = fnSplit ? fnSplit.methodName : fnName;
+            const fnClassName = fnSplit ? fnSplit.className : p.className;
+            const matches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
                 .filter(m => m.type === 'function' || m.params !== undefined);
 
             if (matches.length === 0) {
-                notes.push(`Function "${fnName}" not found.`);
+                // Check if it's a class — suggest `class` command instead
+                const CLASS_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait'];
+                const classMatches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
+                    .filter(m => CLASS_TYPES.includes(m.type));
+                if (classMatches.length > 0) {
+                    notes.push(`"${fnName}" is a ${classMatches[0].type}, not a function. Use \`class ${fnName}\` instead.`);
+                } else {
+                    notes.push(`Function "${fnName}" not found.`);
+                }
                 continue;
             }
 
@@ -472,13 +558,15 @@ const HANDLERS = {
     verify: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
-        const result = index.verify(p.name, { file: p.file });
+        applyClassMethodSyntax(p);
+        const result = index.verify(p.name, { file: p.file, className: p.className });
         return { ok: true, result };
     },
 
     plan: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
         if (!p.addParam && !p.removeParam && !p.renameTo) {
             return { ok: false, error: 'Plan requires an operation: add_param, remove_param, or rename_to.' };
         }
@@ -488,6 +576,7 @@ const HANDLERS = {
             renameTo: p.renameTo,
             defaultValue: p.defaultValue,
             file: p.file,
+            className: p.className,
         });
         return { ok: true, result };
     },
@@ -506,7 +595,8 @@ const HANDLERS = {
     typedef: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
-        const result = index.typedef(p.name, { exact: p.exact || false });
+        applyClassMethodSyntax(p);
+        const result = index.typedef(p.name, { exact: p.exact || false, className: p.className });
         return { ok: true, result };
     },
 
