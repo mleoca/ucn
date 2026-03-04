@@ -5,8 +5,10 @@
  * as the first argument instead of using `this`.
  */
 
+const path = require('path');
 const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
 const { escapeRegExp } = require('./shared');
+const { extractImports } = require('./imports');
 
 /**
  * Find a call expression node at the target line matching funcName
@@ -199,24 +201,73 @@ function verify(index, name, options = {}) {
     const optionalCount = nonRestParams.filter(p => p.optional || p.default !== undefined).length;
     const minArgs = expectedParamCount - optionalCount;
 
-    // Get all call sites
-    const usages = index.usages(name, { codeOnly: true });
-    const calls = usages.filter(u => u.usageType === 'call' && !u.isDefinition);
+    // Get all call sites using findCallers for accurate resolution
+    // (usages-based approach misses calls when className is set or local names collide)
+    const callerResults = index.findCallers(name, {
+        includeMethods: true,
+        includeUncertain: false,
+        targetDefinitions: [def],
+    });
+    // Convert caller results to usage-like objects for analyzeCallSite
+    const calls = callerResults.map(c => ({
+        file: c.file,
+        relativePath: c.relativePath,
+        line: c.line,
+        content: c.content,
+        usageType: 'call',
+        receiver: c.receiver,
+    }));
 
     const valid = [];
     const mismatches = [];
     const uncertain = [];
 
     // If the definition is NOT a method, filter out method calls (e.g., dict.get() vs get())
-    // This prevents false positives where a standalone function name matches method calls
-    const defIsMethod = def.isMethod || def.type === 'method' || def.className;
+    // This prevents false positives where a standalone function name matches method calls.
+    // Exception: module-level calls (module.func()) are kept when the receiver matches the
+    // target module's name and is an imported name (e.g., jobs.submit() where jobs is imported
+    // and the function lives in jobs.py).
+    const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
+    const targetBasename = path.basename(def.file, path.extname(def.file));
+
+    // Build import-name lookup for receiver checking (module.func() vs dict.get())
+    const importNameCache = new Map();
+    function getImportedNames(filePath) {
+        if (importNameCache.has(filePath)) return importNameCache.get(filePath);
+        const names = new Set();
+        const fe = index.files.get(filePath);
+        if (!fe) { importNameCache.set(filePath, names); return names; }
+        try {
+            const content = index._readFile(filePath);
+            const { imports: rawImports, importAliases } = extractImports(content, fe.language);
+            for (const imp of rawImports) {
+                if (imp.names) for (const n of imp.names) names.add(n);
+            }
+            if (importAliases) {
+                for (const alias of importAliases) names.add(alias.local);
+            }
+        } catch (e) { /* skip */ }
+        importNameCache.set(filePath, names);
+        return names;
+    }
 
     for (const call of calls) {
         const analysis = analyzeCallSite(index, call, name);
 
-        // Skip method calls when verifying a non-method definition
+        // Skip method calls when verifying a non-method definition.
+        // This prevents false positives (e.g., dict.get() vs standalone get()).
+        // Allow module-level calls only when:
+        // 1. Receiver matches target file's basename (e.g., jobs == jobs for jobs.py)
+        // 2. Receiver is an imported name (not a local variable)
         if (analysis.isMethodCall && !defIsMethod) {
-            continue;
+            const callReceiver = call.receiver;
+            if (callReceiver && callReceiver === targetBasename) {
+                const importedNames = getImportedNames(call.file);
+                if (!importedNames.has(callReceiver)) continue;
+                // Receiver matches target module and is imported — keep it
+            } else {
+                continue;
+            }
         }
 
         if (analysis.args === null) {

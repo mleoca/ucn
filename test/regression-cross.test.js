@@ -2167,7 +2167,7 @@ public class MyClass {
 });
 
 // --- about: includeMethods default ---
-it('about excludes method callers by default (matching impact)', () => {
+it('about defaults includeMethods based on target type', () => {
     const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-about-methods-'));
     try {
         fs.writeFileSync(path.join(tmpDir, 'pyproject.toml'), '[project]\nname = "test"');
@@ -2184,20 +2184,28 @@ from service import Analyzer
 def run():
     a = Analyzer()
     a.analyze('test')
+
+def helper():
+    return 42
 `);
         const index = new ProjectIndex(tmpDir);
         index.build('**/*.py', { quiet: true });
 
-        // Default: includeMethods=false — aligns about with impact (fix #14)
-        const aboutDefault = index.about('analyze');
-        assert.ok(aboutDefault, 'Should find analyze');
-        assert.ok(aboutDefault.found, 'Should be found');
-        assert.ok(aboutDefault.includeMethods === false, 'includeMethods should default to false');
+        // Class methods: includeMethods defaults to true (method calls are how class methods are invoked)
+        const aboutMethod = index.about('analyze');
+        assert.ok(aboutMethod, 'Should find analyze');
+        assert.ok(aboutMethod.found, 'Should be found');
+        assert.ok(aboutMethod.includeMethods === true, 'includeMethods should default to true for class methods');
 
-        // Explicit true: includes method callers (obj.method() style)
-        const aboutWithMethods = index.about('analyze', { includeMethods: true });
-        assert.ok(aboutWithMethods, 'Should find analyze with includeMethods=true');
-        assert.ok(aboutWithMethods.includeMethods === true, 'includeMethods should be true');
+        // Standalone functions: includeMethods defaults to false (reduces noise from unrelated obj.fn() calls)
+        const aboutFunc = index.about('helper');
+        assert.ok(aboutFunc, 'Should find helper');
+        assert.ok(aboutFunc.found, 'Should be found');
+        assert.ok(aboutFunc.includeMethods === false, 'includeMethods should default to false for standalone functions');
+
+        // Explicit override still works
+        const aboutExplicit = index.about('analyze', { includeMethods: false });
+        assert.ok(aboutExplicit.includeMethods === false, 'explicit includeMethods=false should be respected');
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });
     }
@@ -6975,6 +6983,538 @@ describe('fix #123: React.forwardRef/memo components detected', () => {
             const result = index.about('Dialog');
             assert.ok(result && result.found, 'about should find the forwardRef component');
             assert.strictEqual(result.symbol.name, 'Dialog');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug Report #5 — Evaluation Round 5 Fixes (#115-#125)
+// ============================================================================
+
+describe('fix #115: trace depth=0 misleading message', () => {
+    it('shows "depth=0: showing root only" instead of "no callees"', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function process(x) { return helper(x); }\nfunction helper(x) { return x * 2; }\nmodule.exports = { process, helper };',
+            'app.js': 'const { process } = require("./lib");\nprocess(42);'
+        });
+        try {
+            const index = idx(dir);
+            const result = index.trace('process', { depth: 0 });
+            assert.ok(result, 'trace should return result');
+            assert.ok(result.tree, 'tree should exist');
+            assert.strictEqual(result.tree.children.length, 0, 'no children at depth 0');
+            assert.ok(result.warnings, 'should have warnings');
+            assert.ok(result.warnings.some(w => w.message.includes('depth=0')),
+                'warning should mention depth=0');
+            assert.ok(!result.warnings.some(w => w.message.includes('no callees')),
+                'warning should NOT say "no callees"');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('still shows "no callees" hint for genuinely leaf functions at depth > 0', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function foo() { return 1; }\nmodule.exports = { foo };',
+            'b.js': 'function foo() { return bar(); }\nfunction bar() { return 2; }\nmodule.exports = { foo };'
+        });
+        try {
+            const index = idx(dir);
+            // foo in a.js truly has no callees; foo in b.js does
+            const result = index.trace('foo', { depth: 3, file: 'a.js' });
+            assert.ok(result, 'trace should return result');
+            // No ambiguity warning since we specified file
+            // But it should NOT show depth=0 message since depth > 0
+            if (result.warnings) {
+                assert.ok(!result.warnings.some(w => w.message.includes('depth=0')),
+                    'should NOT mention depth=0 when depth > 0');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #116: search respects top= parameter', () => {
+    it('limits total matches with top parameter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'const x = 1;\nconst y = 2;\nconst z = 3;\nconst w = 4;\nconst v = 5;',
+            'b.js': 'const x = 10;\nconst y = 20;\nconst z = 30;',
+        });
+        try {
+            const index = idx(dir);
+            const allResults = index.search('const', {});
+            const totalAll = allResults.reduce((s, r) => s + r.matches.length, 0);
+            assert.ok(totalAll > 3, `should find > 3 matches, got ${totalAll}`);
+
+            const limited = index.search('const', { top: 3 });
+            const totalLimited = limited.reduce((s, r) => s + r.matches.length, 0);
+            assert.strictEqual(totalLimited, 3, 'should limit to 3 matches');
+            assert.ok(limited.meta.truncatedMatches > 0, 'should report truncated count');
+            assert.strictEqual(limited.meta.totalMatches, totalAll, 'should report total');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('top=1 returns exactly one match', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'let a = 1;\nlet b = 2;\nlet c = 3;',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.search('let', { top: 1 });
+            const total = result.reduce((s, r) => s + r.matches.length, 0);
+            assert.strictEqual(total, 1, 'should return exactly 1 match');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #117: className= parameter functional in impact/verify/plan', () => {
+    it('impact scopes to className', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'service.py': `
+class ServiceA:
+    def close(self):
+        pass
+
+class ServiceB:
+    def close(self):
+        pass
+`,
+            'app.py': `
+from service import ServiceA, ServiceB
+def run():
+    a = ServiceA()
+    a.close()
+    b = ServiceB()
+    b.close()
+`,
+        });
+        try {
+            const index = idx(dir);
+
+            // Without className: finds calls from both classes
+            const impactAll = index.impact('close', {});
+            assert.ok(impactAll, 'should find close');
+
+            // With className=ServiceA: should scope results
+            const impactA = index.impact('close', { className: 'ServiceA' });
+            assert.ok(impactA, 'should find close for ServiceA');
+            assert.ok(impactA.file.includes('service.py'), 'should resolve to service.py');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('verify scopes to className', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'svc.py': `
+class Alpha:
+    def process(self, data):
+        return data
+
+class Beta:
+    def process(self, x, y):
+        return x + y
+`,
+            'main.py': `
+from svc import Alpha, Beta
+def run():
+    a = Alpha()
+    a.process("hello")
+    b = Beta()
+    b.process(1, 2)
+`,
+        });
+        try {
+            const index = idx(dir);
+            const verifyA = index.verify('process', { className: 'Alpha' });
+            assert.ok(verifyA, 'should find process for Alpha');
+            assert.ok(verifyA.found, 'should be found');
+            // Alpha.process takes 1 arg (self excluded), Beta.process takes 2
+            assert.strictEqual(verifyA.expectedArgs.min, 1, 'Alpha.process expects 1 arg');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #118: verify finds calls for *args/**kwargs functions', () => {
+    it('finds call sites for functions with *args', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'util.py': `
+def submit(*args, **kwargs):
+    return args, kwargs
+`,
+            'caller.py': `
+from util import submit
+def run():
+    submit(1, 2, 3)
+    submit(key="value")
+    submit()
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('submit', {});
+            assert.ok(result, 'should find submit');
+            assert.ok(result.found, 'should be found');
+            assert.ok(result.totalCalls > 0, `should find calls, got ${result.totalCalls}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #125: verify counts module-level calls (jobs.submit pattern)', () => {
+    it('finds calls via import module (import jobs + jobs.submit)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'jobs.py': `
+def submit(task, priority=1):
+    pass
+
+def cancel(task_id):
+    pass
+`,
+            'worker.py': `
+import jobs
+
+def process():
+    jobs.submit("task1")
+    jobs.submit("task2", priority=2)
+    jobs.cancel("abc")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('submit');
+            assert.ok(result.found, 'Should find submit function');
+            assert.strictEqual(result.totalCalls, 2,
+                `Should count 2 module-level calls via jobs.submit(), got ${result.totalCalls}`);
+            assert.strictEqual(result.valid, 2, 'Both calls should be valid');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('finds calls via from-import (from api import jobs + jobs.submit)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'jobs.py': `
+def submit(fn, *args, **kwargs):
+    pass
+`,
+            'caller.py': `
+from . import jobs
+
+def run():
+    jobs.submit(task_fn, 1, 2, key="val")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('submit');
+            assert.ok(result.found, 'Should find submit function');
+            assert.strictEqual(result.totalCalls, 1,
+                `Should count 1 module-level call via jobs.submit(), got ${result.totalCalls}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('still filters dict.get() false positives', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'api.py': `
+def get(url):
+    return url
+`,
+            'client.py': `
+from api import get
+
+def fetch():
+    result = get("/data")
+    headers = {"Host": "example.com"}
+    host = headers.get("Host")
+    data = {"key": "value"}
+    val = data.get("key")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('get');
+            assert.ok(result.found, 'Should find get function');
+            // Only direct get("/data") should count, not headers.get() or data.get()
+            assert.strictEqual(result.totalCalls, 1,
+                `Should count only 1 direct call, got ${result.totalCalls}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #119: about CALLERS includes method callers for class methods', () => {
+    it('defaults includeMethods=true for class methods', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'analyzer.py': `
+class Analyzer:
+    def analyze(self, data):
+        return self._process(data)
+
+    def _process(self, data):
+        return data * 2
+`,
+            'main.py': `
+from analyzer import Analyzer
+def run():
+    a = Analyzer()
+    a.analyze('test')
+    result = a.analyze('other')
+`,
+        });
+        try {
+            const index = idx(dir);
+            const about = index.about('analyze');
+            assert.ok(about, 'should find analyze');
+            assert.ok(about.found, 'should be found');
+            assert.ok(about.includeMethods === true, 'should default to includeMethods=true for methods');
+            // Should find callers including a.analyze() calls
+            assert.ok(about.callers.total > 0, `should find callers, got ${about.callers.total}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('defaults includeMethods=false for standalone functions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }',
+        });
+        try {
+            const index = idx(dir);
+            const about = index.about('helper');
+            assert.ok(about, 'should find helper');
+            assert.ok(about.found, 'should be found');
+            assert.ok(about.includeMethods === false, 'should default to includeMethods=false for functions');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #120: impact finds call sites despite local name collision', () => {
+    it('finds method calls in files with same-name local function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'engine.py': `
+class Engine:
+    def analyze(self, data):
+        return data * 2
+`,
+            'api.py': `
+from engine import Engine
+
+def analyze(request):
+    """FastAPI endpoint with same name"""
+    eng = Engine()
+    result = eng.analyze(request.data)
+    return result
+`,
+            'worker.py': `
+from engine import Engine
+def run_worker():
+    e = Engine()
+    e.analyze('batch_data')
+`,
+        });
+        try {
+            const index = idx(dir);
+            // impact on Engine.analyze should find calls in BOTH api.py and worker.py
+            const result = index.impact('analyze', { className: 'Engine' });
+            assert.ok(result, 'should find analyze');
+            const files = result.byFile.map(f => f.file);
+            assert.ok(result.totalCallSites >= 2,
+                `should find >= 2 call sites, got ${result.totalCallSites} in files: ${files.join(', ')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #121: stacktrace uses AST-based function attribution', () => {
+    it('resolves correct enclosing function when trace name mismatches', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': `
+function alpha() {
+    return 1;
+}
+
+function beta() {
+    // line 7
+    // line 8
+    // line 9
+    return alpha() + 1;
+}
+
+function gamma() {
+    // line 13
+    // line 14
+    return beta() + 2;
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // Simulate a stack trace where function name is wrong (e.g., from minified code)
+            const frame = index.createStackFrame(
+                'app.js', 10, 'wrong_name', null, '    at wrong_name (app.js:10:5)'
+            );
+            assert.ok(frame, 'should create frame');
+            assert.ok(frame.found, 'should find file');
+            // Should use AST to find the actual enclosing function (beta, lines 6-11)
+            if (frame.functionInfo) {
+                assert.strictEqual(frame.functionInfo.name, 'beta',
+                    `should attribute to beta (enclosing function), got ${frame.functionInfo.name}`);
+                assert.ok(frame.functionInfo.inferred, 'should be marked as inferred');
+                assert.strictEqual(frame.functionInfo.traceName, 'wrong_name',
+                    'should preserve original trace name');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #122: with_types=true shows types from function body', () => {
+    it('includes types referenced in method body, not just parent class', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'models.py': `
+class Config:
+    pass
+
+class Report:
+    pass
+
+class Processor:
+    def process(self, data):
+        config = Config()
+        report = Report()
+        return report
+`,
+        });
+        try {
+            const index = idx(dir);
+            const about = index.about('process', { withTypes: true });
+            assert.ok(about, 'should find process');
+            assert.ok(about.found, 'should be found');
+            const typeNames = about.types.map(t => t.name);
+            assert.ok(typeNames.includes('Processor'), 'should include parent class');
+            assert.ok(typeNames.includes('Config'), 'should include Config from body');
+            assert.ok(typeNames.includes('Report'), 'should include Report from body');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #123: deadcode not fooled by property access substring matching', () => {
+    it('does not count obj.Name as usage of standalone Name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test","type":"module"}',
+            'components.js': `
+export const Separator = () => '<hr/>';
+export const Button = () => '<button/>';
+`,
+            'lib.js': `
+const Primitives = { Separator: 'primitive-sep' };
+// Uses Primitives.Separator (property access), not the exported Separator
+export function render() { return Primitives.Separator; }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            const deadNames = dead.map(d => d.name);
+            // Separator should be detected as dead — Primitives.Separator is NOT a usage
+            assert.ok(deadNames.includes('Separator'),
+                `Separator should be dead code, dead items: ${deadNames.join(', ')}`);
+            // Button should also be dead (no usage at all)
+            assert.ok(deadNames.includes('Button'),
+                `Button should be dead code`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #124: include_methods=false filters self/this method calls in callees', () => {
+    it('excludes self.method() callees when includeMethods=false', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pyproject.toml': '[project]\nname = "test"',
+            'service.py': `
+class Service:
+    def run(self):
+        self.step_one()
+        self.step_two()
+        helper()
+
+    def step_one(self):
+        pass
+
+    def step_two(self):
+        pass
+
+def helper():
+    pass
+`,
+        });
+        try {
+            const index = idx(dir);
+            // With includeMethods=true: should see step_one, step_two, helper
+            const withMethods = index.findCallees(
+                index.symbols.get('run').find(s => s.className === 'Service'),
+                { includeMethods: true }
+            );
+            const withNames = withMethods.map(c => c.name);
+            assert.ok(withNames.includes('step_one'), 'should include step_one with methods');
+            assert.ok(withNames.includes('step_two'), 'should include step_two with methods');
+
+            // With includeMethods=false: should only see helper (non-method calls)
+            const withoutMethods = index.findCallees(
+                index.symbols.get('run').find(s => s.className === 'Service'),
+                { includeMethods: false }
+            );
+            const withoutNames = withoutMethods.map(c => c.name);
+            assert.ok(!withoutNames.includes('step_one'), 'should exclude step_one without methods');
+            assert.ok(!withoutNames.includes('step_two'), 'should exclude step_two without methods');
+            assert.ok(withoutNames.includes('helper'), 'should still include helper (non-method)');
         } finally {
             rm(dir);
         }

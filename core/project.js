@@ -1705,12 +1705,21 @@ class ProjectIndex {
 
     /**
      * Extract type names from a function definition
-     * Finds all word-like type identifiers from param types and return type,
-     * then filters to only those that exist in the project symbol table.
+     * Finds all word-like type identifiers from param types, return type,
+     * class membership, and function body — filters to project-defined types only.
      */
     extractTypeNames(def) {
+        const TYPE_KINDS = ['type', 'interface', 'class', 'struct'];
         const types = new Set();
-        // Collect all type annotation strings
+
+        const addIfType = (name) => {
+            const syms = this.symbols.get(name);
+            if (syms && syms.some(s => TYPE_KINDS.includes(s.type))) {
+                types.add(name);
+            }
+        };
+
+        // 1. From param and return type annotations
         const typeStrings = [];
         if (def.paramsStructured) {
             for (const param of def.paramsStructured) {
@@ -1718,17 +1727,29 @@ class ProjectIndex {
             }
         }
         if (def.returnType) typeStrings.push(def.returnType);
-
-        // Extract all word-like identifiers from type annotations
-        // Handles: Dict[str, Any], Optional[QuoteData], str | None, List[int], CustomType
         for (const ts of typeStrings) {
             const matches = ts.match(/\b([A-Za-z_]\w*)\b/g);
             if (matches) {
-                for (const m of matches) {
-                    // Only include names that exist as type/interface/class/struct in the symbol table
-                    const syms = this.symbols.get(m);
-                    if (syms && syms.some(s => ['type', 'interface', 'class', 'struct'].includes(s.type))) {
-                        types.add(m);
+                for (const m of matches) addIfType(m);
+            }
+        }
+
+        // 2. From the class the method belongs to
+        if (def.className) addIfType(def.className);
+
+        // 3. From function body — always scan for project-defined type references
+        //    (constructors, type annotations, isinstance checks)
+        //    Not just a fallback — methods may reference types beyond their own class
+        const code = this.extractCode(def);
+        if (code) {
+            // Find capitalized identifiers that match project types
+            const bodyMatches = code.match(/\b([A-Z][A-Za-z0-9_]*)\b/g);
+            if (bodyMatches) {
+                const seen = new Set();
+                for (const m of bodyMatches) {
+                    if (!seen.has(m)) {
+                        seen.add(m);
+                        addIfType(m);
                     }
                 }
             }
@@ -2621,11 +2642,17 @@ class ProjectIndex {
             }
         }
 
-        // Add smart hint when resolved function has zero callees and alternatives exist
-        if (tree && tree.children && tree.children.length === 0 && definitions.length > 1 && !options.file) {
-            warnings.push({
-                message: `Resolved to ${def.relativePath}:${def.startLine} which has no callees. ${definitions.length - 1} other definition(s) exist — specify a file to pick a different one.`
-            });
+        // Add smart hint when resolved function has zero callees
+        if (tree && tree.children && tree.children.length === 0) {
+            if (maxDepth === 0) {
+                warnings.push({
+                    message: `depth=0: showing root function only. Increase depth to see callees.`
+                });
+            } else if (definitions.length > 1 && !options.file) {
+                warnings.push({
+                    message: `Resolved to ${def.relativePath}:${def.startLine} which has no callees. ${definitions.length - 1} other definition(s) exist — specify a file to pick a different one.`
+                });
+            }
         }
 
         return {
@@ -2658,58 +2685,140 @@ class ProjectIndex {
         if (!def) {
             return null;
         }
-        const usages = this.usages(name, { codeOnly: true });
-        const targetBindingId = def.bindingId;
-        const calls = usages.filter(u => {
-            if (u.usageType !== 'call' || u.isDefinition) return false;
-            const fileEntry = this.files.get(u.file);
-            if (fileEntry) {
-                // Filter by binding: skip calls from files that define their own version of this function
-                // For Go, also check sibling files in same directory (same package scope)
-                if (targetBindingId) {
-                    let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
-                    if (localBindings.length === 0 && fileEntry.language === 'go') {
-                        const dir = path.dirname(u.file);
-                        for (const [fp, fe] of this.files) {
-                            if (fp !== u.file && path.dirname(fp) === dir) {
-                                const sibling = (fe.bindings || []).filter(b => b.name === name);
-                                localBindings = localBindings.concat(sibling);
+        const defIsMethod = def.isMethod || def.type === 'method' || def.className;
+
+        // Use findCallers for className-scoped or method queries (sophisticated binding resolution)
+        // Fall back to usages-based approach for simple function queries (backward compatible)
+        let callSites;
+        if (options.className || defIsMethod) {
+            // findCallers has proper method call resolution (self/this, binding IDs, receiver checks)
+            let callerResults = this.findCallers(name, {
+                includeMethods: true,
+                includeUncertain: false,
+                targetDefinitions: [def],
+            });
+
+            // When className is explicitly provided, filter out method calls whose
+            // receiver clearly belongs to a different type. This helps with common
+            // method names like .close(), .get() etc. where many objects have the same method.
+            if (options.className && def.className) {
+                const targetClassName = def.className;
+                callerResults = callerResults.filter(c => {
+                    // Keep non-method calls and self/this/cls calls (already resolved by findCallers)
+                    if (!c.isMethod) return true;
+                    const r = c.receiver;
+                    if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
+                    // Check if receiver matches the target class name (case-insensitive camelCase convention)
+                    if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
+                    // Check if receiver is an instance of the target class using local variable type inference
+                    if (c.callerFile) {
+                        const callerDef = c.callerStartLine ? { file: c.callerFile, startLine: c.callerStartLine, endLine: c.callerEndLine } : null;
+                        if (callerDef) {
+                            const callerCalls = this.getCachedCalls(c.callerFile);
+                            if (callerCalls && Array.isArray(callerCalls)) {
+                                const localTypes = new Map();
+                                for (const call of callerCalls) {
+                                    if (call.line >= callerDef.startLine && call.line <= callerDef.endLine) {
+                                        if (!call.isMethod && !call.receiver) {
+                                            const syms = this.symbols.get(call.name);
+                                            if (syms && syms.some(s => s.type === 'class')) {
+                                                // Found a constructor call — check for assignment pattern
+                                                const fileEntry = this.files.get(c.callerFile);
+                                                if (fileEntry) {
+                                                    const content = this._readFile(c.callerFile);
+                                                    const lines = content.split('\n');
+                                                    const line = lines[call.line - 1] || '';
+                                                    // Match "var = ClassName(...)"
+                                                    const m = line.match(/^\s*(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/);
+                                                    if (m && m[2] === call.name) {
+                                                        localTypes.set(m[1], call.name);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                const receiverType = localTypes.get(r);
+                                if (receiverType) {
+                                    return receiverType === targetClassName;
+                                }
                             }
                         }
                     }
-                    if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
-                        return false; // This file/package has its own definition — call is to that, not our target
+                    // When className is explicitly set and we can't determine the receiver type,
+                    // still include the call (conservative: prefer false positives over false negatives)
+                    return true;
+                });
+            }
+
+            callSites = [];
+            for (const c of callerResults) {
+                const analysis = this.analyzeCallSite(
+                    { file: c.file, relativePath: c.relativePath, line: c.line, content: c.content },
+                    name
+                );
+                callSites.push({
+                    file: c.relativePath,
+                    line: c.line,
+                    expression: c.content.trim(),
+                    callerName: c.callerName,
+                    ...analysis
+                });
+            }
+            this._clearTreeCache();
+        } else {
+            const usages = this.usages(name, { codeOnly: true });
+            const targetBindingId = def.bindingId;
+            const calls = usages.filter(u => {
+                if (u.usageType !== 'call' || u.isDefinition) return false;
+                const fileEntry = this.files.get(u.file);
+                if (fileEntry) {
+                    // Filter by binding: skip calls from files that define their own version of this function
+                    // For Go, also check sibling files in same directory (same package scope)
+                    if (targetBindingId) {
+                        let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
+                        if (localBindings.length === 0 && fileEntry.language === 'go') {
+                            const dir = path.dirname(u.file);
+                            for (const [fp, fe] of this.files) {
+                                if (fp !== u.file && path.dirname(fp) === dir) {
+                                    const sibling = (fe.bindings || []).filter(b => b.name === name);
+                                    localBindings = localBindings.concat(sibling);
+                                }
+                            }
+                        }
+                        if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
+                            return false; // This file/package has its own definition — call is to that, not our target
+                        }
+                    }
+                    // Cross-reference with findCallsInCode to filter local closures and built-ins
+                    // (findCallsInCode has scope-aware filtering that findUsagesInCode lacks)
+                    const parsedCalls = this.getCachedCalls(u.file);
+                    if (parsedCalls && Array.isArray(parsedCalls)) {
+                        const hasCall = parsedCalls.some(c => c.name === name && c.line === u.line);
+                        if (!hasCall) return false;
                     }
                 }
-                // Cross-reference with findCallsInCode to filter local closures and built-ins
-                // (findCallsInCode has scope-aware filtering that findUsagesInCode lacks)
-                const parsedCalls = this.getCachedCalls(u.file);
-                if (parsedCalls && Array.isArray(parsedCalls)) {
-                    const hasCall = parsedCalls.some(c => c.name === name && c.line === u.line);
-                    if (!hasCall) return false;
-                }
-            }
-            return true;
-        });
-
-        // Analyze each call site, filtering out method calls for non-method definitions
-        const defIsMethod = def.isMethod || def.type === 'method' || def.className;
-        const callSites = [];
-        for (const call of calls) {
-            const analysis = this.analyzeCallSite(call, name);
-            // Skip method calls (obj.parse()) when target is a standalone function (parse())
-            if (analysis.isMethodCall && !defIsMethod) {
-                continue;
-            }
-            callSites.push({
-                file: call.relativePath,
-                line: call.line,
-                expression: call.content.trim(),
-                callerName: this.findEnclosingFunction(call.file, call.line),
-                ...analysis
+                return true;
             });
+
+            // Analyze each call site, filtering out method calls for non-method definitions
+            callSites = [];
+            for (const call of calls) {
+                const analysis = this.analyzeCallSite(call, name);
+                // Skip method calls (obj.parse()) when target is a standalone function (parse())
+                if (analysis.isMethodCall && !defIsMethod) {
+                    continue;
+                }
+                callSites.push({
+                    file: call.relativePath,
+                    line: call.line,
+                    expression: call.content.trim(),
+                    callerName: this.findEnclosingFunction(call.file, call.line),
+                    ...analysis
+                });
+            }
+            this._clearTreeCache();
         }
-        this._clearTreeCache();
 
         // Apply exclude filter
         let filteredSites = callSites;
@@ -2824,7 +2933,6 @@ class ProjectIndex {
         try {
         const maxCallers = options.all ? Infinity : (options.maxCallers || 10);
         const maxCallees = options.all ? Infinity : (options.maxCallees || 10);
-        const includeMethods = options.includeMethods ?? false;
 
         // Find symbol definition(s) — skip counts since about() computes its own via usages()
         const definitions = this.find(name, { exact: true, file: options.file, className: options.className, skipCounts: true });
@@ -2856,6 +2964,11 @@ class ProjectIndex {
 
         // Use the actual symbol name (may differ from query if fuzzy matched)
         const symbolName = primary.name;
+
+        // Default includeMethods: true when target is a class method (method calls are the primary way
+        // class methods are invoked), false for standalone functions (reduces noise from unrelated obj.fn() calls)
+        const isMethod = !!(primary.isMethod || primary.type === 'method' || primary.className);
+        const includeMethods = options.includeMethods ?? isMethod;
 
         // Get usage counts by type
         const usages = this.usages(symbolName, { codeOnly: true });
@@ -2917,12 +3030,16 @@ class ProjectIndex {
         // Get type definitions if requested
         let types = [];
         if (options.withTypes) {
-            const typeNames = this.extractTypeNames(primary);
-            for (const typeName of typeNames) {
+            const TYPE_KINDS = ['type', 'interface', 'class', 'struct'];
+            const seen = new Set();
+
+            const addType = (typeName) => {
+                if (seen.has(typeName)) return;
+                seen.add(typeName);
                 const typeSymbols = this.symbols.get(typeName);
                 if (typeSymbols) {
                     for (const sym of typeSymbols) {
-                        if (['type', 'interface', 'class', 'struct'].includes(sym.type)) {
+                        if (TYPE_KINDS.includes(sym.type)) {
                             types.push({
                                 name: sym.name,
                                 type: sym.type,
@@ -2931,6 +3048,18 @@ class ProjectIndex {
                             });
                         }
                     }
+                }
+            };
+
+            // From signature annotations
+            const typeNames = this.extractTypeNames(primary);
+            for (const typeName of typeNames) addType(typeName);
+
+            // From callee signatures — types used by functions this function calls
+            if (allCallees) {
+                for (const callee of allCallees) {
+                    const calleeTypeNames = this.extractTypeNames(callee);
+                    for (const tn of calleeTypeNames) addType(tn);
                 }
             }
         }
@@ -3103,7 +3232,28 @@ class ProjectIndex {
             }
         }
 
-        results.meta = { filesScanned, filesSkipped, totalFiles: this.files.size, regexFallback };
+        // Apply top limit (limits total matches across all files)
+        const totalMatches = results.reduce((sum, r) => sum + r.matches.length, 0);
+        let truncatedMatches = 0;
+        if (options.top && options.top > 0 && totalMatches > options.top) {
+            let remaining = options.top;
+            const truncated = [];
+            for (const r of results) {
+                if (remaining <= 0) break;
+                if (r.matches.length <= remaining) {
+                    truncated.push(r);
+                    remaining -= r.matches.length;
+                } else {
+                    truncated.push({ ...r, matches: r.matches.slice(0, remaining) });
+                    remaining = 0;
+                }
+            }
+            truncatedMatches = totalMatches - options.top;
+            results.length = 0;
+            results.push(...truncated);
+        }
+
+        results.meta = { filesScanned, filesSkipped, totalFiles: this.files.size, regexFallback, totalMatches, truncatedMatches };
         return results;
         } finally { this._endOp(); }
     }

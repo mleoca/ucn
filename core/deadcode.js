@@ -52,6 +52,44 @@ function buildUsageIndex(index) {
                     node.type === 'shorthand_property_identifier' ||
                     node.type === 'shorthand_property_identifier_pattern' ||
                     node.type === 'field_identifier') {
+                    // Skip property_identifier/field_identifier when they're:
+                    // 1. The property part of a member expression (e.g., obj.Separator)
+                    // 2. An object literal key (e.g., { Separator: value })
+                    // These are NOT references to standalone symbols.
+                    // Shorthand properties ({ Separator }) use shorthand_property_identifier instead.
+                    if ((node.type === 'property_identifier' || node.type === 'field_identifier') && node.parent) {
+                        const parentType = node.parent.type;
+                        // Object literal key: { Separator: 'value' } — not a reference
+                        if (parentType === 'pair' || parentType === 'key_value_pair' ||
+                            parentType === 'dictionary_entry' || parentType === 'field_declaration') {
+                            // Check if this is the key (first child) of the pair
+                            const firstChild = node.parent.child(0);
+                            if (firstChild === node) {
+                                for (let i = 0; i < node.childCount; i++) {
+                                    traverse(node.child(i));
+                                }
+                                return;
+                            }
+                        }
+                        // Member expression property: obj.Separator — not a standalone reference
+                        if (parentType === 'member_expression' ||
+                            parentType === 'field_expression' ||
+                            parentType === 'member_access_expression' ||
+                            parentType === 'selector_expression' ||       // Go
+                            parentType === 'field_access_expression' ||   // Rust
+                            parentType === 'scoped_identifier') {         // Rust
+                            // Check if this is the property (right side) of the member expression
+                            // by checking if it's NOT the object (left side)
+                            const firstChild = node.parent.child(0);
+                            if (firstChild !== node) {
+                                // This is the property part — skip it for deadcode counting
+                                for (let i = 0; i < node.childCount; i++) {
+                                    traverse(node.child(i));
+                                }
+                                return;
+                            }
+                        }
+                    }
                     const name = node.text;
                     if (!usageIndex.has(name)) {
                         usageIndex.set(name, []);
