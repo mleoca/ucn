@@ -99,6 +99,24 @@ function checkFileError(result, file) {
     return null;
 }
 
+/**
+ * Validate that className filter actually matches a definition.
+ * Returns error string if className is invalid, null if OK.
+ */
+function validateClassName(index, name, className) {
+    if (!className) return null;
+    const allDefs = index.symbols.get(name);
+    if (!allDefs || allDefs.length === 0) return null; // no defs at all — let the command handle "not found"
+    const matching = allDefs.filter(d => d.className === className);
+    if (matching.length > 0) return null; // className matched
+    // className specified but no definitions match
+    const available = [...new Set(allDefs.filter(d => d.className).map(d => d.className))];
+    if (available.length > 0) {
+        return `Symbol "${name}" not found in class "${className}". Available in: ${available.join(', ')}.`;
+    }
+    return `Symbol "${name}" is not a method of any class. Defined in: ${allDefs[0].relativePath}:${allDefs[0].startLine}.`;
+}
+
 /** Parse a number param (handles string from CLI, number from MCP). */
 function num(val, fallback) {
     if (val == null) return fallback;
@@ -162,6 +180,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.context(p.name, {
             includeMethods: p.includeMethods,
             includeUncertain: p.includeUncertain || false,
@@ -177,6 +197,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.impact(p.name, {
             file: p.file,
             className: p.className,
@@ -291,6 +313,7 @@ const HANDLERS = {
             topLevel: p.topLevel,
             all: p.all,
             top: num(p.top, undefined),
+            file: p.file,
         });
         return { ok: true, result };
     },
@@ -298,6 +321,7 @@ const HANDLERS = {
     search: (index, p) => {
         const err = requireTerm(p.term);
         if (err) return { ok: false, error: err };
+        const testsExcluded = !p.includeTests;
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
         const result = index.search(p.term, {
             codeOnly: p.codeOnly || false,
@@ -308,6 +332,7 @@ const HANDLERS = {
             regex: p.regex,
             top: num(p.top, undefined),
         });
+        if (result.meta) result.meta.testsExcluded = testsExcluded;
         return { ok: true, result };
     },
 
@@ -560,6 +585,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.verify(p.name, { file: p.file, className: p.className });
         return { ok: true, result };
     },
@@ -568,6 +595,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         if (!p.addParam && !p.removeParam && !p.renameTo) {
             return { ok: false, error: 'Plan requires an operation: add_param, remove_param, or rename_to.' };
         }

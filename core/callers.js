@@ -646,9 +646,21 @@ function findCallees(index, def, options = {}) {
         // Respect includeMethods=false — skip self/this method resolution entirely
         if (selfAttrCalls && def.className && options.includeMethods !== false) {
             const attrTypes = getInstanceAttributeTypes(index, def.file, def.className);
-            if (attrTypes) {
-                for (const call of selfAttrCalls) {
-                    const targetClass = attrTypes.get(call.selfAttribute);
+            for (const call of selfAttrCalls) {
+                    let targetClass = attrTypes ? attrTypes.get(call.selfAttribute) : null;
+                    // Unique method heuristic: if attr type unknown but method exists on exactly one class
+                    if (!targetClass) {
+                        const methodSyms = index.symbols.get(call.name);
+                        if (methodSyms) {
+                            const classNames = new Set();
+                            for (const s of methodSyms) {
+                                if (s.className) classNames.add(s.className);
+                            }
+                            if (classNames.size === 1) {
+                                targetClass = classNames.values().next().value;
+                            }
+                        }
+                    }
                     if (!targetClass) continue;
 
                     // Find method in symbol table where className matches
@@ -670,7 +682,6 @@ function findCallees(index, def, options = {}) {
                         });
                     }
                 }
-            }
         }
 
         // Third pass: resolve self/this/super.method() calls to same-class or parent methods

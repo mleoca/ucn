@@ -2052,6 +2052,10 @@ function formatSearch(results, term) {
         lines.push(`\n${results.reduce((s, r) => s + r.matches.length, 0)} shown of ${meta.totalMatches} total matches. Use top= to see more.`);
     }
 
+    if (meta && meta.testsExcluded && meta.filesSkipped > 0) {
+        lines.push(`\nNote: ${meta.filesSkipped} file${meta.filesSkipped === 1 ? '' : 's'} excluded by filters (test files hidden by default; use include_tests=true to include).`);
+    }
+
     return lines.join('\n');
 }
 

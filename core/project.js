@@ -919,6 +919,21 @@ class ProjectIndex {
             }
         }
 
+        // For methods (symbols with className), objects can be passed as parameters
+        // to files with no import relationship to the definition file.
+        // Expand to all project files that mention the name (fast text pre-check).
+        if (symbol.className) {
+            for (const filePath of this.files.keys()) {
+                if (relevantFiles.has(filePath)) continue;
+                try {
+                    const content = this._readFile(filePath);
+                    if (content.includes(name)) {
+                        relevantFiles.add(filePath);
+                    }
+                } catch (e) { /* skip unreadable */ }
+            }
+        }
+
         let calls = 0;
         let definitions = 0;
         let imports = 0;
@@ -1018,10 +1033,36 @@ class ProjectIndex {
                 // Try AST-based detection first (with per-operation cache)
                 const astUsages = this._getCachedUsages(filePath, name);
                 if (astUsages !== null) {
+                    // Pre-compute: does any imported project file define this name?
+                    // Used to filter namespace member expressions (e.g., DropdownMenuPrimitive.Separator)
+                    // while keeping module access patterns (e.g., output.formatExample())
+                    let _importedHasDef = null;
+                    const importedFileHasDef = () => {
+                        if (_importedHasDef !== null) return _importedHasDef;
+                        const importedFiles = this.importGraph.get(filePath) || [];
+                        _importedHasDef = importedFiles.some(imp => {
+                            const impEntry = this.files.get(imp);
+                            return impEntry?.symbols?.some(s => s.name === name);
+                        });
+                        return _importedHasDef;
+                    };
+
                     for (const u of astUsages) {
                         // Skip if this is a definition line (already added above)
                         if (definitions.some(d => d.file === filePath && d.startLine === u.line)) {
                             continue;
+                        }
+
+                        // Filter member expressions with unrelated receivers in JS/TS/Python.
+                        // Keeps: standalone usages, self/this/cls/super, method calls on known types,
+                        //        and module access (output.fn()) when the imported file defines the name.
+                        // Filters: namespace access to external packages (DropdownMenuPrimitive.Separator).
+                        if (u.receiver && !['self', 'this', 'cls', 'super'].includes(u.receiver) &&
+                            fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
+                            const hasMethodDef = allDefinitions.some(d => d.className);
+                            if (!hasMethodDef && !importedFileHasDef()) {
+                                continue;
+                            }
                         }
 
                         const lineContent = lines[u.line - 1] || '';
@@ -2746,6 +2787,35 @@ class ProjectIndex {
                             }
                         }
                     }
+                    // Check parameter type annotations: def foo(tracker: SourceTracker) → tracker.record()
+                    if (c.callerFile && c.callerStartLine) {
+                        const callerSymbol = this.findEnclosingFunction(c.callerFile, c.line, true);
+                        if (callerSymbol && callerSymbol.paramsStructured) {
+                            for (const param of callerSymbol.paramsStructured) {
+                                if (param.name === r && param.type) {
+                                    // Check if the type annotation contains the target class name
+                                    const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
+                                    if (typeMatches && typeMatches.some(t => t === targetClassName)) {
+                                        return true;
+                                    }
+                                    // Type annotation exists but doesn't match target class — filter out
+                                    return false;
+                                }
+                            }
+                        }
+                    }
+                    // Unique method heuristic: if the called method exists on exactly one class
+                    // and it matches the target, include the call (no other class could match)
+                    const methodDefs = this.symbols.get(name);
+                    if (methodDefs) {
+                        const classNames = new Set();
+                        for (const d of methodDefs) {
+                            if (d.className) classNames.add(d.className);
+                        }
+                        if (classNames.size === 1 && classNames.has(targetClassName)) {
+                            return true;
+                        }
+                    }
                     // className explicitly set but receiver type unknown — filter it out.
                     // User asked for a specific class; unknown receivers are likely unrelated.
                     return false;
@@ -3338,7 +3408,38 @@ class ProjectIndex {
         let totalDynamic = 0;
         let totalTests = 0;
 
+        // When file= is specified, scope to matching files only
+        let fileFilter = null;
+        if (options.file) {
+            const resolved = this.findFile(options.file);
+            if (resolved) {
+                fileFilter = new Set([resolved]);
+            } else {
+                // Try substring match for partial paths
+                const matching = [];
+                for (const fp of this.files.keys()) {
+                    const rp = path.relative(this.root, fp);
+                    if (rp.includes(options.file) || fp.includes(options.file)) {
+                        matching.push(fp);
+                    }
+                }
+                if (matching.length > 0) {
+                    fileFilter = new Set(matching);
+                } else {
+                    return {
+                        meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
+                        totals: { files: 0, lines: 0, functions: 0, classes: 0, state: 0, testFiles: 0 },
+                        summary: { topFunctionFiles: [], topLineFiles: [], entryFiles: [] },
+                        files: [],
+                        hiddenFiles: 0,
+                        error: `File not found in project: ${options.file}`
+                    };
+                }
+            }
+        }
+
         for (const [filePath, fileEntry] of this.files) {
+            if (fileFilter && !fileFilter.has(filePath)) continue;
             let functions = fileEntry.symbols.filter(s =>
                 s.type === 'function' || s.type === 'method' || s.type === 'static' ||
                 s.type === 'constructor' || s.type === 'public' || s.type === 'abstract'

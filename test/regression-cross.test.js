@@ -7648,12 +7648,12 @@ def cleanup():
 // BUG #23: usages receiver tracking for member expressions
 // ============================================================================
 
-describe('Bug #23: usages receiver tracking', () => {
-    it('should include receiver info for member expression usages (JS)', () => {
+describe('Bug #23: usages filters external namespace member expressions', () => {
+    it('should filter Ns.Separator but keep standalone Separator (JS)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'app.jsx': `
-import * as Ns from "./lib";
+import * as Ns from "@external/lib";
 
 function Separator() { return null; }
 
@@ -7665,30 +7665,54 @@ function Menu() {
         try {
             const index = idx(dir);
             const usages = index.usages('Separator');
+            // Ns.Separator should be FILTERED (external namespace access)
             const nsUsage = usages.find(u => u.receiver === 'Ns');
-            assert.ok(nsUsage, 'should include receiver for Ns.Separator');
-            const standaloneUsage = usages.find(u => !u.receiver && u.isDefinition);
-            assert.ok(standaloneUsage, 'should include standalone Separator definition');
+            assert.ok(!nsUsage, 'Ns.Separator should be filtered out');
+            // Standalone definition should remain
+            const defUsage = usages.find(u => u.isDefinition);
+            assert.ok(defUsage, 'standalone Separator definition should exist');
         } finally {
             rm(dir);
         }
     });
 
-    it('should include receiver info for member expression usages (Python)', () => {
+    it('should keep module.fn() when imported file defines the name (JS)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}\nmodule.exports = { helper };',
+            'app.js': 'const lib = require("./lib");\nfunction main() { lib.helper(); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const usages = index.usages('helper');
+            const moduleCall = usages.find(u => u.receiver === 'lib');
+            assert.ok(moduleCall, 'lib.helper() should be kept — imported file defines helper');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should filter external namespace member expressions (Python)', () => {
         const dir = tmp({
             'setup.py': 'from setuptools import setup',
             'app.py': `
 import os
 
-def get_path():
-    return os.path
+def path():
+    return "/"
+
+x = os.path
 `,
         });
         try {
             const index = idx(dir);
             const usages = index.usages('path');
-            const osUsage = usages.find(u => u.receiver === 'os');
-            assert.ok(osUsage, 'should include receiver for os.path');
+            // os.path should be FILTERED (os is external, no project file defines path via import)
+            const osUsage = usages.find(u => u.receiver === 'os' && !u.isDefinition);
+            assert.ok(!osUsage, 'os.path should be filtered — os is external');
+            // Local path() definition should remain
+            const defUsage = usages.find(u => u.isDefinition);
+            assert.ok(defUsage, 'standalone path() definition should exist');
         } finally {
             rm(dir);
         }
@@ -7741,6 +7765,484 @@ def caller():
             const output = runCli(dir, 'verify', ['process'], ['--class-name=MyClass']);
             assert.ok(!output.includes('Unknown flag'),
                 '--class-name should be a recognized flag');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #156: verify respects class_name filtering', () => {
+    it('filters verify results to only calls on the specified class', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'models.py': 'class HttpClient:\n    def close(self):\n        pass\n\nclass MarketDataFetcher:\n    def close(self):\n        pass\n',
+            'app.py': 'from models import HttpClient, MarketDataFetcher\n\ndef use_http():\n    c = HttpClient()\n    c.close()\n\ndef use_market():\n    m = MarketDataFetcher()\n    m.close()\n\ndef plot_stuff():\n    import matplotlib.pyplot as plt\n    plt.close("all")\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('close', { className: 'HttpClient' });
+            assert.ok(result.found, 'should find close');
+            // totalCalls should be 1 (only c.close() from use_http), not 2 or 3
+            assert.strictEqual(result.totalCalls, 1, 'should only find 1 call (HttpClient)');
+            assert.strictEqual(result.valid, 1, 'the single HttpClient call should be valid');
+            // plt.close and m.close (MarketDataFetcher) should be filtered out
+            assert.strictEqual(result.mismatches, 0, 'no mismatches from other classes');
+            assert.strictEqual(result.mismatchDetails.length, 0, 'no mismatch details from plt.close()');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #157: impact/verify className filter uses parameter type annotations', () => {
+    it('impact includes calls through typed parameters', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'tracker.py': 'class SourceTracker:\n    def record(self, data):\n        pass\n',
+            'service.py': 'from tracker import SourceTracker\n\ndef process_data(tracker: SourceTracker, items):\n    for item in items:\n        tracker.record(item)\n\ndef direct_use():\n    t = SourceTracker()\n    t.record("hello")\n',
+        });
+        try {
+            const index = idx(dir);
+            const impact = index.impact('record', { className: 'SourceTracker' });
+            assert.ok(impact, 'impact should return results');
+            // Gather all call sites from byFile
+            const allSites = impact.byFile.flatMap(f => f.sites);
+            // direct_use: t.record("hello")
+            const hasDirectCall = allSites.some(c =>
+                c.expression && c.expression.includes('t.record')
+            );
+            // process_data: tracker.record(item) - should be found via parameter type annotation
+            const hasParamCall = allSites.some(c =>
+                c.expression && c.expression.includes('tracker.record')
+            );
+            assert.ok(hasDirectCall, 'should find direct constructor-based call');
+            assert.ok(hasParamCall, 'should find call via typed parameter (tracker: SourceTracker)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('verify includes calls through typed parameters', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'client.py': 'class HttpClient:\n    def get(self, url):\n        pass\n',
+            'handler.py': 'from client import HttpClient\n\ndef fetch_data(client: HttpClient):\n    client.get("/api/data")\n\ndef direct():\n    c = HttpClient()\n    c.get("/api/other")\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('get', { className: 'HttpClient' });
+            assert.ok(result.found, 'should find get');
+            // Both calls should be counted: client.get() (typed param) and c.get() (constructor)
+            assert.strictEqual(result.totalCalls, 2, 'should find 2 calls (typed param + constructor)');
+            assert.strictEqual(result.valid, 2, 'both calls should be valid');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #159: unique method heuristic for className filtering', () => {
+    it('impact includes untyped param calls when method is unique to target class', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'tracker.py': 'class SourceTracker:\n    def record(self, data):\n        pass\n',
+            'service.py': 'from tracker import SourceTracker\n\ndef process(tracker=None):\n    if tracker:\n        tracker.record("data")\n\ndef direct():\n    t = SourceTracker()\n    t.record("hello")\n',
+        });
+        try {
+            const index = idx(dir);
+            const impact = index.impact('record', { className: 'SourceTracker' });
+            assert.ok(impact, 'impact should return results');
+            const allSites = impact.byFile.flatMap(f => f.sites);
+            // Both calls should be included: direct constructor + untyped param (unique method)
+            assert.ok(allSites.some(c => c.expression && c.expression.includes('t.record')),
+                'should find direct constructor-based call');
+            assert.ok(allSites.some(c => c.expression && c.expression.includes('tracker.record')),
+                'should find untyped param call via unique method heuristic');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does NOT include calls when method exists on multiple classes', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'classes.py': 'class HttpClient:\n    def close(self):\n        pass\n\nclass DbConnection:\n    def close(self):\n        pass\n',
+            'app.py': 'from classes import HttpClient, DbConnection\n\ndef cleanup(conn=None):\n    if conn:\n        conn.close()\n\ndef direct():\n    c = HttpClient()\n    c.close()\n',
+        });
+        try {
+            const index = idx(dir);
+            const impact = index.impact('close', { className: 'HttpClient' });
+            assert.ok(impact, 'impact should return results');
+            const allSites = impact.byFile.flatMap(f => f.sites);
+            // direct c.close() should be included (constructor assignment)
+            assert.ok(allSites.some(c => c.expression && c.expression.includes('c.close')),
+                'should find direct constructor-based call');
+            // conn.close() should NOT be included (close exists on 2 classes)
+            assert.ok(!allSites.some(c => c.expression && c.expression.includes('conn.close')),
+                'should NOT find ambiguous untyped param call when method is on multiple classes');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #158: search shows test file exclusion note', () => {
+    it('shows note about excluded test files when matches are found', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'MAGIC_VALUE = 42\n',
+            'test_lib.py': 'from lib import MAGIC_VALUE\ndef test_magic():\n    assert MAGIC_VALUE == 42\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'search', { term: 'MAGIC_VALUE' });
+            assert.ok(result.ok);
+            const text = output.formatSearch(result.result, 'MAGIC_VALUE');
+            assert.ok(text.includes('MAGIC_VALUE'), 'should find matches');
+            // Should mention excluded files
+            assert.ok(text.includes('excluded by filters') || text.includes('test files hidden'),
+                'should mention that test files were excluded');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not show note when include_tests=true', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'MAGIC_VALUE = 42\n',
+            'test_lib.py': 'from lib import MAGIC_VALUE\ndef test_magic():\n    assert MAGIC_VALUE == 42\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'search', { term: 'MAGIC_VALUE', includeTests: true });
+            assert.ok(result.ok);
+            const text = output.formatSearch(result.result, 'MAGIC_VALUE');
+            assert.ok(text.includes('MAGIC_VALUE'), 'should find matches');
+            assert.ok(!text.includes('test files hidden'),
+                'should not mention test exclusion when include_tests=true');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #35: impact/verify/context silently ignore invalid class_name
+// ============================================================================
+
+describe('fix #35: impact/verify/context reject invalid class_name', () => {
+    let dir, index;
+
+    it('setup', () => {
+        dir = tmp({
+            'requirements.txt': '',
+            'api.py': `
+class JobRunner:
+    def submit(self):
+        return "job"
+
+def submit():
+    return "standalone"
+`,
+            'app.py': `
+from api import submit, JobRunner
+
+def main():
+    result = submit()
+    runner = JobRunner()
+    runner.submit()
+`,
+        });
+        index = idx(dir);
+    });
+
+    it('impact errors when class_name has no such method', () => {
+        const result = execute(index, 'impact', { name: 'submit', className: 'NonExistentClass' });
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.error.includes('not found in class'), result.error);
+    });
+
+    it('impact errors when method not in specified class', () => {
+        const result = execute(index, 'impact', { name: 'main', className: 'JobRunner' });
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.error.includes('not a method'), result.error);
+    });
+
+    it('verify errors when class_name is invalid', () => {
+        const result = execute(index, 'verify', { name: 'submit', className: 'NonExistentClass' });
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.error.includes('not found in class'), result.error);
+    });
+
+    it('context errors when class_name is invalid', () => {
+        const result = execute(index, 'context', { name: 'submit', className: 'NonExistentClass' });
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.error.includes('not found in class'), result.error);
+    });
+
+    it('plan errors when class_name is invalid', () => {
+        const result = execute(index, 'plan', { name: 'submit', className: 'NonExistentClass', addParam: 'x' });
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.error.includes('not found in class'), result.error);
+    });
+
+    it('impact succeeds with valid class_name', () => {
+        const result = execute(index, 'impact', { name: 'submit', className: 'JobRunner' });
+        assert.strictEqual(result.ok, true);
+    });
+
+    it('verify succeeds with valid class_name', () => {
+        const result = execute(index, 'verify', { name: 'submit', className: 'JobRunner' });
+        assert.strictEqual(result.ok, true);
+    });
+
+    it('error lists available classes', () => {
+        const result = execute(index, 'impact', { name: 'submit', className: 'WrongClass' });
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.error.includes('JobRunner'), 'should mention available class');
+    });
+
+    it('cleanup', () => { rm(dir); });
+});
+
+// ============================================================================
+// BUG #36: find undercounts obj.method() patterns
+// ============================================================================
+
+describe('fix #36: find counts obj.method() calls accurately', () => {
+    it('counts method calls from files without direct import', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'tracker.py': `
+class Tracker:
+    def record(self, event):
+        pass
+`,
+            'app.py': `
+from tracker import Tracker
+
+def start():
+    t = Tracker()
+    t.record("start")
+`,
+            'helper.py': `
+def process(tracker):
+    tracker.record("step1")
+    tracker.record("step2")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const results = index.find('record');
+            assert.ok(results.length > 0, 'should find record');
+            const recordResult = results.find(r => r.name === 'record');
+            // Should count calls from helper.py too (no direct import)
+            assert.ok(recordResult.usageCounts.calls >= 3,
+                `Expected at least 3 calls, got ${recordResult.usageCounts.calls}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #37: toc file= silently ignored
+// ============================================================================
+
+describe('fix #37: toc respects file parameter', () => {
+    it('scopes toc to a single file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nfunction other() { return 2; }\n',
+            'app.js': 'function main() { return helper(); }\n',
+            'utils.js': 'function util() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            // Full toc should show all files
+            const full = execute(index, 'toc', {});
+            assert.ok(full.ok);
+            assert.ok(full.result.totals.files >= 3);
+
+            // Scoped toc should show only matching file
+            const scoped = execute(index, 'toc', { file: 'lib.js' });
+            assert.ok(scoped.ok);
+            assert.strictEqual(scoped.result.totals.files, 1, 'should show only 1 file');
+            assert.strictEqual(scoped.result.files[0].file, 'lib.js');
+            assert.strictEqual(scoped.result.totals.functions, 2, 'lib.js has 2 functions');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('toc file= with partial path', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/api/routes.js': 'function getUsers() {}\nfunction createUser() {}\n',
+            'src/lib/utils.js': 'function format() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'toc', { file: 'api/routes' });
+            assert.ok(result.ok);
+            assert.strictEqual(result.result.totals.files, 1);
+            assert.ok(result.result.files[0].file.includes('routes'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('toc file= returns error for missing file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'toc', { file: 'nonexistent.js' });
+            assert.ok(result.ok); // toc still returns ok but with 0 files
+            assert.strictEqual(result.result.totals.files, 0);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #38: plan add_param without default produces invalid signature
+// ============================================================================
+
+describe('fix #38: plan add_param places required param before optionals', () => {
+    it('inserts required param before optional params (Python)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'cache.py': `
+def set_cache(key, data, hours=4, conn=None):
+    pass
+`,
+            'app.py': `
+from cache import set_cache
+
+def store():
+    set_cache("k", "v")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'set_cache',
+                addParam: 'ttl_hours',
+            });
+            assert.ok(result.ok);
+            // The new required param should appear BEFORE optional params
+            const afterSig = result.result.after.signature;
+            assert.ok(afterSig.includes('ttl_hours'), 'should contain new param');
+            // ttl_hours should come before hours (which has default)
+            const ttlIdx = afterSig.indexOf('ttl_hours');
+            const hoursIdx = afterSig.indexOf('hours');
+            assert.ok(ttlIdx < hoursIdx,
+                `Required param 'ttl_hours' (pos ${ttlIdx}) should come before optional 'hours' (pos ${hoursIdx})`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('appends param at end when it has a default value', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'cache.py': `
+def set_cache(key, data, hours=4, conn=None):
+    pass
+`,
+            'app.py': `
+from cache import set_cache
+
+def store():
+    set_cache("k", "v")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'set_cache',
+                addParam: 'ttl_hours',
+                defaultValue: '24',
+            });
+            assert.ok(result.ok);
+            const afterSig = result.result.after.signature;
+            // With default, the param should be at the end (valid position)
+            assert.ok(afterSig.includes('ttl_hours = 24'), 'should have param with default');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('inserts required param before optional in JS/TS', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `
+function connect(host, port, timeout = 5000, retries = 3) {
+    return null;
+}
+`,
+            'app.js': `
+const { connect } = require('./lib');
+function main() { connect("localhost", 8080); }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'connect',
+                addParam: 'protocol',
+            });
+            assert.ok(result.ok);
+            const afterSig = result.result.after.signature;
+            const protoIdx = afterSig.indexOf('protocol');
+            const timeoutIdx = afterSig.indexOf('timeout');
+            assert.ok(protoIdx < timeoutIdx,
+                `Required 'protocol' should come before optional 'timeout'`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG #39: plan add_param (no default) misleading guidance (fixed by #38)
+// ============================================================================
+
+describe('fix #39: plan add_param required param shows correct guidance', () => {
+    it('call sites say "Add argument" when no default (valid with #38 fix)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'cache.py': `
+def set_cache(key, data, hours=4):
+    pass
+`,
+            'app.py': `
+from cache import set_cache
+
+def store():
+    set_cache("k", "v")
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'plan', {
+                name: 'set_cache',
+                addParam: 'ttl_hours',
+            });
+            assert.ok(result.ok);
+            // Signature should be valid (ttl_hours before hours)
+            const afterSig = result.result.after.signature;
+            const ttlIdx = afterSig.indexOf('ttl_hours');
+            const hoursIdx = afterSig.indexOf('hours');
+            assert.ok(ttlIdx < hoursIdx, 'signature should be valid');
+            // Call sites should have guidance
+            assert.ok(result.result.changes.length > 0, 'should have call site changes');
+            assert.ok(result.result.changes[0].suggestion.includes('Add argument'));
         } finally {
             rm(dir);
         }

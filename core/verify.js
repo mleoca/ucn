@@ -203,11 +203,83 @@ function verify(index, name, options = {}) {
 
     // Get all call sites using findCallers for accurate resolution
     // (usages-based approach misses calls when className is set or local names collide)
-    const callerResults = index.findCallers(name, {
+    let callerResults = index.findCallers(name, {
         includeMethods: true,
         includeUncertain: false,
         targetDefinitions: [def],
     });
+
+    // When className is explicitly provided, filter out method calls whose
+    // receiver clearly belongs to a different type (same logic as impact()).
+    if (options.className && def.className) {
+        const targetClassName = def.className;
+        callerResults = callerResults.filter(c => {
+            if (!c.isMethod) return true;
+            const r = c.receiver;
+            if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
+            if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
+            // Check local variable type inference from constructor assignments
+            if (c.callerFile) {
+                const callerDef = c.callerStartLine ? { file: c.callerFile, startLine: c.callerStartLine, endLine: c.callerEndLine } : null;
+                if (callerDef) {
+                    const callerCalls = index.getCachedCalls(c.callerFile);
+                    if (callerCalls && Array.isArray(callerCalls)) {
+                        const localTypes = new Map();
+                        for (const call of callerCalls) {
+                            if (call.line >= callerDef.startLine && call.line <= callerDef.endLine) {
+                                if (!call.isMethod && !call.receiver) {
+                                    const syms = index.symbols.get(call.name);
+                                    if (syms && syms.some(s => s.type === 'class')) {
+                                        const content = index._readFile(c.callerFile);
+                                        const clines = content.split('\n');
+                                        const cline = clines[call.line - 1] || '';
+                                        const m = cline.match(/^\s*(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/);
+                                        if (m && m[2] === call.name) {
+                                            localTypes.set(m[1], call.name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        const receiverType = localTypes.get(r);
+                        if (receiverType) {
+                            return receiverType === targetClassName;
+                        }
+                    }
+                }
+            }
+            // Check parameter type annotations: def foo(tracker: SourceTracker) → tracker.record()
+            if (c.callerFile && c.callerStartLine) {
+                const callerSymbol = index.findEnclosingFunction(c.callerFile, c.line, true);
+                if (callerSymbol && callerSymbol.paramsStructured) {
+                    for (const param of callerSymbol.paramsStructured) {
+                        if (param.name === r && param.type) {
+                            const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
+                            if (typeMatches && typeMatches.some(t => t === targetClassName)) {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+            // Unique method heuristic: if the called method exists on exactly one class
+            // and it matches the target, include the call (no other class could match)
+            const methodDefs = index.symbols.get(name);
+            if (methodDefs) {
+                const classNames = new Set();
+                for (const d of methodDefs) {
+                    if (d.className) classNames.add(d.className);
+                }
+                if (classNames.size === 1 && classNames.has(targetClassName)) {
+                    return true;
+                }
+            }
+            // className explicitly set but receiver type unknown — filter it out
+            return false;
+        });
+    }
+
     // Convert caller results to usage-like objects for analyzeCallSite
     const calls = callerResults.map(c => ({
         file: c.file,
@@ -410,7 +482,23 @@ function plan(index, name, options = {}) {
             name: options.addParam,
             ...(options.defaultValue && { default: options.defaultValue })
         };
-        newParams.push(newParam);
+
+        // When adding a required param (no default), insert before the first
+        // optional param to avoid producing invalid signatures in Python/TS
+        // (required params must precede optional ones).
+        if (!options.defaultValue) {
+            const firstOptIdx = newParams.findIndex(p => p.optional || p.default !== undefined);
+            if (firstOptIdx !== -1) {
+                // Also skip self/cls/&self/&mut self at position 0
+                const insertIdx = Math.max(firstOptIdx,
+                    (newParams.length > 0 && ['self', 'cls', '&self', '&mut self'].includes(newParams[0].name)) ? 1 : 0);
+                newParams.splice(insertIdx, 0, newParam);
+            } else {
+                newParams.push(newParam);
+            }
+        } else {
+            newParams.push(newParam);
+        }
 
         // Generate new signature
         const paramsList = newParams.map(p => {
