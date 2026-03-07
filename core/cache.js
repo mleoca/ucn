@@ -53,11 +53,17 @@ function saveCache(index, cachePath) {
         exportGraph: Array.from(index.exportGraph.entries()),
         extendsGraph: Array.from(index.extendsGraph.entries()),
         extendedByGraph: Array.from(index.extendedByGraph.entries()),
-        callsCache: callsCacheData,
         failedFiles: index.failedFiles ? Array.from(index.failedFiles) : []
     };
 
     fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
+
+    // Save callsCache to a separate file (lazy-loaded on demand)
+    if (callsCacheData.length > 0) {
+        const callsCacheFile = path.join(path.dirname(cacheFile), 'calls-cache.json');
+        fs.writeFileSync(callsCacheFile, JSON.stringify(callsCacheData));
+    }
+
     return cacheFile;
 }
 
@@ -111,10 +117,11 @@ function loadCache(index, cachePath) {
             index.extendedByGraph = new Map(cacheData.extendedByGraph);
         }
 
-        // Restore callsCache if present (v2+)
+        // Backward compat: if old cache has callsCache inline, load it
         if (Array.isArray(cacheData.callsCache)) {
             index.callsCache = new Map(cacheData.callsCache);
         }
+        // Otherwise, callsCache stays empty — loaded on demand via loadCallsCache()
 
         // Restore failedFiles if present
         if (Array.isArray(cacheData.failedFiles)) {
@@ -190,4 +197,30 @@ function isCacheStale(index) {
     return false;
 }
 
-module.exports = { saveCache, loadCache, isCacheStale };
+/**
+ * Load callsCache from separate file on demand.
+ * Only loads if callsCache is empty (not already populated from inline or prior load).
+ * @param {object} index - ProjectIndex instance
+ * @returns {boolean} - True if loaded successfully
+ */
+function loadCallsCache(index) {
+    if (index.callsCache.size > 0) return true; // Already populated
+    if (index._callsCacheLoaded) return false;   // Already attempted, file didn't exist
+    index._callsCacheLoaded = true;
+
+    const callsCacheFile = path.join(index.root, '.ucn-cache', 'calls-cache.json');
+    if (!fs.existsSync(callsCacheFile)) return false;
+
+    try {
+        const data = JSON.parse(fs.readFileSync(callsCacheFile, 'utf-8'));
+        if (Array.isArray(data)) {
+            index.callsCache = new Map(data);
+            return true;
+        }
+    } catch (e) {
+        // Corrupted file — ignore
+    }
+    return false;
+}
+
+module.exports = { saveCache, loadCache, loadCallsCache, isCacheStale };

@@ -625,23 +625,30 @@ function helper() { return 42; }
             // Verify callsCache is populated
             assert.ok(index1.callsCache.size > 0, 'callsCache should be populated');
 
-            // Save cache
-            const cachePath = path.join(tmpDir, 'test-cache.json');
-            index1.saveCache(cachePath);
+            // Save cache (default path)
+            index1.saveCache();
 
-            // Verify cache file has callsCache
-            const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 4, 'Cache version should be 4 (className, memberType, isMethod for all languages)');
-            assert.ok(Array.isArray(cacheData.callsCache), 'Cache should have callsCache array');
-            assert.ok(cacheData.callsCache.length > 0, 'callsCache should have entries');
+            // Verify main cache file does NOT have inline callsCache
+            const mainCachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const cacheData = JSON.parse(fs.readFileSync(mainCachePath, 'utf-8'));
+            assert.strictEqual(cacheData.version, 4, 'Cache version should be 4');
+            assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
+
+            // Verify separate calls-cache.json exists
+            const callsCachePath = path.join(tmpDir, '.ucn-cache', 'calls-cache.json');
+            assert.ok(fs.existsSync(callsCachePath), 'Separate calls-cache.json should exist');
 
             // Load in new instance
             const index2 = new ProjectIndex(tmpDir);
-            const loaded = index2.loadCache(cachePath);
+            const loaded = index2.loadCache();
             assert.ok(loaded, 'Cache should load successfully');
 
-            // Verify callsCache is restored
-            assert.ok(index2.callsCache.size > 0, 'callsCache should be restored');
+            // callsCache is lazy-loaded, so should be empty after loadCache
+            assert.strictEqual(index2.callsCache.size, 0, 'callsCache should not be loaded eagerly');
+
+            // Trigger lazy load via loadCallsCache
+            index2.loadCallsCache();
+            assert.ok(index2.callsCache.size > 0, 'callsCache should be restored after loadCallsCache');
 
             // Verify calls are usable without reparsing
             const calls = index2.getCachedCalls(filePath);
@@ -674,13 +681,12 @@ function helper() { return 42; }
             const callers1 = index1.findCallers('helper');
             const time1 = Date.now() - start1;
 
-            // Save cache
-            const cachePath = path.join(tmpDir, 'perf-cache.json');
-            index1.saveCache(cachePath);
+            // Save cache (default path so lazy callsCache loading works)
+            index1.saveCache();
 
             // Load in new instance
             const index2 = new ProjectIndex(tmpDir);
-            index2.loadCache(cachePath);
+            index2.loadCache();
 
             // Time findCallers after cache load
             const start2 = Date.now();
@@ -1774,11 +1780,15 @@ describe('fix: callsCache persisted to disk after command execution', () => {
             assert.ok(index.callsCache.size > 0, 'callsCache populated after findCallers');
             assert.ok(index.callsCacheDirty, 'dirty flag set');
 
-            // Save and reload — callsCache should persist
+            // Save and reload — callsCache should persist in separate file
             index.saveCache();
             const index2 = new ProjectIndex(dir);
             index2.loadCache();
-            assert.ok(index2.callsCache.size > 0, 'callsCache loaded from disk');
+            // callsCache is now lazy-loaded, not inline in index.json
+            assert.strictEqual(index2.callsCache.size, 0, 'callsCache not loaded eagerly');
+            // Trigger lazy load
+            index2.loadCallsCache();
+            assert.ok(index2.callsCache.size > 0, 'callsCache loaded from separate file');
         } finally {
             rm(dir);
         }

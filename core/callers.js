@@ -92,6 +92,9 @@ function getCachedCalls(index, filePath, options = {}) {
 function findCallers(index, name, options = {}) {
     index._beginOp();
     try {
+    // Lazy-load callsCache from disk if not already populated
+    if (index.loadCallsCache) index.loadCallsCache();
+
     const callers = [];
     const stats = options.stats;
 
@@ -391,6 +394,9 @@ function findCallers(index, name, options = {}) {
 function findCallees(index, def, options = {}) {
     index._beginOp();
     try {
+    // Lazy-load callsCache from disk if not already populated
+    if (index.loadCallsCache) index.loadCallsCache();
+
     try {
         // Get all calls from the file's cache (now includes enclosingFunction)
         const calls = getCachedCalls(index, def.file);

@@ -3612,6 +3612,9 @@ class ProjectIndex {
     /** Load index from cache file */
     loadCache(cachePath) { return indexCache.loadCache(this, cachePath); }
 
+    /** Load callsCache from separate file on demand (called by findCallers/findCallees) */
+    loadCallsCache() { return indexCache.loadCallsCache(this); }
+
     /** Check if cache is stale (any files changed or new files added) */
     isCacheStale() { return indexCache.isCacheStale(this); }
 
