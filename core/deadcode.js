@@ -9,12 +9,13 @@ const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../
 const { isTestFile } = require('./discovery');
 
 /**
- * Build a usage index for all identifiers in the codebase (optimized for deadcode)
+ * Build a usage index for identifiers in the codebase (optimized for deadcode)
  * Scans all files ONCE and builds a reverse index: name -> [usages]
  * @param {object} index - ProjectIndex instance
+ * @param {Set<string>} [filterNames] - If provided, only track these names (reduces memory)
  * @returns {Map<string, Array>} Usage index
  */
-function buildUsageIndex(index) {
+function buildUsageIndex(index, filterNames) {
     const usageIndex = new Map(); // name -> [{file, line}]
 
     for (const [filePath, fileEntry] of index.files) {
@@ -91,6 +92,12 @@ function buildUsageIndex(index) {
                         }
                     }
                     const name = node.text;
+                    if (filterNames && !filterNames.has(name)) {
+                        for (let i = 0; i < node.childCount; i++) {
+                            traverse(node.child(i));
+                        }
+                        return;
+                    }
                     if (!usageIndex.has(name)) {
                         usageIndex.set(name, []);
                     }
@@ -144,19 +151,21 @@ function deadcode(index, options = {}) {
     let excludedDecorated = 0;
     let excludedExported = 0;
 
-    // Build usage index once (instead of per-symbol)
-    const usageIndex = buildUsageIndex(index);
+    // Collect callable symbol names to reduce usage index scope
+    const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor'];
+    const callableNames = new Set();
+    for (const [symbolName, symbols] of index.symbols) {
+        if (symbols.some(s => callableTypes.includes(s.type))) {
+            callableNames.add(symbolName);
+        }
+    }
+
+    // Build usage index once (instead of per-symbol), filtered to callable names only
+    const usageIndex = buildUsageIndex(index, callableNames);
 
     for (const [name, symbols] of index.symbols) {
         for (const symbol of symbols) {
-            // Skip non-function/class types
-            // Include various method types from different languages:
-            // - function: standalone functions
-            // - class, struct, interface: type definitions (skip them in deadcode)
-            // - method: class methods
-            // - static, public, abstract: Java method modifiers used as types
-            // - constructor: constructors
-            const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor'];
+            // Skip non-function/class types (callableTypes defined above)
             if (!callableTypes.includes(symbol.type)) {
                 continue;
             }
