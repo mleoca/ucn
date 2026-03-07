@@ -108,8 +108,12 @@ function findCallers(index, name, options = {}) {
     // Phase 1: Find matching calls without reading file content.
     // Collect pending callers keyed by file — content is read only in Phase 2.
     const pendingByFile = new Map(); // filePath -> [{ call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver }]
+    let pendingCount = 0;
+    const maxResults = options.maxResults;
 
     for (const [filePath, fileEntry] of index.files) {
+        // Early exit when maxResults is reached
+        if (maxResults && pendingCount >= maxResults) break;
         try {
             const calls = getCachedCalls(index, filePath);
             if (!calls) continue;
@@ -131,6 +135,7 @@ function findCallers(index, name, options = {}) {
                         call, fileEntry, callerSymbol,
                         isMethod: false, isFunctionReference: true, receiver: undefined
                     });
+                    pendingCount++;
                     continue;
                 }
 
@@ -361,6 +366,7 @@ function findCallers(index, name, options = {}) {
                     isMethod: call.isMethod || false, isFunctionReference: false,
                     receiver: call.receiver
                 });
+                pendingCount++;
             }
         } catch (e) {
             // Expected: minified files exceed tree-sitter buffer, binary files fail to parse.

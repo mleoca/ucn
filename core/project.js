@@ -3103,7 +3103,9 @@ class ProjectIndex {
         let allCallers = null;
         let allCallees = null;
         if (primary.type === 'function' || primary.params !== undefined) {
-            allCallers = this.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary] });
+            // Use maxResults to limit file iteration (with buffer for exclude filtering)
+            const callerCap = maxCallers === Infinity ? undefined : maxCallers * 3;
+            allCallers = this.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap });
             // Apply exclude filter before slicing
             if (options.exclude && options.exclude.length > 0) {
                 allCallers = allCallers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
