@@ -1385,3 +1385,67 @@ var _ = "data"
         }
     });
 });
+
+// ============================================================================
+// fix #164: Go parameter type disambiguation in callers
+// ============================================================================
+
+describe('fix #164: t.Run() should NOT match custom Run() method', () => {
+    it('filters out callers where receiverType from function params does not match target', () => {
+        const dir = tmp({
+            'go.mod': 'module test',
+            'controller.go': 'package main\ntype DeploymentController struct{}\nfunc (dc *DeploymentController) Run() {}',
+            'main_test.go': 'package main\nimport "testing"\nfunc TestFoo(t *testing.T) {\n  t.Run("sub", nil)\n}',
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Run');
+            // t.Run() should NOT appear as a caller of DeploymentController.Run
+            const callerNames = ctx.callers.map(c => c.name);
+            assert.ok(!callerNames.includes('TestFoo'),
+                'TestFoo should NOT be a caller of DeploymentController.Run (t is *testing.T, not DeploymentController)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('correctly includes callers where receiverType matches', () => {
+        const dir = tmp({
+            'go.mod': 'module test',
+            'controller.go': 'package main\ntype DeploymentController struct{}\nfunc (dc *DeploymentController) Run() {}',
+            'app.go': 'package main\nfunc startController(dc *DeploymentController) {\n  dc.Run()\n}',
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('Run');
+            const callerNames = ctx.callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('startController'),
+                'startController should be a caller (dc is *DeploymentController)');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix #164: callees resolve to correct receiver type (Go)', () => {
+    it('resolves callees to correct receiver type via parameter types', () => {
+        const dir = tmp({
+            'go.mod': 'module test',
+            'types.go': 'package main\ntype Server struct{}\nfunc (s *Server) Run() {}\ntype Client struct{}\nfunc (c *Client) Run() {}',
+            'main.go': 'package main\nfunc main() {\n  s := &Server{}\n  s.Run()\n}',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')?.find(s => s.file.includes('main.go'));
+            assert.ok(def, 'main function should exist');
+            const callees = index.findCallees(def);
+            // Go methods have receiver (e.g., "*Server") rather than className
+            assert.ok(callees.some(c => c.receiver && c.receiver.includes('Server')),
+                'Should resolve to Server.Run');
+            assert.ok(!callees.some(c => c.receiver && c.receiver.includes('Client')),
+                'Should NOT resolve to Client.Run');
+        } finally {
+            rm(dir);
+        }
+    });
+});
