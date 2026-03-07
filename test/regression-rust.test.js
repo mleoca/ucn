@@ -1122,3 +1122,30 @@ fn main() {}
         }
     });
 });
+
+describe('fix #167: Rust method references detected as callbacks', () => {
+    it('detects obj.method passed as argument as callback reference', () => {
+        const dir = tmp({
+            'main.rs': `struct Handler;
+impl Handler {
+    fn process(&self) {}
+}
+fn execute(f: impl Fn()) { f(); }
+fn main() {
+    let h = Handler;
+    execute(h.process);
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const mainDef = index.symbols.get('main')?.find(s => s.file.includes('main.rs'));
+            assert.ok(mainDef, 'main function should exist');
+            const callees = index.findCallees(mainDef);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('execute'), 'should find execute as callee');
+            assert.ok(calleeNames.includes('process'), 'should find process as callback callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});

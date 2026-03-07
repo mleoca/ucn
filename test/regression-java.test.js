@@ -1307,3 +1307,28 @@ describe('fix #163: Java callee disambiguation with receiver type', () => {
         }
     });
 });
+
+describe('fix #167: Java method references detected as callbacks', () => {
+    it('detects this::method as callback reference', () => {
+        const dir = tmp({
+            'Main.java': `public class Main {
+    void worker() { System.out.println("work"); }
+    void run() {
+        execute(this::worker);
+    }
+    static void execute(Runnable r) { r.run(); }
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('run')?.find(s => s.file.includes('Main.java'));
+            assert.ok(def, 'run method should exist');
+            const callees = index.findCallees(def);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('execute'), 'should find execute as callee');
+            assert.ok(calleeNames.includes('worker'), 'should find worker as callback callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});

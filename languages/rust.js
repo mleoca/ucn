@@ -799,6 +799,31 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
+        // Detect function/method references passed as arguments:
+        // field_expression inside arguments (obj.method as callback)
+        if (node.type === 'field_expression' && node.parent?.type === 'arguments') {
+            const grandparent = node.parent?.parent;
+            if (!grandparent || grandparent.type !== 'call_expression' || grandparent.childForFieldName('function') !== node) {
+                const fieldNode = node.childForFieldName('field');
+                const valueNode = node.childForFieldName('value');
+                if (fieldNode) {
+                    const receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
+                    const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
+                    const enclosingFunction = getCurrentEnclosingFunction();
+                    calls.push({
+                        name: fieldNode.text,
+                        line: node.startPosition.row + 1,
+                        isMethod: true,
+                        receiver,
+                        ...(receiverType && { receiverType }),
+                        isFunctionReference: true,
+                        isPotentialCallback: true,
+                        enclosingFunction
+                    });
+                }
+            }
+        }
+
         return true;
     }, {
         onLeave: (node) => {

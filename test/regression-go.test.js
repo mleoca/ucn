@@ -1447,6 +1447,27 @@ describe('fix #165: Go directory import links all package files', () => {
     });
 });
 
+describe('fix #167: Go function references detected as callbacks', () => {
+    it('detects dc.worker passed as argument as callback reference', () => {
+        const dir = tmp({
+            'go.mod': 'module test',
+            'types.go': 'package main\ntype DC struct{}\nfunc (dc *DC) worker() {}',
+            'main.go': 'package main\nfunc UntilWithContext(f func()) {}\nfunc main() {\n  dc := &DC{}\n  UntilWithContext(dc.worker)\n}',
+        });
+        try {
+            const index = idx(dir);
+            const mainDef = index.symbols.get('main')?.find(s => s.file.includes('main.go'));
+            assert.ok(mainDef, 'main function should exist');
+            const callees = index.findCallees(mainDef);
+            const calleeNames = callees.map(c => c.name);
+            assert.ok(calleeNames.includes('UntilWithContext'), 'should find UntilWithContext as callee');
+            assert.ok(calleeNames.includes('worker'), 'should find worker as callback callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #164: callees resolve to correct receiver type (Go)', () => {
     it('resolves callees to correct receiver type via parameter types', () => {
         const dir = tmp({

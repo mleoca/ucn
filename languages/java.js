@@ -767,7 +767,28 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
-        return true;
+        // Detect method references passed as arguments: this::worker, obj::method
+        if (node.type === 'method_reference') {
+            const nameNode = node.namedChild(node.namedChildCount - 1);
+            const objNode = node.namedChild(0);
+            if (nameNode && nameNode.type === 'identifier') {
+                const receiver = objNode ? (objNode.type === 'identifier' || objNode.type === 'this' ? objNode.text : undefined) : undefined;
+                const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
+                const enclosingFunction = getCurrentEnclosingFunction();
+                calls.push({
+                    name: nameNode.text,
+                    line: node.startPosition.row + 1,
+                    isMethod: !!receiver,
+                    receiver,
+                    ...(receiverType && { receiverType }),
+                    isFunctionReference: true,
+                    isPotentialCallback: true,
+                    enclosingFunction
+                });
+            }
+            return true;
+        }
+
         // Track local variable types from new Type() assignments
         // e.g., Foo f = new Foo(); or var f = new Foo();
         if (node.type === 'local_variable_declaration' && functionStack.length > 0) {
@@ -789,6 +810,7 @@ function findCallsInCode(code, parser) {
             }
         }
 
+        return true;
     }, {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
