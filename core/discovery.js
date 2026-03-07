@@ -191,7 +191,7 @@ function expandGlob(pattern, options = {}) {
     const root = path.resolve(options.root || process.cwd());
     const ignores = options.ignores || DEFAULT_IGNORES;
     const maxDepth = options.maxDepth || 20;
-    const maxFiles = options.maxFiles || 10000;
+    const maxFiles = options.maxFiles || 50000;
     const followSymlinks = options.followSymlinks !== false; // default true
 
     // Handle home directory expansion

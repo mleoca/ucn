@@ -157,7 +157,7 @@ class ProjectIndex {
 
         const globOpts = {
             root: this.root,
-            maxFiles: options.maxFiles || 10000,
+            maxFiles: options.maxFiles || this.config.maxFiles || 50000,
             followSymlinks: options.followSymlinks
         };
 

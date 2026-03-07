@@ -1002,3 +1002,45 @@ describe('fix #122: find("test_*") should include test files', () => {
         }
     });
 });
+
+describe('config maxFiles from .ucn.json', () => {
+    it('respects maxFiles from .ucn.json config', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            '.ucn.json': JSON.stringify({ maxFiles: 2 }),
+            'a.js': 'function a() {}',
+            'b.js': 'function b() {}',
+            'c.js': 'function c() {}',
+            'd.js': 'function d() {}',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            // With maxFiles=2, only 2 files should be indexed
+            assert.strictEqual(index.files.size, 2);
+            assert.ok(index.truncated, 'should report truncation');
+            assert.strictEqual(index.truncated.maxFiles, 2);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('CLI --max-files overrides config maxFiles', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            '.ucn.json': JSON.stringify({ maxFiles: 1 }),
+            'a.js': 'function a() {}',
+            'b.js': 'function b() {}',
+            'c.js': 'function c() {}',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            // CLI maxFiles=10 should override config maxFiles=1
+            index.build(null, { quiet: true, maxFiles: 10 });
+            assert.strictEqual(index.files.size, 3);
+            assert.ok(!index.truncated, 'should not be truncated');
+        } finally {
+            rm(dir);
+        }
+    });
+});
