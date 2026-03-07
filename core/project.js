@@ -453,12 +453,25 @@ class ProjectIndex {
                 }
 
                 if (resolved && this.files.has(resolved)) {
-                    importedFiles.push(resolved);
-
-                    if (!this.exportGraph.has(resolved)) {
-                        this.exportGraph.set(resolved, []);
+                    // For Go, a package import means all files in that directory are dependencies
+                    // (Go packages span multiple files in the same directory)
+                    const filesToLink = [resolved];
+                    if (fileEntry.language === 'go') {
+                        const pkgDir = path.dirname(resolved);
+                        for (const fp of this.files.keys()) {
+                            if (fp !== resolved && path.dirname(fp) === pkgDir && fp.endsWith('.go')) {
+                                filesToLink.push(fp);
+                            }
+                        }
                     }
-                    this.exportGraph.get(resolved).push(filePath);
+
+                    for (const linkedFile of filesToLink) {
+                        importedFiles.push(linkedFile);
+                        if (!this.exportGraph.has(linkedFile)) {
+                            this.exportGraph.set(linkedFile, []);
+                        }
+                        this.exportGraph.get(linkedFile).push(filePath);
+                    }
                 }
             }
 

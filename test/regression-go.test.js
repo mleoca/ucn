@@ -1310,3 +1310,46 @@ describe('K8s fix: Bug 2 — search respects --file', () => {
         }
     });
 });
+
+// Bug fix: Go package imports should link to all files in package directory
+describe('fix: Go package import links all files in package directory', () => {
+    it('counts usages from symbols defined in non-first package file', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/myapp\n\ngo 1.21\n',
+            'main.go': `package main
+
+import "example.com/myapp/pkg/util"
+
+func main() {
+    util.Helper()
+    util.Format("test")
+}
+`,
+            'pkg/util/alpha.go': `package util
+
+func Alpha() string { return "alpha" }
+`,
+            'pkg/util/helpers.go': `package util
+
+func Helper() int { return 42 }
+func Format(s string) string { return s }
+`
+        });
+        try {
+            const index = idx(dir);
+            // Helper and Format are defined in helpers.go (not alpha.go which comes first alphabetically)
+            // Usage count should still work because the import links to all files in the package
+            const results = index.find('Helper');
+            assert.ok(results.length > 0, 'should find Helper');
+            const helper = results[0];
+            assert.ok(helper.usageCount >= 1, `Helper should have usages (got ${helper.usageCount})`);
+
+            const formatResults = index.find('Format');
+            assert.ok(formatResults.length > 0, 'should find Format');
+            const format = formatResults[0];
+            assert.ok(format.usageCount >= 1, `Format should have usages (got ${format.usageCount})`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
