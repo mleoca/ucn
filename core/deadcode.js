@@ -183,6 +183,11 @@ function deadcode(index, options = {}) {
                 continue;
             }
 
+            // Apply file filter (scopes deadcode to matching files)
+            if (options.file && !symbol.relativePath.includes(options.file)) {
+                continue;
+            }
+
             // Apply exclude and in filters
             if ((options.exclude && options.exclude.length > 0) || options.in) {
                 if (!index.matchesFilters(symbol.relativePath, { exclude: options.exclude, in: options.in })) {

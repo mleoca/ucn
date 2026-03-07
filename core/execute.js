@@ -450,6 +450,7 @@ const HANDLERS = {
             includeTests: p.includeTests || false,
             exclude: toExcludeArray(p.exclude),
             in: p.in,
+            file: p.file,
         });
         // Apply limit to dead code results
         const limit = num(p.limit, undefined);
