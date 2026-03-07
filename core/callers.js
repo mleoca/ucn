@@ -13,6 +13,22 @@ const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES } = require('./shared');
 
 /**
+ * Extract a single line from content without splitting the entire string.
+ * @param {string} content - Full file content
+ * @param {number} lineNum - 1-indexed line number
+ * @returns {string} The line content
+ */
+function getLine(content, lineNum) {
+    let start = 0;
+    for (let i = 1; i < lineNum; i++) {
+        start = content.indexOf('\n', start) + 1;
+        if (start === 0) return ''; // past end
+    }
+    const end = content.indexOf('\n', start);
+    return end === -1 ? content.slice(start) : content.slice(start, end);
+}
+
+/**
  * Get cached call sites for a file, with mtime/hash validation
  * Uses mtime for fast cache validation, falls back to hash if mtime matches but content changed
  * @param {object} index - ProjectIndex instance
@@ -378,13 +394,12 @@ function findCallers(index, name, options = {}) {
     for (const [filePath, pending] of pendingByFile) {
         try {
             const content = fs.readFileSync(filePath, 'utf-8');
-            const lines = content.split('\n');
             for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver } of pending) {
                 callers.push({
                     file: filePath,
                     relativePath: fileEntry.relativePath,
                     line: call.line,
-                    content: lines[call.line - 1] || '',
+                    content: getLine(content, call.line),
                     callerName: callerSymbol ? callerSymbol.name : null,
                     callerFile: callerSymbol ? filePath : null,
                     callerStartLine: callerSymbol ? callerSymbol.startLine : null,
