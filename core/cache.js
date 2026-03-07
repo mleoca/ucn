@@ -45,6 +45,24 @@ function saveCache(index, cachePath) {
     const configHash = crypto.createHash('md5')
         .update(JSON.stringify(index.config || {})).digest('hex');
 
+    // Strip redundant fields from symbols to reduce cache size.
+    // symbol.file = path.join(root, symbol.relativePath) — reconstructable
+    // symbol.bindingId = relativePath:type:startLine — reconstructable
+    // fileEntry.path = Map key — redundant
+    const strippedSymbols = [];
+    for (const [name, defs] of index.symbols) {
+        const stripped = defs.map(s => {
+            const { file, bindingId, ...rest } = s;
+            return rest;
+        });
+        strippedSymbols.push([name, stripped]);
+    }
+    const strippedFiles = [];
+    for (const [filePath, entry] of index.files) {
+        const { path: _p, ...rest } = entry;
+        strippedFiles.push([filePath, rest]);
+    }
+
     const cacheData = {
         version: 4,  // v4: className, memberType, isMethod for all languages
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
@@ -52,8 +70,8 @@ function saveCache(index, cachePath) {
         root: index.root,
         buildTime: index.buildTime,
         timestamp: Date.now(),
-        files: Array.from(index.files.entries()),
-        symbols: Array.from(index.symbols.entries()),
+        files: strippedFiles,
+        symbols: strippedSymbols,
         importGraph: Array.from(index.importGraph.entries()),
         exportGraph: Array.from(index.exportGraph.entries()),
         extendsGraph: Array.from(index.extendsGraph.entries()),
@@ -109,7 +127,23 @@ function loadCache(index, cachePath) {
         }
 
         index.files = new Map(cacheData.files);
+        // Reconstruct stripped fields on file entries
+        for (const [filePath, entry] of index.files) {
+            if (!entry.path) entry.path = filePath;
+        }
+
         index.symbols = new Map(cacheData.symbols);
+        // Reconstruct stripped fields on symbols
+        const root = cacheData.root || index.root;
+        for (const [, defs] of index.symbols) {
+            for (const s of defs) {
+                if (!s.file && s.relativePath) s.file = path.join(root, s.relativePath);
+                if (!s.bindingId && s.relativePath && s.type && s.startLine) {
+                    s.bindingId = `${s.relativePath}:${s.type}:${s.startLine}`;
+                }
+            }
+        }
+
         index.importGraph = new Map(cacheData.importGraph);
         index.exportGraph = new Map(cacheData.exportGraph);
         index.buildTime = cacheData.buildTime;
