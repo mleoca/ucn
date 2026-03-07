@@ -160,7 +160,12 @@ function loadCache(index, cachePath) {
         if (Array.isArray(cacheData.callsCache)) {
             index.callsCache = new Map(cacheData.callsCache);
         }
-        // Otherwise, callsCache stays empty — loaded on demand via loadCallsCache()
+        // Otherwise, eagerly load from separate calls-cache.json if it exists.
+        // This costs ~300MB on large codebases but prevents 10K cold tree-sitter
+        // re-parses (2GB+ peak) when findCallers runs on an empty callsCache.
+        if (index.callsCache.size === 0) {
+            loadCallsCache(index);
+        }
 
         // Restore failedFiles if present
         if (Array.isArray(cacheData.failedFiles)) {

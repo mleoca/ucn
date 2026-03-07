@@ -643,12 +643,8 @@ function helper() { return 42; }
             const loaded = index2.loadCache();
             assert.ok(loaded, 'Cache should load successfully');
 
-            // callsCache is lazy-loaded, so should be empty after loadCache
-            assert.strictEqual(index2.callsCache.size, 0, 'callsCache should not be loaded eagerly');
-
-            // Trigger lazy load via loadCallsCache
-            index2.loadCallsCache();
-            assert.ok(index2.callsCache.size > 0, 'callsCache should be restored after loadCallsCache');
+            // callsCache is eagerly loaded from calls-cache.json during loadCache
+            assert.ok(index2.callsCache.size > 0, 'callsCache should be loaded eagerly from calls-cache.json');
 
             // Verify calls are usable without reparsing
             const calls = index2.getCachedCalls(filePath);
@@ -1784,11 +1780,8 @@ describe('fix: callsCache persisted to disk after command execution', () => {
             index.saveCache();
             const index2 = new ProjectIndex(dir);
             index2.loadCache();
-            // callsCache is now lazy-loaded, not inline in index.json
-            assert.strictEqual(index2.callsCache.size, 0, 'callsCache not loaded eagerly');
-            // Trigger lazy load
-            index2.loadCallsCache();
-            assert.ok(index2.callsCache.size > 0, 'callsCache loaded from separate file');
+            // callsCache is eagerly loaded from separate calls-cache.json
+            assert.ok(index2.callsCache.size > 0, 'callsCache loaded eagerly from calls-cache.json');
         } finally {
             rm(dir);
         }
@@ -1947,17 +1940,17 @@ describe('perf: loadCache and findCallers baseline', () => {
             index1.findCallers('run');
             index1.saveCache();
 
-            // Measure loadCache time (should NOT load callsCache)
+            // Measure loadCache time (eagerly loads callsCache from separate file)
             const start = Date.now();
             const index2 = new ProjectIndex(dir);
             index2.loadCache();
             const loadTime = Date.now() - start;
 
-            // callsCache should be empty (lazy)
-            assert.strictEqual(index2.callsCache.size, 0, 'callsCache not loaded eagerly');
+            // callsCache should be eagerly loaded (prevents 10K cold tree-sitter parses)
+            assert.ok(index2.callsCache.size > 0, 'callsCache should be loaded eagerly from calls-cache.json');
             assert.ok(loadTime < 500, `loadCache should be fast: ${loadTime}ms`);
 
-            // Measure findCallers (triggers lazy load + lookup)
+            // findCallers should be fast since callsCache is warm
             const start2 = Date.now();
             const callers = index2.findCallers('run');
             const callersTime = Date.now() - start2;
