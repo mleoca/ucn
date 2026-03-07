@@ -1925,3 +1925,47 @@ describe('fix: CLI error paths still save cache', () => {
         }
     });
 });
+
+// ============================================================================
+// Performance regression baseline
+// ============================================================================
+
+describe('perf: loadCache and findCallers baseline', () => {
+    it('loadCache is fast with separate callsCache file', () => {
+        // Create a medium fixture (100+ files)
+        const files = { 'package.json': '{"name":"perf-test"}' };
+        for (let i = 0; i < 120; i++) {
+            files[`mod${i}.js`] = `function fn${i}() { return run(); }\nmodule.exports = { fn${i} };`;
+        }
+        files['run.js'] = 'function run() { return 42; }\nmodule.exports = { run };';
+
+        const dir = tmp(files);
+        try {
+            const index1 = new ProjectIndex(dir);
+            index1.build('**/*.js', { quiet: true });
+            // Warm up callsCache
+            index1.findCallers('run');
+            index1.saveCache();
+
+            // Measure loadCache time (should NOT load callsCache)
+            const start = Date.now();
+            const index2 = new ProjectIndex(dir);
+            index2.loadCache();
+            const loadTime = Date.now() - start;
+
+            // callsCache should be empty (lazy)
+            assert.strictEqual(index2.callsCache.size, 0, 'callsCache not loaded eagerly');
+            assert.ok(loadTime < 500, `loadCache should be fast: ${loadTime}ms`);
+
+            // Measure findCallers (triggers lazy load + lookup)
+            const start2 = Date.now();
+            const callers = index2.findCallers('run');
+            const callersTime = Date.now() - start2;
+
+            assert.ok(callers.length >= 100, `Should find 120 callers, got ${callers.length}`);
+            assert.ok(callersTime < 2000, `findCallers should complete reasonably: ${callersTime}ms`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
