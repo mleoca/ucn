@@ -1427,6 +1427,26 @@ describe('fix #164: t.Run() should NOT match custom Run() method', () => {
     });
 });
 
+describe('fix #165: Go directory import links all package files', () => {
+    it('counts usages for symbols from all files in imported Go package', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test',
+            'pkg/foo/a.go': 'package foo\nfunc FuncA() {}',
+            'pkg/foo/b.go': 'package foo\nfunc FuncB() {}',
+            'main.go': 'package main\nimport "example.com/test/pkg/foo"\nfunc main() { foo.FuncA(); foo.FuncB() }',
+        });
+        try {
+            const index = idx(dir);
+            const a = index.find('FuncA');
+            const b = index.find('FuncB');
+            assert.ok(a.some(s => s.usageCount > 0), 'FuncA should have usages from main.go');
+            assert.ok(b.some(s => s.usageCount > 0), 'FuncB should have usages from main.go');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #164: callees resolve to correct receiver type (Go)', () => {
     it('resolves callees to correct receiver type via parameter types', () => {
         const dir = tmp({
