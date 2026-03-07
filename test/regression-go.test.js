@@ -759,3 +759,554 @@ func process(n int) {}
         assert.ok(callNames.includes('process'), 'process should not be filtered (count is not a closure)');
     });
 });
+
+// ============================================================================
+// fix #160: Go iota constants not indexed
+// ============================================================================
+
+describe('fix #160: Go iota constants indexed as state symbols', () => {
+    it('finds exported constants in iota blocks', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'status.go': `package framework
+type Code int
+const (
+    Success Code = iota
+    Error
+    Unschedulable
+    Wait
+    Skip
+    Pending
+)
+`
+        });
+        try {
+            const index = idx(dir);
+            // All exported iota constants should be findable
+            for (const name of ['Success', 'Error', 'Unschedulable', 'Wait', 'Skip', 'Pending']) {
+                const syms = index.symbols.get(name) || [];
+                assert.ok(syms.length > 0, `Should find constant ${name}`);
+                assert.strictEqual(syms[0].type, 'state', `${name} should have type "state"`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not index unexported iota constants', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'internal.go': `package main
+type color int
+const (
+    red color = iota
+    green
+    blue
+)
+`
+        });
+        try {
+            const index = idx(dir);
+            for (const name of ['red', 'green', 'blue']) {
+                const syms = index.symbols.get(name) || [];
+                assert.strictEqual(syms.length, 0, `Unexported const ${name} should not be indexed`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('indexes exported constants from non-iota blocks', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'consts.go': `package main
+const MaxRetries = 3
+const Timeout = 30
+const internal = 5
+`
+        });
+        try {
+            const index = idx(dir);
+            // Exported constants should be indexed (fix K8s Bug 11)
+            const syms = index.symbols.get('MaxRetries') || [];
+            assert.ok(syms.length > 0, 'Exported const MaxRetries should be indexed');
+            const timeout = index.symbols.get('Timeout') || [];
+            assert.ok(timeout.length > 0, 'Exported const Timeout should be indexed');
+            // Unexported constants should NOT be indexed
+            const internal = index.symbols.get('internal') || [];
+            assert.strictEqual(internal.length, 0, 'Unexported const should not be indexed');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #161: Go receiver type tracking for method disambiguation
+// ============================================================================
+
+describe('fix #161: Go receiver type tracking in findCallsInCode', () => {
+    const goMod = require('../languages/go');
+    const { getParser } = require('../languages');
+    const parser = getParser('go');
+
+    it('tracks receiverType from method receiver', () => {
+        const code = `package main
+type Framework struct{}
+func (f *Framework) RunFilter() {
+    f.runFilterPlugin()
+}
+func (f *Framework) runFilterPlugin() {}
+`;
+        const calls = goMod.findCallsInCode(code, parser);
+        const runFilter = calls.find(c => c.name === 'runFilterPlugin');
+        assert.ok(runFilter, 'Should find runFilterPlugin call');
+        assert.strictEqual(runFilter.receiverType, 'Framework',
+            'receiverType should be Framework (from method receiver)');
+    });
+
+    it('tracks receiverType from function parameters', () => {
+        const code = `package main
+type Client struct{}
+func processClient(c *Client) {
+    c.GetPods()
+}
+func (c *Client) GetPods() {}
+`;
+        const calls = goMod.findCallsInCode(code, parser);
+        const getPods = calls.find(c => c.name === 'GetPods');
+        assert.ok(getPods, 'Should find GetPods call');
+        assert.strictEqual(getPods.receiverType, 'Client',
+            'receiverType should be Client (from parameter type)');
+    });
+
+    it('tracks receiverType from composite literal assignment', () => {
+        const code = `package main
+type Status struct{ Code int }
+func doWork() {
+    s := &Status{Code: 1}
+    s.String()
+}
+func (s *Status) String() string { return "" }
+`;
+        const calls = goMod.findCallsInCode(code, parser);
+        const str = calls.find(c => c.name === 'String');
+        assert.ok(str, 'Should find String call');
+        assert.strictEqual(str.receiverType, 'Status',
+            'receiverType should be Status (from composite literal)');
+    });
+
+    it('does not set receiverType for unknown receivers', () => {
+        const code = `package main
+func doWork(x interface{}) {
+    x.Method()
+}
+`;
+        const calls = goMod.findCallsInCode(code, parser);
+        const method = calls.find(c => c.name === 'Method');
+        assert.ok(method, 'Should find Method call');
+        assert.strictEqual(method.receiverType, undefined,
+            'receiverType should be undefined for unknown type');
+    });
+});
+
+// ============================================================================
+// fix #162: Go callee disambiguation uses receiver type
+// ============================================================================
+
+describe('fix #162: Go callee disambiguation with receiver type', () => {
+    it('resolves callees to correct type when multiple types have same method', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'types.go': `package main
+
+type FilterPlugin struct{}
+func (f *FilterPlugin) Run() string { return "filter" }
+
+type ScorePlugin struct{}
+func (s *ScorePlugin) Run() string { return "score" }
+
+func (f *FilterPlugin) Execute() {
+    f.Run()
+}
+
+func (s *ScorePlugin) Execute() {
+    s.Run()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // FilterPlugin.Execute should call FilterPlugin.Run, not ScorePlugin.Run
+            const filterExec = (index.symbols.get('Execute') || [])
+                .find(d => d.receiver === '*FilterPlugin');
+            assert.ok(filterExec, 'Should find FilterPlugin.Execute');
+            const filterCallees = index.findCallees(filterExec);
+            const filterRun = filterCallees.find(c => c.name === 'Run');
+            assert.ok(filterRun, 'Should find Run callee');
+            assert.ok(filterRun.receiver === '*FilterPlugin',
+                'Run callee should be from FilterPlugin, got: ' + filterRun.receiver);
+
+            // ScorePlugin.Execute should call ScorePlugin.Run
+            const scoreExec = (index.symbols.get('Execute') || [])
+                .find(d => d.receiver === '*ScorePlugin');
+            assert.ok(scoreExec, 'Should find ScorePlugin.Execute');
+            const scoreCallees = index.findCallees(scoreExec);
+            const scoreRun = scoreCallees.find(c => c.name === 'Run');
+            assert.ok(scoreRun, 'Should find Run callee');
+            assert.ok(scoreRun.receiver === '*ScorePlugin',
+                'Run callee should be from ScorePlugin, got: ' + scoreRun.receiver);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('resolves callers to correct type with targetDefinitions', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'types.go': `package main
+
+type PreFilter struct{}
+func (p *PreFilter) Process() string { return "pre" }
+
+type PreScore struct{}
+func (p *PreScore) Process() string { return "score" }
+
+type Runner struct{}
+func (r *Runner) RunFilters(pf *PreFilter) {
+    pf.Process()
+}
+func (r *Runner) RunScores(ps *PreScore) {
+    ps.Process()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // Callers of PreFilter.Process should include RunFilters, not RunScores
+            const preFilterProcess = (index.symbols.get('Process') || [])
+                .find(d => d.receiver === '*PreFilter');
+            assert.ok(preFilterProcess, 'Should find PreFilter.Process');
+
+            const callers = index.findCallers('Process', {
+                targetDefinitions: [preFilterProcess]
+            });
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('RunFilters'),
+                'RunFilters should be a caller of PreFilter.Process');
+            assert.ok(!callerNames.includes('RunScores'),
+                'RunScores should NOT be a caller of PreFilter.Process');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('resolves method calls via New* constructor pattern', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'factory.go': `package main
+
+type Registry struct{}
+func NewRegistry() *Registry { return &Registry{} }
+func (r *Registry) Register(name string) {}
+
+type Cache struct{}
+func NewCache() *Cache { return &Cache{} }
+func (c *Cache) Register(key string) {}
+
+func setup() {
+    reg := NewRegistry()
+    reg.Register("plugin1")
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const setupDef = (index.symbols.get('setup') || [])[0];
+            assert.ok(setupDef, 'Should find setup function');
+            const callees = index.findCallees(setupDef);
+            const regCallee = callees.find(c => c.name === 'Register');
+            // Should resolve to Registry.Register via NewRegistry constructor
+            assert.ok(regCallee, 'Should find Register callee');
+            assert.ok(regCallee.receiver === '*Registry',
+                'Register should resolve to Registry, got: ' + regCallee.receiver);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 7 — TestFoo auto-include regex
+// ============================================================================
+
+describe('K8s fix: Bug 7 — find auto-includes tests for Go TestFoo pattern', () => {
+    it('TestFoo pattern should auto-include test files', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'main.go': 'package main\nfunc Run() {}\n',
+            'main_test.go': 'package main\nfunc TestRun() { Run() }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'find', { name: 'TestRun' });
+            assert.ok(ok, 'find should succeed');
+            assert.ok(result.length > 0, 'TestRun should be found (test files auto-included)');
+            assert.strictEqual(result[0].name, 'TestRun');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 3 — Caller false positives for common Go method names
+// ============================================================================
+
+describe('K8s fix: Bug 3 — callers filtered by receiverType', () => {
+    it('filters callers when receiverType is known and differs from target', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'controller.go': `package main
+
+type DeploymentController struct{}
+func (dc *DeploymentController) Run() {}
+
+type TestController struct{}
+func (tc *TestController) Run() {}
+
+func startDeployment(dc *DeploymentController) {
+    dc.Run()
+}
+
+func runTest(t *TestController) {
+    t.Run()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const dcRun = (index.symbols.get('Run') || [])
+                .find(d => d.receiver === '*DeploymentController');
+            assert.ok(dcRun, 'Should find DeploymentController.Run');
+            const callers = index.findCallers('Run', { targetDefinitions: [dcRun] });
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('startDeployment'),
+                'startDeployment should be a caller');
+            assert.ok(!callerNames.includes('runTest'),
+                'runTest should NOT be a caller (t has type TestController)');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 8 — Embedded struct fields
+// ============================================================================
+
+describe('K8s fix: Bug 8 — embedded struct fields detected', () => {
+    it('should detect embedded struct fields', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+
+type Base struct {
+    ID int
+}
+
+type Child struct {
+    Base
+    Name string
+}
+`;
+        const classes = goMod.findClasses(code, parser);
+        const child = classes.find(c => c.name === 'Child');
+        assert.ok(child, 'Child should be found');
+        assert.ok(child.members.length >= 2, `Should have at least 2 members, got ${child.members.length}`);
+        const embedded = child.members.find(m => m.name === 'Base');
+        assert.ok(embedded, 'Embedded Base should be detected');
+        assert.strictEqual(embedded.embedded, true, 'Should have embedded flag');
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 9 — Embedded interface members
+// ============================================================================
+
+describe('K8s fix: Bug 9 — embedded interface members detected', () => {
+    it('should detect embedded interfaces', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+
+type Reader interface {
+    Read(p []byte) (int, error)
+}
+
+type ReadWriter interface {
+    Reader
+    Write(p []byte) (int, error)
+}
+`;
+        const classes = goMod.findClasses(code, parser);
+        const rw = classes.find(c => c.name === 'ReadWriter');
+        assert.ok(rw, 'ReadWriter should be found');
+        assert.ok(rw.members.length >= 2, `Should have at least 2 members, got ${rw.members.length}`);
+        const embedded = rw.members.find(m => m.name === 'Reader');
+        assert.ok(embedded, 'Embedded Reader should be detected');
+        assert.strictEqual(embedded.embedded, true, 'Should have embedded flag');
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 12 — Function reference callbacks as callees
+// ============================================================================
+
+describe('K8s fix: Bug 12 — Go function reference callbacks detected as callees', () => {
+    it('should detect member expression used as argument as callee', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('go');
+        const goMod = getLanguageModule('go');
+        const code = `package main
+
+func (dc *Controller) Run() {
+    go UntilWithContext(ctx, dc.worker, time.Second)
+}
+
+func (dc *Controller) worker() {}
+func UntilWithContext(ctx interface{}, f func(), d interface{}) {}
+`;
+        const calls = goMod.findCallsInCode(code, parser);
+        const workerRef = calls.find(c => c.name === 'worker' && c.isPotentialCallback);
+        assert.ok(workerRef, 'dc.worker passed as arg should be detected as potential callback');
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 11 — Package-level exported const/var indexed
+// ============================================================================
+
+describe('K8s fix: Bug 11 — exported package-level const/var indexed', () => {
+    it('should index exported const declarations', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'register.go': `package main
+const GroupName = "abac.authorization.kubernetes.io"
+const Version = "v1"
+var SchemeGroupVersion = GroupName + "/" + Version
+`,
+        });
+        try {
+            const index = idx(dir);
+            const gn = index.symbols.get('GroupName') || [];
+            assert.ok(gn.length > 0, 'GroupName should be indexed');
+            const ver = index.symbols.get('Version') || [];
+            assert.ok(ver.length > 0, 'Version should be indexed');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('should NOT index unexported const/var', () => {
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'internal.go': `package main
+const maxRetries = 3
+var timeout = 30
+`,
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual((index.symbols.get('maxRetries') || []).length, 0,
+                'unexported const should not be indexed');
+            assert.strictEqual((index.symbols.get('timeout') || []).length, 0,
+                'unexported var should not be indexed');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 15 — No warning when --file matches nothing
+// ============================================================================
+
+describe('K8s fix: Bug 15 — file pattern match warning', () => {
+    it('should return error when --file matches no files', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'main.go': 'package main\nfunc main() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'find', { name: 'main', file: 'nonexistent/path' });
+            assert.ok(!ok, 'Should fail when file pattern matches nothing');
+            assert.ok(error.includes('No files matched'), `Error should mention no files matched, got: ${error}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 17 — --limit flag
+// ============================================================================
+
+describe('K8s fix: Bug 17 — limit flag caps results', () => {
+    it('find results limited by --limit', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'funcs.go': `package main
+func FooA() {}
+func FooB() {}
+func FooC() {}
+func FooD() {}
+func FooE() {}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result, note } = execute(index, 'find', { name: 'Foo*', limit: 2 });
+            assert.ok(ok, 'find should succeed');
+            assert.ok(result.length <= 2, `Should be limited to 2, got ${result.length}`);
+            assert.ok(note && note.includes('Showing 2 of'), 'Should have limit note');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: Bug 2 — search respects --file
+// ============================================================================
+
+describe('K8s fix: Bug 2 — search respects --file', () => {
+    it('should filter search results by --file pattern', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'go.mod': 'module test\ngo 1.21',
+            'pkg/controller/deploy.go': 'package controller\n// deployment logic\nfunc Deploy() {}\n',
+            'cmd/app.go': 'package app\n// deployment config\nfunc Setup() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'search', { term: 'deployment', file: 'pkg/controller' });
+            assert.ok(ok, 'search should succeed');
+            // Should only find results in pkg/controller
+            for (const r of result) {
+                assert.ok(r.file.includes('pkg/controller'),
+                    `Result file ${r.file} should match --file pattern`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});

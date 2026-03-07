@@ -70,6 +70,7 @@ const PARAM_MAP = {
     rename_to:         'renameTo',
     default_value:     'defaultValue',
     top_level:         'topLevel',
+    max_files:         'maxFiles',
 };
 
 // ============================================================================

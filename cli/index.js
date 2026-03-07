@@ -102,6 +102,8 @@ function parseFlags(tokens) {
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions'),
         className: getValueFlag('--class-name'),
+        limit: parseInt(getValueFlag('--limit') || '0') || undefined,
+        maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
     };
 }
 
@@ -126,7 +128,7 @@ const knownFlags = new Set([
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions',
-    '--max-lines', '--class-name'
+    '--max-lines', '--class-name', '--limit', '--max-files'
 ]);
 
 // Handle help flag
@@ -396,7 +398,7 @@ function runProjectCommand(rootDir, command, arg) {
     // If cache was loaded but stale, force rebuild to avoid duplicates
     let needsCacheSave = false;
     if (!usedCache) {
-        index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks });
+        index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles });
         needsCacheSave = flags.cache;
     }
 
@@ -408,8 +410,9 @@ function runProjectCommand(rootDir, command, arg) {
         // ── Commands using shared executor ───────────────────────────────
 
         case 'toc': {
-            const { ok, result, error } = execute(index, 'toc', flags);
+            const { ok, result, error, note } = execute(index, 'toc', flags);
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result, output.formatTocJson, r => output.formatToc(r, {
                 detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
                 uncertainHint: 'use --include-uncertain to include all'
@@ -429,8 +432,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'usages': {
-            const { ok, result, error } = execute(index, 'usages', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'usages', { name: arg, ...flags });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result,
                 r => output.formatUsagesJson(r, arg),
                 r => output.formatUsages(r, arg)
@@ -665,8 +669,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'api': {
-            const { ok, result, error } = execute(index, 'api', { file: arg });
+            const { ok, result, error, note } = execute(index, 'api', { file: arg || flags.file, limit: flags.limit });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result,
                 r => output.formatApiJson(r, arg),
                 r => output.formatApi(r, arg)
@@ -685,8 +690,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'deadcode': {
-            const { ok, result, error } = execute(index, 'deadcode', { ...flags, in: flags.in || subdirScope });
+            const { ok, result, error, note } = execute(index, 'deadcode', { ...flags, in: flags.in || subdirScope });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result,
                 output.formatDeadcodeJson,
                 r => output.formatDeadcode(r, {
@@ -1040,6 +1046,8 @@ Common Flags:
   --direction=X       Graph direction: imports, importers, or both (default: both)
   --all               Expand truncated sections (about, trace, graph, related)
   --top=N             Limit results (find, deadcode)
+  --limit=N           Limit result count (find, usages, search, deadcode, api, toc)
+  --max-files=N       Max files to index (large projects)
   --context=N         Lines of context around matches
   --json              Machine-readable output
   --code-only         Filter out comments and strings

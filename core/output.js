@@ -8,6 +8,18 @@
 const fs = require('fs');
 const path = require('path');
 
+/**
+ * Format dynamic imports note with language-appropriate terminology.
+ * Go doesn't have "dynamic imports" — uses "blank/dot imports" instead.
+ */
+function dynamicImportsNote(count, meta) {
+    if (!count) return null;
+    if (meta?.projectLanguage === 'go') {
+        return `${count} blank/dot import(s)`;
+    }
+    return `${count} dynamic import(s)`;
+}
+
 const FILE_ERROR_MESSAGES = {
     'file-not-found': 'File not found in project',
     'file-ambiguous': 'Ambiguous file match'
@@ -1399,7 +1411,7 @@ function formatToc(toc, options = {}) {
 
     const meta = toc.meta || {};
     const warnings = [];
-    if (meta.dynamicImports) warnings.push(`${meta.dynamicImports} dynamic import(s)`);
+    if (meta.dynamicImports) { const dn = dynamicImportsNote(meta.dynamicImports, meta); if (dn) warnings.push(dn); }
     if (meta.uncertain) warnings.push(`${meta.uncertain} uncertain reference(s)`);
     if (warnings.length) {
         const uncertainSuffix = meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
@@ -1651,7 +1663,7 @@ function formatContext(ctx, options = {}) {
 
     if (ctx.meta) {
         const notes = [];
-        if (ctx.meta.dynamicImports) notes.push(`${ctx.meta.dynamicImports} dynamic import(s)`);
+        if (ctx.meta.dynamicImports) { const dn = dynamicImportsNote(ctx.meta.dynamicImports, ctx.meta); if (dn) notes.push(dn); }
         if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
         if (notes.length) {
             const uncertainSuffix = ctx.meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
@@ -1731,7 +1743,7 @@ function formatSmart(smart, options = {}) {
 
     if (smart.meta) {
         const notes = [];
-        if (smart.meta.dynamicImports) notes.push(`${smart.meta.dynamicImports} dynamic import(s)`);
+        if (smart.meta.dynamicImports) { const dn = dynamicImportsNote(smart.meta.dynamicImports, smart.meta); if (dn) notes.push(dn); }
         if (smart.meta.uncertain) notes.push(`${smart.meta.uncertain} uncertain call(s) skipped`);
         if (notes.length) {
             const uncertainSuffix = smart.meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
@@ -2082,7 +2094,11 @@ function formatStats(stats, options = {}) {
     lines.push('PROJECT STATISTICS');
     lines.push('═'.repeat(60));
     lines.push(`Root: ${stats.root}`);
-    lines.push(`Files: ${stats.files}`);
+    if (stats.truncated) {
+        lines.push(`Files: ${stats.files} (truncated at ${stats.truncated.maxFiles} — use --max-files to increase)`);
+    } else {
+        lines.push(`Files: ${stats.files}`);
+    }
     lines.push(`Symbols: ${stats.symbols}`);
     lines.push(`Build time: ${stats.buildTime}ms`);
 

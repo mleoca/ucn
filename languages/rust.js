@@ -631,10 +631,57 @@ function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+    // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
+    const scopeTypes = new Map();
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['function_item', 'closure_expression'].includes(node.type);
+    };
+
+    // Extract the base type name from a Rust type node (strips &, &mut, Box<>, etc.)
+    const extractTypeName = (typeNode) => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'type_identifier') return typeNode.text;
+        if (typeNode.type === 'reference_type') {
+            // &Filter or &mut Filter -> Filter
+            for (let i = 0; i < typeNode.namedChildCount; i++) {
+                const r = extractTypeName(typeNode.namedChild(i));
+                if (r) return r;
+            }
+        }
+        if (typeNode.type === 'generic_type') {
+            // Box<Filter> -> Filter (or get the outer type)
+            return extractTypeName(typeNode.namedChild(0));
+        }
+        if (typeNode.type === 'scoped_type_identifier') {
+            // module::Type -> Type
+            const nameNode = typeNode.childForFieldName('name');
+            return nameNode?.text || null;
+        }
+        return null;
+    };
+
+    // Build type map from function parameters (including self receiver for impl methods)
+    const buildScopeTypeMap = (node) => {
+        const typeMap = new Map();
+        const paramsNode = node.childForFieldName('parameters');
+        if (paramsNode) {
+            for (let i = 0; i < paramsNode.namedChildCount; i++) {
+                const param = paramsNode.namedChild(i);
+                if (param.type === 'parameter') {
+                    const patternNode = param.childForFieldName('pattern');
+                    const typeNode = param.childForFieldName('type');
+                    const typeName = extractTypeName(typeNode);
+                    if (patternNode && typeName) {
+                        // Pattern can be identifier or _
+                        const name = patternNode.type === 'identifier' ? patternNode.text : null;
+                        if (name) typeMap.set(name, typeName);
+                    }
+                }
+            }
+        }
+        return typeMap;
     };
 
     // Helper to extract function name from a function node
@@ -656,14 +703,25 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    // Look up variable type from scope chain
+    const getReceiverType = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) return typeMap.get(varName);
+        }
+        return undefined;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
-            functionStack.push({
+            const entry = {
                 name: extractFunctionName(node),
                 startLine: node.startPosition.row + 1,
                 endLine: node.endPosition.row + 1
-            });
+            };
+            functionStack.push(entry);
+            scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
         }
 
         // Handle function calls: foo(), obj.method(), Type::func(), foo::<T>()
@@ -692,11 +750,14 @@ function findCallsInCode(code, parser) {
                 const valueNode = funcNode.childForFieldName('value');
 
                 if (fieldNode) {
+                    const receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
+                    const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
                     calls.push({
                         name: fieldNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: true,
-                        receiver: (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined,
+                        receiver,
+                        ...(receiverType && { receiverType }),
                         enclosingFunction
                     });
                 }
@@ -742,7 +803,10 @@ function findCallsInCode(code, parser) {
     }, {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
-                functionStack.pop();
+                const leaving = functionStack.pop();
+                if (leaving) {
+                    scopeTypes.delete(leaving.startLine);
+                }
             }
         }
     });

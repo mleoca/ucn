@@ -124,6 +124,34 @@ function num(val, fallback) {
     return isNaN(n) ? fallback : n;
 }
 
+/**
+ * Apply limit to an array result.
+ * Returns { items, total, limited } where limited is true if truncated.
+ */
+function applyLimit(arr, limit) {
+    if (!arr || !limit || limit <= 0 || arr.length <= limit) {
+        return { items: arr, total: arr ? arr.length : 0, limited: false };
+    }
+    return { items: arr.slice(0, limit), total: arr.length, limited: true };
+}
+
+/** Build a limit note string */
+function limitNote(limit, total) {
+    return `Showing ${limit} of ${total} results. Use --limit N to see more.`;
+}
+
+/**
+ * Check if a --file pattern matches any files in the index.
+ * Returns error string if no files match, null otherwise.
+ */
+function checkFilePatternMatch(index, filePattern) {
+    if (!filePattern) return null;
+    for (const [, fileEntry] of index.files) {
+        if (fileEntry.relativePath.includes(filePattern)) return null;
+    }
+    return `No files matched pattern '${filePattern}'.`;
+}
+
 /** Read a file and extract lines for a symbol match, applying HTML cleanup. */
 function readAndExtract(match) {
     const content = fs.readFileSync(match.file, 'utf-8');
@@ -270,14 +298,17 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        // Check if --file pattern matches any files
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         // Auto-include tests when pattern clearly targets test functions
         // But only if the user didn't explicitly set include_tests=false
         let includeTests = p.includeTests;
-        if (includeTests === undefined && p.name && /^test[_*?]/i.test(p.name)) {
+        if (includeTests === undefined && p.name && /^test[_*?A-Z]/i.test(p.name)) {
             includeTests = true;
         }
         const exclude = applyTestExclusions(p.exclude, includeTests);
-        const result = index.find(p.name, {
+        let result = index.find(p.name, {
             file: p.file,
             className: p.className,
             exact: p.exact || false,
@@ -285,11 +316,18 @@ const HANDLERS = {
             in: p.in,
         });
         // Warn if exact mode silently disables glob expansion
-        let note;
+        const notes = [];
         if (p.exact && p.name && (p.name.includes('*') || p.name.includes('?'))) {
-            note = `Note: exact=true treats "${p.name}" as a literal name (glob expansion disabled).`;
+            notes.push(`Note: exact=true treats "${p.name}" as a literal name (glob expansion disabled).`);
         }
-        return { ok: true, result, note };
+        // Apply limit
+        const limit = num(p.limit, undefined);
+        if (limit && limit > 0) {
+            const { items, total, limited } = applyLimit(result, limit);
+            if (limited) notes.push(limitNote(limit, total));
+            result = items;
+        }
+        return { ok: true, result, note: notes.length ? notes.join('\n') : undefined };
     },
 
     usages: (index, p) => {
@@ -304,7 +342,29 @@ const HANDLERS = {
             exclude,
             in: p.in,
         });
-        return { ok: true, result };
+        // Apply limit to total usages across files
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && result.files) {
+            let total = result.files.reduce((s, f) => s + f.usages.length, 0);
+            if (total > limit) {
+                let remaining = limit;
+                const truncated = [];
+                for (const f of result.files) {
+                    if (remaining <= 0) break;
+                    if (f.usages.length <= remaining) {
+                        truncated.push(f);
+                        remaining -= f.usages.length;
+                    } else {
+                        truncated.push({ ...f, usages: f.usages.slice(0, remaining) });
+                        remaining = 0;
+                    }
+                }
+                result.files = truncated;
+                note = limitNote(limit, total);
+            }
+        }
+        return { ok: true, result, note };
     },
 
     toc: (index, p) => {
@@ -315,7 +375,40 @@ const HANDLERS = {
             top: num(p.top, undefined),
             file: p.file,
         });
-        return { ok: true, result };
+        // Apply limit to detailed toc entries
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && p.detailed && result.files) {
+            let totalEntries = result.files.reduce((s, f) => s + (f.functions?.length || 0) + (f.classes?.length || 0), 0);
+            if (totalEntries > limit) {
+                let remaining = limit;
+                for (const f of result.files) {
+                    if (remaining <= 0) {
+                        f.functions = [];
+                        f.classes = [];
+                        continue;
+                    }
+                    const fns = f.functions?.length || 0;
+                    const cls = f.classes?.length || 0;
+                    if (fns + cls <= remaining) {
+                        remaining -= fns + cls;
+                    } else {
+                        if (f.functions && remaining > 0) {
+                            f.functions = f.functions.slice(0, remaining);
+                            remaining -= f.functions.length;
+                        }
+                        if (f.classes && remaining > 0) {
+                            f.classes = f.classes.slice(0, remaining);
+                            remaining -= f.classes.length;
+                        } else if (f.classes) {
+                            f.classes = [];
+                        }
+                    }
+                }
+                note = limitNote(limit, totalEntries);
+            }
+        }
+        return { ok: true, result, note };
     },
 
     search: (index, p) => {
@@ -323,6 +416,8 @@ const HANDLERS = {
         if (err) return { ok: false, error: err };
         const testsExcluded = !p.includeTests;
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
+        // Use limit as top if top not set
+        const topVal = num(p.top, undefined) || num(p.limit, undefined);
         const result = index.search(p.term, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
@@ -330,7 +425,8 @@ const HANDLERS = {
             exclude,
             in: p.in,
             regex: p.regex,
-            top: num(p.top, undefined),
+            top: topVal,
+            file: p.file,
         });
         if (result.meta) result.meta.testsExcluded = testsExcluded;
         return { ok: true, result };
@@ -355,7 +451,17 @@ const HANDLERS = {
             exclude: toExcludeArray(p.exclude),
             in: p.in,
         });
-        return { ok: true, result };
+        // Apply limit to dead code results
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && result.dead) {
+            const { items, total, limited } = applyLimit(result.dead, limit);
+            if (limited) {
+                note = limitNote(limit, total);
+                result.dead = items;
+            }
+        }
+        return { ok: true, result, note };
     },
 
     // ── Extracting Code ─────────────────────────────────────────────────
@@ -639,12 +745,20 @@ const HANDLERS = {
     },
 
     api: (index, p) => {
-        const result = index.api(p.file);
+        let result = index.api(p.file);
         if (p.file) {
             const fileErr = checkFileError(result, p.file);
             if (fileErr) return { ok: false, error: fileErr };
         }
-        return { ok: true, result };
+        // Apply limit to api results (api returns an array)
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && Array.isArray(result)) {
+            const { items, total, limited } = applyLimit(result, limit);
+            if (limited) note = limitNote(limit, total);
+            result = items;
+        }
+        return { ok: true, result, note };
     },
 
     stats: (index, p) => {

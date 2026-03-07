@@ -247,6 +247,23 @@ function extractStructFields(structNode, code) {
                     memberType: 'field',
                     ...(typeNode && { fieldType: typeNode.text })
                 });
+            } else if (typeNode) {
+                // Embedded field: has type but no name (e.g., `Base` in `type Child struct { Base; Name string }`)
+                // Use the type name as the field name
+                let embeddedName = typeNode.text;
+                // Strip pointer prefix: *Base → Base
+                if (embeddedName.startsWith('*')) embeddedName = embeddedName.slice(1);
+                // Strip package prefix: pkg.Base → Base
+                const dotIdx = embeddedName.indexOf('.');
+                if (dotIdx >= 0) embeddedName = embeddedName.slice(dotIdx + 1);
+                fields.push({
+                    name: embeddedName,
+                    startLine,
+                    endLine,
+                    memberType: 'field',
+                    embedded: true,
+                    fieldType: typeNode.text
+                });
             }
         }
     }
@@ -268,11 +285,13 @@ function extractInterfaceMembers(interfaceNode, code) {
             let nameText = null;
             let paramsText = null;
             let returnType = null;
+            let hasParams = false;
             for (let j = 0; j < child.namedChildCount; j++) {
                 const sub = child.namedChild(j);
                 if (sub.type === 'field_identifier' || sub.type === 'type_identifier') {
                     if (!nameText) nameText = sub.text;
                 } else if (sub.type === 'parameter_list') {
+                    hasParams = true;
                     if (!paramsText) {
                         paramsText = sub.text.slice(1, -1); // strip parens
                     } else {
@@ -296,14 +315,63 @@ function extractInterfaceMembers(interfaceNode, code) {
                 }
             }
             if (nameText) {
-                members.push({
-                    name: nameText,
-                    startLine,
-                    endLine,
-                    memberType: 'method',
-                    ...(paramsText !== null && { params: paramsText }),
-                    ...(returnType && { returnType })
-                });
+                // Distinguish between method signatures and embedded interfaces:
+                // method_elem with parameter_list → method
+                // method_elem with only type_identifier → embedded interface
+                if (!hasParams && child.namedChildCount === 1 && child.namedChild(0).type === 'type_identifier') {
+                    // Embedded interface
+                    members.push({
+                        name: nameText,
+                        startLine,
+                        endLine,
+                        memberType: 'field',
+                        embedded: true,
+                        fieldType: nameText
+                    });
+                } else {
+                    members.push({
+                        name: nameText,
+                        startLine,
+                        endLine,
+                        memberType: 'method',
+                        ...(paramsText !== null && { params: paramsText }),
+                        ...(returnType && { returnType })
+                    });
+                }
+            }
+        } else if (child.type === 'type_identifier' || child.type === 'qualified_type') {
+            // Standalone type identifier inside interface body — embedded interface
+            const { startLine, endLine } = nodeToLocation(child, code);
+            let embName = child.text;
+            const dotIdx = embName.indexOf('.');
+            if (dotIdx >= 0) embName = embName.slice(dotIdx + 1);
+            members.push({
+                name: embName,
+                startLine,
+                endLine,
+                memberType: 'field',
+                embedded: true,
+                fieldType: child.text
+            });
+        } else if (child.type === 'type_elem') {
+            // type_elem wrapping a type_identifier — embedded interface
+            // e.g., `Reader` in `type ReadWriter interface { Reader; Write(...) }`
+            for (let j = 0; j < child.namedChildCount; j++) {
+                const sub = child.namedChild(j);
+                if (sub.type === 'type_identifier' || sub.type === 'qualified_type') {
+                    const { startLine, endLine } = nodeToLocation(sub, code);
+                    let embName = sub.text;
+                    const dotIdx = embName.indexOf('.');
+                    if (dotIdx >= 0) embName = embName.slice(dotIdx + 1);
+                    members.push({
+                        name: embName,
+                        startLine,
+                        endLine,
+                        memberType: 'field',
+                        embedded: true,
+                        fieldType: sub.text
+                    });
+                }
             }
         }
     }
@@ -318,6 +386,8 @@ function findStateObjects(code, parser) {
     const objects = [];
 
     const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|Default[A-Z][a-zA-Z]*|[A-Z][a-zA-Z]*(?:Config|Settings|Options))$/;
+    // All exported (^[A-Z]) package-level const/var are indexed as state objects
+    const isExportedName = (name) => /^[A-Z]/.test(name);
 
     // Check if a value node is a composite literal
     function isCompositeLiteral(valueNode) {
@@ -329,21 +399,51 @@ function findStateObjects(code, parser) {
         return false;
     }
 
+    // Check if a const block uses iota (enum-like pattern)
+    function blockHasIota(constDecl) {
+        for (let i = 0; i < constDecl.namedChildCount; i++) {
+            const spec = constDecl.namedChild(i);
+            if (spec.type === 'const_spec') {
+                const valueNode = spec.childForFieldName('value');
+                if (valueNode) {
+                    // Check if any child is 'iota'
+                    const checkIota = (n) => {
+                        if (n.type === 'iota') return true;
+                        for (let j = 0; j < n.childCount; j++) {
+                            if (checkIota(n.child(j))) return true;
+                        }
+                        return false;
+                    };
+                    if (checkIota(valueNode)) return true;
+                }
+            }
+        }
+        return false;
+    }
+
     traverseTree(tree.rootNode, (node) => {
         // Handle const declarations
         if (node.type === 'const_declaration') {
+            const isIotaBlock = blockHasIota(node);
             for (let i = 0; i < node.namedChildCount; i++) {
                 const spec = node.namedChild(i);
                 if (spec.type === 'const_spec') {
                     const nameNode = spec.childForFieldName('name');
                     const valueNode = spec.childForFieldName('value');
+                    if (!nameNode) continue;
+                    const name = nameNode.text;
 
-                    if (nameNode && valueNode && isCompositeLiteral(valueNode)) {
-                        const name = nameNode.text;
-                        if (statePattern.test(name)) {
-                            const { startLine, endLine } = nodeToLocation(spec, code);
-                            objects.push({ name, startLine, endLine });
-                        }
+                    // Include if: composite literal matching state pattern, OR exported const in iota block,
+                    // OR any exported (^[A-Z]) package-level const
+                    if (valueNode && isCompositeLiteral(valueNode) && statePattern.test(name)) {
+                        const { startLine, endLine } = nodeToLocation(spec, code);
+                        objects.push({ name, startLine, endLine });
+                    } else if (isIotaBlock && /^[A-Z]/.test(name)) {
+                        const { startLine, endLine } = nodeToLocation(spec, code);
+                        objects.push({ name, startLine, endLine, isConst: true });
+                    } else if (isExportedName(name)) {
+                        const { startLine, endLine } = nodeToLocation(spec, code);
+                        objects.push({ name, startLine, endLine, isConst: true });
                     }
                 }
             }
@@ -358,9 +458,12 @@ function findStateObjects(code, parser) {
                     const nameNode = spec.childForFieldName('name');
                     const valueNode = spec.childForFieldName('value');
 
-                    if (nameNode && valueNode && isCompositeLiteral(valueNode)) {
+                    if (nameNode) {
                         const name = nameNode.text;
-                        if (statePattern.test(name)) {
+                        if (valueNode && isCompositeLiteral(valueNode) && statePattern.test(name)) {
+                            const { startLine, endLine } = nodeToLocation(spec, code);
+                            objects.push({ name, startLine, endLine });
+                        } else if (isExportedName(name)) {
                             const { startLine, endLine } = nodeToLocation(spec, code);
                             objects.push({ name, startLine, endLine });
                         }
@@ -411,10 +514,72 @@ function findCallsInCode(code, parser) {
     const functionStack = [];  // Stack of { name, startLine, endLine }
     // Track local closure names per function scope (scopeStartLine -> Set<name>)
     const closureScopes = new Map();
+    // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
+    const scopeTypes = new Map();
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['function_declaration', 'method_declaration', 'func_literal'].includes(node.type);
+    };
+
+    // Extract the base type name from a type node (strips pointer, qualified, etc.)
+    const extractTypeName = (typeNode) => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'type_identifier') return typeNode.text;
+        if (typeNode.type === 'pointer_type') {
+            // *Framework -> Framework
+            for (let i = 0; i < typeNode.namedChildCount; i++) {
+                const r = extractTypeName(typeNode.namedChild(i));
+                if (r) return r;
+            }
+        }
+        if (typeNode.type === 'qualified_type') {
+            // pkg.Type -> Type
+            const tn = typeNode.childForFieldName('name');
+            if (tn) return tn.text;
+        }
+        return null;
+    };
+
+    // Build type map from function/method parameters and receiver
+    const buildScopeTypeMap = (node) => {
+        const typeMap = new Map();
+
+        // Method receiver: func (f *Framework) Method()
+        if (node.type === 'method_declaration') {
+            const receiverNode = node.childForFieldName('receiver');
+            if (receiverNode) {
+                for (let i = 0; i < receiverNode.namedChildCount; i++) {
+                    const param = receiverNode.namedChild(i);
+                    if (param.type === 'parameter_declaration') {
+                        const nameNode = param.childForFieldName('name');
+                        const typeNode = param.childForFieldName('type');
+                        const typeName = extractTypeName(typeNode);
+                        if (nameNode && typeName) {
+                            typeMap.set(nameNode.text, typeName);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Function/method parameters
+        const paramsNode = node.childForFieldName('parameters');
+        if (paramsNode) {
+            for (let i = 0; i < paramsNode.namedChildCount; i++) {
+                const param = paramsNode.namedChild(i);
+                if (param.type === 'parameter_declaration') {
+                    const nameNode = param.childForFieldName('name');
+                    const typeNode = param.childForFieldName('type');
+                    const typeName = extractTypeName(typeNode);
+                    if (nameNode && typeName) {
+                        typeMap.set(nameNode.text, typeName);
+                    }
+                }
+            }
+        }
+
+        return typeMap;
     };
 
     // Helper to extract function name from a function node
@@ -449,14 +614,63 @@ function findCallsInCode(code, parser) {
         return false;
     };
 
+    // Look up variable type from scope chain
+    const getReceiverType = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) return typeMap.get(varName);
+        }
+        return undefined;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
-            functionStack.push({
+            const entry = {
                 name: extractFunctionName(node),
                 startLine: node.startPosition.row + 1,
                 endLine: node.endPosition.row + 1
-            });
+            };
+            functionStack.push(entry);
+            scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
+        }
+
+        // Track local variable types from composite literals and typed assignments
+        // e.g., s := &Status{...} → s has type Status
+        //        registry := Registry{...} → registry has type Registry
+        if (node.type === 'short_var_declaration' && functionStack.length > 0) {
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            if (left && right) {
+                const names = left.type === 'expression_list'
+                    ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
+                          .filter(n => n.type === 'identifier').map(n => n.text)
+                    : left.type === 'identifier' ? [left.text] : [];
+                const values = right.type === 'expression_list'
+                    ? Array.from({ length: right.namedChildCount }, (_, i) => right.namedChild(i))
+                    : [right];
+                const scopeKey = functionStack[functionStack.length - 1].startLine;
+                const typeMap = scopeTypes.get(scopeKey);
+                if (typeMap && names.length > 0 && values.length > 0) {
+                    for (let vi = 0; vi < Math.min(names.length, values.length); vi++) {
+                        const val = values[vi];
+                        let typeName = null;
+                        // &Type{...} or Type{...}
+                        if (val.type === 'composite_literal') {
+                            typeName = extractTypeName(val.childForFieldName('type'));
+                        } else if (val.type === 'unary_expression' && val.childCount > 0) {
+                            for (let ci = 0; ci < val.namedChildCount; ci++) {
+                                const ch = val.namedChild(ci);
+                                if (ch.type === 'composite_literal') {
+                                    typeName = extractTypeName(ch.childForFieldName('type'));
+                                    break;
+                                }
+                            }
+                        }
+                        if (typeName) typeMap.set(names[vi], typeName);
+                    }
+                }
+            }
         }
 
         // Track local closures: atoi := func(...) { ... } or var handler = func(...) { ... }
@@ -537,11 +751,14 @@ function findCallsInCode(code, parser) {
                 const operandNode = funcNode.childForFieldName('operand');
 
                 if (fieldNode) {
+                    const receiver = operandNode?.type === 'identifier' ? operandNode.text : undefined;
+                    const receiverType = receiver ? getReceiverType(receiver) : undefined;
                     calls.push({
                         name: fieldNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: true,
-                        receiver: operandNode?.type === 'identifier' ? operandNode.text : undefined,
+                        receiver,
+                        ...(receiverType && { receiverType }),
                         enclosingFunction,
                         uncertain
                     });
@@ -550,12 +767,41 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
+        // Detect function references passed as arguments: dc.worker passed to UntilWithContext(ctx, dc.worker, ...)
+        // selector_expression inside argument_list (not inside call_expression as the function)
+        if (node.type === 'selector_expression' && node.parent?.type === 'argument_list') {
+            // Only if this selector_expression is NOT the function being called
+            const grandparent = node.parent?.parent;
+            if (!grandparent || grandparent.type !== 'call_expression' || grandparent.childForFieldName('function') !== node) {
+                const fieldNode = node.childForFieldName('field');
+                const operandNode = node.childForFieldName('operand');
+                if (fieldNode && operandNode) {
+                    const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                    const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                    const enclosingFunction = getCurrentEnclosingFunction();
+                    calls.push({
+                        name: fieldNode.text,
+                        line: node.startPosition.row + 1,
+                        isMethod: true,
+                        receiver,
+                        ...(receiverType && { receiverType }),
+                        enclosingFunction,
+                        isPotentialCallback: true,
+                        uncertain: false
+                    });
+                }
+            }
+        }
+
         return true;
     }, {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
                 const leaving = functionStack.pop();
-                if (leaving) closureScopes.delete(leaving.startLine);
+                if (leaving) {
+                    closureScopes.delete(leaving.startLine);
+                    scopeTypes.delete(leaving.startLine);
+                }
             }
         }
     });

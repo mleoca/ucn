@@ -252,7 +252,9 @@ server.registerTool(
             case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
             all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
             top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
-            class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)')
+            class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
+            limit: z.number().optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed.'),
+            max_files: z.number().optional().describe('Max files to index (default: 10000). Use for very large codebases.')
 
         })
     },
@@ -350,18 +352,22 @@ server.registerTool(
 
             case 'usages': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'usages', ep);
+                const { ok, result, error, note } = execute(index, 'usages', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatUsages(result, ep.name));
+                let text = output.formatUsages(result, ep.name);
+                if (note) text += '\n\n' + note;
+                return toolResult(text);
             }
 
             case 'toc': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'toc', ep);
+                const { ok, result, error, note } = execute(index, 'toc', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatToc(result, {
+                let text = output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
-                }));
+                });
+                if (note) text += '\n\n' + note;
+                return toolResult(text);
             }
 
             case 'search': {
@@ -380,13 +386,16 @@ server.registerTool(
 
             case 'deadcode': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'deadcode', ep);
+                const { ok, result, error, note } = execute(index, 'deadcode', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatDeadcode(result, {
+                const dcNote = note;
+                let dcText = output.formatDeadcode(result, {
                     top: ep.top || 0,
                     decoratedHint: !ep.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
                     exportedHint: !ep.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined
-                }));
+                });
+                if (dcNote) dcText += '\n\n' + dcNote;
+                return toolResult(dcText);
             }
 
             // ── File Dependencies ───────────────────────────────────────
@@ -465,9 +474,11 @@ server.registerTool(
 
             case 'api': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'api', ep);
+                const { ok, result, error, note } = execute(index, 'api', ep);
                 if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatApi(result, ep.file || '.'));
+                let apiText = output.formatApi(result, ep.file || '.');
+                if (note) apiText += '\n\n' + note;
+                return toolResult(apiText);
             }
 
             case 'stats': {

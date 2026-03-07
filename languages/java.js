@@ -623,10 +623,55 @@ function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+    // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
+    const scopeTypes = new Map();
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['method_declaration', 'constructor_declaration', 'lambda_expression'].includes(node.type);
+    };
+
+    // Extract type name from a Java type node (strips generics, qualified names)
+    const extractTypeName = (typeNode) => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'type_identifier') return typeNode.text;
+        if (typeNode.type === 'generic_type') {
+            // List<String> -> List (first named child is the base type)
+            for (let i = 0; i < typeNode.namedChildCount; i++) {
+                const r = extractTypeName(typeNode.namedChild(i));
+                if (r) return r;
+            }
+        }
+        if (typeNode.type === 'scoped_type_identifier') {
+            // pkg.Type -> Type (last identifier)
+            const nameNode = typeNode.childForFieldName('name') ||
+                typeNode.namedChild(typeNode.namedChildCount - 1);
+            return nameNode?.text || null;
+        }
+        if (typeNode.type === 'array_type') {
+            return extractTypeName(typeNode.namedChild(0));
+        }
+        return null;
+    };
+
+    // Build type map from method/constructor parameters
+    const buildScopeTypeMap = (node) => {
+        const typeMap = new Map();
+        const paramsNode = node.childForFieldName('parameters');
+        if (paramsNode) {
+            for (let i = 0; i < paramsNode.namedChildCount; i++) {
+                const param = paramsNode.namedChild(i);
+                if (param.type === 'formal_parameter' || param.type === 'spread_parameter') {
+                    const nameNode = param.childForFieldName('name');
+                    const typeNode = param.childForFieldName('type');
+                    const typeName = extractTypeName(typeNode);
+                    if (nameNode && typeName) {
+                        typeMap.set(nameNode.text, typeName);
+                    }
+                }
+            }
+        }
+        return typeMap;
     };
 
     // Helper to extract function name from a function node
@@ -652,14 +697,25 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    // Look up variable type from scope chain
+    const getReceiverType = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) return typeMap.get(varName);
+        }
+        return undefined;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
-            functionStack.push({
+            const entry = {
                 name: extractFunctionName(node),
                 startLine: node.startPosition.row + 1,
                 endLine: node.endPosition.row + 1
-            });
+            };
+            functionStack.push(entry);
+            scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
         }
 
         // Handle method invocations: foo(), obj.foo(), this.foo()
@@ -669,11 +725,14 @@ function findCallsInCode(code, parser) {
 
             if (nameNode) {
                 const enclosingFunction = getCurrentEnclosingFunction();
+                const receiver = (objNode?.type === 'identifier' || objNode?.type === 'this') ? objNode.text : undefined;
+                const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
                 calls.push({
                     name: nameNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: !!objNode,
-                    receiver: (objNode?.type === 'identifier' || objNode?.type === 'this') ? objNode.text : undefined,
+                    receiver,
+                    ...(receiverType && { receiverType }),
                     enclosingFunction
                 });
             }
@@ -709,10 +768,34 @@ function findCallsInCode(code, parser) {
         }
 
         return true;
+        // Track local variable types from new Type() assignments
+        // e.g., Foo f = new Foo(); or var f = new Foo();
+        if (node.type === 'local_variable_declaration' && functionStack.length > 0) {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'variable_declarator') {
+                    const nameNode = child.childForFieldName('name');
+                    const valueNode = child.childForFieldName('value');
+                    if (nameNode && valueNode && valueNode.type === 'object_creation_expression') {
+                        const typeNode = valueNode.childForFieldName('type');
+                        const typeName = extractTypeName(typeNode);
+                        if (typeName) {
+                            const scopeKey = functionStack[functionStack.length - 1].startLine;
+                            const typeMap = scopeTypes.get(scopeKey);
+                            if (typeMap) typeMap.set(nameNode.text, typeName);
+                        }
+                    }
+                }
+            }
+        }
+
     }, {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
-                functionStack.pop();
+                const leaving = functionStack.pop();
+                if (leaving) {
+                    scopeTypes.delete(leaving.startLine);
+                }
             }
         }
     });

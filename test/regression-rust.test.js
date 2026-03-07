@@ -977,3 +977,148 @@ fn main() {
         assert.ok(readImport, 'Read in use std::io::Read should be classified as import');
     });
 });
+
+// ============================================================================
+// fix #163: Rust receiver type tracking for method disambiguation
+// ============================================================================
+
+describe('fix #163: Rust receiver type tracking in findCallsInCode', () => {
+    it('infers receiverType from function parameters', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `struct Filter {}
+impl Filter { fn run(&self) {} }
+struct Score {}
+impl Score { fn run(&self) {} }
+fn process(f: &Filter, s: &Score) {
+    f.run();
+    s.run();
+}`;
+        const calls = rustMod.findCallsInCode(code, parser);
+        const fRun = calls.find(c => c.name === 'run' && c.receiver === 'f');
+        const sRun = calls.find(c => c.name === 'run' && c.receiver === 's');
+        assert.ok(fRun, 'Should find f.run() call');
+        assert.ok(sRun, 'Should find s.run() call');
+        assert.strictEqual(fRun.receiverType, 'Filter', 'f should have receiverType Filter');
+        assert.strictEqual(sRun.receiverType, 'Score', 's should have receiverType Score');
+    });
+
+    it('does not set receiverType for self.method()', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `struct Foo {}
+impl Foo {
+    fn bar(&self) { self.baz(); }
+    fn baz(&self) {}
+}`;
+        const calls = rustMod.findCallsInCode(code, parser);
+        const selfBaz = calls.find(c => c.name === 'baz' && c.receiver === 'self');
+        assert.ok(selfBaz, 'Should find self.baz() call');
+        assert.strictEqual(selfBaz.receiverType, undefined, 'self.baz() should not have receiverType');
+    });
+
+    it('strips reference types to get base type', () => {
+        const { getParser, getLanguageModule } = require('../languages/index');
+        const parser = getParser('rust');
+        const rustMod = getLanguageModule('rust');
+        const code = `struct Config {}
+impl Config { fn validate(&self) -> bool { true } }
+fn check(cfg: &mut Config) {
+    cfg.validate();
+}`;
+        const calls = rustMod.findCallsInCode(code, parser);
+        const cfgValidate = calls.find(c => c.name === 'validate' && c.receiver === 'cfg');
+        assert.ok(cfgValidate, 'Should find cfg.validate() call');
+        assert.strictEqual(cfgValidate.receiverType, 'Config',
+            '&mut Config should resolve to Config');
+    });
+});
+
+describe('fix #163: Rust callee disambiguation with receiver type', () => {
+    it('resolves callees to correct type when multiple types have same method', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"',
+            'src/main.rs': `struct Filter {}
+impl Filter {
+    fn run(&self) -> String { String::from("filter") }
+}
+
+struct Score {}
+impl Score {
+    fn run(&self) -> String { String::from("score") }
+}
+
+fn process(f: &Filter, s: &Score) {
+    f.run();
+    s.run();
+}
+
+fn main() {}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // process should resolve f.run() → Filter.run, s.run() → Score.run
+            const processDef = (index.symbols.get('process') || [])[0];
+            assert.ok(processDef, 'Should find process');
+            const callees = index.findCallees(processDef);
+            const runCallees = callees.filter(c => c.name === 'run');
+            assert.ok(runCallees.length >= 2,
+                `Should find both run callees, got: ${runCallees.map(c => c.receiver).join(', ')}`);
+            assert.ok(runCallees.some(c => c.receiver === 'Filter'),
+                'Should include Filter.run');
+            assert.ok(runCallees.some(c => c.receiver === 'Score'),
+                'Should include Score.run');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('resolves callers to correct type with targetDefinitions', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"',
+            'src/main.rs': `struct Filter {}
+impl Filter {
+    fn process(&self) -> String { String::from("filter") }
+}
+
+struct Score {}
+impl Score {
+    fn process(&self) -> String { String::from("score") }
+}
+
+fn run_filters(f: &Filter) {
+    f.process();
+}
+
+fn run_scores(s: &Score) {
+    s.process();
+}
+
+fn main() {}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // Callers of Filter.process should include run_filters, not run_scores
+            const filterProcess = (index.symbols.get('process') || [])
+                .find(d => d.receiver === 'Filter');
+            assert.ok(filterProcess, 'Should find Filter.process');
+
+            const callers = index.findCallers('process', {
+                targetDefinitions: [filterProcess]
+            });
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('run_filters'),
+                'run_filters should be a caller of Filter.process');
+            assert.ok(!callerNames.includes('run_scores'),
+                'run_scores should NOT be a caller of Filter.process');
+        } finally {
+            rm(dir);
+        }
+    });
+});

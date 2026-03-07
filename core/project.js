@@ -170,6 +170,13 @@ class ProjectIndex {
 
         const files = expandGlob(pattern, globOpts);
 
+        // Track if files were truncated by maxFiles limit
+        if (files.length >= globOpts.maxFiles) {
+            this.truncated = { indexed: files.length, maxFiles: globOpts.maxFiles };
+        } else {
+            this.truncated = null;
+        }
+
         if (!quiet) {
             console.error(`Indexing ${files.length} files in ${this.root}...`);
         }
@@ -1294,6 +1301,7 @@ class ProjectIndex {
                 dynamicImports,
                 uncertain: stats.uncertain,
                 includeMethods: !!options.includeMethods,
+                projectLanguage: this._getPredominantLanguage(),
                 // Structural facts for reliability hints
                 ...(def.isMethod && { isMethod: true }),
                 ...(def.className && { className: def.className }),
@@ -1436,7 +1444,8 @@ class ProjectIndex {
                 complete: stats.uncertain === 0 && dynamicImports === 0,
                 skipped: 0,
                 dynamicImports,
-                uncertain: stats.uncertain
+                uncertain: stats.uncertain,
+                projectLanguage: this._getPredominantLanguage()
             }
         };
         } finally { this._endOp(); }
@@ -1445,6 +1454,27 @@ class ProjectIndex {
     // ========================================================================
     // HELPER METHODS
     // ========================================================================
+
+    /**
+     * Get the predominant language of the project (cached).
+     * Returns 'go', 'javascript', etc. if >80% of files are that language.
+     */
+    _getPredominantLanguage() {
+        if (this._predominantLang !== undefined) return this._predominantLang;
+        const counts = {};
+        for (const [, fe] of this.files) {
+            counts[fe.language] = (counts[fe.language] || 0) + 1;
+        }
+        const total = this.files.size;
+        for (const [lang, count] of Object.entries(counts)) {
+            if (count / total > 0.8) {
+                this._predominantLang = lang;
+                return lang;
+            }
+        }
+        this._predominantLang = null;
+        return null;
+    }
 
     /**
      * Get line content from a file
@@ -2392,6 +2422,8 @@ class ProjectIndex {
         let evalUsage = 0;
         let reflectionUsage = 0;
 
+        const predominantLang = this._getPredominantLanguage();
+
         for (const [filePath, fileEntry] of this.files) {
             // Skip node_modules - we don't care about their patterns
             if (filePath.includes('node_modules')) continue;
@@ -2399,14 +2431,16 @@ class ProjectIndex {
             try {
                 const content = this._readFile(filePath);
 
-                // Dynamic imports: import(), require(variable), __import__
-                dynamicImports += (content.match(/import\s*\([^'"]/g) || []).length;
-                dynamicImports += (content.match(/require\s*\([^'"]/g) || []).length;
-                dynamicImports += (content.match(/__import__\s*\(/g) || []).length;
+                if (fileEntry.language !== 'go') {
+                    // Dynamic imports: import(), require(variable), __import__
+                    dynamicImports += (content.match(/import\s*\([^'"]/g) || []).length;
+                    dynamicImports += (content.match(/require\s*\([^'"]/g) || []).length;
+                    dynamicImports += (content.match(/__import__\s*\(/g) || []).length;
 
-                // eval, Function constructor
-                evalUsage += (content.match(/(^|[^a-zA-Z_])eval\s*\(/gm) || []).length;
-                evalUsage += (content.match(/new\s+Function\s*\(/g) || []).length;
+                    // eval, Function constructor
+                    evalUsage += (content.match(/(^|[^a-zA-Z_])eval\s*\(/gm) || []).length;
+                    evalUsage += (content.match(/new\s+Function\s*\(/g) || []).length;
+                }
 
                 // Reflection: getattr, hasattr, Reflect
                 reflectionUsage += (content.match(/\bgetattr\s*\(/g) || []).length;
@@ -3203,6 +3237,14 @@ class ProjectIndex {
         }
 
         for (const [filePath, fileEntry] of this.files) {
+            // Apply --file filter
+            if (options.file) {
+                const fp = fileEntry.relativePath;
+                if (!fp.includes(options.file) && !fp.endsWith(options.file)) {
+                    filesSkipped++;
+                    continue;
+                }
+            }
             // Apply exclude/in filters
             if ((options.exclude && options.exclude.length > 0) || options.in) {
                 if (!this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude, in: options.in })) {
@@ -3349,7 +3391,8 @@ class ProjectIndex {
             symbols: totalSymbols,  // Total symbol count, not unique names
             buildTime: this.buildTime,
             byLanguage: {},
-            byType: {}
+            byType: {},
+            ...(this.truncated && { truncated: this.truncated })
         };
 
         for (const [filePath, fileEntry] of this.files) {
@@ -3525,7 +3568,8 @@ class ProjectIndex {
                 complete: totalDynamic === 0,
                 skipped: 0,
                 dynamicImports: totalDynamic,
-                uncertain: 0
+                uncertain: 0,
+                projectLanguage: this._getPredominantLanguage()
             },
             totals: {
                 files: files.length,

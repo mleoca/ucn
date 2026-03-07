@@ -307,31 +307,48 @@ function findCallers(index, name, options = {}) {
                 }
 
                 // Java/Go/Rust receiver-class disambiguation:
-                // When targetDefinitions narrows to specific class(es) and the call has a
-                // receiver (e.g. javascriptFileService.createDataFile()), check if the
-                // receiver name better matches a non-target class definition.
-                // This prevents false positives like reporting obj.save() as a caller of
-                // TargetClass.save() when obj is clearly a different type.
+                // When the target definition has a class/receiver type, filter callers
+                // whose receiverType is known to be a different type.
+                // Go uses inferred receiverType; Java/Rust fall back to variable name matching.
                 if (call.isMethod && call.receiver && !resolvedBySameClass && !bindingId &&
-                    options.targetDefinitions && definitions.length > 1 &&
                     (fileEntry.language === 'java' || fileEntry.language === 'go' || fileEntry.language === 'rust')) {
-                    const targetClassNames = new Set(targetDefs.map(d => d.className).filter(Boolean));
-                    if (targetClassNames.size > 0) {
-                        const receiverLower = call.receiver.toLowerCase();
-                        // Check if receiver matches any target class (camelCase convention)
-                        const matchesTarget = [...targetClassNames].some(cn => cn.toLowerCase() === receiverLower);
-                        if (!matchesTarget) {
-                            // Check if receiver matches a non-target class instead
-                            const nonTargetClasses = definitions
-                                .filter(d => d.className && !targetClassNames.has(d.className))
-                                .map(d => d.className);
-                            const matchesOther = nonTargetClasses.some(cn => cn.toLowerCase() === receiverLower);
-                            if (matchesOther) {
-                                // Receiver clearly belongs to a different class
+                    // Build target type set from both className (Java) and receiver (Go/Rust)
+                    const targetTypes = new Set();
+                    for (const td of targetDefs) {
+                        if (td.className) targetTypes.add(td.className);
+                        if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
+                    }
+                    if (targetTypes.size > 0) {
+                        // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
+                        const knownType = call.receiverType;
+                        if (knownType) {
+                            const matchesTarget = targetTypes.has(knownType);
+                            if (!matchesTarget) {
+                                // Known type doesn't match target — skip directly
                                 isUncertain = true;
                                 if (!options.includeUncertain) {
                                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                                     continue;
+                                }
+                            }
+                        } else if (options.targetDefinitions && definitions.length > 1) {
+                            // No inferred type — fall back to receiver variable name matching
+                            // only when we have multiple definitions to disambiguate
+                            const receiverLower = call.receiver.toLowerCase();
+                            const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
+                            if (!matchesTarget) {
+                                const nonTargetClasses = new Set();
+                                for (const d of definitions) {
+                                    const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
+                                    if (t && !targetTypes.has(t)) nonTargetClasses.add(t);
+                                }
+                                const matchesOther = [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
+                                if (matchesOther) {
+                                    isUncertain = true;
+                                    if (!options.includeUncertain) {
+                                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                        continue;
+                                    }
                                 }
                             }
                         }
@@ -403,6 +420,8 @@ function findCallees(index, def, options = {}) {
         let localTypes = null;
         if (language === 'python' || language === 'javascript') {
             localTypes = _buildLocalTypeMap(index, def, calls);
+        } else if (language === 'go' || language === 'java' || language === 'rust') {
+            localTypes = _buildTypedLocalTypeMap(index, def, calls);
         }
 
         for (const call of calls) {
@@ -434,11 +453,14 @@ function findCallees(index, def, options = {}) {
                 } else if (localTypes && localTypes.has(call.receiver)) {
                     // Resolve method calls on locally-constructed objects:
                     // bt = Backtester(...); bt.run_backtest() → Backtester.run_backtest
-                    const className = localTypes.get(call.receiver);
+                    // Go: f.Run() where f is *Framework → Framework.Run (receiver match)
+                    const typeName = localTypes.get(call.receiver);
                     const symbols = index.symbols.get(call.name);
-                    const match = symbols?.find(s => s.className === className);
+                    const match = symbols?.find(s =>
+                        s.className === typeName ||
+                        (s.receiver && s.receiver.replace(/^\*/, '') === typeName));
                     if (match) {
-                        const key = match.bindingId || `${className}.${call.name}`;
+                        const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
@@ -447,6 +469,61 @@ function findCallees(index, def, options = {}) {
                         }
                     }
                     continue;
+                } else if (call.receiverType && (language === 'go' || language === 'java' || language === 'rust')) {
+                    // Use parser-inferred receiverType for method resolution
+                    // e.g., f.RunFilter() where f is *Framework → resolve to Framework.RunFilter
+                    const typeName = call.receiverType;
+                    const symbols = index.symbols.get(call.name);
+                    const match = symbols?.find(s =>
+                        (s.receiver && s.receiver.replace(/^\*/, '') === typeName) ||
+                        s.className === typeName);
+                    if (match) {
+                        const key = match.bindingId || `${typeName}.${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                        } else {
+                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1 });
+                        }
+                        continue;
+                    }
+                    // No match found with inferred type — fall through to include as unresolved
+                } else if (language === 'go' && call.receiver) {
+                    // Go package-qualified calls: klog.Infof(), wait.UntilWithContext()
+                    // Check if receiver is an import alias and resolve to correct package
+                    const goImports = fileEntry?.imports || [];
+                    // Find import whose package name matches the receiver
+                    const importModule = goImports.find(mod => {
+                        const pkgName = mod.split('/').pop();
+                        return pkgName === call.receiver;
+                    });
+                    if (importModule) {
+                        // Receiver is an import alias — resolve to definitions from that package
+                        const symbols = index.symbols.get(call.name);
+                        if (symbols) {
+                            // Match by checking if the definition's directory path matches the import path suffix
+                            const importParts = importModule.split('/');
+                            const match = symbols.find(s => {
+                                const sDir = path.dirname(s.relativePath || path.relative(index.root, s.file));
+                                // Try matching progressively shorter suffixes of the import path
+                                for (let i = importParts.length - 1; i >= 0; i--) {
+                                    const suffix = importParts.slice(i).join('/');
+                                    if (sDir === suffix || sDir.endsWith('/' + suffix)) return true;
+                                }
+                                return false;
+                            });
+                            if (match) {
+                                const key = match.bindingId || `${call.receiver}.${call.name}`;
+                                const existing = callees.get(key);
+                                if (existing) {
+                                    existing.count += 1;
+                                } else {
+                                    callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1 });
+                                }
+                                continue;
+                            }
+                        }
+                    }
                 } else if (language !== 'go' && language !== 'java' && language !== 'rust' && !options.includeMethods) {
                     continue;
                 }
@@ -544,7 +621,23 @@ function findCallees(index, def, options = {}) {
                         // (cross-type ambiguity, e.g. TypeA.Length vs TypeB.Length).
                         const defs = index.symbols.get(call.name);
                         if (defs && defs.length > 1) {
-                            isUncertain = true;
+                            // Go: if receiverType is known, check if it matches exactly one def
+                            // This resolves ambiguity like Framework.Run vs Scheduler.Run
+                            const rType = call.receiverType || localTypes?.get(call.receiver);
+                            if (rType && (language === 'go' || language === 'java' || language === 'rust')) {
+                                const matchingDef = defs.find(d =>
+                                    d.className === rType ||
+                                    (d.receiver && d.receiver.replace(/^\*/, '') === rType));
+                                if (matchingDef) {
+                                    // Resolved to specific type — not uncertain
+                                    calleeKey = matchingDef.bindingId || `${rType}.${call.name}`;
+                                    bindingResolved = matchingDef.bindingId;
+                                } else {
+                                    isUncertain = true;
+                                }
+                            } else {
+                                isUncertain = true;
+                            }
                         }
                     }
                 }
@@ -944,6 +1037,51 @@ function _buildLocalTypeMap(index, def, calls) {
         );
         if (withMatch) {
             localTypes.set(withMatch[1], call.name);
+        }
+    }
+
+    return localTypes.size > 0 ? localTypes : null;
+}
+
+/**
+ * Build a local variable type map for typed languages (Go, Java, Rust)
+ * using parser-inferred receiverType from call objects.
+ * Go also resolves New*() constructor patterns.
+ * @param {object} index - ProjectIndex instance
+ * @param {object} def - Function definition with file, startLine, endLine
+ * @param {Array} calls - Cached call sites for the file
+ */
+function _buildTypedLocalTypeMap(index, def, calls) {
+    const localTypes = new Map();
+
+    for (const call of calls) {
+        if (call.line < def.startLine || call.line > def.endLine) continue;
+
+        // Collect receiverType from method calls (inferred by parser from params/receivers)
+        if (call.isMethod && call.receiver && call.receiverType) {
+            localTypes.set(call.receiver, call.receiverType);
+        }
+
+        // Collect types from constructor calls: x := NewFoo() → x maps to Foo
+        if (!call.isMethod && !call.isPotentialCallback && /^New[A-Z]/.test(call.name)) {
+            let content;
+            try {
+                content = index._readFile(def.file);
+            } catch { continue; }
+            const lines = content.split('\n');
+            const sourceLine = lines[call.line - 1];
+            if (!sourceLine) continue;
+            const escapedName = call.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const assignMatch = sourceLine.match(
+                new RegExp(`(\\w+)\\s*:=\\s*${escapedName}\\s*\\(`)
+            );
+            if (assignMatch) {
+                // NewFoo → Foo, NewFooBar → FooBar
+                const typeName = call.name.slice(3);
+                if (typeName && /^[A-Z]/.test(typeName)) {
+                    localTypes.set(assignMatch[1], typeName);
+                }
+            }
         }
     }
 
