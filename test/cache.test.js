@@ -631,7 +631,7 @@ function helper() { return 42; }
             // Verify main cache file does NOT have inline callsCache
             const mainCachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(mainCachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 5, 'Cache version should be 5');
+            assert.strictEqual(cacheData.version, 6, 'Cache version should be 6');
             assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
 
             // Verify separate calls-cache.json exists
@@ -1959,6 +1959,103 @@ describe('perf: loadCache and findCallers baseline', () => {
             assert.ok(callersTime < 2000, `findCallers should complete reasonably: ${callersTime}ms`);
         } finally {
             rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #173: Cache v6 uses relative paths to reduce cache size
+// ============================================================================
+describe('Cache v6 relative paths', () => {
+    it('saves relative paths and restores absolute paths correctly', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-cache-v6-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+            fs.writeFileSync(path.join(tmpDir, 'lib.js'),
+                'function helper() { return 1; }\nmodule.exports = { helper };');
+            fs.writeFileSync(path.join(tmpDir, 'app.js'),
+                'const { helper } = require("./lib");\nfunction main() { helper(); }');
+
+            const index1 = new ProjectIndex(tmpDir);
+            index1.build(null, { quiet: true });
+            index1.saveCache();
+
+            // Check that cache uses relative paths
+            const cachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
+            assert.strictEqual(cacheData.version, 6);
+
+            // File keys should be relative
+            for (const [key] of cacheData.files) {
+                assert.ok(!path.isAbsolute(key),
+                    `File key should be relative, got: ${key}`);
+            }
+            // Import/export graph keys should be relative
+            for (const [key] of cacheData.importGraph) {
+                assert.ok(!path.isAbsolute(key),
+                    `ImportGraph key should be relative, got: ${key}`);
+            }
+
+            // Load into new instance and verify absolute paths are restored
+            const index2 = new ProjectIndex(tmpDir);
+            const loaded = index2.loadCache();
+            assert.ok(loaded, 'Cache should load');
+
+            // File keys should be absolute after load
+            for (const key of index2.files.keys()) {
+                assert.ok(path.isAbsolute(key),
+                    `File key should be absolute after load, got: ${key}`);
+            }
+            // Symbols should have absolute file paths
+            for (const [, defs] of index2.symbols) {
+                for (const s of defs) {
+                    assert.ok(path.isAbsolute(s.file),
+                        `Symbol file should be absolute, got: ${s.file}`);
+                }
+            }
+
+            // Commands should still work
+            const callers = index2.findCallers('helper', {});
+            assert.ok(callers.length > 0, 'findCallers should work after v6 cache load');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('cache file is smaller with relative paths', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-cache-v6-size-'));
+        fs.writeFileSync(path.join(tmpDir, 'package.json'), '{"name":"test"}');
+        // Create a deep path structure to maximize savings
+        const deepDir = path.join(tmpDir, 'src', 'com', 'example', 'deep', 'nested');
+        fs.mkdirSync(deepDir, { recursive: true });
+        for (let i = 0; i < 5; i++) {
+            fs.writeFileSync(path.join(deepDir, `module${i}.js`),
+                `function fn${i}() { return ${i}; }\nmodule.exports = { fn${i} };`);
+        }
+        fs.writeFileSync(path.join(deepDir, 'main.js'),
+            'const m0 = require("./module0");\nfunction main() { m0.fn0(); }');
+
+        try {
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+            index.saveCache();
+
+            const cachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const cacheJson = fs.readFileSync(cachePath, 'utf-8');
+
+            // Verify file keys and graph keys use relative paths.
+            // The root field stores the absolute path (needed for reconstruction).
+            const cacheData2 = JSON.parse(cacheJson);
+            for (const [key] of cacheData2.files) {
+                assert.ok(!path.isAbsolute(key),
+                    `File key should be relative, got: ${key}`);
+            }
+            for (const [key] of cacheData2.importGraph) {
+                assert.ok(!path.isAbsolute(key),
+                    `ImportGraph key should be relative, got: ${key}`);
+            }
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
         }
     });
 });

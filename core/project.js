@@ -258,7 +258,11 @@ class ProjectIndex {
         const language = detectLanguage(filePath);
         if (!language) return;
 
-        const parsed = parseFile(filePath);
+        // Parse content once — the tree-sitter cache in safeParse ensures the tree
+        // is shared across parse()/extractImports()/extractExports() (5→1 parse per file)
+        const parsed = parse(content, language);
+        parsed.filePath = filePath;
+        parsed.relativePath = filePath;
         const { imports, dynamicCount, importAliases } = extractImports(content, language);
         const { exports } = extractExports(content, language);
 
@@ -2952,11 +2956,27 @@ class ProjectIndex {
 
             // Analyze each call site, filtering out method calls for non-method definitions
             callSites = [];
+            const defFileEntry = this.files.get(def.file);
+            const defLang = defFileEntry?.language;
+            const targetDir = defLang === 'go' ? path.basename(path.dirname(def.file)) : null;
             for (const call of calls) {
                 const analysis = this.analyzeCallSite(call, name);
                 // Skip method calls (obj.parse()) when target is a standalone function (parse())
+                // For Go, allow calls where receiver matches the package directory name
+                // (e.g., controller.FilterActive() where file is in pkg/controller/)
                 if (analysis.isMethodCall && !defIsMethod) {
-                    continue;
+                    if (targetDir) {
+                        // Get receiver from parsed calls cache
+                        const parsedCalls = this.getCachedCalls(call.file);
+                        const matchedCall = parsedCalls?.find(c => c.name === name && c.line === call.line);
+                        if (matchedCall?.receiver === targetDir) {
+                            // Receiver matches package directory — keep it
+                        } else {
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                 }
                 callSites.push({
                     file: call.relativePath,

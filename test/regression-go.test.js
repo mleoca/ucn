@@ -1755,3 +1755,139 @@ describe('fix #169: callee resolution prefers imported package definitions', () 
     });
 });
 
+// ============================================================================
+// fix #170: Go unexported function visibility enforcement
+// Unexported (lowercase) Go functions are package-private. Callers from other
+// packages should be filtered out to prevent cross-package name collisions.
+// ============================================================================
+describe('fix #170: Go unexported visibility in findCallers', () => {
+    it('filters cross-package callers for unexported functions', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/a/handler.go': [
+                'package a',
+                'func handleErr(err error) {}',
+                'func Process() { handleErr(nil) }',
+            ].join('\n'),
+            'pkg/b/handler.go': [
+                'package b',
+                'func handleErr(err error) {}',
+                'func Run() { handleErr(nil) }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('handleErr').filter(d => d.file.includes('pkg/a/'));
+            assert.ok(defs.length > 0, 'Should find handleErr in pkg/a');
+            const callers = index.findCallers('handleErr', {
+                targetDefinitions: defs,
+            });
+            const callerFiles = callers.map(c => c.relativePath);
+            assert.ok(callerFiles.every(f => f.startsWith('pkg/a/')),
+                `All callers should be from pkg/a, got: ${callerFiles}`);
+            assert.ok(!callerFiles.some(f => f.startsWith('pkg/b/')),
+                'Should NOT include callers from pkg/b');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('allows same-package callers for unexported functions', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/helper.go': [
+                'package pkg',
+                'func helper() int { return 1 }',
+            ].join('\n'),
+            'pkg/main.go': [
+                'package pkg',
+                'func Main() int { return helper() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('helper', {});
+            assert.ok(callers.length >= 1, 'Should find same-package caller');
+            assert.ok(callers.some(c => c.relativePath.includes('main.go')),
+                'Should include pkg/main.go as caller');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #171: impact() Go package-qualified call filtering
+// impact() was filtering out Go pkg.Func() calls because it compared receiver
+// to filename instead of directory name. Same fix as verify (#167) but for impact.
+// ============================================================================
+describe('fix #171: impact keeps Go package-qualified calls', () => {
+    it('impact includes controller.FilterActive() when file is controller_utils.go', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/controller/controller_utils.go': [
+                'package controller',
+                'func FilterActive(items []int) []int {',
+                '    return items',
+                '}',
+            ].join('\n'),
+            'cmd/app.go': [
+                'package main',
+                'import "example.com/test/pkg/controller"',
+                'func run() {',
+                '    controller.FilterActive(nil)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.impact('FilterActive', { file: 'controller_utils' });
+            assert.ok(result, 'impact should return result');
+            assert.ok(result.totalCallSites >= 1,
+                `Expected at least 1 call site, got ${result.totalCallSites}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #172: findCallees should not resolve non-callable types as callees
+// When a local variable name matches a global interface/struct, the callee
+// resolution should skip non-callable types without binding evidence.
+// ============================================================================
+describe('fix #172: callees skip non-callable types (interface/struct)', () => {
+    it('local variable call does not resolve to interface definition', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/handler.go': [
+                'package pkg',
+                'type Handler interface {',
+                '    Handle()',
+                '}',
+            ].join('\n'),
+            'pkg/crash.go': [
+                'package pkg',
+                'func HandleCrash(handlers []func()) {',
+                '    for _, handler := range handlers {',
+                '        handler()',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const crashDef = index.find('HandleCrash')[0];
+            assert.ok(crashDef, 'Should find HandleCrash');
+            const callees = index.findCallees(crashDef, {});
+            // 'handler' should NOT appear as a callee (it's a local variable, and
+            // the only symbol named 'handler' is an interface, which is non-callable)
+            const handlerCallee = callees.find(c => c.name === 'Handler' || c.type === 'interface');
+            assert.ok(!handlerCallee,
+                'Should not resolve local variable to interface definition');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+

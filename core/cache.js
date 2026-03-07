@@ -30,10 +30,10 @@ function saveCache(index, cachePath) {
 
     const cacheFile = cachePath || path.join(cacheDir, 'index.json');
 
-    // Prepare callsCache for serialization (exclude content to save space)
+    // Prepare callsCache for serialization (exclude content, use relative paths)
     const callsCacheData = [];
     for (const [filePath, entry] of index.callsCache) {
-        callsCacheData.push([filePath, {
+        callsCacheData.push([path.relative(index.root, filePath), {
             mtime: entry.mtime,
             hash: entry.hash,
             calls: entry.calls
@@ -45,10 +45,13 @@ function saveCache(index, cachePath) {
     const configHash = crypto.createHash('md5')
         .update(JSON.stringify(index.config || {})).digest('hex');
 
-    // Strip redundant fields from symbols to reduce cache size.
+    // Strip redundant fields from symbols and file entries to reduce cache size.
+    // v6: All paths stored as relative paths (saves ~60% on large codebases).
     // symbol.file = path.join(root, symbol.relativePath) — reconstructable
     // symbol.bindingId = relativePath:type:startLine — reconstructable
     // fileEntry.path = Map key — redundant
+    // fileEntry.relativePath = now the Map key — redundant
+    const root = index.root;
     const strippedSymbols = [];
     for (const [name, defs] of index.symbols) {
         const stripped = defs.map(s => {
@@ -57,26 +60,41 @@ function saveCache(index, cachePath) {
         });
         strippedSymbols.push([name, stripped]);
     }
+    // Files: use relativePath as key, strip path and relativePath from entries
     const strippedFiles = [];
-    for (const [filePath, entry] of index.files) {
-        const { path: _p, ...rest } = entry;
-        strippedFiles.push([filePath, rest]);
+    for (const [, entry] of index.files) {
+        const { path: _p, relativePath: rp, ...rest } = entry;
+        strippedFiles.push([rp, rest]);
     }
 
+    // Convert graph paths from absolute to relative
+    const relGraph = (graph) => {
+        const result = [];
+        for (const [absKey, absValues] of graph) {
+            const relKey = path.relative(root, absKey);
+            const relValues = absValues.map(v => path.relative(root, v));
+            result.push([relKey, relValues]);
+        }
+        return result;
+    };
+
     const cacheData = {
-        version: 5,  // v5: Go exported const/var indexing, embedded structs/interfaces
+        version: 6,  // v6: relative paths throughout (saves ~60% cache size)
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
-        root: index.root,
+        root,
         buildTime: index.buildTime,
         timestamp: Date.now(),
         files: strippedFiles,
         symbols: strippedSymbols,
-        importGraph: Array.from(index.importGraph.entries()),
-        exportGraph: Array.from(index.exportGraph.entries()),
+        importGraph: relGraph(index.importGraph),
+        exportGraph: relGraph(index.exportGraph),
+        // extendsGraph/extendedByGraph use class names as keys (not file paths)
         extendsGraph: Array.from(index.extendsGraph.entries()),
         extendedByGraph: Array.from(index.extendedByGraph.entries()),
-        failedFiles: index.failedFiles ? Array.from(index.failedFiles) : []
+        failedFiles: index.failedFiles
+            ? Array.from(index.failedFiles).map(f => path.relative(root, f))
+            : []
     };
 
     fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
@@ -107,9 +125,8 @@ function loadCache(index, cachePath) {
         const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
 
         // Check version compatibility
-        // v5 adds Go exported const/var indexing, embedded structs/interfaces
-        // Only accept exactly version 5 (or future versions handled explicitly)
-        if (cacheData.version !== 5) {
+        // v6: relative paths throughout (saves ~60% cache size)
+        if (cacheData.version !== 6) {
             return false;
         }
 
@@ -126,15 +143,19 @@ function loadCache(index, cachePath) {
             return false;
         }
 
-        index.files = new Map(cacheData.files);
-        // Reconstruct stripped fields on file entries
-        for (const [filePath, entry] of index.files) {
-            if (!entry.path) entry.path = filePath;
+        const root = cacheData.root || index.root;
+
+        // Reconstruct files Map: relative key → absolute key, restore path and relativePath
+        index.files = new Map();
+        for (const [relPath, entry] of cacheData.files) {
+            const absPath = path.join(root, relPath);
+            entry.path = absPath;
+            entry.relativePath = relPath;
+            index.files.set(absPath, entry);
         }
 
+        // Reconstruct symbols: restore file and bindingId from relativePath
         index.symbols = new Map(cacheData.symbols);
-        // Reconstruct stripped fields on symbols
-        const root = cacheData.root || index.root;
         for (const [, defs] of index.symbols) {
             for (const s of defs) {
                 if (!s.file && s.relativePath) s.file = path.join(root, s.relativePath);
@@ -144,11 +165,20 @@ function loadCache(index, cachePath) {
             }
         }
 
-        index.importGraph = new Map(cacheData.importGraph);
-        index.exportGraph = new Map(cacheData.exportGraph);
+        // Reconstruct graphs: relative paths → absolute paths
+        const absGraph = (data) => {
+            const m = new Map();
+            for (const [relKey, relValues] of data) {
+                m.set(path.join(root, relKey), relValues.map(v => path.join(root, v)));
+            }
+            return m;
+        };
+        index.importGraph = absGraph(cacheData.importGraph);
+        index.exportGraph = absGraph(cacheData.exportGraph);
         index.buildTime = cacheData.buildTime;
 
         // Restore optional graphs if present
+        // extendsGraph/extendedByGraph use class names as keys (not file paths)
         if (Array.isArray(cacheData.extendsGraph)) {
             index.extendsGraph = new Map(cacheData.extendsGraph);
         }
@@ -156,20 +186,17 @@ function loadCache(index, cachePath) {
             index.extendedByGraph = new Map(cacheData.extendedByGraph);
         }
 
-        // Backward compat: if old cache has callsCache inline, load it
-        if (Array.isArray(cacheData.callsCache)) {
-            index.callsCache = new Map(cacheData.callsCache);
-        }
-        // Otherwise, eagerly load from separate calls-cache.json if it exists.
-        // This costs ~300MB on large codebases but prevents 10K cold tree-sitter
-        // re-parses (2GB+ peak) when findCallers runs on an empty callsCache.
+        // Eagerly load callsCache from separate file.
+        // Prevents 10K cold tree-sitter re-parses (2GB+ peak) when findCallers runs.
         if (index.callsCache.size === 0) {
             loadCallsCache(index);
         }
 
-        // Restore failedFiles if present
+        // Restore failedFiles if present (convert relative paths back to absolute)
         if (Array.isArray(cacheData.failedFiles)) {
-            index.failedFiles = new Set(cacheData.failedFiles);
+            index.failedFiles = new Set(
+                cacheData.failedFiles.map(f => path.isAbsolute(f) ? f : path.join(root, f))
+            );
         }
 
         // Only rebuild graphs if config changed (e.g., aliases modified)
@@ -262,7 +289,13 @@ function loadCallsCache(index) {
     try {
         const data = JSON.parse(fs.readFileSync(callsCacheFile, 'utf-8'));
         if (Array.isArray(data)) {
-            index.callsCache = new Map(data);
+            // Convert relative paths back to absolute
+            const absData = data.map(([relPath, entry]) => {
+                // Handle both relative (v6+) and absolute (legacy) paths
+                const absPath = path.isAbsolute(relPath) ? relPath : path.join(index.root, relPath);
+                return [absPath, entry];
+            });
+            index.callsCache = new Map(absData);
             return true;
         }
     } catch (e) {

@@ -324,6 +324,17 @@ function findCallers(index, name, options = {}) {
                     continue;
                 }
 
+                // Go unexported visibility: lowercase functions are package-private.
+                // Only allow callers from the same package directory.
+                if (fileEntry.language === 'go' && /^[a-z]/.test(name)) {
+                    const targetPkgDirs = new Set(
+                        targetDefs.filter(d => d.file).map(d => path.dirname(d.file))
+                    );
+                    if (targetPkgDirs.size > 0 && !targetPkgDirs.has(path.dirname(filePath))) {
+                        continue;
+                    }
+                }
+
                 // Java/Go/Rust receiver-class disambiguation:
                 // When the target definition has a class/receiver type, filter callers
                 // whose receiverType is known to be a different type.
@@ -966,6 +977,14 @@ function findCallees(index, def, options = {}) {
                             callee = scored[0].symbol;
                         }
                     }
+                }
+
+                // Skip non-callable types (interface, struct, type) as callees.
+                // These appear when local variables shadow symbol names
+                // (e.g., `for _, handler := range handlers { handler(r) }` —
+                // handler is a local var, not the handler interface type).
+                if (!bindingId && NON_CALLABLE_TYPES.has(callee.type)) {
+                    continue;
                 }
 
                 // Skip test-file callees when caller is production code and

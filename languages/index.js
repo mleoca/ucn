@@ -228,7 +228,19 @@ function getParseOptions(contentLength = 0) {
  * @param {object} options - Additional parse options
  * @returns {object} Parsed tree
  */
+// Single-entry parse cache: during indexFile(), the same (parser, content) is parsed
+// 5 times (findFunctions + findClasses + findStateObjects + findImports + findExports).
+// Caching the last result eliminates 4 out of 5 parses per file (80% reduction).
+let _lastParseParser = null;
+let _lastParseContent = null;
+let _lastParseTree = null;
+
 function safeParse(parser, content, oldTree = undefined, options = {}) {
+    // Fast path: return cached tree if same parser and content (no oldTree override)
+    if (!oldTree && parser === _lastParseParser && content === _lastParseContent && _lastParseTree) {
+        return _lastParseTree;
+    }
+
     const contentLength = content.length;
 
     // Try with escalating buffer sizes
@@ -243,7 +255,14 @@ function safeParse(parser, content, oldTree = undefined, options = {}) {
     let lastError;
     for (const bufferSize of bufferSizes) {
         try {
-            return parser.parse(content, oldTree, { ...options, bufferSize });
+            const tree = parser.parse(content, oldTree, { ...options, bufferSize });
+            // Cache the result for same-(parser, content) reuse
+            if (!oldTree) {
+                _lastParseParser = parser;
+                _lastParseContent = content;
+                _lastParseTree = tree;
+            }
+            return tree;
         } catch (e) {
             lastError = e;
             // Only retry on buffer-related errors
