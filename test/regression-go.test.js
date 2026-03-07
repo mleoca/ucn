@@ -1490,3 +1490,268 @@ describe('fix #164: callees resolve to correct receiver type (Go)', () => {
         }
     });
 });
+
+// ============================================================================
+// fix #164: countSymbolUsages misses Go same-package usages
+// Go files in the same package reference each other without imports.
+// countSymbolUsages must include same-directory .go files in relevantFiles.
+// ============================================================================
+describe('fix #164: countSymbolUsages includes Go same-package files', () => {
+    it('counts usages from sibling files in same Go package', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/controller.go': [
+                'package pkg',
+                'func helper() int { return 1 }',
+                'func Main() { helper() }',
+            ].join('\n'),
+            'pkg/worker.go': [
+                'package pkg',
+                'func Worker() { helper() }',
+            ].join('\n'),
+            'pkg/utils.go': [
+                'package pkg',
+                'func Utils() { helper() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const results = index.find('helper');
+            const helperResult = results.find(r => r.name === 'helper');
+            assert.ok(helperResult, 'Should find helper');
+            // helper is defined once and called 3 times (Main, Worker, Utils)
+            assert.ok(helperResult.usageCount >= 4,
+                `Expected at least 4 usages (1 def + 3 calls), got ${helperResult.usageCount}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #165: about usages count inconsistent with usages command
+// about() was calling usages() without test exclusions, while the usages
+// command applies them by default.
+// ============================================================================
+describe('fix #165: about and usages command agree on counts', () => {
+    it('about excludes test file usages by default', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/lib.go': [
+                'package pkg',
+                'func Process() int { return 1 }',
+            ].join('\n'),
+            'pkg/lib_test.go': [
+                'package pkg',
+                'import "testing"',
+                'func TestProcess(t *testing.T) { Process() }',
+            ].join('\n'),
+            'cmd/main.go': [
+                'package main',
+                'import "example.com/test/pkg"',
+                'func main() { pkg.Process() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const aboutResult = index.about('Process', { file: 'pkg/lib.go' });
+            const usagesExcludeTests = index.usages('Process', {
+                codeOnly: true,
+                exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
+            });
+            // about should match usages-with-test-exclusions
+            const aboutCalls = aboutResult.usages.calls;
+            const usagesWithExcl = usagesExcludeTests.filter(u => u.usageType === 'call').length;
+            assert.strictEqual(aboutCalls, usagesWithExcl,
+                `about calls (${aboutCalls}) should match usages with test exclusion (${usagesWithExcl})`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #166: deadcode false positives for Go methods called via receiver
+// buildUsageIndex() was skipping all field_identifier nodes on the right side
+// of selector_expression, including method calls like dc.syncDeployment().
+// ============================================================================
+describe('fix #166: deadcode does not report Go methods called via receiver', () => {
+    it('receiver.method() calls are counted as usages', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/controller.go': [
+                'package pkg',
+                '',
+                'type Controller struct{}',
+                '',
+                'func (c *Controller) syncDeployment() {',
+                '    c.getReplicaSets()',
+                '}',
+                '',
+                'func (c *Controller) getReplicaSets() int {',
+                '    return 0',
+                '}',
+                '',
+                'func (c *Controller) Run() {',
+                '    c.syncDeployment()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            const deadNames = dead.map(d => d.name);
+            assert.ok(!deadNames.includes('syncDeployment'),
+                'syncDeployment should NOT be dead — called via c.syncDeployment()');
+            assert.ok(!deadNames.includes('getReplicaSets'),
+                'getReplicaSets should NOT be dead — called via c.getReplicaSets()');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #167: verify drops Go qualified function calls (package.Func)
+// verify.js was comparing receiver to target filename, but Go package aliases
+// come from the directory name (last segment of import path), not the filename.
+// ============================================================================
+describe('fix #167: verify keeps Go package-qualified function calls', () => {
+    it('controller.FilterActive() not dropped when file is controller_utils.go', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/controller/controller_utils.go': [
+                'package controller',
+                'func FilterActive(items []int) []int {',
+                '    return items',
+                '}',
+            ].join('\n'),
+            'cmd/app.go': [
+                'package main',
+                'import "example.com/test/pkg/controller"',
+                'func run() {',
+                '    controller.FilterActive(nil)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.verify('FilterActive', { file: 'controller_utils' });
+            assert.ok(result.valid >= 1,
+                `Expected at least 1 valid call site, got ${result.valid}`);
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #168: graph command shows Go test files as source dependencies
+// When building importGraph for Go, _test.go files should not be linked
+// as dependencies of non-test source files.
+// ============================================================================
+describe('fix #168: graph excludes Go test files from non-test dependencies', () => {
+    it('non-test file does not depend on _test.go files', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/lib.go': [
+                'package pkg',
+                'func Helper() int { return 1 }',
+            ].join('\n'),
+            'pkg/lib_test.go': [
+                'package pkg',
+                'import "testing"',
+                'func TestHelper(t *testing.T) { Helper() }',
+            ].join('\n'),
+            'cmd/main.go': [
+                'package main',
+                'import "example.com/test/pkg"',
+                'func main() { pkg.Helper() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const graph = index.graph('cmd/main.go', { direction: 'imports' });
+            const depFiles = graph.nodes.map(n => n.relativePath);
+            const hasTestFile = depFiles.some(f => f.endsWith('_test.go'));
+            assert.ok(!hasTestFile,
+                `Non-test file should not depend on test files, got: ${depFiles.filter(f => f.endsWith('_test.go'))}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('test file CAN depend on _test.go siblings', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/lib.go': [
+                'package pkg',
+                'func Helper() int { return 1 }',
+            ].join('\n'),
+            'pkg/lib_test.go': [
+                'package pkg',
+                'import "testing"',
+                'func TestHelper(t *testing.T) { Helper() }',
+            ].join('\n'),
+            'pkg/helpers_test.go': [
+                'package pkg',
+                'import "example.com/test/pkg"',
+                'func testUtil() { pkg.Helper() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Test files importing the same package can see sibling test files
+            const graph = index.graph('pkg/helpers_test.go', { direction: 'imports' });
+            // Should include pkg/lib.go at minimum
+            const depFiles = graph.nodes.map(n => n.relativePath);
+            assert.ok(depFiles.some(f => f === 'pkg/lib.go'),
+                'Test file should see lib.go as dependency');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #169: callee resolution uses importGraph for better disambiguation
+// When multiple packages export the same name, prefer the one imported
+// by the caller's file.
+// ============================================================================
+describe('fix #169: callee resolution prefers imported package definitions', () => {
+    it('resolves callee to imported package rather than random match', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/a/register.go': [
+                'package a',
+                'func Register() {}',
+            ].join('\n'),
+            'pkg/b/register.go': [
+                'package b',
+                'func Register() {}',
+            ].join('\n'),
+            'cmd/main.go': [
+                'package main',
+                'import "example.com/test/pkg/a"',
+                'func main() {',
+                '    a.Register()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees(
+                index.find('main').find(s => s.file.includes('cmd/main.go')),
+                {}
+            );
+            const registerCallee = callees.find(c => c.name === 'Register');
+            if (registerCallee) {
+                assert.ok(registerCallee.relativePath.includes('pkg/a/'),
+                    `Should resolve to pkg/a/register.go, got ${registerCallee.relativePath}`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+

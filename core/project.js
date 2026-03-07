@@ -14,7 +14,7 @@ const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parse, parseFile, cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
-const { escapeRegExp, NON_CALLABLE_TYPES } = require('./shared');
+const { escapeRegExp, NON_CALLABLE_TYPES, addTestExclusions } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 const deadcodeModule = require('./deadcode');
@@ -458,8 +458,14 @@ class ProjectIndex {
                     const filesToLink = [resolved];
                     if (fileEntry.language === 'go') {
                         const pkgDir = path.dirname(resolved);
+                        // When a non-test file imports a Go package, link all non-test files
+                        // in that directory. Test files are compiled separately by `go test`
+                        // and should not appear as source dependencies.
+                        const importerIsTest = filePath.endsWith('_test.go');
                         for (const fp of this.files.keys()) {
                             if (fp !== resolved && path.dirname(fp) === pkgDir && fp.endsWith('.go')) {
+                                // Skip test files unless the importer is also a test file
+                                if (!importerIsTest && fp.endsWith('_test.go')) continue;
                                 filesToLink.push(fp);
                             }
                         }
@@ -922,8 +928,21 @@ class ProjectIndex {
         // 1. The file where it's defined
         // 2. Files that import from the definition file
         // 3. Transitively: files that import from re-exporters of this symbol
+        // 4. Go: all files in the same package directory (same-package references need no import)
         const relevantFiles = new Set([defFile]);
         const queue = [defFile];
+
+        // Go same-package: add all .go files in the same directory
+        const defEntry = this.files.get(defFile);
+        if (defEntry?.language === 'go') {
+            const pkgDir = path.dirname(defFile);
+            for (const fp of this.files.keys()) {
+                if (fp !== defFile && fp.endsWith('.go') && path.dirname(fp) === pkgDir) {
+                    relevantFiles.add(fp);
+                }
+            }
+        }
+
         while (queue.length > 0) {
             const file = queue.pop();
             const importers = this.exportGraph.get(file) || [];
@@ -3100,8 +3119,12 @@ class ProjectIndex {
         const isMethod = !!(primary.isMethod || primary.type === 'method' || primary.className);
         const includeMethods = options.includeMethods ?? isMethod;
 
-        // Get usage counts by type
-        const usages = this.usages(symbolName, { codeOnly: true });
+        // Get usage counts by type (exclude test files by default, matching usages command behavior)
+        const usageOpts = { codeOnly: true };
+        if (!options.includeTests) {
+            usageOpts.exclude = addTestExclusions(options.exclude);
+        }
+        const usages = this.usages(symbolName, usageOpts);
         const usagesByType = {
             definitions: usages.filter(u => u.isDefinition).length,
             calls: usages.filter(u => u.usageType === 'call').length,

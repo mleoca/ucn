@@ -902,10 +902,10 @@ function findCallees(index, def, options = {}) {
                             callee = sameDir;
                         } else {
                             // Priority 2.5: Imported file — check if the caller's file imports
-                            // from any of the candidate callee files
-                            const callerImports = fileEntry?.imports || [];
-                            const importedFiles = new Set(callerImports.map(imp => imp.resolvedPath).filter(Boolean));
-                            const importedCallee = symbols.find(s => importedFiles.has(s.file));
+                            // from any of the candidate callee files (using importGraph)
+                            const callerImportedFiles = index.importGraph.get(def.file) || [];
+                            const importedFileSet = new Set(callerImportedFiles);
+                            const importedCallee = symbols.find(s => importedFileSet.has(s.file));
                             if (importedCallee) {
                                 callee = importedCallee;
                             } else if (defReceiver) {

@@ -301,6 +301,8 @@ function verify(index, name, options = {}) {
     // and the function lives in jobs.py).
     const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
     const targetBasename = path.basename(def.file, path.extname(def.file));
+    const defFileEntry = index.files.get(def.file);
+    const defLang = defFileEntry?.language;
 
     // Build import-name lookup for receiver checking (module.func() vs dict.get())
     const importNameCache = new Map();
@@ -337,6 +339,15 @@ function verify(index, name, options = {}) {
                 const importedNames = getImportedNames(call.file);
                 if (!importedNames.has(callReceiver)) continue;
                 // Receiver matches target module and is imported — keep it
+            } else if (callReceiver && defLang === 'go') {
+                // Go: receiver is package alias (last segment of import path, e.g., "controller"
+                // from "k8s.io/.../pkg/controller"), not the filename ("controller_utils").
+                // Check if receiver matches the directory name of the target file.
+                const targetDir = path.basename(path.dirname(def.file));
+                if (callReceiver !== targetDir) {
+                    continue;
+                }
+                // Receiver matches package directory — keep it
             } else {
                 continue;
             }

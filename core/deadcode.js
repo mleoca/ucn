@@ -73,6 +73,8 @@ function buildUsageIndex(index, filterNames) {
                             }
                         }
                         // Member expression property: obj.Separator — not a standalone reference
+                        // EXCEPTION: If the selector/member expression is part of a call_expression,
+                        // this IS a method call (e.g., dc.syncDeployment()) and should count as usage.
                         if (parentType === 'member_expression' ||
                             parentType === 'field_expression' ||
                             parentType === 'member_access_expression' ||
@@ -83,11 +85,21 @@ function buildUsageIndex(index, filterNames) {
                             // by checking if it's NOT the object (left side)
                             const firstChild = node.parent.child(0);
                             if (firstChild !== node) {
-                                // This is the property part — skip it for deadcode counting
-                                for (let i = 0; i < node.childCount; i++) {
-                                    traverse(node.child(i));
+                                // Check if this member expression is part of a call or
+                                // used as a function reference (callback argument)
+                                const grandparent = node.parent.parent;
+                                const isCall = grandparent &&
+                                    (grandparent.type === 'call_expression' ||
+                                     grandparent.type === 'argument_list' ||
+                                     grandparent.type === 'arguments');
+                                if (!isCall) {
+                                    // Pure field access — skip for deadcode counting
+                                    for (let i = 0; i < node.childCount; i++) {
+                                        traverse(node.child(i));
+                                    }
+                                    return;
                                 }
-                                return;
+                                // Method call or callback — fall through to count as usage
                             }
                         }
                     }
