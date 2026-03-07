@@ -2097,11 +2097,23 @@ class ProjectIndex {
 
         let fileIterator;
         if (filePath) {
+            // Try exact resolution first
             const resolved = this.resolveFilePathForQuery(filePath);
-            if (typeof resolved !== 'string') return resolved;
-            const fileEntry = this.files.get(resolved);
-            if (!fileEntry) return { error: 'file-not-found', filePath };
-            fileIterator = [[resolved, fileEntry]];
+            if (typeof resolved === 'string') {
+                const fileEntry = this.files.get(resolved);
+                if (!fileEntry) return { error: 'file-not-found', filePath };
+                fileIterator = [[resolved, fileEntry]];
+            } else {
+                // Fall back to pattern filter (substring match on relative path)
+                const matches = [];
+                for (const [absPath, fe] of this.files) {
+                    if (fe.relativePath.includes(filePath)) {
+                        matches.push([absPath, fe]);
+                    }
+                }
+                if (matches.length === 0) return { error: 'file-not-found', filePath };
+                fileIterator = matches;
+            }
         } else {
             fileIterator = this.files.entries();
         }

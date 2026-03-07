@@ -8248,3 +8248,26 @@ def store():
         }
     });
 });
+
+describe('fix #166: api command respects --file pattern filter', () => {
+    it('filters api results by file substring pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib/utils.js': 'export function helper() {}\nexport function other() {}',
+            'app.js': 'export function main() {}',
+        });
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'api', {});
+            assert.strictEqual(r1.result.length, 3, 'should find 3 total exports');
+            const r2 = execute(index, 'api', { file: 'utils' });
+            assert.ok(r2.ok, 'should not error');
+            assert.strictEqual(r2.result.length, 2, 'should find 2 exports in utils.js');
+            const r3 = execute(index, 'api', { file: 'app' });
+            assert.ok(r3.ok);
+            assert.strictEqual(r3.result.length, 1, 'should find 1 export in app.js');
+        } finally {
+            rm(dir);
+        }
+    });
+});
