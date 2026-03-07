@@ -3578,13 +3578,18 @@ class ProjectIndex {
             displayFiles = files.slice(0, top);
         }
 
+        // Count files with no symbols (generated/empty files)
+        const emptyFiles = files.filter(f => f.functions === 0 && f.classes === 0 && f.state === 0).length;
+
         return {
             meta: {
                 complete: totalDynamic === 0,
                 skipped: 0,
                 dynamicImports: totalDynamic,
                 uncertain: 0,
-                projectLanguage: this._getPredominantLanguage()
+                projectLanguage: this._getPredominantLanguage(),
+                ...(fileFilter && { filteredBy: options.file, matchedFiles: files.length }),
+                ...(emptyFiles > 0 && fileFilter && { emptyFiles })
             },
             totals: {
                 files: files.length,

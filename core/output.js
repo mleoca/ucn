@@ -1410,6 +1410,12 @@ function formatToc(toc, options = {}) {
     lines.push(`  ${t.functions} functions, ${t.classes} types (classes/interfaces/enums), ${t.state} state objects`);
 
     const meta = toc.meta || {};
+    if (meta.filteredBy) {
+        lines.push(`  Filtered by: --file=${meta.filteredBy} (${meta.matchedFiles} files matched)`);
+        if (meta.emptyFiles) {
+            lines.push(`  Note: ${meta.emptyFiles} file(s) have no detected symbols (may be generated or data files)`);
+        }
+    }
     const warnings = [];
     if (meta.dynamicImports) { const dn = dynamicImportsNote(meta.dynamicImports, meta); if (dn) warnings.push(dn); }
     if (meta.uncertain) warnings.push(`${meta.uncertain} uncertain reference(s)`);

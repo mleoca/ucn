@@ -1353,3 +1353,35 @@ func Format(s string) string { return s }
         }
     });
 });
+
+// Bug 14: toc --file shows note for files with no detected symbols
+describe('fix: toc --file notes empty/generated files', () => {
+    it('reports emptyFiles count when --file matches files with no symbols', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/app\n\ngo 1.21\n',
+            'main.go': `package main
+
+func main() {}
+`,
+            'generated/zz_generated_types.go': `package generated
+
+// This file has no functions or types detectable by the parser
+var _ = "placeholder"
+`,
+            'generated/zz_generated_data.go': `package generated
+
+// Another generated file with no symbols
+var _ = "data"
+`
+        });
+        try {
+            const index = idx(dir);
+            const toc = index.getToc({ file: 'generated' });
+            assert.ok(toc.meta.filteredBy === 'generated', 'should record filteredBy');
+            assert.ok(toc.meta.matchedFiles >= 2, 'should match generated files');
+            assert.ok(toc.meta.emptyFiles >= 2, 'should report empty files');
+        } finally {
+            rm(dir);
+        }
+    });
+});

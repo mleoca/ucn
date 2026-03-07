@@ -64,7 +64,7 @@ function saveCache(index, cachePath) {
     }
 
     const cacheData = {
-        version: 4,  // v4: className, memberType, isMethod for all languages
+        version: 5,  // v5: Go exported const/var indexing, embedded structs/interfaces
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root: index.root,
@@ -107,9 +107,9 @@ function loadCache(index, cachePath) {
         const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
 
         // Check version compatibility
-        // v4 adds className, memberType, isMethod for all languages
-        // Only accept exactly version 4 (or future versions handled explicitly)
-        if (cacheData.version !== 4) {
+        // v5 adds Go exported const/var indexing, embedded structs/interfaces
+        // Only accept exactly version 5 (or future versions handled explicitly)
+        if (cacheData.version !== 5) {
             return false;
         }
 

@@ -631,7 +631,7 @@ function helper() { return 42; }
             // Verify main cache file does NOT have inline callsCache
             const mainCachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(mainCachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 4, 'Cache version should be 4');
+            assert.strictEqual(cacheData.version, 5, 'Cache version should be 5');
             assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
 
             // Verify separate calls-cache.json exists
