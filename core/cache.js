@@ -41,9 +41,14 @@ function saveCache(index, cachePath) {
         }]);
     }
 
+    // Hash config to detect when graph rebuild is needed on load
+    const configHash = crypto.createHash('md5')
+        .update(JSON.stringify(index.config || {})).digest('hex');
+
     const cacheData = {
         version: 4,  // v4: className, memberType, isMethod for all languages
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
+        configHash,
         root: index.root,
         buildTime: index.buildTime,
         timestamp: Date.now(),
@@ -128,9 +133,13 @@ function loadCache(index, cachePath) {
             index.failedFiles = new Set(cacheData.failedFiles);
         }
 
-        // Rebuild derived graphs to ensure consistency with current config
-        index.buildImportGraph();
-        index.buildInheritanceGraph();
+        // Only rebuild graphs if config changed (e.g., aliases modified)
+        const currentConfigHash = crypto.createHash('md5')
+            .update(JSON.stringify(index.config || {})).digest('hex');
+        if (currentConfigHash !== cacheData.configHash) {
+            index.buildImportGraph();
+            index.buildInheritanceGraph();
+        }
 
         return true;
     } catch (e) {
