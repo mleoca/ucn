@@ -208,6 +208,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const result = index.context(p.name, {
@@ -225,6 +227,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const result = index.impact(p.name, {
@@ -241,6 +245,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.smart(p.name, {
             file: p.file,
             className: p.className,
@@ -256,6 +262,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const depthVal = num(p.depth, undefined);
         const result = index.trace(p.name, {
             depth: depthVal ?? 3,
@@ -273,6 +281,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.example(p.name, { file: p.file, className: p.className });
         if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
         return { ok: true, result };
@@ -282,6 +292,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.related(p.name, {
             file: p.file,
             className: p.className,
@@ -444,6 +456,8 @@ const HANDLERS = {
     },
 
     deadcode: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.deadcode({
             includeExported: p.includeExported || false,
             includeDecorated: p.includeDecorated || false,
@@ -471,6 +485,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
 
         const fnNames = p.name.includes(',')
             ? p.name.split(',').map(n => n.trim()).filter(Boolean)
@@ -531,6 +547,8 @@ const HANDLERS = {
     class: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
 
         const CLASS_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait'];
         const matches = index.find(p.name, { file: p.file, skipCounts: true })
@@ -692,6 +710,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const result = index.verify(p.name, { file: p.file, className: p.className });
@@ -702,6 +722,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         if (!p.addParam && !p.removeParam && !p.renameTo) {

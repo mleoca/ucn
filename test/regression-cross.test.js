@@ -8249,6 +8249,68 @@ def store():
     });
 });
 
+describe('fix #168: commands warn when --file matches no files', () => {
+    it('context returns error for non-matching --file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}\nmodule.exports = { helper };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'helper', file: 'nonexistent' });
+            assert.ok(!r.ok, 'should fail');
+            assert.ok(r.error.includes('nonexistent'), 'should mention the pattern');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('impact returns error for non-matching --file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'impact', { name: 'helper', file: 'xyz' });
+            assert.ok(!r.ok);
+            assert.ok(r.error.includes('xyz'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('deadcode returns error for non-matching --file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', { file: 'nonexistent' });
+            assert.ok(!r.ok);
+            assert.ok(r.error.includes('nonexistent'));
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('fn returns error for non-matching --file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'fn', { name: 'helper', file: 'nope' });
+            assert.ok(!r.ok);
+            assert.ok(r.error.includes('nope'));
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix #166: api command respects --file pattern filter', () => {
     it('filters api results by file substring pattern', () => {
         const dir = tmp({
