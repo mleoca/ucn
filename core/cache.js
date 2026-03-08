@@ -60,10 +60,11 @@ function saveCache(index, cachePath) {
         });
         strippedSymbols.push([name, stripped]);
     }
-    // Files: use relativePath as key, strip path and relativePath from entries
+    // Files: use relativePath as key, strip path, relativePath, symbols, and bindings from entries.
+    // symbols/bindings are already stored in the top-level symbols map — no need to duplicate.
     const strippedFiles = [];
     for (const [, entry] of index.files) {
-        const { path: _p, relativePath: rp, ...rest } = entry;
+        const { path: _p, relativePath: rp, symbols: _s, bindings: _b, ...rest } = entry;
         strippedFiles.push([rp, rest]);
     }
 
@@ -79,7 +80,7 @@ function saveCache(index, cachePath) {
     };
 
     const cacheData = {
-        version: 6,  // v6: relative paths throughout (saves ~60% cache size)
+        version: 7,  // v7: strip symbols/bindings from file entries (dedup ~45% cache reduction)
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
@@ -125,8 +126,8 @@ function loadCache(index, cachePath) {
         const cacheData = JSON.parse(fs.readFileSync(cacheFile, 'utf-8'));
 
         // Check version compatibility
-        // v6: relative paths throughout (saves ~60% cache size)
-        if (cacheData.version !== 6) {
+        // v7: symbols/bindings stripped from file entries (dedup)
+        if (cacheData.version !== 7) {
             return false;
         }
 
@@ -146,21 +147,36 @@ function loadCache(index, cachePath) {
         const root = cacheData.root || index.root;
 
         // Reconstruct files Map: relative key → absolute key, restore path and relativePath
+        // Initialize symbols/bindings arrays (will be populated from top-level symbols)
         index.files = new Map();
         for (const [relPath, entry] of cacheData.files) {
             const absPath = path.join(root, relPath);
             entry.path = absPath;
             entry.relativePath = relPath;
+            if (!entry.symbols) entry.symbols = [];
+            if (!entry.bindings) entry.bindings = [];
             index.files.set(absPath, entry);
         }
 
         // Reconstruct symbols: restore file and bindingId from relativePath
+        // Also rebuild fileEntry.symbols and fileEntry.bindings from top-level data
         index.symbols = new Map(cacheData.symbols);
         for (const [, defs] of index.symbols) {
             for (const s of defs) {
                 if (!s.file && s.relativePath) s.file = path.join(root, s.relativePath);
                 if (!s.bindingId && s.relativePath && s.type && s.startLine) {
                     s.bindingId = `${s.relativePath}:${s.type}:${s.startLine}`;
+                }
+                // Rebuild fileEntry.symbols and bindings from top-level symbols
+                const fileEntry = index.files.get(s.file);
+                if (fileEntry) {
+                    fileEntry.symbols.push(s);
+                    fileEntry.bindings.push({
+                        id: s.bindingId,
+                        name: s.name,
+                        type: s.type,
+                        startLine: s.startLine
+                    });
                 }
             }
         }

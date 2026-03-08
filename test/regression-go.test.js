@@ -12,6 +12,8 @@ const fs = require('fs');
 
 const { parse } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
+const { saveCache, loadCache } = require('../core/cache');
+const { parseStackTrace } = require('../core/stacktrace');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
 const os = require('os');
@@ -1885,6 +1887,813 @@ describe('fix #172: callees skip non-callable types (interface/struct)', () => {
             const handlerCallee = callees.find(c => c.name === 'Handler' || c.type === 'interface');
             assert.ok(!handlerCallee,
                 'Should not resolve local variable to interface definition');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #174: Add 'field' to NON_CALLABLE_TYPES
+// ============================================================================
+describe('fix #174: field type excluded from callees', () => {
+    it('field_identifier as field (not method) should not appear as callee', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'types.go': `package main
+type PodAction struct {
+    KillPod bool
+    Name    string
+}
+func (p PodAction) String() string {
+    return fmt.Sprintf("kill=%v name=%s", p.KillPod, p.Name)
+}
+`,
+            'methods.go': `package main
+func KillPod(pod *Pod) error {
+    return nil
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees(
+                index.find('String').find(d => d.className === 'PodAction'), {}
+            );
+            // KillPod and Name as field accesses should not show as callees
+            const killPodCallee = callees.find(c => c.name === 'KillPod');
+            assert.ok(!killPodCallee || killPodCallee.type === 'field',
+                'Field access KillPod should not appear as callable callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #175: Go stack traces carry forward function name
+// ============================================================================
+describe('fix #175: Go stack trace function names', () => {
+    it('links function name from previous line to file:line frame', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+func syncDeployment() {
+    panic("test")
+}
+func processNextWorkItem() {
+    syncDeployment()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const stack = `goroutine 1 [running]:
+example.com/test.syncDeployment()
+\tmain.go:3
+example.com/test.processNextWorkItem()
+\tmain.go:6`;
+            const result = parseStackTrace(index, stack);
+            assert.ok(result.frames.length >= 2, 'Should parse at least 2 frames');
+            assert.strictEqual(result.frames[0].function, 'syncDeployment');
+            assert.strictEqual(result.frames[1].function, 'processNextWorkItem');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('handles Go method receiver syntax (*Type).Method', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+type Server struct{}
+func (s *Server) Run() { panic("test") }
+`
+        });
+        try {
+            const index = idx(dir);
+            const stack = `goroutine 1 [running]:
+example.com/test.(*Server).Run()
+\tmain.go:3`;
+            const result = parseStackTrace(index, stack);
+            assert.ok(result.frames.length >= 1);
+            assert.strictEqual(result.frames[0].function, 'Run');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #176: Cache deduplication (symbols not stored twice)
+// ============================================================================
+describe('fix #176: cache strips symbols from file entries', () => {
+    it('cache file entries do not contain symbols/bindings arrays', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+func Hello() string { return "hello" }
+func World() string { return "world" }
+`
+        });
+        try {
+            const index = idx(dir);
+            const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+            saveCache(index, cachePath);
+            const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
+            // File entries should NOT contain symbols or bindings
+            for (const [, entry] of cacheData.files) {
+                assert.ok(!entry.symbols, 'File entry should not contain symbols');
+                assert.ok(!entry.bindings, 'File entry should not contain bindings');
+            }
+            assert.strictEqual(cacheData.version, 7, 'Cache version should be 7');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('loadCache reconstructs symbols and bindings in file entries', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+func Hello() string { return "hello" }
+func World() string { return "world" }
+`
+        });
+        try {
+            const index = idx(dir);
+            const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+            saveCache(index, cachePath);
+
+            // Create a fresh index and load from cache
+            const index2 = new ProjectIndex(dir, { quiet: true });
+            const loaded = loadCache(index2, cachePath);
+            assert.ok(loaded, 'Cache should load successfully');
+
+            // File entries should have reconstructed symbols and bindings
+            for (const [, entry] of index2.files) {
+                assert.ok(Array.isArray(entry.symbols), 'symbols should be reconstructed');
+                assert.ok(Array.isArray(entry.bindings), 'bindings should be reconstructed');
+            }
+
+            // Verify symbols are correct
+            const helloDefs = index2.symbols.get('Hello');
+            assert.ok(helloDefs && helloDefs.length > 0, 'Hello should be in symbols');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #177: Go unexported callback visibility
+// ============================================================================
+describe('fix #177: Go unexported callback visibility filtering', () => {
+    it('unexported method passed as callback should only show callers from same package', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/deploy/controller.go': `package deploy
+
+type DeployController struct{}
+
+func (dc *DeployController) worker() { }
+
+func (dc *DeployController) Start() {
+    run(dc.worker)
+}
+`,
+            'pkg/replica/controller.go': `package replica
+
+type ReplicaController struct{}
+
+func (rc *ReplicaController) worker() { }
+
+func (rc *ReplicaController) Start() {
+    run(rc.worker)
+}
+`,
+            'pkg/run/run.go': `package run
+func run(fn func()) { fn() }
+`
+        });
+        try {
+            const index = idx(dir);
+            // Find the deploy worker definition
+            const workerDefs = index.find('worker');
+            const deployWorker = workerDefs.find(d => d.relativePath?.includes('deploy'));
+            assert.ok(deployWorker, 'Should find deploy worker');
+
+            const callers = index.findCallers('worker', {
+                targetDefinitions: [deployWorker]
+            });
+            // Only deploy's Start should be a caller, not replica's Start
+            const callerFiles = callers.map(c => c.relativePath || '');
+            const hasDeployCaller = callerFiles.some(f => f.includes('deploy'));
+            const hasReplicaCaller = callerFiles.some(f => f.includes('replica'));
+            assert.ok(hasDeployCaller,
+                'Deploy controller should be a caller');
+            assert.ok(!hasReplicaCaller,
+                'Replica controller should NOT be a caller of deploy worker');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #178: diff-impact receiver filtering for common method names
+// ============================================================================
+describe('fix #178: diff-impact receiver filtering', () => {
+    it('findCallers propagates receiverType in results', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cache.go': `package main
+type Cache struct{}
+func (c *Cache) Get(key string) string { return "" }
+func NewCache() *Cache { return &Cache{} }
+`,
+            'handler.go': `package main
+func handleRequest(c *Cache) {
+    c.Get("key")
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('Get', {});
+            // With typed param `c *Cache`, receiverType should be propagated
+            const withType = callers.filter(c => c.receiverType === 'Cache');
+            assert.ok(withType.length > 0,
+                'receiverType should be propagated in caller results');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #179: Go method receiver filtering in impact() uses receiver, not className
+// ============================================================================
+describe('fix #179: Go impact() uses receiver for method disambiguation', () => {
+    it('impact() filters callers for Go methods using receiver type', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cache.go': `package main
+type RealCache struct{}
+func (c *RealCache) Get(key string) string { return "" }
+
+type FakeCache struct{}
+func (c *FakeCache) Get(key string) string { return "" }
+`,
+            'handler.go': `package main
+func handleRequest(c *RealCache) {
+    c.Get("key")
+}
+`,
+            'test_handler.go': `package main
+func testHandler(c *FakeCache) {
+    c.Get("test")
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // Impact for FakeCache.Get should NOT include handleRequest's caller
+            const fakeDefs = index.find('Get').filter(d =>
+                d.receiver && d.receiver.includes('FakeCache'));
+            assert.ok(fakeDefs.length > 0, 'Should find FakeCache.Get');
+            const impact = index.impact('Get', {
+                className: 'FakeCache',
+                file: fakeDefs[0].relativePath
+            });
+            // handleRequest calls c.Get with RealCache receiver — should be filtered
+            const callerNames = (impact?.callSites || []).map(c => c.callerName);
+            assert.ok(!callerNames.includes('handleRequest'),
+                'handleRequest (RealCache) should not appear in FakeCache.Get impact');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('impact() works for Go methods without className', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'server.go': `package main
+type Server struct{}
+func (s *Server) Run() { }
+`,
+            'main.go': `package main
+func main() {
+    s := &Server{}
+    s.Run()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const impact = index.impact('Run');
+            assert.ok(impact, 'impact() should return results for Go method');
+            assert.ok(impact.totalCallSites >= 1, 'Should find at least 1 caller');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #180: findCallees filters non-callable types on receiverType path
+// ============================================================================
+describe('fix #180: findCallees filters non-callable types', () => {
+    it('struct fields should not appear as callees via receiverType path', () => {
+        const { NON_CALLABLE_TYPES } = require('../core/shared');
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'types.go': `package main
+type OwnerReference struct {
+    Name string
+    Kind string
+}
+func NewOwnerRef() *OwnerReference { return &OwnerReference{} }
+`,
+            'resolver.go': `package main
+func resolveControllerRef(ref *OwnerReference) string {
+    return ref.Name + ref.Kind
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const resolverDef = index.find('resolveControllerRef')[0];
+            assert.ok(resolverDef, 'Should find resolveControllerRef');
+            const callees = index.findCallees(resolverDef, {});
+            // Name and Kind are struct fields — should not appear as callable callees
+            const fieldCallees = callees.filter(c =>
+                (c.name === 'Name' || c.name === 'Kind') &&
+                NON_CALLABLE_TYPES.has(c.type));
+            assert.strictEqual(fieldCallees.length, 0,
+                'Struct fields should not appear as callees');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #181: className set from receiver for Go/Rust methods
+// ============================================================================
+describe('fix #181: Go/Rust methods get className from receiver', () => {
+    it('Go methods have className set from receiver', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'server.go': `package main
+type Server struct{}
+func (s *Server) Run() { }
+func (s *Server) Stop() { }
+`
+        });
+        try {
+            const index = idx(dir);
+            const runDefs = index.find('Run');
+            const serverRun = runDefs.find(d => d.receiver?.includes('Server'));
+            assert.ok(serverRun, 'Should find Server.Run');
+            assert.strictEqual(serverRun.className, 'Server',
+                'Go method should have className set from receiver');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('impact() works with className for Go methods', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'types.go': `package main
+type RealCache struct{}
+func (c *RealCache) Get(key string) string { return "" }
+
+type FakeCache struct{}
+func (c *FakeCache) Get(key string) string { return "" }
+`,
+            'handler.go': `package main
+func handleReal(c *RealCache) { c.Get("k") }
+func handleFake(c *FakeCache) { c.Get("k") }
+`
+        });
+        try {
+            const index = idx(dir);
+            const impact = index.impact('Get', { className: 'FakeCache' });
+            assert.ok(impact, 'impact should work with className for Go methods');
+            const callerNames = (impact.callSites || []).map(c => c.callerName);
+            assert.ok(!callerNames.includes('handleReal'),
+                'handleReal (RealCache) should NOT appear in FakeCache.Get impact');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #182: Go package-qualified calls not marked as method calls
+// ============================================================================
+describe('fix #182: Go package-qualified calls marked isMethod: false', () => {
+    it('pkg.Func() should not be isMethod when receiver is import alias', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'util.go': `package util
+func Get() string { return "ok" }
+`,
+            'main.go': `package main
+import "example.com/test/util"
+func handler() { util.Get() }
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('Get', {});
+            const caller = callers.find(c => c.callerName === 'handler');
+            assert.ok(caller, 'Should find handler as caller');
+            // The call should be isMethod: false since util is an import alias
+            assert.ok(!caller.isMethod || caller.isMethod === false,
+                'Package-qualified call should not be isMethod');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #183: Function-typed struct fields are callable
+// ============================================================================
+describe('fix #183: Go function-typed struct fields as callees', () => {
+    it('function-typed field should appear as callee', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'controller.go': `package main
+type Controller struct {
+    syncHandler  func(key string) error
+    Name         string
+}
+func (c *Controller) processNextWorkItem() {
+    c.syncHandler("default/my-deployment")
+    _ = c.Name
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const procDef = index.find('processNextWorkItem')[0];
+            assert.ok(procDef, 'Should find processNextWorkItem');
+            const callees = index.findCallees(procDef, {});
+            const syncHandler = callees.find(c => c.name === 'syncHandler');
+            assert.ok(syncHandler, 'syncHandler (function-typed field) should appear as callee');
+            // Name (string field) should NOT appear
+            const nameCallee = callees.find(c => c.name === 'Name');
+            assert.ok(!nameCallee, 'Name (string field) should not appear as callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #184: Go renamed imports detected as package calls
+// ============================================================================
+describe('fix #184: Go renamed import aliases', () => {
+    it('renamed import alias recognized as package call (isMethod: false)', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/version/version.go': `package version
+func Get() string { return "1.0" }
+`,
+            'main.go': `package main
+import utilversion "example.com/test/pkg/version"
+func handler() string { return utilversion.Get() }
+`
+        });
+        try {
+            const index = idx(dir);
+            // utilversion.Get() should resolve correctly
+            const callers = index.findCallers('Get', {});
+            const caller = callers.find(c => c.callerName === 'handler');
+            assert.ok(caller, 'Should find handler as caller of Get');
+            // Should not be marked as method call
+            assert.ok(!caller.isMethod,
+                'Renamed import call should not be isMethod');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('importNames stored in fileEntry includes renamed aliases', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+import (
+    "fmt"
+    utilversion "example.com/test/version"
+)
+func main() { fmt.Println(utilversion.Get()) }
+`
+        });
+        try {
+            const index = idx(dir);
+            const mainFile = Array.from(index.files.values()).find(f =>
+                f.relativePath === 'main.go');
+            assert.ok(mainFile, 'Should find main.go');
+            assert.ok(mainFile.importNames, 'Should have importNames');
+            assert.ok(mainFile.importNames.includes('fmt'), 'Should include fmt');
+            assert.ok(mainFile.importNames.includes('utilversion'),
+                'Should include renamed alias utilversion');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #185: Method vs non-method cross-matching filter
+// ============================================================================
+describe('fix #185: method/non-method cross-matching', () => {
+    it('method call should not match standalone function', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'errorf.go': `package main
+func Errorf(format string, args ...interface{}) { }
+`,
+            'test.go': `package main
+import "testing"
+func TestSomething(t *testing.T) {
+    t.Errorf("failed: %v", err)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // t.Errorf() is a method call — should NOT match standalone Errorf
+            const callers = index.findCallers('Errorf', {});
+            const testCaller = callers.find(c => c.callerName === 'TestSomething');
+            assert.ok(!testCaller,
+                't.Errorf() should not match standalone func Errorf');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('non-method call should not match class method', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'controller.go': `package main
+type DeploymentController struct{}
+func (dc *DeploymentController) Run(workers int) { }
+`,
+            'cli/cli.go': `package cli
+func Run() { }
+`,
+            'main.go': `package main
+import "example.com/test/cli"
+func main() {
+    cli.Run()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // cli.Run() is a package call — should NOT match DeploymentController.Run
+            const runDefs = index.find('Run');
+            const dcRun = runDefs.find(d => d.className === 'DeploymentController');
+            assert.ok(dcRun, 'Should find DeploymentController.Run');
+            const callers = index.findCallers('Run', {
+                targetDefinitions: [dcRun]
+            });
+            const mainCaller = callers.find(c => c.callerName === 'main');
+            assert.ok(!mainCaller,
+                'cli.Run() should not match DeploymentController.Run');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #186: _buildTypedLocalTypeMap handles multi-value returns and pkg prefix
+// ============================================================================
+describe('fix #186: Go New* multi-value returns', () => {
+    it('x, err := pkg.NewFoo() maps x to Foo type', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/controller.go': `package pkg
+type DeploymentController struct{}
+func (dc *DeploymentController) Run() { }
+func NewDeploymentController() (*DeploymentController, error) {
+    return &DeploymentController{}, nil
+}
+`,
+            'main.go': `package main
+import "example.com/test/pkg"
+func startController() {
+    dsc, err := pkg.NewDeploymentController()
+    if err != nil { return }
+    dsc.Run()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const startDef = index.find('startController')[0];
+            assert.ok(startDef, 'Should find startController');
+            const callees = index.findCallees(startDef, {});
+            const runCallee = callees.find(c => c.name === 'Run');
+            assert.ok(runCallee, 'Run should be resolved as callee via NewDeploymentController type');
+            // Should resolve to DeploymentController.Run specifically
+            if (runCallee.className) {
+                assert.strictEqual(runCallee.className, 'DeploymentController',
+                    'Should resolve to DeploymentController.Run');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #188: resolveSymbol prefers definitions from more-imported packages
+// ============================================================================
+describe('fix #188: resolveSymbol import popularity tiebreaker', () => {
+    it('prefers definition from more-imported package', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/common/scheme.go': `package common
+func Scheme() string { return "https" }
+`,
+            'pkg/rare/scheme.go': `package rare
+func Scheme() string { return "ftp" }
+`,
+            'handler1.go': `package main
+import "example.com/test/pkg/common"
+func h1() { common.Scheme() }
+`,
+            'handler2.go': `package main
+import "example.com/test/pkg/common"
+func h2() { common.Scheme() }
+`,
+            'handler3.go': `package main
+import "example.com/test/pkg/common"
+func h3() { common.Scheme() }
+`,
+            'rare_user.go': `package main
+import "example.com/test/pkg/rare"
+func r1() { rare.Scheme() }
+`
+        });
+        try {
+            const index = idx(dir);
+            const { def } = index.resolveSymbol('Scheme');
+            assert.ok(def, 'Should resolve Scheme');
+            // common/scheme.go is imported by 3 files, rare/scheme.go by 1
+            assert.ok(def.relativePath.includes('common'),
+                'Should prefer definition from more-imported package');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// fix #189: Function-typed parameter calls should not match global functions
+// ============================================================================
+
+describe('fix #189: func-typed param calls excluded from callers', () => {
+    it('calls to function-typed parameters should not appear as callers of global functions', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'match.go': `package webhook
+func match(obj interface{}) bool {
+    return obj != nil
+}
+`,
+            'claim.go': `package claim
+import "example.com/test/webhook"
+func ClaimObject(match func(interface{}) bool, release func(interface{}) error) {
+    if match(nil) {
+        release(nil)
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('match');
+            // match() inside ClaimObject is calling the parameter, not webhook.match
+            const fromClaim = callers.filter(c => c.relativePath === 'claim.go');
+            assert.strictEqual(fromClaim.length, 0,
+                'Function-typed parameter call should not be reported as caller of global match');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('function-typed params are tracked in Go findCallsInCode', () => {
+        const { getParser } = require('../languages');
+        const goParser = getParser('go');
+        const goModule = require('../languages/go');
+        const code = `package test
+func Process(filter func(string) bool, handler func(string) error) {
+    if filter("test") {
+        handler("test")
+    }
+    fmt.Println("done")
+}
+`;
+        const calls = goModule.findCallsInCode(code, goParser);
+        // filter() and handler() should NOT appear — they're func-typed params
+        const filterCalls = calls.filter(c => c.name === 'filter');
+        const handlerCalls = calls.filter(c => c.name === 'handler');
+        assert.strictEqual(filterCalls.length, 0, 'filter() is a func-typed param, should be skipped');
+        assert.strictEqual(handlerCalls.length, 0, 'handler() is a func-typed param, should be skipped');
+        // Println should still be detected
+        const printlnCalls = calls.filter(c => c.name === 'Println');
+        assert.ok(printlnCalls.length > 0, 'Println should still be detected');
+    });
+
+    it('shared-type func params: adopt, release func(...) both skipped', () => {
+        const { getParser } = require('../languages');
+        const goParser = getParser('go');
+        const goModule = require('../languages/go');
+        const code = `package test
+func ClaimObject(adopt, release func(interface{}) error) {
+    adopt(obj)
+    release(obj)
+    fmt.Println("done")
+}
+`;
+        const calls = goModule.findCallsInCode(code, goParser);
+        const adoptCalls = calls.filter(c => c.name === 'adopt');
+        const releaseCalls = calls.filter(c => c.name === 'release');
+        assert.strictEqual(adoptCalls.length, 0, 'adopt is a func-typed param, should be skipped');
+        assert.strictEqual(releaseCalls.length, 0, 'release is a func-typed param, should be skipped');
+    });
+});
+
+// ============================================================================
+// fix #190: New*() constructor inference for receiverType in Go parser
+// ============================================================================
+
+describe('fix #190: New*() receiver type inference in Go parser', () => {
+    it('infers receiverType from NewFoo() assignments', () => {
+        const { getParser } = require('../languages');
+        const goParser = getParser('go');
+        const goModule = require('../languages/go');
+        const code = `package test
+import "pkg"
+func main() {
+    dsc := NewDeploymentController(ctx)
+    dsc.Run(ctx)
+    c, err := pkg.NewCache(opts)
+    c.Get("key")
+}
+`;
+        const calls = goModule.findCallsInCode(code, goParser, { imports: ['pkg'] });
+        const runCall = calls.find(c => c.name === 'Run' && c.receiver === 'dsc');
+        assert.ok(runCall, 'Should find dsc.Run() call');
+        assert.strictEqual(runCall.receiverType, 'DeploymentController',
+            'Should infer DeploymentController from NewDeploymentController()');
+        const getCall = calls.find(c => c.name === 'Get' && c.receiver === 'c');
+        assert.ok(getCall, 'Should find c.Get() call');
+        assert.strictEqual(getCall.receiverType, 'Cache',
+            'Should infer Cache from pkg.NewCache()');
+    });
+
+    it('New*() inference improves findCallers receiver disambiguation', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'controller.go': `package controller
+type DeploymentController struct{}
+func (dc *DeploymentController) Run(ctx interface{}) {}
+type StatefulSetController struct{}
+func (sc *StatefulSetController) Run(ctx interface{}) {}
+`,
+            'main.go': `package controller
+func startDeploy() {
+    dsc := NewDeploymentController()
+    dsc.Run(ctx)
+}
+func startStateful() {
+    ssc := NewStatefulSetController()
+    ssc.Run(ctx)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // When asking about DeploymentController.Run specifically
+            const defs = index.symbols.get('Run') || [];
+            const dcDef = defs.find(d => d.className === 'DeploymentController');
+            assert.ok(dcDef, 'Should find DeploymentController.Run def');
+            const callers = index.findCallers('Run', { targetDefinitions: [dcDef] });
+            const dcCallers = callers.filter(c => c.callerName === 'startDeploy');
+            const scCallers = callers.filter(c => c.callerName === 'startStateful');
+            assert.ok(dcCallers.length > 0, 'Should find startDeploy as caller');
+            assert.strictEqual(scCallers.length, 0,
+                'startStateful calls StatefulSetController.Run, not DeploymentController.Run');
         } finally {
             rm(dir);
         }

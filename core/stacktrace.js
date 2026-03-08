@@ -293,7 +293,8 @@ function parseStackTrace(index, stackText) {
         // Go: "file.go:line" or "package/file.go:line +0x..."
         { regex: /^\s*([^\s:]+\.go):(\d+)(?:\s|$)/, extract: (m) => ({ file: m[1], line: parseInt(m[2]), funcName: null, col: null }) },
         // Go with function: "package.FunctionName()\n\tfile.go:line"
-        { regex: /^\s*([^\s(]+)\(\)$/, extract: null }, // Skip function-only lines
+        // Also handles method syntax: "package.(*Type).Method(...)"
+        { regex: /^\s*((?:[^\s(]|\([^)]*\))+)\(.*\)$/, extract: null }, // Skip function-only lines
         // Java: "at package.Class.method(File.java:line)"
         { regex: /at\s+([^\(]+)\(([^:]+):(\d+)\)/, extract: (m) => ({ funcName: m[1].split('.').pop(), file: m[2], line: parseInt(m[3]), col: null }) },
         // Rust: "at src/main.rs:line:col" or panic location
@@ -302,16 +303,40 @@ function parseStackTrace(index, stackText) {
         { regex: /([^\s:]+\.\w+):(\d+)(?::(\d+))?/, extract: (m) => ({ file: m[1], line: parseInt(m[2]), col: m[3] ? parseInt(m[3]) : null, funcName: null }) }
     ];
 
+    // Track Go function names that appear on a line before the file:line
+    let pendingGoFuncName = null;
+
     for (const line of lines) {
         const trimmed = line.trim();
         if (!trimmed) continue;
 
         // Try each pattern until one matches
+        let matched = false;
         for (const pattern of patterns) {
             const match = pattern.regex.exec(trimmed);
-            if (match && pattern.extract) {
+            if (match) {
+                if (pattern.extract === null) {
+                    // Go function-only line (e.g. "package.FunctionName()")
+                    // Extract the function name and carry it forward to the next file:line
+                    const fullName = match[1];
+                    // Go uses fully-qualified names: pkg/path.FuncName or pkg/path.(*Type).Method
+                    const lastDot = fullName.lastIndexOf('.');
+                    pendingGoFuncName = lastDot >= 0 ? fullName.slice(lastDot + 1) : fullName;
+                    // Strip Go method receiver syntax: (*Type).Method → Method
+                    if (pendingGoFuncName.startsWith('(*')) {
+                        const parenClose = pendingGoFuncName.indexOf(').');
+                        if (parenClose >= 0) pendingGoFuncName = pendingGoFuncName.slice(parenClose + 2);
+                    }
+                    matched = true;
+                    break;
+                }
                 const extracted = pattern.extract(match);
                 if (extracted && extracted.file && extracted.line) {
+                    // Use pending Go function name if no function name extracted
+                    if (!extracted.funcName && pendingGoFuncName) {
+                        extracted.funcName = pendingGoFuncName;
+                    }
+                    pendingGoFuncName = null;
                     frames.push(createStackFrame(
                         index,
                         extracted.file,
@@ -320,9 +345,13 @@ function parseStackTrace(index, stackText) {
                         extracted.col,
                         trimmed
                     ));
+                    matched = true;
                     break; // Move to next line
                 }
             }
+        }
+        if (!matched) {
+            pendingGoFuncName = null; // Reset if line doesn't match any pattern
         }
     }
 

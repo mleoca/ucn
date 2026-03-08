@@ -8333,3 +8333,50 @@ describe('fix #166: api command respects --file pattern filter', () => {
         }
     });
 });
+
+// ============================================================================
+// Fix #187: usages() uses filtered definitions for method detection
+// ============================================================================
+describe('fix #187: usages test exclusion consistency', () => {
+    it('usages with test exclusion should not count test-only method definitions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `
+class Handler {
+    process(data) { return data; }
+}
+module.exports = { Handler };
+`,
+            'app.js': `
+const { Handler } = require('./lib');
+const h = new Handler();
+h.process('input');
+`,
+            'test/test.js': `
+class TestHandler {
+    process(data) { return 'test'; }
+}
+const t = new TestHandler();
+t.process('test-input');
+`
+        });
+        try {
+            const index = idx(dir);
+            // Without test exclusion
+            const allUsages = index.usages('process', {});
+            // With test exclusion
+            const filteredUsages = index.usages('process', {
+                exclude: ['test']
+            });
+            // Filtered should have fewer usages (test file excluded)
+            assert.ok(filteredUsages.length < allUsages.length,
+                'Test-excluded usages should be fewer than all usages');
+            // No filtered usage should be from test files
+            const testUsage = filteredUsages.find(u =>
+                u.relativePath && u.relativePath.includes('test/'));
+            assert.ok(!testUsage, 'No usage should come from test files');
+        } finally {
+            rm(dir);
+        }
+    });
+});

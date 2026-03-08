@@ -508,7 +508,7 @@ const GO_BUILTINS = new Set([
     'println', 'real', 'recover'
 ]);
 
-function findCallsInCode(code, parser) {
+function findCallsInCode(code, parser, options = {}) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
@@ -516,6 +516,18 @@ function findCallsInCode(code, parser) {
     const closureScopes = new Map();
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
+    // Track function-typed parameter names per scope (scopeStartLine -> Set<name>)
+    const funcParamScopes = new Map();
+
+    // Build set of import aliases for distinguishing pkg.Func() from obj.Method()
+    // options.imports contains resolved alias names (e.g., 'utilversion' for renamed imports,
+    // 'fmt' for standard imports). These come from fileEntry.importNames.
+    const importAliases = new Set();
+    if (options.imports) {
+        for (const name of options.imports) {
+            if (name && name !== '_' && name !== '.') importAliases.add(name);
+        }
+    }
 
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
@@ -541,9 +553,12 @@ function findCallsInCode(code, parser) {
         return null;
     };
 
-    // Build type map from function/method parameters and receiver
+    // Build type map from function/method parameters and receiver.
+    // Also returns funcParamNames: parameter names with function types (func(...) ...)
+    // so calls to them can be skipped (they're local parameter calls, not global function calls).
     const buildScopeTypeMap = (node) => {
         const typeMap = new Map();
+        const funcParamNames = new Set();
 
         // Method receiver: func (f *Framework) Method()
         if (node.type === 'method_declaration') {
@@ -564,22 +579,35 @@ function findCallsInCode(code, parser) {
         }
 
         // Function/method parameters
+        // Go allows shared-type declarations: (adopt, release func(...) error)
+        // childForFieldName('name') returns only the first name — iterate all identifier children
         const paramsNode = node.childForFieldName('parameters');
         if (paramsNode) {
             for (let i = 0; i < paramsNode.namedChildCount; i++) {
                 const param = paramsNode.namedChild(i);
                 if (param.type === 'parameter_declaration') {
-                    const nameNode = param.childForFieldName('name');
                     const typeNode = param.childForFieldName('type');
-                    const typeName = extractTypeName(typeNode);
-                    if (nameNode && typeName) {
-                        typeMap.set(nameNode.text, typeName);
+                    if (!typeNode) continue;
+                    // Collect all name identifiers in this declaration
+                    const nameNodes = [];
+                    for (let j = 0; j < param.namedChildCount; j++) {
+                        const child = param.namedChild(j);
+                        if (child.type === 'identifier') nameNodes.push(child);
+                    }
+                    if (nameNodes.length === 0) continue;
+                    if (typeNode.type === 'function_type') {
+                        for (const nn of nameNodes) funcParamNames.add(nn.text);
+                    } else {
+                        const typeName = extractTypeName(typeNode);
+                        if (typeName) {
+                            for (const nn of nameNodes) typeMap.set(nn.text, typeName);
+                        }
                     }
                 }
             }
         }
 
-        return typeMap;
+        return { typeMap, funcParamNames };
     };
 
     // Helper to extract function name from a function node
@@ -614,6 +642,16 @@ function findCallsInCode(code, parser) {
         return false;
     };
 
+    // Check if name is a function-typed parameter (e.g., match func(Object) bool)
+    // Calls to these are local parameter invocations, not global function calls
+    const isFuncTypedParam = (name) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const scope = funcParamScopes.get(functionStack[i].startLine);
+            if (scope?.has(name)) return true;
+        }
+        return false;
+    };
+
     // Look up variable type from scope chain
     const getReceiverType = (varName) => {
         for (let i = functionStack.length - 1; i >= 0; i--) {
@@ -632,7 +670,11 @@ function findCallsInCode(code, parser) {
                 endLine: node.endPosition.row + 1
             };
             functionStack.push(entry);
-            scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
+            const { typeMap, funcParamNames } = buildScopeTypeMap(node);
+            scopeTypes.set(entry.startLine, typeMap);
+            if (funcParamNames.size > 0) {
+                funcParamScopes.set(entry.startLine, funcParamNames);
+            }
         }
 
         // Track local variable types from composite literals and typed assignments
@@ -664,6 +706,20 @@ function findCallsInCode(code, parser) {
                                 if (ch.type === 'composite_literal') {
                                     typeName = extractTypeName(ch.childForFieldName('type'));
                                     break;
+                                }
+                            }
+                        } else if (val.type === 'call_expression') {
+                            // NewFoo() or pkg.NewFoo() → infer type as Foo
+                            const callFuncNode = val.childForFieldName('function');
+                            if (callFuncNode) {
+                                const callName = callFuncNode.type === 'identifier'
+                                    ? callFuncNode.text
+                                    : callFuncNode.type === 'selector_expression'
+                                        ? callFuncNode.childForFieldName('field')?.text
+                                        : null;
+                                if (callName && /^New[A-Z]/.test(callName)) {
+                                    typeName = callName.slice(3);
+                                    if (!typeName || !/^[A-Z]/.test(typeName)) typeName = null;
                                 }
                             }
                         }
@@ -736,6 +792,9 @@ function findCallsInCode(code, parser) {
                 if (GO_BUILTINS.has(callName)) return true;
                 // Skip calls to local closures (they shadow package-level functions)
                 if (isLocalClosure(callName)) return true;
+                // Skip calls to function-typed parameters (e.g., match func(Object) bool)
+                // These are local parameter invocations, not calls to global functions
+                if (isFuncTypedParam(callName)) return true;
 
                 // Direct call: foo()
                 calls.push({
@@ -752,11 +811,14 @@ function findCallsInCode(code, parser) {
 
                 if (fieldNode) {
                     const receiver = operandNode?.type === 'identifier' ? operandNode.text : undefined;
-                    const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                    // Distinguish pkg.Func() (package-qualified) from obj.Method()
+                    // If receiver is a known import alias, this is a package call, not a method call
+                    const isPkgCall = receiver && importAliases.has(receiver);
+                    const receiverType = (!isPkgCall && receiver) ? getReceiverType(receiver) : undefined;
                     calls.push({
                         name: fieldNode.text,
                         line: node.startPosition.row + 1,
-                        isMethod: true,
+                        isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),
                         enclosingFunction,

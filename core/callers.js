@@ -79,7 +79,16 @@ function getCachedCalls(index, filePath, options = {}) {
         if (!langModule.findCallsInCode) return null;
 
         const parser = getParser(language);
-        const calls = langModule.findCallsInCode(content, parser);
+        // Pass import alias names to Go parser for package vs method call disambiguation
+        // importNames contains resolved alias names (e.g., 'utilversion' for renamed imports)
+        const callOpts = {};
+        if (language === 'go') {
+            const fileEntry = index.files.get(filePath);
+            if (fileEntry?.importNames) {
+                callOpts.imports = fileEntry.importNames;
+            }
+        }
+        const calls = langModule.findCallsInCode(content, parser, callOpts);
 
         index.callsCache.set(filePath, {
             mtime,
@@ -144,6 +153,33 @@ function findCallers(index, name, options = {}) {
                 if (call.isPotentialCallback) {
                     const syms = definitions;
                     if (!syms || syms.length === 0) continue;
+
+                    // Go unexported visibility: lowercase functions are package-private.
+                    // Only allow callers from the same package directory.
+                    if (fileEntry.language === 'go' && /^[a-z]/.test(name)) {
+                        const targetDefs = options.targetDefinitions || definitions;
+                        const targetPkgDirs = new Set(
+                            targetDefs.filter(d => d.file).map(d => path.dirname(d.file))
+                        );
+                        if (targetPkgDirs.size > 0 && !targetPkgDirs.has(path.dirname(filePath))) {
+                            continue;
+                        }
+                    }
+
+                    // Go/Java/Rust receiver disambiguation for callbacks (e.g. dc.worker)
+                    if (call.isMethod && call.receiver &&
+                        (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
+                        const targetDefs = options.targetDefinitions || definitions;
+                        const targetTypes = new Set();
+                        for (const td of targetDefs) {
+                            if (td.className) targetTypes.add(td.className);
+                            if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
+                        }
+                        if (targetTypes.size > 0 && call.receiverType) {
+                            if (!targetTypes.has(call.receiverType)) continue;
+                        }
+                    }
+
                     // Find the enclosing function
                     const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                     if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
@@ -158,11 +194,12 @@ function findCallers(index, name, options = {}) {
                 // Resolve binding within this file (without mutating cached call objects)
                 let bindingId = call.bindingId;
                 let isUncertain = call.uncertain;
-                // Skip binding resolution for method calls with non-self/this/cls receivers:
+                // Skip binding resolution for calls with non-self/this/cls receivers:
                 // e.g., analyzer.analyze_instrument() should NOT resolve to a local
                 // standalone function def `analyze_instrument` — they're different symbols.
+                // Also skip for Go package-qualified calls (isMethod:false but has receiver like 'cli')
                 const selfReceivers = new Set(['self', 'cls', 'this', 'super']);
-                const skipLocalBinding = call.isMethod && call.receiver && !selfReceivers.has(call.receiver);
+                const skipLocalBinding = call.receiver && !selfReceivers.has(call.receiver);
                 if (!bindingId && !skipLocalBinding) {
                     let bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
                     // For Go, also check sibling files in same directory (same package scope)
@@ -335,6 +372,22 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Go/Java/Rust: method vs non-method cross-matching filter.
+                // Prevents t.Errorf() (method call) from matching standalone func Errorf,
+                // and cli.Run() (package call, isMethod:false) from matching DeploymentController.Run.
+                if (!bindingId && !resolvedBySameClass &&
+                    (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
+                    const targetHasClass = targetDefs.some(d => d.className);
+                    if (call.isMethod && !targetHasClass) {
+                        // Method call but target is a standalone function — skip
+                        continue;
+                    }
+                    if (!call.isMethod && targetHasClass) {
+                        // Non-method call but target is a class method — skip
+                        continue;
+                    }
+                }
+
                 // Java/Go/Rust receiver-class disambiguation:
                 // When the target definition has a class/receiver type, filter callers
                 // whose receiverType is known to be a different type.
@@ -391,7 +444,8 @@ function findCallers(index, name, options = {}) {
                 pendingByFile.get(filePath).push({
                     call, fileEntry, callerSymbol,
                     isMethod: call.isMethod || false, isFunctionReference: false,
-                    receiver: call.receiver
+                    receiver: call.receiver,
+                    receiverType: call.receiverType
                 });
                 pendingCount++;
             }
@@ -405,7 +459,7 @@ function findCallers(index, name, options = {}) {
     for (const [filePath, pending] of pendingByFile) {
         try {
             const content = fs.readFileSync(filePath, 'utf-8');
-            for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver } of pending) {
+            for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType } of pending) {
                 callers.push({
                     file: filePath,
                     relativePath: fileEntry.relativePath,
@@ -417,7 +471,8 @@ function findCallers(index, name, options = {}) {
                     callerEndLine: callerSymbol ? callerSymbol.endLine : null,
                     isMethod,
                     ...(isFunctionReference && { isFunctionReference: true }),
-                    ...(receiver !== undefined && { receiver })
+                    ...(receiver !== undefined && { receiver }),
+                    ...(receiverType && { receiverType })
                 });
             }
         } catch (e) {
@@ -507,9 +562,12 @@ function findCallees(index, def, options = {}) {
                     // Go: f.Run() where f is *Framework → Framework.Run (receiver match)
                     const typeName = localTypes.get(call.receiver);
                     const symbols = index.symbols.get(call.name);
+                    const isCallable = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+                        (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                     const match = symbols?.find(s =>
+                        isCallable(s) && (
                         s.className === typeName ||
-                        (s.receiver && s.receiver.replace(/^\*/, '') === typeName));
+                        (s.receiver && s.receiver.replace(/^\*/, '') === typeName)));
                     if (match) {
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
@@ -525,9 +583,12 @@ function findCallees(index, def, options = {}) {
                     // e.g., f.RunFilter() where f is *Framework → resolve to Framework.RunFilter
                     const typeName = call.receiverType;
                     const symbols = index.symbols.get(call.name);
+                    const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+                        (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
                     const match = symbols?.find(s =>
+                        isCallableRT(s) && (
                         (s.receiver && s.receiver.replace(/^\*/, '') === typeName) ||
-                        s.className === typeName);
+                        s.className === typeName));
                     if (match) {
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
@@ -983,8 +1044,12 @@ function findCallees(index, def, options = {}) {
                 // These appear when local variables shadow symbol names
                 // (e.g., `for _, handler := range handlers { handler(r) }` —
                 // handler is a local var, not the handler interface type).
+                // Exception: function-typed fields (e.g., syncHandler func(...))
+                // are callable via Go dependency injection patterns.
                 if (!bindingId && NON_CALLABLE_TYPES.has(callee.type)) {
-                    continue;
+                    const isFuncField = callee.type === 'field' && callee.fieldType &&
+                        /^func\b/.test(callee.fieldType);
+                    if (!isFuncField) continue;
                 }
 
                 // Skip test-file callees when caller is production code and
@@ -1122,7 +1187,9 @@ function _buildTypedLocalTypeMap(index, def, calls) {
         }
 
         // Collect types from constructor calls: x := NewFoo() → x maps to Foo
-        if (!call.isMethod && !call.isPotentialCallback && /^New[A-Z]/.test(call.name)) {
+        // Handles: x := NewFoo(), x, err := NewFoo(), x := pkg.NewFoo(), x, err := pkg.NewFoo()
+        const newName = call.isMethod ? call.name : call.name;
+        if (/^New[A-Z]/.test(newName) && !call.isPotentialCallback) {
             let content;
             try {
                 content = index._readFile(def.file);
@@ -1130,13 +1197,13 @@ function _buildTypedLocalTypeMap(index, def, calls) {
             const lines = content.split('\n');
             const sourceLine = lines[call.line - 1];
             if (!sourceLine) continue;
-            const escapedName = call.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            // Match: x := [pkg.]NewFoo( or x, err := [pkg.]NewFoo( or x, _ := [pkg.]NewFoo(
             const assignMatch = sourceLine.match(
-                new RegExp(`(\\w+)\\s*:=\\s*${escapedName}\\s*\\(`)
+                /(\w+)(?:\s*,\s*\w+)?\s*:=\s*(?:\w+\.)?(\w+)\s*\(/
             );
-            if (assignMatch) {
+            if (assignMatch && /^New[A-Z]/.test(assignMatch[2])) {
                 // NewFoo → Foo, NewFooBar → FooBar
-                const typeName = call.name.slice(3);
+                const typeName = assignMatch[2].slice(3);
                 if (typeName && /^[A-Z]/.test(typeName)) {
                     localTypes.set(assignMatch[1], typeName);
                 }

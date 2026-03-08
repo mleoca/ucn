@@ -48,6 +48,6 @@ function escapeRegExp(text) {
 }
 
 // Symbol types that are not callable (used to filter class/struct/type declarations from call analysis)
-const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl']);
+const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl', 'field']);
 
 module.exports = { pickBestDefinition, addTestExclusions, escapeRegExp, NON_CALLABLE_TYPES };

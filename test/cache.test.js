@@ -631,7 +631,7 @@ function helper() { return 42; }
             // Verify main cache file does NOT have inline callsCache
             const mainCachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(mainCachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 6, 'Cache version should be 6');
+            assert.strictEqual(cacheData.version, 7, 'Cache version should be 7');
             assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
 
             // Verify separate calls-cache.json exists
@@ -1983,7 +1983,7 @@ describe('Cache v6 relative paths', () => {
             // Check that cache uses relative paths
             const cachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 6);
+            assert.strictEqual(cacheData.version, 7);
 
             // File keys should be relative
             for (const [key] of cacheData.files) {

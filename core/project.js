@@ -291,6 +291,7 @@ class ProjectIndex {
             mtime: stat.mtimeMs,
             size: stat.size,
             imports: imports.map(i => i.module),
+            importNames: imports.flatMap(i => i.names || []),
             exports: exports.map(e => e.name),
             exportDetails: exports,
             symbols: [],
@@ -324,6 +325,7 @@ class ProjectIndex {
                 ...(item.receiver && { receiver: item.receiver }),
                 ...(item.className && { className: item.className }),
                 ...(item.memberType && { memberType: item.memberType }),
+                ...(item.fieldType && { fieldType: item.fieldType }),
                 ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
                 ...(item.nameLine && { nameLine: item.nameLine })
             };
@@ -342,6 +344,12 @@ class ProjectIndex {
         };
 
         for (const fn of parsed.functions) {
+            // Go/Rust methods: set className from receiver for consistent method resolution.
+            // Go/Rust methods are standalone functions with receiver, not class members,
+            // so className is never set by the class member loop below.
+            if (fn.receiver && !fn.className) {
+                fn.className = fn.receiver.replace(/^\*/, '');
+            }
             addSymbol(fn, fn.isConstructor ? 'constructor' : 'function');
         }
 
@@ -784,14 +792,41 @@ class ProjectIndex {
         // Sort by score descending, then by index order for stability
         scored.sort((a, b) => b.score - a.score);
 
-        // Tiebreaker: when top candidates have equal score, prefer by usage count
+        // Tiebreaker: when top candidates have equal score, prefer by import popularity
+        // (how many files import the candidate's file), then by usage count
         if (scored.length > 1 && scored[0].score === scored[1].score) {
             const tiedScore = scored[0].score;
             const tiedCandidates = scored.filter(s => s.score === tiedScore);
+
+            // Count how many files import each candidate's file (import popularity)
+            // For Go, count importers of any file in the same directory (same package)
             for (const candidate of tiedCandidates) {
+                let importerCount = 0;
+                for (const [, importedFiles] of this.importGraph) {
+                    if (importedFiles.includes(candidate.def.file)) {
+                        importerCount++;
+                    }
+                }
+                // For Go, also count importers of sibling files (same package)
+                const candidateEntry = this.files.get(candidate.def.file);
+                if (candidateEntry?.language === 'go') {
+                    const candidateDir = path.dirname(candidate.def.file);
+                    for (const [, importedFiles] of this.importGraph) {
+                        for (const imp of importedFiles) {
+                            if (imp !== candidate.def.file && path.dirname(imp) === candidateDir) {
+                                importerCount++;
+                                break; // count each importer once
+                            }
+                        }
+                    }
+                }
+                candidate.importerCount = importerCount;
                 candidate.usageCount = this.countSymbolUsages(candidate.def).total;
             }
-            tiedCandidates.sort((a, b) => b.usageCount - a.usageCount);
+            // Sort by import popularity first, then usage count
+            tiedCandidates.sort((a, b) =>
+                (b.importerCount - a.importerCount) || (b.usageCount - a.usageCount)
+            );
             // Rebuild scored array: sorted tied candidates first, then rest
             const rest = scored.filter(s => s.score !== tiedScore);
             scored.length = 0;
@@ -1102,7 +1137,7 @@ class ProjectIndex {
                         // Filters: namespace access to external packages (DropdownMenuPrimitive.Separator).
                         if (u.receiver && !['self', 'this', 'cls', 'super'].includes(u.receiver) &&
                             fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
-                            const hasMethodDef = allDefinitions.some(d => d.className);
+                            const hasMethodDef = definitions.some(d => d.className);
                             if (!hasMethodDef && !importedFileHasDef()) {
                                 continue;
                             }
@@ -2809,7 +2844,7 @@ class ProjectIndex {
         if (!def) {
             return null;
         }
-        const defIsMethod = def.isMethod || def.type === 'method' || def.className;
+        const defIsMethod = def.isMethod || def.type === 'method' || def.className || def.receiver;
 
         // Use findCallers for className-scoped or method queries (sophisticated binding resolution)
         // Fall back to usages-based approach for simple function queries (backward compatible)
@@ -2822,10 +2857,11 @@ class ProjectIndex {
                 targetDefinitions: [def],
             });
 
-            // When className is explicitly provided, filter out method calls whose
-            // receiver clearly belongs to a different type. This helps with common
-            // method names like .close(), .get() etc. where many objects have the same method.
-            if (options.className && def.className) {
+            // When the target definition has a className (including Go/Rust methods which
+            // now get className from receiver), filter out method calls whose receiver
+            // clearly belongs to a different type. This helps with common method names
+            // like .close(), .get() etc. where many types have the same method.
+            if (def.className) {
                 const targetClassName = def.className;
                 callerResults = callerResults.filter(c => {
                     // Keep non-method calls and self/this/cls calls (already resolved by findCallers)
@@ -2886,20 +2922,22 @@ class ProjectIndex {
                             }
                         }
                     }
-                    // Unique method heuristic: if the called method exists on exactly one class
+                    // Unique method heuristic: if the called method exists on exactly one class/type
                     // and it matches the target, include the call (no other class could match)
                     const methodDefs = this.symbols.get(name);
                     if (methodDefs) {
                         const classNames = new Set();
                         for (const d of methodDefs) {
                             if (d.className) classNames.add(d.className);
+                            // Go/Rust: use receiver type as className equivalent
+                            else if (d.receiver) classNames.add(d.receiver.replace(/^\*/, ''));
                         }
                         if (classNames.size === 1 && classNames.has(targetClassName)) {
                             return true;
                         }
                     }
-                    // className explicitly set but receiver type unknown — filter it out.
-                    // User asked for a specific class; unknown receivers are likely unrelated.
+                    // Type-scoped query but receiver type unknown — filter it out.
+                    // Unknown receivers are likely unrelated.
                     return false;
                 });
             }
@@ -3997,7 +4035,40 @@ class ProjectIndex {
                 const allDefs = this.symbols.get(symbol.name) || [];
                 const targetDefs = allDefs.filter(d => d.file === change.filePath && d.startLine === symbol.startLine);
 
-                const callers = this.findCallers(symbol.name, { targetDefinitions: targetDefs.length > 0 ? targetDefs : undefined });
+                let callers = this.findCallers(symbol.name, {
+                    targetDefinitions: targetDefs.length > 0 ? targetDefs : undefined,
+                    includeMethods: true,
+                    includeUncertain: false,
+                });
+
+                // For Go/Java/Rust methods with a className, filter callers whose
+                // receiver clearly belongs to a different type (same logic as impact()).
+                const targetDef = targetDefs[0] || symbol;
+                if (targetDef.className && (lang === 'go' || lang === 'java' || lang === 'rust')) {
+                    const targetClassName = targetDef.className;
+                    callers = callers.filter(c => {
+                        if (!c.isMethod) return true;
+                        const r = c.receiver;
+                        if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
+                        // Use receiverType from findCallers when available
+                        if (c.receiverType) {
+                            return c.receiverType === targetClassName ||
+                                   c.receiverType === targetDef.receiver?.replace(/^\*/, '');
+                        }
+                        // Unique method heuristic: if the method exists on exactly one class/type, include
+                        const methodDefs = this.symbols.get(symbol.name);
+                        if (methodDefs) {
+                            const classNames = new Set();
+                            for (const d of methodDefs) {
+                                if (d.className) classNames.add(d.className);
+                                else if (d.receiver) classNames.add(d.receiver.replace(/^\*/, ''));
+                            }
+                            if (classNames.size === 1 && classNames.has(targetClassName)) return true;
+                        }
+                        // Unknown receiver + multiple classes with this method → filter out
+                        return false;
+                    });
+                }
 
                 for (const c of callers) {
                     callerFileSet.add(c.file);
