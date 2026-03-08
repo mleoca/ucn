@@ -2059,3 +2059,115 @@ describe('Cache v6 relative paths', () => {
         }
     });
 });
+
+describe('perf: indexFile stat-first skip', () => {
+    it('returns false for unchanged files (stat-only, no read)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function a() { return 1; }',
+            'b.js': 'function b() { return 2; }'
+        });
+        try {
+            const index = idx(dir);
+            // Re-index same files — mtime+size match, should skip without reading
+            assert.strictEqual(index.indexFile(path.join(dir, 'a.js')), false);
+            assert.strictEqual(index.indexFile(path.join(dir, 'b.js')), false);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('returns true for modified files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function a() { return 1; }'
+        });
+        try {
+            const index = idx(dir);
+            fs.writeFileSync(path.join(dir, 'a.js'), 'function a() { return 999; }');
+            assert.strictEqual(index.indexFile(path.join(dir, 'a.js')), true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('updates mtime when content unchanged but file touched', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function a() {}'
+        });
+        try {
+            const index = idx(dir);
+            const filePath = path.join(dir, 'a.js');
+            const origMtime = index.files.get(filePath).mtime;
+
+            // Touch file — changes mtime, same content
+            const futureTime = (Date.now() + 2000) / 1000;
+            fs.utimesSync(filePath, futureTime, futureTime);
+
+            const changed = index.indexFile(filePath);
+            assert.strictEqual(changed, false, 'touched file should not count as changed');
+            assert.notStrictEqual(index.files.get(filePath).mtime, origMtime, 'mtime should update');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('perf: skip graph rebuild on zero-change incremental', () => {
+    it('preserves graphs when no files changed in forceRebuild', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            index.saveCache();
+
+            // Load cache and forceRebuild with no changes
+            const index2 = new ProjectIndex(dir);
+            index2.loadCache();
+            index2.build(null, { quiet: true, forceRebuild: true });
+
+            // Graphs should be intact (from cache, not rebuilt)
+            assert.ok(index2.importGraph.size > 0, 'import graph should exist');
+            assert.ok(index2.symbols.has('helper'), 'symbols intact');
+            assert.ok(index2.symbols.has('main'), 'symbols intact');
+
+            // Callers should still work
+            const callers = index2.findCallers('helper', {});
+            assert.ok(callers.length > 0, 'callers should work');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('rebuilds graphs when a file changes', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            index.saveCache();
+
+            // Modify a file
+            fs.writeFileSync(path.join(dir, 'app.js'),
+                'const { helper } = require("./lib");\nfunction app() { helper(); helper(); }');
+
+            const index2 = new ProjectIndex(dir);
+            index2.loadCache();
+            index2.build(null, { quiet: true, forceRebuild: true });
+
+            // New function should be indexed
+            assert.ok(index2.symbols.has('app'), 'new function should be indexed');
+            assert.ok(!index2.symbols.has('main'), 'old function should be gone');
+        } finally {
+            rm(dir);
+        }
+    });
+});

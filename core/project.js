@@ -181,6 +181,7 @@ class ProjectIndex {
             console.error(`Indexing ${files.length} files in ${this.root}...`);
         }
 
+        let deletedInRebuild = 0;
         if (options.forceRebuild) {
             // Incremental rebuild: only remove files that no longer exist on disk.
             // indexFile() already skips unchanged files and calls removeFileSymbols()
@@ -191,6 +192,7 @@ class ProjectIndex {
                     this.removeFileSymbols(cachedPath);
                     this.files.delete(cachedPath);
                     this.callsCache.delete(cachedPath);
+                    deletedInRebuild++;
                 }
             }
         }
@@ -200,10 +202,11 @@ class ProjectIndex {
         this._attrTypeCache = null;
 
         let indexed = 0;
+        let changed = 0;
         if (!this.failedFiles) this.failedFiles = new Set();
         for (const file of files) {
             try {
-                this.indexFile(file);
+                if (this.indexFile(file)) changed++;
                 indexed++;
                 this.failedFiles.delete(file); // Succeeded now, remove from failed
             } catch (e) {
@@ -214,8 +217,11 @@ class ProjectIndex {
             }
         }
 
-        this.buildImportGraph();
-        this.buildInheritanceGraph();
+        // Skip graph rebuild when incremental rebuild found no changes
+        if (changed > 0 || deletedInRebuild > 0 || !options.forceRebuild) {
+            this.buildImportGraph();
+            this.buildInheritanceGraph();
+        }
 
         this.buildTime = Date.now() - startTime;
 
@@ -241,14 +247,22 @@ class ProjectIndex {
      * Index a single file
      */
     indexFile(filePath) {
+        const stat = fs.statSync(filePath);
+        const existing = this.files.get(filePath);
+
+        // Fast path: skip read entirely when mtime+size both match
+        if (existing && existing.mtime === stat.mtimeMs && existing.size === stat.size) {
+            return false;
+        }
+
         const content = fs.readFileSync(filePath, 'utf-8');
         const hash = crypto.createHash('md5').update(content).digest('hex');
-        const stat = fs.statSync(filePath);
 
-        // Check if already indexed and unchanged
-        const existing = this.files.get(filePath);
-        if (existing && existing.hash === hash && existing.mtime === stat.mtimeMs) {
-            return;
+        // Content-based skip: mtime changed but content didn't (touch, git checkout)
+        if (existing && existing.hash === hash) {
+            existing.mtime = stat.mtimeMs;
+            existing.size = stat.size;
+            return false;
         }
 
         if (existing) {
@@ -368,6 +382,7 @@ class ProjectIndex {
         }
 
         this.files.set(filePath, fileEntry);
+        return true;
     }
 
     /**
@@ -401,7 +416,7 @@ class ProjectIndex {
      * Handles regular imports, static imports (strips member name), and wildcards (strips .*).
      * Progressively strips trailing segments to find the class file.
      */
-    _resolveJavaPackageImport(importModule) {
+    _resolveJavaPackageImport(importModule, javaFileIndex) {
         const isWildcard = importModule.endsWith('.*');
         // Strip wildcard suffix (e.g., "com.pkg.Class.*" -> "com.pkg.Class")
         const mod = isWildcard ? importModule.slice(0, -2) : importModule;
@@ -409,11 +424,28 @@ class ProjectIndex {
 
         // Try progressively shorter paths: full path, then strip last segment, etc.
         // This handles static imports where path includes member name after class
-        for (let i = segments.length; i > 0; i--) {
-            const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
-            for (const absPath of this.files.keys()) {
-                if (absPath.endsWith(fileSuffix)) {
-                    return absPath;
+        if (javaFileIndex) {
+            // Fast path: use pre-built filename→files index (O(candidates) vs O(all files))
+            for (let i = segments.length; i > 0; i--) {
+                const className = segments[i - 1];
+                const candidates = javaFileIndex.get(className);
+                if (candidates) {
+                    const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
+                    for (const absPath of candidates) {
+                        if (absPath.endsWith(fileSuffix)) {
+                            return absPath;
+                        }
+                    }
+                }
+            }
+        } else {
+            // Fallback: scan all files (used by imports() method outside buildImportGraph)
+            for (let i = segments.length; i > 0; i--) {
+                const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
+                for (const absPath of this.files.keys()) {
+                    if (absPath.endsWith(fileSuffix)) {
+                        return absPath;
+                    }
                 }
             }
         }
@@ -439,6 +471,22 @@ class ProjectIndex {
         this.importGraph.clear();
         this.exportGraph.clear();
 
+        // Pre-build directory→files map for Go package linking (O(1) lookup vs O(n) scan)
+        const dirToGoFiles = new Map();
+        // Pre-build filename→files map for Java import resolution (O(1) vs O(n) scan)
+        const javaFileIndex = new Map();
+        for (const [fp, fe] of this.files) {
+            if (fe.language === 'go') {
+                const dir = path.dirname(fp);
+                if (!dirToGoFiles.has(dir)) dirToGoFiles.set(dir, []);
+                dirToGoFiles.get(dir).push(fp);
+            } else if (fe.language === 'java') {
+                const name = path.basename(fp, '.java');
+                if (!javaFileIndex.has(name)) javaFileIndex.set(name, []);
+                javaFileIndex.get(name).push(fp);
+            }
+        }
+
         for (const [filePath, fileEntry] of this.files) {
             const importedFiles = [];
             const seenModules = new Set();
@@ -461,7 +509,7 @@ class ProjectIndex {
                 // Java package imports: resolve by progressive suffix matching
                 // Handles regular, static (com.pkg.Class.method), and wildcard (com.pkg.Class.*) imports
                 if (!resolved && fileEntry.language === 'java' && !importModule.startsWith('.')) {
-                    resolved = this._resolveJavaPackageImport(importModule);
+                    resolved = this._resolveJavaPackageImport(importModule, javaFileIndex);
                 }
 
                 if (resolved && this.files.has(resolved)) {
@@ -470,13 +518,10 @@ class ProjectIndex {
                     const filesToLink = [resolved];
                     if (fileEntry.language === 'go') {
                         const pkgDir = path.dirname(resolved);
-                        // When a non-test file imports a Go package, link all non-test files
-                        // in that directory. Test files are compiled separately by `go test`
-                        // and should not appear as source dependencies.
+                        const dirFiles = dirToGoFiles.get(pkgDir) || [];
                         const importerIsTest = filePath.endsWith('_test.go');
-                        for (const fp of this.files.keys()) {
-                            if (fp !== resolved && path.dirname(fp) === pkgDir && fp.endsWith('.go')) {
-                                // Skip test files unless the importer is also a test file
+                        for (const fp of dirFiles) {
+                            if (fp !== resolved) {
                                 if (!importerIsTest && fp.endsWith('_test.go')) continue;
                                 filesToLink.push(fp);
                             }

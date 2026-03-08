@@ -235,32 +235,9 @@ function loadCache(index, cachePath) {
  * @returns {boolean} - True if cache needs rebuilding
  */
 function isCacheStale(index) {
-    // Check for new files added to project
-    // Use same ignores as build() — .gitignore + .ucn.json exclude
-    const pattern = detectProjectPattern(index.root);
-    const globOpts = { root: index.root };
-    const gitignorePatterns = parseGitignore(index.root);
-    const configExclude = index.config.exclude || [];
-    if (gitignorePatterns.length > 0 || configExclude.length > 0) {
-        globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
-    }
-    const currentFiles = expandGlob(pattern, globOpts);
-    const cachedPaths = new Set(index.files.keys());
-
-    for (const file of currentFiles) {
-        if (!cachedPaths.has(file) && !(index.failedFiles && index.failedFiles.has(file))) {
-            return true; // New file found
-        }
-    }
-
-    // Check existing cached files for modifications/deletions
+    // Fast path: check cached files for modifications/deletions first (stat-only).
+    // This returns early without the expensive directory walk when any file changed.
     for (const [filePath, fileEntry] of index.files) {
-        // File deleted
-        if (!fs.existsSync(filePath)) {
-            return true;
-        }
-
-        // File modified - check size first, then mtime, then hash
         try {
             const stat = fs.statSync(filePath);
 
@@ -281,7 +258,25 @@ function isCacheStale(index) {
                 return true;
             }
         } catch (e) {
-            return true;
+            return true; // File deleted or inaccessible
+        }
+    }
+
+    // Slow path: glob the project to detect new files added since last build.
+    // Only reached when all cached files are unchanged.
+    const pattern = detectProjectPattern(index.root);
+    const globOpts = { root: index.root };
+    const gitignorePatterns = parseGitignore(index.root);
+    const configExclude = index.config.exclude || [];
+    if (gitignorePatterns.length > 0 || configExclude.length > 0) {
+        globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
+    }
+    const currentFiles = expandGlob(pattern, globOpts);
+    const cachedPaths = new Set(index.files.keys());
+
+    for (const file of currentFiles) {
+        if (!cachedPaths.has(file) && !(index.failedFiles && index.failedFiles.has(file))) {
+            return true; // New file found
         }
     }
 

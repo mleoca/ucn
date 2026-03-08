@@ -52,11 +52,17 @@ function getIndex(projectDir) {
     }
     const root = findProjectRoot(absDir);
     const cached = indexCache.get(root);
+    const STALE_CHECK_INTERVAL_MS = 2000;
 
-    // Always check staleness — isCacheStale() is cheap (mtime/size checks)
-    if (cached && !cached.index.isCacheStale()) {
-        cached.checkedAt = Date.now(); // True LRU: refresh on access
-        return cached.index;
+    // Throttle staleness checks — isCacheStale() re-globs and stats all files
+    if (cached) {
+        if (Date.now() - cached.checkedAt < STALE_CHECK_INTERVAL_MS) {
+            return cached.index; // Recently verified fresh
+        }
+        if (!cached.index.isCacheStale()) {
+            cached.checkedAt = Date.now();
+            return cached.index;
+        }
     }
 
     // Build new index (or rebuild stale one)
