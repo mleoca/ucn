@@ -1034,7 +1034,7 @@ Usage:
   (Default output is text; add --json for machine-readable JSON)
 
 ═══════════════════════════════════════════════════════════════════════════════
-UNDERSTAND CODE (UCN's strength - semantic analysis)
+UNDERSTAND CODE
 ═══════════════════════════════════════════════════════════════════════════════
   about <name>        RECOMMENDED: Full picture (definition, callers, callees, tests, code)
   context <name>      Who calls this + what it calls (numbered for expand)
