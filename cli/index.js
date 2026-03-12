@@ -1052,7 +1052,7 @@ Usage:
 ═══════════════════════════════════════════════════════════════════════════════
 UNDERSTAND CODE
 ═══════════════════════════════════════════════════════════════════════════════
-  about <name>        RECOMMENDED: Full picture (definition, callers, callees, tests, code)
+  about <name>        Full picture (definition, callers, callees, tests, code)
   context <name>      Who calls this + what it calls (numbered for expand)
   smart <name>        Function + all dependencies inline
   impact <name>       What breaks if changed (call sites grouped by file)
