@@ -2302,10 +2302,12 @@ function formatCircularDeps(result) {
         lines.push(`Filtered to cycles involving: ${result.fileFilter}`);
     }
 
+    const scannedCount = result.filesWithImports || result.totalFiles;
+
     if (result.cycles.length === 0) {
         lines.push('');
         lines.push('No circular dependencies found.');
-        lines.push(`Scanned ${result.totalFiles} files.`);
+        lines.push(`Scanned ${scannedCount} files with import relationships.`);
         return lines.join('\n');
     }
 
@@ -2318,7 +2320,7 @@ function formatCircularDeps(result) {
 
     lines.push('');
     const { totalCycles, filesInCycles } = result.summary;
-    lines.push(`Summary: ${totalCycles} circular dependency chain${totalCycles !== 1 ? 's' : ''} involving ${filesInCycles} file${filesInCycles !== 1 ? 's' : ''} out of ${result.totalFiles} total.`);
+    lines.push(`Summary: ${totalCycles} circular dependency chain${totalCycles !== 1 ? 's' : ''} involving ${filesInCycles} file${filesInCycles !== 1 ? 's' : ''} (${scannedCount} files with imports scanned).`);
 
     return lines.join('\n');
 }

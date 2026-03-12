@@ -2749,9 +2749,16 @@ class ProjectIndex {
 
             result.sort((a, b) => a.length - b.length || a.files[0].localeCompare(b.files[0]));
 
+            // Count files that participate in import graph (have edges)
+            let filesWithImports = 0;
+            for (const [, targets] of this.importGraph) {
+                if (targets && targets.length > 0) filesWithImports++;
+            }
+
             return {
                 cycles: result,
                 totalFiles: this.files.size,
+                filesWithImports,
                 fileFilter: fileFilter || undefined,
                 summary: {
                     totalCycles: result.length,
