@@ -948,6 +948,8 @@ function findCallsInCode(code, parser) {
     const functionStack = [];  // Stack of { name, startLine, endLine }
     const aliases = new Map();  // Track local aliases: aliasName -> originalName (string or string[])
     const nonCallableNames = new Set();  // Track names assigned non-callable values
+    const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
     // Helper to check if a node is a non-callable literal
     const isNonCallableInit = (node) => {
@@ -1066,6 +1068,8 @@ function findCallsInCode(code, parser) {
                 startLine: node.startPosition.row + 1,
                 endLine: node.endPosition.row + 1
             });
+            // Save localVarTypes so inner declarations don't leak to sibling functions
+            localVarTypesStack.push(new Map(localVarTypes));
         }
 
         // Track local aliases: const myParse = parse, const { parse: csvParse } = ...
@@ -1107,6 +1111,42 @@ function findCallsInCode(code, parser) {
             // Constructor results are object instances, not callable functions
             if (nameNode?.type === 'identifier' && initNode?.type === 'new_expression') {
                 nonCallableNames.add(nameNode.text);
+                // Infer type: const x = new Foo() → x is Foo
+                const ctorNode = initNode.childForFieldName('constructor');
+                if (ctorNode?.type === 'identifier') {
+                    localVarTypes.set(nameNode.text, ctorNode.text);
+                }
+            }
+            // Track TypeScript type annotations: const x: Foo = ...
+            if (nameNode?.type === 'identifier') {
+                const typeNode = node.childForFieldName('type');
+                if (typeNode) {
+                    // type_annotation → first named child is the type identifier
+                    const typeId = typeNode.type === 'type_annotation'
+                        ? typeNode.namedChild(0) : typeNode;
+                    if (typeId?.type === 'type_identifier' || typeId?.type === 'identifier') {
+                        localVarTypes.set(nameNode.text, typeId.text);
+                    } else if (typeId?.type === 'generic_type') {
+                        // Store<string> → generic_type has type_identifier as first child
+                        const baseType = typeId.namedChild(0);
+                        if (baseType?.type === 'type_identifier' || baseType?.type === 'identifier') {
+                            localVarTypes.set(nameNode.text, baseType.text);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Track reassignment with new expression: x = new Bar() → update localVarTypes
+        if (node.type === 'assignment_expression') {
+            const left = node.childForFieldName('left');
+            const right = node.childForFieldName('right');
+            if (left?.type === 'identifier' && right?.type === 'new_expression') {
+                nonCallableNames.add(left.text);
+                const ctorNode = right.childForFieldName('constructor');
+                if (ctorNode?.type === 'identifier') {
+                    localVarTypes.set(left.text, ctorNode.text);
+                }
             }
         }
 
@@ -1178,11 +1218,13 @@ function findCallsInCode(code, parser) {
                                 receiver = objNode.text;
                             }
                         }
+                        const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
                         calls.push({
                             name: propName,
                             line: node.startPosition.row + 1,
                             isMethod: true,
                             receiver,
+                            ...(receiverType && { receiverType }),
                             enclosingFunction,
                             uncertain
                         });
@@ -1405,6 +1447,12 @@ function findCallsInCode(code, parser) {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
                 functionStack.pop();
+                // Restore localVarTypes to pre-function state
+                const saved = localVarTypesStack.pop();
+                if (saved) {
+                    localVarTypes.clear();
+                    for (const [k, v] of saved) localVarTypes.set(k, v);
+                }
             }
         }
     });

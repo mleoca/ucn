@@ -17,7 +17,7 @@ const CANONICAL_COMMANDS = [
     // Understanding code
     'about', 'context', 'impact', 'blast', 'smart', 'trace', 'reverseTrace', 'example', 'related',
     // Finding code
-    'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode',
+    'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode', 'entrypoints',
     // Extracting code
     'fn', 'class', 'lines', 'expand',
     // File dependencies
@@ -72,6 +72,8 @@ const PARAM_MAP = {
     case_sensitive:    'caseSensitive',
     include_exported:  'includeExported',
     include_decorated: 'includeDecorated',
+    min_confidence:    'minConfidence',
+    show_confidence:   'showConfidence',
     calls_only:        'callsOnly',
     class_name:        'className',
     max_lines:         'maxLines',

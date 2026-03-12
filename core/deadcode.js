@@ -8,6 +8,7 @@
 const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
 const { isTestFile } = require('./discovery');
 const { escapeRegExp } = require('./shared');
+const { isFrameworkEntrypoint } = require('./entrypoints');
 
 /** Check if a position in a line is inside a string literal (quotes/backticks) */
 function isInsideString(line, pos) {
@@ -369,23 +370,13 @@ function deadcode(index, options = {}) {
                 continue;
             }
 
-            // Framework registration decorators — excluded by default to reduce noise
-            // Python: decorators with '.' (attribute access) like @router.get, @app.route, @celery.task
-            // Java: non-standard annotations like @Bean, @Scheduled, @GetMapping
-            // These functions are invoked by frameworks, not by user code — AST can't see the call path
-            const javaKeywords = new Set(['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default']);
-            const hasRegistrationDecorator = (() => {
-                if (lang === 'python') {
-                    const decorators = symbol.decorators || [];
-                    return decorators.some(d => d.includes('.'));
-                }
-                if (lang === 'java') {
-                    return mods.some(m => !javaKeywords.has(m));
-                }
-                return false;
-            })();
+            // Framework entry point detection — excluded by default to reduce noise
+            // Detects decorator/annotation patterns (Python, Java, Rust, JS/TS) and
+            // call-pattern-based registration (Express routes, Gin handlers, etc.)
+            // These functions are invoked by frameworks, not by user code.
+            const hasFrameworkEntrypoint = isFrameworkEntrypoint(symbol, index);
 
-            if (hasRegistrationDecorator && !options.includeDecorated) {
+            if (hasFrameworkEntrypoint && !options.includeDecorated) {
                 excludedDecorated++;
                 continue;
             }
@@ -447,9 +438,10 @@ function deadcode(index, options = {}) {
                 // Python: symbol.decorators (e.g., ['app.route("/path")', 'login_required'])
                 // Java/Rust/Go: symbol.modifiers may contain annotations (e.g., 'bean', 'scheduled')
                 const decorators = symbol.decorators || [];
-                // For Java, extract annotation-like modifiers (javaKeywords defined above)
+                // For Java, extract annotation-like modifiers
+                const javaKw = new Set(['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default']);
                 const annotations = lang === 'java'
-                    ? mods.filter(m => !javaKeywords.has(m))
+                    ? mods.filter(m => !javaKw.has(m))
                     : [];
 
                 results.push({

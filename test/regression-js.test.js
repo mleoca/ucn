@@ -2993,3 +2993,407 @@ describe('fix #123: TS graph importers via tsconfig references', () => {
         }
     });
 });
+
+// ============================================================================
+// ENTRYPOINTS: JS/TS framework detection
+// ============================================================================
+
+describe('Entrypoints: Express/NestJS detection', () => {
+    const { detectEntrypoints, isFrameworkEntrypoint } = require('../core/entrypoints');
+
+    it('detects Express app.get/post route handlers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.js': `
+const app = require('express')();
+function listItems(req, res) { res.json([]); }
+function addItem(req, res) { res.json({}); }
+app.get('/items', listItems);
+app.post('/items', addItem);
+module.exports = { listItems, addItem };
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('listItems'), 'should detect listItems');
+            assert.ok(names.includes('addItem'), 'should detect addItem');
+            assert.strictEqual(eps.find(e => e.name === 'listItems').framework, 'express');
+            assert.strictEqual(eps.find(e => e.name === 'listItems').confidence, 0.90);
+        } finally { rm(dir); }
+    });
+
+    it('detects Fastify router handlers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': `
+const fastify = require('fastify')();
+function healthCheck(req, reply) { reply.send({ ok: true }); }
+fastify.get('/health', healthCheck);
+module.exports = { healthCheck };
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            assert.ok(eps.some(e => e.name === 'healthCheck'), 'should detect Fastify handler');
+        } finally { rm(dir); }
+    });
+
+    it('detects NestJS decorator-based handlers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'controller.ts': `
+@Controller('users')
+class UserController {
+    @Get()
+    findAll() { return []; }
+
+    @Post()
+    create() { return {}; }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            // NestJS uses decorators on the class — UserController should be detected
+            assert.ok(eps.length > 0, 'should detect NestJS entry points');
+            assert.ok(eps.some(e => e.framework === 'nestjs'), 'should identify as NestJS');
+        } finally { rm(dir); }
+    });
+
+    it('Express route handlers excluded from deadcode', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': `
+function handler(req, res) { res.send('ok'); }
+function unused() { return 42; }
+app.get('/api', handler);
+module.exports = { handler, unused };
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode({ includeExported: true });
+            const names = dc.map(d => d.name);
+            assert.ok(!names.includes('handler'), 'route handler should not be dead code');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Regression: JS/TS receiver type inference (Phase 3c)
+// ============================================================================
+
+describe('Regression: JS/TS receiver type inference (Phase 3c)', () => {
+    it('new Foo() constructor inference resolves method to correct class', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'router.js': `
+class Router {
+    route(path) { return path; }
+}
+class Handler {
+    route(path) { return path.toUpperCase(); }
+}
+module.exports = { Router, Handler };
+`,
+            'app.js': `
+const { Router } = require('./router');
+function setup() {
+    const r = new Router();
+    r.route('/api');
+}
+module.exports = { setup };
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('route', { includeMethods: true });
+            assert.ok(callers.length > 0, 'should find callers of route');
+            const setupCaller = callers.find(c => c.callerName === 'setup');
+            assert.ok(setupCaller, 'setup should be a caller of route');
+            assert.strictEqual(setupCaller.resolution, 'receiver-hint',
+                'new Router() should give receiver-hint resolution');
+            assert.ok(setupCaller.confidence >= 0.80,
+                'receiver-hint should have confidence >= 0.80');
+        } finally { rm(dir); }
+    });
+
+    it('TypeScript type annotation infers receiverType', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'client.ts': `
+class ApiClient {
+    fetch(url: string) { return url; }
+}
+function getClient(): ApiClient { return new ApiClient(); }
+
+const api: ApiClient = getClient();
+api.fetch('/data');
+
+export { ApiClient, getClient };
+`
+        });
+        try {
+            const index = idx(dir);
+            // Verify at the parser level that receiverType is set
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'client.ts'), 'utf8');
+            const parser = getParser('typescript');
+            const calls = findCallsInCode(code, parser);
+            const fetchCall = calls.find(c => c.name === 'fetch' && c.receiver === 'api');
+            assert.ok(fetchCall, 'should find api.fetch() call');
+            assert.strictEqual(fetchCall.receiverType, 'ApiClient',
+                'TypeScript type annotation should infer receiverType as ApiClient');
+        } finally { rm(dir); }
+    });
+
+    it('no false positive on untyped receivers (regular function return)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': `
+function getSomething() { return {}; }
+function main() {
+    const x = getSomething();
+    x.process();
+}
+module.exports = { main };
+`
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const processCall = calls.find(c => c.name === 'process' && c.receiver === 'x');
+            assert.ok(processCall, 'should find x.process() call');
+            assert.strictEqual(processCall.receiverType, undefined,
+                'regular function return should NOT infer receiverType');
+        } finally { rm(dir); }
+    });
+});
+
+// Fix: localVarTypes scoping — types should not leak between sibling functions
+describe('fix: localVarTypes function scoping (JS)', () => {
+    it('sibling functions with same variable name get independent types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'models.js': 'class Foo { run() {} }\nclass Bar { run() {} }\nmodule.exports = { Foo, Bar };',
+            'app.js': [
+                'const { Foo, Bar } = require("./models");',
+                'function funcA() { const x = new Foo(); x.run(); }',
+                'function funcB() { const x = new Bar(); x.run(); }',
+                'module.exports = { funcA, funcB };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const runCalls = calls.filter(c => c.name === 'run' && c.isMethod);
+            assert.strictEqual(runCalls.length, 2);
+            // funcA's x.run() should have receiverType 'Foo'
+            assert.strictEqual(runCalls[0].receiverType, 'Foo', 'funcA x.run() should be Foo');
+            // funcB's x.run() should have receiverType 'Bar' (not Foo!)
+            assert.strictEqual(runCalls[1].receiverType, 'Bar', 'funcB x.run() should be Bar, not leaked Foo');
+        } finally { rm(dir); }
+    });
+
+    it('parameter name does not inherit type from sibling function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'class Foo { run() {} }',
+                'function funcA() { const x = new Foo(); x.run(); }',
+                'function funcB(x) { x.run(); }',
+                'module.exports = { Foo, funcA, funcB };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const runCalls = calls.filter(c => c.name === 'run' && c.isMethod);
+            assert.strictEqual(runCalls.length, 2);
+            assert.strictEqual(runCalls[0].receiverType, 'Foo', 'funcA should infer Foo');
+            assert.strictEqual(runCalls[1].receiverType, undefined,
+                'funcB parameter x should NOT inherit Foo from sibling funcA');
+        } finally { rm(dir); }
+    });
+
+    it('module-level typed variable remains visible inside functions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'class Database { query() {} }',
+                'const db = new Database();',
+                'function getUsers() { db.query("users"); }',
+                'function getOrders() { db.query("orders"); }',
+                'module.exports = { Database, getUsers, getOrders };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const queryCalls = calls.filter(c => c.name === 'query' && c.receiver === 'db');
+            assert.strictEqual(queryCalls.length, 2);
+            assert.strictEqual(queryCalls[0].receiverType, 'Database');
+            assert.strictEqual(queryCalls[1].receiverType, 'Database');
+        } finally { rm(dir); }
+    });
+
+    it('nested function inherits outer scope types via closure', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'class Client { fetch() {} }',
+                'function outer() {',
+                '    const c = new Client();',
+                '    function inner() { c.fetch(); }',
+                '}',
+                'module.exports = { Client };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const fetchCall = calls.find(c => c.name === 'fetch' && c.receiver === 'c');
+            assert.ok(fetchCall);
+            assert.strictEqual(fetchCall.receiverType, 'Client',
+                'inner function should see outer scope type via closure');
+        } finally { rm(dir); }
+    });
+});
+
+// Fix: JS assignment_expression reassignment updates localVarTypes
+describe('fix: JS reassignment tracking', () => {
+    it('let x = new Foo(); x = new Bar() → Bar wins (last assignment)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'class Foo { run() {} }',
+                'class Bar { run() {} }',
+                'function test() { let x = new Foo(); x = new Bar(); x.run(); }',
+                'module.exports = { Foo, Bar, test };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const runCall = calls.find(c => c.name === 'run' && c.isMethod);
+            assert.ok(runCall);
+            assert.strictEqual(runCall.receiverType, 'Bar',
+                'reassignment should update type to Bar');
+        } finally { rm(dir); }
+    });
+
+    it('reassignment without new does not clear existing type', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'class Foo { run() {} }',
+                'function test() { let x = new Foo(); x = getSomething(); x.run(); }',
+                'module.exports = { Foo, test };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const parser = getParser('javascript');
+            const calls = findCallsInCode(code, parser);
+            const runCall = calls.find(c => c.name === 'run' && c.isMethod);
+            assert.ok(runCall);
+            // Reassignment to function call doesn't update localVarTypes,
+            // so the original Foo type persists (acceptable: conservative behavior)
+            assert.strictEqual(runCall.receiverType, 'Foo');
+        } finally { rm(dir); }
+    });
+});
+
+// Fix: TS generic type annotations extract base type
+describe('fix: TS generic type annotations', () => {
+    it('Store<string> extracts Store as receiverType', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.ts': [
+                'class Store { get() {} }',
+                'function test() { const s: Store<string> = new Store(); s.get(); }',
+                'export { Store, test };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.ts'), 'utf8');
+            const parser = getParser('typescript');
+            const calls = findCallsInCode(code, parser);
+            const getCall = calls.find(c => c.name === 'get' && c.receiver === 's');
+            assert.ok(getCall);
+            assert.strictEqual(getCall.receiverType, 'Store',
+                'generic annotation should extract base type Store');
+        } finally { rm(dir); }
+    });
+
+    it('Map<string, number> annotation-only (no new) extracts Map', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.ts': [
+                'function test() { const m: Map<string, number> = getMap(); m.get("key"); }',
+                'export { test };'
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.ts'), 'utf8');
+            const parser = getParser('typescript');
+            const calls = findCallsInCode(code, parser);
+            const getCall = calls.find(c => c.name === 'get' && c.receiver === 'm');
+            assert.ok(getCall);
+            assert.strictEqual(getCall.receiverType, 'Map',
+                'generic annotation without new should still extract base type');
+        } finally { rm(dir); }
+    });
+
+    it('generic annotation resolves through index', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'store.js': [
+                'class Store { retrieve() { return undefined; } }',
+                'module.exports = { Store };',
+            ].join('\n'),
+            'app.js': [
+                'const { Store } = require("./store");',
+                'function useStore() { const s = new Store(); s.retrieve(); }',
+                'module.exports = { useStore };'
+            ].join('\n')
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('useStore');
+            assert.ok(defs && defs.length > 0, 'useStore should be in symbol table');
+            const callees = index.findCallees(defs[0], { includeMethods: true });
+            const callee = callees.find(c => c.name === 'retrieve');
+            assert.ok(callee, 'should resolve s.retrieve() as callee via receiverType');
+        } finally { rm(dir); }
+    });
+});

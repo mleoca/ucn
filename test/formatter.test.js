@@ -833,6 +833,41 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('obj.method()'), 'Should mention method calls excluded');
         });
 
+        it('shows confidence note when confidenceFiltered is set', () => {
+            const about = {
+                found: true,
+                symbol: { name: 'fn', type: 'function', file: 'lib.js', startLine: 1, endLine: 1 },
+                usages: { calls: 0, imports: 0, references: 0 },
+                totalUsages: 0,
+                callers: { total: 0, top: [] },
+                callees: { total: 0, top: [] },
+                tests: { totalMatches: 0, fileCount: 0, files: [] },
+                otherDefinitions: [],
+                code: 'function fn() {}',
+                includeMethods: false,
+                confidenceFiltered: 3
+            };
+            const text = output.formatAbout(about);
+            assert.ok(text.includes('3 edge(s) below confidence threshold hidden'), 'Should show filtered count');
+        });
+
+        it('shows confidence per edge when showConfidence is true', () => {
+            const about = {
+                found: true,
+                symbol: { name: 'fn', type: 'function', file: 'lib.js', startLine: 1, endLine: 3 },
+                usages: { calls: 1, imports: 0, references: 0 },
+                totalUsages: 1,
+                callers: { total: 1, top: [{ file: 'app.js', line: 5, expression: 'fn()', callerName: 'main', confidence: 0.98, resolution: 'exact-binding' }] },
+                callees: { total: 0, top: [] },
+                tests: { totalMatches: 0, fileCount: 0, files: [] },
+                otherDefinitions: [],
+                code: 'function fn() {}',
+                includeMethods: false
+            };
+            const text = output.formatAbout(about, { showConfidence: true });
+            assert.ok(text.includes('confidence: 0.98 (exact-binding)'), 'Should show confidence per caller');
+        });
+
     });
 
     // ────────────────────────────────────────────────────────────────────────
@@ -2039,5 +2074,80 @@ describe('Bug Hunt: formatExampleJson null best', () => {
     it('should not crash when result exists but result.best is undefined', () => {
         const json = JSON.parse(output.formatExampleJson({ totalCalls: 0 }, 'missing'));
         assert.strictEqual(json.found, false);
+    });
+});
+
+// ============================================================================
+// Confidence rendering in formatContext
+// ============================================================================
+
+describe('Confidence rendering in formatContext', () => {
+    it('shows confidence when showConfidence is true', () => {
+        const ctx = {
+            function: 'myFn',
+            file: 'a.js',
+            callers: [{
+                relativePath: 'b.js', line: 10, content: 'myFn()',
+                callerName: 'caller1', callerFile: 'b.js', callerStartLine: 5, callerEndLine: 15,
+                confidence: 0.98, resolution: 'exact-binding',
+            }],
+            callees: [{
+                name: 'dep', relativePath: 'c.js', startLine: 1, endLine: 5,
+                weight: 'normal', file: 'c.js',
+                confidence: 0.65, resolution: 'scope-match',
+            }],
+            meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 0, includeMethods: false },
+        };
+        const { text } = output.formatContext(ctx, { showConfidence: true });
+        assert.ok(text.includes('confidence: 0.98 (exact-binding)'), 'should show caller confidence');
+        assert.ok(text.includes('confidence: 0.65 (scope-match)'), 'should show callee confidence');
+    });
+
+    it('hides confidence when showConfidence is false', () => {
+        const ctx = {
+            function: 'myFn',
+            file: 'a.js',
+            callers: [{
+                relativePath: 'b.js', line: 10, content: 'myFn()',
+                callerName: 'caller1', confidence: 0.98, resolution: 'exact-binding',
+            }],
+            callees: [],
+            meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 0, includeMethods: false },
+        };
+        const { text } = output.formatContext(ctx, { showConfidence: false });
+        assert.ok(!text.includes('confidence:'), 'should not show confidence');
+    });
+
+    it('shows confidenceFiltered note when edges filtered', () => {
+        const ctx = {
+            function: 'myFn',
+            file: 'a.js',
+            callers: [],
+            callees: [],
+            meta: { complete: false, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 5, includeMethods: false },
+        };
+        const { text } = output.formatContext(ctx);
+        assert.ok(text.includes('5 edge(s) below confidence threshold hidden'));
+    });
+
+    it('includes confidence in JSON output', () => {
+        const ctx = {
+            function: 'myFn',
+            file: 'a.js',
+            callers: [{
+                relativePath: 'b.js', line: 10, content: 'myFn()',
+                callerName: 'caller1', confidence: 0.98, resolution: 'exact-binding',
+            }],
+            callees: [{
+                name: 'dep', relativePath: 'c.js', startLine: 1, type: 'function',
+                weight: 'normal', confidence: 0.65, resolution: 'scope-match',
+            }],
+            meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 0, includeMethods: false },
+        };
+        const json = JSON.parse(output.formatContextJson(ctx));
+        assert.strictEqual(json.data.callers[0].confidence, 0.98);
+        assert.strictEqual(json.data.callers[0].resolution, 'exact-binding');
+        assert.strictEqual(json.data.callees[0].confidence, 0.65);
+        assert.strictEqual(json.data.callees[0].resolution, 'scope-match');
     });
 });

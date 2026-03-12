@@ -112,6 +112,9 @@ function parseFlags(tokens) {
         decorator: getValueFlag('--decorator'),
         exported: tokens.includes('--exported'),
         unused: tokens.includes('--unused'),
+        showConfidence: tokens.includes('--show-confidence'),
+        minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
+        framework: getValueFlag('--framework'),
     };
 }
 
@@ -137,7 +140,9 @@ const knownFlags = new Set([
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions',
     '--max-lines', '--class-name', '--limit', '--max-files',
-    '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused'
+    '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
+    '--show-confidence', '--min-confidence',
+    '--framework'
 ]);
 
 // Handle help flag
@@ -476,7 +481,8 @@ function runProjectCommand(rootDir, command, arg) {
                 const { text, expandable } = output.formatContext(ctx, {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     expandHint: 'Use "ucn . expand <N>" to see code for item N',
-                    uncertainHint: 'use --include-uncertain to include all'
+                    uncertainHint: 'use --include-uncertain to include all',
+                    showConfidence: flags.showConfidence,
                 });
                 console.log(text);
 
@@ -540,7 +546,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) fail(error);
             printOutput(result,
                 output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth })
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence })
             );
             break;
         }
@@ -747,6 +753,16 @@ function runProjectCommand(rootDir, command, arg) {
                     decoratedHint: !flags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
                     exportedHint: !flags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
                 })
+            );
+            break;
+        }
+
+        case 'entrypoints': {
+            const { ok, result, error } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file });
+            if (!ok) fail(error);
+            printOutput(result,
+                output.formatEntrypointsJson,
+                r => output.formatEntrypoints(r)
             );
             break;
         }
@@ -1081,6 +1097,7 @@ REFACTORING HELPERS
   verify <name>       Check all call sites match signature
   diff-impact         What changed in git diff and who calls it (--base, --staged)
   deadcode            Find unused functions/classes
+  entrypoints         Detect framework entry points (routes, DI, tasks)
 
 ═══════════════════════════════════════════════════════════════════════════════
 OTHER
@@ -1107,10 +1124,13 @@ Common Flags:
   --include-tests     Include test files
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
+  --show-confidence   Show confidence scores per caller/callee edge
+  --min-confidence=N  Filter edges below confidence threshold (0.0-1.0)
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)
   --functions         Show per-function line counts (stats command)
   --include-decorated Include decorated/annotated symbols in deadcode
+  --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
   --exact             Exact name match only (find)
   --calls-only        Only show call/test-case matches (tests)
   --case-sensitive    Case-sensitive text search (search)
@@ -1340,7 +1360,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             const { text, expandable } = output.formatContext(result, {
                 methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                 expandHint: 'Use "expand <N>" to see code for item N',
-                uncertainHint: 'use --include-uncertain to include all'
+                uncertainHint: 'use --include-uncertain to include all',
+                showConfidence: iflags.showConfidence,
             });
             console.log(text);
             if (cache) {
@@ -1364,6 +1385,13 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
+        case 'entrypoints': {
+            const { ok, result, error } = execute(index, 'entrypoints', { type: iflags.type, framework: iflags.framework, file: iflags.file });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatEntrypoints(result));
+            break;
+        }
+
         // ── Standard commands routed through execute() ───────────────────
 
         case 'toc': {
@@ -1379,7 +1407,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         case 'about': {
             const { ok, result, error } = execute(index, 'about', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            console.log(output.formatAbout(result, { expand: iflags.expand, root: index.root, showAll: iflags.all, depth: iflags.depth }));
+            console.log(output.formatAbout(result, { expand: iflags.expand, root: index.root, showAll: iflags.all, depth: iflags.depth, showConfidence: iflags.showConfidence }));
             break;
         }
 

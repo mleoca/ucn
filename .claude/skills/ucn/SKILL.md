@@ -83,11 +83,23 @@ ucn class MarketDataFetcher
 
 ### 6. `deadcode` — Find unused code
 
-Lists all functions and classes with zero callers across the project.
+Lists all functions and classes with zero callers across the project. Framework entry points (Express routes, Spring controllers, Celery tasks, etc.) are automatically excluded.
 
 ```bash
 ucn deadcode                        # Everything
 ucn deadcode --exclude=test         # Skip test files (most useful)
+ucn deadcode --include-decorated    # Include framework-registered functions
+```
+
+### 7. `entrypoints` — Detect framework entry points
+
+Lists functions registered as framework handlers (HTTP routes, DI beans, job schedulers, etc.). Detects patterns across Express, FastAPI, Flask, Spring, Gin, Actix, Celery, pytest, and more.
+
+```bash
+ucn entrypoints                          # All detected entry points
+ucn entrypoints --type=http              # HTTP routes only
+ucn entrypoints --framework=express      # Specific framework
+ucn entrypoints --file=routes/           # Scoped to files
 ```
 
 ## When to Use the Other Commands
@@ -120,6 +132,7 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |
 | File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Setting `--depth=N` expands all children. Can be noisy — use depth=1 for large projects. For function-level flow, use `trace` instead |
 | Are there circular dependencies? | `ucn circular-deps` | Detect circular import chains. `--file=<pattern>` filters to cycles involving a file. `--exclude=test` skips test files |
+| What are the framework entry points? | `ucn entrypoints` | Lists all detected routes, DI beans, tasks, etc. Filter: `--type=http`, `--framework=express` |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
 | Extract specific lines from a file | `ucn lines --file=<file> --range=10-20` | Pull a line range without reading the whole file |
 | Find type definitions | `ucn typedef <name>` | Interfaces, enums, structs, traits, type aliases |
@@ -170,8 +183,11 @@ ucn [target] <command> [name] [--flags]
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
 | `--exact` | Exact name match only in `find`/`typedef` (no substring) |
 | `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |
+| `--show-confidence` | Show confidence scores (0.0–1.0) per caller/callee edge in `context`/`about` |
+| `--min-confidence=N` | Filter edges below confidence threshold (e.g., `--min-confidence=0.7` keeps only high-confidence edges) |
 | `--include-exported` | Include exported symbols in `deadcode` results |
 | `--include-decorated` | Include decorated/annotated symbols in `deadcode` results |
+| `--framework=X` | Filter `entrypoints` by framework (e.g., `express`, `spring`, `celery`) |
 | `--type=<kind>` | Structural search: `function`, `class`, `call`, `method`, `type`. Triggers index query instead of text grep |
 | `--param=<name>` | Structural search: filter by parameter name or type (e.g., `--param=Request`) |
 | `--receiver=<name>` | Structural search: filter calls by receiver (e.g., `--receiver=db` for all db.* calls) |

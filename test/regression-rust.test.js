@@ -1149,3 +1149,224 @@ fn main() {
         }
     });
 });
+
+describe('fix #191: Rust local variable type inference for confidence scoring', () => {
+    it('infers receiverType from struct expression: let s = Server { ... }', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'lib.rs': `
+struct Server { port: u16 }
+impl Server { fn start(&self) {} }
+struct Client { url: String }
+impl Client { fn start(&self) {} }
+
+fn setup() {
+    let s = Server { port: 8080 };
+    s.start();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('start', { includeMethods: true });
+            const setup = callers.find(c => c.callerName === 'setup');
+            assert.ok(setup, 'setup should be a caller');
+            assert.strictEqual(setup.receiverType, 'Server', 'should infer Server from struct expression');
+            assert.strictEqual(setup.resolution, 'receiver-hint');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('infers receiverType from constructor call: let s = Server::new()', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'lib.rs': `
+struct Server { port: u16 }
+impl Server {
+    fn new() -> Server { Server { port: 8080 } }
+    fn start(&self) {}
+}
+
+fn setup() {
+    let s = Server::new();
+    s.start();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('start', { includeMethods: true });
+            const setup = callers.find(c => c.callerName === 'setup');
+            assert.ok(setup, 'setup should be a caller');
+            assert.strictEqual(setup.receiverType, 'Server', 'should infer Server from ::new()');
+            assert.strictEqual(setup.resolution, 'receiver-hint');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('infers receiverType from explicit type annotation: let s: Server = ...', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'lib.rs': `
+struct Server { port: u16 }
+impl Server { fn start(&self) {} }
+
+fn get_server() -> Server { Server { port: 8080 } }
+
+fn setup() {
+    let s: Server = get_server();
+    s.start();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('start', { includeMethods: true });
+            const setup = callers.find(c => c.callerName === 'setup');
+            assert.ok(setup, 'setup should be a caller');
+            assert.strictEqual(setup.receiverType, 'Server', 'should infer Server from type annotation');
+            assert.strictEqual(setup.resolution, 'receiver-hint');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('infers receiverType from reference to struct: let s = &Config { ... }', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'lib.rs': `
+struct Config { debug: bool }
+impl Config { fn validate(&self) -> bool { true } }
+
+fn init() {
+    let cfg = &Config { debug: true };
+    cfg.validate();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('validate', { includeMethods: true });
+            const init = callers.find(c => c.callerName === 'init');
+            assert.ok(init, 'init should be a caller');
+            assert.strictEqual(init.receiverType, 'Config', 'should infer Config from &struct');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('infers from ::default(), ::from(), ::with_* constructors', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'lib.rs': `
+struct Builder { ready: bool }
+impl Builder { fn build(&self) {} }
+
+fn run() {
+    let b = Builder::default();
+    b.build();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('build', { includeMethods: true });
+            const run = callers.find(c => c.callerName === 'run');
+            assert.ok(run, 'run should be a caller');
+            assert.strictEqual(run.receiverType, 'Builder', 'should infer Builder from ::default()');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('disambiguates between types with same method name using inferred receiverType', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"',
+            'lib.rs': `
+struct Server { port: u16 }
+impl Server { fn start(&self) {} }
+struct Client { url: String }
+impl Client { fn start(&self) {} }
+
+fn launch_server() {
+    let s = Server::new();
+    s.start();
+}
+fn launch_client() {
+    let c = Client::from("localhost");
+    c.start();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // Check callers of start targeting Server
+            const serverDefs = index.symbols.get('start')?.filter(s => s.className === 'Server');
+            assert.ok(serverDefs?.length > 0, 'should find Server.start definition');
+            const serverCallers = index.findCallers('start', { includeMethods: true, targetDefinitions: serverDefs });
+            const serverCallerNames = serverCallers.map(c => c.callerName);
+            assert.ok(serverCallerNames.includes('launch_server'), 'launch_server should call Server.start');
+            assert.ok(!serverCallerNames.includes('launch_client'), 'launch_client should NOT call Server.start');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// ENTRYPOINTS: Rust Actix/Tokio detection
+// ============================================================================
+
+describe('Entrypoints: Actix/Tokio detection', () => {
+    const { detectEntrypoints } = require('../core/entrypoints');
+
+    it('detects #[get] and #[post] Actix route attributes', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"',
+            'main.rs': `
+use actix_web::{get, post, HttpResponse};
+
+#[get("/health")]
+async fn health() -> HttpResponse {
+    HttpResponse::Ok().finish()
+}
+
+#[post("/items")]
+async fn create_item() -> HttpResponse {
+    HttpResponse::Created().finish()
+}
+
+fn helper() -> i32 { 42 }
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('health'), 'should detect #[get] handler');
+            assert.ok(names.includes('create_item'), 'should detect #[post] handler');
+            assert.ok(!names.includes('helper'), 'should not detect plain helper');
+            assert.ok(eps.find(e => e.name === 'health').framework === 'actix');
+        } finally { rm(dir); }
+    });
+
+    it('detects #[tokio::main] runtime entry point', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"',
+            'main.rs': `
+#[tokio::main]
+async fn main() {
+    println!("Hello");
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            // main is already a runtime entry point, but tokio::main should also detect
+            assert.ok(eps.some(e => e.framework === 'tokio'), 'should detect tokio::main');
+        } finally { rm(dir); }
+    });
+});

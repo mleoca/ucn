@@ -182,6 +182,7 @@ const HANDLERS = {
             exclude: toExcludeArray(p.exclude),
             maxCallers: num(p.top, undefined),
             maxCallees: num(p.top, undefined),
+            minConfidence: num(p.minConfidence, 0),
         });
         if (!result) {
             // Give better error if file/className filter is the problem
@@ -201,7 +202,7 @@ const HANDLERS = {
             }
             return { ok: false, error: `Symbol "${p.name}" not found.` };
         }
-        return { ok: true, result };
+        return { ok: true, result, showConfidence: !!p.showConfidence };
     },
 
     context: (index, p) => {
@@ -218,9 +219,10 @@ const HANDLERS = {
             file: p.file,
             className: p.className,
             exclude: toExcludeArray(p.exclude),
+            minConfidence: num(p.minConfidence, 0),
         });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
-        return { ok: true, result };
+        return { ok: true, result, showConfidence: !!p.showConfidence };
     },
 
     impact: (index, p) => {
@@ -566,6 +568,18 @@ const HANDLERS = {
             }
         }
         return { ok: true, result, note };
+    },
+
+    entrypoints: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const { detectEntrypoints } = require('./entrypoints');
+        const result = detectEntrypoints(index, {
+            type: p.type,
+            framework: p.framework,
+            file: p.file,
+        });
+        return { ok: true, result };
     },
 
     // ── Extracting Code ─────────────────────────────────────────────────

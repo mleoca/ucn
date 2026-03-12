@@ -518,6 +518,8 @@ function findCallsInCode(code, parser, options = {}) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+    // Skip common non-function identifiers when detecting callback arguments
+    const GO_SKIP_IDENTS = new Set(['nil', 'true', 'false', 'err', 'ctx', 'context', 'iota']);
     // Track local closure names per function scope (scopeStartLine -> Set<name>)
     const closureScopes = new Map();
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
@@ -858,6 +860,24 @@ function findCallsInCode(code, parser, options = {}) {
                         uncertain: false
                     });
                 }
+            }
+        }
+
+        // Detect plain identifier function references passed as arguments:
+        // e.g., r.GET("/users", listUsers) — listUsers is a plain identifier in argument_list
+        if (node.type === 'identifier' && node.parent?.type === 'argument_list') {
+            const name = node.text;
+            if (!GO_SKIP_IDENTS.has(name) && !importAliases.has(name)) {
+                const enclosingFunction = getCurrentEnclosingFunction();
+                calls.push({
+                    name,
+                    line: node.startPosition.row + 1,
+                    isMethod: false,
+                    isFunctionReference: true,
+                    isPotentialCallback: true,
+                    enclosingFunction,
+                    uncertain: false
+                });
             }
         }
 

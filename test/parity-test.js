@@ -228,6 +228,69 @@ function testProcessData() {
         });
     });
 
+    describe('confidence options parity', () => {
+        it('CLI: context --show-confidence shows confidence scores', () => {
+            const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--show-confidence']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(output.includes('confidence:'), 'Should show confidence scores');
+            assert.match(output, /confidence: \d+\.\d+/, 'Should show numeric confidence');
+        });
+
+        it('interactive: context --show-confidence shows confidence scores', () => {
+            const output = runInteractive(FIXTURES_PATH, ['context processData --show-confidence']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(output.includes('confidence:'), 'Should show confidence scores');
+        });
+
+        it('MCP: context show_confidence shows confidence scores', async () => {
+            const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData', show_confidence: true });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+            assert.ok(res.text.includes('confidence:'), 'MCP should show confidence scores');
+        });
+
+        it('CLI: about --show-confidence shows confidence scores', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--show-confidence']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(output.includes('confidence:'), 'Should show confidence scores in about');
+        });
+
+        it('CLI: about --min-confidence=0.9 filters low-confidence edges', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--min-confidence=0.9']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            // helper callee has confidence 0.65, should be filtered from CALLEES section
+            assert.ok(output.includes('below confidence threshold hidden'), 'Should show filtered edge note');
+            // Extract callees section and verify helper is not listed as a callee
+            const calleesSection = output.split('CALLEES')[1]?.split('───')[0] || '';
+            assert.ok(!calleesSection.includes('helper'), 'Low-confidence callee should be filtered from CALLEES');
+        });
+
+        it('interactive: about --min-confidence=0.9 filters low-confidence edges', () => {
+            const output = runInteractive(FIXTURES_PATH, ['about processData --min-confidence=0.9']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(output.includes('below confidence threshold hidden'), 'Should show filtered edge note');
+        });
+
+        it('MCP: about min_confidence=0.9 filters low-confidence edges', async () => {
+            const res = await mcpClient.callTool({ command: 'about', project_dir: FIXTURES_PATH, name: 'processData', min_confidence: 0.9 });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('processData'), 'Should find symbol');
+            assert.ok(res.text.includes('below confidence threshold hidden'), 'MCP should show filtered edge note');
+        });
+
+        it('MCP: context min_confidence=0.9 filters low-confidence edges', async () => {
+            const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData', min_confidence: 0.9 });
+            assert.ok(!res.isError, 'Should not error');
+            assert.ok(res.text.includes('below confidence threshold hidden'), 'MCP context should filter and note');
+        });
+
+        it('CLI: context without --show-confidence omits confidence lines', () => {
+            const output = runCli(FIXTURES_PATH, 'context', ['processData']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(!output.includes('confidence:'), 'Should NOT show confidence without flag');
+        });
+    });
+
     describe('smart options parity', () => {
         it('CLI: smart --include-methods works', () => {
             const output = runCli(FIXTURES_PATH, 'smart', ['processData'], ['--include-methods']);
@@ -924,5 +987,110 @@ describe('fix: class --max-lines validation in core (all surfaces)', () => {
         } finally {
             rm(dir);
         }
+    });
+});
+
+// ============================================================================
+// Entrypoints command parity
+// ============================================================================
+
+describe('entrypoints command parity', () => {
+    const { execute } = require('../core/execute');
+    const { tmp, rm, idx } = require('./helpers');
+
+    it('CLI: entrypoints command works', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': '@app.route("/x")\ndef handler():\n    return 1\n'
+        });
+        try {
+            const out = runCli(dir, 'entrypoints', []);
+            assert.ok(out.includes('handler') || out.includes('Entry Point'), `CLI should show entry points, got: ${out.substring(0, 200)}`);
+        } finally { rm(dir); }
+    });
+
+    it('CLI: entrypoints --json returns valid JSON', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': '@app.route("/x")\ndef handler():\n    return 1\n'
+        });
+        try {
+            const out = runCli(dir, 'entrypoints', [], ['--json']);
+            const parsed = JSON.parse(out);
+            assert.ok(parsed.meta, 'JSON should have meta');
+            assert.ok(parsed.data, 'JSON should have data');
+            assert.ok(Array.isArray(parsed.data.entrypoints), 'should have entrypoints array');
+        } finally { rm(dir); }
+    });
+
+    it('interactive: entrypoints works', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': '@app.route("/x")\ndef handler():\n    return 1\n'
+        });
+        try {
+            const out = runInteractive(dir, ['entrypoints']);
+            assert.ok(out.includes('handler') || out.includes('Entry Point') || out.includes('Framework'), `interactive should show entry points`);
+        } finally { rm(dir); }
+    });
+
+    it('MCP: entrypoints command works', async () => {
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const dir = tmp({
+                'pyproject.toml': '[project]\nname = "test"',
+                'app.py': '@app.route("/x")\ndef handler():\n    return 1\n'
+            });
+            try {
+                const result = await client.callTool({ command: 'entrypoints', project_dir: dir });
+                assert.ok(!result.isError, 'MCP should not return error');
+                assert.ok(result.text.includes('handler') || result.text.includes('Entry Point') || result.text.includes('Framework'),
+                    `MCP should show entry points`);
+            } finally { rm(dir); }
+        } finally { client.stop(); }
+    });
+
+    it('CLI: entrypoints --type=test filters by type', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'conftest.py': '@pytest.fixture\ndef db():\n    return None\n',
+            'app.py': '@app.route("/x")\ndef handler():\n    return 1\n'
+        });
+        try {
+            const out = runCli(dir, 'entrypoints', [], ['--type=test', '--json']);
+            const parsed = JSON.parse(out);
+            assert.ok(parsed.data.entrypoints.every(e => e.type === 'test'), 'should only show test type');
+        } finally { rm(dir); }
+    });
+
+    it('CLI: entrypoints --framework filters by framework', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'conftest.py': '@pytest.fixture\ndef db():\n    return None\n',
+            'app.py': '@app.route("/x")\ndef handler():\n    return 1\n'
+        });
+        try {
+            const out = runCli(dir, 'entrypoints', [], ['--framework=pytest', '--json']);
+            const parsed = JSON.parse(out);
+            assert.ok(parsed.data.entrypoints.every(e => e.framework === 'pytest'), 'should only show pytest');
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints registered in CANONICAL_COMMANDS', () => {
+        assert.ok(CANONICAL_COMMANDS.includes('entrypoints'), 'entrypoints should be in CANONICAL_COMMANDS');
+    });
+
+    it('entrypoints has handler in execute.js', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function x() {}\nmodule.exports = { x };'
+        });
+        try {
+            const index = idx(dir);
+            const { ok } = execute(index, 'entrypoints', {});
+            assert.strictEqual(ok, true, 'entrypoints handler should exist');
+        } finally { rm(dir); }
     });
 });

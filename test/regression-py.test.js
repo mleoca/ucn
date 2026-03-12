@@ -1309,3 +1309,372 @@ class Manager:
         }
     });
 });
+
+// ============================================================================
+// ENTRYPOINTS: Python framework detection
+// ============================================================================
+
+describe('Entrypoints: FastAPI/Flask/Celery/pytest detection', () => {
+    const { detectEntrypoints, isFrameworkEntrypoint } = require('../core/entrypoints');
+
+    it('detects FastAPI route decorators', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'main.py': `
+from fastapi import FastAPI
+app = FastAPI()
+
+@app.get("/items")
+def list_items():
+    return []
+
+@router.post("/items")
+def create_item():
+    return {}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('list_items'), 'should detect list_items');
+            assert.ok(names.includes('create_item'), 'should detect create_item');
+            assert.ok(eps.every(e => e.type === 'http'), 'all should be http type');
+        } finally { rm(dir); }
+    });
+
+    it('detects Celery task decorators', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'tasks.py': `
+from celery import shared_task
+
+@shared_task
+def send_email(to, subject):
+    pass
+
+@app.task
+def process_payment(order_id):
+    pass
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('send_email'), 'should detect @shared_task');
+            assert.ok(names.includes('process_payment'), 'should detect @app.task');
+            assert.ok(eps.filter(e => e.name === 'send_email')[0].type === 'jobs', 'should be jobs type');
+        } finally { rm(dir); }
+    });
+
+    it('detects pytest.fixture', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'conftest.py': `
+import pytest
+
+@pytest.fixture
+def db_session():
+    return connect()
+
+@pytest.fixture(scope="module")
+def app():
+    return create_app()
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('db_session'), 'should detect @pytest.fixture');
+            assert.ok(eps.filter(e => e.name === 'db_session')[0].framework === 'pytest');
+            assert.ok(eps.filter(e => e.name === 'db_session')[0].type === 'test');
+        } finally { rm(dir); }
+    });
+
+    it('detects Django view decorators', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'views.py': `
+from rest_framework.decorators import api_view
+
+@api_view(['GET'])
+def get_users(request):
+    return Response([])
+
+@login_required
+def dashboard(request):
+    return render(request, 'dash.html')
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('get_users'), 'should detect @api_view');
+            assert.ok(names.includes('dashboard'), 'should detect @login_required');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Regression: Python receiver type inference (Phase 3c)
+// ============================================================================
+
+describe('Regression: Python receiver type inference (Phase 3c)', () => {
+    it('constructor inference: Backtester() resolves bt.run() to Backtester.run', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'backtester.py': `
+class Backtester:
+    def run(self):
+        return "running"
+
+class Simulator:
+    def run(self):
+        return "simulating"
+`,
+            'main.py': `
+from backtester import Backtester
+
+def execute():
+    bt = Backtester()
+    bt.run()
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('run', { includeMethods: true });
+            assert.ok(callers.length > 0, 'should find callers of run');
+            const execCaller = callers.find(c => c.callerName === 'execute');
+            assert.ok(execCaller, 'execute should be a caller of run');
+            assert.strictEqual(execCaller.resolution, 'receiver-hint',
+                'Backtester() constructor should give receiver-hint resolution');
+            assert.ok(execCaller.confidence >= 0.80,
+                'receiver-hint should have confidence >= 0.80');
+        } finally { rm(dir); }
+    });
+
+    it('type annotation inference: client: HttpClient resolves client.request()', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'http.py': `
+class HttpClient:
+    def request(self, url):
+        return url
+
+def get_client():
+    return HttpClient()
+`,
+            'app.py': `
+from http import HttpClient, get_client
+
+def fetch_data():
+    client: HttpClient = get_client()
+    client.request("/api")
+`
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const reqCall = calls.find(c => c.name === 'request' && c.receiver === 'client');
+            assert.ok(reqCall, 'should find client.request() call');
+            assert.strictEqual(reqCall.receiverType, 'HttpClient',
+                'type annotation should infer receiverType as HttpClient');
+        } finally { rm(dir); }
+    });
+
+    it('parameter type inference: def process(engine: SearchEngine) resolves engine.query()', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'search.py': `
+class SearchEngine:
+    def query(self, text):
+        return text
+`,
+            'handler.py': `
+from search import SearchEngine
+
+def process(engine: SearchEngine):
+    engine.query("test")
+`
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'handler.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const queryCall = calls.find(c => c.name === 'query' && c.receiver === 'engine');
+            assert.ok(queryCall, 'should find engine.query() call');
+            assert.strictEqual(queryCall.receiverType, 'SearchEngine',
+                'parameter type annotation should infer receiverType as SearchEngine');
+        } finally { rm(dir); }
+    });
+
+    it('no false positive on lowercase assignment (non-class by convention)', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+def compute():
+    return {}
+
+def main():
+    result = compute()
+    result.save()
+`
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const saveCall = calls.find(c => c.name === 'save' && c.receiver === 'result');
+            assert.ok(saveCall, 'should find result.save() call');
+            assert.strictEqual(saveCall.receiverType, undefined,
+                'lowercase function return should NOT infer receiverType');
+        } finally { rm(dir); }
+    });
+});
+
+// Fix: localVarTypes scoping — types should not leak between sibling functions
+describe('fix: localVarTypes function scoping (Python)', () => {
+    it('sibling functions with same variable name get independent types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.py': [
+                'class Foo:',
+                '    def run(self): pass',
+                'class Bar:',
+                '    def run(self): pass',
+                'def func_a():',
+                '    x = Foo()',
+                '    x.run()',
+                'def func_b():',
+                '    x = Bar()',
+                '    x.run()',
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const runCalls = calls.filter(c => c.name === 'run' && c.isMethod && c.receiver === 'x');
+            assert.strictEqual(runCalls.length, 2);
+            assert.strictEqual(runCalls[0].receiverType, 'Foo', 'func_a x.run() should be Foo');
+            assert.strictEqual(runCalls[1].receiverType, 'Bar', 'func_b x.run() should be Bar, not leaked Foo');
+        } finally { rm(dir); }
+    });
+
+    it('parameter name does not inherit type from sibling function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.py': [
+                'class Foo:',
+                '    def run(self): pass',
+                'def func_a():',
+                '    x = Foo()',
+                '    x.run()',
+                'def func_b(x):',
+                '    x.run()',
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const runCalls = calls.filter(c => c.name === 'run' && c.isMethod && c.receiver === 'x');
+            assert.strictEqual(runCalls.length, 2);
+            assert.strictEqual(runCalls[0].receiverType, 'Foo', 'func_a should infer Foo');
+            assert.strictEqual(runCalls[1].receiverType, undefined,
+                'func_b parameter x should NOT inherit Foo from sibling');
+        } finally { rm(dir); }
+    });
+
+    it('module-level typed variable remains visible inside functions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.py': [
+                'class Database:',
+                '    def query(self, sql): pass',
+                'db = Database()',
+                'def get_users():',
+                '    db.query("users")',
+                'def get_orders():',
+                '    db.query("orders")',
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const queryCalls = calls.filter(c => c.name === 'query' && c.receiver === 'db');
+            assert.strictEqual(queryCalls.length, 2);
+            assert.strictEqual(queryCalls[0].receiverType, 'Database');
+            assert.strictEqual(queryCalls[1].receiverType, 'Database');
+        } finally { rm(dir); }
+    });
+
+    it('nested function inherits outer scope types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.py': [
+                'class Client:',
+                '    def fetch(self): pass',
+                'def outer():',
+                '    c = Client()',
+                '    def inner():',
+                '        c.fetch()',
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const fetchCall = calls.find(c => c.name === 'fetch' && c.receiver === 'c');
+            assert.ok(fetchCall);
+            assert.strictEqual(fetchCall.receiverType, 'Client',
+                'inner function should see outer scope type');
+        } finally { rm(dir); }
+    });
+
+    it('typed parameter annotation is scoped to its function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.py': [
+                'class Foo:',
+                '    def run(self): pass',
+                'class Bar:',
+                '    def run(self): pass',
+                'def func_a(x: Foo):',
+                '    x.run()',
+                'def func_b(x: Bar):',
+                '    x.run()',
+            ].join('\n')
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/python');
+            const code = fs.readFileSync(path.join(dir, 'app.py'), 'utf8');
+            const parser = getParser('python');
+            const calls = findCallsInCode(code, parser);
+            const runCalls = calls.filter(c => c.name === 'run' && c.isMethod && c.receiver === 'x');
+            assert.strictEqual(runCalls.length, 2);
+            assert.strictEqual(runCalls[0].receiverType, 'Foo', 'func_a typed param should be Foo');
+            assert.strictEqual(runCalls[1].receiverType, 'Bar', 'func_b typed param should be Bar, not Foo');
+        } finally { rm(dir); }
+    });
+});

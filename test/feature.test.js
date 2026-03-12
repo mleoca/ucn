@@ -1482,3 +1482,871 @@ function another() { return 2; }
     });
 });
 
+// ============================================================================
+// FEATURE TESTS: entrypoints command
+// ============================================================================
+
+describe('Feature: entrypoints command', () => {
+    const { execute } = require('../core/execute');
+
+    it('detects Python Flask decorator entry points', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+from flask import Flask
+app = Flask(__name__)
+
+@app.route('/users')
+def get_users():
+    return []
+
+@app.post('/users')
+def create_user():
+    return {}
+
+def helper():
+    return 42
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.ok(result.length >= 2, `should detect at least 2 entry points, got ${result.length}`);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('get_users'), 'should detect get_users');
+            assert.ok(names.includes('create_user'), 'should detect create_user');
+            assert.ok(!names.includes('helper'), 'should not detect helper');
+            assert.ok(result.every(r => r.type === 'http'), 'all should be http type');
+        } finally { rm(dir); }
+    });
+
+    it('detects Java Spring annotations', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'UserController.java': `
+package com.example;
+
+@RestController
+public class UserController {
+    @GetMapping("/users")
+    public List<User> getUsers() {
+        return userService.findAll();
+    }
+
+    @PostMapping("/users")
+    public User createUser() {
+        return new User();
+    }
+
+    private void internalHelper() {}
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('getUsers'), 'should detect getUsers');
+            assert.ok(names.includes('createUser'), 'should detect createUser');
+            assert.ok(!names.includes('internalHelper'), 'should not detect private helper');
+        } finally { rm(dir); }
+    });
+
+    it('detects Express route handlers via call-pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'routes.js': `
+const express = require('express');
+const app = express();
+
+function getUsers(req, res) { res.json([]); }
+function createUser(req, res) { res.json({}); }
+function helper() { return 42; }
+
+app.get('/users', getUsers);
+app.post('/users', createUser);
+
+module.exports = { getUsers, createUser, helper };
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('getUsers'), 'should detect getUsers as route handler');
+            assert.ok(names.includes('createUser'), 'should detect createUser as route handler');
+            assert.ok(!names.includes('helper'), 'should not detect plain helper');
+            const ep = result.find(r => r.name === 'getUsers');
+            assert.strictEqual(ep.framework, 'express');
+            assert.strictEqual(ep.type, 'http');
+        } finally { rm(dir); }
+    });
+
+    it('filters by --type', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+@app.route('/a')
+def route_a():
+    return 1
+
+@celery.task
+def task_a():
+    return 2
+
+@pytest.fixture
+def db():
+    return None
+`
+        });
+        try {
+            const index = idx(dir);
+            const all = execute(index, 'entrypoints', {});
+            assert.ok(all.ok);
+            assert.ok(all.result.length >= 3, `should detect >= 3, got ${all.result.length}`);
+
+            // Filter by type=test
+            const testsOnly = execute(index, 'entrypoints', { type: 'test' });
+            assert.ok(testsOnly.ok);
+            assert.ok(testsOnly.result.every(r => r.type === 'test'));
+        } finally { rm(dir); }
+    });
+
+    it('filters by --framework', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+@app.route('/a')
+def route_a():
+    return 1
+
+@pytest.fixture
+def db():
+    return None
+`
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'entrypoints', { framework: 'pytest' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length >= 1);
+            assert.ok(result.result.every(r => r.framework === 'pytest'));
+        } finally { rm(dir); }
+    });
+
+    it('filters by --file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'routes/users.js': 'function getUsers() {}\napp.get("/users", getUsers);\nmodule.exports = { getUsers };',
+            'routes/orders.js': 'function getOrders() {}\napp.get("/orders", getOrders);\nmodule.exports = { getOrders };'
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'entrypoints', { file: 'users' });
+            assert.ok(result.ok);
+            assert.ok(result.result.every(r => r.file.includes('users')));
+        } finally { rm(dir); }
+    });
+
+    it('deadcode excludes framework entry points', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+@app.route('/a')
+def route_a():
+    return 1
+
+@something.task
+def task_b():
+    return 2
+
+def plain_unused():
+    return 3
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            const names = dc.map(d => d.name);
+            assert.ok(!names.includes('route_a'), 'route_a should be excluded from deadcode');
+            assert.ok(!names.includes('task_b'), 'task_b should be excluded from deadcode');
+            assert.ok(names.includes('plain_unused'), 'plain_unused should remain in deadcode');
+            assert.ok(dc.excludedDecorated >= 2, 'should count excluded decorated');
+        } finally { rm(dir); }
+    });
+
+    // --- backward compatibility: catch-all fallbacks in entrypoints.js ---
+
+    it('deadcode excludes Python function with unknown dotted decorator via catch-all', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'hooks.py': `
+@something.hook
+def my_hook_handler():
+    return 1
+
+def plain_unused():
+    return 2
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            const names = dc.map(d => d.name);
+            assert.ok(!names.includes('my_hook_handler'),
+                'function with unknown dotted decorator (@something.hook) should be excluded from deadcode');
+            assert.ok(names.includes('plain_unused'),
+                'function without decorator should remain in deadcode');
+            assert.ok(dc.excludedDecorated >= 1,
+                'should count at least 1 excluded decorated symbol');
+        } finally { rm(dir); }
+    });
+
+    it('deadcode does NOT exclude Python function with simple (non-dotted) decorator', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'utils.py': `
+@staticmethod
+def helper():
+    return 1
+
+@property
+def name():
+    return "x"
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            const names = dc.map(d => d.name);
+            // @staticmethod and @property have no dot — should NOT be detected as framework entry points
+            // They may still be excluded for other reasons (exported, etc.), but excludedDecorated should be 0
+            assert.strictEqual(dc.excludedDecorated, 0,
+                'simple (non-dotted) decorators like @staticmethod and @property should not trigger framework detection');
+        } finally { rm(dir); }
+    });
+
+    it('deadcode excludes Java method with @Transactional via java-custom-annotation catch-all', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Service.java': `
+public class Service {
+    @Transactional
+    void processPayment() {
+        // framework-managed
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            const names = dc.map(d => d.name);
+            assert.ok(!names.includes('processPayment'),
+                '@Transactional method should be excluded from deadcode via java-custom-annotation catch-all');
+            assert.ok(dc.excludedDecorated >= 1,
+                'should count at least 1 excluded decorated symbol for @Transactional');
+        } finally { rm(dir); }
+    });
+
+    it('deadcode excludes Java @Override method via isJavaOverride (not entrypoints)', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Impl.java': `
+public class Impl {
+    @Override
+    public String toString() {
+        return "impl";
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            const names = dc.map(d => d.name);
+            // @Override is handled by isJavaOverride in deadcode.js, NOT by entrypoints
+            // The function should be excluded either way
+            assert.ok(!names.includes('toString'),
+                '@Override method should be excluded from deadcode');
+        } finally { rm(dir); }
+    });
+
+    it('deadcode does NOT exclude Java method with only standard modifiers', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Utils.java': `
+public class Utils {
+    public static int compute(int x) {
+        return x * 2;
+    }
+    private void internalHelper() {
+        // no annotation, just standard modifiers
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            // include exported to avoid the public/export exclusion hiding the result
+            const dc = index.deadcode({ includeExported: true });
+            const names = dc.map(d => d.name);
+            // Methods with only standard Java modifiers (public, static, private) should NOT
+            // be detected as framework entry points. They should appear in deadcode if unused.
+            assert.strictEqual(dc.excludedDecorated, 0,
+                'standard Java modifiers (public, static, private) should not trigger framework detection');
+            assert.ok(names.includes('compute') || names.includes('internalHelper'),
+                'methods with only standard modifiers should be candidates for deadcode');
+        } finally { rm(dir); }
+    });
+
+    it('deadcode does NOT exclude Rust struct with #[derive(Clone)] as framework entry point', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"',
+            'src/lib.rs': `
+#[derive(Clone, Debug)]
+pub struct Config {
+    pub name: String,
+}
+
+fn unused_helper() -> i32 {
+    42
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            // derive should NOT match the actix pattern (get|post|put|delete|patch|actix_web::main|actix_web::test)
+            // So #[derive(Clone)] should not cause framework entry point detection
+            // The struct itself is a type (not a function), so it won't appear in deadcode results.
+            // The key check: excludedDecorated should be 0 because derive is not a framework annotation.
+            assert.strictEqual(dc.excludedDecorated, 0,
+                '#[derive(Clone)] should NOT be detected as framework entry point');
+            // unused_helper should be detected as dead code
+            const names = dc.map(d => d.name);
+            assert.ok(names.includes('unused_helper'),
+                'unused_helper with no attributes should be in deadcode');
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints returns empty array for project without frameworks', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function add(a, b) { return a + b; }\nmodule.exports = { add };'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.strictEqual(result.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints JSON format includes all fields', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+@app.route('/a')
+def route_a():
+    return 1
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.ok(result.length > 0);
+            const json = JSON.parse(output.formatEntrypointsJson(result));
+            assert.ok(json.meta.total > 0);
+            const ep = json.data.entrypoints[0];
+            assert.ok(ep.name, 'should have name');
+            assert.ok(ep.file, 'should have file');
+            assert.ok(ep.line, 'should have line');
+            assert.ok(ep.type, 'should have type');
+            assert.ok(ep.framework, 'should have framework');
+            assert.ok(ep.confidence, 'should have confidence');
+            assert.ok(ep.evidence, 'should have evidence');
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints text format groups by type', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Service.java': `
+@Service
+public class Service {
+    @Scheduled(fixedRate = 5000)
+    public void cleanup() {}
+
+    @GetMapping("/health")
+    public String health() { return "ok"; }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const text = output.formatEntrypoints(result);
+            assert.ok(text.includes('Framework Entry Points:'), 'should have header');
+        } finally { rm(dir); }
+    });
+
+    // ── False positive audit ────────────────────────────────────────────
+
+    it('JS: app.get(string) without callback is NOT an entrypoint', () => {
+        // app.get('port') is Express config lookup, not route registration.
+        // String literal args don't produce isFunctionReference/isPotentialCallback.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.js': `
+const express = require('express');
+const app = express();
+
+const port = app.get('port');
+const env = app.get('env');
+
+function startServer() {
+    app.listen(port);
+}
+
+module.exports = { startServer };
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.strictEqual(result.length, 0,
+                'app.get(string) should not produce entrypoints, got: ' +
+                result.map(r => r.name).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('JS: app.get with inline arrow fn is NOT a named entrypoint', () => {
+        // Inline arrow functions are anonymous — they have no name to register
+        // as an entrypoint. The callback IS the handler but has no symbol name.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'routes.js': `
+const express = require('express');
+const app = express();
+
+app.get('/health', (req, res) => { res.json({ ok: true }); });
+app.post('/data', (req, res) => { res.json({}); });
+
+module.exports = app;
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.strictEqual(result.length, 0,
+                'inline arrow handlers should not produce named entrypoints, got: ' +
+                result.map(r => r.name).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('JS: myMap.get(key) is NOT an entrypoint (receiver mismatch)', () => {
+        // Receiver "myMap" does not match express-route pattern /^(app|router|server|fastify)$/i
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cache.js': `
+const myMap = new Map();
+
+function lookup(key) {
+    return myMap.get(key);
+}
+
+function store(key, value) {
+    myMap.set(key, value);
+}
+
+module.exports = { lookup, store };
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.strictEqual(result.length, 0,
+                'myMap.get() should not match express route pattern, got: ' +
+                result.map(r => r.name).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('Go: router.Get() does NOT match Gin case-sensitive pattern', () => {
+        // Gin uses UPPERCASE methods: GET, POST, etc. The methodPattern is
+        // /^(GET|POST|PUT|DELETE|PATCH|HEAD|OPTIONS|Any|Handle)$/ — case-sensitive.
+        // router.Get() (lowercase "et") must NOT match.
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21',
+            'main.go': `
+package main
+
+type Config struct {
+    data map[string]string
+}
+
+func (c *Config) Get(key string) string {
+    return c.data[key]
+}
+
+func main() {
+    router := Config{data: map[string]string{"host": "localhost"}}
+    val := router.Get("host")
+    _ = val
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            // "Get" does not match /^(GET|POST|...)$/ (case-sensitive)
+            const falsePositives = result.filter(r => r.patternId === 'gin-route');
+            assert.strictEqual(falsePositives.length, 0,
+                'router.Get() (mixed case) should not match Gin pattern, got: ' +
+                falsePositives.map(r => r.name).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('Java: public static void main is NOT a framework entrypoint', () => {
+        // Java's main() is a language entry point, not a framework entry point.
+        // It should not be detected by spring/DI patterns (no annotations).
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'App.java': `
+package com.example;
+
+public class App {
+    public static void main(String[] args) {
+        System.out.println("Hello");
+    }
+
+    private void helper() {}
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            // main() has modifiers [public, static] which are excluded by the
+            // java-custom-annotation catch-all pattern's negative lookahead.
+            const mainEntrypoints = result.filter(r => r.name === 'main');
+            assert.strictEqual(mainEntrypoints.length, 0,
+                'Java main() should not be detected as framework entrypoint, got patterns: ' +
+                mainEntrypoints.map(r => r.patternId).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('JS: function named "get" or "post" without route registration is NOT an entrypoint', () => {
+        // Functions named after HTTP verbs should not be entrypoints unless
+        // they are actually registered with a route-like call pattern.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'http-utils.js': `
+function get(url) {
+    return fetch(url);
+}
+
+function post(url, data) {
+    return fetch(url, { method: 'POST', body: JSON.stringify(data) });
+}
+
+function del(url) {
+    return fetch(url, { method: 'DELETE' });
+}
+
+module.exports = { get, post, del };
+`,
+            'client.js': `
+const { get, post } = require('./http-utils');
+
+async function fetchUsers() {
+    return get('/api/users');
+}
+
+async function createUser(data) {
+    return post('/api/users', data);
+}
+
+module.exports = { fetchUsers, createUser };
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.strictEqual(result.length, 0,
+                'functions named get/post without route registration should not be entrypoints, got: ' +
+                result.map(r => `${r.name}(${r.patternId})`).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('Java: @SuppressWarnings and @Deprecated are NOT framework entrypoints', () => {
+        // Standard JDK annotations should be excluded from the java-custom-annotation
+        // catch-all pattern to avoid false positives in entrypoints detection.
+        const dir = tmp({
+            'Main.java': `
+public class Main {
+    @SuppressWarnings("unused")
+    private void unusedHelper() {}
+
+    @Deprecated
+    public void oldMethod() {}
+
+    @Override
+    public String toString() { return "Main"; }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(!names.includes('unusedHelper'),
+                '@SuppressWarnings should not be a framework entrypoint');
+            assert.ok(!names.includes('oldMethod'),
+                '@Deprecated should not be a framework entrypoint');
+            assert.ok(!names.includes('toString'),
+                '@Override should not be a framework entrypoint');
+        } finally { rm(dir); }
+    });
+
+    // ── False negative audit ──────────────────────────────────────────
+
+    it('JS: app.use(auth, handler) detects BOTH callbacks in middleware chain', () => {
+        // Express middleware chain: app.use(auth, handler) has TWO callbacks
+        // on the same line. Both should be detected as entrypoints.
+        // `use` is in HOF_METHODS (all args are callbacks), so both `auth` and
+        // `handler` get isFunctionReference: true via the HOF path.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'routes.js': `
+const express = require('express');
+const app = express();
+
+function auth(req, res, next) { next(); }
+function handler(req, res) { res.json({}); }
+
+app.use(auth, handler);
+
+module.exports = { auth, handler };
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('auth'),
+                'should detect auth as middleware entrypoint, got: ' + names.join(', '));
+            assert.ok(names.includes('handler'),
+                'should detect handler as middleware entrypoint, got: ' + names.join(', '));
+            assert.ok(result.every(r => r.framework === 'express'));
+        } finally { rm(dir); }
+    });
+
+    it('JS: app.get("/path", require("./handler")) — require()-wrapped handler is a false negative', () => {
+        // require() returns the module export at runtime, but in the AST it's a
+        // call_expression, not an identifier. Neither isFunctionReference nor
+        // isPotentialCallback is set on call_expression nodes, so the callback
+        // detection in buildCallbackEntrypointMap misses it.
+        // This is a known limitation — documenting it here.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'routes.js': `
+const express = require('express');
+const app = express();
+
+app.get('/path', require('./handler'));
+`,
+            'handler.js': `
+function handleRequest(req, res) { res.json({}); }
+module.exports = handleRequest;
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            // False negative: require()-wrapped handler is not detected.
+            // The handler function exists in handler.js but is not linked to the
+            // route registration in routes.js.
+            assert.strictEqual(result.length, 0,
+                'require()-wrapped handlers are a known false negative (call_expression, not identifier)');
+        } finally { rm(dir); }
+    });
+
+    it('JS: app.get("/path", function handleRequest(req, res) {}) — named function expression is a false negative', () => {
+        // A named function expression defined inline as a route handler argument
+        // is parsed as a function_expression node, not an identifier. The callback
+        // detection only looks for identifier and member_expression nodes, so it
+        // misses the inline named function.
+        // The function IS parsed by findFunctions, but there's no callback link.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'routes.js': `
+const express = require('express');
+const app = express();
+
+app.get('/path', function handleRequest(req, res) { res.json({}); });
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            // False negative: named function expressions in route args are not detected.
+            assert.strictEqual(result.length, 0,
+                'named function expressions in route args are a known false negative');
+        } finally { rm(dir); }
+    });
+
+    it('Python: function with BOTH @app.route AND @login_required detects as flask entrypoint', () => {
+        // Multiple decorators: @app.route matches flask-route, @login_required
+        // matches django-view. The first matching pattern (flask-route) wins.
+        // The function should appear exactly once with framework=flask.
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+from flask import Flask
+app = Flask(__name__)
+
+@app.route('/admin')
+@login_required
+def admin_panel():
+    return 'admin'
+
+def helper():
+    return 42
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('admin_panel'),
+                'should detect admin_panel with multiple decorators, got: ' + names.join(', '));
+            assert.ok(!names.includes('helper'), 'should not detect plain helper');
+            // Should only appear once despite matching two patterns
+            const adminEntries = result.filter(r => r.name === 'admin_panel');
+            assert.strictEqual(adminEntries.length, 1,
+                'should appear exactly once despite multiple decorator matches');
+            assert.strictEqual(adminEntries[0].framework, 'flask',
+                'should be attributed to flask (first matching pattern)');
+        } finally { rm(dir); }
+    });
+
+    it('Go: Gin group routes — v1.GET("/users", listUsers) detected', () => {
+        // Gin group routes: router.Group("/v1") returns a RouterGroup, commonly
+        // assigned to variables like v1, v2, etc. The receiverPattern includes
+        // v\d+ to match these common variable names.
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21',
+            'main.go': `
+package main
+
+import "github.com/gin-gonic/gin"
+
+func listUsers(c *gin.Context) {
+    c.JSON(200, []string{})
+}
+
+func main() {
+    router := gin.Default()
+    v1 := router.Group("/v1")
+    v1.GET("/users", listUsers)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('listUsers'),
+                'v1.GET should detect listUsers as gin route handler');
+            const entry = result.find(r => r.name === 'listUsers');
+            assert.strictEqual(entry.framework, 'gin');
+            assert.strictEqual(entry.type, 'http');
+        } finally { rm(dir); }
+    });
+
+    it('Python: @app.route("/path", methods=["GET", "POST"]) with arguments detects correctly', () => {
+        // Decorator with arguments: the decorator string includes the arguments
+        // (e.g., "app.route('/path', methods=['GET', 'POST'])"), and the flask
+        // pattern /^(app|bp|blueprint)\.(route|get|post|put|delete|patch)/ tests
+        // the start of the string, so arguments don't interfere.
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "test"',
+            'app.py': `
+from flask import Flask
+app = Flask(__name__)
+
+@app.route('/path', methods=['GET', 'POST'])
+def handle():
+    return 'ok'
+
+@app.route('/simple')
+def simple():
+    return 'simple'
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('handle'),
+                'decorator with methods= arg should still be detected, got: ' + names.join(', '));
+            assert.ok(names.includes('simple'),
+                'simple decorator should be detected, got: ' + names.join(', '));
+            // Both should be flask
+            assert.ok(result.every(r => r.framework === 'flask'),
+                'both should be attributed to flask');
+        } finally { rm(dir); }
+    });
+
+    it('Go: http.HandleFunc with named handler IS an entrypoint (positive control)', () => {
+        // Ensure that legitimate Go route registration is still detected.
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21',
+            'main.go': `
+package main
+
+import "net/http"
+
+func healthCheck(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("ok"))
+}
+
+func main() {
+    http.HandleFunc("/health", healthCheck)
+    http.ListenAndServe(":8080", nil)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const names = result.map(r => r.name);
+            assert.ok(names.includes('healthCheck'),
+                'http.HandleFunc with named handler should be detected, got: ' + names.join(', '));
+            const ep = result.find(r => r.name === 'healthCheck');
+            assert.strictEqual(ep.framework, 'net/http');
+            assert.strictEqual(ep.type, 'http');
+        } finally { rm(dir); }
+    });
+});
+

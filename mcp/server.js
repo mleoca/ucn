@@ -232,6 +232,8 @@ server.registerTool(
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
             include_methods: z.boolean().optional().describe('Include obj.method() calls (default: true for about/trace)'),
             include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches'),
+            min_confidence: z.number().optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
+            show_confidence: z.boolean().optional().describe('Show confidence scores and resolution evidence per edge'),
             with_types: z.boolean().optional().describe('Include related type definitions in output'),
             detailed: z.boolean().optional().describe('Show full symbol listing per file'),
             exact: z.boolean().optional().describe('Exact name match only (no substring matching)'),
@@ -297,7 +299,8 @@ server.registerTool(
                 if (!ok) return toolResult(error); // soft error — won't kill sibling calls
                 return toolResult(output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
-                    methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.'
+                    methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.',
+                    showConfidence: ep.showConfidence,
                 }));
             }
 
@@ -306,7 +309,8 @@ server.registerTool(
                 const { ok, result: ctx, error } = execute(index, 'context', ep);
                 if (!ok) return toolResult(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
-                    expandHint: 'Use expand command with item number to see code for any item.'
+                    expandHint: 'Use expand command with item number to see code for any item.',
+                    showConfidence: ep.showConfidence,
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
                 return toolResult(text);
@@ -440,6 +444,13 @@ server.registerTool(
                 });
                 if (dcNote) dcText += '\n\n' + dcNote;
                 return toolResult(dcText);
+            }
+
+            case 'entrypoints': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'entrypoints', ep);
+                if (!ok) return toolResult(error);
+                return toolResult(output.formatEntrypoints(result));
             }
 
             // ── File Dependencies ───────────────────────────────────────

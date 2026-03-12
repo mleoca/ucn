@@ -11,6 +11,7 @@ const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageModule } = require('../languages');
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES } = require('./shared');
+const { scoreEdge } = require('./confidence');
 
 /**
  * Extract a single line from content without splitting the entire string.
@@ -191,7 +192,8 @@ function findCallers(index, name, options = {}) {
                     if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                     pendingByFile.get(filePath).push({
                         call, fileEntry, callerSymbol,
-                        isMethod: false, isFunctionReference: true, receiver: undefined
+                        isMethod: false, isFunctionReference: true, receiver: undefined,
+                        _evidence: { isFunctionReference: true }
                     });
                     pendingCount++;
                     continue;
@@ -422,12 +424,13 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
-                // Java/Go/Rust receiver-class disambiguation:
+                // Receiver-class disambiguation:
                 // When the target definition has a class/receiver type, filter callers
                 // whose receiverType is known to be a different type.
-                // Go uses inferred receiverType; Java/Rust fall back to variable name matching.
+                // All languages use receiverType when available (constructor/annotation inference).
+                // Go/Java/Rust additionally fall back to variable name matching.
                 if (call.isMethod && call.receiver && !resolvedBySameClass && !bindingId &&
-                    (fileEntry.language === 'java' || fileEntry.language === 'go' || fileEntry.language === 'rust')) {
+                    (call.receiverType || fileEntry.language === 'java' || fileEntry.language === 'go' || fileEntry.language === 'rust')) {
                     // Build target type set from both className (Java) and receiver (Go/Rust)
                     const targetTypes = new Set();
                     for (const td of targetDefs) {
@@ -474,12 +477,43 @@ function findCallers(index, name, options = {}) {
                 // Find the enclosing function (get full symbol info)
                 const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
 
+                // Check import graph evidence: does this file import from the target definition's file?
+                const targetDefs2 = options.targetDefinitions || definitions;
+                const targetFiles2 = new Set(targetDefs2.map(d => d.file).filter(Boolean));
+                const callerImports = index.importGraph.get(filePath) || [];
+                let hasImportLink = targetFiles2.has(filePath) || callerImports.some(imp => targetFiles2.has(imp));
+                // Check one level of re-exports (barrel files) for import evidence
+                if (!hasImportLink) {
+                    for (const imp of callerImports) {
+                        const transImports = index.importGraph.get(imp) || [];
+                        if (transImports.some(ti => targetFiles2.has(ti))) {
+                            hasImportLink = true;
+                            break;
+                        }
+                    }
+                }
+
                 if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                 pendingByFile.get(filePath).push({
                     call, fileEntry, callerSymbol,
                     isMethod: call.isMethod || false, isFunctionReference: false,
                     receiver: call.receiver,
-                    receiverType: call.receiverType
+                    receiverType: call.receiverType,
+                    _evidence: {
+                        hasBindingId: !!bindingId,
+                        resolvedBySameClass: !!resolvedBySameClass,
+                        isUncertain: !!isUncertain || (
+                            // Method calls where binding resolution was skipped (non-self receiver)
+                            // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
+                            skipLocalBinding && call.isMethod && !resolvedBySameClass &&
+                            fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust' &&
+                            !(call.receiver && (fileEntry.bindings || []).some(b => b.name === call.receiver))
+                        ),
+                        hasReceiverType: !!call.receiverType,
+                        hasReceiverEvidence: !!(call.receiver &&
+                            (fileEntry.bindings || []).some(b => b.name === call.receiver)),
+                        hasImportEvidence: !!bindingId || hasImportLink,
+                    }
                 });
                 pendingCount++;
             }
@@ -493,7 +527,8 @@ function findCallers(index, name, options = {}) {
     for (const [filePath, pending] of pendingByFile) {
         try {
             const content = fs.readFileSync(filePath, 'utf-8');
-            for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType } of pending) {
+            for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, _evidence } of pending) {
+                const scored = scoreEdge(_evidence || {});
                 callers.push({
                     file: filePath,
                     relativePath: fileEntry.relativePath,
@@ -506,7 +541,9 @@ function findCallers(index, name, options = {}) {
                     isMethod,
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(receiver !== undefined && { receiver }),
-                    ...(receiverType && { receiverType })
+                    ...(receiverType && { receiverType }),
+                    confidence: scored.confidence,
+                    resolution: scored.resolution,
                 });
             }
         } catch (e) {
@@ -612,9 +649,11 @@ function findCallees(index, def, options = {}) {
                         }
                     }
                     continue;
-                } else if (call.receiverType && (language === 'go' || language === 'java' || language === 'rust')) {
+                } else if (call.receiverType) {
                     // Use parser-inferred receiverType for method resolution
-                    // e.g., f.RunFilter() where f is *Framework → resolve to Framework.RunFilter
+                    // Go/Java/Rust: from param/receiver type declarations
+                    // JS/TS: from `new Foo()` assignments or TypeScript type annotations
+                    // Python: from constructor calls or type annotations
                     const typeName = call.receiverType;
                     const symbols = index.symbols.get(call.name);
                     const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
@@ -981,6 +1020,8 @@ function findCallees(index, def, options = {}) {
         const defReceiver = def.receiver;
         const defFileEntry = fileEntry;
         const callerIsTest = defFileEntry && isTestFile(defFileEntry.relativePath, defFileEntry.language);
+        // Pre-compute import graph for callee confidence scoring
+        const callerImportSet = new Set(index.importGraph.get(def.file) || []);
 
         for (const { name: calleeName, bindingId, count } of callees.values()) {
             const symbols = index.symbols.get(calleeName);
@@ -1009,9 +1050,7 @@ function findCallees(index, def, options = {}) {
                         } else {
                             // Priority 2.5: Imported file — check if the caller's file imports
                             // from any of the candidate callee files (using importGraph)
-                            const callerImportedFiles = index.importGraph.get(def.file) || [];
-                            const importedFileSet = new Set(callerImportedFiles);
-                            const importedCallee = symbols.find(s => importedFileSet.has(s.file));
+                            const importedCallee = symbols.find(s => callerImportSet.has(s.file));
                             if (importedCallee) {
                                 callee = importedCallee;
                             } else if (defReceiver) {
@@ -1095,10 +1134,18 @@ function findCallees(index, def, options = {}) {
                     }
                 }
 
+                const calleeScored = scoreEdge({
+                    hasBindingId: !!bindingId,
+                    hasImportEvidence: !!bindingId || (symbols && symbols.length === 1) ||
+                        (callee.file === def.file) || callerImportSet.has(callee.file),
+                    isUncertain: false, // uncertain callees already filtered above
+                });
                 result.push({
                     ...callee,
                     callCount: count,
-                    weight: index.calculateWeight(count)
+                    weight: index.calculateWeight(count),
+                    confidence: calleeScored.confidence,
+                    resolution: calleeScored.resolution,
                 });
             }
         }

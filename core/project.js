@@ -1531,6 +1531,17 @@ class ProjectIndex {
             callees = callees.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
         }
 
+        // Apply confidence filtering
+        let confidenceFiltered = 0;
+        if (options.minConfidence > 0) {
+            const { filterByConfidence } = require('./confidence');
+            const callerResult = filterByConfidence(callers, options.minConfidence);
+            const calleeResult = filterByConfidence(callees, options.minConfidence);
+            callers = callerResult.kept;
+            callees = calleeResult.kept;
+            confidenceFiltered = callerResult.filtered + calleeResult.filtered;
+        }
+
         const filesInScope = new Set([def.file]);
         callers.forEach(c => filesInScope.add(c.file));
         callees.forEach(c => filesInScope.add(c.file));
@@ -1550,10 +1561,11 @@ class ProjectIndex {
             callers,
             callees,
             meta: {
-                complete: stats.uncertain === 0 && dynamicImports === 0,
+                complete: stats.uncertain === 0 && dynamicImports === 0 && confidenceFiltered === 0,
                 skipped: 0,
                 dynamicImports,
                 uncertain: stats.uncertain,
+                confidenceFiltered,
                 includeMethods: !!options.includeMethods,
                 projectLanguage: this._getPredominantLanguage(),
                 // Structural facts for reliability hints
@@ -3917,6 +3929,7 @@ class ProjectIndex {
         let callees = [];
         let allCallers = null;
         let allCallees = null;
+        let aboutConfFiltered = 0;
         if (primary.type === 'function' || primary.params !== undefined) {
             // Use maxResults to limit file iteration (with buffer for exclude filtering)
             const callerCap = maxCallers === Infinity ? undefined : maxCallers * 3;
@@ -3925,17 +3938,33 @@ class ProjectIndex {
             if (options.exclude && options.exclude.length > 0) {
                 allCallers = allCallers.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
             }
+            // Apply confidence filtering before slicing
+            if (options.minConfidence > 0) {
+                const { filterByConfidence } = require('./confidence');
+                const callerResult = filterByConfidence(allCallers, options.minConfidence);
+                allCallers = callerResult.kept;
+                aboutConfFiltered += callerResult.filtered;
+            }
             callers = allCallers.slice(0, maxCallers).map(c => ({
                 file: c.relativePath,
                 line: c.line,
                 expression: c.content.trim(),
-                callerName: c.callerName
+                callerName: c.callerName,
+                confidence: c.confidence,
+                resolution: c.resolution,
             }));
 
             allCallees = this.findCallees(primary, { includeMethods, includeUncertain: options.includeUncertain });
             // Apply exclude filter before slicing
             if (options.exclude && options.exclude.length > 0) {
                 allCallees = allCallees.filter(c => this.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            }
+            // Apply confidence filtering before slicing
+            if (options.minConfidence > 0) {
+                const { filterByConfidence } = require('./confidence');
+                const calleeResult = filterByConfidence(allCallees, options.minConfidence);
+                allCallees = calleeResult.kept;
+                aboutConfFiltered += calleeResult.filtered;
             }
             callees = allCallees.slice(0, maxCallees).map(c => ({
                 name: c.name,
@@ -3944,7 +3973,9 @@ class ProjectIndex {
                 startLine: c.startLine,
                 endLine: c.endLine,
                 weight: c.weight,
-                callCount: c.callCount
+                callCount: c.callCount,
+                confidence: c.confidence,
+                resolution: c.resolution,
             }));
         }
 
@@ -4032,6 +4063,7 @@ class ProjectIndex {
             types,
             code,
             includeMethods,
+            ...(aboutConfFiltered > 0 && { confidenceFiltered: aboutConfFiltered }),
             completeness: this.detectCompleteness()
         };
 

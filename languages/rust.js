@@ -895,6 +895,68 @@ function findCallsInCode(code, parser) {
             }
         }
 
+        // Track local variable types from let declarations
+        // Pattern 1: let s = Server { ... } (struct expression)
+        // Pattern 2: let s = Server::new() / ::from() / ::default() (scoped constructor)
+        // Pattern 3: let s: Server = ... (explicit type annotation)
+        if (node.type === 'let_declaration' && functionStack.length > 0) {
+            const patternNode = node.childForFieldName('pattern');
+            const valueNode = node.childForFieldName('value');
+            const typeAnnotation = node.childForFieldName('type');
+            if (patternNode && patternNode.type === 'identifier') {
+                const varName = patternNode.text;
+                const scopeKey = functionStack[functionStack.length - 1].startLine;
+                const typeMap = scopeTypes.get(scopeKey);
+                if (typeMap) {
+                    let typeName = null;
+                    // Pattern 3: explicit type annotation — let s: Server = ...
+                    if (typeAnnotation) {
+                        typeName = extractTypeName(typeAnnotation);
+                    }
+                    if (!typeName && valueNode) {
+                        // Pattern 1: struct expression — let s = Server { ... }
+                        if (valueNode.type === 'struct_expression') {
+                            const nameNode = valueNode.childForFieldName('name');
+                            typeName = nameNode?.text || null;
+                            // Strip path prefix: module::Server → Server
+                            if (typeName && typeName.includes('::')) {
+                                const parts = typeName.split('::');
+                                typeName = parts[parts.length - 1];
+                            }
+                        }
+                        // &Server { ... } (reference to struct expression)
+                        else if (valueNode.type === 'reference_expression') {
+                            const inner = valueNode.childForFieldName('value');
+                            if (inner?.type === 'struct_expression') {
+                                const nameNode = inner.childForFieldName('name');
+                                typeName = nameNode?.text || null;
+                                if (typeName && typeName.includes('::')) {
+                                    const parts = typeName.split('::');
+                                    typeName = parts[parts.length - 1];
+                                }
+                            }
+                        }
+                        // Pattern 2: constructor call — let s = Server::new()
+                        else if (valueNode.type === 'call_expression') {
+                            const funcNode = valueNode.childForFieldName('function');
+                            if (funcNode?.type === 'scoped_identifier') {
+                                const pathText = funcNode.text;
+                                const segments = pathText.split('::');
+                                if (segments.length >= 2) {
+                                    const methodName = segments[segments.length - 1];
+                                    if (/^(new|from|default|with_|create|build|open|connect|init)/.test(methodName)) {
+                                        typeName = segments[segments.length - 2];
+                                        if (!typeName || !/^[A-Z]/.test(typeName)) typeName = null;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (typeName) typeMap.set(varName, typeName);
+                }
+            }
+        }
+
         return true;
     }, {
         onLeave: (node) => {

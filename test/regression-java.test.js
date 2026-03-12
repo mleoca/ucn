@@ -1332,3 +1332,109 @@ describe('fix #167: Java method references detected as callbacks', () => {
         }
     });
 });
+
+// ============================================================================
+// ENTRYPOINTS: Java Spring annotation detection
+// ============================================================================
+
+describe('Entrypoints: Spring annotation detection', () => {
+    const { detectEntrypoints, isFrameworkEntrypoint } = require('../core/entrypoints');
+
+    it('detects @GetMapping/@PostMapping handlers', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Controller.java': `
+package com.example;
+
+@RestController
+public class ItemController {
+    @GetMapping("/items")
+    public List<Item> getItems() { return items; }
+
+    @PostMapping("/items")
+    public Item createItem() { return new Item(); }
+
+    @DeleteMapping("/items/{id}")
+    public void deleteItem(Long id) {}
+
+    private void helper() {}
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('getItems'), 'should detect @GetMapping');
+            assert.ok(names.includes('createItem'), 'should detect @PostMapping');
+            assert.ok(names.includes('deleteItem'), 'should detect @DeleteMapping');
+            assert.ok(!names.includes('helper'), 'should not detect private helper');
+            assert.ok(eps.filter(e => e.name === 'getItems').some(e => e.framework === 'spring'));
+        } finally { rm(dir); }
+    });
+
+    it('detects @Service/@Component DI entry points', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Service.java': `
+package com.example;
+
+@Service
+public class UserService {
+    public void doWork() {}
+}
+
+@Component
+public class HealthIndicator {
+    public String check() { return "ok"; }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            assert.ok(eps.some(e => e.type === 'di'), 'should detect DI entry points');
+        } finally { rm(dir); }
+    });
+
+    it('detects @Scheduled job entry points', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'Jobs.java': `
+package com.example;
+
+@Component
+public class CleanupJob {
+    @Scheduled(fixedRate = 5000)
+    public void cleanup() {
+        System.out.println("cleaning...");
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            assert.ok(eps.some(e => e.name === 'cleanup' && e.type === 'jobs'), 'should detect @Scheduled');
+        } finally { rm(dir); }
+    });
+
+    it('Spring annotations excluded from deadcode', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'App.java': `
+@RestController
+public class App {
+    @GetMapping("/health")
+    public String health() { return "ok"; }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const dc = index.deadcode();
+            const names = dc.map(d => d.name);
+            assert.ok(!names.includes('health'), '@GetMapping method should not be dead code');
+        } finally { rm(dir); }
+    });
+});

@@ -1044,3 +1044,611 @@ describe('config maxFiles from .ucn.json', () => {
         }
     });
 });
+
+// ============================================================================
+// Confidence Scoring Tests (Phase 3a)
+// ============================================================================
+
+describe('Confidence Scoring', () => {
+    const { execute } = require('../core/execute');
+    const { scoreEdge, filterByConfidence, RESOLUTION, SCORES } = require('../core/confidence');
+
+    describe('scoreEdge', () => {
+        it('scores exact-binding highest', () => {
+            const result = scoreEdge({ hasBindingId: true });
+            assert.strictEqual(result.resolution, RESOLUTION.EXACT_BINDING);
+            assert.strictEqual(result.confidence, SCORES[RESOLUTION.EXACT_BINDING]);
+        });
+
+        it('scores same-class resolution', () => {
+            const result = scoreEdge({ resolvedBySameClass: true });
+            assert.strictEqual(result.resolution, RESOLUTION.SAME_CLASS);
+            assert.strictEqual(result.confidence, SCORES[RESOLUTION.SAME_CLASS]);
+        });
+
+        it('scores receiver-hint resolution', () => {
+            const result = scoreEdge({ resolvedByReceiverHint: true });
+            assert.strictEqual(result.resolution, RESOLUTION.RECEIVER_HINT);
+        });
+
+        it('scores parser receiverType', () => {
+            const result = scoreEdge({ hasReceiverType: true });
+            assert.strictEqual(result.resolution, RESOLUTION.RECEIVER_HINT);
+        });
+
+        it('scores scope-match for import evidence', () => {
+            const result = scoreEdge({ hasImportEvidence: true });
+            assert.strictEqual(result.resolution, RESOLUTION.SCOPE_MATCH);
+        });
+
+        it('scores uncertain lowest', () => {
+            const result = scoreEdge({ isUncertain: true });
+            assert.strictEqual(result.resolution, RESOLUTION.UNCERTAIN);
+            assert.strictEqual(result.confidence, SCORES[RESOLUTION.UNCERTAIN]);
+        });
+
+        it('scores name-only for no evidence', () => {
+            const result = scoreEdge({});
+            assert.strictEqual(result.resolution, RESOLUTION.NAME_ONLY);
+        });
+
+        it('includes evidence strings', () => {
+            const result = scoreEdge({ hasBindingId: true, hasImportEvidence: true });
+            assert.ok(result.evidence.length > 0);
+            assert.ok(result.evidence.includes('binding-id match'));
+        });
+    });
+
+    describe('filterByConfidence', () => {
+        it('keeps all edges when threshold is 0', () => {
+            const edges = [{ confidence: 0.5 }, { confidence: 0.2 }];
+            const { kept, filtered } = filterByConfidence(edges, 0);
+            assert.strictEqual(kept.length, 2);
+            assert.strictEqual(filtered, 0);
+        });
+
+        it('filters edges below threshold', () => {
+            const edges = [
+                { confidence: 0.98 },
+                { confidence: 0.65 },
+                { confidence: 0.25 },
+            ];
+            const { kept, filtered } = filterByConfidence(edges, 0.5);
+            assert.strictEqual(kept.length, 2);
+            assert.strictEqual(filtered, 1);
+        });
+
+        it('handles empty array', () => {
+            const { kept, filtered } = filterByConfidence([], 0.5);
+            assert.strictEqual(kept.length, 0);
+            assert.strictEqual(filtered, 0);
+        });
+    });
+
+    describe('callers have confidence metadata', () => {
+        it('attaches confidence to findCallers results', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('helper');
+                assert.ok(callers.length > 0, 'should find callers');
+                for (const c of callers) {
+                    assert.ok(c.confidence != null, 'caller should have confidence');
+                    assert.ok(c.resolution != null, 'caller should have resolution');
+                    assert.ok(c.confidence >= 0 && c.confidence <= 1, 'confidence should be 0-1');
+                }
+            } finally {
+                rm(dir);
+            }
+        });
+
+        it('attaches confidence to findCallees results', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }\nmodule.exports = { main };'
+            });
+            try {
+                const index = idx(dir);
+                const mainDef = index.symbols.get('main');
+                assert.ok(mainDef && mainDef.length > 0);
+                const callees = index.findCallees(mainDef[0]);
+                assert.ok(callees.length > 0, 'should find callees');
+                for (const c of callees) {
+                    assert.ok(c.confidence != null, 'callee should have confidence');
+                    assert.ok(c.resolution != null, 'callee should have resolution');
+                }
+            } finally {
+                rm(dir);
+            }
+        });
+    });
+
+    describe('context command with confidence', () => {
+        it('includes confidenceFiltered in meta', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                // With high min-confidence, should filter edges
+                const result = index.context('helper', { minConfidence: 0.99 });
+                assert.ok(result);
+                assert.ok(result.meta.confidenceFiltered >= 0);
+            } finally {
+                rm(dir);
+            }
+        });
+
+        it('callers in context have confidence when present', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const result = index.context('helper');
+                assert.ok(result);
+                assert.ok(result.callers.length > 0);
+                assert.ok(result.callers[0].confidence != null);
+            } finally {
+                rm(dir);
+            }
+        });
+    });
+
+    describe('--min-confidence filtering via execute', () => {
+        it('filters low-confidence callers in context', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'a.js': 'function foo() { return 1; }\nmodule.exports = { foo };',
+                'b.js': 'const { foo } = require("./a");\nfunction bar() { foo(); }',
+            });
+            try {
+                const index = idx(dir);
+                // Without filter
+                const r1 = execute(index, 'context', { name: 'foo' });
+                assert.ok(r1.ok);
+                const countBefore = r1.result.callers.length;
+
+                // With impossibly high filter
+                const r2 = execute(index, 'context', { name: 'foo', minConfidence: 0.99 });
+                assert.ok(r2.ok);
+                assert.ok(r2.result.callers.length <= countBefore);
+                assert.ok(r2.result.meta.confidenceFiltered >= 0);
+            } finally {
+                rm(dir);
+            }
+        });
+    });
+
+    describe('confidence scoring per resolution tier', () => {
+        it('same-file caller gets exact-binding (0.98)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nfunction main() { helper(); }\nmodule.exports = { helper, main };'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('helper');
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'exact-binding');
+                assert.strictEqual(callers[0].confidence, 0.98);
+            } finally { rm(dir); }
+        });
+
+        it('cross-file imported caller gets scope-match (0.65)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('helper');
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'scope-match');
+                assert.strictEqual(callers[0].confidence, 0.65);
+            } finally { rm(dir); }
+        });
+
+        it('Go receiverType caller gets receiver-hint (0.80)', () => {
+            const dir = tmp({
+                'go.mod': 'module test\ngo 1.21',
+                'main.go': 'package main\n\ntype Server struct{}\n\nfunc (s *Server) Start() {}\n\nfunc main() {\n    s := &Server{}\n    s.Start()\n}\n'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('Start', { includeMethods: true });
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'receiver-hint');
+                assert.strictEqual(callers[0].confidence, 0.80);
+            } finally { rm(dir); }
+        });
+
+        it('Java receiverType caller gets receiver-hint (0.80)', () => {
+            const dir = tmp({
+                'pom.xml': '<project></project>',
+                'Service.java': 'public class Service {\n    public void execute() {}\n}\n',
+                'App.java': 'public class App {\n    public void main() {\n        Service svc = new Service();\n        svc.execute();\n    }\n}\n'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('execute', { includeMethods: true });
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'receiver-hint');
+                assert.strictEqual(callers[0].confidence, 0.80);
+            } finally { rm(dir); }
+        });
+
+        it('JS new Constructor() caller gets receiver-hint (0.80)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'client.js': 'class Client {\n    fetch(url) { return url; }\n}\nmodule.exports = { Client };',
+                'app.js': 'const { Client } = require("./client");\nfunction run() {\n    const c = new Client();\n    c.fetch("/api");\n}\nmodule.exports = { run };'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('fetch', { includeMethods: true });
+                assert.ok(callers.length > 0, 'should find callers of fetch');
+                assert.strictEqual(callers[0].resolution, 'receiver-hint',
+                    'new Client() should infer receiverType and give receiver-hint');
+                assert.ok(callers[0].confidence >= 0.80,
+                    'receiver-hint confidence should be >= 0.80');
+            } finally { rm(dir); }
+        });
+
+        it('Python cross-file inheritance caller gets same-class (0.92)', () => {
+            const dir = tmp({
+                'setup.py': '',
+                'base.py': 'class Base:\n    def process(self):\n        return 1\n',
+                'child.py': 'from base import Base\n\nclass Child(Base):\n    def run(self):\n        self.process()\n'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('process', { includeMethods: true });
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'same-class');
+                assert.strictEqual(callers[0].confidence, 0.92);
+            } finally { rm(dir); }
+        });
+
+        it('JS this.method() caller gets exact-binding (0.98)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'app.js': 'class Controller {\n    helper() { return 1; }\n    main() { return this.helper(); }\n}\nmodule.exports = { Controller };'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('helper', { includeMethods: true });
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'exact-binding');
+                assert.strictEqual(callers[0].confidence, 0.98);
+            } finally { rm(dir); }
+        });
+
+        it('JS method call with no receiver evidence scores uncertain (0.25)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'class Foo { get() { return 1; } }\nmodule.exports = { Foo };',
+                'app.js': 'const m = getModule();\nm.get();\n'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('get', { includeUncertain: true, includeMethods: true });
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'uncertain');
+                assert.strictEqual(callers[0].confidence, 0.25);
+            } finally { rm(dir); }
+        });
+
+        it('callback caller gets scope-match (0.65)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function handler() { return 1; }\nmodule.exports = { handler };',
+                'app.js': 'const { handler } = require("./lib");\nfunction setup() { emitter.on("click", handler); }\n'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('handler');
+                assert.ok(callers.length > 0);
+                assert.strictEqual(callers[0].resolution, 'scope-match');
+                assert.strictEqual(callers[0].confidence, 0.65);
+            } finally { rm(dir); }
+        });
+
+        it('re-exported function callers get scope-match via barrel file', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': `function helper() { return 42; }\nmodule.exports = { helper };`,
+                'barrel.js': `const { helper } = require('./lib');\nmodule.exports = { helper };`,
+                'app.js': `const { helper } = require('./barrel');\nfunction main() { helper(); }\nmodule.exports = { main };`
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('helper');
+                const appCaller = callers.find(c => c.file.endsWith('app.js'));
+                assert.ok(appCaller, 'should find caller in app.js');
+                assert.ok(appCaller.confidence >= 0.65, `re-export caller should be scope-match (0.65) or better, got ${appCaller.confidence}`);
+                assert.notStrictEqual(appCaller.resolution, 'name-only', 'should not be name-only through barrel file');
+            } finally {
+                rm(dir);
+            }
+        });
+    });
+
+    describe('callee confidence scoring', () => {
+        it('same-file callee gets exact-binding (0.98)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'app.js': 'function helper() { return 1; }\nfunction main() { return helper(); }\nmodule.exports = { main };'
+            });
+            try {
+                const index = idx(dir);
+                const callees = index.findCallees(index.symbols.get('main')[0]);
+                assert.ok(callees.length > 0);
+                assert.strictEqual(callees[0].resolution, 'exact-binding');
+                assert.strictEqual(callees[0].confidence, 0.98);
+            } finally { rm(dir); }
+        });
+
+        it('cross-file callee with import gets scope-match (0.65)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib1.js': 'function process(x) { return x + 1; }\nmodule.exports = { process };',
+                'lib2.js': 'function process(x) { return x * 2; }\nmodule.exports = { process };',
+                'app.js': 'const { process } = require("./lib1");\nfunction main() { return process(1); }\nmodule.exports = { main };'
+            });
+            try {
+                const index = idx(dir);
+                const callees = index.findCallees(index.symbols.get('main')[0]);
+                const proc = callees.find(c => c.name === 'process');
+                assert.ok(proc, 'should find process callee');
+                assert.strictEqual(proc.resolution, 'scope-match');
+                assert.strictEqual(proc.confidence, 0.65);
+            } finally { rm(dir); }
+        });
+    });
+
+    describe('confidence edge cases', () => {
+        it('min-confidence=1.0 filters all non-perfect edges', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const result = index.context('helper', { minConfidence: 1.0 });
+                assert.ok(result);
+                assert.strictEqual(result.callers.length, 0);
+                assert.strictEqual(result.meta.confidenceFiltered, 1);
+            } finally { rm(dir); }
+        });
+
+        it('about command respects min-confidence', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'about', { name: 'helper', minConfidence: 0.99 });
+                assert.ok(result.ok);
+                assert.strictEqual(result.result.callers.total, 0);
+            } finally { rm(dir); }
+        });
+
+        it('import evidence overrides uncertain for callers with import graph', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'class Client { fetch() {} }\nmodule.exports = { Client };',
+                'app.js': 'const { Client } = require("./lib");\nconst c = new Client();\nc.fetch();\n'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('fetch', { includeUncertain: true, includeMethods: true });
+                assert.ok(callers.length > 0);
+                // Should be receiver-hint (type-inferred from `new Client()`) not uncertain
+                assert.strictEqual(callers[0].resolution, 'receiver-hint');
+                assert.ok(callers[0].confidence >= 0.80, 'type inference should give high confidence');
+            } finally { rm(dir); }
+        });
+
+        it('about command tracks confidenceFiltered count', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }',
+                'app2.js': 'const { helper } = require("./lib");\nfunction run() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'about', { name: 'helper', minConfidence: 0.9 });
+                assert.ok(result.ok);
+                assert.strictEqual(result.result.confidenceFiltered, 2, 'should track 2 filtered edges');
+                assert.strictEqual(result.result.callers.total, 0, 'all callers below threshold');
+            } finally { rm(dir); }
+        });
+
+        it('about without min-confidence has no confidenceFiltered field', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
+            });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'about', { name: 'helper' });
+                assert.ok(result.ok);
+                assert.strictEqual(result.result.confidenceFiltered, undefined, 'no filtering = no counter');
+            } finally { rm(dir); }
+        });
+
+        it('callee confidence: single definition gets scope-match', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'app.js': 'function main() { helper(); }'  // no import, but only 1 definition
+            });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'context', { name: 'main', showConfidence: true });
+                assert.ok(result.ok);
+                const callee = result.result.callees.find(c => c.name === 'helper');
+                assert.ok(callee);
+                assert.strictEqual(callee.resolution, 'scope-match', 'single def = scope-match');
+                assert.strictEqual(callee.confidence, 0.65);
+            } finally { rm(dir); }
+        });
+
+        it('callee confidence: ambiguous definitions get name-only', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'a.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+                'b.js': 'function helper() { return 2; }\nmodule.exports = { helper };',
+                'app.js': 'function main() { helper(); }'  // no import, 2 definitions
+            });
+            try {
+                const index = idx(dir);
+                const result = execute(index, 'context', { name: 'main', showConfidence: true });
+                assert.ok(result.ok);
+                const callee = result.result.callees.find(c => c.name === 'helper');
+                assert.ok(callee);
+                assert.strictEqual(callee.resolution, 'name-only', 'ambiguous = name-only');
+                assert.strictEqual(callee.confidence, 0.40);
+            } finally { rm(dir); }
+        });
+
+        it('HTML inline script callers get confidence scoring', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function handler() { return 1; }',
+                'page.html': '<html><body><script>function init() { handler(); }</script></body></html>'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('handler', { includeMethods: true });
+                const htmlCaller = callers.find(c => c.file.endsWith('page.html'));
+                assert.ok(htmlCaller, 'should find caller from HTML');
+                assert.ok(htmlCaller.confidence != null, 'HTML caller should have confidence');
+                assert.ok(htmlCaller.resolution != null, 'HTML caller should have resolution');
+            } finally { rm(dir); }
+        });
+
+        it('filterByConfidence treats missing confidence as 0', () => {
+            const { filterByConfidence } = require('../core/confidence');
+            const edges = [
+                { name: 'a', confidence: 0.98 },
+                { name: 'b' },  // no confidence
+                { name: 'c', confidence: 0.65 },
+                { name: 'd', confidence: null },
+            ];
+            const { kept, filtered } = filterByConfidence(edges, 0.5);
+            assert.strictEqual(kept.length, 2, 'should keep only edges >= 0.5');
+            assert.strictEqual(filtered, 2, 'should filter edges without confidence');
+            assert.ok(kept.every(e => e.confidence >= 0.5));
+        });
+
+        it('filterByConfidence handles NaN/negative/Infinity thresholds safely', () => {
+            const { filterByConfidence } = require('../core/confidence');
+            const edges = [{ name: 'a', confidence: 0.65 }];
+
+            // NaN → no filtering (falsy check)
+            assert.strictEqual(filterByConfidence(edges, NaN).kept.length, 1);
+            // Negative → no filtering
+            assert.strictEqual(filterByConfidence(edges, -1).kept.length, 1);
+            // Infinity → filters everything
+            assert.strictEqual(filterByConfidence(edges, Infinity).kept.length, 0);
+        });
+
+        it('self-recursive function gets exact-binding for self-call', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function factorial(n) {\n  if (n <= 1) return 1;\n  return n * factorial(n - 1);\n}\nmodule.exports = { factorial };'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('factorial');
+                const selfCaller = callers.find(c => c.callerName === 'factorial');
+                assert.ok(selfCaller, 'should find self-call');
+                assert.strictEqual(selfCaller.resolution, 'exact-binding');
+                assert.strictEqual(selfCaller.confidence, 0.98);
+            } finally { rm(dir); }
+        });
+
+        it('--show-confidence + --include-methods works together', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'class S { process(d) { return d; } }\nfunction caller() { const s = new S(); s.process("x"); }\nmodule.exports = { S, caller };'
+            });
+            try {
+                const index = idx(dir);
+                const r = execute(index, 'context', { name: 'process', showConfidence: true, includeMethods: true });
+                assert.ok(r.ok);
+                assert.ok(r.result.callers.length > 0, 'should find method callers');
+                assert.ok(r.result.callers[0].confidence != null, 'method callers should have confidence');
+            } finally { rm(dir); }
+        });
+
+        it('JSON always includes confidence regardless of showConfidence flag', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'a.js': 'function fn() { return 1; }\nmodule.exports = { fn };',
+                'b.js': 'const { fn } = require("./a");\nfunction c() { fn(); }\nmodule.exports = { c };'
+            });
+            try {
+                const index = idx(dir);
+                const output = require('../core/output');
+                // Without showConfidence
+                const ctx = execute(index, 'context', { name: 'fn' });
+                const json = JSON.parse(output.formatContextJson(ctx.result));
+                assert.ok(json.data.callers[0].confidence != null, 'JSON should always have confidence');
+                assert.ok(json.data.callers[0].resolution != null, 'JSON should always have resolution');
+            } finally { rm(dir); }
+        });
+
+        it('multiple same-name definitions: targeted callers disambiguate with confidence', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'modA.js': 'function validate(x) { return x > 0; }\nmodule.exports = { validate };',
+                'modB.js': 'function validate(x) { return typeof x === "string"; }\nmodule.exports = { validate };',
+                'userA.js': 'const { validate } = require("./modA");\nfunction check() { validate(42); }\nmodule.exports = { check };'
+            });
+            try {
+                const index = idx(dir);
+                const defsA = index.symbols.get('validate')?.filter(s => s.file?.endsWith('modA.js'));
+                const callers = index.findCallers('validate', { targetDefinitions: defsA });
+                assert.strictEqual(callers.length, 1, 'should find only userA caller');
+                assert.ok(callers[0].file.endsWith('userA.js'));
+                assert.ok(callers[0].confidence >= 0.65, 'targeted caller should have import evidence');
+            } finally { rm(dir); }
+        });
+
+        it('2-hop re-export gets name-only (known limitation)', () => {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                'lib.js': 'function deep() { return 42; }\nmodule.exports = { deep };',
+                'mid.js': 'const { deep } = require("./lib");\nmodule.exports = { deep };',
+                'barrel.js': 'const { deep } = require("./mid");\nmodule.exports = { deep };',
+                'app.js': 'const { deep } = require("./barrel");\nfunction main() { deep(); }\nmodule.exports = { main };'
+            });
+            try {
+                const index = idx(dir);
+                const callers = index.findCallers('deep');
+                const appCaller = callers.find(c => c.file.endsWith('app.js'));
+                assert.ok(appCaller, 'should find caller through 2-hop re-export');
+                // 2-hop re-export: our fix covers 1 hop, 2 hops falls back to name-only
+                assert.strictEqual(appCaller.resolution, 'name-only', '2-hop re-export is name-only (known limitation)');
+            } finally { rm(dir); }
+        });
+    });
+});

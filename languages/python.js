@@ -402,6 +402,8 @@ function findCallsInCode(code, parser) {
     const functionStack = [];  // Stack of { name, startLine, endLine }
     const aliases = new Map();  // Track local aliases: aliasName -> originalName
     const nonCallableNames = new Set();  // Track names assigned non-callable values
+    const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
     // Helper to check if a node is a non-callable literal
     const isNonCallableInit = (node) => {
@@ -467,6 +469,21 @@ function findCallsInCode(code, parser) {
                 startLine,
                 endLine: node.endPosition.row + 1
             });
+            // Save localVarTypes so inner declarations don't leak to sibling functions
+            localVarTypesStack.push(new Map(localVarTypes));
+        }
+
+        // Track parameter type annotations: def foo(x: Foo) → x is Foo
+        if (node.type === 'typed_parameter' || node.type === 'typed_default_parameter') {
+            // typed_default_parameter has 'name' field; typed_parameter does not — use namedChild(0)
+            const nameNode = node.childForFieldName('name') || node.namedChild(0);
+            const typeNode = node.childForFieldName('type');
+            if (nameNode?.type === 'identifier' && typeNode) {
+                const typeId = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
+                if (typeId?.type === 'identifier' && !['self', 'cls'].includes(nameNode.text)) {
+                    localVarTypes.set(nameNode.text, typeId.text);
+                }
+            }
         }
 
         // Track local aliases and non-callable assignments
@@ -474,6 +491,15 @@ function findCallsInCode(code, parser) {
             const left = node.childForFieldName('left');
             const right = node.childForFieldName('right');
             if (left?.type === 'identifier') {
+                // Track type annotation: x: Foo = ... → x is Foo
+                const typeNode = node.childForFieldName('type');
+                if (typeNode) {
+                    // type node wraps the actual type identifier
+                    const typeId = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
+                    if (typeId?.type === 'identifier') {
+                        localVarTypes.set(left.text, typeId.text);
+                    }
+                }
                 if (right?.type === 'identifier') {
                     aliases.set(left.text, right.text);
                 }
@@ -515,6 +541,12 @@ function findCallsInCode(code, parser) {
                 // Exception: partial() already handled above via alias tracking.
                 else if (right?.type === 'call' && !aliases.has(left.text)) {
                     nonCallableNames.add(left.text);
+                    // Infer type from constructor call: x = ClassName(...)
+                    // Python convention: classes start with uppercase
+                    const callFunc = right.childForFieldName('function');
+                    if (callFunc?.type === 'identifier' && /^[A-Z]/.test(callFunc.text)) {
+                        localVarTypes.set(left.text, callFunc.text);
+                    }
                 }
                 // Third: subscript/attribute access results are non-callable data
                 // (e.g., close = candles["close"].values, item = data[0])
@@ -575,11 +607,13 @@ function findCallsInCode(code, parser) {
                         }
                     }
 
+                    const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
                     calls.push({
                         name: attrNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: true,
                         receiver,
+                        ...(receiverType && { receiverType }),
                         ...(selfAttribute && { selfAttribute }),
                         enclosingFunction,
                         uncertain
@@ -641,6 +675,12 @@ function findCallsInCode(code, parser) {
         onLeave: (node) => {
             if (isFunctionNode(node)) {
                 functionStack.pop();
+                // Restore localVarTypes to pre-function state
+                const saved = localVarTypesStack.pop();
+                if (saved) {
+                    localVarTypes.clear();
+                    for (const [k, v] of saved) localVarTypes.set(k, v);
+                }
             }
         }
     });

@@ -2700,3 +2700,360 @@ func startStateful() {
     });
 });
 
+// ============================================================================
+// ENTRYPOINTS: Go framework detection (Gin, net/http)
+// ============================================================================
+
+describe('Entrypoints: Gin/net-http detection', () => {
+    const { detectEntrypoints } = require('../core/entrypoints');
+
+    it('detects Gin router.GET/POST handlers', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `
+package main
+
+import "github.com/gin-gonic/gin"
+
+func listUsers(c *gin.Context) {
+    c.JSON(200, []string{})
+}
+
+func createUser(c *gin.Context) {
+    c.JSON(201, nil)
+}
+
+func main() {
+    r := gin.Default()
+    r.GET("/users", listUsers)
+    r.POST("/users", createUser)
+    r.Run()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('listUsers'), 'should detect listUsers as Gin handler');
+            assert.ok(names.includes('createUser'), 'should detect createUser as Gin handler');
+            const ep = eps.find(e => e.name === 'listUsers');
+            assert.strictEqual(ep.framework, 'gin');
+            assert.strictEqual(ep.type, 'http');
+        } finally { rm(dir); }
+    });
+
+    it('detects http.HandleFunc handlers', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'server.go': `
+package main
+
+import "net/http"
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {
+    w.Write([]byte("ok"))
+}
+
+func main() {
+    http.HandleFunc("/health", healthHandler)
+    http.ListenAndServe(":8080", nil)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('healthHandler'), 'should detect http.HandleFunc handler');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Go callback detection (isPotentialCallback for plain identifiers in argument_list)
+// Verifies that the Go parser's plain-identifier callback detection (e.g.,
+// r.GET("/users", listUsers)) does not introduce false positives in
+// findCallers/findCallees when variables appear in argument_list.
+// ============================================================================
+
+describe('Regression: Go callback detection noise (isPotentialCallback)', () => {
+    it('detects function references passed as callbacks', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'main.go': `package main
+
+import "fmt"
+
+func process(data string) string {
+    return fmt.Sprintf("processed: %s", data)
+}
+
+func transform(fn func(string) string, input string) string {
+    return fn(input)
+}
+
+func main() {
+    result := transform(process, "hello")
+    fmt.Println(result)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // process is passed as callback to transform — main should be a caller
+            const processCallers = index.findCallers('process');
+            assert.ok(processCallers.length > 0, 'process should have callers');
+            assert.ok(processCallers.some(c => (c.name || c.callerName) === 'main'),
+                'main should be a caller of process (callback)');
+            assert.ok(processCallers.some(c => c.isFunctionReference),
+                'caller should be marked as isFunctionReference');
+
+            // transform is called directly — main should be a caller
+            const transformCallers = index.findCallers('transform');
+            assert.ok(transformCallers.length > 0, 'transform should have callers');
+            assert.ok(transformCallers.some(c => (c.name || c.callerName) === 'main'),
+                'main should be a caller of transform');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not create phantom callers from variables in argument_list', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'main.go': `package main
+
+import "fmt"
+
+func process(data string) string {
+    return fmt.Sprintf("processed: %s", data)
+}
+
+func transform(fn func(string) string, input string) string {
+    return fn(input)
+}
+
+func main() {
+    result := transform(process, "hello")
+    fmt.Println(result)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // Variables like data, input, result appear in argument_list but are NOT
+            // functions — they should not appear as callers or callees
+            for (const varName of ['data', 'input', 'result']) {
+                const callers = index.findCallers(varName);
+                assert.strictEqual(callers.length, 0,
+                    `variable "${varName}" should not have callers (not in symbol table)`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('findCallees includes callbacks alongside direct calls', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'main.go': `package main
+
+import "fmt"
+
+func process(data string) string {
+    return fmt.Sprintf("processed: %s", data)
+}
+
+func transform(fn func(string) string, input string) string {
+    return fn(input)
+}
+
+func main() {
+    result := transform(process, "hello")
+    fmt.Println(result)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const mainDef = index.symbols.get('main')?.[0];
+            assert.ok(mainDef, 'main definition should exist');
+
+            const callees = index.findCallees(mainDef, { includeUncertain: true });
+            const calleeNames = callees.map(c => c.name);
+
+            assert.ok(calleeNames.includes('transform'),
+                'findCallees(main) should include transform (direct call)');
+            assert.ok(calleeNames.includes('process'),
+                'findCallees(main) should include process (callback reference)');
+
+            // Variables should NOT be callees
+            for (const varName of ['data', 'input', 'result', 'hello']) {
+                assert.ok(!calleeNames.includes(varName),
+                    `variable "${varName}" should not be a callee`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Gin-style route handler detection via callback', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'router.go': `package main
+
+import (
+    "fmt"
+    "net/http"
+)
+
+func listUsers(w http.ResponseWriter, r *http.Request) {
+    users := getUsers()
+    fmt.Fprintf(w, "%v", users)
+}
+
+func getUsers() []string {
+    return []string{"alice", "bob"}
+}
+
+func createUser(w http.ResponseWriter, r *http.Request) {
+    name := r.URL.Query().Get("name")
+    fmt.Fprintf(w, "created: %s", name)
+}
+
+func setupRoutes(mux *http.ServeMux) {
+    mux.HandleFunc("/users", listUsers)
+    mux.HandleFunc("/users/create", createUser)
+}
+
+func main() {
+    mux := http.NewServeMux()
+    setupRoutes(mux)
+    http.ListenAndServe(":8080", mux)
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // Route handlers should be detected as callees of setupRoutes
+            const setupDef = index.symbols.get('setupRoutes')?.[0];
+            assert.ok(setupDef, 'setupRoutes definition should exist');
+
+            const callees = index.findCallees(setupDef, { includeUncertain: true });
+            const calleeNames = callees.map(c => c.name);
+
+            assert.ok(calleeNames.includes('listUsers'),
+                'setupRoutes should have listUsers as callee (route callback)');
+            assert.ok(calleeNames.includes('createUser'),
+                'setupRoutes should have createUser as callee (route callback)');
+
+            // Route handlers should list setupRoutes as caller
+            const listUsersCallers = index.findCallers('listUsers');
+            assert.ok(listUsersCallers.some(c => (c.name || c.callerName) === 'setupRoutes'),
+                'listUsers should have setupRoutes as caller');
+            assert.ok(listUsersCallers.some(c => c.isFunctionReference),
+                'listUsers caller should be marked as isFunctionReference');
+
+            const createUserCallers = index.findCallers('createUser');
+            assert.ok(createUserCallers.some(c => (c.name || c.callerName) === 'setupRoutes'),
+                'createUser should have setupRoutes as caller');
+
+            // Variables should NOT be phantom callers/callees
+            for (const varName of ['users', 'name', 'mux', 'w', 'r']) {
+                const callers = index.findCallers(varName);
+                assert.strictEqual(callers.length, 0,
+                    `variable "${varName}" should not have callers`);
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('context() correctly reports callback relationships', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'main.go': `package main
+
+func process(x int) int {
+    return x * 2
+}
+
+func apply(fn func(int) int, val int) int {
+    return fn(val)
+}
+
+func helper() int {
+    result := apply(process, 42)
+    return result
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // context('process') should show helper as a caller
+            const ctx = index.context('process');
+            assert.ok(ctx.callers.length > 0, 'process should have callers');
+            assert.ok(ctx.callers.some(c => c.callerName === 'helper'),
+                'helper should be a caller of process (callback)');
+
+            // context('helper') should show both apply and process as callees
+            const ctxHelper = index.context('helper');
+            const calleeNames = ctxHelper.callees.map(c => c.name);
+            assert.ok(calleeNames.includes('apply'),
+                'helper callees should include apply (direct call)');
+            assert.ok(calleeNames.includes('process'),
+                'helper callees should include process (callback reference)');
+
+            // Variables should NOT appear as callees
+            assert.ok(!calleeNames.includes('result'),
+                'variable "result" should not be a callee');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('GO_SKIP_IDENTS filters common non-function identifiers', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21\n',
+            'main.go': `package main
+
+import "context"
+
+func doWork(ctx context.Context) error {
+    if err := process(ctx, nil, true, false); err != nil {
+        return err
+    }
+    return nil
+}
+
+func process(ctx context.Context, data interface{}, flag1 bool, flag2 bool) error {
+    return nil
+}
+`
+        });
+        try {
+            const index = idx(dir);
+
+            // nil, true, false, err, ctx are in GO_SKIP_IDENTS — should not be detected
+            for (const skipName of ['nil', 'true', 'false', 'err', 'ctx']) {
+                const callers = index.findCallers(skipName);
+                assert.strictEqual(callers.length, 0,
+                    `GO_SKIP_IDENT "${skipName}" should not have callers`);
+            }
+
+            // process should still be detected as a callee of doWork (direct call, not callback)
+            const doWorkDef = index.symbols.get('doWork')?.[0];
+            const callees = index.findCallees(doWorkDef, { includeUncertain: true });
+            assert.ok(callees.some(c => c.name === 'process'),
+                'doWork should have process as callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+

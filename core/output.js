@@ -348,7 +348,8 @@ function formatContextJson(context) {
                 file: c.relativePath || c.file,
                 line: c.line,
                 expression: c.content,  // FULL expression
-                callerName: c.callerName
+                callerName: c.callerName,
+                ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
             })),
             callees: callees.map(c => ({
                 name: c.name,
@@ -356,7 +357,8 @@ function formatContextJson(context) {
                 file: c.relativePath || c.file,
                 line: c.startLine,
                 params: c.params,  // FULL params
-                weight: c.weight || 'normal'  // Dependency weight: core, setup, utility
+                weight: c.weight || 'normal',  // Dependency weight: core, setup, utility
+                ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
             })),
             ...(context.warnings && { warnings: context.warnings })
         }
@@ -1512,6 +1514,9 @@ function formatAbout(about, options = {}) {
             lines.push(`  Note: ${w.message}`);
         }
     }
+    if (about.confidenceFiltered) {
+        lines.push(`  Note: ${about.confidenceFiltered} edge(s) below confidence threshold hidden`);
+    }
 
     // Usage summary
     lines.push('');
@@ -1519,6 +1524,7 @@ function formatAbout(about, options = {}) {
     lines.push(`  ${about.usages.calls} calls, ${about.usages.imports} imports, ${about.usages.references} references`);
 
     // Callers
+    const showConf = options.showConfidence || false;
     let aboutTruncated = false;
     if (about.callers.total > 0) {
         lines.push('');
@@ -1532,6 +1538,9 @@ function formatAbout(about, options = {}) {
             const caller = c.callerName ? `[${c.callerName}]` : '';
             lines.push(`  ${c.file}:${c.line} ${caller}`);
             lines.push(`    ${c.expression}`);
+            if (showConf && c.confidence != null) {
+                lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+            }
         }
     }
 
@@ -1547,6 +1556,9 @@ function formatAbout(about, options = {}) {
         for (const c of about.callees.top) {
             const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
             lines.push(`  ${c.name}${weight} - ${c.file}:${c.line} (${c.callCount}x)`);
+            if (showConf && c.confidence != null) {
+                lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+            }
 
             // Inline expansion: show first 3 lines of callee code
             if (expand && root && c.file && c.startLine) {
@@ -1954,6 +1966,7 @@ function formatContext(ctx, options = {}) {
         const notes = [];
         if (ctx.meta.dynamicImports) { const dn = dynamicImportsNote(ctx.meta.dynamicImports, ctx.meta); if (dn) notes.push(dn); }
         if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
+        if (ctx.meta.confidenceFiltered) notes.push(`${ctx.meta.confidenceFiltered} edge(s) below confidence threshold hidden`);
         if (notes.length) {
             const uncertainSuffix = ctx.meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
             lines.push(`  Note: ${notes.join(', ')}${uncertainSuffix}`);
@@ -1970,12 +1983,16 @@ function formatContext(ctx, options = {}) {
         }
     }
 
+    const showConf = options.showConfidence || false;
     const callers = ctx.callers || [];
     lines.push(`\nCALLERS (${callers.length}):`);
     for (const c of callers) {
         const callerName = c.callerName ? ` [${c.callerName}]` : '';
         lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
         lines.push(`    ${c.content.trim()}`);
+        if (showConf && c.confidence != null) {
+            lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+        }
         expandable.push({
             num: itemNum++,
             type: 'caller',
@@ -1999,6 +2016,9 @@ function formatContext(ctx, options = {}) {
     for (const c of callees) {
         const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
         lines.push(`  [${itemNum}] ${c.name}${weight} - ${c.relativePath}:${c.startLine}`);
+        if (showConf && c.confidence != null) {
+            lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+        }
         expandable.push({
             num: itemNum++,
             type: 'callee',
@@ -3065,6 +3085,80 @@ function formatLinesJson(result) {
     }, null, 2);
 }
 
+// ============================================================================
+// Entrypoints command formatters
+// ============================================================================
+
+/**
+ * Format entrypoints command output (text)
+ */
+function formatEntrypoints(results, options = {}) {
+    if (!results || results.length === 0) {
+        return 'No framework entry points detected.';
+    }
+
+    const lines = [];
+    lines.push(`Framework Entry Points: ${results.length} detected\n`);
+
+    // Group by type
+    const byType = new Map();
+    for (const ep of results) {
+        if (!byType.has(ep.type)) byType.set(ep.type, []);
+        byType.get(ep.type).push(ep);
+    }
+
+    const typeLabels = {
+        http: 'HTTP Routes',
+        di: 'Dependency Injection',
+        jobs: 'Job Schedulers',
+        test: 'Test Fixtures',
+        runtime: 'Runtime Entry Points',
+        ui: 'UI Handlers',
+        events: 'Event Handlers',
+    };
+
+    let itemNum = 0;
+    for (const [type, entries] of byType) {
+        const label = typeLabels[type] || type;
+        lines.push(`${label} (${entries.length}):`);
+
+        let currentFile = null;
+        for (const ep of entries) {
+            if (ep.file !== currentFile) {
+                currentFile = ep.file;
+                lines.push(`  ${ep.file}`);
+            }
+            itemNum++;
+            const evidence = ep.evidence.join(', ');
+            lines.push(`    [${itemNum}] ${ep.name} (${ep.framework}) — ${evidence}${' '.repeat(Math.max(0, 40 - ep.name.length - ep.framework.length - evidence.length))}:${ep.line}`);
+        }
+        lines.push('');
+    }
+
+    return lines.join('\n').trimEnd();
+}
+
+/**
+ * Format entrypoints command output (JSON)
+ */
+function formatEntrypointsJson(results) {
+    return JSON.stringify({
+        meta: { total: results.length },
+        data: {
+            entrypoints: results.map(ep => ({
+                name: ep.name,
+                file: ep.file,
+                line: ep.line,
+                type: ep.type,
+                framework: ep.framework,
+                patternId: ep.patternId,
+                evidence: ep.evidence,
+                confidence: ep.confidence,
+            }))
+        }
+    }, null, 2);
+}
+
 module.exports = {
     // Utilities
     normalizeParams,
@@ -3184,5 +3278,9 @@ module.exports = {
     formatClassResult,
     formatClassResultJson,
     formatLines,
-    formatLinesJson
+    formatLinesJson,
+
+    // Entrypoints command
+    formatEntrypoints,
+    formatEntrypointsJson,
 };
