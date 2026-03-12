@@ -241,6 +241,50 @@ const HANDLERS = {
         return { ok: true, result };
     },
 
+    blast: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
+        const depthVal = num(p.depth, undefined);
+        const result = index.blast(p.name, {
+            depth: depthVal ?? 3,
+            file: p.file,
+            className: p.className,
+            all: p.all || depthVal !== undefined,
+            exclude: toExcludeArray(p.exclude),
+            includeMethods: p.includeMethods,
+            includeUncertain: p.includeUncertain || false,
+        });
+        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        return { ok: true, result };
+    },
+
+    reverseTrace: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
+        const depthVal = num(p.depth, undefined);
+        const result = index.reverseTrace(p.name, {
+            depth: depthVal ?? 5,
+            file: p.file,
+            className: p.className,
+            all: p.all || depthVal !== undefined,
+            exclude: toExcludeArray(p.exclude),
+            includeMethods: p.includeMethods,
+            includeUncertain: p.includeUncertain || false,
+        });
+        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        return { ok: true, result };
+    },
+
     smart: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
@@ -424,6 +468,30 @@ const HANDLERS = {
     },
 
     search: (index, p) => {
+        // Detect structural search mode: any of these flags triggers index-based search
+        const isStructural = p.type || p.param || p.receiver || p.returns || p.decorator || p.exported || p.unused;
+        if (isStructural) {
+            const exclude = applyTestExclusions(p.exclude, p.includeTests);
+            const topVal = num(p.top, undefined) || num(p.limit, undefined);
+            const result = index.structuralSearch({
+                term: p.term || p.name,
+                type: p.type,
+                param: p.param,
+                receiver: p.receiver,
+                returns: p.returns,
+                decorator: p.decorator,
+                exported: p.exported || false,
+                unused: p.unused || false,
+                caseSensitive: p.caseSensitive || false,
+                exclude,
+                in: p.in,
+                file: p.file,
+                top: topVal || 50,
+            });
+            if (result.meta.error) return { ok: false, error: result.meta.error };
+            return { ok: true, result, structural: true };
+        }
+
         const err = requireTerm(p.term);
         if (err) return { ok: false, error: err };
         const testsExcluded = !p.includeTests;
@@ -452,6 +520,27 @@ const HANDLERS = {
             callsOnly: p.callsOnly || false,
             className: p.className,
         });
+        return { ok: true, result };
+    },
+
+    affectedTests: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
+        const depthVal = num(p.depth, undefined);
+        const result = index.affectedTests(p.name, {
+            depth: depthVal ?? 3,
+            file: p.file,
+            className: p.className,
+            exclude: toExcludeArray(p.exclude),
+            includeMethods: p.includeMethods,
+            includeUncertain: p.includeUncertain || false,
+        });
+        if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
     },
 
@@ -701,6 +790,14 @@ const HANDLERS = {
         });
         const fileErr = checkFileError(result, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        return { ok: true, result };
+    },
+
+    circularDeps: (index, p) => {
+        const result = index.circularDeps({
+            file: p.file,
+            exclude: toExcludeArray(p.exclude),
+        });
         return { ok: true, result };
     },
 

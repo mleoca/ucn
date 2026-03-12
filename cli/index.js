@@ -104,6 +104,14 @@ function parseFlags(tokens) {
         className: getValueFlag('--class-name'),
         limit: parseInt(getValueFlag('--limit') || '0') || undefined,
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
+        // Structural search flags
+        type: getValueFlag('--type'),
+        param: getValueFlag('--param'),
+        receiver: getValueFlag('--receiver'),
+        returns: getValueFlag('--returns'),
+        decorator: getValueFlag('--decorator'),
+        exported: tokens.includes('--exported'),
+        unused: tokens.includes('--unused'),
     };
 }
 
@@ -128,7 +136,8 @@ const knownFlags = new Set([
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions',
-    '--max-lines', '--class-name', '--limit', '--max-files'
+    '--max-lines', '--class-name', '--limit', '--max-files',
+    '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused'
 ]);
 
 // Handle help flag
@@ -287,7 +296,9 @@ function runFileCommand(filePath, command, arg) {
 
     // Require arg for commands that need it
     const needsArg = { fn: 'fn <name>', class: 'class <name>', find: 'find <name>', usages: 'usages <name>', search: 'search <term>', lines: 'lines <start-end>', typedef: 'typedef <name>' };
-    if (needsArg[canonical]) {
+    // Structural search doesn't require term
+    const isStructural = flags.type || flags.param || flags.receiver || flags.returns || flags.decorator || flags.exported || flags.unused;
+    if (needsArg[canonical] && !(canonical === 'search' && isStructural)) {
         requireArg(arg, `Usage: ucn <file> ${needsArg[canonical]}`);
     }
 
@@ -342,7 +353,11 @@ function runFileCommand(filePath, command, arg) {
             printOutput(result, r => output.formatUsagesJson(r, arg), r => output.formatUsages(r, arg));
             break;
         case 'search':
-            printOutput(result, r => output.formatSearchJson(r, arg), r => output.formatSearch(r, arg));
+            if (result && result.meta && result.meta.mode === 'structural') {
+                printOutput(result, output.formatStructuralSearchJson, output.formatStructuralSearch);
+            } else {
+                printOutput(result, r => output.formatSearchJson(r, arg), r => output.formatSearch(r, arg));
+            }
             break;
         case 'typedef':
             printOutput(result, r => output.formatTypedefJson(r, arg), r => output.formatTypedef(r, arg));
@@ -537,6 +552,13 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        case 'blast': {
+            const { ok, result, error } = execute(index, 'blast', { name: arg, ...flags });
+            if (!ok) fail(error);
+            printOutput(result, output.formatBlastJson, output.formatBlast);
+            break;
+        }
+
         case 'plan': {
             const { ok, result, error } = execute(index, 'plan', { name: arg, ...flags });
             if (!ok) fail(error);
@@ -548,6 +570,13 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error } = execute(index, 'trace', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatTraceJson, output.formatTrace);
+            break;
+        }
+
+        case 'reverseTrace': {
+            const { ok, result, error } = execute(index, 'reverseTrace', { name: arg, ...flags });
+            if (!ok) fail(error);
+            printOutput(result, output.formatReverseTraceJson, output.formatReverseTrace);
             break;
         }
 
@@ -646,6 +675,13 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        case 'circularDeps': {
+            const { ok, result, error } = execute(index, 'circularDeps', { file: flags.file, exclude: flags.exclude });
+            if (!ok) fail(error);
+            printOutput(result, output.formatCircularDepsJson, output.formatCircularDeps);
+            break;
+        }
+
         // ── Remaining commands ──────────────────────────────────────────
 
         case 'typedef': {
@@ -668,6 +704,13 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        case 'affectedTests': {
+            const { ok, result, error } = execute(index, 'affectedTests', { name: arg, ...flags });
+            if (!ok) fail(error);
+            printOutput(result, output.formatAffectedTestsJson, output.formatAffectedTests);
+            break;
+        }
+
         case 'api': {
             const { ok, result, error, note } = execute(index, 'api', { file: arg || flags.file, limit: flags.limit });
             if (!ok) fail(error);
@@ -680,12 +723,16 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'search': {
-            const { ok, result, error } = execute(index, 'search', { term: arg, ...flags });
+            const { ok, result, error, structural } = execute(index, 'search', { term: arg, ...flags });
             if (!ok) fail(error);
-            printOutput(result,
-                r => output.formatSearchJson(r, arg),
-                r => output.formatSearch(r, arg)
-            );
+            if (structural) {
+                printOutput(result, output.formatStructuralSearchJson, output.formatStructuralSearch);
+            } else {
+                printOutput(result,
+                    r => output.formatSearchJson(r, arg),
+                    r => output.formatSearch(r, arg)
+                );
+            }
             break;
         }
 
@@ -993,7 +1040,9 @@ UNDERSTAND CODE (UCN's strength - semantic analysis)
   context <name>      Who calls this + what it calls (numbered for expand)
   smart <name>        Function + all dependencies inline
   impact <name>       What breaks if changed (call sites grouped by file)
+  blast <name>        Transitive blast radius (callers of callers, --depth=N)
   trace <name>        Call tree visualization (--depth=N expands all children)
+  reverse-trace <name> Upward call chain to entry points (--depth=N, default 5)
   related <name>      Find similar functions (same file, shared deps)
   example <name>      Best usage example with context
 
@@ -1004,7 +1053,9 @@ FIND CODE
   usages <name>       All usages grouped: definitions, calls, imports, references
   toc                 Table of contents (compact; --detailed lists all symbols)
   search <term>       Text search (regex default, --context=N, --exclude=, --in=)
+                      Structural: --type=function|class|call --param= --returns= --decorator= --exported --unused
   tests <name>        Find test files for a function
+  affected-tests <n>  Tests affected by a change (blast + test detection, --depth=N)
 
 ═══════════════════════════════════════════════════════════════════════════════
 EXTRACT CODE
@@ -1021,6 +1072,7 @@ FILE DEPENDENCIES
   exporters <file>    Who imports this file
   file-exports <file> What does file export
   graph <file>        Full dependency tree (--depth=N, --direction=imports|importers|both)
+  circular-deps       Detect circular import chains (--file=, --exclude=)
 
 ═══════════════════════════════════════════════════════════════════════════════
 REFACTORING HELPERS
@@ -1128,18 +1180,23 @@ Commands:
   expand <N>             Show code for item N from context
   smart <name>           Function + dependencies
   impact <name>          What breaks if changed
+  blast <name>           Transitive blast radius (--depth=N)
   trace <name>           Call tree (--depth=N)
+  reverse-trace <name>   Upward to entry points (--depth=N)
   example <name>         Best usage example
   related <name>         Sibling functions
   fn <name>[,n2,...]     Extract function(s) (--file=)
   class <name>           Extract class code (--file=)
   lines <range>          Extract lines (--file= required)
   graph <file>           File dependency tree (--direction=, --depth=)
+  circular-deps          Circular import chains (--file=, --exclude=)
   file-exports <file>    File's exported symbols
   imports <file>         What file imports
   exporters <file>       Who imports file
   tests <name>           Find tests (--calls-only)
+  affected-tests <n>     Tests affected by a change (--depth=N)
   search <term>          Text search (--context=N, --exclude=, --in=)
+                         Structural: --type= --param= --returns= --decorator= --exported --unused
   typedef <name>         Find type definitions
   deadcode               Find unused functions/classes
   verify <name>          Check call sites match signature
@@ -1349,10 +1406,24 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
+        case 'blast': {
+            const { ok, result, error } = execute(index, 'blast', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatBlast(result));
+            break;
+        }
+
         case 'trace': {
             const { ok, result, error } = execute(index, 'trace', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
             console.log(output.formatTrace(result));
+            break;
+        }
+
+        case 'reverseTrace': {
+            const { ok, result, error } = execute(index, 'reverseTrace', { name: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatReverseTrace(result));
             break;
         }
 
@@ -1361,6 +1432,13 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             if (!ok) { console.log(error); return; }
             const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
             console.log(output.formatGraph(result, { showAll: iflags.all || !!iflags.depth, maxDepth: graphDepth, file: arg }));
+            break;
+        }
+
+        case 'circularDeps': {
+            const { ok, result, error } = execute(index, 'circularDeps', { file: iflags.file, exclude: iflags.exclude });
+            if (!ok) { console.log(error); return; }
+            console.log(output.formatCircularDeps(result));
             break;
         }
 
@@ -1392,10 +1470,21 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
-        case 'search': {
-            const { ok, result, error } = execute(index, 'search', { term: arg, ...iflags });
+        case 'affectedTests': {
+            const { ok, result, error } = execute(index, 'affectedTests', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            console.log(output.formatSearch(result, arg));
+            console.log(output.formatAffectedTests(result));
+            break;
+        }
+
+        case 'search': {
+            const { ok, result, error, structural } = execute(index, 'search', { term: arg, ...iflags });
+            if (!ok) { console.log(error); return; }
+            if (structural) {
+                console.log(output.formatStructuralSearch(result));
+            } else {
+                console.log(output.formatSearch(result, arg));
+            }
             break;
         }
 

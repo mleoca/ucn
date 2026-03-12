@@ -330,17 +330,43 @@ function findClasses(code, parser) {
                 const annotations = extractAnnotations(node);
                 const docstring = extractJavaDocstring(code, startLine);
                 const generics = extractGenerics(node);
+                const implementsInfo = extractImplements(node);
+
+                // Extract record components as members
+                const members = extractClassMembers(node, code);
+                // Also extract record components from formal_parameters
+                const paramsNode = node.childForFieldName('parameters');
+                if (paramsNode) {
+                    for (let pi = 0; pi < paramsNode.namedChildCount; pi++) {
+                        const param = paramsNode.namedChild(pi);
+                        if (param.type === 'formal_parameter' || param.type === 'spread_parameter') {
+                            const pName = param.childForFieldName('name');
+                            const pType = param.childForFieldName('type');
+                            if (pName) {
+                                const { startLine: pLine, endLine: pEnd } = nodeToLocation(param, code);
+                                members.push({
+                                    name: pName.text,
+                                    startLine: pLine,
+                                    endLine: pEnd,
+                                    memberType: 'field',
+                                    ...(pType && { fieldType: pType.text })
+                                });
+                            }
+                        }
+                    }
+                }
 
                 classes.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     type: 'record',
-                    members: [],
+                    members,
                     modifiers,
                     ...(docstring && { docstring }),
                     ...(generics && { generics }),
-                    ...(annotations.length > 0 && { annotations })
+                    ...(annotations.length > 0 && { annotations }),
+                    ...(implementsInfo.length > 0 && { implements: implementsInfo })
                 });
             }
             return false;
@@ -384,6 +410,14 @@ function extractImplements(classNode) {
             const iface = interfacesNode.namedChild(i);
             if (iface.type === 'type_identifier' || iface.type === 'generic_type') {
                 interfaces.push(iface.text);
+            } else if (iface.type === 'type_list') {
+                // Records and some class declarations wrap interfaces in a type_list
+                for (let j = 0; j < iface.namedChildCount; j++) {
+                    const inner = iface.namedChild(j);
+                    if (inner.type === 'type_identifier' || inner.type === 'generic_type') {
+                        interfaces.push(inner.text);
+                    }
+                }
             }
         }
         return interfaces;

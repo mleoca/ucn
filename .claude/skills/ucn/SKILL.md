@@ -49,7 +49,17 @@ ucn impact score_trend --exclude=test  # Only production callers
 
 Replaces: grep for the function name → manually filtering definitions vs calls vs imports → reading context around each match.
 
-### 3. `trace` — Understand execution flow
+### 3. `blast` — Transitive blast radius
+
+Walks UP the caller chain recursively. Shows the full tree of functions affected transitively if you change something. Like `impact` but recursive — answers "what breaks if I change this, including indirect callers?"
+
+```bash
+ucn blast helper                     # callers of callers (depth 3)
+ucn blast helper --depth=5           # deeper chain
+ucn blast helper --exclude=test      # skip test callers
+```
+
+### 4. `trace` — Understand execution flow (downward)
 
 Draws the call tree downward from any function. Compact by default; setting `--depth=N` shows the full tree to that depth with all children expanded.
 
@@ -61,7 +71,7 @@ ucn trace generate_report --all      # all children at default depth
 
 Shows the entire pipeline — what `generate_report` calls, what those functions call, etc. — as an indented tree. No file reading needed. Invaluable for understanding orchestrator functions or entry points.
 
-### 4. `fn` / `class` — Extract without reading the whole file
+### 5. `fn` / `class` — Extract without reading the whole file
 
 Pull one or more functions out of a large file. Supports comma-separated names for bulk extraction.
 
@@ -71,7 +81,7 @@ ucn fn parse,format,validate        # Extract multiple functions in one call
 ucn class MarketDataFetcher
 ```
 
-### 5. `deadcode` — Find unused code
+### 6. `deadcode` — Find unused code
 
 Lists all functions and classes with zero callers across the project.
 
@@ -86,6 +96,9 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 |-----------|---------|-------------|
 | Quick callers + callees list | `ucn context <name>` | Who calls it and what it calls. Results are numbered for `expand`. Use instead of `about` when you just need the call graph, not source code |
 | Need function + all its helpers inline | `ucn smart <name>` | Returns function source with every helper it calls expanded below it. Use instead of `about` when you need code, not metadata |
+| Full transitive blast radius | `ucn blast <name> --depth=5` | Callers of callers — the full chain of what breaks if you change something |
+| How execution reaches a function | `ucn reverse-trace <name>` | Walk UP callers to entry points (★ marked). Shows how code flows to this function. Default depth=5 |
+| Which tests to run after a change | `ucn affected-tests <name>` | Blast + test detection: shows test files, coverage %, uncovered functions. Use `--depth=N` to control depth |
 | What changed and who's affected | `ucn diff-impact --base=main` | Shows changed functions + their callers from git diff |
 | Checking if a refactor broke signatures | `ucn verify <name>` | Validates all call sites match the function's parameter count |
 | Understanding a file's role in the project | `ucn imports <file>` | What it depends on |
@@ -97,10 +110,16 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 | Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |
 | Regex search (default) | `ucn search '\d+'` | Search supports regex by default (alternation, character classes, etc.) |
 | Text search filtered | `ucn search term --exclude=test` | Search only in matching files |
+| Structural search (index) | `ucn search --type=function --param=Request` | Query the symbol table, not text. Finds functions by param, return type, decorator, etc. |
+| Find all db.* calls | `ucn search --type=call --receiver=db` | Search call sites by receiver — something grep can't do |
+| Find exported functions | `ucn search --type=function --exported` | Only exported/public symbols |
+| Find unused symbols | `ucn search --type=function --unused` | Mini deadcode: zero callers |
+| Find decorated functions | `ucn search --decorator=Route` | Functions/classes with a specific decorator/annotation |
 | Finding all usages (not just calls) | `ucn usages <name>` | Groups into: definitions, calls, imports, type references |
 | Finding sibling/related functions | `ucn related <name>` | Name-based + structural matching (same file, shared deps). Not semantic — best for parse/format pairs |
 | Preview a rename or param change | `ucn plan <name> --rename-to=new_name` | Shows what would change without doing it |
 | File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Setting `--depth=N` expands all children. Can be noisy — use depth=1 for large projects. For function-level flow, use `trace` instead |
+| Are there circular dependencies? | `ucn circular-deps` | Detect circular import chains. `--file=<pattern>` filters to cycles involving a file. `--exclude=test` skips test files |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
 | Extract specific lines from a file | `ucn lines --file=<file> --range=10-20` | Pull a line range without reading the whole file |
 | Find type definitions | `ucn typedef <name>` | Interfaces, enums, structs, traits, type aliases |
@@ -153,6 +172,13 @@ ucn [target] <command> [name] [--flags]
 | `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |
 | `--include-exported` | Include exported symbols in `deadcode` results |
 | `--include-decorated` | Include decorated/annotated symbols in `deadcode` results |
+| `--type=<kind>` | Structural search: `function`, `class`, `call`, `method`, `type`. Triggers index query instead of text grep |
+| `--param=<name>` | Structural search: filter by parameter name or type (e.g., `--param=Request`) |
+| `--receiver=<name>` | Structural search: filter calls by receiver (e.g., `--receiver=db` for all db.* calls) |
+| `--returns=<type>` | Structural search: filter by return type (e.g., `--returns=error`) |
+| `--decorator=<name>` | Structural search: filter by decorator/annotation (e.g., `--decorator=Route`) |
+| `--exported` | Structural search: only exported/public symbols |
+| `--unused` | Structural search: only symbols with zero callers |
 
 ## Workflow Integration
 
@@ -164,7 +190,9 @@ ucn trace problematic_function --depth=2  # See what it calls
 
 **Before modifying a function:**
 ```bash
-ucn impact the_function                 # Who will break?
+ucn impact the_function                 # Who will break? (direct callers)
+ucn blast the_function                  # Who will break? (full transitive chain)
+ucn affected-tests the_function         # Which tests to run after the change?
 ucn smart the_function                  # See it + its helpers
 # ... make changes ...
 ucn verify the_function                 # Did all call sites survive?

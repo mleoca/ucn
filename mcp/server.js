@@ -181,6 +181,7 @@ UNDERSTANDING CODE:
 - about <name>: Definition, source, callers, callees, and tests — everything in one call. Replaces 3-4 grep+read cycles. Your first stop for any function or class.
 - context <name>: Who calls it and what does it call, without source code. Results are numbered for use with expand. For classes/structs, shows all methods instead.
 - impact <name>: Every call site with actual arguments passed, grouped by file. Essential before changing a function signature — shows exactly what breaks.
+- blast <name>: Transitive blast radius — callers of callers. Shows the full chain of functions affected if you change something. Like impact but recursive. Use depth (default: 3) to control how far up the chain to walk.
 - smart <name>: Get a function's source with all called functions expanded inline (not constants/variables). Use to understand or modify a function and its dependencies in one read.
 - trace <name>: Call tree from a function downward. Use to understand "what happens when X runs" — maps which modules a pipeline touches without reading files. Set depth (default: 3); setting depth expands all children.
 - example <name>: Best real-world usage example. Automatically scores call sites by quality and returns the top one with context. Use to understand expected calling patterns.
@@ -190,8 +191,9 @@ FINDING CODE:
 - find <name>: Locate definitions ranked by usage count. Supports glob patterns (e.g. find "handle*" or "_update*"). Use when you know the name but not the file.
 - usages <name>: See every usage organized by type: definitions, calls, imports, references. Complete picture of how something is used. Use code_only=true to skip comments/strings.
 - toc: Get a quick overview of a project you haven't seen before — file counts, line counts, function/class counts, entry points. Use detailed=true for full symbol listing.
-- search <term>: Text search (like grep, respects .gitignore). Supports regex by default (e.g. "\\d+" or "foo|bar"). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case. Invalid regex auto-falls back to plain text.
+- search <term>: Text search (like grep, respects .gitignore). Supports regex by default (e.g. "\\d+" or "foo|bar"). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case. Invalid regex auto-falls back to plain text. STRUCTURAL MODE: Add type=function|class|call|method|type to query the symbol index instead of text. Combine with param=, returns=, decorator=, receiver= (for calls), exported=true, unused=true. Term becomes optional name filter (glob). Example: type=function, param=Request → all functions taking Request.
 - tests <name>: Find test files covering a function, test case names, and how it's called in tests. Use before modifying or to find test patterns to follow.
+- affected_tests <name>: Which tests to run after changing a function. Combines blast (transitive callers) with test detection. Shows test files, coverage %, and uncovered functions. Use depth= to control depth.
 - deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
 
 EXTRACTING CODE (use instead of reading entire files):
@@ -260,7 +262,15 @@ server.registerTool(
             top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
             class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
             limit: z.number().optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed.'),
-            max_files: z.number().optional().describe('Max files to index (default: 10000). Use for very large codebases.')
+            max_files: z.number().optional().describe('Max files to index (default: 10000). Use for very large codebases.'),
+            // Structural search flags (search command)
+            type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type. Triggers index-based search.'),
+            param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
+            receiver: z.string().optional().describe('Filter calls by receiver (structural search, type=call). E.g. "db", "http".'),
+            returns: z.string().optional().describe('Filter by return type (structural search). E.g. "Promise", "error".'),
+            decorator: z.string().optional().describe('Filter by decorator/annotation (structural search). E.g. "Route", "Test".'),
+            exported: z.boolean().optional().describe('Only exported/public symbols (structural search).'),
+            unused: z.boolean().optional().describe('Only symbols with zero callers (structural search).')
 
         })
     },
@@ -309,6 +319,15 @@ server.registerTool(
                 return toolResult(output.formatImpact(result));
             }
 
+            case 'blast': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'blast', ep);
+                if (!ok) return toolResult(error); // soft error
+                return toolResult(output.formatBlast(result, {
+                    allHint: 'Set depth to expand all children.',
+                }));
+            }
+
             case 'smart': {
                 const index = getIndex(project_dir);
                 const { ok, result, error } = execute(index, 'smart', ep);
@@ -323,6 +342,15 @@ server.registerTool(
                 return toolResult(output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
+                }));
+            }
+
+            case 'reverse_trace': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'reverseTrace', ep);
+                if (!ok) return toolResult(error);
+                return toolResult(output.formatReverseTrace(result, {
+                    allHint: 'Set depth to expand all children.',
                 }));
             }
 
@@ -378,8 +406,11 @@ server.registerTool(
 
             case 'search': {
                 const index = getIndex(project_dir);
-                const { ok, result, error } = execute(index, 'search', ep);
+                const { ok, result, error, structural } = execute(index, 'search', ep);
                 if (!ok) return toolResult(error); // soft error
+                if (structural) {
+                    return toolResult(output.formatStructuralSearch(result));
+                }
                 return toolResult(output.formatSearch(result, ep.term));
             }
 
@@ -388,6 +419,13 @@ server.registerTool(
                 const { ok, result, error } = execute(index, 'tests', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTests(result, ep.name));
+            }
+
+            case 'affected_tests': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'affectedTests', ep);
+                if (!ok) return toolResult(error);
+                return toolResult(output.formatAffectedTests(result));
             }
 
             case 'deadcode': {
@@ -437,6 +475,13 @@ server.registerTool(
                     depthHint: 'Set depth parameter for deeper graph.',
                     allHint: 'Set depth to expand all children.'
                 }));
+            }
+
+            case 'circular_deps': {
+                const index = getIndex(project_dir);
+                const { ok, result, error } = execute(index, 'circularDeps', ep);
+                if (!ok) return toolResult(error);
+                return toolResult(output.formatCircularDeps(result));
             }
 
             // ── Refactoring ─────────────────────────────────────────────

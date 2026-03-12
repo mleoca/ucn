@@ -7,6 +7,20 @@
 
 const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
 const { isTestFile } = require('./discovery');
+const { escapeRegExp } = require('./shared');
+
+/** Check if a position in a line is inside a string literal (quotes/backticks) */
+function isInsideString(line, pos) {
+    let inSingle = false, inDouble = false, inBacktick = false;
+    for (let j = 0; j < pos; j++) {
+        const ch = line[j];
+        if (ch === '\\') { j++; continue; }
+        if (ch === '"' && !inSingle && !inBacktick) inDouble = !inDouble;
+        if (ch === "'" && !inDouble && !inBacktick) inSingle = !inSingle;
+        if (ch === '`' && !inDouble && !inSingle) inBacktick = !inBacktick;
+    }
+    return inSingle || inDouble || inBacktick;
+}
 
 /**
  * Build a usage index for identifiers in the codebase (optimized for deadcode)
@@ -24,6 +38,19 @@ function buildUsageIndex(index, filterNames) {
             if (!language) continue;
 
             const content = index._readFile(filePath);
+
+            // Text pre-filter: skip files that don't contain any target names
+            // (avoids expensive tree-sitter parse + AST traversal for irrelevant files)
+            if (filterNames && filterNames.size > 0) {
+                let hasAny = false;
+                for (const name of filterNames) {
+                    if (content.includes(name)) {
+                        hasAny = true;
+                        break;
+                    }
+                }
+                if (!hasAny) continue;
+            }
 
             // For HTML files, parse the virtual JS content instead of raw HTML
             // (HTML tree-sitter sees script content as raw_text, not JS identifiers)
@@ -163,6 +190,11 @@ function deadcode(index, options = {}) {
     let excludedDecorated = 0;
     let excludedExported = 0;
 
+    // Ensure callee index is built (lazy, reused across operations)
+    if (!index.calleeIndex) {
+        index.buildCalleeIndex();
+    }
+
     // Collect callable symbol names to reduce usage index scope
     const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor'];
     const callableNames = new Set();
@@ -172,8 +204,71 @@ function deadcode(index, options = {}) {
         }
     }
 
-    // Build usage index once (instead of per-symbol), filtered to callable names only
-    const usageIndex = buildUsageIndex(index, callableNames);
+    // Pre-filter: names in the callee index have call sites → definitely used → not dead.
+    const potentiallyDeadNames = new Set();
+    for (const name of callableNames) {
+        if (!index.calleeIndex.has(name)) {
+            potentiallyDeadNames.add(name);
+        }
+    }
+
+    // Build usage index for potentially dead names using text scan (no tree-sitter reparsing).
+    // The callee index already covers all call-based usages. For remaining names, a word-boundary
+    // text scan catches imports, exports, shorthand properties, type refs, and variable refs.
+    // Trade-off: may match names in comments/strings (false "used" → fewer dead code reports),
+    // but avoids ~1.9s of tree-sitter re-parsing. buildUsageIndex() is kept for direct callers.
+    const usageIndex = new Map();
+    if (potentiallyDeadNames.size > 0) {
+        for (const [filePath, fileEntry] of index.files) {
+            try {
+                const content = index._readFile(filePath);
+                const lines = content.split('\n');
+                for (const name of potentiallyDeadNames) {
+                    if (!content.includes(name)) continue;
+                    const nameLen = name.length;
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+                        if (!line.includes(name)) continue;
+                        // Skip line if entirely inside a line comment (// or #)
+                        const commentIdx = line.indexOf('//');
+                        const hashIdx = line.indexOf('#');
+                        let searchFrom = 0;
+                        while (searchFrom < line.length) {
+                            const pos = line.indexOf(name, searchFrom);
+                            if (pos === -1) break;
+                            searchFrom = pos + 1;
+                            // Word boundary check
+                            if (pos > 0 && /\w/.test(line[pos - 1])) continue;
+                            if (pos + nameLen < line.length && /\w/.test(line[pos + nameLen])) continue;
+                            // Skip if inside a // comment (not :// URL)
+                            if (commentIdx !== -1 && commentIdx < pos &&
+                                (commentIdx === 0 || line[commentIdx - 1] !== ':')) continue;
+                            // Skip if inside a # comment (Python — # preceded by whitespace or at start)
+                            if (hashIdx !== -1 && hashIdx < pos &&
+                                (hashIdx === 0 || /\s/.test(line[hashIdx - 1]))) continue;
+                            // Skip if inside a string literal
+                            if (isInsideString(line, pos)) continue;
+                            // Skip property/field access: preceded by '.' unless followed by '(' (method call)
+                            if (pos > 0 && line[pos - 1] === '.' &&
+                                (pos + nameLen >= line.length || line[pos + nameLen] !== '(')) continue;
+                            // Skip object literal key: name followed by ':' (not '::' for Rust paths)
+                            const afterChar = pos + nameLen < line.length ? line[pos + nameLen] : '';
+                            const afterChar2 = pos + nameLen + 1 < line.length ? line[pos + nameLen + 1] : '';
+                            if (afterChar === ':' && afterChar2 !== ':') continue;
+                            // Valid reference found
+                            if (!usageIndex.has(name)) usageIndex.set(name, []);
+                            usageIndex.get(name).push({
+                                file: filePath,
+                                line: i + 1,
+                                relativePath: fileEntry.relativePath
+                            });
+                            break; // one match per line is enough for deadcode
+                        }
+                    }
+                }
+            } catch {}
+        }
+    }
 
     for (const [name, symbols] of index.symbols) {
         for (const symbol of symbols) {
@@ -308,7 +403,12 @@ function deadcode(index, options = {}) {
                 continue;
             }
 
-            // Use pre-built index for O(1) lookup instead of O(files) scan
+            // Fast path: name has call sites in callee index → definitely used → not dead
+            if (index.calleeIndex.has(name)) {
+                continue;
+            }
+
+            // Slow path: check AST-based usage index for remaining names
             const allUsages = usageIndex.get(name) || [];
 
             // Filter out usages that are at the definition location

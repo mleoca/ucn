@@ -1798,10 +1798,11 @@ describe('fix: callsCache persisted to disk after command execution', () => {
             index.findCallers('helper');
             index.callsCacheDirty = false;
 
-            // Touch a file (change mtime without changing content)
-            const libPath = path.join(dir, 'lib.js');
+            // Touch the file that contains calls (change mtime without changing content)
+            // Note: inverted callee index means only files containing calls to 'helper' are scanned
+            const appPath = path.join(dir, 'app.js');
             const now = new Date();
-            fs.utimesSync(libPath, now, now);
+            fs.utimesSync(appPath, now, now);
 
             // findCallers again — should detect mtime change and set dirty
             index.findCallers('helper');

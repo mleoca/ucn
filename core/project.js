@@ -25,6 +25,29 @@ const callersModule = require('./callers');
 let LANGUAGE_KEYWORDS = null;
 
 /**
+ * Build a glob-style matcher: * matches any sequence, ? matches one char.
+ * Case-insensitive by default. Returns a function (string) => boolean.
+ */
+function buildGlobMatcher(pattern, caseSensitive) {
+    const escaped = pattern.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+        .replace(/\*/g, '.*')
+        .replace(/\?/g, '.');
+    const regex = new RegExp('^' + escaped + '$', caseSensitive ? '' : 'i');
+    return (name) => regex.test(name);
+}
+
+const STRUCTURAL_TYPES = new Set(['function', 'class', 'call', 'method', 'type']);
+
+/**
+ * Substring match. Case-insensitive by default.
+ */
+function matchesSubstring(text, pattern, caseSensitive) {
+    if (!text) return false;
+    if (caseSensitive) return text.includes(pattern);
+    return text.toLowerCase().includes(pattern.toLowerCase());
+}
+
+/**
  * ProjectIndex - Manages symbol table for a project
  */
 class ProjectIndex {
@@ -47,6 +70,7 @@ class ProjectIndex {
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
         this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
+        this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
     /**
@@ -407,8 +431,61 @@ class ProjectIndex {
         // Invalidate cached call data for this file
         this.callsCache.delete(filePath);
 
+        // Invalidate callee index (will be rebuilt lazily)
+        this.calleeIndex = null;
+
         // Invalidate attribute type cache for this file
         if (this._attrTypeCache) this._attrTypeCache.delete(filePath);
+    }
+
+    /**
+     * Build inverted call index: callee name -> Set<filePath>.
+     * Built lazily on first findCallers call, from the calls cache.
+     * Enables O(relevant files) lookup instead of O(all files) scan.
+     */
+    buildCalleeIndex() {
+        const { getCachedCalls } = require('./callers');
+        this.calleeIndex = new Map();
+
+        for (const [filePath] of this.files) {
+            const calls = getCachedCalls(this, filePath);
+            if (!calls) continue;
+            for (const call of calls) {
+                const name = call.name;
+                if (!this.calleeIndex.has(name)) {
+                    this.calleeIndex.set(name, new Set());
+                }
+                this.calleeIndex.get(name).add(filePath);
+                // Also index resolvedName and resolvedNames for alias resolution
+                if (call.resolvedName && call.resolvedName !== name) {
+                    if (!this.calleeIndex.has(call.resolvedName)) {
+                        this.calleeIndex.set(call.resolvedName, new Set());
+                    }
+                    this.calleeIndex.get(call.resolvedName).add(filePath);
+                }
+                if (call.resolvedNames) {
+                    for (const rn of call.resolvedNames) {
+                        if (rn !== name) {
+                            if (!this.calleeIndex.has(rn)) {
+                                this.calleeIndex.set(rn, new Set());
+                            }
+                            this.calleeIndex.get(rn).add(filePath);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Get the set of files that contain calls to a given name.
+     * Returns null if callee index is not available (falls back to full scan).
+     */
+    getCalleeFiles(name) {
+        if (!this.calleeIndex) {
+            this.buildCalleeIndex();
+        }
+        return this.calleeIndex.get(name) || null;
     }
 
     /**
@@ -553,7 +630,7 @@ class ProjectIndex {
         const classNames = new Set();
         for (const [, fileEntry] of this.files) {
             for (const symbol of fileEntry.symbols) {
-                if (['class', 'interface', 'struct', 'trait'].includes(symbol.type)) {
+                if (['class', 'interface', 'struct', 'trait', 'record'].includes(symbol.type)) {
                     classNames.add(symbol.name);
                 }
             }
@@ -561,7 +638,7 @@ class ProjectIndex {
 
         for (const [filePath, fileEntry] of this.files) {
             for (const symbol of fileEntry.symbols) {
-                if (!['class', 'interface', 'struct', 'trait'].includes(symbol.type)) {
+                if (!['class', 'interface', 'struct', 'trait', 'record'].includes(symbol.type)) {
                     continue;
                 }
 
@@ -866,12 +943,10 @@ class ProjectIndex {
                     }
                 }
                 candidate.importerCount = importerCount;
-                candidate.usageCount = this.countSymbolUsages(candidate.def).total;
             }
-            // Sort by import popularity first, then usage count
-            tiedCandidates.sort((a, b) =>
-                (b.importerCount - a.importerCount) || (b.usageCount - a.usageCount)
-            );
+            // Sort by import popularity (cheap — no file reads needed)
+            // Skip usage count (expensive) — import popularity is a strong enough signal
+            tiedCandidates.sort((a, b) => b.importerCount - a.importerCount);
             // Rebuild scored array: sorted tied candidates first, then rest
             const rest = scored.filter(s => s.score !== tiedScore);
             scored.length = 0;
@@ -1002,9 +1077,68 @@ class ProjectIndex {
      * @param {object} symbol - Symbol with file, name, etc.
      * @returns {object} { total, calls, definitions, imports, references }
      */
-    countSymbolUsages(symbol) {
+    countSymbolUsages(symbol, options = {}) {
         const name = symbol.name;
         const defFile = symbol.file;
+
+        // Fast path: use callee index + import graph for counting (no file reads)
+        // This is an approximation — counts files containing calls, not individual call sites.
+        // Use options.detailed = true for exact per-call-site counting via AST.
+        if (!options.detailed) {
+            // Ensure callee index is built (lazy, reused across operations)
+            if (!this.calleeIndex) this.buildCalleeIndex();
+            const hasFilters = options.exclude && options.exclude.length > 0;
+
+            // Count calls from callee index (files containing calls to this name)
+            const calleeFiles = this.calleeIndex.get(name);
+            let calls = 0;
+            if (calleeFiles) {
+                // Count actual call entries from calls cache for accuracy
+                const { getCachedCalls } = require('./callers');
+                for (const fp of calleeFiles) {
+                    // Apply exclude filters
+                    if (hasFilters) {
+                        const fe = this.files.get(fp);
+                        if (fe && !this.matchesFilters(fe.relativePath, { exclude: options.exclude })) continue;
+                    }
+                    const fileCalls = getCachedCalls(this, fp);
+                    if (!fileCalls) continue;
+                    for (const c of fileCalls) {
+                        if (c.name === name || c.resolvedName === name ||
+                            (c.resolvedNames && c.resolvedNames.includes(name))) {
+                            calls++;
+                        }
+                    }
+                }
+            }
+
+            // Count definitions from symbol table
+            const defs = this.symbols.get(name) || [];
+            let definitions = defs.length;
+            if (hasFilters) {
+                definitions = defs.filter(d =>
+                    this.matchesFilters(d.relativePath, { exclude: options.exclude })
+                ).length;
+            }
+
+            // Count imports from import graph (files that import from defFile and use this name)
+            let imports = 0;
+            const importers = this.exportGraph.get(defFile) || [];
+            for (const importer of importers) {
+                const fe = this.files.get(importer);
+                if (!fe) continue;
+                if (hasFilters && !this.matchesFilters(fe.relativePath, { exclude: options.exclude })) continue;
+                // Check if this file's importNames reference our symbol
+                if (fe.importNames && fe.importNames.includes(name)) {
+                    imports++;
+                }
+            }
+
+            const total = calls + definitions + imports;
+            return { total, calls, definitions, imports, references: 0 };
+        }
+
+        // Detailed path: full AST-based counting (original algorithm)
         // Note: no 'g' flag - we only need to test for presence per line
         const regex = new RegExp('\\b' + escapeRegExp(name) + '\\b');
 
@@ -1029,8 +1163,8 @@ class ProjectIndex {
 
         while (queue.length > 0) {
             const file = queue.pop();
-            const importers = this.exportGraph.get(file) || [];
-            for (const importer of importers) {
+            const importersArr = this.exportGraph.get(file) || [];
+            for (const importer of importersArr) {
                 if (!relevantFiles.has(importer)) {
                     relevantFiles.add(importer);
                     // If this importer re-exports the symbol, follow its importers too
@@ -1062,8 +1196,12 @@ class ProjectIndex {
         let imports = 0;
         let references = 0;
 
+        const hasExclude = options.exclude && options.exclude.length > 0;
         for (const filePath of relevantFiles) {
-            if (!this.files.has(filePath)) continue;
+            const fileEntry = this.files.get(filePath);
+            if (!fileEntry) continue;
+            // Apply exclude filters (e.g., test file exclusion)
+            if (hasExclude && !this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude })) continue;
 
             try {
                 // Try AST-based counting first (with per-operation cache)
@@ -2535,6 +2673,97 @@ class ProjectIndex {
     }
 
     /**
+     * Detect circular dependencies in the import graph.
+     * Uses DFS with 3-color marking to find all cycles.
+     * @param {object} options - { file, exclude }
+     * @returns {object} - { cycles, totalFiles, summary }
+     */
+    circularDeps(options = {}) {
+        this._beginOp();
+        try {
+            const exclude = options.exclude || [];
+            const fileFilter = options.file || null;
+
+            const WHITE = 0, GRAY = 1, BLACK = 2;
+            const color = new Map();
+            const cycles = [];
+            const stack = [];
+
+            const shouldSkip = (file) => {
+                if (!this.files.has(file)) return true;
+                if (exclude.length > 0) {
+                    const entry = this.files.get(file);
+                    if (entry && !this.matchesFilters(entry.relativePath, { exclude })) return true;
+                }
+                return false;
+            };
+
+            const dfs = (file) => {
+                color.set(file, GRAY);
+                stack.push(file);
+
+                const neighbors = [...new Set(this.importGraph.get(file) || [])];
+
+                for (const neighbor of neighbors) {
+                    if (shouldSkip(neighbor)) continue;
+                    const nc = color.get(neighbor) || WHITE;
+                    if (nc === GRAY) {
+                        const idx = stack.indexOf(neighbor);
+                        cycles.push(stack.slice(idx));
+                    } else if (nc === WHITE) {
+                        dfs(neighbor);
+                    }
+                }
+
+                stack.pop();
+                color.set(file, BLACK);
+            };
+
+            for (const file of this.files.keys()) {
+                if ((color.get(file) || WHITE) === WHITE && !shouldSkip(file)) {
+                    dfs(file);
+                }
+            }
+
+            // Convert to relative paths and deduplicate
+            const seen = new Set();
+            const uniqueCycles = [];
+            for (const cycle of cycles) {
+                const relCycle = cycle.map(f => this.files.get(f)?.relativePath || path.relative(this.root, f));
+                // Normalize: rotate so lexicographically smallest file is first
+                const sorted = relCycle.slice().sort();
+                const minIdx = relCycle.indexOf(sorted[0]);
+                const rotated = [...relCycle.slice(minIdx), ...relCycle.slice(0, minIdx)];
+                const key = rotated.join('\0');
+                if (!seen.has(key)) {
+                    seen.add(key);
+                    uniqueCycles.push({ files: rotated, length: rotated.length });
+                }
+            }
+
+            // Filter by file pattern
+            let result = uniqueCycles;
+            if (fileFilter) {
+                result = uniqueCycles.filter(c => c.files.some(f => f.includes(fileFilter)));
+            }
+
+            result.sort((a, b) => a.length - b.length || a.files[0].localeCompare(b.files[0]));
+
+            return {
+                cycles: result,
+                totalFiles: this.files.size,
+                fileFilter: fileFilter || undefined,
+                summary: {
+                    totalCycles: result.length,
+                    filesInCycles: new Set(result.flatMap(c => c.files)).size,
+                }
+            };
+        } finally {
+            this._endOp();
+        }
+    }
+
+    /**
      * Detect patterns that may cause incomplete results
      * Returns warnings about dynamic code patterns
      * Cached to avoid rescanning on every query
@@ -3003,46 +3232,51 @@ class ProjectIndex {
             }
             this._clearTreeCache();
         } else {
-            const usages = this.usages(name, { codeOnly: true });
+            // Use findCallers (benefits from callee index) instead of usages() for speed
+            const callerResults = this.findCallers(name, {
+                includeMethods: false,
+                includeUncertain: false,
+                targetDefinitions: [def],
+            });
             const targetBindingId = def.bindingId;
-            const calls = usages.filter(u => {
-                if (u.usageType !== 'call' || u.isDefinition) return false;
+            // Convert findCallers results to the format expected by analyzeCallSite
+            const calls = callerResults.map(c => ({
+                file: c.file,
+                relativePath: c.relativePath,
+                line: c.line,
+                content: c.content,
+                usageType: 'call',
+                callerName: c.callerName,
+            }));
+            // Keep the same binding filter for backward compat (findCallers already handles this,
+            // but cross-check with usages-based binding filter for safety)
+            const filteredCalls = calls.filter(u => {
                 const fileEntry = this.files.get(u.file);
-                if (fileEntry) {
-                    // Filter by binding: skip calls from files that define their own version of this function
-                    // For Go, also check sibling files in same directory (same package scope)
-                    if (targetBindingId) {
-                        let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
-                        if (localBindings.length === 0 && fileEntry.language === 'go') {
-                            const dir = path.dirname(u.file);
-                            for (const [fp, fe] of this.files) {
-                                if (fp !== u.file && path.dirname(fp) === dir) {
-                                    const sibling = (fe.bindings || []).filter(b => b.name === name);
-                                    localBindings = localBindings.concat(sibling);
-                                }
+                if (fileEntry && targetBindingId) {
+                    let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
+                    if (localBindings.length === 0 && fileEntry.language === 'go') {
+                        const dir = path.dirname(u.file);
+                        for (const [fp, fe] of this.files) {
+                            if (fp !== u.file && path.dirname(fp) === dir) {
+                                const sibling = (fe.bindings || []).filter(b => b.name === name);
+                                localBindings = localBindings.concat(sibling);
                             }
                         }
-                        if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
-                            return false; // This file/package has its own definition — call is to that, not our target
-                        }
                     }
-                    // Cross-reference with findCallsInCode to filter local closures and built-ins
-                    // (findCallsInCode has scope-aware filtering that findUsagesInCode lacks)
-                    const parsedCalls = this.getCachedCalls(u.file);
-                    if (parsedCalls && Array.isArray(parsedCalls)) {
-                        const hasCall = parsedCalls.some(c => c.name === name && c.line === u.line);
-                        if (!hasCall) return false;
+                    if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
+                        return false;
                     }
                 }
                 return true;
             });
+            // (findCallers already handles binding resolution and scope-aware filtering)
 
             // Analyze each call site, filtering out method calls for non-method definitions
             callSites = [];
             const defFileEntry = this.files.get(def.file);
             const defLang = defFileEntry?.language;
             const targetDir = defLang === 'go' ? path.basename(path.dirname(def.file)) : null;
-            for (const call of calls) {
+            for (const call of filteredCalls) {
                 const analysis = this.analyzeCallSite(call, name);
                 // Skip method calls (obj.parse()) when target is a standalone function (parse())
                 // For Go, allow calls where receiver matches the package directory name
@@ -3065,7 +3299,7 @@ class ProjectIndex {
                     file: call.relativePath,
                     line: call.line,
                     expression: call.content.trim(),
-                    callerName: this.findEnclosingFunction(call.file, call.line),
+                    callerName: call.callerName || this.findEnclosingFunction(call.file, call.line),
                     ...analysis
                 });
             }
@@ -3131,6 +3365,450 @@ class ProjectIndex {
             patterns,
             scopeWarning
         };
+        } finally { this._endOp(); }
+    }
+
+    /**
+     * Transitive blast radius — walk UP the caller chain recursively.
+     * Answers: "What breaks transitively if I change this function?"
+     *
+     * @param {string} name - Function name
+     * @param {object} options - { depth, file, className, all, exclude, includeMethods, includeUncertain }
+     * @returns {object|null} Blast radius tree with summary
+     */
+    blast(name, options = {}) {
+        this._beginOp();
+        try {
+            const maxDepth = Math.max(0, options.depth ?? 3);
+            const maxChildren = options.all ? Infinity : 10;
+            const includeMethods = options.includeMethods ?? true;
+            const includeUncertain = options.includeUncertain || false;
+            const exclude = options.exclude || [];
+
+            const { def, definitions, warnings } = this.resolveSymbol(name, { file: options.file, className: options.className });
+            if (!def) return null;
+
+            const visited = new Set();
+            const affectedFunctions = new Set();
+            const affectedFiles = new Set();
+            let maxDepthReached = 0;
+
+            const buildCallerTree = (funcDef, currentDepth) => {
+                const key = `${funcDef.file}:${funcDef.startLine}`;
+                if (currentDepth > maxDepth) return null;
+                if (visited.has(key)) {
+                    return {
+                        name: funcDef.name,
+                        file: funcDef.relativePath,
+                        line: funcDef.startLine,
+                        type: funcDef.type || 'function',
+                        children: [],
+                        alreadyShown: true
+                    };
+                }
+                visited.add(key);
+
+                if (currentDepth > maxDepthReached) maxDepthReached = currentDepth;
+                if (currentDepth > 0) {
+                    affectedFunctions.add(key);
+                    affectedFiles.add(funcDef.file);
+                }
+
+                const node = {
+                    name: funcDef.name,
+                    file: funcDef.relativePath,
+                    line: funcDef.startLine,
+                    type: funcDef.type || 'function',
+                    children: []
+                };
+
+                if (currentDepth < maxDepth) {
+                    const callers = this.findCallers(funcDef.name, {
+                        includeMethods,
+                        includeUncertain,
+                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                    });
+
+                    // Deduplicate callers by enclosing function (multiple call sites → one tree node)
+                    const uniqueCallers = new Map();
+                    for (const c of callers) {
+                        if (!c.callerName) continue; // skip module-level code
+                        // Apply exclude filter
+                        if (exclude.length > 0 && !this.matchesFilters(c.relativePath, { exclude })) continue;
+                        const callerKey = c.callerStartLine
+                            ? `${c.callerFile}:${c.callerStartLine}`
+                            : `${c.callerFile}:${c.callerName}`;
+                        if (!uniqueCallers.has(callerKey)) {
+                            uniqueCallers.set(callerKey, {
+                                name: c.callerName,
+                                file: c.callerFile,
+                                relativePath: c.relativePath,
+                                startLine: c.callerStartLine,
+                                endLine: c.callerEndLine,
+                                callSites: 1
+                            });
+                        } else {
+                            uniqueCallers.get(callerKey).callSites++;
+                        }
+                    }
+
+                    // Resolve definitions and build child nodes
+                    const callerEntries = [];
+                    for (const [, caller] of uniqueCallers) {
+                        // Look up actual definition from symbol table
+                        const defs = this.symbols.get(caller.name);
+                        let callerDef = defs?.find(d => d.file === caller.file && d.startLine === caller.startLine);
+
+                        if (!callerDef) {
+                            // Pseudo-definition for callers not in symbol table
+                            callerDef = {
+                                name: caller.name,
+                                file: caller.file,
+                                relativePath: caller.relativePath,
+                                startLine: caller.startLine,
+                                endLine: caller.endLine,
+                                type: 'function'
+                            };
+                        }
+
+                        callerEntries.push({ def: callerDef, callSites: caller.callSites });
+                    }
+
+                    // Stable sort by file + line
+                    callerEntries.sort((a, b) =>
+                        a.def.file.localeCompare(b.def.file) || a.def.startLine - b.def.startLine
+                    );
+
+                    for (const { def: cDef, callSites } of callerEntries.slice(0, maxChildren)) {
+                        const childTree = buildCallerTree(cDef, currentDepth + 1);
+                        if (childTree) {
+                            childTree.callSites = callSites;
+                            node.children.push(childTree);
+                        }
+                    }
+
+                    if (callerEntries.length > maxChildren) {
+                        node.truncatedChildren = callerEntries.length - maxChildren;
+                        // Count truncated callers in summary
+                        for (const { def: cDef } of callerEntries.slice(maxChildren)) {
+                            const key = `${cDef.file}:${cDef.startLine}`;
+                            if (!visited.has(key)) {
+                                affectedFunctions.add(key);
+                                affectedFiles.add(cDef.file);
+                            }
+                        }
+                    }
+                }
+
+                return node;
+            };
+
+            const tree = buildCallerTree(def, 0);
+
+            // Smart hints
+            if (tree && tree.children.length === 0) {
+                if (maxDepth === 0) {
+                    warnings.push({ message: 'depth=0: showing root function only. Increase depth to see callers.' });
+                } else if (definitions.length > 1 && !options.file) {
+                    warnings.push({
+                        message: `Resolved to ${def.relativePath}:${def.startLine} which has no callers. ${definitions.length - 1} other definition(s) exist — specify a file to pick a different one.`
+                    });
+                }
+            }
+
+            return {
+                root: name,
+                file: def.relativePath,
+                line: def.startLine,
+                maxDepth,
+                includeMethods,
+                tree,
+                summary: {
+                    totalAffected: affectedFunctions.size,
+                    totalFiles: affectedFiles.size,
+                    maxDepthReached
+                },
+                warnings: warnings.length > 0 ? warnings : undefined
+            };
+        } finally { this._endOp(); }
+    }
+
+    /**
+     * Reverse trace: walk UP the caller chain to entry points.
+     * Like blast but focused on "how does execution reach this function?"
+     * Marks leaf nodes (functions with no callers) as entry points.
+     */
+    reverseTrace(name, options = {}) {
+        this._beginOp();
+        try {
+            const maxDepth = Math.max(0, options.depth ?? 5);
+            const maxChildren = options.all ? Infinity : 10;
+            const includeMethods = options.includeMethods ?? true;
+            const includeUncertain = options.includeUncertain || false;
+            const exclude = options.exclude || [];
+
+            const { def, definitions, warnings } = this.resolveSymbol(name, { file: options.file, className: options.className });
+            if (!def) return null;
+
+            const visited = new Set();
+            const entryPoints = [];
+            let maxDepthReached = 0;
+
+            const buildCallerTree = (funcDef, currentDepth) => {
+                const key = `${funcDef.file}:${funcDef.startLine}`;
+                if (currentDepth > maxDepth) return null;
+                if (visited.has(key)) {
+                    return {
+                        name: funcDef.name,
+                        file: funcDef.relativePath,
+                        line: funcDef.startLine,
+                        type: funcDef.type || 'function',
+                        children: [],
+                        alreadyShown: true
+                    };
+                }
+                visited.add(key);
+                if (currentDepth > maxDepthReached) maxDepthReached = currentDepth;
+
+                const node = {
+                    name: funcDef.name,
+                    file: funcDef.relativePath,
+                    line: funcDef.startLine,
+                    type: funcDef.type || 'function',
+                    children: []
+                };
+
+                if (currentDepth < maxDepth) {
+                    const callers = this.findCallers(funcDef.name, {
+                        includeMethods,
+                        includeUncertain,
+                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                    });
+
+                    // Deduplicate callers by enclosing function
+                    const uniqueCallers = new Map();
+                    for (const c of callers) {
+                        if (!c.callerName) continue;
+                        if (exclude.length > 0 && !this.matchesFilters(c.relativePath, { exclude })) continue;
+                        const callerKey = c.callerStartLine
+                            ? `${c.callerFile}:${c.callerStartLine}`
+                            : `${c.callerFile}:${c.callerName}`;
+                        if (!uniqueCallers.has(callerKey)) {
+                            uniqueCallers.set(callerKey, {
+                                name: c.callerName,
+                                file: c.callerFile,
+                                relativePath: c.relativePath,
+                                startLine: c.callerStartLine,
+                                endLine: c.callerEndLine,
+                                callSites: 1
+                            });
+                        } else {
+                            uniqueCallers.get(callerKey).callSites++;
+                        }
+                    }
+
+                    // Resolve definitions and build child nodes
+                    const callerEntries = [];
+                    for (const [, caller] of uniqueCallers) {
+                        const defs = this.symbols.get(caller.name);
+                        let callerDef = defs?.find(d => d.file === caller.file && d.startLine === caller.startLine);
+                        if (!callerDef) {
+                            callerDef = {
+                                name: caller.name,
+                                file: caller.file,
+                                relativePath: caller.relativePath,
+                                startLine: caller.startLine,
+                                endLine: caller.endLine,
+                                type: 'function'
+                            };
+                        }
+                        callerEntries.push({ def: callerDef, callSites: caller.callSites });
+                    }
+
+                    callerEntries.sort((a, b) =>
+                        a.def.file.localeCompare(b.def.file) || a.def.startLine - b.def.startLine
+                    );
+
+                    for (const { def: cDef, callSites } of callerEntries.slice(0, maxChildren)) {
+                        const childTree = buildCallerTree(cDef, currentDepth + 1);
+                        if (childTree) {
+                            childTree.callSites = callSites;
+                            node.children.push(childTree);
+                        }
+                    }
+
+                    if (callerEntries.length > maxChildren) {
+                        node.truncatedChildren = callerEntries.length - maxChildren;
+                        // Count entry points in truncated branches so summary is accurate
+                        for (const { def: cDef } of callerEntries.slice(maxChildren)) {
+                            const key = `${cDef.file}:${cDef.startLine}`;
+                            if (!visited.has(key)) {
+                                const cCallers = this.findCallers(cDef.name, {
+                                    includeMethods, includeUncertain,
+                                    targetDefinitions: cDef.bindingId ? [cDef] : undefined,
+                                });
+                                if (cCallers.length === 0) {
+                                    entryPoints.push({ name: cDef.name, file: cDef.relativePath || path.relative(this.root, cDef.file), line: cDef.startLine });
+                                }
+                            }
+                        }
+                    }
+
+                    // Mark as entry point if no callers found (and not at depth limit)
+                    if (uniqueCallers.size === 0 && currentDepth > 0) {
+                        node.entryPoint = true;
+                        entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                    }
+                }
+
+                return node;
+            };
+
+            const tree = buildCallerTree(def, 0);
+
+            // Also mark root as entry point if it has no callers
+            if (tree && tree.children.length === 0 && maxDepth > 0) {
+                tree.entryPoint = true;
+                entryPoints.push({ name: def.name, file: def.relativePath, line: def.startLine });
+            }
+
+            // Smart hints
+            if (tree && tree.children.length === 0) {
+                if (maxDepth === 0) {
+                    warnings.push({ message: 'depth=0: showing root function only. Increase depth to see callers.' });
+                } else if (definitions.length > 1 && !options.file) {
+                    warnings.push({
+                        message: `Resolved to ${def.relativePath}:${def.startLine} which has no callers. ${definitions.length - 1} other definition(s) exist — specify a file to pick a different one.`
+                    });
+                }
+            }
+
+            return {
+                root: name,
+                file: def.relativePath,
+                line: def.startLine,
+                maxDepth,
+                includeMethods,
+                tree,
+                entryPoints,
+                summary: {
+                    totalEntryPoints: entryPoints.length,
+                    totalFunctions: visited.size - 1, // exclude root
+                    maxDepthReached
+                },
+                warnings: warnings.length > 0 ? warnings : undefined
+            };
+        } finally { this._endOp(); }
+    }
+
+    /**
+     * Find tests affected by a change to the given function.
+     * Composes blast() (transitive callers) with test file scanning.
+     */
+    affectedTests(name, options = {}) {
+        this._beginOp();
+        try {
+            // Step 1: Get all transitively affected functions via blast
+            const blastResult = this.blast(name, {
+                depth: options.depth ?? 3,
+                file: options.file,
+                className: options.className,
+                all: true,
+                exclude: options.exclude,
+                includeMethods: options.includeMethods,
+                includeUncertain: options.includeUncertain,
+            });
+            if (!blastResult) return null;
+
+            // Step 2: Collect all affected function names from the tree
+            const affectedNames = new Set();
+            affectedNames.add(name);
+            const collectNames = (node) => {
+                if (!node) return;
+                affectedNames.add(node.name);
+                for (const child of node.children || []) collectNames(child);
+            };
+            collectNames(blastResult.tree);
+
+            // Step 3: Build regex patterns for all names
+            const namePatterns = new Map();
+            for (const n of affectedNames) {
+                const escaped = escapeRegExp(n);
+                namePatterns.set(n, {
+                    regex: new RegExp('\\b' + escaped + '\\b'),
+                    callPattern: new RegExp(escaped + '\\s*\\('),
+                });
+            }
+
+            // Step 4: Scan test files once for all affected names
+            const exclude = options.exclude;
+            const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
+            const results = [];
+            for (const [filePath, fileEntry] of this.files) {
+                if (!isTestFile(fileEntry.relativePath, fileEntry.language)) continue;
+                if (excludeArr.length > 0 && !this.matchesFilters(fileEntry.relativePath, { exclude: excludeArr })) continue;
+                try {
+                    const content = this._readFile(filePath);
+                    const lines = content.split('\n');
+                    const fileMatches = new Map();
+
+                    lines.forEach((line, idx) => {
+                        for (const [funcName, patterns] of namePatterns) {
+                            if (patterns.regex.test(line)) {
+                                let matchType = 'reference';
+                                if (/\b(describe|it|test|spec)\s*\(/.test(line)) {
+                                    matchType = 'test-case';
+                                } else if (/\b(import|require|from)\b/.test(line)) {
+                                    matchType = 'import';
+                                } else if (patterns.callPattern.test(line)) {
+                                    matchType = 'call';
+                                }
+                                if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
+                                fileMatches.get(funcName).push({
+                                    line: idx + 1, content: line.trim(),
+                                    matchType, functionName: funcName
+                                });
+                            }
+                        }
+                    });
+
+                    if (fileMatches.size > 0) {
+                        const coveredFunctions = [...fileMatches.keys()];
+                        const allMatches = [];
+                        for (const matches of fileMatches.values()) allMatches.push(...matches);
+                        allMatches.sort((a, b) => a.line - b.line);
+                        results.push({
+                            file: fileEntry.relativePath,
+                            coveredFunctions,
+                            matchCount: allMatches.length,
+                            matches: allMatches
+                        });
+                    }
+                } catch (e) { /* skip unreadable */ }
+            }
+
+            // Sort by coverage breadth then alphabetically
+            results.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || a.file.localeCompare(b.file));
+
+            // Compute coverage stats
+            const coveredSet = new Set();
+            for (const r of results) for (const f of r.coveredFunctions) coveredSet.add(f);
+            const uncovered = [...affectedNames].filter(n => !coveredSet.has(n));
+
+            return {
+                root: blastResult.root, file: blastResult.file, line: blastResult.line,
+                depth: blastResult.maxDepth,
+                affectedFunctions: [...affectedNames],
+                testFiles: results,
+                summary: {
+                    totalAffected: affectedNames.size,
+                    totalTestFiles: results.length,
+                    coveredFunctions: coveredSet.size,
+                    uncoveredCount: uncovered.length,
+                },
+                uncovered,
+                warnings: blastResult.warnings,
+            };
         } finally { this._endOp(); }
     }
 
@@ -3222,18 +3900,10 @@ class ProjectIndex {
         const isMethod = !!(primary.isMethod || primary.type === 'method' || primary.className);
         const includeMethods = options.includeMethods ?? isMethod;
 
-        // Get usage counts by type (exclude test files by default, matching usages command behavior)
-        const usageOpts = { codeOnly: true };
-        if (!options.includeTests) {
-            usageOpts.exclude = addTestExclusions(options.exclude);
-        }
-        const usages = this.usages(symbolName, usageOpts);
-        const usagesByType = {
-            definitions: usages.filter(u => u.isDefinition).length,
-            calls: usages.filter(u => u.usageType === 'call').length,
-            imports: usages.filter(u => u.usageType === 'import').length,
-            references: usages.filter(u => u.usageType === 'reference').length
-        };
+        // Get usage counts by type (fast path uses callee index, no file reads)
+        // Exclude test files by default (matching usages command behavior)
+        const countExclude = !options.includeTests ? addTestExclusions(options.exclude) : options.exclude;
+        const usagesByType = this.countSymbolUsages(primary, { exclude: countExclude });
 
         // Get callers and callees (only for functions)
         let callers = [];
@@ -3524,6 +4194,206 @@ class ProjectIndex {
         } finally { this._endOp(); }
     }
 
+    /**
+     * Structural search — query the symbol table and call index, not raw text.
+     * Answers questions like "functions taking Request param", "all db.* calls",
+     * "exported async functions", "decorated route handlers".
+     *
+     * @param {object} options
+     * @param {string} [options.term] - Name filter (glob: * and ? supported)
+     * @param {string} [options.type] - Symbol kind: function, class, call, method, type
+     * @param {string} [options.param] - Parameter name or type substring
+     * @param {string} [options.receiver] - Call receiver pattern (for type=call)
+     * @param {string} [options.returns] - Return type substring
+     * @param {string} [options.decorator] - Decorator/annotation name substring
+     * @param {boolean} [options.exported] - Only exported symbols
+     * @param {boolean} [options.unused] - Only symbols with zero callers
+     * @param {string[]} [options.exclude] - Exclude file patterns
+     * @param {string} [options.in] - Restrict to subdirectory
+     * @param {string} [options.file] - File pattern filter
+     * @param {number} [options.top] - Limit results
+     * @returns {{ results: Array, meta: object }}
+     */
+    structuralSearch(options = {}) {
+        this._beginOp();
+        try {
+            const { term, param, receiver, returns: returnType, decorator, exported, unused } = options;
+            // Auto-infer type: --receiver implies type=call
+            const type = options.type || (receiver ? 'call' : undefined);
+            const results = [];
+
+            // Validate type if provided
+            if (type && !STRUCTURAL_TYPES.has(type)) {
+                return {
+                    results: [],
+                    meta: {
+                        mode: 'structural',
+                        query: { type },
+                        totalMatched: 0,
+                        shown: 0,
+                        error: `Invalid type "${type}". Valid types: ${[...STRUCTURAL_TYPES].join(', ')}`,
+                    }
+                };
+            }
+
+            // Build glob-style name matcher from term
+            const nameMatcher = term ? buildGlobMatcher(term, options.caseSensitive) : null;
+
+            // Helper: check if file passes filters
+            const passesFileFilter = (fileEntry) => {
+                if (!fileEntry) return false;
+                if (options.file) {
+                    const rp = fileEntry.relativePath;
+                    if (!rp.includes(options.file) && !rp.endsWith(options.file)) return false;
+                }
+                if ((options.exclude && options.exclude.length > 0) || options.in) {
+                    if (!this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude, in: options.in })) return false;
+                }
+                return true;
+            };
+
+            if (type === 'call') {
+                // Search call sites from callee index
+                const { getCachedCalls } = require('./callers');
+                const seenFiles = new Set();
+
+                // If term is given, only scan files that might contain that call
+                if (term && !term.includes('*') && !term.includes('?')) {
+                    // Exact or substring — use callee index for fast lookup
+                    this.buildCalleeIndex();
+                    const files = this.calleeIndex.get(term);
+                    if (files) for (const f of files) seenFiles.add(f);
+                } else {
+                    // Scan all files
+                    for (const fp of this.files.keys()) seenFiles.add(fp);
+                }
+
+                for (const filePath of seenFiles) {
+                    const fileEntry = this.files.get(filePath);
+                    if (!passesFileFilter(fileEntry)) continue;
+                    const calls = getCachedCalls(this, filePath);
+                    if (!calls) continue;
+                    for (const call of calls) {
+                        if (nameMatcher && !nameMatcher(call.name)) continue;
+                        if (receiver) {
+                            if (!call.receiver) continue;
+                            if (!matchesSubstring(call.receiver, receiver, options.caseSensitive)) continue;
+                        }
+                        results.push({
+                            kind: 'call',
+                            name: call.receiver ? `${call.receiver}.${call.name}` : call.name,
+                            file: fileEntry.relativePath,
+                            line: call.line,
+                            receiver: call.receiver || null,
+                            isMethod: call.isMethod || false,
+                        });
+                    }
+                }
+            } else {
+                // Search symbols (functions, classes, methods, types)
+                const functionTypes = new Set(['function', 'constructor', 'method', 'arrow', 'static', 'classmethod']);
+                const classTypes = new Set(['class', 'struct', 'interface', 'impl', 'trait']);
+                const typeTypes = new Set(['type', 'enum', 'interface', 'trait']);
+                const methodTypes = new Set(['method', 'constructor']);
+
+                for (const [symbolName, definitions] of this.symbols) {
+                    if (nameMatcher && !nameMatcher(symbolName)) continue;
+
+                    for (const def of definitions) {
+                        // Type filter
+                        if (type === 'function' && !functionTypes.has(def.type)) continue;
+                        if (type === 'class' && !classTypes.has(def.type)) continue;
+                        if (type === 'method' && !methodTypes.has(def.type) && !def.isMethod) continue;
+                        if (type === 'type' && !typeTypes.has(def.type)) continue;
+
+                        // File filters
+                        const fileEntry = this.files.get(def.file);
+                        if (!passesFileFilter(fileEntry)) continue;
+
+                        // Param filter: match param name or type
+                        if (param) {
+                            const cs = options.caseSensitive;
+                            const ps = def.paramsStructured || [];
+                            const paramStr = def.params || '';
+                            const hasMatch = ps.some(p =>
+                                matchesSubstring(p.name, param, cs) ||
+                                (p.type && matchesSubstring(p.type, param, cs))
+                            ) || matchesSubstring(paramStr, param, cs);
+                            if (!hasMatch) continue;
+                        }
+
+                        // Return type filter
+                        if (returnType) {
+                            if (!def.returnType || !matchesSubstring(def.returnType, returnType, options.caseSensitive)) continue;
+                        }
+
+                        // Decorator filter: checks decorators (Python), modifiers (Java annotations stored lowercase)
+                        if (decorator) {
+                            const cs = options.caseSensitive;
+                            const hasDecorator = (def.decorators && def.decorators.some(d => matchesSubstring(d, decorator, cs))) ||
+                                (def.modifiers && def.modifiers.some(m => matchesSubstring(m, decorator, cs)));
+                            if (!hasDecorator) continue;
+                        }
+
+                        // Exported filter
+                        if (exported) {
+                            const mods = def.modifiers || [];
+                            const isExp = (fileEntry && fileEntry.exports.includes(symbolName)) ||
+                                mods.includes('export') || mods.includes('public') ||
+                                mods.some(m => m.startsWith('pub')) ||
+                                (fileEntry && fileEntry.language === 'go' && /^[A-Z]/.test(symbolName));
+                            if (!isExp) continue;
+                        }
+
+                        // Unused filter (expensive — last check)
+                        if (unused) {
+                            this.buildCalleeIndex();
+                            if (this.calleeIndex.has(symbolName)) continue;
+                        }
+
+                        // Merge decorators from both Python-style decorators and Java-style modifiers
+                        const allDecorators = def.decorators || null;
+
+                        results.push({
+                            kind: def.type,
+                            name: symbolName,
+                            file: def.relativePath,
+                            line: def.startLine,
+                            params: def.params || null,
+                            returnType: def.returnType || null,
+                            decorators: allDecorators,
+                            className: def.className || null,
+                            exported: exported ? true : undefined,
+                        });
+                    }
+                }
+            }
+
+            // Sort by file, then line
+            results.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+
+            // Apply top limit
+            const total = results.length;
+            const top = options.top;
+            if (top && top > 0 && results.length > top) {
+                results.length = top;
+            }
+
+            return {
+                results,
+                meta: {
+                    mode: 'structural',
+                    query: Object.fromEntries(Object.entries({
+                        type: type || 'any', term, param, receiver, returns: returnType,
+                        decorator, exported: exported || undefined, unused: unused || undefined,
+                    }).filter(([, v]) => v !== undefined && v !== null)),
+                    totalMatched: total,
+                    shown: results.length,
+                }
+            };
+        } finally { this._endOp(); }
+    }
+
     // ========================================================================
     // PROJECT INFO
     // ========================================================================
@@ -3573,7 +4443,8 @@ class ProjectIndex {
             for (const [name, symbols] of this.symbols) {
                 for (const sym of symbols) {
                     if (sym.type === 'function' || sym.type === 'method' || sym.type === 'static' ||
-                        sym.type === 'constructor' || sym.type === 'public' || sym.type === 'abstract') {
+                        sym.type === 'constructor' || sym.type === 'public' || sym.type === 'abstract' ||
+                        sym.type === 'classmethod') {
                         const lineCount = sym.endLine - sym.startLine + 1;
                         const relativePath = sym.relativePath || (sym.file ? path.relative(this.root, sym.file) : '');
                         functions.push({
@@ -3638,10 +4509,11 @@ class ProjectIndex {
             if (fileFilter && !fileFilter.has(filePath)) continue;
             let functions = fileEntry.symbols.filter(s =>
                 s.type === 'function' || s.type === 'method' || s.type === 'static' ||
-                s.type === 'constructor' || s.type === 'public' || s.type === 'abstract'
+                s.type === 'constructor' || s.type === 'public' || s.type === 'abstract' ||
+                s.type === 'classmethod'
             );
             const classes = fileEntry.symbols.filter(s =>
-                ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'impl'].includes(s.type)
+                ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'impl', 'record', 'namespace'].includes(s.type)
             );
             const state = fileEntry.symbols.filter(s => s.type === 'state');
 

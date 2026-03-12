@@ -192,6 +192,11 @@ function findClasses(code, parser) {
                             : typeKind === 'interface' ? extractInterfaceMembers(typeNode, code)
                             : [];
 
+                        // Extract embedded field names as extends (Go composition)
+                        const embeddedBases = members
+                            .filter(m => m.embedded)
+                            .map(m => m.name);
+
                         types.push({
                             name,
                             startLine,
@@ -200,7 +205,8 @@ function findClasses(code, parser) {
                             members,
                             modifiers: isExported ? ['export'] : [],
                             ...(docstring && { docstring }),
-                            ...(typeParams && { generics: typeParams })
+                            ...(typeParams && { generics: typeParams }),
+                            ...(embeddedBases.length > 0 && { extends: embeddedBases.join(', ') })
                         });
                     }
                 }

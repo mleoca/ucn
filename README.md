@@ -38,7 +38,7 @@ Supports JS/TS, Python, Go, Rust, Java, and HTML. Runs locally.
                             │
                      ┌──────┴──────┐
                      │ UCN Engine  │
-                     │ 28 commands │
+                     │  commands   │
                      │ tree-sitter │
                      └─────────────┘
 ```
@@ -138,7 +138,7 @@ VS Code uses `.vscode/mcp.json`:
 
 </details>
 
-All 28 commands ship as a single MCP tool - under 2KB of context.
+All commands ship as a single MCP tool - under 2KB of context.
 
 ### Agent Skill (no server needed)
 
@@ -265,28 +265,31 @@ ucn deadcode --exclude=test                # what can be deleted?
 
 ---
 
-## All 28 commands
+## All commands
 
 ```
   UNDERSTAND                          MODIFY SAFELY
   ─────────────────────               ─────────────────────
   about         full picture          impact          all call sites
-  context       callers + callees     diff-impact     git diff + callers
-  smart         function + helpers    verify          signature check
-  trace         call tree             plan            refactor preview
+  context       callers + callees     blast           transitive impact
+  smart         function + helpers    diff-impact     git diff + callers
+  trace         call tree             verify          signature check
+  reverse-trace callers → root        plan            refactor preview
 
   FIND & EXTRACT                      ARCHITECTURE
   ─────────────────────               ─────────────────────
   find          locate definitions    imports         file dependencies
   usages        all occurrences       exporters       reverse dependencies
   fn            extract function      graph           dependency tree
-  class         extract class         related         sibling functions
-  toc           project overview      tests           find test coverage
-  deadcode      unused code           stacktrace      error trace context
-  search        text search           api             public API surface
-  example       best usage example    typedef         type definitions
-  lines         extract line range    file-exports    file's exports
-  expand        drill into context    stats           project stats
+  class         extract class         circular-deps   import cycles
+  toc           project overview      related         sibling functions
+  deadcode      unused code           tests           find test coverage
+  search        text search           affected-tests  tests for changes
+  example       best usage example    stacktrace      error trace context
+  lines         extract line range    api             public API surface
+  expand        drill into context    typedef         type definitions
+                                      file-exports    file's exports
+                                      stats           project stats
 ```
 
 ---

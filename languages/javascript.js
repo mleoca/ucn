@@ -87,6 +87,27 @@ function extractModifiers(text) {
 }
 
 /**
+ * Extract decorators from a JS/TS class or method node.
+ * In tree-sitter-javascript/typescript, decorators are direct children of the node.
+ * @param {object} node - AST node (class_declaration, method_definition, etc.)
+ * @returns {string[]} Array of decorator names (without @)
+ */
+function extractDecorators(node) {
+    const decorators = [];
+    for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        if (child.type === 'decorator') {
+            let text = child.text.replace(/^@/, '');
+            // Strip arguments: @Component({...}) → Component
+            const parenIdx = text.indexOf('(');
+            if (parenIdx > 0) text = text.substring(0, parenIdx);
+            decorators.push(text);
+        }
+    }
+    return decorators;
+}
+
+/**
  * Find all functions in JS/TS code using tree-sitter
  * @param {string} code - Source code
  * @param {object} parser - Tree-sitter parser instance
@@ -390,8 +411,8 @@ function findClasses(code, parser) {
     const classes = [];
 
     traverseTree(tree.rootNode, (node) => {
-        // Class declarations
-        if (node.type === 'class_declaration' || node.type === 'class') {
+        // Class declarations (including abstract classes)
+        if (node.type === 'class_declaration' || node.type === 'class' || node.type === 'abstract_class_declaration') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(node, code);
@@ -400,17 +421,21 @@ function findClasses(code, parser) {
                 const generics = extractGenerics(node);
                 const extendsInfo = extractExtends(node);
                 const implementsInfo = extractImplements(node);
+                const decorators = extractDecorators(node);
 
+                const isAbstract = node.type === 'abstract_class_declaration';
                 classes.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     type: 'class',
                     members,
+                    ...(isAbstract && { modifiers: ['abstract'] }),
                     ...(docstring && { docstring }),
                     ...(generics && { generics }),
                     ...(extendsInfo && { extends: extendsInfo }),
-                    ...(implementsInfo.length > 0 && { implements: implementsInfo })
+                    ...(implementsInfo.length > 0 && { implements: implementsInfo }),
+                    ...(decorators.length > 0 && { decorators })
                 });
             }
             return false;
@@ -424,13 +449,14 @@ function findClasses(code, parser) {
                 const docstring = extractJSDocstring(code, startLine);
                 const generics = extractGenerics(node);
                 const extendsInfo = extractInterfaceExtends(node);
+                const members = extractInterfaceMembers(node, code);
 
                 classes.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     type: 'interface',
-                    members: [],
+                    members,
                     ...(docstring && { docstring }),
                     ...(generics && { generics }),
                     ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
@@ -464,17 +490,38 @@ function findClasses(code, parser) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(node, code);
                 const docstring = extractJSDocstring(code, startLine);
+                const members = extractEnumMembers(node, code);
 
                 classes.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     type: 'enum',
-                    members: [],
+                    members,
                     ...(docstring && { docstring })
                 });
             }
             return false;
+        }
+
+        // TypeScript namespace/module declarations
+        if (node.type === 'internal_module' || node.type === 'module') {
+            const nameNode = node.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(node, code);
+                const docstring = extractJSDocstring(code, startLine);
+
+                classes.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    type: 'namespace',
+                    members: [],
+                    ...(docstring && { docstring })
+                });
+            }
+            // Continue traversal to find inner functions/classes
+            return true;
         }
 
         return true;
@@ -568,6 +615,74 @@ function extractInterfaceExtends(interfaceNode) {
 }
 
 /**
+ * Extract interface members (method signatures, property signatures)
+ */
+function extractInterfaceMembers(interfaceNode, code) {
+    const members = [];
+    const bodyNode = interfaceNode.childForFieldName('body');
+    if (!bodyNode) return members;
+
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const child = bodyNode.namedChild(i);
+
+        if (child.type === 'method_signature') {
+            const nameNode = child.childForFieldName('name');
+            const paramsNode = child.childForFieldName('parameters');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                const returnType = extractReturnType(child);
+                members.push({
+                    name: nameNode.text,
+                    params: extractParams(paramsNode),
+                    paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                    startLine,
+                    endLine,
+                    memberType: 'method',
+                    isMethod: true,
+                    ...(returnType && { returnType })
+                });
+            }
+        } else if (child.type === 'property_signature') {
+            const nameNode = child.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                members.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    memberType: 'field'
+                });
+            }
+        }
+    }
+    return members;
+}
+
+/**
+ * Extract enum members (name and optional value)
+ */
+function extractEnumMembers(enumNode, code) {
+    const members = [];
+    const bodyNode = enumNode.childForFieldName('body');
+    if (!bodyNode) return members;
+
+    for (let i = 0; i < bodyNode.namedChildCount; i++) {
+        const child = bodyNode.namedChild(i);
+        if (child.type === 'enum_assignment') {
+            const nameNode = child.childForFieldName('name');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                members.push({ name: nameNode.text, startLine, endLine, memberType: 'field' });
+            }
+        } else if (child.type === 'property_identifier') {
+            const { startLine, endLine } = nodeToLocation(child, code);
+            members.push({ name: child.text, startLine, endLine, memberType: 'field' });
+        }
+    }
+    return members;
+}
+
+/**
  * Extract class members
  */
 function extractClassMembers(classNode, code) {
@@ -586,6 +701,20 @@ function extractClassMembers(classNode, code) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 let name = nameNode.text;
                 const text = child.text;
+
+                // Collect decorators from preceding siblings in the class body
+                const decorators = [];
+                for (let j = i - 1; j >= 0; j--) {
+                    const prev = bodyNode.namedChild(j);
+                    if (prev.type === 'decorator') {
+                        let dText = prev.text.replace(/^@/, '');
+                        const parenIdx = dText.indexOf('(');
+                        if (parenIdx > 0) dText = dText.substring(0, parenIdx);
+                        decorators.unshift(dText);
+                    } else {
+                        break;
+                    }
+                }
 
                 // Determine member type
                 let memberType = 'method';
@@ -630,7 +759,42 @@ function extractClassMembers(classNode, code) {
                     isGenerator: isGen,
                     isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
-                    ...(docstring && { docstring })
+                    ...(docstring && { docstring }),
+                    ...(decorators.length > 0 && { decorators })
+                });
+            }
+        }
+
+        // Abstract method signatures (TypeScript)
+        if (child.type === 'abstract_method_signature') {
+            const nameNode = child.childForFieldName('name');
+            const paramsNode = child.childForFieldName('parameters');
+            if (nameNode) {
+                const { startLine, endLine } = nodeToLocation(child, code);
+                const returnType = extractReturnType(child);
+                const docstring = extractJSDocstring(code, startLine);
+                // Collect decorators from preceding siblings
+                const decorators = [];
+                for (let j = i - 1; j >= 0; j--) {
+                    const prev = bodyNode.namedChild(j);
+                    if (prev.type === 'decorator') {
+                        let dText = prev.text.replace(/^@/, '');
+                        const parenIdx = dText.indexOf('(');
+                        if (parenIdx > 0) dText = dText.substring(0, parenIdx);
+                        decorators.unshift(dText);
+                    } else break;
+                }
+                members.push({
+                    name: nameNode.text,
+                    params: extractParams(paramsNode),
+                    paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                    startLine,
+                    endLine,
+                    memberType: 'abstract',
+                    isMethod: true,
+                    ...(returnType && { returnType }),
+                    ...(docstring && { docstring }),
+                    ...(decorators.length > 0 && { decorators })
                 });
             }
         }
@@ -644,6 +808,31 @@ function extractClassMembers(classNode, code) {
                 const valueNode = child.childForFieldName('value');
                 const isArrow = valueNode && valueNode.type === 'arrow_function';
 
+                // Collect decorators — children of the field node (TS) or preceding siblings (JS)
+                const fieldDecorators = [];
+                // Check children first (TypeScript: decorator is child of public_field_definition)
+                for (let ci = 0; ci < child.namedChildCount; ci++) {
+                    const fc = child.namedChild(ci);
+                    if (fc.type === 'decorator') {
+                        let dText = fc.text.replace(/^@/, '');
+                        const parenIdx = dText.indexOf('(');
+                        if (parenIdx > 0) dText = dText.substring(0, parenIdx);
+                        fieldDecorators.push(dText);
+                    }
+                }
+                // Also check preceding siblings (JS proposal decorators)
+                if (fieldDecorators.length === 0) {
+                    for (let j = i - 1; j >= 0; j--) {
+                        const prev = bodyNode.namedChild(j);
+                        if (prev.type === 'decorator') {
+                            let dText = prev.text.replace(/^@/, '');
+                            const parenIdx = dText.indexOf('(');
+                            if (parenIdx > 0) dText = dText.substring(0, parenIdx);
+                            fieldDecorators.unshift(dText);
+                        } else break;
+                    }
+                }
+
                 if (isArrow) {
                     const paramsNode = valueNode.childForFieldName('parameters');
                     const returnType = extractReturnType(valueNode);
@@ -656,14 +845,16 @@ function extractClassMembers(classNode, code) {
                         memberType: name.startsWith('#') ? 'private' : 'field',
                         isArrow: true,
                         isMethod: true,  // Arrow fields are callable like methods
-                        ...(returnType && { returnType })
+                        ...(returnType && { returnType }),
+                        ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                     });
                 } else {
                     members.push({
                         name,
                         startLine,
                         endLine,
-                        memberType: name.startsWith('#') ? 'private field' : 'field'
+                        memberType: name.startsWith('#') ? 'private field' : 'field',
+                        ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                         // Not a method - regular field
                     });
                 }

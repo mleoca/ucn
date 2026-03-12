@@ -855,6 +855,289 @@ function formatTraceJson(trace) {
 }
 
 /**
+ * Format blast command output - text
+ * Shows transitive blast radius (callers of callers)
+ */
+function formatBlast(blast, options = {}) {
+    if (!blast) {
+        return 'Function not found.';
+    }
+
+    const lines = [];
+
+    // Header
+    lines.push(`Blast radius for ${blast.root}`);
+    lines.push('═'.repeat(60));
+    lines.push(`${blast.file}:${blast.line}`);
+    lines.push(`Depth: ${blast.maxDepth}`);
+
+    if (blast.warnings && blast.warnings.length > 0) {
+        for (const w of blast.warnings) {
+            lines.push(`Note: ${w.message}`);
+        }
+    }
+
+    lines.push('');
+
+    // Render tree (same structure as trace but showing callers)
+    let hasTruncation = false;
+    const renderNode = (node, prefix = '', isLast = true) => {
+        const connector = isLast ? '└── ' : '├── ';
+        const extension = isLast ? '    ' : '│   ';
+
+        let label = node.name;
+        if (node.file) {
+            label += ` (${node.file}:${node.line})`;
+        }
+        if (node.callSites && node.callSites > 1) {
+            label += ` ${node.callSites}x`;
+        }
+        if (node.alreadyShown) {
+            label += ' (see above)';
+        }
+
+        lines.push(prefix + connector + label);
+
+        if (node.children && !node.alreadyShown) {
+            const hasMore = node.truncatedChildren > 0;
+            for (let i = 0; i < node.children.length; i++) {
+                const isChildLast = !hasMore && i === node.children.length - 1;
+                renderNode(node.children[i], prefix + extension, isChildLast);
+            }
+            if (hasMore) {
+                hasTruncation = true;
+                lines.push(prefix + extension + `└── ... and ${node.truncatedChildren} more callers`);
+            }
+        }
+    };
+
+    // Root node
+    lines.push(blast.root);
+    if (blast.tree && blast.tree.children) {
+        const rootHasMore = blast.tree.truncatedChildren > 0;
+        for (let i = 0; i < blast.tree.children.length; i++) {
+            const isLast = !rootHasMore && i === blast.tree.children.length - 1;
+            renderNode(blast.tree.children[i], '', isLast);
+        }
+        if (rootHasMore) {
+            hasTruncation = true;
+            lines.push(`└── ... and ${blast.tree.truncatedChildren} more callers`);
+        }
+    }
+
+    // Summary
+    if (blast.summary) {
+        lines.push('');
+        const { totalAffected, totalFiles } = blast.summary;
+        if (totalAffected > 0) {
+            lines.push(`Summary: 1 function changed → ${totalAffected} function${totalAffected !== 1 ? 's' : ''} affected across ${totalFiles} file${totalFiles !== 1 ? 's' : ''}`);
+        } else {
+            lines.push('Summary: No callers found — this function is a root/entry point.');
+        }
+    }
+
+    if (hasTruncation) {
+        const allHint = options.allHint || 'Use --all to show all.';
+        lines.push(`\nSome results truncated. ${allHint}`);
+    }
+
+    if (blast.includeMethods === false) {
+        lines.push('\nNote: obj.method() calls excluded. Use --include-methods to include them.');
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format blast command output - JSON
+ */
+function formatBlastJson(blast) {
+    if (!blast) {
+        return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
+    }
+    return JSON.stringify(blast, null, 2);
+}
+
+/**
+ * Format reverse-trace command output - text
+ * Shows upward call chain to entry points
+ */
+function formatReverseTrace(result, options = {}) {
+    if (!result) {
+        return 'Function not found.';
+    }
+
+    const lines = [];
+
+    // Header
+    lines.push(`Reverse trace for ${result.root}`);
+    lines.push('═'.repeat(60));
+    lines.push(`${result.file}:${result.line}`);
+    lines.push(`Depth: ${result.maxDepth}`);
+
+    if (result.warnings && result.warnings.length > 0) {
+        for (const w of result.warnings) {
+            lines.push(`Note: ${w.message}`);
+        }
+    }
+
+    lines.push('');
+
+    // Render tree
+    let hasTruncation = false;
+    const renderNode = (node, prefix = '', isLast = true) => {
+        const connector = isLast ? '└── ' : '├── ';
+        const extension = isLast ? '    ' : '│   ';
+
+        let label = node.name;
+        if (node.file) {
+            label += ` (${node.file}:${node.line})`;
+        }
+        if (node.callSites && node.callSites > 1) {
+            label += ` ${node.callSites}x`;
+        }
+        if (node.entryPoint) {
+            label += ' ★ entry point';
+        }
+        if (node.alreadyShown) {
+            label += ' (see above)';
+        }
+
+        lines.push(prefix + connector + label);
+
+        if (node.children && !node.alreadyShown) {
+            const hasMore = node.truncatedChildren > 0;
+            for (let i = 0; i < node.children.length; i++) {
+                const isChildLast = !hasMore && i === node.children.length - 1;
+                renderNode(node.children[i], prefix + extension, isChildLast);
+            }
+            if (hasMore) {
+                hasTruncation = true;
+                lines.push(prefix + extension + `└── ... and ${node.truncatedChildren} more callers`);
+            }
+        }
+    };
+
+    // Root node
+    let rootLabel = result.root;
+    if (result.tree && result.tree.entryPoint) {
+        rootLabel += ' ★ entry point (no callers)';
+    }
+    lines.push(rootLabel);
+    if (result.tree && result.tree.children) {
+        const rootHasMore = result.tree.truncatedChildren > 0;
+        for (let i = 0; i < result.tree.children.length; i++) {
+            const isLast = !rootHasMore && i === result.tree.children.length - 1;
+            renderNode(result.tree.children[i], '', isLast);
+        }
+        if (rootHasMore) {
+            hasTruncation = true;
+            lines.push(`└── ... and ${result.tree.truncatedChildren} more callers`);
+        }
+    }
+
+    // Entry points summary
+    if (result.entryPoints && result.entryPoints.length > 0) {
+        lines.push('');
+        lines.push(`Entry points (${result.entryPoints.length}):`);
+        for (const ep of result.entryPoints) {
+            lines.push(`  ★ ${ep.name} (${ep.file}:${ep.line})`);
+        }
+    }
+
+    // Summary
+    if (result.summary) {
+        lines.push('');
+        const { totalEntryPoints, totalFunctions } = result.summary;
+        if (totalFunctions > 0) {
+            lines.push(`Summary: ${totalEntryPoints} entry point${totalEntryPoints !== 1 ? 's' : ''} reach${totalEntryPoints === 1 ? 'es' : ''} ${result.root} through ${totalFunctions} intermediate function${totalFunctions !== 1 ? 's' : ''}`);
+        } else {
+            lines.push('Summary: No callers found — this function is itself an entry point.');
+        }
+    }
+
+    if (hasTruncation) {
+        const allHint = options.allHint || 'Use --all to show all.';
+        lines.push(`\nSome results truncated. ${allHint}`);
+    }
+
+    if (result.includeMethods === false) {
+        lines.push('\nNote: obj.method() calls excluded. Use --include-methods to include them.');
+    }
+
+    return lines.join('\n');
+}
+
+/**
+ * Format reverse-trace command output - JSON
+ */
+function formatReverseTraceJson(result) {
+    if (!result) {
+        return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
+    }
+    return JSON.stringify(result, null, 2);
+}
+
+/**
+ * Format affected-tests command output - text
+ */
+function formatAffectedTests(result) {
+    if (!result) return 'Function not found.';
+
+    const lines = [];
+    const { summary } = result;
+
+    lines.push(`affected-tests: ${result.root}`);
+    lines.push('═'.repeat(60));
+    lines.push(`${result.file}:${result.line}`);
+    lines.push(`1 function changed → ${summary.totalAffected} functions affected (depth ${result.depth})`);
+    lines.push('');
+
+    if (result.testFiles.length === 0) {
+        lines.push('No test files found for any affected function.');
+    } else {
+        lines.push(`Test files to run (${summary.totalTestFiles}):`);
+        lines.push('');
+        for (const tf of result.testFiles) {
+            lines.push(`  ${tf.file} (covers: ${tf.coveredFunctions.join(', ')})`);
+            // Show up to 5 key matches per file
+            const keyMatches = tf.matches
+                .filter(m => m.matchType === 'call' || m.matchType === 'test-case')
+                .slice(0, 5);
+            for (const m of keyMatches) {
+                lines.push(`    L${m.line}: ${m.content}  [${m.matchType}]`);
+            }
+        }
+    }
+
+    if (result.uncovered.length > 0) {
+        lines.push('');
+        lines.push(`Uncovered (${result.uncovered.length}): ${result.uncovered.join(', ')}`);
+        lines.push('  ⚠ These affected functions have no test references');
+    }
+
+    lines.push('');
+    const pct = summary.totalAffected > 0
+        ? Math.round(summary.coveredFunctions / summary.totalAffected * 100)
+        : 0;
+    lines.push(`Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} test files, ${summary.coveredFunctions}/${summary.totalAffected} functions covered (${pct}%)`);
+
+    if (result.warnings?.length > 0) {
+        lines.push('');
+        for (const w of result.warnings) lines.push(`Note: ${w.message}`);
+    }
+
+    return lines.join('\n');
+}
+
+function formatAffectedTestsJson(result) {
+    if (!result) {
+        return JSON.stringify({ found: false, error: 'Function not found' }, null, 2);
+    }
+    return JSON.stringify(result, null, 2);
+}
+
+/**
  * Format related command output - text
  */
 function formatRelated(related, options = {}) {
@@ -2008,6 +2291,43 @@ function formatGraph(graph, options = {}) {
     return lines.join('\n');
 }
 
+function formatCircularDeps(result) {
+    if (!result) return 'No results.';
+    const lines = [];
+
+    lines.push('Circular dependencies');
+    lines.push('═'.repeat(60));
+
+    if (result.fileFilter) {
+        lines.push(`Filtered to cycles involving: ${result.fileFilter}`);
+    }
+
+    if (result.cycles.length === 0) {
+        lines.push('');
+        lines.push('No circular dependencies found.');
+        lines.push(`Scanned ${result.totalFiles} files.`);
+        return lines.join('\n');
+    }
+
+    for (let i = 0; i < result.cycles.length; i++) {
+        const cycle = result.cycles[i];
+        lines.push('');
+        lines.push(`Cycle ${i + 1} (${cycle.length} files):`);
+        lines.push(`  ${cycle.files.join(' → ')} → ${cycle.files[0]}`);
+    }
+
+    lines.push('');
+    const { totalCycles, filesInCycles } = result.summary;
+    lines.push(`Summary: ${totalCycles} circular dependency chain${totalCycles !== 1 ? 's' : ''} involving ${filesInCycles} file${filesInCycles !== 1 ? 's' : ''} out of ${result.totalFiles} total.`);
+
+    return lines.join('\n');
+}
+
+function formatCircularDepsJson(result) {
+    if (!result) return JSON.stringify({ error: 'No results' }, null, 2);
+    return JSON.stringify(result, null, 2);
+}
+
 /**
  * Detect common double-escaping patterns in regex search terms.
  * When MCP/JSON transport is involved, agents often write \\.  when they mean \. (literal dot).
@@ -2075,6 +2395,67 @@ function formatSearch(results, term) {
     }
 
     return lines.join('\n');
+}
+
+/**
+ * Format structural search results (index-based queries)
+ */
+function formatStructuralSearch(result) {
+    const { results, meta } = result;
+    const lines = [];
+
+    // Build query description
+    const parts = [];
+    if (meta.query.type) parts.push(`type=${meta.query.type}`);
+    if (meta.query.term) parts.push(`name="${meta.query.term}"`);
+    if (meta.query.param) parts.push(`param="${meta.query.param}"`);
+    if (meta.query.receiver) parts.push(`receiver="${meta.query.receiver}"`);
+    if (meta.query.returns) parts.push(`returns="${meta.query.returns}"`);
+    if (meta.query.decorator) parts.push(`decorator="${meta.query.decorator}"`);
+    if (meta.query.exported) parts.push('exported');
+    if (meta.query.unused) parts.push('unused');
+    const queryStr = parts.join(', ');
+
+    lines.push(`Structural search: ${queryStr}`);
+    lines.push('═'.repeat(60));
+
+    if (results.length === 0) {
+        lines.push('No matches found.');
+        return lines.join('\n');
+    }
+
+    lines.push(`Found ${meta.totalMatched} match${meta.totalMatched === 1 ? '' : 'es'}${meta.shown < meta.totalMatched ? ` (showing ${meta.shown})` : ''}:`);
+    lines.push('');
+
+    // Group by file
+    let currentFile = null;
+    for (const r of results) {
+        if (r.file !== currentFile) {
+            currentFile = r.file;
+            lines.push(`${r.file}`);
+        }
+
+        if (r.kind === 'call') {
+            lines.push(`  ${r.line}: ${r.name}()${r.isMethod ? ' [method]' : ''}`);
+        } else {
+            let sig = `  ${r.line}: ${r.kind} ${r.name}`;
+            if (r.params) sig += `(${r.params})`;
+            if (r.returnType) sig += ` → ${r.returnType}`;
+            if (r.className) sig += ` [${r.className}]`;
+            if (r.decorators) sig += ` @${r.decorators.join(', @')}`;
+            lines.push(sig);
+        }
+    }
+
+    if (meta.shown < meta.totalMatched) {
+        lines.push(`\n${meta.shown} of ${meta.totalMatched} shown. Use top= to see more.`);
+    }
+
+    return lines.join('\n');
+}
+
+function formatStructuralSearchJson(result) {
+    return JSON.stringify(result, null, 2);
 }
 
 /**
@@ -2746,6 +3127,18 @@ module.exports = {
     formatTrace,
     formatTraceJson,
 
+    // Blast command
+    formatBlast,
+    formatBlastJson,
+
+    // Reverse trace command
+    formatReverseTrace,
+    formatReverseTraceJson,
+
+    // Affected tests command
+    formatAffectedTests,
+    formatAffectedTestsJson,
+
     // Related command
     formatRelated,
     formatRelatedJson,
@@ -2767,7 +3160,11 @@ module.exports = {
     formatFn,
     formatClass,
     formatGraph,
+    formatCircularDeps,
+    formatCircularDepsJson,
     formatSearch,
+    formatStructuralSearch,
+    formatStructuralSearchJson,
     detectDoubleEscaping,
     formatFileExports,
     formatStats,

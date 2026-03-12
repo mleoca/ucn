@@ -127,6 +127,7 @@ function findFunctions(code, parser) {
                 const isAsync = firstLine.includes('async ');
                 const isUnsafe = firstLine.includes('unsafe ');
                 const isConst = firstLine.includes('const fn');
+                const isExtern = firstLine.includes('extern ');
                 const visibility = extractVisibility(text);
                 const returnType = extractReturnType(node);
                 const docstring = extractRustDocstring(code, startLine);
@@ -138,6 +139,7 @@ function findFunctions(code, parser) {
                 if (isAsync) modifiers.push('async');
                 if (isUnsafe) modifiers.push('unsafe');
                 if (isConst) modifiers.push('const');
+                if (isExtern) modifiers.push('extern');
                 // Add attributes like #[test] to modifiers
                 for (const attr of attributes) {
                     modifiers.push(attr);
@@ -155,6 +157,44 @@ function findFunctions(code, parser) {
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
                 });
+            }
+            return true;
+        }
+
+        // Extern block declarations: extern "C" { fn foreign_func(); }
+        if (node.type === 'foreign_mod_item') {
+            if (processedRanges.has(rangeKey)) return true;
+            processedRanges.add(rangeKey);
+
+            const declList = node.childForFieldName('body');
+            if (declList) {
+                for (let i = 0; i < declList.namedChildCount; i++) {
+                    const child = declList.namedChild(i);
+                    if (child.type === 'function_signature_item') {
+                        const fName = child.childForFieldName('name');
+                        const fParams = child.childForFieldName('parameters');
+                        if (fName) {
+                            const { startLine, endLine, indent } = nodeToLocation(child, code);
+                            const visibility = extractVisibility(child.text);
+                            const returnType = extractReturnType(child);
+                            const docstring = extractRustDocstring(code, startLine);
+                            const modifiers = ['extern'];
+                            if (visibility) modifiers.push(visibility);
+
+                            functions.push({
+                                name: fName.text,
+                                params: extractRustParams(fParams),
+                                paramsStructured: parseStructuredParams(fParams, 'rust'),
+                                startLine,
+                                endLine,
+                                indent,
+                                modifiers,
+                                ...(returnType && { returnType }),
+                                ...(docstring && { docstring })
+                            });
+                        }
+                    }
+                }
             }
             return true;
         }
@@ -200,6 +240,9 @@ function findClasses(code, parser) {
                 const visibility = extractVisibility(node.text);
                 const generics = extractGenerics(node);
                 const members = extractStructFields(node, code);
+                const attributes = extractAttributes(node, code);
+                const modifiers = visibility ? [visibility] : [];
+                for (const attr of attributes) modifiers.push(attr);
 
                 types.push({
                     name: nameNode.text,
@@ -207,7 +250,7 @@ function findClasses(code, parser) {
                     endLine,
                     type: 'struct',
                     members,
-                    modifiers: visibility ? [visibility] : [],
+                    modifiers,
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
                 });
@@ -226,6 +269,9 @@ function findClasses(code, parser) {
                 const docstring = extractRustDocstring(code, startLine);
                 const visibility = extractVisibility(node.text);
                 const generics = extractGenerics(node);
+                const attributes = extractAttributes(node, code);
+                const modifiers = visibility ? [visibility] : [];
+                for (const attr of attributes) modifiers.push(attr);
 
                 types.push({
                     name: nameNode.text,
@@ -233,7 +279,7 @@ function findClasses(code, parser) {
                     endLine,
                     type: 'enum',
                     members: extractEnumVariants(node, code),
-                    modifiers: visibility ? [visibility] : [],
+                    modifiers,
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
                 });
@@ -300,6 +346,9 @@ function findClasses(code, parser) {
                 const { startLine, endLine } = nodeToLocation(node, code);
                 const docstring = extractRustDocstring(code, startLine);
                 const visibility = extractVisibility(node.text);
+                const attributes = extractAttributes(node, code);
+                const modifiers = visibility ? [visibility] : [];
+                for (const attr of attributes) modifiers.push(attr);
 
                 types.push({
                     name: nameNode.text,
@@ -307,7 +356,7 @@ function findClasses(code, parser) {
                     endLine,
                     type: 'module',
                     members: [],
-                    modifiers: visibility ? [visibility] : [],
+                    modifiers,
                     ...(docstring && { docstring })
                 });
             }
@@ -373,6 +422,20 @@ function findClasses(code, parser) {
 
         return true;
     });
+
+    // Post-process: surface trait impls as 'implements' on the corresponding struct/enum
+    const implTraits = new Map(); // typeName → [traitName, ...]
+    for (const t of types) {
+        if (t.type === 'impl' && t.traitName && t.typeName) {
+            if (!implTraits.has(t.typeName)) implTraits.set(t.typeName, []);
+            implTraits.get(t.typeName).push(t.traitName);
+        }
+    }
+    for (const t of types) {
+        if ((t.type === 'struct' || t.type === 'enum') && implTraits.has(t.name)) {
+            t.implements = implTraits.get(t.name);
+        }
+    }
 
     types.sort((a, b) => a.startLine - b.startLine);
     return types;
@@ -541,15 +604,22 @@ function extractImplMembers(implNode, code, typeName) {
                 // Check if this is a method (has self parameter) or associated function
                 const hasSelf = paramsNode && paramsNode.text.includes('self');
 
+                // Extract attributes (#[test], #[inline], etc.) for impl members
+                const attributes = extractAttributes(child, code);
+                const modifiers = [];
+                if (visibility) modifiers.push(visibility);
+                for (const attr of attributes) modifiers.push(attr);
+
                 members.push({
                     name: nameNode.text,
                     params: extractRustParams(paramsNode),
                     paramsStructured: parseStructuredParams(paramsNode, 'rust'),
                     startLine,
                     endLine,
-                    memberType: visibility ? 'public' : 'method',
+                    memberType: 'method',
                     isAsync: firstLine.includes('async '),
                     isMethod: hasSelf,  // Only true methods (with self) — associated functions are false
+                    modifiers,
                     ...(typeName && { receiver: typeName }),  // All impl members get receiver for findMethodsForType
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring })
@@ -771,6 +841,7 @@ function findCallsInCode(code, parser) {
                     name: name,
                     line: node.startPosition.row + 1,
                     isMethod: segments.length > 1,
+                    isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
                     receiver: segments.length > 1 ? segments.slice(0, -1).join('::') : undefined,
                     enclosingFunction
                 });

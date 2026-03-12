@@ -717,8 +717,8 @@ function testProcessData() {
             }
         });
 
-        it('MCP enum has exactly 28 commands', () => {
-            assert.strictEqual(getMcpCommandEnum().length, 28);
+        it('MCP enum matches canonical command count', () => {
+            assert.strictEqual(getMcpCommandEnum().length, CANONICAL_COMMANDS.length);
         });
 
         it('resolveCommand handles all aliases', () => {
@@ -788,7 +788,7 @@ describe('Architecture Guards', () => {
             'runProjectCommand should switch on canonical, not command');
     });
 
-    it('every canonical command has a handler in execute.js (28/28, zero exceptions)', () => {
+    it('every canonical command has a handler in execute.js (zero exceptions)', () => {
         const { execute } = require(path.join(__dirname, '..', 'core', 'execute'));
 
         for (const cmd of CANONICAL_COMMANDS) {

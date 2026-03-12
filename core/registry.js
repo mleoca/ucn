@@ -11,17 +11,17 @@
 // CANONICAL COMMANDS
 // ============================================================================
 
-// All 28 commands using camelCase canonical IDs.
+// All commands using camelCase canonical IDs.
 // Order: understanding, finding, extracting, file-deps, refactoring, other.
 const CANONICAL_COMMANDS = [
     // Understanding code
-    'about', 'context', 'impact', 'smart', 'trace', 'example', 'related',
+    'about', 'context', 'impact', 'blast', 'smart', 'trace', 'reverseTrace', 'example', 'related',
     // Finding code
-    'find', 'usages', 'toc', 'search', 'tests', 'deadcode',
+    'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode',
     // Extracting code
     'fn', 'class', 'lines', 'expand',
     // File dependencies
-    'imports', 'exporters', 'fileExports', 'graph',
+    'imports', 'exporters', 'fileExports', 'graph', 'circularDeps',
     // Refactoring
     'verify', 'plan', 'diffImpact',
     // Other
@@ -39,13 +39,23 @@ const CLI_ALIASES = {
     'diff-impact':  'diffImpact',
     'what-imports': 'imports',
     'who-imports':  'exporters',
-    'stack':        'stacktrace',
+    'stack':           'stacktrace',
+    'affected':        'affectedTests',
+    'affected-tests':  'affectedTests',
+    'reverse-trace':   'reverseTrace',
+    'rtrace':          'reverseTrace',
+    'circular-deps':   'circularDeps',
+    'circular':        'circularDeps',
+    'cycles':          'circularDeps',
 };
 
 // MCP uses snake_case for multi-word names.
 const MCP_ALIASES = {
-    'file_exports': 'fileExports',
-    'diff_impact':  'diffImpact',
+    'file_exports':   'fileExports',
+    'diff_impact':    'diffImpact',
+    'affected_tests': 'affectedTests',
+    'reverse_trace':  'reverseTrace',
+    'circular_deps':  'circularDeps',
 };
 
 // ============================================================================

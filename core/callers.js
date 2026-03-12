@@ -136,7 +136,13 @@ function findCallers(index, name, options = {}) {
     let pendingCount = 0;
     const maxResults = options.maxResults;
 
-    for (const [filePath, fileEntry] of index.files) {
+    // Use inverted callee index to skip files that don't contain calls to this name
+    const calleeFiles = index.getCalleeFiles(name);
+    const fileIterator = calleeFiles
+        ? [...calleeFiles].map(fp => [fp, index.files.get(fp)]).filter(([, fe]) => fe)
+        : index.files;
+
+    for (const [filePath, fileEntry] of fileIterator) {
         // Early exit when maxResults is reached
         if (maxResults && pendingCount >= maxResults) break;
         try {
@@ -361,6 +367,32 @@ function findCallers(index, name, options = {}) {
                     continue;
                 }
 
+                // Import-graph disambiguation for JS/TS/Python: when multiple definitions of
+                // the same name exist and this call has no bindingId, check whether the calling
+                // file imports from the target definition's file. Skips false positives like
+                // user_b importing from b.js being reported as a caller of a.js:process.
+                // Go/Java/Rust are excluded — they use package/module scoping, not file imports.
+                if (!bindingId && options.targetDefinitions && definitions.length > 1 &&
+                    fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
+                    const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                    if (targetFiles.size > 0 && !targetFiles.has(filePath)) {
+                        const imports = index.importGraph.get(filePath) || [];
+                        const importsTarget = imports.some(imp => targetFiles.has(imp));
+                        if (!importsTarget) {
+                            // Check one level of re-exports (barrel files)
+                            let foundViaReexport = false;
+                            for (const imp of imports) {
+                                const transImports = index.importGraph.get(imp) || [];
+                                if (transImports.some(ti => targetFiles.has(ti))) {
+                                    foundViaReexport = true;
+                                    break;
+                                }
+                            }
+                            if (!foundViaReexport) continue;
+                        }
+                    }
+                }
+
                 // Go unexported visibility: lowercase functions are package-private.
                 // Only allow callers from the same package directory.
                 if (fileEntry.language === 'go' && /^[a-z]/.test(name)) {
@@ -375,7 +407,9 @@ function findCallers(index, name, options = {}) {
                 // Go/Java/Rust: method vs non-method cross-matching filter.
                 // Prevents t.Errorf() (method call) from matching standalone func Errorf,
                 // and cli.Run() (package call, isMethod:false) from matching DeploymentController.Run.
-                if (!bindingId && !resolvedBySameClass &&
+                // Rust path calls (module::func(), Type::new()) bypass this filter — they're
+                // scoped_identifier calls that can target both standalone functions and impl methods.
+                if (!bindingId && !resolvedBySameClass && !call.isPathCall &&
                     (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
                     const targetHasClass = targetDefs.some(d => d.className);
                     if (call.isMethod && !targetHasClass) {

@@ -208,7 +208,9 @@ function findClasses(code, parser) {
                     ...(nameLine !== startLine && { nameLine })
                 });
             }
-            return false;  // Don't traverse into class body
+            // Traverse into class body to find nested classes (e.g., Django Meta, inner classes)
+            // Methods are already handled via extractClassMembers above; processedRanges prevents duplication
+            return true;
         }
 
         return true;
@@ -289,6 +291,10 @@ function extractClassMembers(classNode, code) {
                         memberType = 'static';
                     } else if (dec.includes('classmethod')) {
                         memberType = 'classmethod';
+                    } else if (dec.endsWith('.setter')) {
+                        memberType = 'setter';
+                    } else if (dec.endsWith('.deleter')) {
+                        memberType = 'deleter';
                     } else if (dec.includes('property')) {
                         memberType = 'property';
                     }
@@ -781,7 +787,7 @@ function findExportsInCode(code, parser) {
                 if (leftNode && leftNode.type === 'identifier' && leftNode.text === '__all__') {
                     const line = node.startPosition.row + 1;
 
-                    if (rightNode && rightNode.type === 'list') {
+                    if (rightNode && (rightNode.type === 'list' || rightNode.type === 'tuple')) {
                         for (let i = 0; i < rightNode.namedChildCount; i++) {
                             const item = rightNode.namedChild(i);
                             if (item.type === 'string') {
