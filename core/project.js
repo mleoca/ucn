@@ -8,7 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execSync, execFileSync } = require('child_process');
+const { execFileSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parse, parseFile, cleanHtmlScriptTags } = require('./parser');

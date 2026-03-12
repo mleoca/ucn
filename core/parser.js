@@ -7,7 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { detectLanguage, getParser, getLanguageModule, isSupported, PARSE_OPTIONS } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, isSupported } = require('../languages');
 
 /**
  * @typedef {Object} FunctionDef
