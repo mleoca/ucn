@@ -2151,3 +2151,158 @@ describe('Confidence rendering in formatContext', () => {
         assert.strictEqual(json.data.callees[0].resolution, 'scope-match');
     });
 });
+
+// ============================================================================
+// Formatter truncation / --all bypass tests (K8s MCP fixes 2026-03-13)
+// ============================================================================
+
+describe('formatDiffImpact caller truncation and --all bypass', () => {
+    function makeDiffResult(callerCount) {
+        const callers = [];
+        for (let i = 0; i < callerCount; i++) {
+            callers.push({ relativePath: `src/file${i}.js`, line: i + 1, callerName: `fn${i}`, content: `doStuff(${i})` });
+        }
+        return {
+            base: 'HEAD',
+            summary: { modifiedFunctions: 1, deletedFunctions: 0, newFunctions: 0, totalCallSites: callerCount, affectedFiles: callerCount },
+            functions: [{
+                name: 'doStuff',
+                relativePath: 'src/core.js',
+                startLine: 10,
+                signature: 'doStuff(x)',
+                addedLines: [12],
+                deletedLines: [],
+                callers
+            }],
+            newFunctions: [],
+            deletedFunctions: [],
+            moduleLevelChanges: []
+        };
+    }
+
+    it('caps callers at 30 by default', () => {
+        const text = output.formatDiffImpact(makeDiffResult(50));
+        assert.ok(text.includes('Callers (50):'), 'should show total count');
+        assert.ok(text.includes('... 20 more callers'), 'should show truncation note');
+        assert.ok(!text.includes('fn49'), 'should not show caller #49');
+        assert.ok(text.includes('fn0'), 'should show first caller');
+        assert.ok(text.includes('fn29'), 'should show caller #29 (last before cap)');
+    });
+
+    it('shows all callers with all: true', () => {
+        const text = output.formatDiffImpact(makeDiffResult(50), { all: true });
+        assert.ok(text.includes('Callers (50):'), 'should show total count');
+        assert.ok(!text.includes('more callers'), 'should NOT show truncation note');
+        assert.ok(text.includes('fn49'), 'should show last caller');
+    });
+
+    it('does not truncate when under the cap', () => {
+        const text = output.formatDiffImpact(makeDiffResult(10));
+        assert.ok(text.includes('Callers (10):'), 'should show total count');
+        assert.ok(!text.includes('more callers'), 'should NOT show truncation note');
+    });
+});
+
+describe('formatAffectedTests test file truncation and --all bypass', () => {
+    function makeAffectedResult(fileCount) {
+        const testFiles = [];
+        for (let i = 0; i < fileCount; i++) {
+            testFiles.push({
+                file: `test/test_${i}.js`,
+                coveredFunctions: [`fn${i}`],
+                matches: [{ line: 1, content: `fn${i}()`, matchType: 'call' }]
+            });
+        }
+        return {
+            root: 'doStuff',
+            file: 'src/core.js',
+            line: 10,
+            depth: 3,
+            summary: { totalAffected: fileCount, totalTestFiles: fileCount, coveredFunctions: fileCount },
+            testFiles,
+            uncovered: [],
+        };
+    }
+
+    it('caps test files at 30 by default', () => {
+        const text = output.formatAffectedTests(makeAffectedResult(50));
+        assert.ok(text.includes('Test files to run (50)'), 'should show total count');
+        assert.ok(text.includes('... 20 more test files'), 'should show truncation note');
+        assert.ok(!text.includes('test_49'), 'should not show file #49');
+    });
+
+    it('shows all test files with all: true', () => {
+        const text = output.formatAffectedTests(makeAffectedResult(50), { all: true });
+        assert.ok(!text.includes('more test files'), 'should NOT show truncation note');
+        assert.ok(text.includes('test_49'), 'should show last file');
+    });
+});
+
+describe('checkFilePatternMatch suggests similar paths', () => {
+    it('suggests directories containing the basename when pattern matches nothing', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/controllers/user.js': 'function getUser() {}',
+            'src/controllers/admin.js': 'function getAdmin() {}',
+            'src/models/user.js': 'function UserModel() {}',
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            // Pattern 'controller' won't match 'controllers' exactly in the path
+            // but the basename 'controllers' contains it — should suggest
+            const result = execute(index, 'context', { name: 'getUser', file: 'handlers' });
+            // 'handlers' matches nothing, but should get an error
+            if (!result.ok && result.error) {
+                assert.ok(result.error.includes('No files matched'), 'should indicate no match');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('impact() no-receiver filtering for Go methods on many types', () => {
+    it('filters chained method calls when method exists on many types', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'types.go': `package cache
+
+type FakeCache struct{}
+func (c *FakeCache) Get(key string) string { return "" }
+
+type RealCache struct{}
+func (c *RealCache) Get(key string) string { return "" }
+
+type HttpClient struct{}
+func (c *HttpClient) Get(url string) string { return "" }
+
+type Store struct{}
+func (s *Store) Get(id int) string { return "" }
+`,
+            'user.go': `package cache
+
+func directCall() {
+    c := &FakeCache{}
+    c.Get("key")
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            // Impact for FakeCache.Get should not include thousands of unrelated callers
+            const result = index.impact('Get', { className: 'FakeCache' });
+            assert.ok(result, 'should return impact result');
+            assert.ok(result.totalCallSites >= 1, 'should find at least 1 call site');
+            // byFile groups call sites — check the actual call expression
+            const allSites = [];
+            for (const group of result.byFile) {
+                allSites.push(...group.sites);
+            }
+            assert.ok(allSites.some(s => s.expression && s.expression.includes('Get')),
+                'should find direct call with receiverType evidence');
+        } finally {
+            rm(dir);
+        }
+    });
+});

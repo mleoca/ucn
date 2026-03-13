@@ -1084,7 +1084,7 @@ function formatReverseTraceJson(result) {
 /**
  * Format affected-tests command output - text
  */
-function formatAffectedTests(result) {
+function formatAffectedTests(result, options = {}) {
     if (!result) return 'Function not found.';
 
     const lines = [];
@@ -1099,9 +1099,12 @@ function formatAffectedTests(result) {
     if (result.testFiles.length === 0) {
         lines.push('No test files found for any affected function.');
     } else {
+        const MAX_TEST_FILES = options.all ? Infinity : 30;
+        const displayFiles = result.testFiles.slice(0, MAX_TEST_FILES);
+        const truncatedFiles = result.testFiles.length - displayFiles.length;
         lines.push(`Test files to run (${summary.totalTestFiles}):`);
         lines.push('');
-        for (const tf of result.testFiles) {
+        for (const tf of displayFiles) {
             lines.push(`  ${tf.file} (covers: ${tf.coveredFunctions.join(', ')})`);
             // Show up to 5 key matches per file
             const keyMatches = tf.matches
@@ -1110,6 +1113,9 @@ function formatAffectedTests(result) {
             for (const m of keyMatches) {
                 lines.push(`    L${m.line}: ${m.content}  [${m.matchType}]`);
             }
+        }
+        if (truncatedFiles > 0) {
+            lines.push(`\n  ... ${truncatedFiles} more test files (use file= and exclude= to narrow scope)`);
         }
     }
 
@@ -2542,10 +2548,11 @@ function formatStats(stats, options = {}) {
 // DIFF IMPACT
 // ============================================================================
 
-function formatDiffImpact(result) {
+function formatDiffImpact(result, options = {}) {
     if (!result) return 'No diff data.';
 
     const lines = [];
+    const MAX_CALLERS_PER_FN = options.all ? Infinity : 30;
 
     lines.push(`Diff Impact Analysis (vs ${result.base})`);
     lines.push('═'.repeat(60));
@@ -2574,11 +2581,16 @@ function formatDiffImpact(result) {
             }
 
             if (fn.callers.length > 0) {
+                const displayCallers = fn.callers.slice(0, MAX_CALLERS_PER_FN);
+                const truncated = fn.callers.length - displayCallers.length;
                 lines.push(`  Callers (${fn.callers.length}):`);
-                for (const c of fn.callers) {
+                for (const c of displayCallers) {
                     const caller = c.callerName ? `[${c.callerName}]` : '';
                     lines.push(`    ${c.relativePath}:${c.line} ${caller}`);
                     lines.push(`      ${c.content}`);
+                }
+                if (truncated > 0) {
+                    lines.push(`    ... ${truncated} more callers (use file= to scope diff to specific files, or use impact with class_name= for type-filtered results)`);
                 }
             } else {
                 lines.push('  Callers: none found');

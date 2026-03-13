@@ -15,6 +15,8 @@ const { ProjectIndex } = require('../core/project');
 const { saveCache, loadCache } = require('../core/cache');
 const { parseStackTrace } = require('../core/stacktrace');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
+const { execute } = require('../core/execute');
+const { detectEntrypoints } = require('../core/entrypoints');
 
 const os = require('os');
 
@@ -3051,6 +3053,237 @@ func process(ctx context.Context, data interface{}, flag1 bool, flag2 bool) erro
             const callees = index.findCallees(doWorkDef, { includeUncertain: true });
             assert.ok(callees.some(c => c.name === 'process'),
                 'doWork should have process as callee');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// K8s MCP Issue Fixes (2026-03-13)
+// ============================================================================
+
+describe('K8s fix: Issue 2 — function-value assignments tracked in call graph', () => {
+    it('detects struct field assignment: sched.SchedulePod = sched.schedulePod', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'scheduler.go': `package scheduler
+
+type Scheduler struct {
+    SchedulePod func()
+}
+
+func (s *Scheduler) schedulePod() {
+    // implementation
+}
+
+func New() *Scheduler {
+    sched := &Scheduler{}
+    sched.SchedulePod = sched.schedulePod
+    return sched
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('schedulePod');
+            // The assignment should create a caller edge
+            assert.ok(ctx.callers.length > 0, 'schedulePod should have callers from field assignment');
+            assert.ok(ctx.callers.some(c => c.callerName === 'New'), 'caller should be New()');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('detects composite literal field: addNodeToCache as value', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'handler.go': `package controller
+
+func addNodeToCache(obj interface{}) {
+    // handle add
+}
+
+func updateNode(obj interface{}) {
+    // handle update
+}
+
+func registerHandlers() {
+    handlers := map[string]func(interface{}){
+        "add": addNodeToCache,
+    }
+    _ = handlers
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('addNodeToCache');
+            assert.ok(ctx.callers.length > 0, 'addNodeToCache should have callers from composite literal');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('K8s fix: Issue 4 — diff_impact filters chained method calls without receiver', () => {
+    it('filters out callers with no receiver when method is on many types', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cache.go': `package cache
+
+type FakeCache struct{}
+func (c *FakeCache) Get(key string) string { return "" }
+
+type RealCache struct{}
+func (c *RealCache) Get(key string) string { return "" }
+
+type HttpClient struct{}
+func (c *HttpClient) Get(url string) string { return "" }
+
+type Store struct{}
+func (s *Store) Get(id int) string { return "" }
+`,
+            'user.go': `package cache
+
+func useFakeCache() {
+    c := &FakeCache{}
+    c.Get("key")
+}
+
+func useRealCache() {
+    c := &RealCache{}
+    c.Get("key")
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            // Get callers of FakeCache.Get specifically
+            const callers = index.findCallers('Get', {
+                targetDefinitions: [{ file: dir + '/cache.go', startLine: 4, className: 'FakeCache', receiver: '*FakeCache' }],
+                includeMethods: true,
+                includeUncertain: false,
+            });
+            // Should find useFakeCache (has receiverType evidence) but not useRealCache
+            const callerNames = callers.map(c => c.callerName);
+            assert.ok(callerNames.includes('useFakeCache'), 'should find useFakeCache as caller');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('K8s fix: Issue 5 — entrypoints detects Go main/init/Test functions', () => {
+    it('detects main() and init() as entry points', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+
+func init() {
+    // register something
+}
+
+func main() {
+    run()
+}
+
+func run() {}
+`,
+            'helper_test.go': `package main
+
+import "testing"
+
+func TestRun(t *testing.T) {}
+func BenchmarkRun(b *testing.B) {}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('main'), 'should detect main()');
+            assert.ok(names.includes('init'), 'should detect init()');
+            assert.ok(names.includes('TestRun'), 'should detect TestRun()');
+            assert.ok(names.includes('BenchmarkRun'), 'should detect BenchmarkRun()');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('K8s fix: Issue 6 — toc respects in= filter', () => {
+    it('scopes toc output to matching directory', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/scheduler/scheduler.go': `package scheduler
+func Schedule() {}
+func Run() {}
+`,
+            'pkg/api/types.go': `package api
+type CronJob struct{}
+func NewCronJob() *CronJob { return nil }
+`,
+            'pkg/controller/main.go': `package controller
+func Start() {}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'toc', { in: 'pkg/scheduler' });
+            assert.ok(result.ok, 'toc should succeed');
+            // Should only include files from pkg/scheduler
+            assert.strictEqual(result.result.totals.files, 1, 'should only have 1 file from pkg/scheduler');
+            assert.ok(result.result.files[0].file.includes('scheduler'), 'file should be in scheduler dir');
+            assert.ok(result.result.meta.scopedTo === 'pkg/scheduler', 'meta should show scopedTo');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('K8s fix: Issue 3 — file= shows all alternatives on mismatch', () => {
+    it('lists all definitions when file= filter matches none', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/api/schedule.go': `package api
+type Schedule struct{}
+`,
+            'pkg/batch/types.go': `package batch
+type Schedule struct{}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'about', { name: 'Schedule', file: 'pkg/scheduler' });
+            // Should fail with a helpful error listing alternatives
+            assert.ok(!result.ok, 'should indicate Schedule not found in pkg/scheduler');
+            assert.ok(result.error.includes('definition'), 'error should mention definitions');
+            assert.ok(result.error.includes('pkg/api'), 'error should list pkg/api as alternative');
+            assert.ok(result.error.includes('pkg/batch'), 'error should list pkg/batch as alternative');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('K8s fix: Issue 7 — resolveSymbol prefers shallower paths', () => {
+    it('prefers definition with shorter path over deeper one', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'pkg/core.go': `package pkg
+func Process() {}
+`,
+            'pkg/internal/v2/compat/process.go': `package compat
+func Process() {}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { def } = index.resolveSymbol('Process');
+            assert.ok(def, 'should resolve Process');
+            // Shallower path should win
+            assert.ok(def.relativePath.includes('core.go'), 'should prefer shallower path pkg/core.go over deeply nested one');
         } finally {
             rm(dir);
         }

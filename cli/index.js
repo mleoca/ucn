@@ -715,7 +715,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'affectedTests': {
             const { ok, result, error } = execute(index, 'affectedTests', { name: arg, ...flags });
             if (!ok) fail(error);
-            printOutput(result, output.formatAffectedTestsJson, output.formatAffectedTests);
+            printOutput(result, output.formatAffectedTestsJson, r => output.formatAffectedTests(r, { all: flags.all }));
             break;
         }
 
@@ -782,7 +782,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'diffImpact': {
             const { ok, result, error } = execute(index, 'diffImpact', { base: flags.base, staged: flags.staged, file: flags.file });
             if (!ok) fail(error);
-            printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
+            printOutput(result, output.formatDiffImpactJson, r => output.formatDiffImpact(r, { all: flags.all }));
             break;
         }
 
@@ -1504,7 +1504,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         case 'affectedTests': {
             const { ok, result, error } = execute(index, 'affectedTests', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            console.log(output.formatAffectedTests(result));
+            console.log(output.formatAffectedTests(result, { all: iflags.all }));
             break;
         }
 
@@ -1536,7 +1536,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         case 'diffImpact': {
             const { ok, result, error } = execute(index, 'diffImpact', iflags);
             if (!ok) { console.log(error); return; }
-            console.log(output.formatDiffImpact(result));
+            console.log(output.formatDiffImpact(result, { all: iflags.all }));
             break;
         }
 

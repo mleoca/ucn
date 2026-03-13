@@ -919,6 +919,10 @@ class ProjectIndex {
             if (d.startLine && d.endLine && d.type === 'function') {
                 score += Math.min(d.endLine - d.startLine, 100);
             }
+            // Prefer shallower paths (fewer directory levels = more central to project)
+            // Max bonus 50 for root-level files, decreasing with depth
+            const depth = (rp.match(/\//g) || []).length;
+            score += Math.max(0, 50 - depth * 10);
             return { def: d, score };
         });
 
@@ -969,10 +973,15 @@ class ProjectIndex {
         // Build warnings
         const warnings = [];
         if (definitions.length > 1) {
+            const others = definitions.filter(d => d !== def);
+            const shown = others.slice(0, 5);
+            const extra = others.length - shown.length;
+            const alsoIn = shown.map(d => `${d.relativePath}:${d.startLine}`).join(', ');
+            const suffix = extra > 0 ? `, and ${extra} more` : '';
             warnings.push({
                 type: 'ambiguous',
-                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${definitions.filter(d => d !== def).map(d => `${d.relativePath}:${d.startLine}`).join(', ')}. Specify a file to disambiguate.`,
-                alternatives: definitions.filter(d => d !== def).map(d => ({
+                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${alsoIn}${suffix}. Use file= to disambiguate.`,
+                alternatives: others.map(d => ({
                     file: d.relativePath,
                     line: d.startLine
                 }))
@@ -3255,11 +3264,29 @@ class ProjectIndex {
             // like .close(), .get() etc. where many types have the same method.
             if (def.className) {
                 const targetClassName = def.className;
+                // Pre-compute how many types share this method name
+                const _impMethodDefs = this.symbols.get(name);
+                const _impClassNames = new Set();
+                if (_impMethodDefs) {
+                    for (const d of _impMethodDefs) {
+                        if (d.className) _impClassNames.add(d.className);
+                        else if (d.receiver) _impClassNames.add(d.receiver.replace(/^\*/, ''));
+                    }
+                }
                 callerResults = callerResults.filter(c => {
                     // Keep non-method calls and self/this/cls calls (already resolved by findCallers)
                     if (!c.isMethod) return true;
                     const r = c.receiver;
-                    if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
+                    if (r && ['self', 'cls', 'this', 'super'].includes(r)) return true;
+                    // Use receiverType from findCallers when available (Go/Java/Rust type inference)
+                    if (c.receiverType) {
+                        return c.receiverType === targetClassName;
+                    }
+                    // No receiver (chained/complex expression): only include if method is
+                    // unique or rare across types — otherwise too many false positives
+                    if (!r) {
+                        return _impClassNames.size <= 1;
+                    }
                     // Check if receiver matches the target class name (case-insensitive camelCase convention)
                     if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
                     // Check if receiver is an instance of the target class using local variable type inference
@@ -3341,17 +3368,8 @@ class ProjectIndex {
                     }
                     // Unique method heuristic: if the called method exists on exactly one class/type
                     // and it matches the target, include the call (no other class could match)
-                    const methodDefs = this.symbols.get(name);
-                    if (methodDefs) {
-                        const classNames = new Set();
-                        for (const d of methodDefs) {
-                            if (d.className) classNames.add(d.className);
-                            // Go/Rust: use receiver type as className equivalent
-                            else if (d.receiver) classNames.add(d.receiver.replace(/^\*/, ''));
-                        }
-                        if (classNames.size === 1 && classNames.has(targetClassName)) {
-                            return true;
-                        }
+                    if (_impClassNames.size === 1 && _impClassNames.has(targetClassName)) {
+                        return true;
                     }
                     // Type-scoped query but receiver type unknown — filter it out.
                     // Unknown receivers are likely unrelated.
@@ -4697,6 +4715,9 @@ class ProjectIndex {
             if (options.exclude && options.exclude.length > 0) {
                 if (!this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude })) continue;
             }
+            if (options.in) {
+                if (!this.matchesFilters(fileEntry.relativePath, { in: options.in })) continue;
+            }
             let functions = fileEntry.symbols.filter(s =>
                 s.type === 'function' || s.type === 'method' || s.type === 'static' ||
                 s.type === 'constructor' || s.type === 'public' || s.type === 'abstract' ||
@@ -4789,6 +4810,7 @@ class ProjectIndex {
                 uncertain: 0,
                 projectLanguage: this._getPredominantLanguage(),
                 ...(fileFilter && { filteredBy: options.file, matchedFiles: files.length }),
+                ...(options.in && { scopedTo: options.in }),
                 ...(emptyFiles > 0 && fileFilter && { emptyFiles })
             },
             totals: {
@@ -5153,24 +5175,38 @@ class ProjectIndex {
                 const targetDef = targetDefs[0] || symbol;
                 if (targetDef.className && (lang === 'go' || lang === 'java' || lang === 'rust')) {
                     const targetClassName = targetDef.className;
+                    // Pre-compute how many types share this method name
+                    const methodDefs = this.symbols.get(symbol.name);
+                    const classNames = new Set();
+                    if (methodDefs) {
+                        for (const d of methodDefs) {
+                            if (d.className) classNames.add(d.className);
+                            else if (d.receiver) classNames.add(d.receiver.replace(/^\*/, ''));
+                        }
+                    }
+                    const isWidelyShared = classNames.size > 3;
                     callers = callers.filter(c => {
                         if (!c.isMethod) return true;
                         const r = c.receiver;
-                        if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
+                        if (r && ['self', 'cls', 'this', 'super'].includes(r)) return true;
+                        // No receiver (chained/complex expression): only include if method is
+                        // unique or rare across types — otherwise too many false positives
+                        if (!r) {
+                            return classNames.size <= 1;
+                        }
                         // Use receiverType from findCallers when available
                         if (c.receiverType) {
                             return c.receiverType === targetClassName ||
                                    c.receiverType === targetDef.receiver?.replace(/^\*/, '');
                         }
                         // Unique method heuristic: if the method exists on exactly one class/type, include
-                        const methodDefs = this.symbols.get(symbol.name);
-                        if (methodDefs) {
-                            const classNames = new Set();
-                            for (const d of methodDefs) {
-                                if (d.className) classNames.add(d.className);
-                                else if (d.receiver) classNames.add(d.receiver.replace(/^\*/, ''));
-                            }
-                            if (classNames.size === 1 && classNames.has(targetClassName)) return true;
+                        if (classNames.size === 1 && classNames.has(targetClassName)) return true;
+                        // For widely shared method names (Get, Set, Run, etc.), require same-package
+                        // evidence when receiver type is unknown
+                        if (isWidelyShared) {
+                            const callerFile = c.file || '';
+                            const targetDir = path.dirname(change.filePath);
+                            return path.dirname(callerFile) === targetDir;
                         }
                         // Unknown receiver + multiple classes with this method → filter out
                         return false;

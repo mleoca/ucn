@@ -83,6 +83,7 @@ const PARAM_MAP = {
     default_value:     'defaultValue',
     top_level:         'topLevel',
     max_files:         'maxFiles',
+    max_chars:         'maxChars',
 };
 
 // ============================================================================

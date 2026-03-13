@@ -149,6 +149,23 @@ function checkFilePatternMatch(index, filePattern) {
     for (const [, fileEntry] of index.files) {
         if (fileEntry.relativePath.includes(filePattern)) return null;
     }
+    // Suggest similar directories/files to help user refine
+    const patternLower = filePattern.toLowerCase();
+    const basename = filePattern.split('/').pop().toLowerCase();
+    const suggestions = new Set();
+    for (const [, fileEntry] of index.files) {
+        const rp = fileEntry.relativePath.toLowerCase();
+        // Check if any path component contains the last segment of the pattern
+        if (basename && rp.includes(basename)) {
+            // Extract the directory containing the match
+            const dir = fileEntry.relativePath.split('/').slice(0, -1).join('/');
+            if (dir) suggestions.add(dir);
+            if (suggestions.size >= 5) break;
+        }
+    }
+    if (suggestions.size > 0) {
+        return `No files matched pattern '${filePattern}'. Similar paths:\n${[...suggestions].map(s => '  ' + s).join('\n')}`;
+    }
     return `No files matched pattern '${filePattern}'.`;
 }
 
@@ -187,17 +204,16 @@ const HANDLERS = {
         if (!result) {
             // Give better error if file/className filter is the problem
             if (p.file || p.className) {
-                const unfiltered = index.about(p.name, {
-                    withTypes: p.withTypes || false,
-                    all: false,
-                    includeMethods: p.includeMethods,
-                    includeUncertain: p.includeUncertain || false,
-                    exclude: toExcludeArray(p.exclude),
-                });
-                if (unfiltered && unfiltered.found !== false && unfiltered.symbol) {
-                    const loc = `${unfiltered.symbol.file}:${unfiltered.symbol.startLine}`;
+                // Show ALL definitions so user can pick the right file= filter
+                const allDefs = index.symbols.get(p.name) || [];
+                if (allDefs.length > 0) {
                     const filterDesc = p.className ? `class "${p.className}"` : `file "${p.file}"`;
-                    return { ok: false, error: `Symbol "${p.name}" not found in ${filterDesc}. Found in: ${loc}. Use the correct --file or Class.method syntax.` };
+                    const locations = allDefs
+                        .slice(0, 10)
+                        .map(d => `  ${d.relativePath}:${d.startLine}${d.className ? ` (${d.className})` : ''}`)
+                        .join('\n');
+                    const more = allDefs.length > 10 ? `\n  ... and ${allDefs.length - 10} more` : '';
+                    return { ok: false, error: `Symbol "${p.name}" not found in ${filterDesc}. Found ${allDefs.length} definition(s) elsewhere:\n${locations}${more}\nUse file= with a path fragment from the list above to disambiguate.` };
                 }
             }
             return { ok: false, error: `Symbol "${p.name}" not found.` };
@@ -422,6 +438,7 @@ const HANDLERS = {
             top: num(p.top, undefined),
             file: p.file,
             exclude: p.exclude,
+            in: p.in,
         });
         // Apply limit to detailed toc entries (symbols are in f.symbols.functions/classes arrays)
         const limit = num(p.limit, undefined);

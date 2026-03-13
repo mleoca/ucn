@@ -174,6 +174,55 @@ const FRAMEWORK_PATTERNS = [
         pattern: /^tokio::main$/,
     },
 
+    // ── Go Runtime Entry Points ─────────────────────────────────────────
+
+    // Go main function (program entry)
+    {
+        id: 'go-main',
+        languages: new Set(['go']),
+        type: 'runtime',
+        framework: 'go',
+        detection: 'namePattern',
+        pattern: /^main$/,
+    },
+
+    // Go init functions (package initialization, called by runtime)
+    {
+        id: 'go-init',
+        languages: new Set(['go']),
+        type: 'runtime',
+        framework: 'go',
+        detection: 'namePattern',
+        pattern: /^init$/,
+    },
+
+    // Go test functions (called by go test)
+    {
+        id: 'go-test',
+        languages: new Set(['go']),
+        type: 'test',
+        framework: 'go',
+        detection: 'namePattern',
+        pattern: /^(Test|Benchmark|Example|Fuzz)[A-Z_]/,
+    },
+
+    // ── Go Framework Patterns ─────────────────────────────────────────
+
+    // Cobra CLI framework — RunE, Run, PreRunE etc. assigned to cobra.Command struct fields
+    // Detected via call-pattern: cobra.Command composite literals with function value fields
+    {
+        id: 'cobra-command',
+        languages: new Set(['go']),
+        type: 'cli',
+        framework: 'cobra',
+        detection: 'callPattern',
+        receiverPattern: /^cobra$/i,
+        methodPattern: /^Command$/,
+    },
+
+    // Go goroutine launch — go func() or go handler()
+    // (detected separately in namePattern since it's a language feature)
+
     // ── Catch-all fallbacks ─────────────────────────────────────────────
 
     // Python: any decorator with '.' (attribute access) — framework registration heuristic
@@ -308,12 +357,16 @@ function detectEntrypoints(index, options = {}) {
     const results = [];
     const seen = new Set(); // file:line:name dedup key
 
-    // 1. Scan all symbols for decorator/modifier-based patterns
+    // Collect name-based patterns for efficient matching
+    const namePatterns = FRAMEWORK_PATTERNS.filter(p => p.detection === 'namePattern');
+
+    // 1. Scan all symbols for decorator/modifier/name-based patterns
     for (const [name, symbols] of index.symbols) {
         for (const symbol of symbols) {
             const fileEntry = index.files.get(symbol.file);
             if (!fileEntry) continue;
 
+            // Check decorator/modifier-based patterns
             const match = matchDecoratorOrModifier(symbol, fileEntry.language);
             if (match) {
                 const key = `${symbol.file}:${symbol.startLine}:${name}`;
@@ -331,6 +384,30 @@ function detectEntrypoints(index, options = {}) {
                     evidence: [match.matchedOn],
                     confidence: 0.95,
                 });
+                continue;
+            }
+
+            // Check name-based patterns (main, init, TestXxx, etc.)
+            for (const np of namePatterns) {
+                if (!np.languages.has(fileEntry.language)) continue;
+                if (np.pattern.test(name)) {
+                    const key = `${symbol.file}:${symbol.startLine}:${name}`;
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+
+                    results.push({
+                        name,
+                        file: symbol.relativePath || symbol.file,
+                        absoluteFile: symbol.file,
+                        line: symbol.startLine,
+                        type: np.type,
+                        framework: np.framework,
+                        patternId: np.id,
+                        evidence: [`${name}() convention`],
+                        confidence: 1.0,
+                    });
+                    break;
+                }
             }
         }
     }

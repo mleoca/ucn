@@ -6,12 +6,12 @@
     "url": "https://github.com/mleoca/ucn",
     "source": "github"
   },
-  "version": "3.8.6",
+  "version": "3.8.7",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "ucn",
-      "version": "3.8.6",
+      "version": "3.8.7",
       "transport": {
         "type": "stdio"
       }

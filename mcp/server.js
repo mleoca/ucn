@@ -114,16 +114,29 @@ const server = new McpServer({
 // TOOL HELPERS
 // ============================================================================
 
-const MAX_OUTPUT_CHARS = 100000; // ~100KB, safe for all MCP clients
+const DEFAULT_OUTPUT_CHARS = 30000;  // ~7.5K tokens — safe default for AI context
+const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars override
 
-function toolResult(text) {
+function toolResult(text, command, maxChars) {
     if (!text) return { content: [{ type: 'text', text: '(no output)' }] };
-    if (text.length > MAX_OUTPUT_CHARS) {
-        const truncated = text.substring(0, MAX_OUTPUT_CHARS);
+    const limit = Math.min(maxChars || DEFAULT_OUTPUT_CHARS, MAX_OUTPUT_CHARS);
+    if (text.length > limit) {
+        const fullSize = text.length;
+        const fullTokens = Math.round(fullSize / 4);
+        const truncated = text.substring(0, limit);
         // Cut at last newline to avoid breaking mid-line
         const lastNewline = truncated.lastIndexOf('\n');
-        const cleanCut = lastNewline > MAX_OUTPUT_CHARS * 0.8 ? truncated.substring(0, lastNewline) : truncated;
-        return { content: [{ type: 'text', text: cleanCut + '\n\n... (output truncated — refine query or use file/in/exclude parameters to narrow scope)' }] };
+        const cleanCut = lastNewline > limit * 0.8 ? truncated.substring(0, lastNewline) : truncated;
+        // Command-specific narrowing hints
+        let narrow = 'Use file=/in=/exclude= to narrow scope.';
+        if (command === 'toc') {
+            narrow = 'Use in= to scope to a subdirectory, or detailed=false for compact view.';
+        } else if (command === 'diff_impact') {
+            narrow = 'Use file= to scope to specific files/directories.';
+        } else if (command === 'affected_tests') {
+            narrow = 'Use file= to scope, exclude= to skip patterns.';
+        }
+        return { content: [{ type: 'text', text: cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Or use all=true to see everything (warning: ~${fullTokens} tokens).` }] };
     }
     return { content: [{ type: 'text', text }] };
 }
@@ -272,6 +285,7 @@ server.registerTool(
             class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
             limit: z.number().optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed.'),
             max_files: z.number().optional().describe('Max files to index (default: 10000). Use for very large codebases.'),
+            max_chars: z.number().optional().describe('Max output chars before truncation (default: 30000 ~7.5K tokens, max: 100000 ~25K tokens). Use all=true to bypass all caps, or set this for fine-grained control. Truncation message shows full size.'),
             // Structural search flags (search command)
             type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type. Triggers index-based search.'),
             param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
@@ -291,6 +305,11 @@ server.registerTool(
         // This eliminates per-case param selection and prevents CLI/MCP drift.
         const { command: _c, project_dir: _p, ...rawParams } = args;
         const ep = normalizeParams(rawParams);
+        // all=true bypasses both formatter caps AND char truncation (parity with CLI --all)
+        const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
+
+        // Wrap toolResult to auto-inject maxChars from this request
+        const tr = (text, cmd) => toolResult(text, cmd, maxChars);
 
         try {
             switch (command) {
@@ -304,8 +323,8 @@ server.registerTool(
             case 'about': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'about', ep);
-                if (!ok) return toolResult(error); // soft error — won't kill sibling calls
-                return toolResult(output.formatAbout(result, {
+                if (!ok) return tr(error); // soft error — won't kill sibling calls
+                return tr(output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.',
                     showConfidence: ep.showConfidence,
@@ -315,27 +334,27 @@ server.registerTool(
             case 'context': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result: ctx, error } = execute(index, 'context', ep);
-                if (!ok) return toolResult(error); // context uses soft error (not toolError)
+                if (!ok) return tr(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
                     showConfidence: ep.showConfidence,
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
-                return toolResult(text);
+                return tr(text);
             }
 
             case 'impact': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'impact', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatImpact(result));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatImpact(result));
             }
 
             case 'blast': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'blast', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatBlast(result, {
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatBlast(result, {
                     allHint: 'Set depth to expand all children.',
                 }));
             }
@@ -343,15 +362,15 @@ server.registerTool(
             case 'smart': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'smart', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatSmart(result));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatSmart(result));
             }
 
             case 'trace': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'trace', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatTrace(result, {
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
                 }));
@@ -360,8 +379,8 @@ server.registerTool(
             case 'reverse_trace': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'reverseTrace', ep);
-                if (!ok) return toolResult(error);
-                return toolResult(output.formatReverseTrace(result, {
+                if (!ok) return tr(error);
+                return tr(output.formatReverseTrace(result, {
                     allHint: 'Set depth to expand all children.',
                 }));
             }
@@ -369,17 +388,17 @@ server.registerTool(
             case 'example': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'example', ep);
-                if (!ok) return toolResult(error);
-                if (!result) return toolResult(`No usage examples found for "${ep.name}".`);
-                return toolResult(output.formatExample(result, ep.name));
+                if (!ok) return tr(error);
+                if (!result) return tr(`No usage examples found for "${ep.name}".`);
+                return tr(output.formatExample(result, ep.name));
             }
 
             case 'related': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'related', ep);
-                if (!ok) return toolResult(error);
-                if (!result) return toolResult(`Symbol "${ep.name}" not found.`);
-                return toolResult(output.formatRelated(result, {
+                if (!ok) return tr(error);
+                if (!result) return tr(`Symbol "${ep.name}" not found.`);
+                return tr(output.formatRelated(result, {
                     all: ep.all || false, top: ep.top,
                     allHint: 'Repeat with all=true to show all.'
                 }));
@@ -390,60 +409,60 @@ server.registerTool(
             case 'find': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'find', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 let text = output.formatFind(result, ep.name, ep.top);
                 if (note) text += '\n\n' + note;
-                return toolResult(text);
+                return tr(text);
             }
 
             case 'usages': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'usages', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 let text = output.formatUsages(result, ep.name);
                 if (note) text += '\n\n' + note;
-                return toolResult(text);
+                return tr(text);
             }
 
             case 'toc': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'toc', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 let text = output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 });
                 if (note) text += '\n\n' + note;
-                return toolResult(text);
+                return tr(text, 'toc');
             }
 
             case 'search': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error, structural } = execute(index, 'search', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 if (structural) {
-                    return toolResult(output.formatStructuralSearch(result));
+                    return tr(output.formatStructuralSearch(result));
                 }
-                return toolResult(output.formatSearch(result, ep.term));
+                return tr(output.formatSearch(result, ep.term));
             }
 
             case 'tests': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'tests', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatTests(result, ep.name));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatTests(result, ep.name));
             }
 
             case 'affected_tests': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'affectedTests', ep);
-                if (!ok) return toolResult(error);
-                return toolResult(output.formatAffectedTests(result));
+                if (!ok) return tr(error);
+                return tr(output.formatAffectedTests(result, { all: ep.all }), 'affected_tests');
             }
 
             case 'deadcode': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'deadcode', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 const dcNote = note;
                 let dcText = output.formatDeadcode(result, {
                     top: ep.top || 0,
@@ -451,14 +470,14 @@ server.registerTool(
                     exportedHint: !ep.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined
                 });
                 if (dcNote) dcText += '\n\n' + dcNote;
-                return toolResult(dcText);
+                return tr(dcText);
             }
 
             case 'entrypoints': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'entrypoints', ep);
-                if (!ok) return toolResult(error);
-                return toolResult(output.formatEntrypoints(result));
+                if (!ok) return tr(error);
+                return tr(output.formatEntrypoints(result));
             }
 
             // ── File Dependencies ───────────────────────────────────────
@@ -466,29 +485,29 @@ server.registerTool(
             case 'imports': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'imports', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatImports(result, ep.file));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatImports(result, ep.file));
             }
 
             case 'exporters': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'exporters', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatExporters(result, ep.file));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatExporters(result, ep.file));
             }
 
             case 'file_exports': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fileExports', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatFileExports(result, ep.file));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatFileExports(result, ep.file));
             }
 
             case 'graph': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'graph', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatGraph(result, {
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatGraph(result, {
                     showAll: ep.all || ep.depth !== undefined,
                     maxDepth: ep.depth ?? 2, file: ep.file,
                     depthHint: 'Set depth parameter for deeper graph.',
@@ -499,8 +518,8 @@ server.registerTool(
             case 'circular_deps': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'circularDeps', ep);
-                if (!ok) return toolResult(error);
-                return toolResult(output.formatCircularDeps(result));
+                if (!ok) return tr(error);
+                return tr(output.formatCircularDeps(result));
             }
 
             // ── Refactoring ─────────────────────────────────────────────
@@ -508,22 +527,22 @@ server.registerTool(
             case 'verify': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'verify', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatVerify(result));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatVerify(result));
             }
 
             case 'plan': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'plan', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatPlan(result));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatPlan(result));
             }
 
             case 'diff_impact': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'diffImpact', ep);
-                if (!ok) return toolResult(error); // soft error — e.g. "not a git repo"
-                return toolResult(output.formatDiffImpact(result));
+                if (!ok) return tr(error); // soft error — e.g. "not a git repo"
+                return tr(output.formatDiffImpact(result, { all: ep.all }), 'diff_impact');
             }
 
             // ── Other ───────────────────────────────────────────────────
@@ -531,31 +550,31 @@ server.registerTool(
             case 'typedef': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'typedef', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatTypedef(result, ep.name));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatTypedef(result, ep.name));
             }
 
             case 'stacktrace': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stacktrace', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatStackTrace(result));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatStackTrace(result));
             }
 
             case 'api': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'api', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 let apiText = output.formatApi(result, ep.file || '.');
                 if (note) apiText += '\n\n' + note;
-                return toolResult(apiText);
+                return tr(apiText);
             }
 
             case 'stats': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stats', ep);
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(output.formatStats(result, { top: ep.top || 0 }));
+                if (!ok) return tr(error); // soft error
+                return tr(output.formatStats(result, { top: ep.top || 0 }));
             }
 
             // ── Extracting Code (via execute) ────────────────────────────
@@ -565,14 +584,14 @@ server.registerTool(
                 if (err) return err;
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fn', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
                     if (typeof check !== 'string') return check;
                 }
                 const notes = result.notes.length ? result.notes.map(n => 'Note: ' + n).join('\n') + '\n\n' : '';
-                return toolResult(notes + output.formatFnResult(result));
+                return tr(notes + output.formatFnResult(result));
             }
 
             case 'class': {
@@ -583,24 +602,24 @@ server.registerTool(
                 }
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'class', ep);
-                if (!ok) return toolResult(error);  // soft error (class not found)
+                if (!ok) return tr(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
                     if (typeof check !== 'string') return check;
                 }
                 const notes = result.notes.length ? result.notes.map(n => 'Note: ' + n).join('\n') + '\n\n' : '';
-                return toolResult(notes + output.formatClassResult(result));
+                return tr(notes + output.formatClassResult(result));
             }
 
             case 'lines': {
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'lines', ep);
-                if (!ok) return toolResult(error); // soft error
+                if (!ok) return tr(error); // soft error
                 // MCP path security: validate file is within project root
                 const check = resolveAndValidatePath(index, result.relativePath);
                 if (typeof check !== 'string') return check;
-                return toolResult(output.formatLines(result));
+                return tr(output.formatLines(result));
             }
 
             case 'expand': {
@@ -614,8 +633,8 @@ server.registerTool(
                     itemCount: lookup.itemCount, symbolName: lookup.symbolName,
                     validateRoot: true
                 });
-                if (!ok) return toolResult(error); // soft error
-                return toolResult(result.text);
+                if (!ok) return tr(error); // soft error
+                return tr(result.text);
             }
 
             default:

@@ -889,6 +889,108 @@ function findCallsInCode(code, parser, options = {}) {
             }
         }
 
+        // Detect function-value assignments:
+        // Pattern 1: sched.SchedulePod = sched.schedulePod (field = method reference)
+        // Pattern 2: sched.SchedulePod = schedulePod (field = function reference)
+        // Pattern 3: var handler = processEvent (short variable = function reference)
+        // The RHS is a function reference (not a call — no parentheses)
+        if (node.type === 'assignment_statement' || node.type === 'short_var_declaration') {
+            // Skip blank identifier assignments: _ = x (used to suppress unused warnings)
+            const left = node.childForFieldName('left');
+            const isBlankAssign = left && left.text.trim() === '_';
+            const right = isBlankAssign ? null : node.childForFieldName('right');
+            if (right) {
+                // Walk through the expression list (could be multiple assignments)
+                const rhsNodes = right.type === 'expression_list' ? right.namedChildren : [right];
+                for (const rhs of rhsNodes) {
+                    // selector_expression: sched.schedulePod
+                    if (rhs.type === 'selector_expression') {
+                        const fieldNode = rhs.childForFieldName('field');
+                        const operandNode = rhs.childForFieldName('operand');
+                        if (fieldNode && operandNode) {
+                            const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                            const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                            const enclosingFunction = getCurrentEnclosingFunction();
+                            calls.push({
+                                name: fieldNode.text,
+                                line: rhs.startPosition.row + 1,
+                                isMethod: true,
+                                receiver,
+                                ...(receiverType && { receiverType }),
+                                enclosingFunction,
+                                isPotentialCallback: true,
+                                uncertain: false
+                            });
+                        }
+                    }
+                    // Plain identifier: schedulePod (standalone function reference)
+                    if (rhs.type === 'identifier') {
+                        const name = rhs.text;
+                        if (!GO_SKIP_IDENTS.has(name) && !GO_BUILTINS.has(name) && !importAliases.has(name) && /^[a-zA-Z]/.test(name)) {
+                            const enclosingFunction = getCurrentEnclosingFunction();
+                            calls.push({
+                                name,
+                                line: rhs.startPosition.row + 1,
+                                isMethod: false,
+                                isFunctionReference: true,
+                                isPotentialCallback: true,
+                                enclosingFunction,
+                                uncertain: false
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Detect function references in composite literal fields:
+        // ResourceEventHandlerFuncs{AddFunc: addNodeToCache, UpdateFunc: updateNode}
+        // keyed_element → literal_element(key) ":" literal_element(value)
+        // Go wraps values in literal_element nodes — unwrap to get the actual expression
+        if (node.type === 'keyed_element') {
+            // The value (second child, unwrap literal_element if present)
+            let valueNode = node.namedChildCount >= 2 ? node.namedChild(node.namedChildCount - 1) : null;
+            if (valueNode && valueNode.type === 'literal_element') {
+                valueNode = valueNode.namedChildCount > 0 ? valueNode.namedChild(0) : null;
+            }
+            if (valueNode) {
+                if (valueNode.type === 'identifier') {
+                    const name = valueNode.text;
+                    if (!GO_SKIP_IDENTS.has(name) && !GO_BUILTINS.has(name) && !importAliases.has(name) && /^[a-zA-Z]/.test(name)) {
+                        const enclosingFunction = getCurrentEnclosingFunction();
+                        calls.push({
+                            name,
+                            line: valueNode.startPosition.row + 1,
+                            isMethod: false,
+                            isFunctionReference: true,
+                            isPotentialCallback: true,
+                            enclosingFunction,
+                            uncertain: false
+                        });
+                    }
+                }
+                if (valueNode.type === 'selector_expression') {
+                    const fieldNode = valueNode.childForFieldName('field');
+                    const operandNode = valueNode.childForFieldName('operand');
+                    if (fieldNode && operandNode) {
+                        const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
+                        const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                        const enclosingFunction = getCurrentEnclosingFunction();
+                        calls.push({
+                            name: fieldNode.text,
+                            line: valueNode.startPosition.row + 1,
+                            isMethod: true,
+                            receiver,
+                            ...(receiverType && { receiverType }),
+                            enclosingFunction,
+                            isPotentialCallback: true,
+                            uncertain: false
+                        });
+                    }
+                }
+            }
+        }
+
         return true;
     }, {
         onLeave: (node) => {
