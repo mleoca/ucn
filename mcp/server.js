@@ -114,12 +114,17 @@ const server = new McpServer({
 // TOOL HELPERS
 // ============================================================================
 
-const DEFAULT_OUTPUT_CHARS = 10000;  // ~2.5K tokens — compact default for AI agents
+const DEFAULT_OUTPUT_CHARS = 10000;  // ~2.5K tokens — targeted commands (about, context, smart, etc.)
+const BROAD_OUTPUT_CHARS = 3000;     // ~750 tokens — broad commands where truncated listings are useless
 const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars override
+
+// Broad commands: output is project-wide, truncation means you need a filter, not more text
+const BROAD_COMMANDS = new Set(['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']);
 
 function toolResult(text, command, maxChars) {
     if (!text) return { content: [{ type: 'text', text: '(no output)' }] };
-    const limit = Math.min(maxChars || DEFAULT_OUTPUT_CHARS, MAX_OUTPUT_CHARS);
+    const defaultLimit = BROAD_COMMANDS.has(command) ? BROAD_OUTPUT_CHARS : DEFAULT_OUTPUT_CHARS;
+    const limit = Math.min(maxChars || defaultLimit, MAX_OUTPUT_CHARS);
     if (text.length > limit) {
         const fullSize = text.length;
         const fullTokens = Math.round(fullSize / 4);
@@ -128,14 +133,15 @@ function toolResult(text, command, maxChars) {
         const lastNewline = truncated.lastIndexOf('\n');
         const cleanCut = lastNewline > limit * 0.8 ? truncated.substring(0, lastNewline) : truncated;
         // Command-specific narrowing hints
-        let narrow = 'Use file=/in=/exclude= to narrow scope.';
-        if (command === 'toc') {
-            narrow = 'Use in= to scope to a subdirectory, or detailed=false for compact view.';
-        } else if (command === 'diff_impact') {
-            narrow = 'Use file= to scope to specific files/directories.';
-        } else if (command === 'affected_tests') {
-            narrow = 'Use file= to scope, exclude= to skip patterns.';
-        }
+        const hints = {
+            toc: 'Use in= to scope to a subdirectory, or detailed=false for compact view.',
+            entrypoints: 'Use framework= to filter by framework, exclude= to skip patterns.',
+            diff_impact: 'Use file= to scope to specific files/directories.',
+            affected_tests: 'Use file= to scope, exclude= to skip patterns.',
+            deadcode: 'Use file= to scope, exclude= to skip patterns.',
+            usages: 'Use file= to scope to specific files.',
+        };
+        const narrow = hints[command] || 'Use file=/in=/exclude= to narrow scope.';
         return { content: [{ type: 'text', text: cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Or use all=true to see everything (warning: ~${fullTokens} tokens).` }] };
     }
     return { content: [{ type: 'text', text }] };
@@ -285,7 +291,7 @@ server.registerTool(
             class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
             limit: z.number().optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed.'),
             max_files: z.number().optional().describe('Max files to index (default: 10000). Use for very large codebases.'),
-            max_chars: z.number().optional().describe('Max output chars before truncation (default: 30000 ~7.5K tokens, max: 100000 ~25K tokens). Use all=true to bypass all caps, or set this for fine-grained control. Truncation message shows full size.'),
+            max_chars: z.number().optional().describe('Max output chars before truncation. Targeted commands (about, context, smart, etc.): 10K default. Broad commands (toc, entrypoints, deadcode, etc.): 3K default. Max: 100K. Use all=true to bypass all caps.'),
             // Structural search flags (search command)
             type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type. Triggers index-based search.'),
             param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
@@ -308,8 +314,8 @@ server.registerTool(
         // all=true bypasses both formatter caps AND char truncation (parity with CLI --all)
         const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
 
-        // Wrap toolResult to auto-inject maxChars from this request
-        const tr = (text, cmd) => toolResult(text, cmd, maxChars);
+        // Wrap toolResult to auto-inject command + maxChars from this request
+        const tr = (text) => toolResult(text, command, maxChars);
 
         try {
             switch (command) {
@@ -432,7 +438,7 @@ server.registerTool(
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 });
                 if (note) text += '\n\n' + note;
-                return tr(text, 'toc');
+                return tr(text);
             }
 
             case 'search': {
@@ -456,7 +462,7 @@ server.registerTool(
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'affectedTests', ep);
                 if (!ok) return tr(error);
-                return tr(output.formatAffectedTests(result, { all: ep.all }), 'affected_tests');
+                return tr(output.formatAffectedTests(result, { all: ep.all }));
             }
 
             case 'deadcode': {
@@ -542,7 +548,7 @@ server.registerTool(
                 const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'diffImpact', ep);
                 if (!ok) return tr(error); // soft error — e.g. "not a git repo"
-                return tr(output.formatDiffImpact(result, { all: ep.all }), 'diff_impact');
+                return tr(output.formatDiffImpact(result, { all: ep.all }));
             }
 
             // ── Other ───────────────────────────────────────────────────

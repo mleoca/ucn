@@ -14016,3 +14016,30 @@ describe('fix: MCP max_files parameter honored', () => {
         }
     });
 });
+
+// =============================================================================
+// MCP two-tier output limits
+// =============================================================================
+describe('MCP two-tier output limits', () => {
+    it('BROAD_COMMANDS set includes the correct commands', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
+            assert.ok(serverCode.includes(`'${cmd}'`), `BROAD_COMMANDS should include ${cmd}`);
+        }
+    });
+
+    it('broad commands use 3K default, targeted use 10K', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        assert.ok(serverCode.includes('BROAD_OUTPUT_CHARS = 3000'), 'Broad limit should be 3000');
+        assert.ok(serverCode.includes('DEFAULT_OUTPUT_CHARS = 10000'), 'Targeted limit should be 10000');
+        assert.ok(serverCode.includes('BROAD_COMMANDS.has(command) ? BROAD_OUTPUT_CHARS : DEFAULT_OUTPUT_CHARS'),
+            'toolResult should select limit based on command type');
+    });
+
+    it('each broad command has a narrowing hint', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
+            assert.ok(serverCode.includes(`${cmd}:`), `Should have narrowing hint for ${cmd}`);
+        }
+    });
+});
