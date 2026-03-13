@@ -392,7 +392,7 @@ function formatSearchJson(results, term) {
     const meta = results.meta;
     const obj = {
         term,
-        totalMatches: results.reduce((sum, r) => sum + r.matches.length, 0),
+        totalMatches: (meta && meta.totalMatches != null) ? meta.totalMatches : results.reduce((sum, r) => sum + r.matches.length, 0),
         files: results.map(r => ({
             file: r.file,
             matchCount: r.matches.length,
@@ -407,6 +407,7 @@ function formatSearchJson(results, term) {
         obj.filesSkipped = meta.filesSkipped;
         obj.totalFiles = meta.totalFiles;
         if (meta.regexFallback) obj.regexFallback = meta.regexFallback;
+        if (meta.truncatedMatches > 0) obj.truncatedMatches = meta.truncatedMatches;
     }
     return JSON.stringify(obj, null, 2);
 }
@@ -839,7 +840,7 @@ function formatTrace(trace, options = {}) {
     }
 
     if (trace.includeMethods === false) {
-        const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded (--include-methods=false). Remove flag to include them (default).';
+        const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded — use --include-methods to include them';
         lines.push(`\n${methodsHint}`);
     }
 
@@ -1634,7 +1635,7 @@ function formatAbout(about, options = {}) {
     }
 
     if (about.includeMethods === false) {
-        const methodsHint = options.methodsHint || 'Note: obj.method() callers/callees excluded (--include-methods=false). Remove flag to include them (default).';
+        const methodsHint = options.methodsHint || 'Note: obj.method() callers/callees excluded — use --include-methods to include them';
         lines.push(`\n${methodsHint}`);
     }
 
@@ -2322,7 +2323,7 @@ function formatCircularDeps(result) {
         lines.push(`Filtered to cycles involving: ${result.fileFilter}`);
     }
 
-    const scannedCount = result.filesWithImports || result.totalFiles;
+    const scannedCount = result.filesWithImports != null ? result.filesWithImports : result.totalFiles;
 
     if (result.cycles.length === 0) {
         lines.push('');
@@ -2413,7 +2414,7 @@ function formatSearch(results, term) {
     }
 
     if (meta && meta.testsExcluded && meta.filesSkipped > 0) {
-        lines.push(`\nNote: ${meta.filesSkipped} file${meta.filesSkipped === 1 ? '' : 's'} excluded by filters (test files hidden by default; use include_tests=true to include).`);
+        lines.push(`\nNote: ${meta.filesSkipped} test file${meta.filesSkipped === 1 ? '' : 's'} hidden by default (use include_tests=true to include).`);
     }
 
     return lines.join('\n');

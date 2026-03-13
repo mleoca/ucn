@@ -1370,3 +1370,65 @@ async fn main() {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #175: Rust scoped_identifier (::) calls parsed by verify
+// ============================================================================
+
+describe('fix #175: Rust scoped_identifier (::) calls parsed by verify', () => {
+    const { execute } = require('../core/execute');
+
+    it('verify can parse Task::new() call arguments', () => {
+        const dir = tmp({
+            'a.rs': 'pub struct Task { id: String, name: String }\nimpl Task {\n    pub fn new(id: String, name: String) -> Self {\n        Task { id, name }\n    }\n}\nfn create() { Task::new("1".to_string(), "test".to_string()); }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'new', className: 'Task' });
+            assert.ok(r.ok, 'verify should succeed');
+            assert.strictEqual(r.result.uncertain, 0, 'Task::new() should not be uncertain');
+            assert.strictEqual(r.result.valid, 1, 'Task::new() should be valid');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #179: removeParam 'self' normalizes to match &self/&mut self
+// ============================================================================
+
+describe('fix #179: plan --remove-param self normalizes to match &self', () => {
+    const { execute } = require('../core/execute');
+
+    it('plan --remove-param self matches &self parameter', () => {
+        const dir = tmp({
+            'a.rs': 'struct Foo;\nimpl Foo {\n    fn bar(&self) { }\n}\nfn main() { let f = Foo; f.bar(); }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'bar', removeParam: 'self', className: 'Foo' });
+            assert.ok(r.ok, 'should not error');
+            assert.ok(r.result.found, 'should find the function');
+            assert.ok(!r.result.error, 'should not say "self not found"');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #182: Turbofish syntax in verify
+// ============================================================================
+
+describe('fix #182: turbofish syntax handled by verify', () => {
+    const { execute } = require('../core/execute');
+
+    it('verify handles turbofish generic_function AST nodes', () => {
+        const dir = tmp({
+            'a.rs': 'fn process<F: Fn(i32)>(f: F) { f(1); }\nfn main() { process::<fn(i32)>(|x| {}); }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'process' });
+            assert.ok(r.ok, 'verify should succeed');
+            assert.strictEqual(r.result.uncertain, 0, 'turbofish call should not be uncertain');
+        } finally { rm(dir); }
+    });
+});

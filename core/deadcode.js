@@ -328,9 +328,8 @@ function deadcode(index, options = {}) {
 
             // Rust: trait impl methods are invoked via trait dispatch, not direct calls
             // They can never be "dead" - the trait contract requires them to exist
-            // className for trait impls contains " for " (e.g., "PartialEq for Glob")
             const isRustTraitImpl = lang === 'rust' && symbol.isMethod &&
-                symbol.className && symbol.className.includes(' for ');
+                symbol.className && symbol.traitImpl;
 
             // Go: Test*, Benchmark*, Example* functions are called by go test
             const isGoTestFunc = lang === 'go' &&

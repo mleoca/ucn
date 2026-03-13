@@ -456,6 +456,15 @@ function findCallers(index, name, options = {}) {
                             const receiverLower = call.receiver.toLowerCase();
                             const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
                             if (!matchesTarget) {
+                                // Rust/Go path calls (Type::method() / pkg.Method()): receiver IS the type name
+                                // If it doesn't match target, it's definitely a different type — filter it
+                                if (call.isPathCall && /^[A-Z]/.test(call.receiver)) {
+                                    isUncertain = true;
+                                    if (!options.includeUncertain) {
+                                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                        continue;
+                                    }
+                                }
                                 const nonTargetClasses = new Set();
                                 for (const d of definitions) {
                                     const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
@@ -915,7 +924,8 @@ function findCallees(index, def, options = {}) {
                 callees.set(calleeKey, {
                     name: effectiveName,
                     bindingId: bindingResolved,
-                    count: 1
+                    count: 1,
+                    ...(call.isConstructor && { isConstructor: true })
                 });
             }
         }
@@ -1023,7 +1033,7 @@ function findCallees(index, def, options = {}) {
         // Pre-compute import graph for callee confidence scoring
         const callerImportSet = new Set(index.importGraph.get(def.file) || []);
 
-        for (const { name: calleeName, bindingId, count } of callees.values()) {
+        for (const { name: calleeName, bindingId, count, isConstructor } of callees.values()) {
             const symbols = index.symbols.get(calleeName);
             if (symbols && symbols.length > 0) {
                 let callee = symbols[0];
@@ -1122,7 +1132,8 @@ function findCallees(index, def, options = {}) {
                 if (!bindingId && NON_CALLABLE_TYPES.has(callee.type)) {
                     const isFuncField = callee.type === 'field' && callee.fieldType &&
                         /^func\b/.test(callee.fieldType);
-                    if (!isFuncField) continue;
+                    // Constructor calls (new Foo()) are always callable regardless of type
+                    if (!isFuncField && !isConstructor) continue;
                 }
 
                 // Skip test-file callees when caller is production code and

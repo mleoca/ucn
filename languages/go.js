@@ -290,6 +290,7 @@ function extractInterfaceMembers(interfaceNode, code) {
             // Name is in a field_identifier child
             let nameText = null;
             let paramsText = null;
+            let paramsNode = null;
             let returnType = null;
             let hasParams = false;
             for (let j = 0; j < child.namedChildCount; j++) {
@@ -300,6 +301,7 @@ function extractInterfaceMembers(interfaceNode, code) {
                     hasParams = true;
                     if (!paramsText) {
                         paramsText = sub.text.slice(1, -1); // strip parens
+                        paramsNode = sub;
                     } else {
                         // Second parameter_list is the return type tuple
                         returnType = sub.text;
@@ -312,10 +314,15 @@ function extractInterfaceMembers(interfaceNode, code) {
                 if (nameNode) nameText = nameNode.text;
             }
             if (!returnType) {
-                // Single return type (not a tuple) is a type_identifier
+                // Single return type — can be type_identifier, pointer_type, slice_type, map_type, etc.
+                const returnTypeNodes = new Set([
+                    'type_identifier', 'pointer_type', 'slice_type', 'map_type',
+                    'array_type', 'channel_type', 'function_type', 'interface_type',
+                    'struct_type', 'generic_type', 'qualified_type',
+                ]);
                 for (let j = 0; j < child.namedChildCount; j++) {
                     const sub = child.namedChild(j);
-                    if (sub.type === 'type_identifier' && sub.text !== nameText) {
+                    if (returnTypeNodes.has(sub.type) && sub.text !== nameText) {
                         returnType = sub.text;
                     }
                 }
@@ -341,6 +348,7 @@ function extractInterfaceMembers(interfaceNode, code) {
                         endLine,
                         memberType: 'method',
                         ...(paramsText !== null && { params: paramsText }),
+                        ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'go') }),
                         ...(returnType && { returnType })
                     });
                 }

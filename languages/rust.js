@@ -77,7 +77,11 @@ function extractAttributes(node, code) {
                 const attrContent = match[1];
                 // Get just the attribute name (without arguments)
                 const attrName = attrContent.split('(')[0].trim();
-                attributes.push(attrName);
+                // Skip compiler hint attributes that aren't semantically meaningful for display
+                const SKIP_ATTRS = new Set(['allow', 'deny', 'warn', 'forbid', 'cfg_attr', 'doc']);
+                if (!SKIP_ATTRS.has(attrName)) {
+                    attributes.push(attrName);
+                }
             }
         } else if (!line.startsWith('//')) {
             // Stop at non-comment, non-attribute lines
@@ -491,19 +495,25 @@ function extractImplInfo(implNode) {
         typeName = typeNode.text;
     }
 
-    const prefix = typeParams ? `${typeParams} ` : '';
+    // Strip generic type arguments from typeName and traitName for lookup
+    // e.g., "CacheService<T>" → "CacheService", "Entity" stays "Entity"
+    const stripGenerics = (s) => s ? s.replace(/<[^>]*>/g, '').trim() : s;
+    const bareTypeName = stripGenerics(typeName);
+    const bareTraitName = stripGenerics(traitName);
+
     let name;
-    if (traitName && typeName) {
-        name = `${prefix}${traitName} for ${typeName}`;
-    } else if (typeName) {
-        name = `${prefix}${typeName}`;
+    if (bareTraitName && bareTypeName) {
+        // Use the concrete type as className so Task.get_id works for `impl Entity for Task`
+        name = bareTypeName;
+    } else if (bareTypeName) {
+        name = bareTypeName;
     } else {
         const text = implNode.text;
         const match = text.match(/impl\s*(?:<[^>]+>\s*)?(\w+(?:\s+for\s+\w+)?)/);
-        name = match ? `${prefix}${match[1]}` : 'impl';
+        name = match ? match[1] : 'impl';
     }
 
-    return { name, traitName, typeName };
+    return { name, traitName, typeName: bareTypeName, generics: typeParams || undefined };
 }
 
 /**
@@ -565,7 +575,9 @@ function extractTraitMembers(traitNode, code) {
                     endLine,
                     memberType: 'method',
                     isMethod: true,
+                    modifiers: ['public'], // Trait methods are implicitly public
                     ...(paramsNode && { params: extractRustParams(paramsNode) }),
+                    ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'rust') }),
                     ...(returnType && { returnType }),
                     ...(hasSelf && { receiver: 'self' })
                 });

@@ -3397,3 +3397,68 @@ describe('fix: TS generic type annotations', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #176: Cross-file constructor callee detection
+// ============================================================================
+
+describe('fix #176: cross-file constructor callee detection', () => {
+    it('new Foo() where Foo is imported should detect Foo as callee', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'store.js': 'class Store { retrieve() { return 1; } }\nmodule.exports = { Store };',
+            'app.js': 'const { Store } = require("./store");\nfunction useStore() { const s = new Store(); s.retrieve(); }\nmodule.exports = { useStore };'
+        });
+        try {
+            const i = idx(dir);
+            const defs = i.symbols.get('useStore');
+            assert.ok(defs && defs.length > 0, 'useStore should be in symbol table');
+            const callees = i.findCallees(defs[0], { includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'Store'), 'new Store() should be a callee');
+            assert.ok(callees.some(c => c.name === 'retrieve'), 's.retrieve() should be a callee via receiverType');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #178/TS-BUG-001: TypeScript overloads - about picks implementation
+// ============================================================================
+
+describe('fix #178: TypeScript overloads - about picks implementation over type signature', () => {
+    const { execute } = require('../core/execute');
+
+    it('about should prefer implementation body over type-only overload signatures', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'function processTask(task: string): string;\nfunction processTask(task: number): number;\nfunction processTask(task: any): any { return task; }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'processTask' });
+            assert.ok(r.ok, 'about should succeed');
+            assert.ok(r.result.code.includes('return task'), 'should show implementation body, not type signature');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #181: TypeScript optional ? marker preserved in plan after.params
+// ============================================================================
+
+describe('fix #181: TypeScript optional ? marker preserved in plan after.params', () => {
+    const { execute } = require('../core/execute');
+
+    it('plan should preserve TypeScript optional ? in after.params', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'function greet(name: string, title?: string) { return (title||"")+name; }\ngreet("Alice");'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'greet', addParam: 'suffix: string' });
+            assert.ok(r.ok, 'plan should succeed');
+            const titleParam = r.result.after.params.find(p => p.startsWith('title'));
+            assert.ok(titleParam && titleParam.includes('?'), 'title should preserve ? marker: ' + titleParam);
+        } finally { rm(dir); }
+    });
+});

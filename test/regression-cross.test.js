@@ -2231,7 +2231,7 @@ it('about with includeMethods=false shows note in formatted output', () => {
     };
     const text = formatAbout(aboutResult);
     assert.ok(text.includes('obj.method() callers/callees excluded'), 'Should show note when includeMethods=false');
-    assert.ok(text.includes('--include-methods=false'), 'Should mention the flag');
+    assert.ok(text.includes('--include-methods'), 'Should mention the flag');
 
     // With includeMethods=true (default) — no note
     aboutResult.includeMethods = true;
@@ -7900,7 +7900,7 @@ describe('fix #158: search shows test file exclusion note', () => {
             const text = output.formatSearch(result.result, 'MAGIC_VALUE');
             assert.ok(text.includes('MAGIC_VALUE'), 'should find matches');
             // Should mention excluded files
-            assert.ok(text.includes('excluded by filters') || text.includes('test files hidden'),
+            assert.ok(text.includes('test file') && text.includes('hidden'),
                 'should mention that test files were excluded');
         } finally {
             rm(dir);
@@ -13659,5 +13659,200 @@ describe('Cross-feature: Go embedded struct + method callers', () => {
             const ctx = execute(index, 'context', { name: 'Log' });
             assert.ok(ctx.ok, 'context for Log');
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Bug G1-rust-007 / G7-rust-009: scopeWarning shown even when className provided
+// ============================================================================
+
+describe('fix G1-rust-007/G7-rust-009: no scopeWarning when className already provided', () => {
+    it('impact: no scopeWarning when className is provided', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class Dog { run() {} }\nmodule.exports = { Dog };',
+            'b.js': 'class Cat { run() {} }\nmodule.exports = { Cat };',
+            'main.js': 'const { Dog } = require("./a");\nnew Dog().run();\n',
+        });
+        try {
+            const index = idx(dir);
+            // Without className: warning should appear (multiple classes define run())
+            const withoutClass = index.impact('run');
+            assert.ok(withoutClass, 'impact should succeed');
+            assert.ok(withoutClass.scopeWarning, 'should warn when className not provided');
+
+            // With className: warning should NOT appear
+            const withClass = index.impact('run', { className: 'Dog' });
+            assert.ok(withClass, 'impact with className should succeed');
+            assert.strictEqual(withClass.scopeWarning, null,
+                'scopeWarning must be null when className is already provided');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('verify: no scopeWarning when className is provided', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class Foo { process(x) {} }\nmodule.exports = { Foo };',
+            'b.js': 'class Bar { process(y, z) {} }\nmodule.exports = { Bar };',
+            'main.js': 'const { Foo } = require("./a");\nnew Foo().process(1);\n',
+        });
+        try {
+            const index = idx(dir);
+            // Without className: warning should appear
+            const withoutClass = index.verify('process');
+            assert.ok(withoutClass.found, 'verify should succeed');
+            assert.ok(withoutClass.scopeWarning, 'should warn when className not provided');
+
+            // With className: warning should NOT appear
+            const withClass = index.verify('process', { className: 'Foo' });
+            assert.ok(withClass.found, 'verify with className should succeed');
+            assert.strictEqual(withClass.scopeWarning, null,
+                'scopeWarning must be null when className is already provided');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('impact: no scopeWarning when file is provided', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class Foo { close() {} }\nmodule.exports = { Foo };',
+            'b.js': 'class Bar { close() {} }\nmodule.exports = { Bar };',
+            'main.js': 'const { Foo } = require("./a");\nnew Foo().close();\n',
+        });
+        try {
+            const index = idx(dir);
+            // With file filter: warning should NOT appear
+            const withFile = index.impact('close', { file: 'a.js' });
+            assert.ok(withFile, 'impact with file should succeed');
+            assert.strictEqual(withFile.scopeWarning, null,
+                'scopeWarning must be null when file filter is already provided');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug G1-java-003: resolveSymbol "Also in" list includes chosen definition
+// ============================================================================
+
+describe('fix G1-java-003: resolveSymbol excludes chosen definition from Also In list', () => {
+    it('disambiguation warning does not include the chosen definition in Also in list', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function save(data) { return data; }\nmodule.exports = { save };',
+            'b.js': 'function save(data, opts) { return opts; }\nmodule.exports = { save };',
+        });
+        try {
+            const index = idx(dir);
+            const resolved = index.resolveSymbol('save');
+            assert.ok(resolved.def, 'should resolve to a definition');
+            assert.ok(resolved.definitions.length >= 2, 'should have multiple definitions');
+
+            if (resolved.warnings && resolved.warnings.length > 0) {
+                const warning = resolved.warnings[0];
+                assert.strictEqual(warning.type, 'ambiguous', 'warning type should be ambiguous');
+                // The chosen definition file:line must NOT appear in the alternatives list
+                const chosenKey = `${resolved.def.relativePath}:${resolved.def.startLine}`;
+                const alsoIn = warning.message.match(/Also in: (.+?)\./)?.[1] || '';
+                const alsoInParts = alsoIn.split(', ');
+                assert.ok(!alsoInParts.includes(chosenKey),
+                    `Chosen definition ${chosenKey} must not appear in "Also in" list: "${alsoIn}"`);
+                // The alternatives array also must not contain the chosen definition
+                if (warning.alternatives) {
+                    const chosenInAlts = warning.alternatives.some(
+                        a => a.file === resolved.def.relativePath && a.line === resolved.def.startLine
+                    );
+                    assert.ok(!chosenInAlts,
+                        'alternatives array must not contain the chosen definition');
+                }
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Also in count is exactly (N-1) when N definitions exist', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'x.js': 'function parse(s) { return s; }\nmodule.exports = { parse };',
+            'y.js': 'function parse(s, opts) { return opts; }\nmodule.exports = { parse };',
+            'z.js': 'function parse(s, opts, cb) { cb(); }\nmodule.exports = { parse };',
+        });
+        try {
+            const index = idx(dir);
+            const resolved = index.resolveSymbol('parse');
+            assert.ok(resolved.def, 'should resolve');
+            if (resolved.definitions.length >= 2 && resolved.warnings.length > 0) {
+                const warning = resolved.warnings[0];
+                const totalDefs = resolved.definitions.length;
+                // alternatives should be exactly totalDefs - 1
+                if (warning.alternatives) {
+                    assert.strictEqual(warning.alternatives.length, totalDefs - 1,
+                        `alternatives should be exactly ${totalDefs - 1} (total minus chosen)`);
+                }
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Bug TS-BUG-003: about command note says "Remove flag" instead of --include-methods
+// ============================================================================
+
+describe('fix TS-BUG-003: about command note uses correct --include-methods wording', () => {
+    it('formatAbout note does not say "Remove flag"', () => {
+        const { formatAbout } = require('../core/output');
+        const aboutResult = {
+            found: true,
+            symbol: { name: 'run', type: 'method', file: 'app.js', startLine: 1, endLine: 5, signature: 'run()' },
+            usages: { definitions: 1, calls: 0, imports: 0, references: 0 },
+            totalUsages: 0,
+            callers: { total: 0, top: [] },
+            callees: { total: 0, top: [] },
+            tests: { fileCount: 0, totalMatches: 0, files: [] },
+            otherDefinitions: [],
+            types: [],
+            code: null,
+            includeMethods: false,
+            completeness: { warnings: [] }
+        };
+        const text = formatAbout(aboutResult);
+        assert.ok(!text.includes('Remove flag'),
+            'Note must not say "Remove flag" — there is no flag to remove when using default behavior');
+        assert.ok(text.includes('--include-methods'),
+            'Note must mention "--include-methods" flag to add');
+        assert.ok(text.includes('include'),
+            'Note must guide user toward adding the flag, not removing it');
+    });
+
+    it('formatAbout note wording instructs user to USE --include-methods', () => {
+        const { formatAbout } = require('../core/output');
+        const aboutResult = {
+            found: true,
+            symbol: { name: 'fn', type: 'function', file: 'a.js', startLine: 1, endLine: 3, signature: 'fn()' },
+            usages: { definitions: 1, calls: 0, imports: 0, references: 0 },
+            totalUsages: 0,
+            callers: { total: 0, top: [] },
+            callees: { total: 0, top: [] },
+            tests: { fileCount: 0, totalMatches: 0, files: [] },
+            otherDefinitions: [],
+            types: [],
+            code: null,
+            includeMethods: false,
+            completeness: { warnings: [] }
+        };
+        const text = formatAbout(aboutResult);
+        // The note should say "use --include-methods to include them" (or similar)
+        // and must NOT instruct user to remove a flag that was never set
+        assert.ok(
+            text.includes('use --include-methods') || text.includes('Use --include-methods'),
+            `Note text should instruct to use --include-methods. Got: "${text.slice(-200)}"`
+        );
     });
 });

@@ -365,7 +365,9 @@ class ProjectIndex {
                 ...(item.memberType && { memberType: item.memberType }),
                 ...(item.fieldType && { fieldType: item.fieldType }),
                 ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
-                ...(item.nameLine && { nameLine: item.nameLine })
+                ...(item.nameLine && { nameLine: item.nameLine }),
+                ...(item.traitImpl && { traitImpl: true }),
+                ...(item.isSignature && { isSignature: true })
             };
             fileEntry.symbols.push(symbol);
             fileEntry.bindings.push({
@@ -396,7 +398,7 @@ class ProjectIndex {
             if (cls.members) {
                 for (const m of cls.members) {
                     const memberType = m.memberType || 'method';
-                    addSymbol({ ...m, className: cls.name }, memberType);
+                    addSymbol({ ...m, className: cls.name, ...(cls.traitName && { traitImpl: true }) }, memberType);
                 }
             }
         }
@@ -780,6 +782,8 @@ class ProjectIndex {
         // Check inclusion (directory or file path)
         if (filters.in) {
             const inPattern = filters.in.replace(/\/$/, ''); // strip trailing slash
+            // '.' means current directory = entire project, always matches
+            if (inPattern === '.') return true;
             // Detect if pattern looks like a file path (has an extension)
             const looksLikeFile = /\.\w+$/.test(inPattern);
             if (looksLikeFile) {
@@ -907,6 +911,13 @@ class ProjectIndex {
             // Boost lib/src/core/internal directories (+200)
             if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) {
                 score += 200;
+            }
+            // Deprioritize type-only overload signatures (TypeScript function_signature)
+            if (d.isSignature) score -= 200;
+            // Prefer larger function bodies (implementation over overload signature)
+            // Only for functions/methods — not for class-level types (struct vs impl)
+            if (d.startLine && d.endLine && d.type === 'function') {
+                score += Math.min(d.endLine - d.startLine, 100);
             }
             return { def: d, score };
         });
@@ -1257,10 +1268,16 @@ class ProjectIndex {
         try {
         const usages = [];
 
+        // Resolve file pattern for --file filter
+        const fileFilter = options.file ? this.resolveFilePathForQuery(options.file) : null;
+
         // Get definitions (filtered)
         let allDefinitions = this.symbols.get(name) || [];
         if (options.className) {
             allDefinitions = allDefinitions.filter(d => d.className === options.className);
+        }
+        if (fileFilter) {
+            allDefinitions = allDefinitions.filter(d => d.file === fileFilter);
         }
         const definitions = options.exclude || options.in
             ? allDefinitions.filter(d => this.matchesFilters(d.relativePath, options))
@@ -1278,6 +1295,10 @@ class ProjectIndex {
 
         // Scan all files for usages
         for (const [filePath, fileEntry] of this.files) {
+            // Apply --file filter
+            if (fileFilter && filePath !== fileFilter) {
+                continue;
+            }
             // Apply filters
             if (!this.matchesFilters(fileEntry.relativePath, options)) {
                 continue;
@@ -2247,7 +2268,7 @@ class ProjectIndex {
      * @returns {Array} Matching type definitions
      */
     typedef(name, options = {}) {
-        const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class'];
+        const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class', 'record'];
         const matches = this.find(name, options);
 
         return matches.filter(m => typeKinds.includes(m.type)).map(m => ({
@@ -2277,6 +2298,15 @@ class ProjectIndex {
         for (const [filePath, fileEntry] of this.files) {
             if (isTestFile(fileEntry.relativePath, fileEntry.language)) {
                 testFiles.push({ path: filePath, entry: fileEntry });
+            } else if (fileEntry.language === 'rust') {
+                // Rust idiomatically puts tests in #[cfg(test)] modules inside source files.
+                // Check if file has any symbols with 'test' modifier (#[test] attribute).
+                const hasInlineTests = fileEntry.symbols?.some(s =>
+                    s.modifiers?.includes('test')
+                );
+                if (hasInlineTests) {
+                    testFiles.push({ path: filePath, entry: fileEntry });
+                }
             }
         }
 
@@ -2588,6 +2618,75 @@ class ProjectIndex {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // Python __all__ re-exports: names listed in __all__ that come from imports
+        // e.g. __init__.py: `from .utils import helper` + `__all__ = ["helper"]`
+        // `helper` is in fileEntry.exports but not in fileEntry.symbols
+        if (fileEntry.language === 'python' && fileEntry.exports.length > 0) {
+            const matchedNames = new Set(results.map(r => r.name));
+            const unmatched = fileEntry.exports.filter(name => !matchedNames.has(name));
+            if (unmatched.length > 0) {
+                // Re-extract raw imports to get name→module mapping (not stored in fileEntry)
+                const { extractImports, resolveImport } = require('./imports');
+                try {
+                    const content = this._readFile(absPath);
+                    const { imports: rawImports } = extractImports(content, 'python');
+                    // Build name→module map from raw imports
+                    const nameToModule = new Map();
+                    for (const imp of rawImports) {
+                        if (imp.names) {
+                            for (const name of imp.names) {
+                                if (name !== '*') nameToModule.set(name, imp.module);
+                            }
+                        }
+                    }
+                    for (const name of unmatched) {
+                        const sourceModule = nameToModule.get(name);
+                        if (!sourceModule) continue;
+                        const resolvedSrc = resolveImport(sourceModule, absPath, {
+                            language: 'python',
+                            root: this.root,
+                            extensions: this.extensions
+                        });
+                        if (!resolvedSrc) continue;
+                        const sourceEntry = this.files.get(resolvedSrc);
+                        const srcSymbol = sourceEntry && sourceEntry.symbols.find(s => s.name === name);
+                        if (srcSymbol) {
+                            matchedNames.add(name);
+                            results.push({
+                                name,
+                                type: srcSymbol.type,
+                                file: fileEntry.relativePath,
+                                startLine: srcSymbol.startLine,
+                                endLine: srcSymbol.endLine,
+                                params: srcSymbol.params,
+                                returnType: srcSymbol.returnType,
+                                signature: this.formatSignature(srcSymbol),
+                                reExportedFrom: sourceEntry.relativePath
+                            });
+                        } else {
+                            // Source not indexed or symbol not found — still list it
+                            matchedNames.add(name);
+                            results.push({
+                                name,
+                                type: 're-export',
+                                file: fileEntry.relativePath,
+                                startLine: undefined,
+                                endLine: undefined,
+                                params: undefined,
+                                returnType: null,
+                                signature: `re-export ${name} from '${sourceModule}'`,
+                                reExportedFrom: resolvedSrc
+                                    ? (sourceEntry ? sourceEntry.relativePath : resolvedSrc)
+                                    : sourceModule
+                            });
+                        }
+                    }
+                } catch (_) {
+                    // File read failure — skip Python re-export resolution
                 }
             }
         }
@@ -3181,8 +3280,8 @@ class ProjectIndex {
                                                     const content = this._readFile(c.callerFile);
                                                     const lines = content.split('\n');
                                                     const line = lines[call.line - 1] || '';
-                                                    // Match "var = ClassName(...)"
-                                                    const m = line.match(/^\s*(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/);
+                                                    // Match "var = ClassName(...)" or "var = new ClassName(...)" or "Type var = new ClassName<>(...)"
+                                                    const m = line.match(/(\w+)\s*=\s*(?:await\s+)?(?:new\s+)?(\w+)\s*(?:<[^>]*>)?\s*\(/);
                                                     if (m && m[2] === call.name) {
                                                         localTypes.set(m[1], call.name);
                                                     }
@@ -3194,6 +3293,31 @@ class ProjectIndex {
                                 const receiverType = localTypes.get(r);
                                 if (receiverType) {
                                     return receiverType === targetClassName;
+                                }
+                            }
+                        }
+                    }
+                    // Check class field declarations for receiver type: private DataService service
+                    if (c.callerFile) {
+                        const callerEnclosing = this.findEnclosingFunction(c.callerFile, c.line, true);
+                        if (callerEnclosing?.className) {
+                            const classSyms = this.symbols.get(callerEnclosing.className);
+                            if (classSyms) {
+                                const classDef = classSyms.find(s => s.type === 'class' || s.type === 'struct' || s.type === 'interface');
+                                if (classDef) {
+                                    const content = this._readFile(c.callerFile);
+                                    const lines = content.split('\n');
+                                    // Scan class body for field declarations matching the receiver
+                                    for (let li = classDef.startLine - 1; li < (classDef.endLine || classDef.startLine + 50) && li < lines.length; li++) {
+                                        const line = lines[li];
+                                        // Match Java/TS field: [modifiers] TypeName<...> receiverName [= ...]
+                                        const fieldMatch = line.match(new RegExp(`\\b(\\w+)(?:<[^>]*>)?\\s+${r.replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&')}\\s*[;=]`));
+                                        if (fieldMatch) {
+                                            const fieldType = fieldMatch[1];
+                                            if (fieldType === targetClassName) return true;
+                                            break;
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -3357,7 +3481,7 @@ class ProjectIndex {
                 const classNames = [...new Set(allDefs
                     .filter(d => d.className && d.className !== def.className)
                     .map(d => d.className))];
-                if (classNames.length > 0) {
+                if (classNames.length > 0 && !options.className && !options.file) {
                     scopeWarning = {
                         targetClass: def.className || '(unknown)',
                         otherClasses: classNames,
@@ -3678,6 +3802,19 @@ class ProjectIndex {
                         node.entryPoint = true;
                         entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
                     }
+                } else if (currentDepth > 0) {
+                    // At depth limit: check if this node is an entry point
+                    const callers = this.findCallers(funcDef.name, {
+                        includeMethods,
+                        includeUncertain,
+                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                    });
+                    const hasCallers = callers.some(c => c.callerName &&
+                        (exclude.length === 0 || this.matchesFilters(c.relativePath, { exclude })));
+                    if (!hasCallers) {
+                        node.entryPoint = true;
+                        entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                    }
                 }
 
                 return node;
@@ -3764,7 +3901,12 @@ class ProjectIndex {
             const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
             const results = [];
             for (const [filePath, fileEntry] of this.files) {
-                if (!isTestFile(fileEntry.relativePath, fileEntry.language)) continue;
+                let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
+                // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
+                if (!isTest && fileEntry.language === 'rust') {
+                    isTest = fileEntry.symbols?.some(s => s.modifiers?.includes('test'));
+                }
+                if (!isTest) continue;
                 if (excludeArr.length > 0 && !this.matchesFilters(fileEntry.relativePath, { exclude: excludeArr })) continue;
                 try {
                     const content = this._readFile(filePath);
@@ -4082,6 +4224,7 @@ class ProjectIndex {
         const results = [];
         let filesScanned = 0;
         let filesSkipped = 0;
+        let filesFilteredByFlag = 0;
         const regexFlags = options.caseSensitive ? 'g' : 'gi';
         const useRegex = options.regex !== false; // Default: regex ON
         let regex;
@@ -4103,7 +4246,7 @@ class ProjectIndex {
             if (options.file) {
                 const fp = fileEntry.relativePath;
                 if (!fp.includes(options.file) && !fp.endsWith(options.file)) {
-                    filesSkipped++;
+                    filesFilteredByFlag++;
                     continue;
                 }
             }
@@ -4228,7 +4371,7 @@ class ProjectIndex {
             results.push(...truncated);
         }
 
-        results.meta = { filesScanned, filesSkipped, totalFiles: this.files.size, regexFallback, totalMatches, truncatedMatches };
+        results.meta = { filesScanned, filesSkipped, filesFilteredByFlag, totalFiles: this.files.size, regexFallback, totalMatches, truncatedMatches };
         return results;
         } finally { this._endOp(); }
     }
@@ -4330,7 +4473,7 @@ class ProjectIndex {
                 }
             } else {
                 // Search symbols (functions, classes, methods, types)
-                const functionTypes = new Set(['function', 'constructor', 'method', 'arrow', 'static', 'classmethod']);
+                const functionTypes = new Set(['function', 'constructor', 'method', 'arrow', 'static', 'classmethod', 'abstract']);
                 const classTypes = new Set(['class', 'struct', 'interface', 'impl', 'trait']);
                 const typeTypes = new Set(['type', 'enum', 'interface', 'trait']);
                 const methodTypes = new Set(['method', 'constructor']);
@@ -4359,6 +4502,11 @@ class ProjectIndex {
                                 (p.type && matchesSubstring(p.type, param, cs))
                             ) || matchesSubstring(paramStr, param, cs);
                             if (!hasMatch) continue;
+                        }
+
+                        // Receiver filter: match className for methods
+                        if (receiver) {
+                            if (!def.className || !matchesSubstring(def.className, receiver, options.caseSensitive)) continue;
                         }
 
                         // Return type filter
@@ -4546,6 +4694,9 @@ class ProjectIndex {
 
         for (const [filePath, fileEntry] of this.files) {
             if (fileFilter && !fileFilter.has(filePath)) continue;
+            if (options.exclude && options.exclude.length > 0) {
+                if (!this.matchesFilters(fileEntry.relativePath, { exclude: options.exclude })) continue;
+            }
             let functions = fileEntry.symbols.filter(s =>
                 s.type === 'function' || s.type === 'method' || s.type === 'static' ||
                 s.type === 'constructor' || s.type === 'public' || s.type === 'abstract' ||

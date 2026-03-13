@@ -169,7 +169,9 @@ if (unknownFlags.length > 0) {
 const VALUE_FLAGS = new Set([
     '--file', '--depth', '--top', '--context', '--direction',
     '--add-param', '--remove-param', '--rename-to', '--default',
-    '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name'
+    '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name',
+    '--type', '--param', '--receiver', '--returns', '--decorator',
+    '--limit', '--max-files', '--min-confidence', '--stack'
 ]);
 
 // Remove flags from args, then add args after -- (which are all positional)
@@ -1246,7 +1248,7 @@ Flags can be added per-command: context myFunc --include-methods
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -1456,7 +1458,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'graph': {
-            const { ok, result, error } = execute(index, 'graph', { file: arg, ...iflags });
+            const { ok, result, error } = execute(index, 'graph', { file: arg || iflags.file, direction: iflags.direction, depth: iflags.depth, all: iflags.all });
             if (!ok) { console.log(error); return; }
             const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
             console.log(output.formatGraph(result, { showAll: iflags.all || !!iflags.depth, maxDepth: graphDepth, file: arg }));

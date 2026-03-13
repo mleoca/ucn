@@ -1438,3 +1438,47 @@ public class App {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #177: Java enum methods not double-indexed
+// ============================================================================
+
+describe('fix #177: Java enum methods not double-indexed', () => {
+    it('Java enum methods should not have duplicate entries in symbol table', () => {
+        const dir = tmp({
+            'Main.java': 'public class Main {\n    enum Status {\n        ACTIVE, INACTIVE;\n        public String getValue() { return name(); }\n    }\n}'
+        });
+        try {
+            const i = idx(dir);
+            const defs = i.symbols.get('getValue') || [];
+            assert.strictEqual(defs.length, 1, 'enum method should not be double-indexed');
+            assert.strictEqual(defs[0].className, 'Status');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #184: impact detects class field receiver types', () => {
+    it('should find call sites through class field receivers', () => {
+        const dir = tmp({
+            'Main.java': [
+                'public class Main {',
+                '    private final Service service;',
+                '    public Main(Service service) { this.service = service; }',
+                '    public void run() { service.execute("task"); }',
+                '}',
+            ].join('\n'),
+            'Service.java': [
+                'public class Service {',
+                '    public void execute(String name) { System.out.println(name); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const i = idx(dir);
+            const { execute } = require('../core/execute');
+            const r = execute(i, 'impact', { name: 'execute', className: 'Service' });
+            assert.ok(r.ok);
+            assert.ok(r.result.totalCallSites >= 1, 'should find service.execute() via class field type');
+        } finally { rm(dir); }
+    });
+});

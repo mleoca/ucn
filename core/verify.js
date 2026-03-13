@@ -29,11 +29,17 @@ function findCallNode(node, callTypes, targetRow, funcName) {
             }
         } else {
             // Check if this call is for our target function
-            const funcNode = node.childForFieldName('function') ||
+            let funcNode = node.childForFieldName('function') ||
                              node.childForFieldName('name'); // Java method_invocation uses 'name'
+            // Unwrap turbofish/generic_function: process::<T>() wraps the function in generic_function
+            if (funcNode && funcNode.type === 'generic_function') {
+                funcNode = funcNode.childForFieldName('function') || funcNode.namedChild(0);
+            }
             if (funcNode) {
                 const funcText = funcNode.type === 'member_expression' || funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' || funcNode.type === 'attribute'
                     ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
+                    : funcNode.type === 'scoped_identifier'
+                    ? (funcNode.childForFieldName('name') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
                     : funcNode.text;
                 if (funcText === funcName) return node;
             }
@@ -190,7 +196,7 @@ function verify(index, name, options = {}) {
     let params = def.paramsStructured || [];
     if ((lang === 'python' || lang === 'rust') && params.length > 0) {
         const firstName = params[0].name;
-        if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self') {
+        if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self' || firstName === 'mut self') {
             params = params.slice(1);
         }
     }
@@ -420,7 +426,7 @@ function verify(index, name, options = {}) {
             const classNames = [...new Set(allDefs
                 .filter(d => d.className && d.className !== def.className)
                 .map(d => d.className))];
-            if (classNames.length > 0) {
+            if (classNames.length > 0 && !options.className && !options.file) {
                 scopeWarning = {
                     targetClass: def.className || '(unknown)',
                     otherClasses: classNames,
@@ -494,31 +500,39 @@ function plan(index, name, options = {}) {
             ...(options.defaultValue && { default: options.defaultValue })
         };
 
-        // When adding a required param (no default), insert before the first
-        // optional param to avoid producing invalid signatures in Python/TS
-        // (required params must precede optional ones).
-        if (!options.defaultValue) {
-            const firstOptIdx = newParams.findIndex(p => p.optional || p.default !== undefined);
-            if (firstOptIdx !== -1) {
-                // Also skip self/cls/&self/&mut self at position 0
-                const insertIdx = Math.max(firstOptIdx,
-                    (newParams.length > 0 && ['self', 'cls', '&self', '&mut self'].includes(newParams[0].name)) ? 1 : 0);
+        // When adding a param, insert before rest params (*args/**kwargs) and
+        // before optional params (required must precede optional in Python/TS).
+        {
+            const selfNames = ['self', 'cls', '&self', '&mut self', 'mut self'];
+            const minIdx = (newParams.length > 0 && selfNames.includes(newParams[0].name)) ? 1 : 0;
+            const firstRestIdx = newParams.findIndex(p => p.rest || (p.name && (p.name.startsWith('*') || p.name.startsWith('...'))));
+            if (firstRestIdx !== -1) {
+                // Always insert before rest params (*args, **kwargs, ...rest)
+                const insertIdx = Math.max(firstRestIdx, minIdx);
                 newParams.splice(insertIdx, 0, newParam);
+            } else if (!options.defaultValue) {
+                const firstOptIdx = newParams.findIndex(p => p.optional || p.default !== undefined);
+                if (firstOptIdx !== -1) {
+                    const insertIdx = Math.max(firstOptIdx, minIdx);
+                    newParams.splice(insertIdx, 0, newParam);
+                } else {
+                    newParams.push(newParam);
+                }
             } else {
                 newParams.push(newParam);
             }
-        } else {
-            newParams.push(newParam);
         }
 
         // Generate new signature
         const paramsList = newParams.map(p => {
-            let str = p.name;
+            let str = (p.rest && !p.name.startsWith('*')) ? `...${p.name}` : p.name;
+            if (p.optional && !p.default) str += '?';
             if (p.type) str += `: ${p.type}`;
             if (p.default) str += ` = ${p.default}`;
             return str;
         }).join(', ');
-        newSignature = `${name}(${paramsList})`;
+        const asyncPrefix = (def.async || def.isAsync || def.modifiers?.includes('async')) ? 'async ' : '';
+        newSignature = `${asyncPrefix}${name}(${paramsList})`;
         if (def.returnType) newSignature += `: ${def.returnType}`;
 
         // Describe changes needed at each call site
@@ -540,7 +554,13 @@ function plan(index, name, options = {}) {
 
     if (options.removeParam) {
         operation = 'remove-param';
-        const paramIndex = currentParams.findIndex(p => p.name === options.removeParam);
+        // Normalize self-parameter lookup: 'self' matches '&self', '&mut self', 'mut self'
+        let removeTarget = options.removeParam;
+        let paramIndex = currentParams.findIndex(p => p.name === removeTarget);
+        if (paramIndex === -1 && removeTarget === 'self') {
+            paramIndex = currentParams.findIndex(p => /^&?(?:mut )?self$/.test(p.name));
+            if (paramIndex !== -1) removeTarget = currentParams[paramIndex].name;
+        }
         if (paramIndex === -1) {
             return {
                 found: true,
@@ -549,16 +569,18 @@ function plan(index, name, options = {}) {
             };
         }
 
-        newParams = currentParams.filter(p => p.name !== options.removeParam);
+        newParams = currentParams.filter(p => p.name !== removeTarget);
 
         // Generate new signature
         const paramsList = newParams.map(p => {
-            let str = p.name;
+            let str = (p.rest && !p.name.startsWith('*')) ? `...${p.name}` : p.name;
+            if (p.optional && !p.default) str += '?';
             if (p.type) str += `: ${p.type}`;
             if (p.default) str += ` = ${p.default}`;
             return str;
         }).join(', ');
-        newSignature = `${name}(${paramsList})`;
+        const asyncPrefix = (def.async || def.isAsync || def.modifiers?.includes('async')) ? 'async ' : '';
+        newSignature = `${asyncPrefix}${name}(${paramsList})`;
         if (def.returnType) newSignature += `: ${def.returnType}`;
 
         // For Python/Rust methods, self/cls/&self/&mut self is in paramsStructured
@@ -568,7 +590,7 @@ function plan(index, name, options = {}) {
         let selfOffset = 0;
         if ((lang === 'python' || lang === 'rust') && currentParams.length > 0) {
             const firstName = currentParams[0].name;
-            if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self') {
+            if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self' || firstName === 'mut self') {
                 selfOffset = 1;
             }
         }
@@ -643,11 +665,21 @@ function plan(index, name, options = {}) {
         operation,
         before: {
             signature: currentSignature,
-            params: currentParams.map(p => p.name)
+            params: currentParams.map(p => {
+                let n = p.name;
+                if (p.optional && !p.default) n += '?';
+                if (p.type) n += `: ${p.type}`;
+                return n;
+            })
         },
         after: {
             signature: newSignature,
-            params: newParams.map(p => p.name)
+            params: newParams.map(p => {
+                let n = p.name;
+                if (p.optional && !p.default) n += '?';
+                if (p.type) n += `: ${p.type}`;
+                return n;
+            })
         },
         totalChanges: changes.length,
         filesAffected: new Set(changes.map(c => c.file)).size,

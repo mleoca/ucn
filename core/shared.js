@@ -19,6 +19,8 @@ function pickBestDefinition(matches) {
         if (isTestFile(rp, detectLanguage(m.file))) score -= 500;
         if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
         if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
+        // Deprioritize type-only overload signatures (TypeScript function_signature)
+        if (m.isSignature) score -= 200;
         // Tiebreaker: prefer larger function bodies (more important/complex)
         if (m.startLine && m.endLine) {
             score += Math.min(m.endLine - m.startLine, 100);

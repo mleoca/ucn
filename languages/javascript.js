@@ -181,6 +181,7 @@ function findFunctions(code, parser) {
                     indent,
                     isArrow: false,
                     isGenerator: false,
+                    isSignature: true,
                     modifiers: [],
                     ...(returnType && { returnType }),
                     ...(generics && { generics }),
@@ -1948,6 +1949,13 @@ function findExportsInCode(code, parser) {
                     if (objNode.text === 'exports') {
                         const line = node.startPosition.row + 1;
                         exports.push({ name: propNode.text, type: 'exports', line });
+                        return true;
+                    }
+
+                    // module.exports.name = ...
+                    if (objNode.type === 'member_expression' && objNode.text === 'module.exports') {
+                        const line = node.startPosition.row + 1;
+                        exports.push({ name: propNode.text, type: 'module.exports', line });
                         return true;
                     }
                 }

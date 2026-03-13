@@ -231,6 +231,10 @@ function extractBases(classNode) {
             const arg = argsNode.namedChild(i);
             if (arg.type === 'identifier' || arg.type === 'attribute') {
                 bases.push(arg.text);
+            } else if (arg.type === 'subscript') {
+                // Parameterized base: Generic[T], Protocol[T], Dict[str, int]
+                const baseNode = arg.childForFieldName('value');
+                if (baseNode) bases.push(baseNode.text);
             }
         }
     }

@@ -393,36 +393,25 @@ const HANDLERS = {
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.usages(p.name, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
             className: p.className,
+            file: p.file,
             exclude,
             in: p.in,
         });
-        // Apply limit to total usages across files
+        // Apply limit to total usages (result is a flat array)
         const limit = num(p.limit, undefined);
         let note;
-        if (limit && limit > 0 && result.files) {
-            let total = result.files.reduce((s, f) => s + f.usages.length, 0);
-            if (total > limit) {
-                let remaining = limit;
-                const truncated = [];
-                for (const f of result.files) {
-                    if (remaining <= 0) break;
-                    if (f.usages.length <= remaining) {
-                        truncated.push(f);
-                        remaining -= f.usages.length;
-                    } else {
-                        truncated.push({ ...f, usages: f.usages.slice(0, remaining) });
-                        remaining = 0;
-                    }
-                }
-                result.files = truncated;
-                note = limitNote(limit, total);
-            }
+        let limited = result;
+        if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
+            note = limitNote(limit, result.length);
+            limited = result.slice(0, limit);
         }
-        return { ok: true, result, note };
+        return { ok: true, result: limited, note };
     },
 
     toc: (index, p) => {
@@ -432,34 +421,44 @@ const HANDLERS = {
             all: p.all,
             top: num(p.top, undefined),
             file: p.file,
+            exclude: p.exclude,
         });
-        // Apply limit to detailed toc entries
+        // Apply limit to detailed toc entries (symbols are in f.symbols.functions/classes arrays)
         const limit = num(p.limit, undefined);
         let note;
         if (limit && limit > 0 && p.detailed && result.files) {
-            let totalEntries = result.files.reduce((s, f) => s + (f.functions?.length || 0) + (f.classes?.length || 0), 0);
+            let totalEntries = result.files.reduce((s, f) => {
+                const syms = f.symbols || {};
+                return s + (syms.functions?.length || 0) + (syms.classes?.length || 0);
+            }, 0);
             if (totalEntries > limit) {
                 let remaining = limit;
                 for (const f of result.files) {
+                    const syms = f.symbols || {};
                     if (remaining <= 0) {
-                        f.functions = [];
-                        f.classes = [];
+                        if (syms.functions) syms.functions = [];
+                        if (syms.classes) syms.classes = [];
+                        f.functions = 0;
+                        f.classes = 0;
                         continue;
                     }
-                    const fns = f.functions?.length || 0;
-                    const cls = f.classes?.length || 0;
+                    const fns = syms.functions?.length || 0;
+                    const cls = syms.classes?.length || 0;
                     if (fns + cls <= remaining) {
                         remaining -= fns + cls;
                     } else {
-                        if (f.functions && remaining > 0) {
-                            f.functions = f.functions.slice(0, remaining);
-                            remaining -= f.functions.length;
+                        if (syms.functions && remaining > 0) {
+                            syms.functions = syms.functions.slice(0, remaining);
+                            remaining -= syms.functions.length;
+                            f.functions = syms.functions.length;
                         }
-                        if (f.classes && remaining > 0) {
-                            f.classes = f.classes.slice(0, remaining);
-                            remaining -= f.classes.length;
-                        } else if (f.classes) {
-                            f.classes = [];
+                        if (syms.classes && remaining > 0) {
+                            syms.classes = syms.classes.slice(0, remaining);
+                            remaining -= syms.classes.length;
+                            f.classes = syms.classes.length;
+                        } else if (syms.classes) {
+                            syms.classes = [];
+                            f.classes = 0;
                         }
                     }
                 }
@@ -549,7 +548,7 @@ const HANDLERS = {
     deadcode: (index, p) => {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
-        const result = index.deadcode({
+        let result = index.deadcode({
             includeExported: p.includeExported || false,
             includeDecorated: p.includeDecorated || false,
             includeTests: p.includeTests || false,
@@ -557,15 +556,16 @@ const HANDLERS = {
             in: p.in,
             file: p.file,
         });
-        // Apply limit to dead code results
+        // Apply limit to dead code results (result is an array with custom properties)
         const limit = num(p.limit, undefined);
         let note;
-        if (limit && limit > 0 && result.dead) {
-            const { items, total, limited } = applyLimit(result.dead, limit);
-            if (limited) {
-                note = limitNote(limit, total);
-                result.dead = items;
-            }
+        if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
+            note = limitNote(limit, result.length);
+            const sliced = result.slice(0, limit);
+            // Preserve custom properties (excludedExported, excludedDecorated) from deadcode()
+            if (result.excludedExported != null) sliced.excludedExported = result.excludedExported;
+            if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
+            result = sliced;
         }
         return { ok: true, result, note };
     },
@@ -866,7 +866,7 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
-        const result = index.typedef(p.name, { exact: p.exact || false, className: p.className });
+        const result = index.typedef(p.name, { exact: p.exact || false, className: p.className, file: p.file });
         return { ok: true, result };
     },
 

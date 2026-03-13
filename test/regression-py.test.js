@@ -1678,3 +1678,103 @@ describe('fix: localVarTypes function scoping (Python)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #180: Python **kwargs not double-prefixed in plan signature
+// ============================================================================
+
+describe('fix #180: Python **kwargs not double-prefixed in plan signature', () => {
+    const { execute } = require('../core/execute');
+
+    it('plan add-param should not render **kwargs as ...**kwargs', () => {
+        const dir = tmp({
+            'a.py': 'def process(x, **kwargs):\n    pass\n\nprocess(1, y=2)'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'process', addParam: 'y' });
+            assert.ok(r.ok, 'plan should succeed');
+            assert.ok(!r.result.after.signature.includes('...**'), 'should not have ...**kwargs');
+            assert.ok(r.result.after.signature.includes('**kwargs'), 'should preserve **kwargs');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix G6-PY-002: Python __init__.py fileExports misses __all__ re-exports
+// ============================================================================
+
+describe('fix G6-PY-002: Python __init__.py fileExports resolves __all__ re-exports via imports', () => {
+    it('fileExports on __init__.py returns names from __all__ that come from sub-module imports', () => {
+        const dir = tmp({
+            'utils.py': [
+                'def helper():',
+                '    return 42',
+                '',
+                'def internal():',
+                '    return 0',
+            ].join('\n'),
+            '__init__.py': [
+                'from .utils import helper',
+                '__all__ = ["helper"]',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const exports = index.fileExports('__init__.py');
+            assert.ok(Array.isArray(exports), 'fileExports should return an array');
+            assert.ok(exports.length > 0, 'should have at least one export');
+            const helperExport = exports.find(e => e.name === 'helper');
+            assert.ok(helperExport, 'helper should be included as a re-export');
+            assert.strictEqual(helperExport.reExportedFrom, 'utils.py', 'should record source as utils.py');
+        } finally { rm(dir); }
+    });
+
+    it('fileExports returns both locally-defined symbols and __all__ re-exports', () => {
+        const dir = tmp({
+            'models.py': [
+                'class User:',
+                '    def __init__(self, name):',
+                '        self.name = name',
+            ].join('\n'),
+            '__init__.py': [
+                'from .models import User',
+                '',
+                'VERSION = "1.0.0"',
+                '',
+                '__all__ = ["User", "VERSION"]',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const exports = index.fileExports('__init__.py');
+            const names = exports.map(e => e.name);
+            assert.ok(names.includes('User'), 'User re-export from models.py should be present');
+            assert.ok(names.includes('VERSION'), 'VERSION defined locally should be present');
+            const userExport = exports.find(e => e.name === 'User');
+            assert.ok(userExport.reExportedFrom, 'User should have reExportedFrom set');
+        } finally { rm(dir); }
+    });
+
+    it('fileExports does not add names from imports that are NOT in __all__', () => {
+        const dir = tmp({
+            'utils.py': [
+                'def helper():',
+                '    return 42',
+                'def secret():',
+                '    return 0',
+            ].join('\n'),
+            '__init__.py': [
+                'from .utils import helper, secret',
+                '__all__ = ["helper"]',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const exports = index.fileExports('__init__.py');
+            const names = exports.map(e => e.name);
+            assert.ok(names.includes('helper'), 'helper should be exported');
+            assert.ok(!names.includes('secret'), 'secret should NOT be exported (not in __all__)');
+        } finally { rm(dir); }
+    });
+});

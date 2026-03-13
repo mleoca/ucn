@@ -51,7 +51,11 @@ function extractModifiers(node) {
             if (mod.type === 'marker_annotation' || mod.type === 'annotation') {
                 // Store annotation name (without @) as modifier (e.g., @Test -> 'test', @Override -> 'override')
                 const annoText = mod.text.replace(/^@/, '').split('(')[0].toLowerCase();
-                modifiers.push(annoText);
+                // Skip noise annotations that don't carry semantic meaning
+                const SKIP_ANNOTATIONS = new Set(['suppresswarnings', 'safevarargs', 'serial', 'generated']);
+                if (!SKIP_ANNOTATIONS.has(annoText)) {
+                    modifiers.push(annoText);
+                }
                 continue;
             }
             modifiers.push(mod.text);
@@ -59,10 +63,11 @@ function extractModifiers(node) {
     }
 
     // Also check text before parameter list for modifiers (avoid matching keywords in params)
+    // Use the parameters node position to find the real paren (not annotation parens)
     const text = node.text;
-    const firstLine = text.split('\n')[0];
-    const parenIdx = firstLine.indexOf('(');
-    const preParams = parenIdx >= 0 ? firstLine.substring(0, parenIdx) : firstLine;
+    const paramsNode = node.childForFieldName('parameters');
+    const paramOffset = paramsNode ? paramsNode.startIndex - node.startIndex : -1;
+    const preParams = paramOffset >= 0 ? text.substring(0, paramOffset) : text.split('\n').slice(0, 3).join(' ');
     const keywords = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default'];
     for (const kw of keywords) {
         if (preParams.includes(kw + ' ') && !modifiers.includes(kw)) {
@@ -130,10 +135,10 @@ function findFunctions(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
-            // Skip methods inside a class body (they're extracted as class members)
+            // Skip methods inside a class/interface/enum body (they're extracted as class members)
             let parent = node.parent;
-            if (parent && parent.type === 'class_body') {
-                return true;  // Skip - this is a class method
+            if (parent && (parent.type === 'class_body' || parent.type === 'interface_body' || parent.type === 'enum_body' || parent.type === 'enum_body_declarations')) {
+                return true;  // Skip - this is a class/interface/enum method
             }
 
             const nameNode = node.childForFieldName('name');
@@ -172,10 +177,10 @@ function findFunctions(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
-            // Skip constructors inside a class body (they're extracted as class members)
+            // Skip constructors inside a class/enum body (they're extracted as class members)
             let parent = node.parent;
-            if (parent && parent.type === 'class_body') {
-                return true;  // Skip - this is a class constructor
+            if (parent && (parent.type === 'class_body' || parent.type === 'enum_body' || parent.type === 'enum_body_declarations')) {
+                return true;  // Skip - this is a class/enum constructor
             }
 
             const nameNode = node.childForFieldName('name');
@@ -524,6 +529,7 @@ function extractClassMembers(classNode, code) {
     const members = [];
     const bodyNode = classNode.childForFieldName('body');
     if (!bodyNode) return members;
+    const isInterface = bodyNode.type === 'interface_body';
 
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const child = bodyNode.namedChild(i);
@@ -536,6 +542,13 @@ function extractClassMembers(classNode, code) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const modifiers = extractModifiers(child);
+                // Interface methods are implicitly public and abstract in Java
+                if (isInterface) {
+                    if (!modifiers.includes('public')) modifiers.push('public');
+                    if (!modifiers.includes('abstract') && !modifiers.includes('default') && !modifiers.includes('static')) {
+                        modifiers.push('abstract');
+                    }
+                }
                 const returnType = extractReturnType(child);
                 const docstring = extractJavaDocstring(code, startLine);
                 const nameLine = nameNode.startPosition.row + 1;

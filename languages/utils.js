@@ -100,9 +100,37 @@ function parseJSParam(param, info) {
     } else if (param.type === 'required_parameter' || param.type === 'optional_parameter') {
         const patternNode = param.childForFieldName('pattern');
         const typeNode = param.childForFieldName('type');
-        if (patternNode) info.name = patternNode.text;
+        if (patternNode) {
+            // Check if pattern is a rest_pattern (e.g., ...args inside required_parameter)
+            if (patternNode.type === 'rest_pattern') {
+                const innerName = patternNode.namedChild(0);
+                info.name = innerName ? innerName.text : patternNode.text.replace(/^\.\.\./, '');
+                info.rest = true;
+            } else {
+                info.name = patternNode.text;
+            }
+        }
         if (typeNode) info.type = typeNode.text.replace(/^:\s*/, '');
         if (param.type === 'optional_parameter') info.optional = true;
+        // Check for default value (e.g., priority: number = 1)
+        const valueNode = param.childForFieldName('value');
+        if (valueNode) {
+            info.default = valueNode.text;
+            info.optional = true;
+        } else if (!info.rest) {
+            // Also check for bare number/string/etc. children as defaults
+            for (let i = 0; i < param.namedChildCount; i++) {
+                const child = param.namedChild(i);
+                if (child !== patternNode && child !== (typeNode && typeNode.parent === param ? typeNode : null) &&
+                    child.type !== 'type_annotation' && child.type !== 'rest_pattern' &&
+                    !['identifier', 'type_annotation'].includes(child.type)) {
+                    // This is likely a default value node
+                    info.default = child.text;
+                    info.optional = true;
+                    break;
+                }
+            }
+        }
     } else if (param.type === 'rest_parameter' || param.type === 'rest_pattern') {
         // rest_parameter = TypeScript, rest_pattern = JavaScript
         const patternNode = param.childForFieldName('pattern') || param.namedChild(0);
