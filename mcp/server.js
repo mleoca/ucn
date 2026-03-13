@@ -45,20 +45,18 @@ const indexCache = new Map(); // projectDir → { index, checkedAt }
 const MAX_CACHE_SIZE = 10;
 const expandCacheInstance = new ExpandCache();
 
-function getIndex(projectDir) {
+function getIndex(projectDir, options) {
+    const maxFiles = options && options.maxFiles;
     const absDir = path.resolve(projectDir);
     if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) {
         throw new Error(`Project directory not found: ${absDir}`);
     }
     const root = findProjectRoot(absDir);
     const cached = indexCache.get(root);
-    const STALE_CHECK_INTERVAL_MS = 2000;
 
-    // Throttle staleness checks — isCacheStale() re-globs and stats all files
-    if (cached) {
-        if (Date.now() - cached.checkedAt < STALE_CHECK_INTERVAL_MS) {
-            return cached.index; // Recently verified fresh
-        }
+    // Always check staleness — MCP is used in iterative agent loops where
+    // files change between requests, so a throttle causes stale results.
+    if (cached && !maxFiles) {
         if (!cached.index.isCacheStale()) {
             cached.checkedAt = Date.now();
             return cached.index;
@@ -67,12 +65,15 @@ function getIndex(projectDir) {
 
     // Build new index (or rebuild stale one)
     const index = new ProjectIndex(root);
+    const buildOpts = { quiet: true, forceRebuild: false };
+    if (maxFiles) buildOpts.maxFiles = maxFiles;
     const loaded = index.loadCache();
-    if (loaded && !index.isCacheStale()) {
-        // Disk cache is fresh
+    if (loaded && !maxFiles && !index.isCacheStale()) {
+        // Disk cache is fresh (skip when maxFiles is set — cached index may have different file count)
     } else {
-        index.build(null, { quiet: true, forceRebuild: loaded });
-        index.saveCache();
+        buildOpts.forceRebuild = !!loaded;
+        index.build(null, buildOpts);
+        if (!maxFiles) index.saveCache(); // Don't pollute disk cache with partial indexes
         // Clear expand cache entries for this project — stale after rebuild
         expandCacheInstance.clearForRoot(root);
     }
@@ -93,7 +94,10 @@ function getIndex(projectDir) {
         }
     }
 
-    indexCache.set(root, { index, checkedAt: Date.now() });
+    // Don't cache partial indexes (maxFiles) — they'd serve wrong results for full queries
+    if (!maxFiles) {
+        indexCache.set(root, { index, checkedAt: Date.now() });
+    }
     return index;
 }
 
@@ -298,7 +302,7 @@ server.registerTool(
             // ── Commands using shared executor ─────────────────────────
 
             case 'about': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'about', ep);
                 if (!ok) return toolResult(error); // soft error — won't kill sibling calls
                 return toolResult(output.formatAbout(result, {
@@ -309,7 +313,7 @@ server.registerTool(
             }
 
             case 'context': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result: ctx, error } = execute(index, 'context', ep);
                 if (!ok) return toolResult(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
@@ -321,14 +325,14 @@ server.registerTool(
             }
 
             case 'impact': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'impact', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatImpact(result));
             }
 
             case 'blast': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'blast', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatBlast(result, {
@@ -337,14 +341,14 @@ server.registerTool(
             }
 
             case 'smart': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'smart', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatSmart(result));
             }
 
             case 'trace': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'trace', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTrace(result, {
@@ -354,7 +358,7 @@ server.registerTool(
             }
 
             case 'reverse_trace': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'reverseTrace', ep);
                 if (!ok) return toolResult(error);
                 return toolResult(output.formatReverseTrace(result, {
@@ -363,7 +367,7 @@ server.registerTool(
             }
 
             case 'example': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'example', ep);
                 if (!ok) return toolResult(error);
                 if (!result) return toolResult(`No usage examples found for "${ep.name}".`);
@@ -371,7 +375,7 @@ server.registerTool(
             }
 
             case 'related': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'related', ep);
                 if (!ok) return toolResult(error);
                 if (!result) return toolResult(`Symbol "${ep.name}" not found.`);
@@ -384,7 +388,7 @@ server.registerTool(
             // ── Finding Code ────────────────────────────────────────────
 
             case 'find': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'find', ep);
                 if (!ok) return toolResult(error); // soft error
                 let text = output.formatFind(result, ep.name, ep.top);
@@ -393,7 +397,7 @@ server.registerTool(
             }
 
             case 'usages': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'usages', ep);
                 if (!ok) return toolResult(error); // soft error
                 let text = output.formatUsages(result, ep.name);
@@ -402,7 +406,7 @@ server.registerTool(
             }
 
             case 'toc': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'toc', ep);
                 if (!ok) return toolResult(error); // soft error
                 let text = output.formatToc(result, {
@@ -413,7 +417,7 @@ server.registerTool(
             }
 
             case 'search': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error, structural } = execute(index, 'search', ep);
                 if (!ok) return toolResult(error); // soft error
                 if (structural) {
@@ -423,21 +427,21 @@ server.registerTool(
             }
 
             case 'tests': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'tests', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTests(result, ep.name));
             }
 
             case 'affected_tests': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'affectedTests', ep);
                 if (!ok) return toolResult(error);
                 return toolResult(output.formatAffectedTests(result));
             }
 
             case 'deadcode': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'deadcode', ep);
                 if (!ok) return toolResult(error); // soft error
                 const dcNote = note;
@@ -451,7 +455,7 @@ server.registerTool(
             }
 
             case 'entrypoints': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'entrypoints', ep);
                 if (!ok) return toolResult(error);
                 return toolResult(output.formatEntrypoints(result));
@@ -460,28 +464,28 @@ server.registerTool(
             // ── File Dependencies ───────────────────────────────────────
 
             case 'imports': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'imports', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatImports(result, ep.file));
             }
 
             case 'exporters': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'exporters', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatExporters(result, ep.file));
             }
 
             case 'file_exports': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fileExports', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatFileExports(result, ep.file));
             }
 
             case 'graph': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'graph', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatGraph(result, {
@@ -493,7 +497,7 @@ server.registerTool(
             }
 
             case 'circular_deps': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'circularDeps', ep);
                 if (!ok) return toolResult(error);
                 return toolResult(output.formatCircularDeps(result));
@@ -502,21 +506,21 @@ server.registerTool(
             // ── Refactoring ─────────────────────────────────────────────
 
             case 'verify': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'verify', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatVerify(result));
             }
 
             case 'plan': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'plan', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatPlan(result));
             }
 
             case 'diff_impact': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'diffImpact', ep);
                 if (!ok) return toolResult(error); // soft error — e.g. "not a git repo"
                 return toolResult(output.formatDiffImpact(result));
@@ -525,21 +529,21 @@ server.registerTool(
             // ── Other ───────────────────────────────────────────────────
 
             case 'typedef': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'typedef', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatTypedef(result, ep.name));
             }
 
             case 'stacktrace': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stacktrace', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatStackTrace(result));
             }
 
             case 'api': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'api', ep);
                 if (!ok) return toolResult(error); // soft error
                 let apiText = output.formatApi(result, ep.file || '.');
@@ -548,7 +552,7 @@ server.registerTool(
             }
 
             case 'stats': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stats', ep);
                 if (!ok) return toolResult(error); // soft error
                 return toolResult(output.formatStats(result, { top: ep.top || 0 }));
@@ -559,7 +563,7 @@ server.registerTool(
             case 'fn': {
                 const err = requireName(ep.name);
                 if (err) return err;
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fn', ep);
                 if (!ok) return toolResult(error); // soft error
                 // MCP path security: validate all result files are within project root
@@ -577,7 +581,7 @@ server.registerTool(
                 if (ep.maxLines !== undefined && (!Number.isInteger(ep.maxLines) || ep.maxLines < 1)) {
                     return toolError(`Invalid max_lines: ${ep.maxLines}. Must be a positive integer.`);
                 }
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'class', ep);
                 if (!ok) return toolResult(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
@@ -590,7 +594,7 @@ server.registerTool(
             }
 
             case 'lines': {
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'lines', ep);
                 if (!ok) return toolResult(error); // soft error
                 // MCP path security: validate file is within project root
@@ -603,7 +607,7 @@ server.registerTool(
                 if (ep.item === undefined || ep.item === null) {
                     return toolError('Item number is required (e.g. item=1).');
                 }
-                const index = getIndex(project_dir);
+                const index = getIndex(project_dir, ep);
                 const lookup = expandCacheInstance.lookup(index.root, ep.item);
                 const { ok, result, error } = execute(index, 'expand', {
                     match: lookup.match, itemNum: ep.item,

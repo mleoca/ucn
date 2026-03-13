@@ -13856,3 +13856,163 @@ describe('fix TS-BUG-003: about command note uses correct --include-methods word
         );
     });
 });
+
+// ============================================================================
+// SURFACE PARITY FIXES (2026-03-13)
+// ============================================================================
+
+describe('fix: CLI find test_* auto-discovery (surface parity)', () => {
+    it('CLI find test_* includes test files without --include-tests flag', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tests/test_helper.js': 'function test_helper() {}\nmodule.exports={test_helper};\n'
+        });
+        try {
+            const out = runCli(dir, 'find', ['test_*']);
+            assert.ok(out.includes('test_helper'), `Should find test_helper, got: ${out}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('interactive find test_* includes test files without --include-tests flag', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tests/test_helper.js': 'function test_helper() {}\nmodule.exports={test_helper};\n'
+        });
+        try {
+            const out = runInteractive(dir, ['find test_*']);
+            assert.ok(out.includes('test_helper'), `Should find test_helper, got: ${out}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('executor auto-includes test files when includeTests is undefined and pattern is test_*', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tests/test_helper.js': 'function test_helper() {}\nmodule.exports={test_helper};\n'
+        });
+        try {
+            const index = idx(dir);
+            // Passing includeTests: undefined simulates absent flag
+            const { ok, result } = execute(index, 'find', { name: 'test_*', includeTests: undefined });
+            assert.ok(ok, 'find should succeed');
+            assert.ok(result.length > 0, 'Should find test_helper');
+            assert.ok(result.some(r => r.name === 'test_helper'), 'Should include test_helper');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('executor does NOT auto-include when includeTests is explicitly false', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tests/test_helper.js': 'function test_helper() {}\nmodule.exports={test_helper};\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'find', { name: 'test_*', includeTests: false });
+            assert.ok(ok, 'find should succeed');
+            // With includeTests=false explicitly, test files should be excluded
+            assert.strictEqual(result.length, 0, 'Should not find test_helper when includeTests=false');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: MCP stale cache after file edit', () => {
+    it('MCP returns fresh results immediately after file edit', async () => {
+        const { McpClient } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"stale-test"}',
+            'a.js': 'function alpha() { return 1; }\nmodule.exports = { alpha };\n'
+        });
+        let client;
+        try {
+            client = new McpClient();
+            await client.start();
+            await client.initialize();
+
+            // First query — should find alpha
+            const res1 = await client.callTool('ucn', {
+                command: 'find', project_dir: dir, name: 'alpha'
+            });
+            const text1 = res1.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(text1.includes('alpha'), `First query should find alpha, got: ${text1}`);
+
+            // Edit file — replace alpha with beta
+            fs.writeFileSync(path.join(dir, 'a.js'), 'function beta() { return 2; }\nmodule.exports = { beta };\n');
+
+            // Immediate second query — should find beta (no stale cache)
+            const res2 = await client.callTool('ucn', {
+                command: 'find', project_dir: dir, name: 'beta'
+            });
+            const text2 = res2.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(text2.includes('beta'), `Second query should find beta immediately after edit, got: ${text2}`);
+        } finally {
+            if (client) client.stop();
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: MCP max_files parameter honored', () => {
+    it('MCP max_files limits indexed files', async () => {
+        const { McpClient } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"maxfiles-test"}',
+            'a.js': 'function funcA() {}\nmodule.exports = { funcA };\n',
+            'b.js': 'function funcB() {}\nmodule.exports = { funcB };\n',
+            'c.js': 'function funcC() {}\nmodule.exports = { funcC };\n'
+        });
+        let client;
+        try {
+            client = new McpClient();
+            await client.start();
+            await client.initialize();
+
+            // With max_files: 1, only one file should be indexed
+            const res = await client.callTool('ucn', {
+                command: 'toc', project_dir: dir, max_files: 1
+            });
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            // Toc should show only 1 file (max_files limits discovery)
+            assert.ok(text.includes('1 file'), `Should show 1 file with max_files=1, got: ${text}`);
+        } finally {
+            if (client) client.stop();
+            rm(dir);
+        }
+    });
+
+    it('MCP max_files does not pollute cache for subsequent full queries', async () => {
+        const { McpClient } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"maxfiles-cache-test"}',
+            'a.js': 'function funcA() {}\nmodule.exports = { funcA };\n',
+            'b.js': 'function funcB() {}\nmodule.exports = { funcB };\n'
+        });
+        let client;
+        try {
+            client = new McpClient();
+            await client.start();
+            await client.initialize();
+
+            // First: limited query
+            await client.callTool('ucn', {
+                command: 'toc', project_dir: dir, max_files: 1
+            });
+
+            // Second: full query (no max_files) — should see all files
+            const res = await client.callTool('ucn', {
+                command: 'toc', project_dir: dir
+            });
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(text.includes('2 file'), `Full query should show 2 files, got: ${text}`);
+        } finally {
+            if (client) client.stop();
+            rm(dir);
+        }
+    });
+});

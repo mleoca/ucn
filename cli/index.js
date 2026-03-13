@@ -74,7 +74,7 @@ function parseFlags(tokens) {
         file: getValueFlag('--file'),
         exclude: parseExclude(),
         in: getValueFlag('--in'),
-        includeTests: tokens.includes('--include-tests'),
+        includeTests: tokens.includes('--include-tests') ? true : undefined,
         includeExported: tokens.includes('--include-exported'),
         includeDecorated: tokens.includes('--include-decorated'),
         includeUncertain: tokens.includes('--include-uncertain'),
