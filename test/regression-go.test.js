@@ -3400,5 +3400,62 @@ func main() {
             assert.strictEqual(cobraEps.length, 0, 'non-framework struct fields should NOT be cobra entrypoints');
         } finally { rm(dir); }
     });
+
+    it('detects inline closure cobra handlers via enclosing function', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cmd.go': `package main
+
+import "github.com/spf13/cobra"
+
+func NewServeCmd() *cobra.Command {
+    return &cobra.Command{
+        Use: "serve",
+        RunE: func(cmd *cobra.Command, args []string) error {
+            return nil
+        },
+    }
+}
+
+func main() { NewServeCmd().Execute() }
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const cobraEps = eps.filter(e => e.framework === 'cobra');
+            assert.ok(cobraEps.length > 0, 'should detect cobra entry point from inline closure');
+            assert.ok(cobraEps.some(e => e.name === 'NewServeCmd'), 'enclosing function NewServeCmd should be the entry point');
+        } finally { rm(dir); }
+    });
+
+    it('exclude= filters entrypoint results by file path', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cmd.go': `package main
+
+func main() {}
+`,
+            'test/helper_test.go': `package test
+
+import "testing"
+
+func TestSomething(t *testing.T) {}
+`,
+            'src/app.go': `package src
+
+func init() {}
+`
+        });
+        try {
+            const index = idx(dir);
+            const all = detectEntrypoints(index);
+            assert.ok(all.some(e => e.type === 'test'), 'should have test fixtures without exclude');
+
+            const filtered = detectEntrypoints(index, { exclude: 'test' });
+            assert.ok(!filtered.some(e => e.file.includes('test/')), 'exclude=test should remove test files');
+            assert.ok(filtered.some(e => e.name === 'init' || e.name === 'main'), 'non-test entries should remain');
+        } finally { rm(dir); }
+    });
 });
 

@@ -1017,6 +1017,25 @@ function findCallsInCode(code, parser, options = {}) {
                         });
                     }
                 }
+                // Inline closure: RunE: func(cmd *cobra.Command, args []string) { ... }
+                // Mark the enclosing function as the entry point (the closure itself has no name)
+                if (valueNode.type === 'func_literal' && compositeType && fieldName) {
+                    const enclosing = getCurrentEnclosingFunction();
+                    const enclosingName = typeof enclosing === 'string' ? enclosing : enclosing?.name;
+                    if (enclosingName) {
+                        calls.push({
+                            name: enclosingName,
+                            line: valueNode.startPosition.row + 1,
+                            isMethod: false,
+                            isFunctionReference: false,
+                            isPotentialCallback: true,
+                            enclosingFunction: enclosing,
+                            uncertain: false,
+                            compositeType,
+                            fieldName,
+                        });
+                    }
+                }
             }
         }
 

@@ -476,6 +476,15 @@ function detectEntrypoints(index, options = {}) {
         filtered = filtered.filter(e => e.file.includes(options.file));
     }
 
+    if (options.exclude) {
+        const raw = Array.isArray(options.exclude) ? options.exclude : options.exclude.split(',');
+        const patterns = raw.map(s => s.trim()).filter(Boolean);
+        if (patterns.length > 0) {
+            const regexes = patterns.map(p => new RegExp(`(^|[/._-])${p}s?([/._-]|$)`, 'i'));
+            filtered = filtered.filter(e => !regexes.some(r => r.test(e.file)));
+        }
+    }
+
     // Sort by file, then line
     filtered.sort((a, b) => {
         if (a.file !== b.file) return a.file.localeCompare(b.file);

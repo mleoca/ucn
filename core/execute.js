@@ -595,6 +595,7 @@ const HANDLERS = {
             type: p.type,
             framework: p.framework,
             file: p.file,
+            exclude: p.exclude,
         });
         return { ok: true, result };
     },

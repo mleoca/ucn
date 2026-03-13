@@ -760,7 +760,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'entrypoints': {
-            const { ok, result, error } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file });
+            const { ok, result, error } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file, exclude: flags.exclude });
             if (!ok) fail(error);
             printOutput(result,
                 output.formatEntrypointsJson,
@@ -1389,7 +1389,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'entrypoints': {
-            const { ok, result, error } = execute(index, 'entrypoints', { type: iflags.type, framework: iflags.framework, file: iflags.file });
+            const { ok, result, error } = execute(index, 'entrypoints', { type: iflags.type, framework: iflags.framework, file: iflags.file, exclude: iflags.exclude });
             if (!ok) { console.log(error); return; }
             console.log(output.formatEntrypoints(result));
             break;
