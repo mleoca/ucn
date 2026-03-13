@@ -284,10 +284,16 @@ function testProcessData() {
             assert.ok(res.text.includes('below confidence threshold hidden'), 'MCP context should filter and note');
         });
 
-        it('CLI: context without --show-confidence omits confidence lines', () => {
+        it('CLI: context shows confidence by default', () => {
             const output = runCli(FIXTURES_PATH, 'context', ['processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(!output.includes('confidence:'), 'Should NOT show confidence without flag');
+            assert.ok(output.includes('confidence:'), 'Should show confidence by default');
+        });
+
+        it('CLI: context --no-confidence hides confidence lines', () => {
+            const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--no-confidence']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(!output.includes('confidence:'), 'Should NOT show confidence with --no-confidence');
         });
     });
 

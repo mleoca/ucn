@@ -112,7 +112,7 @@ function parseFlags(tokens) {
         decorator: getValueFlag('--decorator'),
         exported: tokens.includes('--exported'),
         unused: tokens.includes('--unused'),
-        showConfidence: tokens.includes('--show-confidence'),
+        showConfidence: !tokens.includes('--no-confidence'),
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
         framework: getValueFlag('--framework'),
     };
@@ -141,7 +141,7 @@ const knownFlags = new Set([
     '--regex', '--no-regex', '--functions',
     '--max-lines', '--class-name', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
-    '--show-confidence', '--min-confidence',
+    '--show-confidence', '--no-confidence', '--min-confidence',
     '--framework'
 ]);
 
@@ -1127,7 +1127,7 @@ Common Flags:
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
-  --show-confidence   Show confidence scores per caller/callee edge
+  --no-confidence     Hide confidence scores (shown by default)
   --min-confidence=N  Filter edges below confidence threshold (0.0-1.0)
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)

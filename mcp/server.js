@@ -114,7 +114,7 @@ const server = new McpServer({
 // TOOL HELPERS
 // ============================================================================
 
-const DEFAULT_OUTPUT_CHARS = 30000;  // ~7.5K tokens — safe default for AI context
+const DEFAULT_OUTPUT_CHARS = 10000;  // ~2.5K tokens — compact default for AI agents
 const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars override
 
 function toolResult(text, command, maxChars) {
@@ -253,7 +253,7 @@ server.registerTool(
             include_methods: z.boolean().optional().describe('Include obj.method() calls (default: true for about/trace)'),
             include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches'),
             min_confidence: z.number().optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
-            show_confidence: z.boolean().optional().describe('Show confidence scores and resolution evidence per edge'),
+            show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),
             with_types: z.boolean().optional().describe('Include related type definitions in output'),
             detailed: z.boolean().optional().describe('Show full symbol listing per file'),
             exact: z.boolean().optional().describe('Exact name match only (no substring matching)'),
@@ -327,7 +327,7 @@ server.registerTool(
                 return tr(output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.',
-                    showConfidence: ep.showConfidence,
+                    showConfidence: ep.showConfidence !== false,
                 }));
             }
 
@@ -337,7 +337,7 @@ server.registerTool(
                 if (!ok) return tr(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
-                    showConfidence: ep.showConfidence,
+                    showConfidence: ep.showConfidence !== false,
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
                 return tr(text);
