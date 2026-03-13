@@ -1,34 +1,13 @@
 # UCN - Universal Code Navigator
 
-Code intelligence for AI agents and developers - understand, extract, and navigate code without reading whole files.
+See what code does before you touch it.
 
-Precise answers to structural code questions:
-- Who calls this function? → without grepping the whole project
-- What breaks if I change this? → every call site, with arguments
-- What does this function do? → extracted with dependencies inline
-- What code is safe to delete? → verified unused symbols
-
-One command replaces 3-4 grep+read cycles. Powered by tree-sitter.
+Find symbols, trace callers, check impact, pick the right tests, extract code and spot what's dead - from the terminal.
 
 [![npm](https://img.shields.io/npm/v/ucn)](https://www.npmjs.com/package/ucn)
 [![license](https://img.shields.io/npm/l/ucn)](LICENSE)
 
----
-
-## 60-Second Quickstart
-
-```bash
-npm install -g ucn
-
-ucn toc                   # project overview
-ucn fn handleRequest      # extract a function without reading the file
-ucn about handleRequest   # full picture: definition, callers, callees, tests
-ucn impact handleRequest  # all call sites with arguments
-ucn trace main --depth=3  # call tree, no file reads
-ucn deadcode              # unused functions, AST-verified
-```
-
-Supports JS/TS, Python, Go, Rust, Java, and HTML. Runs locally.
+All commands, one engine, three surfaces:
 
 ```
   Terminal              AI Agents           Agent Skills
@@ -43,11 +22,27 @@ Supports JS/TS, Python, Go, Rust, Java, and HTML. Runs locally.
                      └─────────────┘
 ```
 
+Supports JavaScript, TypeScript, Python, Go, Rust, Java, and HTML inline scripts.
+
+If you work with AI, add UCN as a [Skill or MCP](#ai-setup) and let the agent ask better code questions instead of reading whole files.
+All commands ship as a single tool.
+
+UCN is deliberately lightweight:
+
+- **No background processes** - parses on demand, answers, exits
+- **No language servers** - tree-sitter does the parsing, no compilation needed
+- **MCP is optional** - only needed if you connect UCN to an AI agent, the CLI and Skill work on their own
+
 ---
 
-## Why UCN
+```bash
+npm install -g ucn
 
-AI agents waste tokens reading entire files to find one function, or grep for callers and miss half of them. UCN builds a structural index of the codebase - it knows which functions call which, what depends on what, and what's unused. One command gives what would take 3-4 file reads and greps.
+ucn trace main --depth=3       # full execution flow
+ucn about handleRequest        # definition + callers + callees + tests
+ucn impact handleRequest       # every call site with arguments
+ucn deadcode --exclude=test    # unused code, AST-verified
+```
 
 "What happens when `build()` runs?"
 
@@ -55,47 +50,155 @@ AI agents waste tokens reading entire files to find one function, or grep for ca
 $ ucn trace build --depth=2
 
 build
-├── detectProjectPattern (discovery.js:392) 1x
-│   ├── checkDir (discovery.js:396) 2x
-│   └── shouldIgnore (discovery.js:340) 1x
-├── parseGitignore (discovery.js:123) 1x
-├── expandGlob (discovery.js:183) 1x
-│   ├── parseGlobPattern (discovery.js:219) 1x
-│   ├── walkDir (discovery.js:276) 1x
-│   └── compareNames (discovery.js:162) 1x
-├── indexFile (project.js:236) 1x
-│   ├── addSymbol (project.js:293) 4x
+├── detectProjectPattern (core/discovery.js:399) 1x
+│   ├── checkDir (core/discovery.js:403) 2x
+│   └── shouldIgnore (core/discovery.js:347) 1x
+├── parseGitignore (core/discovery.js:130) 1x
+├── expandGlob (core/discovery.js:190) 1x
+│   ├── parseGlobPattern (core/discovery.js:226) 1x
+│   ├── walkDir (core/discovery.js:283) 1x
+│   └── compareNames (core/discovery.js:169) 1x
+├── indexFile (core/project.js:273) 1x
+│   ├── addSymbol (core/project.js:343) 4x
 │   ├── detectLanguage (languages/index.js:157) 1x
-│   ├── parseFile (parser.js:93) 1x
-│   └── extractImports (imports.js:19) 1x
-├── buildImportGraph (project.js:419) 1x
-└── buildInheritanceGraph (project.js:465) 1x
+│   ├── parse (core/parser.js:69) 1x
+│   └── extractImports (core/imports.js:19) 1x
+├── buildImportGraph (core/project.js:549) 1x
+└── buildInheritanceGraph (core/project.js:627) 1x
 ```
 
-One command. No files opened. The full execution flow with every function located by file and line.
+One command. No files opened. Every function located by file and line.
 
 ---
 
-## What it does
+## Understand code you didn't write
 
-| Task | Command | Output |
-|------|---------|--------|
-| Understand one symbol deeply | `ucn about expandGlob` | Definition, callers, callees, tests |
-| Who calls this and what do they pass? | `ucn impact shouldIgnore` | Call sites with argument context |
-| Map an execution path | `ucn trace expandGlob --depth=2` | Call tree |
-| Extract just one function | `ucn fn expandGlob` | Surgical snippet, no file read |
-| Check all call sites match signature | `ucn verify expandGlob` | Mismatch/uncertain call sites |
-| Review branch impact | `ucn diff-impact --base=main` | Changed functions + downstream callers |
-| Find deletable code | `ucn deadcode` | Unused symbols, AST-verified |
-| Get function + helpers inline | `ucn smart shouldIgnore` | Source with dependencies expanded |
+`ucn about` gives you everything about a function in one shot - who calls it, what it calls, which tests cover it, and the source code.
+
+```
+$ ucn about expandGlob
+
+expandGlob (function)
+════════════════════════════════════════════════════════════
+core/discovery.js:190-221
+expandGlob (pattern, options = {})
+
+CALLERS (3):
+  cli/index.js:859 [runGlobCommand]
+    const files = expandGlob(pattern);
+  core/cache.js:274 [isCacheStale]
+    const currentFiles = expandGlob(pattern, globOpts);
+  core/project.js:195 [build]
+    const files = expandGlob(pattern, globOpts);
+
+CALLEES (3):
+  parseGlobPattern [utility] - core/discovery.js:226
+  walkDir [utility] - core/discovery.js:283
+  compareNames [utility] - core/discovery.js:169
+
+TESTS: 6 matches in 2 file(s)
+```
+
+Need to trace execution upward instead? `ucn reverse-trace fn` walks the caller chain back to entry points.
+
+## Change code without breaking things
+
+Before touching a function, check if all existing call sites match its signature:
+
+```
+$ ucn verify expandGlob
+
+expandGlob (pattern, options = {})
+Expected arguments: 1-2
+
+STATUS: ✓ All calls valid (7 calls, 0 mismatches)
+```
+
+Then preview the refactoring. UCN shows exactly what needs to change and where:
+
+```
+$ ucn plan expandGlob --rename-to=expandGlobPattern
+
+SIGNATURE CHANGE:
+  Before: expandGlob (pattern, options = {})
+  After:  expandGlobPattern (pattern, options = {})
+
+CHANGES NEEDED: 7 across 4 files
+
+cli/index.js :859
+  const files = expandGlob(pattern);
+  → const files = expandGlobPattern(pattern);
+
+core/cache.js :274
+  const currentFiles = expandGlob(pattern, globOpts);
+  → const currentFiles = expandGlobPattern(pattern, globOpts);
+
+core/project.js :195
+  const files = expandGlob(pattern, globOpts);
+  → const files = expandGlobPattern(pattern, globOpts);
+```
+
+Run `ucn diff-impact --staged` before committing to see what you changed and who calls it.
+
+## Find what to clean up
+
+Which tests should you run after a change? `affected-tests` walks the blast radius and finds every test that touches the affected functions:
+
+```
+$ ucn affected-tests expandGlob
+
+1 function changed → 18 functions affected (depth 3)
+Summary: 18 affected → 12 test files, 11/18 functions covered (61%)
+
+Uncovered (7): runGlobCommand, runProjectCommand, ...
+  ⚠ These affected functions have no test references
+```
+
+## Find unused code
+
+```
+$ ucn deadcode --exclude=test
+
+Dead code: 1 unused symbol(s)
+
+core/discovery.js
+  [ 162- 166] legacyResolve (function)
+```
+
+## Extract without reading the whole file
+
+```
+$ ucn fn compareNames
+
+core/discovery.js:169
+[ 169- 177] compareNames(a, b)
+────────────────────────────────────────────────────────────
+function compareNames(a, b) {
+    const aLower = a.toLowerCase();
+    const bLower = b.toLowerCase();
+    if (aLower < bLower) return -1;
+    if (aLower > bLower) return 1;
+    if (a < b) return -1;
+    if (a > b) return 1;
+    return 0;
+}
+```
 
 ---
 
-## Setup
+## Testing and reliability
 
-### MCP Server (for AI agents)
+- **Fast** - indexes its own ~25K-line codebase in under 100ms, cached after first run
+- **Discipline** - every bug fix gets a regression test, test code is ~3x the source
+- **Coverage** - every command, every supported language, every surface (CLI, MCP, interactive)
+- **Systematic** - a harness exercises all command and flag combinations against real multi-language fixtures
+- **Test types** - unit, integration, per-language regression, formatter, cache, MCP edge cases, architecture parity guards
 
-One-line setup:
+---
+
+## AI Setup
+
+### MCP
 
 ```bash
 # Claude Code
@@ -138,11 +241,7 @@ VS Code uses `.vscode/mcp.json`:
 
 </details>
 
-All commands ship as a single MCP tool - under 2KB of context.
-
 ### Agent Skill (no server needed)
-
-Drop-in for Claude Code or Codex CLI:
 
 ```bash
 # Claude Code
@@ -156,156 +255,126 @@ cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
 
 ---
 
-## Examples
+## Full help
 
-**Extract a function** without reading the file:
+```text
+UCN - Universal Code Navigator
 
-```
-$ ucn fn expandGlob
+Supported: JavaScript, TypeScript, Python, Go, Rust, Java, HTML
 
-core/discovery.js:183
-[ 183- 214] expandGlob(pattern, options = {})
-────────────────────────────────────────────────────────────
-function expandGlob(pattern, options = {}) {
-    const root = path.resolve(options.root || process.cwd());
-    const ignores = options.ignores || DEFAULT_IGNORES;
-    ...
-    return files.sort(compareNames);
-}
-```
+Usage:
+  ucn [command] [args]            Project mode (current directory)
+  ucn <file> [command] [args]     Single file mode
+  ucn <dir> [command] [args]      Project mode (specific directory)
+  ucn "pattern" [command] [args]  Glob pattern mode
+  (Default output is text; add --json for machine-readable JSON)
 
-**See callers and callees:**
+═══════════════════════════════════════════════════════════════════════════════
+UNDERSTAND CODE
+═══════════════════════════════════════════════════════════════════════════════
+  about <name>        Full picture (definition, callers, callees, tests, code)
+  context <name>      Who calls this + what it calls (numbered for expand)
+  smart <name>        Function + all dependencies inline
+  impact <name>       What breaks if changed (call sites grouped by file)
+  blast <name>        Transitive blast radius (callers of callers, --depth=N)
+  trace <name>        Call tree visualization (--depth=N expands all children)
+  reverse-trace <name> Upward call chain to entry points (--depth=N, default 5)
+  related <name>      Find similar functions (same file, shared deps)
+  example <name>      Best usage example with context
 
-```
-$ ucn context expandGlob
+═══════════════════════════════════════════════════════════════════════════════
+FIND CODE
+═══════════════════════════════════════════════════════════════════════════════
+  find <name>         Find symbol definitions (supports glob: find "handle*")
+  usages <name>       All usages grouped: definitions, calls, imports, references
+  toc                 Table of contents (compact; --detailed lists all symbols)
+  search <term>       Text search (regex default, --context=N, --exclude=, --in=)
+                      Structural: --type=function|class|call --param= --returns= --decorator= --exported --unused
+  tests <name>        Find test files for a function
+  affected-tests <n>  Tests affected by a change (blast + test detection, --depth=N)
 
-CALLERS (7):
-  [1] cli/index.js:785 [runGlobCommand]
-    const files = expandGlob(pattern);
-  [2] core/cache.js:149 [isCacheStale]
-    const currentFiles = expandGlob(pattern, globOpts);
-  [3] core/project.js:171 [build]
-    const files = expandGlob(pattern, globOpts);
-  ...
+═══════════════════════════════════════════════════════════════════════════════
+EXTRACT CODE
+═══════════════════════════════════════════════════════════════════════════════
+  fn <name>[,n2,...]  Extract function(s) (comma-separated for bulk, --file)
+  class <name>        Extract class
+  lines <range>       Extract line range (e.g., lines 50-100)
+  expand <N>          Show code for item N from context output
 
-CALLEES (3):
-  [8] parseGlobPattern [utility] - core/discovery.js:219
-  [9] walkDir [utility] - core/discovery.js:276
-  [10] compareNames [utility] - core/discovery.js:162
-```
+═══════════════════════════════════════════════════════════════════════════════
+FILE DEPENDENCIES
+═══════════════════════════════════════════════════════════════════════════════
+  imports <file>      What does file import
+  exporters <file>    Who imports this file
+  file-exports <file> What does file export
+  graph <file>        Full dependency tree (--depth=N, --direction=imports|importers|both)
+  circular-deps       Detect circular import chains (--file=, --exclude=)
 
-**See impact of recent edits:**
+═══════════════════════════════════════════════════════════════════════════════
+REFACTORING HELPERS
+═══════════════════════════════════════════════════════════════════════════════
+  plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to)
+  verify <name>       Check all call sites match signature
+  diff-impact         What changed in git diff and who calls it (--base, --staged)
+  deadcode            Find unused functions/classes
+  entrypoints         Detect framework entry points (routes, DI, tasks)
 
-```
-$ ucn diff-impact --base=HEAD~1
+═══════════════════════════════════════════════════════════════════════════════
+OTHER
+═══════════════════════════════════════════════════════════════════════════════
+  api                 Show exported/public symbols
+  typedef <name>      Find type definitions
+  stats               Project statistics (--functions for per-function line counts)
+  stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
 
-3 modified, 1 new, 12 call sites across 4 files
-
-MODIFIED FUNCTIONS:
-
-  processOrder
-  src/orders/service.ts:45
-  Lines added: 48-52, Lines deleted: 49
-  Callers (3):
-    src/api/checkout.ts:89 [handleCheckout]
-      await processOrder(cart.items, req.user)
-    src/workers/batch.ts:12 [batchProcess]
-      processOrder(order.items, systemUser)
-    src/jobs/daily.ts:88 [runDailyOrders]
-      results.push(await processOrder(items, admin))
-```
-
-**Trace a call tree:**
-
-```
-$ ucn trace expandGlob --depth=2
-
-expandGlob
-├── parseGlobPattern (core/discovery.js:219) [utility] 1x
-│   └── globToRegex (core/discovery.js:256) [utility] 1x
-├── walkDir (core/discovery.js:276) [utility] 1x
-│   ├── compareNames (core/discovery.js:162) [utility] 1x
-│   ├── shouldIgnore (core/discovery.js:340) [utility] 1x
-│   └── walkDir (core/discovery.js:276) [utility] 1x (see above)
-└── compareNames (core/discovery.js:162) [utility] 1x (see above)
-```
-
-**Find unused code:**
-
-```
-$ ucn deadcode --exclude=test
-
-Dead code: 1 unused symbol(s)
-
-core/discovery.js
-  [ 162- 166] legacyResolve (function)
-```
-
----
-
-## Workflows
-
-```bash
-# Investigating a bug
-ucn about buggyFunction                    # understand it fully
-ucn trace buggyFunction --depth=2          # see what it calls
-
-# Before modifying code
-ucn impact theFunction                     # who will break?
-ucn smart theFunction                      # function + its helpers inline
-# ... make changes ...
-ucn verify theFunction                     # do all call sites still match?
-
-# Before committing
-ucn diff-impact --staged                   # what I changed + who calls it
-
-# Cleanup
-ucn deadcode --exclude=test                # what can be deleted?
-```
-
----
-
-## All commands
-
-```
-  UNDERSTAND                          MODIFY SAFELY
-  ─────────────────────               ─────────────────────
-  about         full picture          impact          all call sites
-  context       callers + callees     blast           transitive impact
-  smart         function + helpers    diff-impact     git diff + callers
-  trace         call tree             verify          signature check
-  reverse-trace callers → root        plan            refactor preview
-
-  FIND & EXTRACT                      ARCHITECTURE
-  ─────────────────────               ─────────────────────
-  find          locate definitions    imports         file dependencies
-  usages        all occurrences       exporters       reverse dependencies
-  fn            extract function      graph           dependency tree
-  class         extract class         circular-deps   import cycles
-  toc           project overview      related         sibling functions
-  deadcode      unused code           tests           find test coverage
-  search        text search           affected-tests  tests for changes
-  example       best usage example    stacktrace      error trace context
-  lines         extract line range    api             public API surface
-  expand        drill into context    typedef         type definitions
-                                      file-exports    file's exports
-                                      stats           project stats
+Common Flags:
+  --file <pattern>    Filter by file path (e.g., --file=routes)
+  --exclude=a,b       Exclude patterns (e.g., --exclude=test,mock)
+  --in=<path>         Only in path (e.g., --in=src/core)
+  --depth=N           Trace/graph depth (default: 3, also expands all children)
+  --direction=X       Graph direction: imports, importers, or both (default: both)
+  --all               Expand truncated sections (about, trace, graph, related)
+  --top=N             Limit results (find, deadcode)
+  --limit=N           Limit result count (find, usages, search, deadcode, api, toc)
+  --max-files=N       Max files to index (large projects)
+  --context=N         Lines of context around matches
+  --json              Machine-readable output
+  --code-only         Filter out comments and strings
+  --with-types        Include type definitions
+  --include-tests     Include test files
+  --class-name=X      Scope to specific class (e.g., --class-name=Repository)
+  --include-methods   Include method calls (obj.fn) in caller/callee analysis
+  --include-uncertain Include ambiguous/uncertain matches
+  --show-confidence   Show confidence scores per caller/callee edge
+  --min-confidence=N  Filter edges below confidence threshold (0.0-1.0)
+  --include-exported  Include exported symbols in deadcode
+  --no-regex          Force plain text search (regex is default)
+  --functions         Show per-function line counts (stats command)
+  --include-decorated Include decorated/annotated symbols in deadcode
+  --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
+  --exact             Exact name match only (find)
+  --calls-only        Only show call/test-case matches (tests)
+  --case-sensitive    Case-sensitive text search (search)
+  --detailed          List all symbols in toc (compact by default)
+  --top-level         Show only top-level functions in toc
+  --max-lines=N       Max source lines for class (large classes show summary)
+  --no-cache          Disable caching
+  --clear-cache       Clear cache before running
+  --base=<ref>        Git ref for diff-impact (default: HEAD)
 ```
 
 ---
 
 ## Limitations
 
-UCN analyzes code structure statically - it doesn't run code.
+- Single-project scope - follows imports within the project, not into `node_modules` or `site-packages`
+- No runtime execution - static analysis only
+- Dynamic dispatch and reflection are only partially visible or invisible
+- JS, TS, and Python method calls can be uncertain when receiver type is unknown
+- Large repos take a few seconds on the first query, then use cache
 
-- **5 languages + HTML** - JS/TS, Python, Go, Rust, Java. Falls back to text search for others.
-- **Static analysis only** - Can't follow `eval()`, `getattr()`, reflection, or other dynamic dispatch.
-- **Duck-typed methods** - `obj.method()` in JS/TS/Python is marked "uncertain" when the receiver type is ambiguous. Go/Rust/Java resolve with high confidence.
-- **Single project scope** - Follows imports within the project but not into `node_modules` or `site-packages`.
-- **First-query index time** - A few seconds on large projects. Cached incrementally after that.
+If you need compiler diagnostics, taint analysis, or runtime semantics, those are different tools for different jobs. UCN trades that depth for speed, portability, and zero setup.
 
 ---
-
-## License
 
 MIT

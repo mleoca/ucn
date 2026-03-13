@@ -26,7 +26,7 @@ Extract functions, trace call chains, find callers, and detect dead code — wit
 - Language not supported (only JS/TS, Python, Go, Rust, Java, HTML)
 - Finding files by name — use glob
 
-## The 5 Commands You'll Use Most
+## The Commands You'll Use Most
 
 ### 1. `about` — First stop for any investigation
 
@@ -157,6 +157,7 @@ ucn [target] <command> [name] [--flags]
 
 | Flag | When to use it |
 |------|---------------|
+| `--class-name=X` | Scope to specific class (e.g., `--class-name=Repository` for method `save`) |
 | `--file=<pattern>` | Disambiguate when a name exists in multiple files (e.g., `--file=api`) |
 | `--exclude=test,mock` | Focus on production code only |
 | `--in=src/core` | Limit search to a subdirectory |
@@ -185,6 +186,10 @@ ucn [target] <command> [name] [--flags]
 | `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |
 | `--show-confidence` | Show confidence scores (0.0–1.0) per caller/callee edge in `context`/`about` |
 | `--min-confidence=N` | Filter edges below confidence threshold (e.g., `--min-confidence=0.7` keeps only high-confidence edges) |
+| `--calls-only` | Only show call/test-case matches in `tests` (skip file-level results) |
+| `--add-param=<name>` | Add a parameter (`plan` command). Combine with `--default=<value>` |
+| `--remove-param=<name>` | Remove a parameter (`plan` command) |
+| `--rename-to=<name>` | Rename a function (`plan` command) |
 | `--include-exported` | Include exported symbols in `deadcode` results |
 | `--include-decorated` | Include decorated/annotated symbols in `deadcode` results |
 | `--framework=X` | Filter `entrypoints` by framework (e.g., `express`, `spring`, `celery`) |

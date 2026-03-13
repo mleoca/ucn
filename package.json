@@ -1,6 +1,6 @@
 {
   "name": "ucn",
-  "version": "3.8.4",
+  "version": "3.8.5",
   "mcpName": "io.github.mleoca/ucn",
   "description": "Code intelligence toolkit for AI agents — extract functions, trace call chains, find callers, detect dead code without reading entire files. Works as MCP server, CLI, or agent skill. Supports JS/TS, Python, Go, Rust, Java.",
   "main": "index.js",

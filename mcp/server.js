@@ -185,6 +185,7 @@ UNDERSTANDING CODE:
 - smart <name>: Get a function's source with all called functions expanded inline (not constants/variables). Use to understand or modify a function and its dependencies in one read.
 - trace <name>: Call tree from a function downward. Use to understand "what happens when X runs" — maps which modules a pipeline touches without reading files. Set depth (default: 3); setting depth expands all children.
 - example <name>: Best real-world usage example. Automatically scores call sites by quality and returns the top one with context. Use to understand expected calling patterns.
+- reverse_trace <name>: Upward call chain to entry points — who calls this, who calls those callers, etc. Use to find all paths that lead to a function. Set depth (default: 5) to control how far up. Complement to trace (which goes downward).
 - related <name>: Sibling functions: same file, similar names, or shared callers/callees. Find companions to update together (e.g., serialize when you're changing deserialize). Name-based, not semantic.
 
 FINDING CODE:
@@ -195,6 +196,7 @@ FINDING CODE:
 - tests <name>: Find test files covering a function, test case names, and how it's called in tests. Use before modifying or to find test patterns to follow.
 - affected_tests <name>: Which tests to run after changing a function. Combines blast (transitive callers) with test detection. Shows test files, coverage %, and uncovered functions. Use depth= to control depth.
 - deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
+- entrypoints: Detect framework entry points: routes, handlers, DI providers, tasks. Auto-detects Express, Flask, Spring, Gin, Actix, and more. Use framework= to filter by specific framework.
 
 EXTRACTING CODE (use instead of reading entire files):
 - fn <name>: Extract one or more functions. Comma-separated for bulk extraction (e.g. "parse,format,validate"). Use file to disambiguate.
@@ -207,6 +209,7 @@ FILE DEPENDENCIES (require file param):
 - exporters: Every file that imports/depends on this file — shows dependents rather than dependencies. Use before moving, renaming, or deleting.
 - file_exports: File's public API: all exported functions, classes, variables with signatures. Use to understand what a module offers before importing. Requires explicit export markers; use toc --detailed as fallback.
 - graph: File-level dependency tree. Use to understand module architecture — which files form a cluster, what the dependency chain looks like. Set direction ("imports"/"importers"/"both"). Can be noisy — use depth=1 for large codebases.
+- circular_deps: Detect circular import chains. Shows cycle paths and involved files. Use file= to check a specific file, exclude= to ignore paths.
 
 REFACTORING:
 - verify <name>: Check all call sites match function signature (argument count). Run before adding/removing parameters to catch breakage early.
@@ -272,7 +275,8 @@ server.registerTool(
             returns: z.string().optional().describe('Filter by return type (structural search). E.g. "Promise", "error".'),
             decorator: z.string().optional().describe('Filter by decorator/annotation (structural search). E.g. "Route", "Test".'),
             exported: z.boolean().optional().describe('Only exported/public symbols (structural search).'),
-            unused: z.boolean().optional().describe('Only symbols with zero callers (structural search).')
+            unused: z.boolean().optional().describe('Only symbols with zero callers (structural search).'),
+            framework: z.string().optional().describe('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.')
 
         })
     },

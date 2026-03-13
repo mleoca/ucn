@@ -171,7 +171,7 @@ const VALUE_FLAGS = new Set([
     '--add-param', '--remove-param', '--rename-to', '--default',
     '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name',
     '--type', '--param', '--receiver', '--returns', '--decorator',
-    '--limit', '--max-files', '--min-confidence', '--stack'
+    '--limit', '--max-files', '--min-confidence', '--stack', '--framework'
 ]);
 
 // Remove flags from args, then add args after -- (which are all positional)
@@ -1124,6 +1124,7 @@ Common Flags:
   --code-only         Filter out comments and strings
   --with-types        Include type definitions
   --include-tests     Include test files
+  --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
   --show-confidence   Show confidence scores per caller/callee edge
@@ -1248,7 +1249,7 @@ Flags can be added per-command: context myFunc --include-methods
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name', '--framework']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
