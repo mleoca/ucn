@@ -3122,6 +3122,7 @@ function formatEntrypoints(results, options = {}) {
 
     const typeLabels = {
         http: 'HTTP Routes',
+        cli: 'CLI Handlers',
         di: 'Dependency Injection',
         jobs: 'Job Schedulers',
         test: 'Test Fixtures',

@@ -209,15 +209,15 @@ const FRAMEWORK_PATTERNS = [
     // ── Go Framework Patterns ─────────────────────────────────────────
 
     // Cobra CLI framework — RunE, Run, PreRunE etc. assigned to cobra.Command struct fields
-    // Detected via call-pattern: cobra.Command composite literals with function value fields
+    // Detected via composite literal: &cobra.Command{RunE: handler}
     {
         id: 'cobra-command',
         languages: new Set(['go']),
         type: 'cli',
         framework: 'cobra',
-        detection: 'callPattern',
-        receiverPattern: /^cobra$/i,
-        methodPattern: /^Command$/,
+        detection: 'compositePattern',
+        typePattern: /^cobra\.Command$/,
+        fieldPattern: /^(Run|RunE|PreRun|PreRunE|PostRun|PostRunE|PersistentPreRun|PersistentPreRunE|PersistentPostRun|PersistentPostRunE)$/,
     },
 
     // Go goroutine launch — go func() or go handler()
@@ -289,50 +289,77 @@ function matchDecoratorOrModifier(symbol, language) {
  */
 function buildCallbackEntrypointMap(index) {
     const callPatterns = FRAMEWORK_PATTERNS.filter(p => p.detection === 'callPattern');
-    if (callPatterns.length === 0) return new Map();
+    const compositePatterns = FRAMEWORK_PATTERNS.filter(p => p.detection === 'compositePattern');
+    if (callPatterns.length === 0 && compositePatterns.length === 0) return new Map();
 
     const result = new Map(); // name -> info
 
     for (const [filePath, fileEntry] of index.files) {
         const lang = fileEntry.language;
-        const relevantPatterns = callPatterns.filter(p => p.languages.has(lang));
-        if (relevantPatterns.length === 0) continue;
 
         const calls = getCachedCalls(index, filePath);
         if (!calls) continue;
 
-        // Pass 1: find route-registration calls, index by line
-        // Match both method calls (obj.method) and package-qualified calls (pkg.Func)
-        const routeLines = new Map(); // line -> { pattern, call }
-        for (const call of calls) {
-            if (!call.receiver) continue;
-            for (const pattern of relevantPatterns) {
-                if (pattern.receiverPattern.test(call.receiver) &&
-                    pattern.methodPattern.test(call.name)) {
-                    routeLines.set(call.line, { pattern, call });
-                    break;
+        // Pass 1+2: call-pattern detection (e.g., app.GET("/", handler))
+        const relevantCallPatterns = callPatterns.filter(p => p.languages.has(lang));
+        if (relevantCallPatterns.length > 0) {
+            // Pass 1: find route-registration calls, index by line
+            const routeLines = new Map(); // line -> { pattern, call }
+            for (const call of calls) {
+                if (!call.receiver) continue;
+                for (const pattern of relevantCallPatterns) {
+                    if (pattern.receiverPattern.test(call.receiver) &&
+                        pattern.methodPattern.test(call.name)) {
+                        routeLines.set(call.line, { pattern, call });
+                        break;
+                    }
+                }
+            }
+
+            if (routeLines.size > 0) {
+                // Pass 2: find callbacks on route-registration lines
+                for (const call of calls) {
+                    if (!call.isFunctionReference && !call.isPotentialCallback) continue;
+                    const route = routeLines.get(call.line);
+                    if (!route) continue;
+
+                    if (!result.has(call.name)) {
+                        result.set(call.name, {
+                            framework: route.pattern.framework,
+                            type: route.pattern.type,
+                            patternId: route.pattern.id,
+                            method: route.call.name.toUpperCase(),
+                            file: filePath,
+                            line: call.line,
+                        });
+                    }
                 }
             }
         }
 
-        if (routeLines.size === 0) continue;
+        // Pass 3: composite literal patterns (e.g., &cobra.Command{RunE: handler})
+        const relevantCompositePatterns = compositePatterns.filter(p => p.languages.has(lang));
+        if (relevantCompositePatterns.length > 0) {
+            for (const call of calls) {
+                if (!call.compositeType) continue;
+                if (!call.isPotentialCallback && !call.isFunctionReference) continue;
 
-        // Pass 2: find callbacks on route-registration lines
-        for (const call of calls) {
-            if (!call.isFunctionReference && !call.isPotentialCallback) continue;
-            const route = routeLines.get(call.line);
-            if (!route) continue;
-
-            // This callback is registered as a framework handler
-            if (!result.has(call.name)) {
-                result.set(call.name, {
-                    framework: route.pattern.framework,
-                    type: route.pattern.type,
-                    patternId: route.pattern.id,
-                    method: route.call.name.toUpperCase(),
-                    file: filePath,
-                    line: call.line,
-                });
+                for (const pattern of relevantCompositePatterns) {
+                    if (pattern.typePattern.test(call.compositeType) &&
+                        pattern.fieldPattern.test(call.fieldName)) {
+                        if (!result.has(call.name)) {
+                            result.set(call.name, {
+                                framework: pattern.framework,
+                                type: pattern.type,
+                                patternId: pattern.id,
+                                method: call.fieldName,
+                                file: filePath,
+                                line: call.line,
+                            });
+                        }
+                        break;
+                    }
+                }
             }
         }
     }

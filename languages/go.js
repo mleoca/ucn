@@ -954,6 +954,31 @@ function findCallsInCode(code, parser, options = {}) {
                 valueNode = valueNode.namedChildCount > 0 ? valueNode.namedChild(0) : null;
             }
             if (valueNode) {
+                // Extract field name (the key) and parent composite literal type
+                let keyNode = node.namedChildCount >= 1 ? node.namedChild(0) : null;
+                if (keyNode && keyNode.type === 'literal_element') {
+                    keyNode = keyNode.namedChildCount > 0 ? keyNode.namedChild(0) : null;
+                }
+                const fieldName = keyNode ? keyNode.text : undefined;
+
+                let compositeType;
+                let compositeLit = node.parent; // literal_value
+                if (compositeLit && compositeLit.type === 'literal_value') {
+                    compositeLit = compositeLit.parent; // composite_literal
+                }
+                if (compositeLit && compositeLit.type === 'composite_literal') {
+                    const typeNode = compositeLit.childForFieldName('type');
+                    if (typeNode) {
+                        if (typeNode.type === 'qualified_type') {
+                            const pkg = typeNode.childForFieldName('package')?.text;
+                            const typeName = typeNode.childForFieldName('name')?.text;
+                            compositeType = pkg && typeName ? `${pkg}.${typeName}` : typeNode.text;
+                        } else if (typeNode.type === 'type_identifier') {
+                            compositeType = typeNode.text;
+                        }
+                    }
+                }
+
                 if (valueNode.type === 'identifier') {
                     const name = valueNode.text;
                     if (!GO_SKIP_IDENTS.has(name) && !GO_BUILTINS.has(name) && !importAliases.has(name) && /^[a-zA-Z]/.test(name)) {
@@ -965,7 +990,9 @@ function findCallsInCode(code, parser, options = {}) {
                             isFunctionReference: true,
                             isPotentialCallback: true,
                             enclosingFunction,
-                            uncertain: false
+                            uncertain: false,
+                            ...(compositeType && { compositeType }),
+                            ...(fieldName && { fieldName }),
                         });
                     }
                 }
@@ -984,7 +1011,9 @@ function findCallsInCode(code, parser, options = {}) {
                             ...(receiverType && { receiverType }),
                             enclosingFunction,
                             isPotentialCallback: true,
-                            uncertain: false
+                            uncertain: false,
+                            ...(compositeType && { compositeType }),
+                            ...(fieldName && { fieldName }),
                         });
                     }
                 }

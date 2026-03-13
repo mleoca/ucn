@@ -3290,3 +3290,115 @@ func Process() {}
     });
 });
 
+// ============================================================================
+// Composite literal entrypoint detection (cobra.Command{RunE: handler})
+// ============================================================================
+
+describe('Composite literal entrypoint detection', () => {
+
+    it('Go parser emits compositeType and fieldName for keyed_element calls', () => {
+        const { getParser } = require('../languages');
+        const goParser = getParser('go');
+        const goModule = require('../languages/go');
+        const code = `package main
+
+import "github.com/spf13/cobra"
+
+func handler(cmd *cobra.Command, args []string) error { return nil }
+
+func init() {
+    _ = &cobra.Command{RunE: handler}
+}
+`;
+        const calls = goModule.findCallsInCode(code, goParser);
+        const handlerCall = calls.find(c => c.name === 'handler' && c.compositeType);
+        assert.ok(handlerCall, 'should have call with compositeType');
+        assert.strictEqual(handlerCall.compositeType, 'cobra.Command');
+        assert.strictEqual(handlerCall.fieldName, 'RunE');
+        assert.strictEqual(handlerCall.isFunctionReference, true);
+        assert.strictEqual(handlerCall.isPotentialCallback, true);
+    });
+
+    it('detects cobra.Command RunE/PreRunE function references as entry points', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cmd.go': `package main
+
+import "github.com/spf13/cobra"
+
+func runHandler(cmd *cobra.Command, args []string) error { return nil }
+func validateConfig(cmd *cobra.Command, args []string) error { return nil }
+
+func NewCmd() *cobra.Command {
+    return &cobra.Command{
+        Use:     "serve",
+        RunE:    runHandler,
+        PreRunE: validateConfig,
+    }
+}
+
+func main() { NewCmd().Execute() }
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const names = eps.map(e => e.name);
+            assert.ok(names.includes('runHandler'), 'should detect runHandler as cobra handler');
+            assert.ok(names.includes('validateConfig'), 'should detect validateConfig as cobra handler');
+            const ep = eps.find(e => e.name === 'runHandler');
+            assert.strictEqual(ep.framework, 'cobra');
+            assert.strictEqual(ep.type, 'cli');
+            assert.strictEqual(ep.patternId, 'cobra-command');
+        } finally { rm(dir); }
+    });
+
+    it('cobra handler functions are NOT flagged as dead code', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'cmd.go': `package main
+
+import "github.com/spf13/cobra"
+
+func runServer(cmd *cobra.Command, args []string) error { return nil }
+func unusedFunc() {}
+
+func main() {
+    cmd := &cobra.Command{RunE: runServer}
+    cmd.Execute()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            const deadNames = dead.map(d => d.name);
+            assert.ok(!deadNames.includes('runServer'), 'runServer should NOT be dead (cobra entry point)');
+            assert.ok(deadNames.includes('unusedFunc'), 'unusedFunc SHOULD be dead');
+        } finally { rm(dir); }
+    });
+
+    it('non-framework composite literal fields are NOT entrypoints', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'types.go': `package main
+
+type Config struct { OnStart func() }
+
+func startUp() {}
+
+func main() {
+    c := Config{OnStart: startUp}
+    c.OnStart()
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const eps = detectEntrypoints(index);
+            const cobraEps = eps.filter(e => e.framework === 'cobra');
+            assert.strictEqual(cobraEps.length, 0, 'non-framework struct fields should NOT be cobra entrypoints');
+        } finally { rm(dir); }
+    });
+});
+
