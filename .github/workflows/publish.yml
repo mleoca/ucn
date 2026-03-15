@@ -15,6 +15,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Configure git identity for tests
+        run: |
+          git config --global user.email "ci@github.com"
+          git config --global user.name "CI"
+
       - uses: actions/setup-node@v4
         with:
           node-version: 22
