@@ -30,4 +30,16 @@ jobs:
         run: npm ci
 
       - name: Run tests
-        run: npm test
+        run: npm test 2>&1 | tee test-output.txt
+
+      - name: Update test count badge
+        if: matrix.node-version == 22 && github.ref == 'refs/heads/main' && github.event_name == 'push'
+        run: |
+          PASS=$(grep '# pass ' test-output.txt | tail -1 | awk '{print $3}')
+          TOTAL=$(grep '# tests ' test-output.txt | tail -1 | awk '{print $3}')
+          echo "{\"schemaVersion\":1,\"label\":\"tests\",\"message\":\"${PASS}/${TOTAL} passing\",\"color\":\"brightgreen\"}" > badge.json
+          curl -s -X PATCH \
+            -H "Authorization: token ${{ secrets.GIST_TOKEN }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/gists/0e10a790e16ab61ddd233e05645e203e \
+            -d "{\"files\":{\"ucn-tests.json\":{\"content\":$(cat badge.json | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read()))')}}}"

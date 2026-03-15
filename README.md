@@ -5,6 +5,9 @@ See what code does before you touch it.
 Find symbols, trace callers, check impact, pick the right tests, extract code and spot what's dead - from the terminal.
 
 [![npm](https://img.shields.io/npm/v/ucn)](https://www.npmjs.com/package/ucn)
+[![CI](https://github.com/mleoca/ucn/actions/workflows/ci.yml/badge.svg)](https://github.com/mleoca/ucn/actions/workflows/ci.yml)
+[![tests](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/mleoca/0e10a790e16ab61ddd233e05645e203e/raw/ucn-tests.json)](https://github.com/mleoca/ucn/actions/workflows/ci.yml)
+[![MCP Registry](https://img.shields.io/badge/MCP-io.github.mleoca%2Fucn-blue)](https://github.com/modelcontextprotocol/servers)
 [![license](https://img.shields.io/npm/l/ucn)](LICENSE)
 
 All commands, one engine, three surfaces:
