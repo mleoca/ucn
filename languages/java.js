@@ -7,6 +7,7 @@
 
 const {
     traverseTree,
+    traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
     extractJavaDocstring
@@ -124,10 +125,11 @@ function extractGenerics(node) {
  */
 function findFunctions(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         // Method declarations
@@ -145,12 +147,12 @@ function findFunctions(code, parser) {
             const paramsNode = node.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
                 const returnType = extractReturnType(node);
                 const generics = extractGenerics(node);
-                const docstring = extractJavaDocstring(code, startLine);
+                const docstring = extractJavaDocstring(lines, startLine);
                 // nameLine: where the name identifier lives (differs from startLine when annotations are present)
                 const nameLine = nameNode.startPosition.row + 1;
 
@@ -187,10 +189,10 @@ function findFunctions(code, parser) {
             const paramsNode = node.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(code, startLine);
+                const docstring = extractJavaDocstring(lines, startLine);
                 const nameLine = nameNode.startPosition.row + 1;
 
                 functions.push({
@@ -222,10 +224,11 @@ function findFunctions(code, parser) {
  */
 function findClasses(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const classes = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         // Class declarations
@@ -235,11 +238,11 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const members = extractClassMembers(node, code);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const members = extractClassMembers(node, lines);
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(code, startLine);
+                const docstring = extractJavaDocstring(lines, startLine);
                 const generics = extractGenerics(node);
                 const extendsInfo = extractExtends(node);
                 const implementsInfo = extractImplements(node);
@@ -274,10 +277,10 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
+                const { startLine, endLine } = nodeToLocation(node, lines);
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(code, startLine);
+                const docstring = extractJavaDocstring(lines, startLine);
                 const generics = extractGenerics(node);
                 const extendsInfo = extractInterfaceExtends(node);
 
@@ -286,7 +289,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'interface',
-                    members: extractClassMembers(node, code),
+                    members: extractClassMembers(node, lines),
                     modifiers,
                     ...(docstring && { docstring }),
                     ...(generics && { generics }),
@@ -304,17 +307,17 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
+                const { startLine, endLine } = nodeToLocation(node, lines);
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(code, startLine);
+                const docstring = extractJavaDocstring(lines, startLine);
 
                 classes.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     type: 'enum',
-                    members: extractEnumConstants(node, code),
+                    members: extractEnumConstants(node, lines),
                     modifiers,
                     ...(docstring && { docstring }),
                     ...(annotations.length > 0 && { annotations })
@@ -330,15 +333,15 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
+                const { startLine, endLine } = nodeToLocation(node, lines);
                 const modifiers = extractModifiers(node);
                 const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(code, startLine);
+                const docstring = extractJavaDocstring(lines, startLine);
                 const generics = extractGenerics(node);
                 const implementsInfo = extractImplements(node);
 
                 // Extract record components as members
-                const members = extractClassMembers(node, code);
+                const members = extractClassMembers(node, lines);
                 // Also extract record components from formal_parameters
                 const paramsNode = node.childForFieldName('parameters');
                 if (paramsNode) {
@@ -348,7 +351,7 @@ function findClasses(code, parser) {
                             const pName = param.childForFieldName('name');
                             const pType = param.childForFieldName('type');
                             if (pName) {
-                                const { startLine: pLine, endLine: pEnd } = nodeToLocation(param, code);
+                                const { startLine: pLine, endLine: pEnd } = nodeToLocation(param, lines);
                                 members.push({
                                     name: pName.text,
                                     startLine: pLine,
@@ -449,7 +452,8 @@ function extractInterfaceExtends(interfaceNode) {
 /**
  * Extract enum constants from enum body
  */
-function extractEnumConstants(enumNode, code) {
+function extractEnumConstants(enumNode, codeOrLines) {
+    const code = codeOrLines;
     const constants = [];
     const bodyNode = enumNode.childForFieldName('body');
     if (!bodyNode) return constants;
@@ -525,7 +529,8 @@ function extractEnumConstants(enumNode, code) {
 /**
  * Extract class members (methods, constructors)
  */
-function extractClassMembers(classNode, code) {
+function extractClassMembers(classNode, codeOrLines) {
+    const code = codeOrLines;
     const members = [];
     const bodyNode = classNode.childForFieldName('body');
     if (!bodyNode) return members;
@@ -611,11 +616,12 @@ function extractClassMembers(classNode, code) {
  */
 function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const objects = [];
 
     const statePattern = /^([A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:CONFIG|SETTINGS|OPTIONS))$/;
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type === 'field_declaration') {
             const modifiers = extractModifiers(node);
             if (modifiers.includes('static') && modifiers.includes('final')) {
@@ -628,7 +634,7 @@ function findStateObjects(code, parser) {
                         if (nameNode && valueNode) {
                             const name = nameNode.text;
                             if (statePattern.test(name)) {
-                                const { startLine, endLine } = nodeToLocation(node, code);
+                                const { startLine, endLine } = nodeToLocation(node, lines);
                                 objects.push({ name, startLine, endLine, modifiers });
                             }
                         }
@@ -649,9 +655,10 @@ function findStateObjects(code, parser) {
  * Parse a Java file completely
  */
 function parse(code, parser) {
+    const totalLines = code.split('\n').length;
     return {
         language: 'java',
-        totalLines: code.split('\n').length,
+        totalLines,
         functions: findFunctions(code, parser),
         classes: findClasses(code, parser),
         stateObjects: findStateObjects(code, parser),
@@ -882,7 +889,7 @@ function findImportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const imports = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type === 'import_declaration') {
             const line = node.startPosition.row + 1;
             let modulePath = null;
@@ -938,7 +945,7 @@ function findExportsInCode(code, parser) {
         return false;
     }
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Public classes
         if (node.type === 'class_declaration' && isPublic(node)) {
             const nameNode = node.childForFieldName('name');
@@ -1008,7 +1015,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Look for identifiers and type_identifiers with the matching name
         // type_identifier is used in Java for type references: new ClassName(), extends ClassName, field types
         if ((node.type !== 'identifier' && node.type !== 'type_identifier') || node.text !== name) {

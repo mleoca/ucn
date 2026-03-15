@@ -7,6 +7,7 @@
 
 const {
     traverseTree,
+    traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
     extractPythonDocstring
@@ -67,10 +68,11 @@ function extractPythonParams(paramsNode) {
  */
 function findFunctions(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         if (node.type === 'function_definition') {
@@ -107,7 +109,7 @@ function findFunctions(code, parser) {
                 const indent = getIndent(node, code);
                 const returnType = extractReturnType(node);
                 const defLine = getDefLine(node);
-                const docstring = extractPythonDocstring(code, defLine);
+                const docstring = extractPythonDocstring(lines, defLine);
 
                 // Check for async
                 const isAsync = node.text.trimStart().startsWith('async ');
@@ -169,10 +171,11 @@ function extractDecorators(node) {
  */
 function findClasses(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const classes = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         if (node.type === 'class_definition') {
@@ -189,9 +192,9 @@ function findClasses(code, parser) {
                 }
 
                 const endLine = node.endPosition.row + 1;
-                const members = extractClassMembers(node, code);
+                const members = extractClassMembers(node, lines);
                 const defLine = getDefLine(node);
-                const docstring = extractPythonDocstring(code, defLine);
+                const docstring = extractPythonDocstring(lines, defLine);
                 const decorators = extractDecorators(node);
                 const bases = extractBases(node);
                 const nameLine = nameNode.startPosition.row + 1;
@@ -337,6 +340,7 @@ function extractClassMembers(classNode, code) {
  */
 function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const objects = [];
 
     const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
@@ -349,7 +353,7 @@ function findStateObjects(code, parser) {
         'call', 'attribute', 'identifier', 'subscript',
     ]);
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type === 'expression_statement' && node.parent === tree.rootNode) {
             const child = node.namedChild(0);
             if (child && child.type === 'assignment') {
@@ -362,11 +366,11 @@ function findStateObjects(code, parser) {
                     const isArray = rightNode.type === 'list';
 
                     if ((isObject || isArray) && statePattern.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(node, code);
+                        const { startLine, endLine } = nodeToLocation(node, lines);
                         objects.push({ name, startLine, endLine });
                     } else if (constantPattern.test(name) && scalarTypes.has(rightNode.type)) {
                         // Module-level UPPER_CASE constants with scalar values
-                        const { startLine, endLine } = nodeToLocation(node, code);
+                        const { startLine, endLine } = nodeToLocation(node, lines);
                         objects.push({ name, startLine, endLine, isConstant: true });
                     }
                 }
@@ -383,9 +387,10 @@ function findStateObjects(code, parser) {
  * Parse a Python file completely
  */
 function parse(code, parser) {
+    const totalLines = code.split('\n').length;
     return {
         language: 'python',
-        totalLines: code.split('\n').length,
+        totalLines,
         functions: findFunctions(code, parser),
         classes: findClasses(code, parser),
         stateObjects: findStateObjects(code, parser),
@@ -703,7 +708,7 @@ function findImportsInCode(code, parser) {
     const imports = [];
     let importAliases = null;  // {original, local}[] — tracks renamed imports
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // import statement: import os, import sys as system
         if (node.type === 'import_statement') {
             const line = node.startPosition.row + 1;
@@ -820,7 +825,7 @@ function findExportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const exports = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Look for __all__ = [...]
         if (node.type === 'expression_statement') {
             const child = node.namedChild(0);
@@ -870,7 +875,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Only look for identifiers with the matching name
         if (node.type !== 'identifier' || node.text !== name) {
             return true;
@@ -966,7 +971,7 @@ function findInstanceAttributeTypes(code, parser) {
 
     const PRIMITIVE_TYPES = new Set(['int', 'float', 'str', 'bool', 'bytes', 'list', 'dict', 'set', 'tuple', 'None', 'Any', 'object']);
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type !== 'class_definition') return true;
 
         const classNameNode = node.childForFieldName('name');

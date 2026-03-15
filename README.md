@@ -188,7 +188,7 @@ function compareNames(a, b) {
 
 ## Testing and reliability
 
-- **Fast** - indexes its own ~25K-line codebase in under 100ms, cached after first run
+- **Fast** - uses incremental cache for optimal performance
 - **Discipline** - every bug fix gets a regression test, test code is ~3x the source
 - **Coverage** - every command, every supported language, every surface (CLI, MCP, interactive)
 - **Systematic** - a harness exercises all command and flag combinations against real multi-language fixtures

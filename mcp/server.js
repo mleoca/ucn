@@ -317,6 +317,7 @@ server.registerTool(
         // Wrap toolResult to auto-inject command + maxChars from this request
         const tr = (text) => toolResult(text, command, maxChars);
 
+        let index = null; // Track for post-command cache save
         try {
             switch (command) {
 
@@ -327,7 +328,7 @@ server.registerTool(
             // ── Commands using shared executor ─────────────────────────
 
             case 'about': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'about', ep);
                 if (!ok) return tr(error); // soft error — won't kill sibling calls
                 return tr(output.formatAbout(result, {
@@ -338,7 +339,7 @@ server.registerTool(
             }
 
             case 'context': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result: ctx, error } = execute(index, 'context', ep);
                 if (!ok) return tr(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
@@ -350,14 +351,14 @@ server.registerTool(
             }
 
             case 'impact': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'impact', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatImpact(result));
             }
 
             case 'blast': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'blast', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatBlast(result, {
@@ -366,14 +367,14 @@ server.registerTool(
             }
 
             case 'smart': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'smart', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatSmart(result));
             }
 
             case 'trace': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'trace', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatTrace(result, {
@@ -383,7 +384,7 @@ server.registerTool(
             }
 
             case 'reverse_trace': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'reverseTrace', ep);
                 if (!ok) return tr(error);
                 return tr(output.formatReverseTrace(result, {
@@ -392,7 +393,7 @@ server.registerTool(
             }
 
             case 'example': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'example', ep);
                 if (!ok) return tr(error);
                 if (!result) return tr(`No usage examples found for "${ep.name}".`);
@@ -400,7 +401,7 @@ server.registerTool(
             }
 
             case 'related': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'related', ep);
                 if (!ok) return tr(error);
                 if (!result) return tr(`Symbol "${ep.name}" not found.`);
@@ -413,7 +414,7 @@ server.registerTool(
             // ── Finding Code ────────────────────────────────────────────
 
             case 'find': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'find', ep);
                 if (!ok) return tr(error); // soft error
                 let text = output.formatFind(result, ep.name, ep.top);
@@ -422,7 +423,7 @@ server.registerTool(
             }
 
             case 'usages': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'usages', ep);
                 if (!ok) return tr(error); // soft error
                 let text = output.formatUsages(result, ep.name);
@@ -431,7 +432,7 @@ server.registerTool(
             }
 
             case 'toc': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'toc', ep);
                 if (!ok) return tr(error); // soft error
                 let text = output.formatToc(result, {
@@ -442,7 +443,7 @@ server.registerTool(
             }
 
             case 'search': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error, structural } = execute(index, 'search', ep);
                 if (!ok) return tr(error); // soft error
                 if (structural) {
@@ -452,21 +453,21 @@ server.registerTool(
             }
 
             case 'tests': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'tests', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatTests(result, ep.name));
             }
 
             case 'affected_tests': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'affectedTests', ep);
                 if (!ok) return tr(error);
                 return tr(output.formatAffectedTests(result, { all: ep.all }));
             }
 
             case 'deadcode': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'deadcode', ep);
                 if (!ok) return tr(error); // soft error
                 const dcNote = note;
@@ -480,7 +481,7 @@ server.registerTool(
             }
 
             case 'entrypoints': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'entrypoints', ep);
                 if (!ok) return tr(error);
                 return tr(output.formatEntrypoints(result));
@@ -489,28 +490,28 @@ server.registerTool(
             // ── File Dependencies ───────────────────────────────────────
 
             case 'imports': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'imports', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatImports(result, ep.file));
             }
 
             case 'exporters': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'exporters', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatExporters(result, ep.file));
             }
 
             case 'file_exports': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fileExports', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatFileExports(result, ep.file));
             }
 
             case 'graph': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'graph', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatGraph(result, {
@@ -522,7 +523,7 @@ server.registerTool(
             }
 
             case 'circular_deps': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'circularDeps', ep);
                 if (!ok) return tr(error);
                 return tr(output.formatCircularDeps(result));
@@ -531,21 +532,21 @@ server.registerTool(
             // ── Refactoring ─────────────────────────────────────────────
 
             case 'verify': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'verify', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatVerify(result));
             }
 
             case 'plan': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'plan', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatPlan(result));
             }
 
             case 'diff_impact': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'diffImpact', ep);
                 if (!ok) return tr(error); // soft error — e.g. "not a git repo"
                 return tr(output.formatDiffImpact(result, { all: ep.all }));
@@ -554,21 +555,21 @@ server.registerTool(
             // ── Other ───────────────────────────────────────────────────
 
             case 'typedef': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'typedef', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatTypedef(result, ep.name));
             }
 
             case 'stacktrace': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stacktrace', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatStackTrace(result));
             }
 
             case 'api': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'api', ep);
                 if (!ok) return tr(error); // soft error
                 let apiText = output.formatApi(result, ep.file || '.');
@@ -577,7 +578,7 @@ server.registerTool(
             }
 
             case 'stats': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stats', ep);
                 if (!ok) return tr(error); // soft error
                 return tr(output.formatStats(result, { top: ep.top || 0 }));
@@ -588,7 +589,7 @@ server.registerTool(
             case 'fn': {
                 const err = requireName(ep.name);
                 if (err) return err;
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fn', ep);
                 if (!ok) return tr(error); // soft error
                 // MCP path security: validate all result files are within project root
@@ -606,7 +607,7 @@ server.registerTool(
                 if (ep.maxLines !== undefined && (!Number.isInteger(ep.maxLines) || ep.maxLines < 1)) {
                     return toolError(`Invalid max_lines: ${ep.maxLines}. Must be a positive integer.`);
                 }
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'class', ep);
                 if (!ok) return tr(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
@@ -619,7 +620,7 @@ server.registerTool(
             }
 
             case 'lines': {
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'lines', ep);
                 if (!ok) return tr(error); // soft error
                 // MCP path security: validate file is within project root
@@ -632,7 +633,7 @@ server.registerTool(
                 if (ep.item === undefined || ep.item === null) {
                     return toolError('Item number is required (e.g. item=1).');
                 }
-                const index = getIndex(project_dir, ep);
+                index = getIndex(project_dir, ep);
                 const lookup = expandCacheInstance.lookup(index.root, ep.item);
                 const { ok, result, error } = execute(index, 'expand', {
                     match: lookup.match, itemNum: ep.item,
@@ -648,6 +649,15 @@ server.registerTool(
             }
         } catch (e) {
             return toolError(e.message);
+        } finally {
+            // Persist calls cache after command execution.
+            // getIndex() only saves after build (when callsCache is empty).
+            // Commands like context/about/impact populate callsCache lazily,
+            // so we save here to avoid re-parsing all files on every MCP session.
+            if (index && index.callsCacheDirty) {
+                try { index.saveCache(); } catch (_) { /* best-effort */ }
+                index.callsCacheDirty = false;
+            }
         }
     }
 );

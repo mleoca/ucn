@@ -7,6 +7,7 @@
 
 const {
     traverseTree,
+    traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
     extractRustDocstring
@@ -61,9 +62,9 @@ function extractVisibility(text) {
  * @param {string} code - Source code
  * @returns {string[]} Array of attribute names
  */
-function extractAttributes(node, code) {
+function extractAttributes(node, codeOrLines) {
     const attributes = [];
-    const lines = code.split('\n');
+    const lines = Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n');
 
     // Look at lines before the function for attributes
     const startLine = node.startPosition.row;
@@ -97,10 +98,11 @@ function extractAttributes(node, code) {
  */
 function findFunctions(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         if (node.type === 'function_item') {
@@ -124,7 +126,7 @@ function findFunctions(code, parser) {
             const paramsNode = node.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const text = node.text;
                 const firstLine = text.split('\n')[0];
 
@@ -134,9 +136,9 @@ function findFunctions(code, parser) {
                 const isExtern = firstLine.includes('extern ');
                 const visibility = extractVisibility(text);
                 const returnType = extractReturnType(node);
-                const docstring = extractRustDocstring(code, startLine);
+                const docstring = extractRustDocstring(lines, startLine);
                 const generics = extractGenerics(node);
-                const attributes = extractAttributes(node, code);
+                const attributes = extractAttributes(node, lines);
 
                 const modifiers = [];
                 if (visibility) modifiers.push(visibility);
@@ -178,10 +180,10 @@ function findFunctions(code, parser) {
                         const fName = child.childForFieldName('name');
                         const fParams = child.childForFieldName('parameters');
                         if (fName) {
-                            const { startLine, endLine, indent } = nodeToLocation(child, code);
+                            const { startLine, endLine, indent } = nodeToLocation(child, lines);
                             const visibility = extractVisibility(child.text);
                             const returnType = extractReturnType(child);
-                            const docstring = extractRustDocstring(code, startLine);
+                            const docstring = extractRustDocstring(lines, startLine);
                             const modifiers = ['extern'];
                             if (visibility) modifiers.push(visibility);
 
@@ -226,10 +228,11 @@ function extractGenerics(node) {
  */
 function findClasses(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const types = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         // Struct items
@@ -239,12 +242,12 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractRustDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractRustDocstring(lines, startLine);
                 const visibility = extractVisibility(node.text);
                 const generics = extractGenerics(node);
-                const members = extractStructFields(node, code);
-                const attributes = extractAttributes(node, code);
+                const members = extractStructFields(node, lines);
+                const attributes = extractAttributes(node, lines);
                 const modifiers = visibility ? [visibility] : [];
                 for (const attr of attributes) modifiers.push(attr);
 
@@ -269,11 +272,11 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractRustDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractRustDocstring(lines, startLine);
                 const visibility = extractVisibility(node.text);
                 const generics = extractGenerics(node);
-                const attributes = extractAttributes(node, code);
+                const attributes = extractAttributes(node, lines);
                 const modifiers = visibility ? [visibility] : [];
                 for (const attr of attributes) modifiers.push(attr);
 
@@ -282,7 +285,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'enum',
-                    members: extractEnumVariants(node, code),
+                    members: extractEnumVariants(node, lines),
                     modifiers,
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
@@ -298,8 +301,8 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractRustDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractRustDocstring(lines, startLine);
                 const visibility = extractVisibility(node.text);
                 const generics = extractGenerics(node);
 
@@ -308,7 +311,7 @@ function findClasses(code, parser) {
                     startLine,
                     endLine,
                     type: 'trait',
-                    members: extractTraitMembers(node, code),
+                    members: extractTraitMembers(node, lines),
                     modifiers: visibility ? [visibility] : [],
                     ...(docstring && { docstring }),
                     ...(generics && { generics })
@@ -322,9 +325,9 @@ function findClasses(code, parser) {
             if (processedRanges.has(rangeKey)) return true;
             processedRanges.add(rangeKey);
 
-            const { startLine, endLine } = nodeToLocation(node, code);
+            const { startLine, endLine } = nodeToLocation(node, lines);
             const implInfo = extractImplInfo(node);
-            const docstring = extractRustDocstring(code, startLine);
+            const docstring = extractRustDocstring(lines, startLine);
 
             types.push({
                 name: implInfo.name,
@@ -333,7 +336,7 @@ function findClasses(code, parser) {
                 type: 'impl',
                 traitName: implInfo.traitName,
                 typeName: implInfo.typeName,
-                members: extractImplMembers(node, code, implInfo.typeName),
+                members: extractImplMembers(node, lines, implInfo.typeName),
                 modifiers: [],
                 ...(docstring && { docstring })
             });
@@ -347,10 +350,10 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractRustDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractRustDocstring(lines, startLine);
                 const visibility = extractVisibility(node.text);
-                const attributes = extractAttributes(node, code);
+                const attributes = extractAttributes(node, lines);
                 const modifiers = visibility ? [visibility] : [];
                 for (const attr of attributes) modifiers.push(attr);
 
@@ -374,8 +377,8 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractRustDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractRustDocstring(lines, startLine);
 
                 types.push({
                     name: nameNode.text,
@@ -407,8 +410,8 @@ function findClasses(code, parser) {
 
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractRustDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractRustDocstring(lines, startLine);
                 const visibility = extractVisibility(node.text);
 
                 types.push({
@@ -448,7 +451,8 @@ function findClasses(code, parser) {
 /**
  * Extract struct fields
  */
-function extractStructFields(structNode, code) {
+function extractStructFields(structNode, codeOrLines) {
+    const code = codeOrLines;
     const fields = [];
     const bodyNode = structNode.childForFieldName('body');
     if (!bodyNode) return fields;
@@ -519,7 +523,8 @@ function extractImplInfo(implNode) {
 /**
  * Extract enum variants
  */
-function extractEnumVariants(enumNode, code) {
+function extractEnumVariants(enumNode, codeOrLines) {
+    const code = codeOrLines;
     const variants = [];
     const bodyNode = enumNode.childForFieldName('body');
     if (!bodyNode) return variants;
@@ -554,7 +559,8 @@ function extractEnumVariants(enumNode, code) {
 /**
  * Extract trait method signatures
  */
-function extractTraitMembers(traitNode, code) {
+function extractTraitMembers(traitNode, codeOrLines) {
+    const code = codeOrLines;
     const members = [];
     const bodyNode = traitNode.childForFieldName('body');
     if (!bodyNode) return members;
@@ -593,7 +599,8 @@ function extractTraitMembers(traitNode, code) {
  * @param {string} code - Source code
  * @param {string} [typeName] - The type this impl is for (e.g., "MyStruct")
  */
-function extractImplMembers(implNode, code, typeName) {
+function extractImplMembers(implNode, codeOrLines, typeName) {
+    const code = codeOrLines;
     const members = [];
     const bodyNode = implNode.childForFieldName('body');
     if (!bodyNode) return members;
@@ -617,7 +624,7 @@ function extractImplMembers(implNode, code, typeName) {
                 const hasSelf = paramsNode && paramsNode.text.includes('self');
 
                 // Extract attributes (#[test], #[inline], etc.) for impl members
-                const attributes = extractAttributes(child, code);
+                const attributes = extractAttributes(child, codeOrLines);
                 const modifiers = [];
                 if (visibility) modifiers.push(visibility);
                 for (const attr of attributes) modifiers.push(attr);
@@ -648,11 +655,12 @@ function extractImplMembers(implNode, code, typeName) {
  */
 function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const objects = [];
 
     const statePattern = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Handle const items (only top-level)
         if (node.type === 'const_item') {
             if (!node.parent || node.parent.type !== 'source_file') return true;
@@ -660,7 +668,7 @@ function findStateObjects(code, parser) {
             if (nameNode) {
                 const name = nameNode.text;
                 if (statePattern.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(node, code);
+                    const { startLine, endLine } = nodeToLocation(node, lines);
                     objects.push({ name, startLine, endLine });
                 }
             }
@@ -674,7 +682,7 @@ function findStateObjects(code, parser) {
             if (nameNode) {
                 const name = nameNode.text;
                 if (statePattern.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(node, code);
+                    const { startLine, endLine } = nodeToLocation(node, lines);
                     objects.push({ name, startLine, endLine });
                 }
             }
@@ -692,9 +700,10 @@ function findStateObjects(code, parser) {
  * Parse a Rust file completely
  */
 function parse(code, parser) {
+    const totalLines = code.split('\n').length;
     return {
         language: 'rust',
-        totalLines: code.split('\n').length,
+        totalLines,
         functions: findFunctions(code, parser),
         classes: findClasses(code, parser),
         stateObjects: findStateObjects(code, parser),
@@ -994,7 +1003,7 @@ function findImportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const imports = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // use declarations
         if (node.type === 'use_declaration') {
             const line = node.startPosition.row + 1;
@@ -1098,7 +1107,7 @@ function findImportsInCode(code, parser) {
     });
 
     // include! macros with non-literal paths
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type === 'macro_invocation') {
             const nameNode = node.childForFieldName('macro');
             if (nameNode && /^include(_str|_bytes)?$/.test(nameNode.text)) {
@@ -1144,7 +1153,7 @@ function findExportsInCode(code, parser) {
         return false;
     }
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Public functions
         if (node.type === 'function_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');
@@ -1266,7 +1275,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Look for identifier, field_identifier (method names in obj.method() calls),
         // and type_identifier (type references in params, return types, struct expressions, etc.)
         const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier';

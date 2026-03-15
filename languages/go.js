@@ -7,6 +7,7 @@
 
 const {
     traverseTree,
+    traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
     extractGoDocstring
@@ -59,10 +60,11 @@ function extractReceiver(receiverNode) {
  */
 function findFunctions(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         // Function declarations
@@ -74,9 +76,9 @@ function findFunctions(code, parser) {
             const paramsNode = node.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const returnType = extractReturnType(node);
-                const docstring = extractGoDocstring(code, startLine);
+                const docstring = extractGoDocstring(lines, startLine);
                 const typeParams = extractTypeParams(node);
 
                 // Check if exported (capitalized)
@@ -108,10 +110,10 @@ function findFunctions(code, parser) {
             const receiverNode = node.childForFieldName('receiver');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const receiver = extractReceiver(receiverNode);
                 const returnType = extractReturnType(node);
-                const docstring = extractGoDocstring(code, startLine);
+                const docstring = extractGoDocstring(lines, startLine);
 
                 // Check if exported
                 const isExported = /^[A-Z]/.test(nameNode.text);
@@ -156,10 +158,11 @@ function extractTypeParams(node) {
  */
 function findClasses(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const types = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         if (node.type === 'type_declaration') {
@@ -173,9 +176,9 @@ function findClasses(code, parser) {
                     const typeNode = spec.childForFieldName('type');
 
                     if (nameNode && typeNode) {
-                        const { startLine, endLine } = nodeToLocation(node, code);
+                        const { startLine, endLine } = nodeToLocation(node, lines);
                         const name = nameNode.text;
-                        const docstring = extractGoDocstring(code, startLine);
+                        const docstring = extractGoDocstring(lines, startLine);
                         const typeParams = extractTypeParams(spec);
 
                         let typeKind = 'type';
@@ -188,8 +191,8 @@ function findClasses(code, parser) {
                         // Check if exported
                         const isExported = /^[A-Z]/.test(name);
 
-                        const members = typeKind === 'struct' ? extractStructFields(typeNode, code)
-                            : typeKind === 'interface' ? extractInterfaceMembers(typeNode, code)
+                        const members = typeKind === 'struct' ? extractStructFields(typeNode, lines)
+                            : typeKind === 'interface' ? extractInterfaceMembers(typeNode, lines)
                             : [];
 
                         // Extract embedded field names as extends (Go composition)
@@ -224,7 +227,7 @@ function findClasses(code, parser) {
 /**
  * Extract struct fields
  */
-function extractStructFields(structNode, code) {
+function extractStructFields(structNode, codeOrLines) {
     const fields = [];
     // struct_type contains a field_declaration_list child (not a 'body' field)
     let fieldListNode = structNode.childForFieldName('body');
@@ -241,7 +244,7 @@ function extractStructFields(structNode, code) {
     for (let i = 0; i < fieldListNode.namedChildCount; i++) {
         const field = fieldListNode.namedChild(i);
         if (field.type === 'field_declaration') {
-            const { startLine, endLine } = nodeToLocation(field, code);
+            const { startLine, endLine } = nodeToLocation(field, codeOrLines);
             const nameNode = field.childForFieldName('name');
             const typeNode = field.childForFieldName('type');
 
@@ -280,13 +283,13 @@ function extractStructFields(structNode, code) {
 /**
  * Extract interface method signatures
  */
-function extractInterfaceMembers(interfaceNode, code) {
+function extractInterfaceMembers(interfaceNode, codeOrLines) {
     const members = [];
     for (let i = 0; i < interfaceNode.namedChildCount; i++) {
         const child = interfaceNode.namedChild(i);
         // tree-sitter Go uses method_elem (or method_spec in older versions)
         if (child.type === 'method_elem' || child.type === 'method_spec') {
-            const { startLine, endLine } = nodeToLocation(child, code);
+            const { startLine, endLine } = nodeToLocation(child, codeOrLines);
             // Name is in a field_identifier child
             let nameText = null;
             let paramsText = null;
@@ -355,7 +358,7 @@ function extractInterfaceMembers(interfaceNode, code) {
             }
         } else if (child.type === 'type_identifier' || child.type === 'qualified_type') {
             // Standalone type identifier inside interface body — embedded interface
-            const { startLine, endLine } = nodeToLocation(child, code);
+            const { startLine, endLine } = nodeToLocation(child, codeOrLines);
             let embName = child.text;
             const dotIdx = embName.indexOf('.');
             if (dotIdx >= 0) embName = embName.slice(dotIdx + 1);
@@ -373,7 +376,7 @@ function extractInterfaceMembers(interfaceNode, code) {
             for (let j = 0; j < child.namedChildCount; j++) {
                 const sub = child.namedChild(j);
                 if (sub.type === 'type_identifier' || sub.type === 'qualified_type') {
-                    const { startLine, endLine } = nodeToLocation(sub, code);
+                    const { startLine, endLine } = nodeToLocation(sub, codeOrLines);
                     let embName = sub.text;
                     const dotIdx = embName.indexOf('.');
                     if (dotIdx >= 0) embName = embName.slice(dotIdx + 1);
@@ -397,6 +400,7 @@ function extractInterfaceMembers(interfaceNode, code) {
  */
 function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const objects = [];
 
     const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|Default[A-Z][a-zA-Z]*|[A-Z][a-zA-Z]*(?:Config|Settings|Options))$/;
@@ -435,7 +439,7 @@ function findStateObjects(code, parser) {
         return false;
     }
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Handle const declarations
         if (node.type === 'const_declaration') {
             const isIotaBlock = blockHasIota(node);
@@ -450,13 +454,13 @@ function findStateObjects(code, parser) {
                     // Include if: composite literal matching state pattern, OR exported const in iota block,
                     // OR any exported (^[A-Z]) package-level const
                     if (valueNode && isCompositeLiteral(valueNode) && statePattern.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, code);
+                        const { startLine, endLine } = nodeToLocation(spec, lines);
                         objects.push({ name, startLine, endLine });
                     } else if (isIotaBlock && /^[A-Z]/.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, code);
+                        const { startLine, endLine } = nodeToLocation(spec, lines);
                         objects.push({ name, startLine, endLine, isConst: true });
                     } else if (isExportedName(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, code);
+                        const { startLine, endLine } = nodeToLocation(spec, lines);
                         objects.push({ name, startLine, endLine, isConst: true });
                     }
                 }
@@ -475,10 +479,10 @@ function findStateObjects(code, parser) {
                     if (nameNode) {
                         const name = nameNode.text;
                         if (valueNode && isCompositeLiteral(valueNode) && statePattern.test(name)) {
-                            const { startLine, endLine } = nodeToLocation(spec, code);
+                            const { startLine, endLine } = nodeToLocation(spec, lines);
                             objects.push({ name, startLine, endLine });
                         } else if (isExportedName(name)) {
-                            const { startLine, endLine } = nodeToLocation(spec, code);
+                            const { startLine, endLine } = nodeToLocation(spec, lines);
                             objects.push({ name, startLine, endLine });
                         }
                     }
@@ -1103,7 +1107,7 @@ function findImportsInCode(code, parser) {
         }
     }
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type === 'import_declaration') {
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
@@ -1138,7 +1142,7 @@ function findExportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const exports = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Exported functions
         if (node.type === 'function_declaration') {
             const nameNode = node.childForFieldName('name');
@@ -1218,7 +1222,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Look for identifier, field_identifier (method names in selector expressions),
         // and type_identifier (type references in params, return types, composite literals, etc.)
         const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier';

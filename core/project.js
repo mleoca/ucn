@@ -306,17 +306,32 @@ class ProjectIndex {
 
         // Detect bundled/minified files (webpack bundles, minified code)
         // These are build artifacts, not user-written source code
-        const contentLines = content.split('\n');
+        // Count lines without splitting: count newlines + 1 (avoids allocating array)
+        let lineCount = 1;
+        let maxLineLen = 0;
+        let longLineCount = 0;
+        let lineStart = 0;
+        for (let ci = 0; ci < content.length; ci++) {
+            if (content.charCodeAt(ci) === 10) { // '\n'
+                const lineLen = ci - lineStart;
+                if (lineLen > maxLineLen) maxLineLen = lineLen;
+                if (lineLen > 1000) longLineCount++;
+                lineStart = ci + 1;
+                lineCount++;
+            }
+        }
+        // Handle last line (no trailing newline)
+        const lastLineLen = content.length - lineStart;
+        if (lastLineLen > maxLineLen) maxLineLen = lastLineLen;
+        if (lastLineLen > 1000) longLineCount++;
+
         const isBundled = (() => {
             // Webpack bundles contain __webpack_require__ or __webpack_modules__
             if (content.includes('__webpack_require__') || content.includes('__webpack_modules__')) return true;
             // Minified files: very few lines but large content (avg > 500 chars/line)
-            if (contentLines.length > 0 && contentLines.length < 50 && content.length / contentLines.length > 500) return true;
+            if (lineCount > 0 && lineCount < 50 && content.length / lineCount > 500) return true;
             // Very long single lines (> 1000 chars) in most of the file suggest minification
-            if (contentLines.length > 0) {
-                const longLines = contentLines.filter(l => l.length > 1000).length;
-                if (longLines > 0 && longLines / contentLines.length > 0.3) return true;
-            }
+            if (lineCount > 0 && longLineCount > 0 && longLineCount / lineCount > 0.3) return true;
             return false;
         })();
 
@@ -324,7 +339,7 @@ class ProjectIndex {
             path: filePath,
             relativePath: path.relative(this.root, filePath),
             language,
-            lines: contentLines.length,
+            lines: lineCount,
             hash,
             mtime: stat.mtimeMs,
             size: stat.size,
@@ -1778,8 +1793,14 @@ class ProjectIndex {
     getLineContent(filePath, lineNum) {
         try {
             const content = this._readFile(filePath);
-            const lines = content.split('\n');
-            return lines[lineNum - 1] || '';
+            // Find the Nth line without splitting the entire file
+            let start = 0;
+            for (let i = 1; i < lineNum; i++) {
+                start = content.indexOf('\n', start) + 1;
+                if (start === 0) return '';
+            }
+            const end = content.indexOf('\n', start);
+            return end === -1 ? content.slice(start) : content.slice(start, end);
         } catch (e) {
             return '';
         }

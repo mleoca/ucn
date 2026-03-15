@@ -7,6 +7,7 @@
 
 const {
     traverseTree,
+    traverseTreeCached,
     nodeToLocation,
     extractParams,
     parseStructuredParams,
@@ -115,10 +116,11 @@ function extractDecorators(node) {
  */
 function findFunctions(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
 
         // Function declarations
@@ -130,10 +132,10 @@ function findFunctions(code, parser) {
             const paramsNode = node.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const returnType = extractReturnType(node);
                 const generics = extractGenerics(node);
-                const docstring = extractJSDocstring(code, startLine);
+                const docstring = extractJSDocstring(lines, startLine);
                 const isGen = isGenerator(node);
                 // Check parent for export status (function_declaration inside export_statement)
                 const modifiers = node.parent && node.parent.type === 'export_statement'
@@ -167,10 +169,10 @@ function findFunctions(code, parser) {
             const paramsNode = node.childForFieldName('parameters');
 
             if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, code);
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
                 const returnType = extractReturnType(node);
                 const generics = extractGenerics(node);
-                const docstring = extractJSDocstring(code, startLine);
+                const docstring = extractJSDocstring(lines, startLine);
 
                 functions.push({
                     name: nameNode.text,
@@ -209,10 +211,10 @@ function findFunctions(code, parser) {
                         if (isArrow || isFnExpr) {
                             processedRanges.add(rangeKey);
                             const paramsNode = valueNode.childForFieldName('parameters');
-                            const { startLine, endLine, indent } = nodeToLocation(node, code);
+                            const { startLine, endLine, indent } = nodeToLocation(node, lines);
                             const returnType = extractReturnType(valueNode);
                             const generics = extractGenerics(valueNode);
-                            const docstring = extractJSDocstring(code, startLine);
+                            const docstring = extractJSDocstring(lines, startLine);
                             const isGen = isGenerator(valueNode);
                             // Check parent for export status (lexical_declaration inside export_statement)
                             const modifiers = node.parent && node.parent.type === 'export_statement'
@@ -255,10 +257,10 @@ function findFunctions(code, parser) {
                                         if (innerFn && (innerFn.type === 'arrow_function' || innerFn.type === 'function_expression')) {
                                             processedRanges.add(rangeKey);
                                             const paramsNode = innerFn.childForFieldName('parameters');
-                                            const { startLine, endLine, indent } = nodeToLocation(node, code);
+                                            const { startLine, endLine, indent } = nodeToLocation(node, lines);
                                             const returnType = extractReturnType(innerFn);
                                             const generics = extractGenerics(innerFn);
-                                            const docstring = extractJSDocstring(code, startLine);
+                                            const docstring = extractJSDocstring(lines, startLine);
                                             const modifiers = node.parent && node.parent.type === 'export_statement'
                                                 ? extractModifiers(node.parent.text)
                                                 : extractModifiers(node.text);
@@ -329,10 +331,10 @@ function findFunctions(code, parser) {
                     if (name) {
                         processedRanges.add(rangeKey);
                         const paramsNode = rightNode.childForFieldName('parameters');
-                        const { startLine, endLine, indent } = nodeToLocation(node, code);
+                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
                         const returnType = extractReturnType(rightNode);
                         const generics = extractGenerics(rightNode);
-                        const docstring = extractJSDocstring(code, startLine);
+                        const docstring = extractJSDocstring(lines, startLine);
                         const isGen = isGenerator(rightNode);
 
                         functions.push({
@@ -367,10 +369,10 @@ function findFunctions(code, parser) {
                         processedRanges.add(rangeKey);
 
                         const paramsNode = child.childForFieldName('parameters');
-                        const { startLine, endLine, indent } = nodeToLocation(node, code);
+                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
                         const returnType = extractReturnType(child);
                         const generics = extractGenerics(child);
-                        const docstring = extractJSDocstring(code, startLine);
+                        const docstring = extractJSDocstring(lines, startLine);
                         const isGen = isGenerator(child);
 
                         functions.push({
@@ -409,16 +411,17 @@ function findFunctions(code, parser) {
  */
 function findClasses(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const classes = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Class declarations (including abstract classes)
         if (node.type === 'class_declaration' || node.type === 'class' || node.type === 'abstract_class_declaration') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const members = extractClassMembers(node, code);
-                const docstring = extractJSDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const members = extractClassMembers(node, lines);
+                const docstring = extractJSDocstring(lines, startLine);
                 const generics = extractGenerics(node);
                 const extendsInfo = extractExtends(node);
                 const implementsInfo = extractImplements(node);
@@ -446,11 +449,11 @@ function findClasses(code, parser) {
         if (node.type === 'interface_declaration') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractJSDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractJSDocstring(lines, startLine);
                 const generics = extractGenerics(node);
                 const extendsInfo = extractInterfaceExtends(node);
-                const members = extractInterfaceMembers(node, code);
+                const members = extractInterfaceMembers(node, lines);
 
                 classes.push({
                     name: nameNode.text,
@@ -470,8 +473,8 @@ function findClasses(code, parser) {
         if (node.type === 'type_alias_declaration') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractJSDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractJSDocstring(lines, startLine);
 
                 classes.push({
                     name: nameNode.text,
@@ -489,9 +492,9 @@ function findClasses(code, parser) {
         if (node.type === 'enum_declaration') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractJSDocstring(code, startLine);
-                const members = extractEnumMembers(node, code);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractJSDocstring(lines, startLine);
+                const members = extractEnumMembers(node, lines);
 
                 classes.push({
                     name: nameNode.text,
@@ -509,8 +512,8 @@ function findClasses(code, parser) {
         if (node.type === 'internal_module' || node.type === 'module') {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, code);
-                const docstring = extractJSDocstring(code, startLine);
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const docstring = extractJSDocstring(lines, startLine);
 
                 classes.push({
                     name: nameNode.text,
@@ -686,7 +689,8 @@ function extractEnumMembers(enumNode, code) {
 /**
  * Extract class members
  */
-function extractClassMembers(classNode, code) {
+function extractClassMembers(classNode, codeOrLines) {
+    const code = codeOrLines; // Accept either string or lines array (nodeToLocation handles both)
     const members = [];
     const bodyNode = classNode.childForFieldName('body');
     if (!bodyNode) return members;
@@ -871,6 +875,7 @@ function extractClassMembers(classNode, code) {
  */
 function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
+    const lines = code.split('\n');
     const objects = [];
 
     const statePattern = /^(CONFIG|[A-Z][a-zA-Z]*(?:State|Store|Context|Options|Settings)|[A-Z][A-Z_]+|Entities|Input)$/;
@@ -885,7 +890,7 @@ function findStateObjects(code, parser) {
         return funcName && factoryFunctions.includes(funcName);
     };
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
             for (let i = 0; i < node.namedChildCount; i++) {
                 const declarator = node.namedChild(i);
@@ -899,10 +904,10 @@ function findStateObjects(code, parser) {
                         const isArray = valueNode.type === 'array';
 
                         if ((isObject || isArray) && statePattern.test(name)) {
-                            const { startLine, endLine } = nodeToLocation(node, code);
+                            const { startLine, endLine } = nodeToLocation(node, lines);
                             objects.push({ name, startLine, endLine });
                         } else if (isFactoryCall(valueNode) && (actionPattern.test(name) || statePattern.test(name))) {
-                            const { startLine, endLine } = nodeToLocation(node, code);
+                            const { startLine, endLine } = nodeToLocation(node, lines);
                             objects.push({ name, startLine, endLine });
                         }
                     }
@@ -923,9 +928,10 @@ function findStateObjects(code, parser) {
  * @returns {ParseResult}
  */
 function parse(code, parser) {
+    const lines = code.split('\n');
     return {
         language: 'javascript',
-        totalLines: code.split('\n').length,
+        totalLines: lines.length,
         functions: findFunctions(code, parser),
         classes: findClasses(code, parser),
         stateObjects: findStateObjects(code, parser),
@@ -1473,7 +1479,7 @@ function findCallbackUsages(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Look for call expressions where our name is passed as an argument
         if (node.type === 'call_expression') {
             const argsNode = node.childForFieldName('arguments');
@@ -1570,7 +1576,7 @@ function findReExports(code, parser) {
     const tree = parseTree(parser, code);
     const reExports = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // export { name } from './module'
         if (node.type === 'export_statement') {
             let hasFrom = false;
@@ -1623,7 +1629,7 @@ function findImportsInCode(code, parser) {
     const imports = [];
     let importAliases = null;  // {original, local}[] — tracks renamed imports
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // ES6 import statements
         if (node.type === 'import_statement') {
             const line = node.startPosition.row + 1;
@@ -1804,7 +1810,7 @@ function findExportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const exports = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // ES6 export statements
         if (node.type === 'export_statement') {
             const line = node.startPosition.row + 1;
@@ -1980,7 +1986,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTree(tree.rootNode, (node) => {
+    traverseTreeCached(tree.rootNode, (node) => {
         // Look for identifier, property_identifier (method names in obj.method() calls),
         // and type_identifier (TypeScript type annotations like `params: MyType`)
         const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier' || node.type === 'type_identifier';
