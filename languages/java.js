@@ -121,6 +121,96 @@ function extractGenerics(node) {
 }
 
 /**
+ * Process a node for function/method extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processFunction(node, functions, processedRanges, lines, code) {
+    // Method declarations
+    if (node.type === 'method_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        // Skip methods inside a class/interface/enum body (they're extracted as class members)
+        let parent = node.parent;
+        if (parent && (parent.type === 'class_body' || parent.type === 'interface_body' || parent.type === 'enum_body' || parent.type === 'enum_body_declarations')) {
+            return true;  // Skip - this is a class/interface/enum method
+        }
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const modifiers = extractModifiers(node);
+            const annotations = extractAnnotations(node);
+            const returnType = extractReturnType(node);
+            const generics = extractGenerics(node);
+            const docstring = extractJavaDocstring(lines, startLine);
+            // nameLine: where the name identifier lives (differs from startLine when annotations are present)
+            const nameLine = nameNode.startPosition.row + 1;
+
+            functions.push({
+                name: nameNode.text,
+                params: extractJavaParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'java'),
+                startLine,
+                endLine,
+                indent,
+                modifiers,
+                ...(returnType && { returnType }),
+                ...(generics && { generics }),
+                ...(docstring && { docstring }),
+                ...(annotations.length > 0 && { annotations }),
+                ...(nameLine !== startLine && { nameLine })
+            });
+        }
+        return true;
+    }
+
+    // Constructor declarations
+    if (node.type === 'constructor_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        // Skip constructors inside a class/enum body (they're extracted as class members)
+        let parent = node.parent;
+        if (parent && (parent.type === 'class_body' || parent.type === 'enum_body' || parent.type === 'enum_body_declarations')) {
+            return true;  // Skip - this is a class/enum constructor
+        }
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const modifiers = extractModifiers(node);
+            const annotations = extractAnnotations(node);
+            const docstring = extractJavaDocstring(lines, startLine);
+            const nameLine = nameNode.startPosition.row + 1;
+
+            functions.push({
+                name: nameNode.text,
+                params: extractJavaParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'java'),
+                startLine,
+                endLine,
+                indent,
+                modifiers,
+                isConstructor: true,
+                ...(docstring && { docstring }),
+                ...(annotations.length > 0 && { annotations }),
+                ...(nameLine !== startLine && { nameLine })
+            });
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/**
  * Find all methods/constructors in Java code using tree-sitter
  */
 function findFunctions(code, parser) {
@@ -130,93 +220,172 @@ function findFunctions(code, parser) {
     const processedRanges = new Set();
 
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        // Method declarations
-        if (node.type === 'method_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            // Skip methods inside a class/interface/enum body (they're extracted as class members)
-            let parent = node.parent;
-            if (parent && (parent.type === 'class_body' || parent.type === 'interface_body' || parent.type === 'enum_body' || parent.type === 'enum_body_declarations')) {
-                return true;  // Skip - this is a class/interface/enum method
-            }
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const modifiers = extractModifiers(node);
-                const annotations = extractAnnotations(node);
-                const returnType = extractReturnType(node);
-                const generics = extractGenerics(node);
-                const docstring = extractJavaDocstring(lines, startLine);
-                // nameLine: where the name identifier lives (differs from startLine when annotations are present)
-                const nameLine = nameNode.startPosition.row + 1;
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractJavaParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'java'),
-                    startLine,
-                    endLine,
-                    indent,
-                    modifiers,
-                    ...(returnType && { returnType }),
-                    ...(generics && { generics }),
-                    ...(docstring && { docstring }),
-                    ...(annotations.length > 0 && { annotations }),
-                    ...(nameLine !== startLine && { nameLine })
-                });
-            }
-            return true;
-        }
-
-        // Constructor declarations
-        if (node.type === 'constructor_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            // Skip constructors inside a class/enum body (they're extracted as class members)
-            let parent = node.parent;
-            if (parent && (parent.type === 'class_body' || parent.type === 'enum_body' || parent.type === 'enum_body_declarations')) {
-                return true;  // Skip - this is a class/enum constructor
-            }
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const modifiers = extractModifiers(node);
-                const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(lines, startLine);
-                const nameLine = nameNode.startPosition.row + 1;
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractJavaParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'java'),
-                    startLine,
-                    endLine,
-                    indent,
-                    modifiers,
-                    isConstructor: true,
-                    ...(docstring && { docstring }),
-                    ...(annotations.length > 0 && { annotations }),
-                    ...(nameLine !== startLine && { nameLine })
-                });
-            }
-            return true;
-        }
-
+        _processFunction(node, functions, processedRanges, lines, code);
         return true;
     });
 
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
+}
+
+/**
+ * Process a node for class/interface/enum/record extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processClass(node, classes, processedRanges, lines, code) {
+    // Class declarations
+    if (node.type === 'class_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const members = extractClassMembers(node, lines);
+            const modifiers = extractModifiers(node);
+            const annotations = extractAnnotations(node);
+            const docstring = extractJavaDocstring(lines, startLine);
+            const generics = extractGenerics(node);
+            const extendsInfo = extractExtends(node);
+            const implementsInfo = extractImplements(node);
+
+            // Check if this is a nested/inner class
+            let parentNode = node.parent;
+            const isNested = parentNode && parentNode.type === 'class_body';
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'class',
+                members,
+                modifiers,
+                ...(isNested && { isNested: true }),
+                ...(docstring && { docstring }),
+                ...(generics && { generics }),
+                ...(annotations.length > 0 && { annotations }),
+                ...(extendsInfo && { extends: extendsInfo }),
+                ...(implementsInfo.length > 0 && { implements: implementsInfo })
+            });
+        }
+        return true;
+    }
+
+    // Interface declarations
+    if (node.type === 'interface_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const modifiers = extractModifiers(node);
+            const annotations = extractAnnotations(node);
+            const docstring = extractJavaDocstring(lines, startLine);
+            const generics = extractGenerics(node);
+            const extendsInfo = extractInterfaceExtends(node);
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'interface',
+                members: extractClassMembers(node, lines),
+                modifiers,
+                ...(docstring && { docstring }),
+                ...(generics && { generics }),
+                ...(annotations.length > 0 && { annotations }),
+                ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
+            });
+        }
+        return true;
+    }
+
+    // Enum declarations
+    if (node.type === 'enum_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const modifiers = extractModifiers(node);
+            const annotations = extractAnnotations(node);
+            const docstring = extractJavaDocstring(lines, startLine);
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'enum',
+                members: extractEnumConstants(node, lines),
+                modifiers,
+                ...(docstring && { docstring }),
+                ...(annotations.length > 0 && { annotations })
+            });
+        }
+        return true;
+    }
+
+    // Record declarations (Java 14+)
+    if (node.type === 'record_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const modifiers = extractModifiers(node);
+            const annotations = extractAnnotations(node);
+            const docstring = extractJavaDocstring(lines, startLine);
+            const generics = extractGenerics(node);
+            const implementsInfo = extractImplements(node);
+
+            // Extract record components as members
+            const members = extractClassMembers(node, lines);
+            // Also extract record components from formal_parameters
+            const paramsNode = node.childForFieldName('parameters');
+            if (paramsNode) {
+                for (let pi = 0; pi < paramsNode.namedChildCount; pi++) {
+                    const param = paramsNode.namedChild(pi);
+                    if (param.type === 'formal_parameter' || param.type === 'spread_parameter') {
+                        const pName = param.childForFieldName('name');
+                        const pType = param.childForFieldName('type');
+                        if (pName) {
+                            const { startLine: pLine, endLine: pEnd } = nodeToLocation(param, lines);
+                            members.push({
+                                name: pName.text,
+                                startLine: pLine,
+                                endLine: pEnd,
+                                memberType: 'field',
+                                ...(pType && { fieldType: pType.text })
+                            });
+                        }
+                    }
+                }
+            }
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'record',
+                members,
+                modifiers,
+                ...(docstring && { docstring }),
+                ...(generics && { generics }),
+                ...(annotations.length > 0 && { annotations }),
+                ...(implementsInfo.length > 0 && { implements: implementsInfo })
+            });
+        }
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -229,157 +398,7 @@ function findClasses(code, parser) {
     const processedRanges = new Set();
 
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        // Class declarations
-        if (node.type === 'class_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const members = extractClassMembers(node, lines);
-                const modifiers = extractModifiers(node);
-                const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(lines, startLine);
-                const generics = extractGenerics(node);
-                const extendsInfo = extractExtends(node);
-                const implementsInfo = extractImplements(node);
-
-                // Check if this is a nested/inner class
-                let parentNode = node.parent;
-                const isNested = parentNode && parentNode.type === 'class_body';
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'class',
-                    members,
-                    modifiers,
-                    ...(isNested && { isNested: true }),
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics }),
-                    ...(annotations.length > 0 && { annotations }),
-                    ...(extendsInfo && { extends: extendsInfo }),
-                    ...(implementsInfo.length > 0 && { implements: implementsInfo })
-                });
-            }
-            // Continue traversal to find inner classes, but members are already extracted
-            return true;
-        }
-
-        // Interface declarations
-        if (node.type === 'interface_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const modifiers = extractModifiers(node);
-                const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(lines, startLine);
-                const generics = extractGenerics(node);
-                const extendsInfo = extractInterfaceExtends(node);
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'interface',
-                    members: extractClassMembers(node, lines),
-                    modifiers,
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics }),
-                    ...(annotations.length > 0 && { annotations }),
-                    ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
-                });
-            }
-            return false;
-        }
-
-        // Enum declarations
-        if (node.type === 'enum_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const modifiers = extractModifiers(node);
-                const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(lines, startLine);
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'enum',
-                    members: extractEnumConstants(node, lines),
-                    modifiers,
-                    ...(docstring && { docstring }),
-                    ...(annotations.length > 0 && { annotations })
-                });
-            }
-            return false;
-        }
-
-        // Record declarations (Java 14+)
-        if (node.type === 'record_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const modifiers = extractModifiers(node);
-                const annotations = extractAnnotations(node);
-                const docstring = extractJavaDocstring(lines, startLine);
-                const generics = extractGenerics(node);
-                const implementsInfo = extractImplements(node);
-
-                // Extract record components as members
-                const members = extractClassMembers(node, lines);
-                // Also extract record components from formal_parameters
-                const paramsNode = node.childForFieldName('parameters');
-                if (paramsNode) {
-                    for (let pi = 0; pi < paramsNode.namedChildCount; pi++) {
-                        const param = paramsNode.namedChild(pi);
-                        if (param.type === 'formal_parameter' || param.type === 'spread_parameter') {
-                            const pName = param.childForFieldName('name');
-                            const pType = param.childForFieldName('type');
-                            if (pName) {
-                                const { startLine: pLine, endLine: pEnd } = nodeToLocation(param, lines);
-                                members.push({
-                                    name: pName.text,
-                                    startLine: pLine,
-                                    endLine: pEnd,
-                                    memberType: 'field',
-                                    ...(pType && { fieldType: pType.text })
-                                });
-                            }
-                        }
-                    }
-                }
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'record',
-                    members,
-                    modifiers,
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics }),
-                    ...(annotations.length > 0 && { annotations }),
-                    ...(implementsInfo.length > 0 && { implements: implementsInfo })
-                });
-            }
-            return false;
-        }
-
+        _processClass(node, classes, processedRanges, lines, code);
         return true;
     });
 
@@ -611,6 +630,38 @@ function extractClassMembers(classNode, codeOrLines) {
     return members;
 }
 
+const _statePattern = /^([A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:CONFIG|SETTINGS|OPTIONS))$/;
+
+/**
+ * Process a node for state object extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processState(node, objects, lines, code) {
+    if (node.type === 'field_declaration') {
+        const modifiers = extractModifiers(node);
+        if (modifiers.includes('static') && modifiers.includes('final')) {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'variable_declarator') {
+                    const nameNode = child.childForFieldName('name');
+                    const valueNode = child.childForFieldName('value');
+
+                    if (nameNode && valueNode) {
+                        const name = nameNode.text;
+                        if (_statePattern.test(name)) {
+                            const { startLine, endLine } = nodeToLocation(node, lines);
+                            objects.push({ name, startLine, endLine, modifiers });
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
 /**
  * Find state objects (static final constants) in Java code
  */
@@ -619,31 +670,8 @@ function findStateObjects(code, parser) {
     const lines = code.split('\n');
     const objects = [];
 
-    const statePattern = /^([A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:CONFIG|SETTINGS|OPTIONS))$/;
-
     traverseTreeCached(tree.rootNode, (node) => {
-        if (node.type === 'field_declaration') {
-            const modifiers = extractModifiers(node);
-            if (modifiers.includes('static') && modifiers.includes('final')) {
-                for (let i = 0; i < node.namedChildCount; i++) {
-                    const child = node.namedChild(i);
-                    if (child.type === 'variable_declarator') {
-                        const nameNode = child.childForFieldName('name');
-                        const valueNode = child.childForFieldName('value');
-
-                        if (nameNode && valueNode) {
-                            const name = nameNode.text;
-                            if (statePattern.test(name)) {
-                                const { startLine, endLine } = nodeToLocation(node, lines);
-                                objects.push({ name, startLine, endLine, modifiers });
-                            }
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-
+        _processState(node, objects, lines, code);
         return true;
     });
 
@@ -655,13 +683,31 @@ function findStateObjects(code, parser) {
  * Parse a Java file completely
  */
 function parse(code, parser) {
-    const totalLines = code.split('\n').length;
+    const tree = parseTree(parser, code);
+    const lines = code.split('\n');
+    const functions = [];
+    const classes = [];
+    const stateObjects = [];
+    const processedFn = new Set();
+    const processedCls = new Set();
+
+    traverseTreeCached(tree.rootNode, (node) => {
+        _processFunction(node, functions, processedFn, lines, code);
+        _processClass(node, classes, processedCls, lines, code);
+        _processState(node, stateObjects, lines, code);
+        return true;
+    });
+
+    functions.sort((a, b) => a.startLine - b.startLine);
+    classes.sort((a, b) => a.startLine - b.startLine);
+    stateObjects.sort((a, b) => a.startLine - b.startLine);
+
     return {
         language: 'java',
-        totalLines,
-        functions: findFunctions(code, parser),
-        classes: findClasses(code, parser),
-        stateObjects: findStateObjects(code, parser),
+        totalLines: lines.length,
+        functions,
+        classes,
+        stateObjects,
         imports: [],
         exports: []
     };

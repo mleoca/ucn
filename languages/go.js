@@ -55,6 +55,230 @@ function extractReceiver(receiverNode) {
     return text.replace(/^\(|\)$/g, '').trim();
 }
 
+// --- Single-pass helpers: extracted from find* callbacks ---
+
+/**
+ * Process a node for function extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processFunction(node, functions, processedRanges, lines) {
+    if (node.type === 'function_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return false;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const returnType = extractReturnType(node);
+            const docstring = extractGoDocstring(lines, startLine);
+            const typeParams = extractTypeParams(node);
+            const isExported = /^[A-Z]/.test(nameNode.text);
+
+            functions.push({
+                name: nameNode.text,
+                params: extractGoParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'go'),
+                startLine,
+                endLine,
+                indent,
+                modifiers: isExported ? ['export'] : [],
+                ...(returnType && { returnType }),
+                ...(docstring && { docstring }),
+                ...(typeParams && { generics: typeParams })
+            });
+        }
+        return true;
+    }
+
+    if (node.type === 'method_declaration') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return false;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+        const receiverNode = node.childForFieldName('receiver');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const receiver = extractReceiver(receiverNode);
+            const returnType = extractReturnType(node);
+            const docstring = extractGoDocstring(lines, startLine);
+            const isExported = /^[A-Z]/.test(nameNode.text);
+
+            functions.push({
+                name: nameNode.text,
+                params: extractGoParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'go'),
+                startLine,
+                endLine,
+                indent,
+                isMethod: true,
+                receiver,
+                modifiers: isExported ? ['export'] : [],
+                ...(returnType && { returnType }),
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Process a node for type/class extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processClass(node, types, processedRanges, lines) {
+    if (node.type !== 'type_declaration') return false;
+
+    const rangeKey = `${node.startIndex}-${node.endIndex}`;
+    if (processedRanges.has(rangeKey)) return false;
+    processedRanges.add(rangeKey);
+
+    for (let i = 0; i < node.namedChildCount; i++) {
+        const spec = node.namedChild(i);
+        if (spec.type === 'type_spec') {
+            const nameNode = spec.childForFieldName('name');
+            const typeNode = spec.childForFieldName('type');
+
+            if (nameNode && typeNode) {
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                const name = nameNode.text;
+                const docstring = extractGoDocstring(lines, startLine);
+                const typeParams = extractTypeParams(spec);
+
+                let typeKind = 'type';
+                if (typeNode.type === 'struct_type') {
+                    typeKind = 'struct';
+                } else if (typeNode.type === 'interface_type') {
+                    typeKind = 'interface';
+                }
+
+                const isExported = /^[A-Z]/.test(name);
+
+                const members = typeKind === 'struct' ? extractStructFields(typeNode, lines)
+                    : typeKind === 'interface' ? extractInterfaceMembers(typeNode, lines)
+                    : [];
+
+                const embeddedBases = members
+                    .filter(m => m.embedded)
+                    .map(m => m.name);
+
+                types.push({
+                    name,
+                    startLine,
+                    endLine,
+                    type: typeKind,
+                    members,
+                    modifiers: isExported ? ['export'] : [],
+                    ...(docstring && { docstring }),
+                    ...(typeParams && { generics: typeParams }),
+                    ...(embeddedBases.length > 0 && { extends: embeddedBases.join(', ') })
+                });
+            }
+        }
+    }
+    return true;
+}
+
+// Module-level state detection helpers
+const GO_STATE_PATTERN = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|Default[A-Z][a-zA-Z]*|[A-Z][a-zA-Z]*(?:Config|Settings|Options))$/;
+
+function _isGoExportedName(name) {
+    return /^[A-Z]/.test(name);
+}
+
+function _isCompositeLiteral(valueNode) {
+    if (!valueNode) return false;
+    if (valueNode.type === 'composite_literal') return true;
+    for (let i = 0; i < valueNode.namedChildCount; i++) {
+        if (valueNode.namedChild(i).type === 'composite_literal') return true;
+    }
+    return false;
+}
+
+function _blockHasIota(constDecl) {
+    for (let i = 0; i < constDecl.namedChildCount; i++) {
+        const spec = constDecl.namedChild(i);
+        if (spec.type === 'const_spec') {
+            const valueNode = spec.childForFieldName('value');
+            if (valueNode) {
+                const checkIota = (n) => {
+                    if (n.type === 'iota') return true;
+                    for (let j = 0; j < n.childCount; j++) {
+                        if (checkIota(n.child(j))) return true;
+                    }
+                    return false;
+                };
+                if (checkIota(valueNode)) return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Process a node for state object extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processState(node, objects, lines) {
+    if (node.type === 'const_declaration') {
+        const isIotaBlock = _blockHasIota(node);
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const spec = node.namedChild(i);
+            if (spec.type === 'const_spec') {
+                const nameNode = spec.childForFieldName('name');
+                const valueNode = spec.childForFieldName('value');
+                if (!nameNode) continue;
+                const name = nameNode.text;
+
+                if (valueNode && _isCompositeLiteral(valueNode) && GO_STATE_PATTERN.test(name)) {
+                    const { startLine, endLine } = nodeToLocation(spec, lines);
+                    objects.push({ name, startLine, endLine });
+                } else if (isIotaBlock && /^[A-Z]/.test(name)) {
+                    const { startLine, endLine } = nodeToLocation(spec, lines);
+                    objects.push({ name, startLine, endLine, isConst: true });
+                } else if (_isGoExportedName(name)) {
+                    const { startLine, endLine } = nodeToLocation(spec, lines);
+                    objects.push({ name, startLine, endLine, isConst: true });
+                }
+            }
+        }
+        return true;
+    }
+
+    if (node.type === 'var_declaration') {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const spec = node.namedChild(i);
+            if (spec.type === 'var_spec') {
+                const nameNode = spec.childForFieldName('name');
+                const valueNode = spec.childForFieldName('value');
+
+                if (nameNode) {
+                    const name = nameNode.text;
+                    if (valueNode && _isCompositeLiteral(valueNode) && GO_STATE_PATTERN.test(name)) {
+                        const { startLine, endLine } = nodeToLocation(spec, lines);
+                        objects.push({ name, startLine, endLine });
+                    } else if (_isGoExportedName(name)) {
+                        const { startLine, endLine } = nodeToLocation(spec, lines);
+                        objects.push({ name, startLine, endLine });
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// --- End single-pass helpers ---
+
 /**
  * Find all functions in Go code using tree-sitter
  */
@@ -63,81 +287,10 @@ function findFunctions(code, parser) {
     const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        // Function declarations
-        if (node.type === 'function_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const returnType = extractReturnType(node);
-                const docstring = extractGoDocstring(lines, startLine);
-                const typeParams = extractTypeParams(node);
-
-                // Check if exported (capitalized)
-                const isExported = /^[A-Z]/.test(nameNode.text);
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractGoParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'go'),
-                    startLine,
-                    endLine,
-                    indent,
-                    modifiers: isExported ? ['export'] : [],
-                    ...(returnType && { returnType }),
-                    ...(docstring && { docstring }),
-                    ...(typeParams && { generics: typeParams })
-                });
-            }
-            return true;
-        }
-
-        // Method declarations (with receivers)
-        if (node.type === 'method_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-            const receiverNode = node.childForFieldName('receiver');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const receiver = extractReceiver(receiverNode);
-                const returnType = extractReturnType(node);
-                const docstring = extractGoDocstring(lines, startLine);
-
-                // Check if exported
-                const isExported = /^[A-Z]/.test(nameNode.text);
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractGoParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'go'),
-                    startLine,
-                    endLine,
-                    indent,
-                    isMethod: true,
-                    receiver,
-                    modifiers: isExported ? ['export'] : [],
-                    ...(returnType && { returnType }),
-                    ...(docstring && { docstring })
-                });
-            }
-            return true;
-        }
-
+        _processFunction(node, functions, processedRanges, lines);
         return true;
     });
-
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
 }
@@ -161,65 +314,10 @@ function findClasses(code, parser) {
     const lines = code.split('\n');
     const types = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        if (node.type === 'type_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            for (let i = 0; i < node.namedChildCount; i++) {
-                const spec = node.namedChild(i);
-                if (spec.type === 'type_spec') {
-                    const nameNode = spec.childForFieldName('name');
-                    const typeNode = spec.childForFieldName('type');
-
-                    if (nameNode && typeNode) {
-                        const { startLine, endLine } = nodeToLocation(node, lines);
-                        const name = nameNode.text;
-                        const docstring = extractGoDocstring(lines, startLine);
-                        const typeParams = extractTypeParams(spec);
-
-                        let typeKind = 'type';
-                        if (typeNode.type === 'struct_type') {
-                            typeKind = 'struct';
-                        } else if (typeNode.type === 'interface_type') {
-                            typeKind = 'interface';
-                        }
-
-                        // Check if exported
-                        const isExported = /^[A-Z]/.test(name);
-
-                        const members = typeKind === 'struct' ? extractStructFields(typeNode, lines)
-                            : typeKind === 'interface' ? extractInterfaceMembers(typeNode, lines)
-                            : [];
-
-                        // Extract embedded field names as extends (Go composition)
-                        const embeddedBases = members
-                            .filter(m => m.embedded)
-                            .map(m => m.name);
-
-                        types.push({
-                            name,
-                            startLine,
-                            endLine,
-                            type: typeKind,
-                            members,
-                            modifiers: isExported ? ['export'] : [],
-                            ...(docstring && { docstring }),
-                            ...(typeParams && { generics: typeParams }),
-                            ...(embeddedBases.length > 0 && { extends: embeddedBases.join(', ') })
-                        });
-                    }
-                }
-            }
-            return true;
-        }
-
+        _processClass(node, types, processedRanges, lines);
         return true;
     });
-
     types.sort((a, b) => a.startLine - b.startLine);
     return types;
 }
@@ -402,98 +500,10 @@ function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const objects = [];
-
-    const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|Default[A-Z][a-zA-Z]*|[A-Z][a-zA-Z]*(?:Config|Settings|Options))$/;
-    // All exported (^[A-Z]) package-level const/var are indexed as state objects
-    const isExportedName = (name) => /^[A-Z]/.test(name);
-
-    // Check if a value node is a composite literal
-    function isCompositeLiteral(valueNode) {
-        if (!valueNode) return false;
-        if (valueNode.type === 'composite_literal') return true;
-        for (let i = 0; i < valueNode.namedChildCount; i++) {
-            if (valueNode.namedChild(i).type === 'composite_literal') return true;
-        }
-        return false;
-    }
-
-    // Check if a const block uses iota (enum-like pattern)
-    function blockHasIota(constDecl) {
-        for (let i = 0; i < constDecl.namedChildCount; i++) {
-            const spec = constDecl.namedChild(i);
-            if (spec.type === 'const_spec') {
-                const valueNode = spec.childForFieldName('value');
-                if (valueNode) {
-                    // Check if any child is 'iota'
-                    const checkIota = (n) => {
-                        if (n.type === 'iota') return true;
-                        for (let j = 0; j < n.childCount; j++) {
-                            if (checkIota(n.child(j))) return true;
-                        }
-                        return false;
-                    };
-                    if (checkIota(valueNode)) return true;
-                }
-            }
-        }
-        return false;
-    }
-
     traverseTreeCached(tree.rootNode, (node) => {
-        // Handle const declarations
-        if (node.type === 'const_declaration') {
-            const isIotaBlock = blockHasIota(node);
-            for (let i = 0; i < node.namedChildCount; i++) {
-                const spec = node.namedChild(i);
-                if (spec.type === 'const_spec') {
-                    const nameNode = spec.childForFieldName('name');
-                    const valueNode = spec.childForFieldName('value');
-                    if (!nameNode) continue;
-                    const name = nameNode.text;
-
-                    // Include if: composite literal matching state pattern, OR exported const in iota block,
-                    // OR any exported (^[A-Z]) package-level const
-                    if (valueNode && isCompositeLiteral(valueNode) && statePattern.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, lines);
-                        objects.push({ name, startLine, endLine });
-                    } else if (isIotaBlock && /^[A-Z]/.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, lines);
-                        objects.push({ name, startLine, endLine, isConst: true });
-                    } else if (isExportedName(name)) {
-                        const { startLine, endLine } = nodeToLocation(spec, lines);
-                        objects.push({ name, startLine, endLine, isConst: true });
-                    }
-                }
-            }
-            return true;
-        }
-
-        // Handle var declarations
-        if (node.type === 'var_declaration') {
-            for (let i = 0; i < node.namedChildCount; i++) {
-                const spec = node.namedChild(i);
-                if (spec.type === 'var_spec') {
-                    const nameNode = spec.childForFieldName('name');
-                    const valueNode = spec.childForFieldName('value');
-
-                    if (nameNode) {
-                        const name = nameNode.text;
-                        if (valueNode && isCompositeLiteral(valueNode) && statePattern.test(name)) {
-                            const { startLine, endLine } = nodeToLocation(spec, lines);
-                            objects.push({ name, startLine, endLine });
-                        } else if (isExportedName(name)) {
-                            const { startLine, endLine } = nodeToLocation(spec, lines);
-                            objects.push({ name, startLine, endLine });
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-
+        _processState(node, objects, lines);
         return true;
     });
-
     objects.sort((a, b) => a.startLine - b.startLine);
     return objects;
 }
@@ -502,12 +512,31 @@ function findStateObjects(code, parser) {
  * Parse a Go file completely
  */
 function parse(code, parser) {
+    const tree = parseTree(parser, code);
+    const lines = code.split('\n');
+    const functions = [];
+    const classes = [];
+    const stateObjects = [];
+    const processedFn = new Set();
+    const processedCls = new Set();
+
+    traverseTreeCached(tree.rootNode, (node) => {
+        _processFunction(node, functions, processedFn, lines);
+        _processClass(node, classes, processedCls, lines);
+        _processState(node, stateObjects, lines);
+        return true;
+    });
+
+    functions.sort((a, b) => a.startLine - b.startLine);
+    classes.sort((a, b) => a.startLine - b.startLine);
+    stateObjects.sort((a, b) => a.startLine - b.startLine);
+
     return {
         language: 'go',
-        totalLines: code.split('\n').length,
-        functions: findFunctions(code, parser),
-        classes: findClasses(code, parser),
-        stateObjects: findStateObjects(code, parser),
+        totalLines: lines.length,
+        functions,
+        classes,
+        stateObjects,
         imports: [],
         exports: []
     };

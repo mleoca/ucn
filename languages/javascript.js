@@ -108,6 +108,291 @@ function extractDecorators(node) {
     return decorators;
 }
 
+// --- Single-pass helpers: extracted from find* callbacks ---
+
+/**
+ * Process a node for function extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processFunction(node, functions, processedRanges, lines) {
+    const rangeKey = `${node.startIndex}-${node.endIndex}`;
+
+    // Function declarations
+    if (node.type === 'function_declaration' || node.type === 'generator_function_declaration') {
+        if (processedRanges.has(rangeKey)) return false;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const returnType = extractReturnType(node);
+            const generics = extractGenerics(node);
+            const docstring = extractJSDocstring(lines, startLine);
+            const isGen = isGenerator(node);
+            // Check parent for export status (function_declaration inside export_statement)
+            const modifiers = node.parent && node.parent.type === 'export_statement'
+                ? extractModifiers(node.parent.text)
+                : extractModifiers(node.text);
+
+            functions.push({
+                name: nameNode.text,
+                params: extractParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                startLine,
+                endLine,
+                indent,
+                isArrow: false,
+                isGenerator: isGen,
+                modifiers,
+                ...(returnType && { returnType }),
+                ...(generics && { generics }),
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    // TypeScript function signatures (e.g., in .d.ts files)
+    if (node.type === 'function_signature') {
+        if (processedRanges.has(rangeKey)) return false;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const returnType = extractReturnType(node);
+            const generics = extractGenerics(node);
+            const docstring = extractJSDocstring(lines, startLine);
+
+            functions.push({
+                name: nameNode.text,
+                params: extractParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'typescript'),
+                startLine,
+                endLine,
+                indent,
+                isArrow: false,
+                isGenerator: false,
+                isSignature: true,
+                modifiers: [],
+                ...(returnType && { returnType }),
+                ...(generics && { generics }),
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    // Variable declarations with arrow functions or function expressions
+    if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
+        if (processedRanges.has(rangeKey)) return false;
+
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const declarator = node.namedChild(i);
+            if (declarator.type === 'variable_declarator') {
+                const nameNode = declarator.childForFieldName('name');
+                const valueNode = declarator.childForFieldName('value');
+
+                if (nameNode && valueNode) {
+                    const isArrow = valueNode.type === 'arrow_function';
+                    const isFnExpr = valueNode.type === 'function_expression' ||
+                                     valueNode.type === 'generator_function';
+
+                    if (isArrow || isFnExpr) {
+                        processedRanges.add(rangeKey);
+                        const paramsNode = valueNode.childForFieldName('parameters');
+                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                        const returnType = extractReturnType(valueNode);
+                        const generics = extractGenerics(valueNode);
+                        const docstring = extractJSDocstring(lines, startLine);
+                        const isGen = isGenerator(valueNode);
+                        // Check parent for export status (lexical_declaration inside export_statement)
+                        const modifiers = node.parent && node.parent.type === 'export_statement'
+                            ? extractModifiers(node.parent.text)
+                            : extractModifiers(node.text);
+
+                        functions.push({
+                            name: nameNode.text,
+                            params: extractParams(paramsNode),
+                            paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                            startLine,
+                            endLine,
+                            indent,
+                            isArrow,
+                            isGenerator: isGen,
+                            modifiers,
+                            ...(returnType && { returnType }),
+                            ...(generics && { generics }),
+                            ...(docstring && { docstring })
+                        });
+                    }
+
+                    // React wrapper patterns: React.forwardRef(...), React.memo(...), forwardRef(...), memo(...)
+                    // const Button = React.forwardRef<Props, Ref>((props, ref) => ...)
+                    // const Memoized = memo((props) => ...)
+                    if (!isArrow && !isFnExpr && valueNode.type === 'call_expression') {
+                        const funcNode = valueNode.childForFieldName('function');
+                        if (funcNode) {
+                            let wrapperName = null;
+                            if (funcNode.type === 'member_expression') {
+                                const prop = funcNode.childForFieldName('property');
+                                wrapperName = prop?.text;
+                            } else if (funcNode.type === 'identifier') {
+                                wrapperName = funcNode.text;
+                            }
+                            if (wrapperName === 'forwardRef' || wrapperName === 'memo') {
+                                const argsNode = valueNode.childForFieldName('arguments');
+                                if (argsNode && argsNode.namedChildCount > 0) {
+                                    const innerFn = argsNode.namedChild(0);
+                                    if (innerFn && (innerFn.type === 'arrow_function' || innerFn.type === 'function_expression')) {
+                                        processedRanges.add(rangeKey);
+                                        const paramsNode = innerFn.childForFieldName('parameters');
+                                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                                        const returnType = extractReturnType(innerFn);
+                                        const generics = extractGenerics(innerFn);
+                                        const docstring = extractJSDocstring(lines, startLine);
+                                        const modifiers = node.parent && node.parent.type === 'export_statement'
+                                            ? extractModifiers(node.parent.text)
+                                            : extractModifiers(node.text);
+
+                                        functions.push({
+                                            name: nameNode.text,
+                                            params: extractParams(paramsNode),
+                                            paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                                            startLine,
+                                            endLine,
+                                            indent,
+                                            isArrow: innerFn.type === 'arrow_function',
+                                            isGenerator: false,
+                                            modifiers,
+                                            ...(returnType && { returnType }),
+                                            ...(generics && { generics }),
+                                            ...(docstring && { docstring })
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    // Assignment expressions: obj.method = function() {} or prototype assignments
+    if (node.type === 'assignment_expression') {
+        if (processedRanges.has(rangeKey)) return false;
+
+        const leftNode = node.childForFieldName('left');
+        const isPrototypeAssignment = leftNode && leftNode.type === 'member_expression' &&
+            leftNode.text.includes('.prototype.');
+
+        // For non-prototype assignments, check if nested
+        if (!isPrototypeAssignment) {
+            let parent = node.parent;
+            let isTopLevel = true;
+            while (parent) {
+                const ptype = parent.type;
+                if (ptype === 'function_declaration' || ptype === 'arrow_function' ||
+                    ptype === 'function_expression' || ptype === 'method_definition' ||
+                    ptype === 'generator_function_declaration' || ptype === 'generator_function' ||
+                    ptype === 'class_body') {
+                    isTopLevel = false;
+                    break;
+                }
+                if (ptype === 'program' || ptype === 'module') {
+                    break;
+                }
+                parent = parent.parent;
+            }
+            if (!isTopLevel) return true;
+        }
+
+        const rightNode = node.childForFieldName('right');
+
+        if (leftNode && rightNode) {
+            const isArrow = rightNode.type === 'arrow_function';
+            const isFnExpr = rightNode.type === 'function_expression' ||
+                             rightNode.type === 'generator_function';
+
+            if (isArrow || isFnExpr) {
+                const name = getAssignmentName(leftNode);
+                if (name) {
+                    processedRanges.add(rangeKey);
+                    const paramsNode = rightNode.childForFieldName('parameters');
+                    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                    const returnType = extractReturnType(rightNode);
+                    const generics = extractGenerics(rightNode);
+                    const docstring = extractJSDocstring(lines, startLine);
+                    const isGen = isGenerator(rightNode);
+
+                    functions.push({
+                        name,
+                        params: extractParams(paramsNode),
+                        paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                        startLine,
+                        endLine,
+                        indent,
+                        isArrow,
+                        isGenerator: isGen,
+                        modifiers: [],
+                        ...(returnType && { returnType }),
+                        ...(generics && { generics }),
+                        ...(docstring && { docstring })
+                    });
+                }
+            }
+        }
+        return true;
+    }
+
+    // Export statements with anonymous functions
+    if (node.type === 'export_statement') {
+        const declaration = node.childForFieldName('declaration');
+        if (!declaration) {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'arrow_function' || child.type === 'function_expression' ||
+                    child.type === 'generator_function') {
+                    if (processedRanges.has(rangeKey)) return true;
+                    processedRanges.add(rangeKey);
+
+                    const paramsNode = child.childForFieldName('parameters');
+                    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                    const returnType = extractReturnType(child);
+                    const generics = extractGenerics(child);
+                    const docstring = extractJSDocstring(lines, startLine);
+                    const isGen = isGenerator(child);
+
+                    functions.push({
+                        name: 'default',
+                        params: extractParams(paramsNode),
+                        paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                        startLine,
+                        endLine,
+                        indent,
+                        isArrow: child.type === 'arrow_function',
+                        isGenerator: isGen,
+                        modifiers: ['export', 'default'],
+                        ...(returnType && { returnType }),
+                        ...(generics && { generics }),
+                        ...(docstring && { docstring })
+                    });
+                    return true;
+                }
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
 /**
  * Find all functions in JS/TS code using tree-sitter
  * @param {string} code - Source code
@@ -119,288 +404,133 @@ function findFunctions(code, parser) {
     const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        // Function declarations
-        if (node.type === 'function_declaration' || node.type === 'generator_function_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const returnType = extractReturnType(node);
-                const generics = extractGenerics(node);
-                const docstring = extractJSDocstring(lines, startLine);
-                const isGen = isGenerator(node);
-                // Check parent for export status (function_declaration inside export_statement)
-                const modifiers = node.parent && node.parent.type === 'export_statement'
-                    ? extractModifiers(node.parent.text)
-                    : extractModifiers(node.text);
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
-                    startLine,
-                    endLine,
-                    indent,
-                    isArrow: false,
-                    isGenerator: isGen,
-                    modifiers,
-                    ...(returnType && { returnType }),
-                    ...(generics && { generics }),
-                    ...(docstring && { docstring })
-                });
-            }
-            return true;
-        }
-
-        // TypeScript function signatures (e.g., in .d.ts files)
-        if (node.type === 'function_signature') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const returnType = extractReturnType(node);
-                const generics = extractGenerics(node);
-                const docstring = extractJSDocstring(lines, startLine);
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'typescript'),
-                    startLine,
-                    endLine,
-                    indent,
-                    isArrow: false,
-                    isGenerator: false,
-                    isSignature: true,
-                    modifiers: [],
-                    ...(returnType && { returnType }),
-                    ...(generics && { generics }),
-                    ...(docstring && { docstring })
-                });
-            }
-            return true;
-        }
-
-        // Variable declarations with arrow functions or function expressions
-        if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
-            if (processedRanges.has(rangeKey)) return true;
-
-            for (let i = 0; i < node.namedChildCount; i++) {
-                const declarator = node.namedChild(i);
-                if (declarator.type === 'variable_declarator') {
-                    const nameNode = declarator.childForFieldName('name');
-                    const valueNode = declarator.childForFieldName('value');
-
-                    if (nameNode && valueNode) {
-                        const isArrow = valueNode.type === 'arrow_function';
-                        const isFnExpr = valueNode.type === 'function_expression' ||
-                                         valueNode.type === 'generator_function';
-
-                        if (isArrow || isFnExpr) {
-                            processedRanges.add(rangeKey);
-                            const paramsNode = valueNode.childForFieldName('parameters');
-                            const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                            const returnType = extractReturnType(valueNode);
-                            const generics = extractGenerics(valueNode);
-                            const docstring = extractJSDocstring(lines, startLine);
-                            const isGen = isGenerator(valueNode);
-                            // Check parent for export status (lexical_declaration inside export_statement)
-                            const modifiers = node.parent && node.parent.type === 'export_statement'
-                                ? extractModifiers(node.parent.text)
-                                : extractModifiers(node.text);
-
-                            functions.push({
-                                name: nameNode.text,
-                                params: extractParams(paramsNode),
-                                paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
-                                startLine,
-                                endLine,
-                                indent,
-                                isArrow,
-                                isGenerator: isGen,
-                                modifiers,
-                                ...(returnType && { returnType }),
-                                ...(generics && { generics }),
-                                ...(docstring && { docstring })
-                            });
-                        }
-
-                        // React wrapper patterns: React.forwardRef(...), React.memo(...), forwardRef(...), memo(...)
-                        // const Button = React.forwardRef<Props, Ref>((props, ref) => ...)
-                        // const Memoized = memo((props) => ...)
-                        if (!isArrow && !isFnExpr && valueNode.type === 'call_expression') {
-                            const funcNode = valueNode.childForFieldName('function');
-                            if (funcNode) {
-                                let wrapperName = null;
-                                if (funcNode.type === 'member_expression') {
-                                    const prop = funcNode.childForFieldName('property');
-                                    wrapperName = prop?.text;
-                                } else if (funcNode.type === 'identifier') {
-                                    wrapperName = funcNode.text;
-                                }
-                                if (wrapperName === 'forwardRef' || wrapperName === 'memo') {
-                                    const argsNode = valueNode.childForFieldName('arguments');
-                                    if (argsNode && argsNode.namedChildCount > 0) {
-                                        const innerFn = argsNode.namedChild(0);
-                                        if (innerFn && (innerFn.type === 'arrow_function' || innerFn.type === 'function_expression')) {
-                                            processedRanges.add(rangeKey);
-                                            const paramsNode = innerFn.childForFieldName('parameters');
-                                            const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                                            const returnType = extractReturnType(innerFn);
-                                            const generics = extractGenerics(innerFn);
-                                            const docstring = extractJSDocstring(lines, startLine);
-                                            const modifiers = node.parent && node.parent.type === 'export_statement'
-                                                ? extractModifiers(node.parent.text)
-                                                : extractModifiers(node.text);
-
-                                            functions.push({
-                                                name: nameNode.text,
-                                                params: extractParams(paramsNode),
-                                                paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
-                                                startLine,
-                                                endLine,
-                                                indent,
-                                                isArrow: innerFn.type === 'arrow_function',
-                                                isGenerator: false,
-                                                modifiers,
-                                                ...(returnType && { returnType }),
-                                                ...(generics && { generics }),
-                                                ...(docstring && { docstring })
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-
-        // Assignment expressions: obj.method = function() {} or prototype assignments
-        if (node.type === 'assignment_expression') {
-            if (processedRanges.has(rangeKey)) return true;
-
-            const leftNode = node.childForFieldName('left');
-            const isPrototypeAssignment = leftNode && leftNode.type === 'member_expression' &&
-                leftNode.text.includes('.prototype.');
-
-            // For non-prototype assignments, check if nested
-            if (!isPrototypeAssignment) {
-                let parent = node.parent;
-                let isTopLevel = true;
-                while (parent) {
-                    const ptype = parent.type;
-                    if (ptype === 'function_declaration' || ptype === 'arrow_function' ||
-                        ptype === 'function_expression' || ptype === 'method_definition' ||
-                        ptype === 'generator_function_declaration' || ptype === 'generator_function' ||
-                        ptype === 'class_body') {
-                        isTopLevel = false;
-                        break;
-                    }
-                    if (ptype === 'program' || ptype === 'module') {
-                        break;
-                    }
-                    parent = parent.parent;
-                }
-                if (!isTopLevel) return true;
-            }
-
-            const rightNode = node.childForFieldName('right');
-
-            if (leftNode && rightNode) {
-                const isArrow = rightNode.type === 'arrow_function';
-                const isFnExpr = rightNode.type === 'function_expression' ||
-                                 rightNode.type === 'generator_function';
-
-                if (isArrow || isFnExpr) {
-                    const name = getAssignmentName(leftNode);
-                    if (name) {
-                        processedRanges.add(rangeKey);
-                        const paramsNode = rightNode.childForFieldName('parameters');
-                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                        const returnType = extractReturnType(rightNode);
-                        const generics = extractGenerics(rightNode);
-                        const docstring = extractJSDocstring(lines, startLine);
-                        const isGen = isGenerator(rightNode);
-
-                        functions.push({
-                            name,
-                            params: extractParams(paramsNode),
-                            paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
-                            startLine,
-                            endLine,
-                            indent,
-                            isArrow,
-                            isGenerator: isGen,
-                            modifiers: [],
-                            ...(returnType && { returnType }),
-                            ...(generics && { generics }),
-                            ...(docstring && { docstring })
-                        });
-                    }
-                }
-            }
-            return true;
-        }
-
-        // Export statements with anonymous functions
-        if (node.type === 'export_statement') {
-            const declaration = node.childForFieldName('declaration');
-            if (!declaration) {
-                for (let i = 0; i < node.namedChildCount; i++) {
-                    const child = node.namedChild(i);
-                    if (child.type === 'arrow_function' || child.type === 'function_expression' ||
-                        child.type === 'generator_function') {
-                        if (processedRanges.has(rangeKey)) return true;
-                        processedRanges.add(rangeKey);
-
-                        const paramsNode = child.childForFieldName('parameters');
-                        const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                        const returnType = extractReturnType(child);
-                        const generics = extractGenerics(child);
-                        const docstring = extractJSDocstring(lines, startLine);
-                        const isGen = isGenerator(child);
-
-                        functions.push({
-                            name: 'default',
-                            params: extractParams(paramsNode),
-                            paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
-                            startLine,
-                            endLine,
-                            indent,
-                            isArrow: child.type === 'arrow_function',
-                            isGenerator: isGen,
-                            modifiers: ['export', 'default'],
-                            ...(returnType && { returnType }),
-                            ...(generics && { generics }),
-                            ...(docstring && { docstring })
-                        });
-                        return true;
-                    }
-                }
-            }
-            return true;
-        }
-
+        _processFunction(node, functions, processedRanges, lines);
         return true;
     });
-
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
+}
+
+/**
+ * Process a node for class/interface/type/enum extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processClass(node, classes, processedRanges, lines) {
+    // Class declarations (including abstract classes)
+    if (node.type === 'class_declaration' || node.type === 'class' || node.type === 'abstract_class_declaration') {
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const members = extractClassMembers(node, lines);
+            const docstring = extractJSDocstring(lines, startLine);
+            const generics = extractGenerics(node);
+            const extendsInfo = extractExtends(node);
+            const implementsInfo = extractImplements(node);
+            const decorators = extractDecorators(node);
+
+            const isAbstract = node.type === 'abstract_class_declaration';
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'class',
+                members,
+                ...(isAbstract && { modifiers: ['abstract'] }),
+                ...(docstring && { docstring }),
+                ...(generics && { generics }),
+                ...(extendsInfo && { extends: extendsInfo }),
+                ...(implementsInfo.length > 0 && { implements: implementsInfo }),
+                ...(decorators.length > 0 && { decorators })
+            });
+        }
+        return true;
+    }
+
+    // TypeScript interface declarations
+    if (node.type === 'interface_declaration') {
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractJSDocstring(lines, startLine);
+            const generics = extractGenerics(node);
+            const extendsInfo = extractInterfaceExtends(node);
+            const members = extractInterfaceMembers(node, lines);
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'interface',
+                members,
+                ...(docstring && { docstring }),
+                ...(generics && { generics }),
+                ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
+            });
+        }
+        return true;
+    }
+
+    // TypeScript type alias declarations
+    if (node.type === 'type_alias_declaration') {
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractJSDocstring(lines, startLine);
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'type',
+                members: [],
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    // TypeScript enum declarations
+    if (node.type === 'enum_declaration') {
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractJSDocstring(lines, startLine);
+            const members = extractEnumMembers(node, lines);
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'enum',
+                members,
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    // TypeScript namespace/module declarations
+    if (node.type === 'internal_module' || node.type === 'module') {
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractJSDocstring(lines, startLine);
+
+            classes.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'namespace',
+                members: [],
+                ...(docstring && { docstring })
+            });
+        }
+        // Matched but continue traversal to find inner functions/classes
+        return true;
+    }
+
+    return false;
 }
 
 /**
@@ -413,124 +543,15 @@ function findClasses(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const classes = [];
-
+    const processedRanges = new Set();
     traverseTreeCached(tree.rootNode, (node) => {
-        // Class declarations (including abstract classes)
-        if (node.type === 'class_declaration' || node.type === 'class' || node.type === 'abstract_class_declaration') {
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const members = extractClassMembers(node, lines);
-                const docstring = extractJSDocstring(lines, startLine);
-                const generics = extractGenerics(node);
-                const extendsInfo = extractExtends(node);
-                const implementsInfo = extractImplements(node);
-                const decorators = extractDecorators(node);
-
-                const isAbstract = node.type === 'abstract_class_declaration';
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'class',
-                    members,
-                    ...(isAbstract && { modifiers: ['abstract'] }),
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics }),
-                    ...(extendsInfo && { extends: extendsInfo }),
-                    ...(implementsInfo.length > 0 && { implements: implementsInfo }),
-                    ...(decorators.length > 0 && { decorators })
-                });
-            }
+        const matched = _processClass(node, classes, processedRanges, lines);
+        // Skip subtrees for class/interface/type/enum (but not namespace)
+        if (matched && node.type !== 'internal_module' && node.type !== 'module') {
             return false;
         }
-
-        // TypeScript interface declarations
-        if (node.type === 'interface_declaration') {
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractJSDocstring(lines, startLine);
-                const generics = extractGenerics(node);
-                const extendsInfo = extractInterfaceExtends(node);
-                const members = extractInterfaceMembers(node, lines);
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'interface',
-                    members,
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics }),
-                    ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
-                });
-            }
-            return false;
-        }
-
-        // TypeScript type alias declarations
-        if (node.type === 'type_alias_declaration') {
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractJSDocstring(lines, startLine);
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'type',
-                    members: [],
-                    ...(docstring && { docstring })
-                });
-            }
-            return false;
-        }
-
-        // TypeScript enum declarations
-        if (node.type === 'enum_declaration') {
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractJSDocstring(lines, startLine);
-                const members = extractEnumMembers(node, lines);
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'enum',
-                    members,
-                    ...(docstring && { docstring })
-                });
-            }
-            return false;
-        }
-
-        // TypeScript namespace/module declarations
-        if (node.type === 'internal_module' || node.type === 'module') {
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractJSDocstring(lines, startLine);
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'namespace',
-                    members: [],
-                    ...(docstring && { docstring })
-                });
-            }
-            // Continue traversal to find inner functions/classes
-            return true;
-        }
-
         return true;
     });
-
     classes.sort((a, b) => a.startLine - b.startLine);
     return classes;
 }
@@ -870,6 +891,51 @@ function extractClassMembers(classNode, codeOrLines) {
     return members;
 }
 
+// Module-level state detection helpers
+const _STATE_PATTERN = /^(CONFIG|[A-Z][a-zA-Z]*(?:State|Store|Context|Options|Settings)|[A-Z][A-Z_]+|Entities|Input)$/;
+const _ACTION_PATTERN = /^(action\w*|[a-z]+Action|[a-z]+State)$/;
+const _FACTORY_FUNCTIONS = ['register', 'createAction', 'defineAction', 'makeAction'];
+
+function _isFactoryCall(node) {
+    if (node.type !== 'call_expression') return false;
+    const funcNode = node.childForFieldName('function');
+    if (!funcNode) return false;
+    const funcName = funcNode.type === 'identifier' ? funcNode.text : null;
+    return funcName && _FACTORY_FUNCTIONS.includes(funcName);
+}
+
+/**
+ * Process a node for state object extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processState(node, objects, lines) {
+    if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const declarator = node.namedChild(i);
+            if (declarator.type === 'variable_declarator') {
+                const nameNode = declarator.childForFieldName('name');
+                const valueNode = declarator.childForFieldName('value');
+
+                if (nameNode && valueNode) {
+                    const name = nameNode.text;
+                    const isObject = valueNode.type === 'object';
+                    const isArray = valueNode.type === 'array';
+
+                    if ((isObject || isArray) && _STATE_PATTERN.test(name)) {
+                        const { startLine, endLine } = nodeToLocation(node, lines);
+                        objects.push({ name, startLine, endLine });
+                    } else if (_isFactoryCall(valueNode) && (_ACTION_PATTERN.test(name) || _STATE_PATTERN.test(name))) {
+                        const { startLine, endLine } = nodeToLocation(node, lines);
+                        objects.push({ name, startLine, endLine });
+                    }
+                }
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 /**
  * Find state objects (CONFIG, constants, etc.)
  */
@@ -877,46 +943,10 @@ function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const objects = [];
-
-    const statePattern = /^(CONFIG|[A-Z][a-zA-Z]*(?:State|Store|Context|Options|Settings)|[A-Z][A-Z_]+|Entities|Input)$/;
-    const actionPattern = /^(action\w*|[a-z]+Action|[a-z]+State)$/;
-    const factoryFunctions = ['register', 'createAction', 'defineAction', 'makeAction'];
-
-    const isFactoryCall = (node) => {
-        if (node.type !== 'call_expression') return false;
-        const funcNode = node.childForFieldName('function');
-        if (!funcNode) return false;
-        const funcName = funcNode.type === 'identifier' ? funcNode.text : null;
-        return funcName && factoryFunctions.includes(funcName);
-    };
-
     traverseTreeCached(tree.rootNode, (node) => {
-        if (node.type === 'lexical_declaration' || node.type === 'variable_declaration') {
-            for (let i = 0; i < node.namedChildCount; i++) {
-                const declarator = node.namedChild(i);
-                if (declarator.type === 'variable_declarator') {
-                    const nameNode = declarator.childForFieldName('name');
-                    const valueNode = declarator.childForFieldName('value');
-
-                    if (nameNode && valueNode) {
-                        const name = nameNode.text;
-                        const isObject = valueNode.type === 'object';
-                        const isArray = valueNode.type === 'array';
-
-                        if ((isObject || isArray) && statePattern.test(name)) {
-                            const { startLine, endLine } = nodeToLocation(node, lines);
-                            objects.push({ name, startLine, endLine });
-                        } else if (isFactoryCall(valueNode) && (actionPattern.test(name) || statePattern.test(name))) {
-                            const { startLine, endLine } = nodeToLocation(node, lines);
-                            objects.push({ name, startLine, endLine });
-                        }
-                    }
-                }
-            }
-        }
+        _processState(node, objects, lines);
         return true;
     });
-
     objects.sort((a, b) => a.startLine - b.startLine);
     return objects;
 }
@@ -928,13 +958,28 @@ function findStateObjects(code, parser) {
  * @returns {ParseResult}
  */
 function parse(code, parser) {
+    const tree = parseTree(parser, code);
     const lines = code.split('\n');
+    const functions = [], classes = [], stateObjects = [];
+    const processedFn = new Set(), processedCls = new Set();
+
+    traverseTreeCached(tree.rootNode, (node) => {
+        _processFunction(node, functions, processedFn, lines);
+        _processClass(node, classes, processedCls, lines);
+        _processState(node, stateObjects, lines);
+        return true; // always continue, never skip subtrees
+    });
+
+    functions.sort((a, b) => a.startLine - b.startLine);
+    classes.sort((a, b) => a.startLine - b.startLine);
+    stateObjects.sort((a, b) => a.startLine - b.startLine);
+
     return {
         language: 'javascript',
         totalLines: lines.length,
-        functions: findFunctions(code, parser),
-        classes: findClasses(code, parser),
-        stateObjects: findStateObjects(code, parser),
+        functions,
+        classes,
+        stateObjects,
         imports: [],  // Handled by core/imports.js
         exports: []   // Handled by core/imports.js
     };

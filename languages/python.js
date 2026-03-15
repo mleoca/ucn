@@ -63,6 +63,169 @@ function extractPythonParams(paramsNode) {
     return params;
 }
 
+// --- Single-pass helpers: extracted from find* callbacks ---
+
+/**
+ * Process a node for function extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processFunction(node, functions, processedRanges, lines, code) {
+    if (node.type === 'function_definition') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        // Skip functions that are inside a class (they're extracted as class members)
+        let parent = node.parent;
+        // Handle decorated_definition wrapper
+        if (parent && parent.type === 'decorated_definition') {
+            parent = parent.parent;
+        }
+        // Check if parent is a class body (block inside class_definition)
+        if (parent && parent.type === 'block') {
+            const grandparent = parent.parent;
+            if (grandparent && grandparent.type === 'class_definition') {
+                return true;  // Skip - this is a class method
+            }
+        }
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            // Check for decorators
+            let startLine = node.startPosition.row + 1;
+            let decoratorStartLine = startLine;
+
+            if (node.parent && node.parent.type === 'decorated_definition') {
+                decoratorStartLine = node.parent.startPosition.row + 1;
+            }
+
+            const endLine = node.endPosition.row + 1;
+            const indent = getIndent(node, code);
+            const returnType = extractReturnType(node);
+            const defLine = getDefLine(node);
+            const docstring = extractPythonDocstring(lines, defLine);
+
+            // Check for async
+            const isAsync = node.text.trimStart().startsWith('async ');
+
+            // Extract decorators
+            const decorators = extractDecorators(node);
+
+            // nameLine: the line where the name identifier lives (for deadcode def-site filtering)
+            // Only set when different from startLine (i.e., when decorators push startLine earlier)
+            const nameLine = nameNode.startPosition.row + 1;
+
+            functions.push({
+                name: nameNode.text,
+                params: extractPythonParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'python'),
+                startLine: decoratorStartLine,
+                endLine,
+                indent,
+                isAsync,
+                modifiers: isAsync ? ['async'] : [],
+                ...(returnType && { returnType }),
+                ...(docstring && { docstring }),
+                ...(decorators.length > 0 && { decorators }),
+                ...(nameLine !== decoratorStartLine && { nameLine })
+            });
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Process a node for class extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processClass(node, classes, processedRanges, lines) {
+    if (node.type !== 'class_definition') return false;
+
+    const rangeKey = `${node.startIndex}-${node.endIndex}`;
+    if (processedRanges.has(rangeKey)) return true;
+    processedRanges.add(rangeKey);
+
+    const nameNode = node.childForFieldName('name');
+
+    if (nameNode) {
+        // Check for decorators
+        let startLine = node.startPosition.row + 1;
+        if (node.parent && node.parent.type === 'decorated_definition') {
+            startLine = node.parent.startPosition.row + 1;
+        }
+
+        const endLine = node.endPosition.row + 1;
+        const members = extractClassMembers(node, lines);
+        const defLine = getDefLine(node);
+        const docstring = extractPythonDocstring(lines, defLine);
+        const decorators = extractDecorators(node);
+        const bases = extractBases(node);
+        const nameLine = nameNode.startPosition.row + 1;
+
+        classes.push({
+            name: nameNode.text,
+            startLine,
+            endLine,
+            type: 'class',
+            members,
+            ...(docstring && { docstring }),
+            ...(decorators.length > 0 && { decorators }),
+            ...(bases.length > 0 && { extends: bases.join(', ') }),
+            ...(nameLine !== startLine && { nameLine })
+        });
+    }
+    return true;
+}
+
+// Module-level state detection patterns
+const _STATE_PATTERN = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
+// Pattern for UPPER_CASE constants that may have scalar values (string, number, bool, etc.)
+const _CONSTANT_PATTERN = /^[A-Z][A-Z0-9_]{1,}$/;
+// RHS types that are scalar/simple values (not dict/list which are handled separately)
+const _SCALAR_TYPES = new Set([
+    'string', 'concatenated_string', 'integer', 'float', 'true', 'false', 'none',
+    'unary_operator', 'binary_operator', 'tuple', 'set', 'parenthesized_expression',
+    'call', 'attribute', 'identifier', 'subscript',
+]);
+
+/**
+ * Process a node for state object extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processState(node, objects, lines) {
+    if (node.type === 'expression_statement' && node.parent && node.parent.parent === null) {
+        const child = node.namedChild(0);
+        if (child && child.type === 'assignment') {
+            const leftNode = child.childForFieldName('left');
+            const rightNode = child.childForFieldName('right');
+
+            if (leftNode && leftNode.type === 'identifier' && rightNode) {
+                const name = leftNode.text;
+                const isObject = rightNode.type === 'dictionary';
+                const isArray = rightNode.type === 'list';
+
+                if ((isObject || isArray) && _STATE_PATTERN.test(name)) {
+                    const { startLine, endLine } = nodeToLocation(node, lines);
+                    objects.push({ name, startLine, endLine });
+                    return true;
+                } else if (_CONSTANT_PATTERN.test(name) && _SCALAR_TYPES.has(rightNode.type)) {
+                    // Module-level UPPER_CASE constants with scalar values
+                    const { startLine, endLine } = nodeToLocation(node, lines);
+                    objects.push({ name, startLine, endLine, isConstant: true });
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// --- End single-pass helpers ---
+
 /**
  * Find all functions in Python code using tree-sitter
  */
@@ -71,81 +234,10 @@ function findFunctions(code, parser) {
     const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        if (node.type === 'function_definition') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            // Skip functions that are inside a class (they're extracted as class members)
-            let parent = node.parent;
-            // Handle decorated_definition wrapper
-            if (parent && parent.type === 'decorated_definition') {
-                parent = parent.parent;
-            }
-            // Check if parent is a class body (block inside class_definition)
-            if (parent && parent.type === 'block') {
-                const grandparent = parent.parent;
-                if (grandparent && grandparent.type === 'class_definition') {
-                    return true;  // Skip - this is a class method
-                }
-            }
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                // Check for decorators
-                let startLine = node.startPosition.row + 1;
-                let decoratorStartLine = startLine;
-
-                if (node.parent && node.parent.type === 'decorated_definition') {
-                    decoratorStartLine = node.parent.startPosition.row + 1;
-                }
-
-                const endLine = node.endPosition.row + 1;
-                const indent = getIndent(node, code);
-                const returnType = extractReturnType(node);
-                const defLine = getDefLine(node);
-                const docstring = extractPythonDocstring(lines, defLine);
-
-                // Check for async
-                const isAsync = node.text.trimStart().startsWith('async ');
-
-                // Extract decorators
-                const decorators = extractDecorators(node);
-
-                // nameLine: the line where the name identifier lives (for deadcode def-site filtering)
-                // Only set when different from startLine (i.e., when decorators push startLine earlier)
-                const nameLine = nameNode.startPosition.row + 1;
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractPythonParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'python'),
-                    startLine: decoratorStartLine,
-                    endLine,
-                    indent,
-                    isAsync,
-                    modifiers: isAsync ? ['async'] : [],
-                    ...(returnType && { returnType }),
-                    ...(docstring && { docstring }),
-                    ...(decorators.length > 0 && { decorators }),
-                    ...(nameLine !== decoratorStartLine && { nameLine })
-                });
-            }
-            return true;
-        }
-
-        if (node.type === 'decorated_definition') {
-            return true;  // Continue traversing into decorated definitions
-        }
-
+        _processFunction(node, functions, processedRanges, lines, code);
         return true;
     });
-
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
 }
@@ -174,51 +266,10 @@ function findClasses(code, parser) {
     const lines = code.split('\n');
     const classes = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        if (node.type === 'class_definition') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-
-            if (nameNode) {
-                // Check for decorators
-                let startLine = node.startPosition.row + 1;
-                if (node.parent && node.parent.type === 'decorated_definition') {
-                    startLine = node.parent.startPosition.row + 1;
-                }
-
-                const endLine = node.endPosition.row + 1;
-                const members = extractClassMembers(node, lines);
-                const defLine = getDefLine(node);
-                const docstring = extractPythonDocstring(lines, defLine);
-                const decorators = extractDecorators(node);
-                const bases = extractBases(node);
-                const nameLine = nameNode.startPosition.row + 1;
-
-                classes.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'class',
-                    members,
-                    ...(docstring && { docstring }),
-                    ...(decorators.length > 0 && { decorators }),
-                    ...(bases.length > 0 && { extends: bases.join(', ') }),
-                    ...(nameLine !== startLine && { nameLine })
-                });
-            }
-            // Traverse into class body to find nested classes (e.g., Django Meta, inner classes)
-            // Methods are already handled via extractClassMembers above; processedRanges prevents duplication
-            return true;
-        }
-
+        _processClass(node, classes, processedRanges, lines);
         return true;
     });
-
     classes.sort((a, b) => a.startLine - b.startLine);
     return classes;
 }
@@ -342,43 +393,10 @@ function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const objects = [];
-
-    const statePattern = /^(CONFIG|SETTINGS|[A-Z][A-Z0-9_]+|[A-Z][a-zA-Z]*(?:Config|Settings|Options|State|Store|Context))$/;
-    // Pattern for UPPER_CASE constants that may have scalar values (string, number, bool, etc.)
-    const constantPattern = /^[A-Z][A-Z0-9_]{1,}$/;
-    // RHS types that are scalar/simple values (not dict/list which are handled separately)
-    const scalarTypes = new Set([
-        'string', 'concatenated_string', 'integer', 'float', 'true', 'false', 'none',
-        'unary_operator', 'binary_operator', 'tuple', 'set', 'parenthesized_expression',
-        'call', 'attribute', 'identifier', 'subscript',
-    ]);
-
     traverseTreeCached(tree.rootNode, (node) => {
-        if (node.type === 'expression_statement' && node.parent === tree.rootNode) {
-            const child = node.namedChild(0);
-            if (child && child.type === 'assignment') {
-                const leftNode = child.childForFieldName('left');
-                const rightNode = child.childForFieldName('right');
-
-                if (leftNode && leftNode.type === 'identifier' && rightNode) {
-                    const name = leftNode.text;
-                    const isObject = rightNode.type === 'dictionary';
-                    const isArray = rightNode.type === 'list';
-
-                    if ((isObject || isArray) && statePattern.test(name)) {
-                        const { startLine, endLine } = nodeToLocation(node, lines);
-                        objects.push({ name, startLine, endLine });
-                    } else if (constantPattern.test(name) && scalarTypes.has(rightNode.type)) {
-                        // Module-level UPPER_CASE constants with scalar values
-                        const { startLine, endLine } = nodeToLocation(node, lines);
-                        objects.push({ name, startLine, endLine, isConstant: true });
-                    }
-                }
-            }
-        }
+        _processState(node, objects, lines);
         return true;
     });
-
     objects.sort((a, b) => a.startLine - b.startLine);
     return objects;
 }
@@ -387,13 +405,31 @@ function findStateObjects(code, parser) {
  * Parse a Python file completely
  */
 function parse(code, parser) {
-    const totalLines = code.split('\n').length;
+    const tree = parseTree(parser, code);
+    const lines = code.split('\n');
+    const functions = [];
+    const classes = [];
+    const stateObjects = [];
+    const processedFn = new Set();
+    const processedCls = new Set();
+
+    traverseTreeCached(tree.rootNode, (node) => {
+        _processFunction(node, functions, processedFn, lines, code);
+        _processClass(node, classes, processedCls, lines);
+        _processState(node, stateObjects, lines);
+        return true;
+    });
+
+    functions.sort((a, b) => a.startLine - b.startLine);
+    classes.sort((a, b) => a.startLine - b.startLine);
+    stateObjects.sort((a, b) => a.startLine - b.startLine);
+
     return {
         language: 'python',
-        totalLines,
-        functions: findFunctions(code, parser),
-        classes: findClasses(code, parser),
-        stateObjects: findStateObjects(code, parser),
+        totalLines: lines.length,
+        functions,
+        classes,
+        stateObjects,
         imports: [],
         exports: []
     };

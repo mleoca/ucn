@@ -93,6 +93,385 @@ function extractAttributes(node, codeOrLines) {
     return attributes;
 }
 
+// --- Module-scope constants for state object detection ---
+const _STATE_PATTERN = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
+
+// --- Single-pass helpers: extracted from find* callbacks ---
+
+/**
+ * Process a node for function extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processFunction(node, functions, processedRanges, lines, code) {
+    if (node.type === 'function_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        // Skip functions inside impl/trait blocks (they're extracted as members)
+        let parent = node.parent;
+        if (parent && (parent.type === 'impl_item' || parent.type === 'trait_item' || parent.type === 'declaration_list')) {
+            // declaration_list is the body of an impl/trait block
+            const grandparent = parent.parent;
+            if (grandparent && (grandparent.type === 'impl_item' || grandparent.type === 'trait_item')) {
+                return true;  // Skip - this is an impl/trait method
+            }
+            if (parent.type === 'impl_item' || parent.type === 'trait_item') {
+                return true;  // Skip - this is an impl/trait method
+            }
+        }
+
+        const nameNode = node.childForFieldName('name');
+        const paramsNode = node.childForFieldName('parameters');
+
+        if (nameNode) {
+            const { startLine, endLine, indent } = nodeToLocation(node, lines);
+            const text = node.text;
+            const firstLine = text.split('\n')[0];
+
+            const isAsync = firstLine.includes('async ');
+            const isUnsafe = firstLine.includes('unsafe ');
+            const isConst = firstLine.includes('const fn');
+            const isExtern = firstLine.includes('extern ');
+            const visibility = extractVisibility(text);
+            const returnType = extractReturnType(node);
+            const docstring = extractRustDocstring(lines, startLine);
+            const generics = extractGenerics(node);
+            const attributes = extractAttributes(node, lines);
+
+            const modifiers = [];
+            if (visibility) modifiers.push(visibility);
+            if (isAsync) modifiers.push('async');
+            if (isUnsafe) modifiers.push('unsafe');
+            if (isConst) modifiers.push('const');
+            if (isExtern) modifiers.push('extern');
+            // Add attributes like #[test] to modifiers
+            for (const attr of attributes) {
+                modifiers.push(attr);
+            }
+
+            functions.push({
+                name: nameNode.text,
+                params: extractRustParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'rust'),
+                startLine,
+                endLine,
+                indent,
+                modifiers,
+                ...(returnType && { returnType }),
+                ...(docstring && { docstring }),
+                ...(generics && { generics })
+            });
+        }
+        return true;
+    }
+
+    // Extern block declarations: extern "C" { fn foreign_func(); }
+    if (node.type === 'foreign_mod_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const declList = node.childForFieldName('body');
+        if (declList) {
+            for (let i = 0; i < declList.namedChildCount; i++) {
+                const child = declList.namedChild(i);
+                if (child.type === 'function_signature_item') {
+                    const fName = child.childForFieldName('name');
+                    const fParams = child.childForFieldName('parameters');
+                    if (fName) {
+                        const { startLine, endLine, indent } = nodeToLocation(child, lines);
+                        const visibility = extractVisibility(child.text);
+                        const returnType = extractReturnType(child);
+                        const docstring = extractRustDocstring(lines, startLine);
+                        const modifiers = ['extern'];
+                        if (visibility) modifiers.push(visibility);
+
+                        functions.push({
+                            name: fName.text,
+                            params: extractRustParams(fParams),
+                            paramsStructured: parseStructuredParams(fParams, 'rust'),
+                            startLine,
+                            endLine,
+                            indent,
+                            modifiers,
+                            ...(returnType && { returnType }),
+                            ...(docstring && { docstring })
+                        });
+                    }
+                }
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Process a node for type/class extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ * Note: for impl_item, caller should NOT skip subtrees (parse() always returns true)
+ */
+function _processClass(node, types, processedRanges, lines, code) {
+    // Struct items
+    if (node.type === 'struct_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractRustDocstring(lines, startLine);
+            const visibility = extractVisibility(node.text);
+            const generics = extractGenerics(node);
+            const members = extractStructFields(node, lines);
+            const attributes = extractAttributes(node, lines);
+            const modifiers = visibility ? [visibility] : [];
+            for (const attr of attributes) modifiers.push(attr);
+
+            types.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'struct',
+                members,
+                modifiers,
+                ...(docstring && { docstring }),
+                ...(generics && { generics })
+            });
+        }
+        return true;
+    }
+
+    // Enum items
+    if (node.type === 'enum_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractRustDocstring(lines, startLine);
+            const visibility = extractVisibility(node.text);
+            const generics = extractGenerics(node);
+            const attributes = extractAttributes(node, lines);
+            const modifiers = visibility ? [visibility] : [];
+            for (const attr of attributes) modifiers.push(attr);
+
+            types.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'enum',
+                members: extractEnumVariants(node, lines),
+                modifiers,
+                ...(docstring && { docstring }),
+                ...(generics && { generics })
+            });
+        }
+        return true;
+    }
+
+    // Trait items
+    if (node.type === 'trait_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractRustDocstring(lines, startLine);
+            const visibility = extractVisibility(node.text);
+            const generics = extractGenerics(node);
+
+            types.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'trait',
+                members: extractTraitMembers(node, lines),
+                modifiers: visibility ? [visibility] : [],
+                ...(docstring && { docstring }),
+                ...(generics && { generics })
+            });
+        }
+        return true;
+    }
+
+    // Impl items
+    if (node.type === 'impl_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const { startLine, endLine } = nodeToLocation(node, lines);
+        const implInfo = extractImplInfo(node);
+        const docstring = extractRustDocstring(lines, startLine);
+
+        types.push({
+            name: implInfo.name,
+            startLine,
+            endLine,
+            type: 'impl',
+            traitName: implInfo.traitName,
+            typeName: implInfo.typeName,
+            members: extractImplMembers(node, lines, implInfo.typeName),
+            modifiers: [],
+            ...(docstring && { docstring })
+        });
+        return true;  // matched
+    }
+
+    // Module items
+    if (node.type === 'mod_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractRustDocstring(lines, startLine);
+            const visibility = extractVisibility(node.text);
+            const attributes = extractAttributes(node, lines);
+            const modifiers = visibility ? [visibility] : [];
+            for (const attr of attributes) modifiers.push(attr);
+
+            types.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'module',
+                members: [],
+                modifiers,
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    // Macro definitions
+    if (node.type === 'macro_definition') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractRustDocstring(lines, startLine);
+
+            types.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'macro',
+                members: [],
+                modifiers: [],
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    // Type aliases (only top-level, not inside traits/impls)
+    if (node.type === 'type_item') {
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return true;
+
+        // Skip if inside trait or impl
+        let parent = node.parent;
+        while (parent) {
+            if (parent.type === 'trait_item' || parent.type === 'impl_item') {
+                return true;  // Skip this one
+            }
+            parent = parent.parent;
+        }
+
+        processedRanges.add(rangeKey);
+
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const { startLine, endLine } = nodeToLocation(node, lines);
+            const docstring = extractRustDocstring(lines, startLine);
+            const visibility = extractVisibility(node.text);
+
+            types.push({
+                name: nameNode.text,
+                startLine,
+                endLine,
+                type: 'type',
+                members: [],
+                modifiers: visibility ? [visibility] : [],
+                ...(docstring && { docstring })
+            });
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Post-process types: surface trait impls as 'implements' on the corresponding struct/enum
+ */
+function _postProcessTraitImpls(types) {
+    const implTraits = new Map(); // typeName → [traitName, ...]
+    for (const t of types) {
+        if (t.type === 'impl' && t.traitName && t.typeName) {
+            if (!implTraits.has(t.typeName)) implTraits.set(t.typeName, []);
+            implTraits.get(t.typeName).push(t.traitName);
+        }
+    }
+    for (const t of types) {
+        if ((t.type === 'struct' || t.type === 'enum') && implTraits.has(t.name)) {
+            t.implements = implTraits.get(t.name);
+        }
+    }
+}
+
+/**
+ * Process a node for state object extraction (single-pass helper)
+ * Returns true if node was matched, false otherwise
+ */
+function _processState(node, objects, lines) {
+    // Handle const items (only top-level)
+    if (node.type === 'const_item') {
+        if (!node.parent || node.parent.type !== 'source_file') return false;
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const name = nameNode.text;
+            if (_STATE_PATTERN.test(name)) {
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                objects.push({ name, startLine, endLine });
+            }
+        }
+        return true;
+    }
+
+    // Handle static items (only top-level)
+    if (node.type === 'static_item') {
+        if (!node.parent || node.parent.type !== 'source_file') return false;
+        const nameNode = node.childForFieldName('name');
+        if (nameNode) {
+            const name = nameNode.text;
+            if (_STATE_PATTERN.test(name)) {
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                objects.push({ name, startLine, endLine });
+            }
+        }
+        return true;
+    }
+
+    return false;
+}
+
+// --- End single-pass helpers ---
+
 /**
  * Find all functions in Rust code using tree-sitter
  */
@@ -101,113 +480,10 @@ function findFunctions(code, parser) {
     const lines = code.split('\n');
     const functions = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        if (node.type === 'function_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            // Skip functions inside impl/trait blocks (they're extracted as members)
-            let parent = node.parent;
-            if (parent && (parent.type === 'impl_item' || parent.type === 'trait_item' || parent.type === 'declaration_list')) {
-                // declaration_list is the body of an impl/trait block
-                const grandparent = parent.parent;
-                if (grandparent && (grandparent.type === 'impl_item' || grandparent.type === 'trait_item')) {
-                    return true;  // Skip - this is an impl/trait method
-                }
-                if (parent.type === 'impl_item' || parent.type === 'trait_item') {
-                    return true;  // Skip - this is an impl/trait method
-                }
-            }
-
-            const nameNode = node.childForFieldName('name');
-            const paramsNode = node.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine, indent } = nodeToLocation(node, lines);
-                const text = node.text;
-                const firstLine = text.split('\n')[0];
-
-                const isAsync = firstLine.includes('async ');
-                const isUnsafe = firstLine.includes('unsafe ');
-                const isConst = firstLine.includes('const fn');
-                const isExtern = firstLine.includes('extern ');
-                const visibility = extractVisibility(text);
-                const returnType = extractReturnType(node);
-                const docstring = extractRustDocstring(lines, startLine);
-                const generics = extractGenerics(node);
-                const attributes = extractAttributes(node, lines);
-
-                const modifiers = [];
-                if (visibility) modifiers.push(visibility);
-                if (isAsync) modifiers.push('async');
-                if (isUnsafe) modifiers.push('unsafe');
-                if (isConst) modifiers.push('const');
-                if (isExtern) modifiers.push('extern');
-                // Add attributes like #[test] to modifiers
-                for (const attr of attributes) {
-                    modifiers.push(attr);
-                }
-
-                functions.push({
-                    name: nameNode.text,
-                    params: extractRustParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'rust'),
-                    startLine,
-                    endLine,
-                    indent,
-                    modifiers,
-                    ...(returnType && { returnType }),
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics })
-                });
-            }
-            return true;
-        }
-
-        // Extern block declarations: extern "C" { fn foreign_func(); }
-        if (node.type === 'foreign_mod_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const declList = node.childForFieldName('body');
-            if (declList) {
-                for (let i = 0; i < declList.namedChildCount; i++) {
-                    const child = declList.namedChild(i);
-                    if (child.type === 'function_signature_item') {
-                        const fName = child.childForFieldName('name');
-                        const fParams = child.childForFieldName('parameters');
-                        if (fName) {
-                            const { startLine, endLine, indent } = nodeToLocation(child, lines);
-                            const visibility = extractVisibility(child.text);
-                            const returnType = extractReturnType(child);
-                            const docstring = extractRustDocstring(lines, startLine);
-                            const modifiers = ['extern'];
-                            if (visibility) modifiers.push(visibility);
-
-                            functions.push({
-                                name: fName.text,
-                                params: extractRustParams(fParams),
-                                paramsStructured: parseStructuredParams(fParams, 'rust'),
-                                startLine,
-                                endLine,
-                                indent,
-                                modifiers,
-                                ...(returnType && { returnType }),
-                                ...(docstring && { docstring })
-                            });
-                        }
-                    }
-                }
-            }
-            return true;
-        }
-
+        _processFunction(node, functions, processedRanges, lines, code);
         return true;
     });
-
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
 }
@@ -231,219 +507,13 @@ function findClasses(code, parser) {
     const lines = code.split('\n');
     const types = [];
     const processedRanges = new Set();
-
     traverseTreeCached(tree.rootNode, (node) => {
-        const rangeKey = `${node.startIndex}-${node.endIndex}`;
-
-        // Struct items
-        if (node.type === 'struct_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractRustDocstring(lines, startLine);
-                const visibility = extractVisibility(node.text);
-                const generics = extractGenerics(node);
-                const members = extractStructFields(node, lines);
-                const attributes = extractAttributes(node, lines);
-                const modifiers = visibility ? [visibility] : [];
-                for (const attr of attributes) modifiers.push(attr);
-
-                types.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'struct',
-                    members,
-                    modifiers,
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics })
-                });
-            }
-            return true;
-        }
-
-        // Enum items
-        if (node.type === 'enum_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractRustDocstring(lines, startLine);
-                const visibility = extractVisibility(node.text);
-                const generics = extractGenerics(node);
-                const attributes = extractAttributes(node, lines);
-                const modifiers = visibility ? [visibility] : [];
-                for (const attr of attributes) modifiers.push(attr);
-
-                types.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'enum',
-                    members: extractEnumVariants(node, lines),
-                    modifiers,
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics })
-                });
-            }
-            return true;
-        }
-
-        // Trait items
-        if (node.type === 'trait_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractRustDocstring(lines, startLine);
-                const visibility = extractVisibility(node.text);
-                const generics = extractGenerics(node);
-
-                types.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'trait',
-                    members: extractTraitMembers(node, lines),
-                    modifiers: visibility ? [visibility] : [],
-                    ...(docstring && { docstring }),
-                    ...(generics && { generics })
-                });
-            }
-            return true;
-        }
-
-        // Impl items
-        if (node.type === 'impl_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const { startLine, endLine } = nodeToLocation(node, lines);
-            const implInfo = extractImplInfo(node);
-            const docstring = extractRustDocstring(lines, startLine);
-
-            types.push({
-                name: implInfo.name,
-                startLine,
-                endLine,
-                type: 'impl',
-                traitName: implInfo.traitName,
-                typeName: implInfo.typeName,
-                members: extractImplMembers(node, lines, implInfo.typeName),
-                modifiers: [],
-                ...(docstring && { docstring })
-            });
-            return false;  // Don't traverse into impl body
-        }
-
-        // Module items
-        if (node.type === 'mod_item') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractRustDocstring(lines, startLine);
-                const visibility = extractVisibility(node.text);
-                const attributes = extractAttributes(node, lines);
-                const modifiers = visibility ? [visibility] : [];
-                for (const attr of attributes) modifiers.push(attr);
-
-                types.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'module',
-                    members: [],
-                    modifiers,
-                    ...(docstring && { docstring })
-                });
-            }
-            return true;
-        }
-
-        // Macro definitions
-        if (node.type === 'macro_definition') {
-            if (processedRanges.has(rangeKey)) return true;
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractRustDocstring(lines, startLine);
-
-                types.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'macro',
-                    members: [],
-                    modifiers: [],
-                    ...(docstring && { docstring })
-                });
-            }
-            return true;
-        }
-
-        // Type aliases (only top-level, not inside traits/impls)
-        if (node.type === 'type_item') {
-            if (processedRanges.has(rangeKey)) return true;
-
-            // Skip if inside trait or impl
-            let parent = node.parent;
-            while (parent) {
-                if (parent.type === 'trait_item' || parent.type === 'impl_item') {
-                    return true;  // Skip this one
-                }
-                parent = parent.parent;
-            }
-
-            processedRanges.add(rangeKey);
-
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(node, lines);
-                const docstring = extractRustDocstring(lines, startLine);
-                const visibility = extractVisibility(node.text);
-
-                types.push({
-                    name: nameNode.text,
-                    startLine,
-                    endLine,
-                    type: 'type',
-                    members: [],
-                    modifiers: visibility ? [visibility] : [],
-                    ...(docstring && { docstring })
-                });
-            }
-            return true;
-        }
-
+        const matched = _processClass(node, types, processedRanges, lines, code);
+        // For impl_item, don't traverse into impl body (original behavior)
+        if (matched && node.type === 'impl_item') return false;
         return true;
     });
-
-    // Post-process: surface trait impls as 'implements' on the corresponding struct/enum
-    const implTraits = new Map(); // typeName → [traitName, ...]
-    for (const t of types) {
-        if (t.type === 'impl' && t.traitName && t.typeName) {
-            if (!implTraits.has(t.typeName)) implTraits.set(t.typeName, []);
-            implTraits.get(t.typeName).push(t.traitName);
-        }
-    }
-    for (const t of types) {
-        if ((t.type === 'struct' || t.type === 'enum') && implTraits.has(t.name)) {
-            t.implements = implTraits.get(t.name);
-        }
-    }
-
+    _postProcessTraitImpls(types);
     types.sort((a, b) => a.startLine - b.startLine);
     return types;
 }
@@ -657,41 +727,10 @@ function findStateObjects(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const objects = [];
-
-    const statePattern = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
-
     traverseTreeCached(tree.rootNode, (node) => {
-        // Handle const items (only top-level)
-        if (node.type === 'const_item') {
-            if (!node.parent || node.parent.type !== 'source_file') return true;
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const name = nameNode.text;
-                if (statePattern.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(node, lines);
-                    objects.push({ name, startLine, endLine });
-                }
-            }
-            return true;
-        }
-
-        // Handle static items (only top-level)
-        if (node.type === 'static_item') {
-            if (!node.parent || node.parent.type !== 'source_file') return true;
-            const nameNode = node.childForFieldName('name');
-            if (nameNode) {
-                const name = nameNode.text;
-                if (statePattern.test(name)) {
-                    const { startLine, endLine } = nodeToLocation(node, lines);
-                    objects.push({ name, startLine, endLine });
-                }
-            }
-            return true;
-        }
-
+        _processState(node, objects, lines);
         return true;
     });
-
     objects.sort((a, b) => a.startLine - b.startLine);
     return objects;
 }
@@ -700,16 +739,25 @@ function findStateObjects(code, parser) {
  * Parse a Rust file completely
  */
 function parse(code, parser) {
-    const totalLines = code.split('\n').length;
-    return {
-        language: 'rust',
-        totalLines,
-        functions: findFunctions(code, parser),
-        classes: findClasses(code, parser),
-        stateObjects: findStateObjects(code, parser),
-        imports: [],
-        exports: []
-    };
+    const tree = parseTree(parser, code);
+    const lines = code.split('\n');
+    const functions = [], classes = [], stateObjects = [];
+    const processedFn = new Set(), processedCls = new Set();
+
+    traverseTreeCached(tree.rootNode, (node) => {
+        _processFunction(node, functions, processedFn, lines, code);
+        _processClass(node, classes, processedCls, lines, code);
+        _processState(node, stateObjects, lines);
+        return true;  // always continue, never skip subtrees
+    });
+
+    _postProcessTraitImpls(classes);
+
+    functions.sort((a, b) => a.startLine - b.startLine);
+    classes.sort((a, b) => a.startLine - b.startLine);
+    stateObjects.sort((a, b) => a.startLine - b.startLine);
+
+    return { language: 'rust', totalLines: lines.length, functions, classes, stateObjects, imports: [], exports: [] };
 }
 
 /**

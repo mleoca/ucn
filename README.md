@@ -345,7 +345,7 @@ Common Flags:
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
-  --show-confidence   Show confidence scores per caller/callee edge
+  --no-confidence     Hide confidence scores (shown by default)
   --min-confidence=N  Filter edges below confidence threshold (0.0-1.0)
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)
@@ -361,6 +361,9 @@ Common Flags:
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
   --base=<ref>        Git ref for diff-impact (default: HEAD)
+  --staged            Analyze staged changes (diff-impact)
+  --no-follow-symlinks  Don't follow symbolic links
+  -i, --interactive   Keep index in memory for multiple queries
 ```
 
 ---
