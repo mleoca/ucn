@@ -3,7 +3,6 @@ name: Publish
 on:
   push:
     tags: ['v*']
-  workflow_dispatch:
 
 permissions:
   contents: read
@@ -34,6 +33,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          npm version "$VERSION" --no-git-tag-version
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" server.json
+
       - uses: actions/setup-node@v5
         with:
           node-version: 22
@@ -52,6 +57,11 @@ jobs:
       id-token: write
     steps:
       - uses: actions/checkout@v5
+
+      - name: Set version from tag
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" server.json
 
       - uses: actions/setup-node@v5
         with:
