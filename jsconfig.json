@@ -1,0 +1,10 @@
+{
+  "compilerOptions": {
+    "checkJs": false,
+    "module": "commonjs",
+    "target": "es2020",
+    "baseUrl": "."
+  },
+  "include": ["core/**/*.js", "cli/**/*.js", "mcp/**/*.js", "languages/**/*.js"],
+  "exclude": ["node_modules"]
+}

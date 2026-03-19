@@ -10,7 +10,8 @@
   },
   "scripts": {
     "test": "node --test test/parser-unit.test.js test/integration.test.js test/cache.test.js test/formatter.test.js test/interactive.test.js test/feature.test.js test/regression-js.test.js test/regression-py.test.js test/regression-go.test.js test/regression-java.test.js test/regression-rust.test.js test/regression-cross.test.js test/cross-language.test.js test/accuracy.test.js test/command-coverage.test.js test/systematic-test.js test/mcp-edge-cases.js test/parity-test.js",
-    "benchmark:agent": "node test/agent-understanding-benchmark.js"
+    "benchmark:agent": "node test/agent-understanding-benchmark.js",
+    "lint": "eslint core/ cli/ mcp/ languages/"
   },
   "keywords": [
     "mcp",
@@ -60,5 +61,9 @@
   "optionalDependencies": {
     "@modelcontextprotocol/sdk": "^1.0.0",
     "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.0.3"
   }
 }

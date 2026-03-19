@@ -2750,8 +2750,8 @@ it('FIX 96 — tsconfig paths are regex-escaped before compilation', () => {
 });
 
 it('FIX 97 — graph direction defaults to "both"', () => {
-    const projectCode = fs.readFileSync(path.join(PROJECT_DIR, 'core', 'project.js'), 'utf-8');
-    assert.ok(projectCode.includes("options.direction || 'both'"),
+    const graphCode = fs.readFileSync(path.join(PROJECT_DIR, 'core', 'graph.js'), 'utf-8');
+    assert.ok(graphCode.includes("options.direction || 'both'"),
         'graph direction should default to "both"');
 });
 

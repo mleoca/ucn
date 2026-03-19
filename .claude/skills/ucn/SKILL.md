@@ -178,7 +178,7 @@ ucn [target] <command> [name] [--flags]
 | `--detailed` | Show full symbol listing per file in `toc` |
 | `--top-level` | Show only top-level functions in `toc` (exclude nested/indented) |
 | `--top=N` | Limit result count (default: 10 for most commands) |
-| `--limit=N` | Limit result count for `find`, `usages`, `search`, `deadcode`, `api`, `toc` |
+| `--limit=N` | Limit result count for `find`, `usages`, `search`, `deadcode`, `api`, `toc`, `entrypoints`, `diff-impact` |
 | `--max-files=N` | Max files to index (for large projects with 10K+ files) |
 | `--max-lines=N` | Max source lines for `class` (large classes show summary by default) |
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
@@ -200,6 +200,7 @@ ucn [target] <command> [name] [--flags]
 | `--decorator=<name>` | Structural search: filter by decorator/annotation (e.g., `--decorator=Route`) |
 | `--exported` | Structural search: only exported/public symbols |
 | `--unused` | Structural search: only symbols with zero callers |
+| `--no-follow-symlinks` | Don't follow symbolic links during file discovery |
 
 ## Workflow Integration
 
