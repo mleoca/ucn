@@ -3912,3 +3912,109 @@ func main() {
     });
 });
 
+// ============================================================================
+// BUG-2: Go stdlib/external package calls should not be counted as callers
+// ============================================================================
+describe('BUG-2: stdlib/external package calls filtered from callers', () => {
+    it('fmt.Errorf() should not be a caller of project Errorf', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'errors/errors.go': `package errors
+func Errorf(msg string) error { return nil }
+`,
+            'main.go': `package main
+import "fmt"
+import "example.com/test/errors"
+func handler() {
+    fmt.Errorf("fail: %v", 1)
+    errors.Errorf("custom error")
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('Errorf', {});
+            // fmt.Errorf() should be filtered out (stdlib call)
+            const fmtCaller = callers.find(c =>
+                c.callerName === 'handler' && c.receiver === 'fmt');
+            assert.ok(!fmtCaller, 'fmt.Errorf() should not be a caller of project Errorf');
+            // errors.Errorf() should still be found (project-internal call)
+            const errorsCaller = callers.find(c =>
+                c.callerName === 'handler' && c.receiver === 'errors');
+            assert.ok(errorsCaller, 'errors.Errorf() should be a caller of project Errorf');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('os.Exit() should not be a caller of project Exit', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'lifecycle/lifecycle.go': `package lifecycle
+func Exit(code int) { }
+`,
+            'main.go': `package main
+import "os"
+func shutdown() { os.Exit(1) }
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('Exit', {});
+            const osCaller = callers.find(c =>
+                c.callerName === 'shutdown' && c.receiver === 'os');
+            assert.ok(!osCaller, 'os.Exit() should not be a caller of project Exit');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('third-party klog.Errorf() filtered via import graph', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'logging/logging.go': `package logging
+func Errorf(msg string) { }
+`,
+            'main.go': `package main
+import "github.com/sirupsen/logrus"
+func handler() { logrus.Errorf("fail") }
+`
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('Errorf', {});
+            const logrusCaller = callers.find(c =>
+                c.callerName === 'handler' && c.receiver === 'logrus');
+            assert.ok(!logrusCaller,
+                'Third-party logrus.Errorf() should not be a caller of project Errorf');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// BUG-2: External package calls filtered from callees
+// ============================================================================
+describe('BUG-2: external package calls filtered from callees', () => {
+    it('fmt.Println should not appear as callee', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'main.go': `package main
+import "fmt"
+func hello() { fmt.Println("hi") }
+`
+        });
+        try {
+            const index = idx(dir);
+            const def = index.find('hello')[0];
+            assert.ok(def, 'Should find hello');
+            const callees = index.findCallees(def, {});
+            const println = callees.find(c => c.name === 'Println');
+            assert.ok(!println, 'fmt.Println should not appear as callee (stdlib)');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+

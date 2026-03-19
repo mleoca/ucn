@@ -963,10 +963,13 @@ class ProjectIndex {
             if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) {
                 score -= 300;
             }
-            // Deprioritize auto-generated files (client-gen, protobuf, etc.) (-300)
+            // Deprioritize auto-generated files (client-gen, protobuf, etc.)
+            // Light penalty (-100): generated code checked into the repo is often
+            // first-class API surface (Go client-gen, Java GRPC stubs), so prefer
+            // hand-written code but don't bury generated definitions.
             const fileEntry = this.files.get(d.file);
             if (fileEntry?.isGenerated) {
-                score -= 300;
+                score -= 100;
             }
             // Boost lib/src/core/internal directories (+200)
             if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) {

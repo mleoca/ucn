@@ -201,6 +201,7 @@ ucn [target] <command> [name] [--flags]
 | `--exported` | Structural search: only exported/public symbols |
 | `--unused` | Structural search: only symbols with zero callers |
 | `--no-follow-symlinks` | Don't follow symbolic links during file discovery |
+| `--workers=N` | Parallel build workers (auto-detect by default; `0` to disable; env: `UCN_WORKERS`) |
 
 ## Workflow Integration
 

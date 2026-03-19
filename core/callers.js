@@ -429,6 +429,39 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Go package-qualified call filter: when a non-method call has a receiver
+                // that is an import alias (e.g., fmt.Errorf()), verify the caller imports
+                // a project file containing the target. Catches stdlib (single-segment imports
+                // like "fmt", "os") and third-party calls (import graph has no edge to target).
+                if (!call.isMethod && call.receiver && !bindingId &&
+                    langTraits(fileEntry.language)?.hasReceiverPackageCalls) {
+                    const callerFileImports = fileEntry.imports || [];
+                    const importModule = callerFileImports.find(mod => {
+                        const parts = mod.split('/');
+                        const last = parts[parts.length - 1];
+                        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+                        return pkgName === call.receiver;
+                    });
+                    if (importModule) {
+                        if (!importModule.includes('/')) {
+                            // Single-segment import — Go stdlib, always external
+                            continue;
+                        }
+                        // Multi-segment import — verify via import graph
+                        const callerImportedFiles = index.importGraph.get(filePath) || [];
+                        const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                        if (!targetFiles.has(filePath)) {
+                            const hasImportEdge = callerImportedFiles.some(imp => targetFiles.has(imp));
+                            if (!hasImportEdge) {
+                                // No import edge — allow same-package (same directory) calls
+                                const callerDir = path.dirname(filePath);
+                                const samePackage = targetDefs.some(d => d.file && path.dirname(d.file) === callerDir);
+                                if (!samePackage) continue;
+                            }
+                        }
+                    }
+                }
+
                 // Receiver-class disambiguation:
                 // When the target definition has a class/receiver type, filter callers
                 // whose receiverType is known to be a different type.
@@ -811,6 +844,8 @@ function findCallees(index, def, options = {}) {
                                 continue;
                             }
                         }
+                        // Import resolved but no project definition matches — external call, skip
+                        continue;
                     }
                 } else if (langTraits(language)?.methodCallInclusion === 'explicit' && !options.includeMethods) {
                     continue;
