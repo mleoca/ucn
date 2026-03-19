@@ -1623,7 +1623,11 @@ function formatAbout(about, options = {}) {
 
     // Completeness warnings (condensed single line)
     if (about.completeness && about.completeness.warnings && about.completeness.warnings.length > 0) {
-        const parts = about.completeness.warnings.map(w => `${w.count} ${w.type.replace('_', ' ')}`);
+        const lang = about.completeness?.projectLanguage;
+        const parts = about.completeness.warnings.map(w => {
+            if (w.type === 'dynamic_imports' && lang === 'go') return `${w.count} blank/dot import(s)`;
+            return `${w.count} ${w.type.replace('_', ' ')}`;
+        });
         lines.push('');
         lines.push(`Note: Results may be incomplete (${parts.join(', ')} in project)`);
     }

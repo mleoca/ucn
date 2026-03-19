@@ -8101,8 +8101,8 @@ describe('fix #37: toc respects file parameter', () => {
         try {
             const index = idx(dir);
             const result = execute(index, 'toc', { file: 'nonexistent.js' });
-            assert.ok(result.ok); // toc still returns ok but with 0 files
-            assert.strictEqual(result.result.totals.files, 0);
+            assert.ok(!result.ok, 'should return error for non-matching file pattern');
+            assert.ok(result.error.includes('No files matched'));
         } finally {
             rm(dir);
         }

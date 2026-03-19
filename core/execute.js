@@ -140,6 +140,12 @@ function limitNote(limit, total) {
     return `Showing ${limit} of ${total} results. Use --limit N to see more.`;
 }
 
+/** Build a truncation warning when index is incomplete */
+function truncationNote(index) {
+    if (!index.truncated) return null;
+    return `Index limited to ${index.truncated.indexed} files (max ${index.truncated.maxFiles}). Results may be incomplete. Use --max-files N to increase.`;
+}
+
 /**
  * Check if a --file pattern matches any files in the index.
  * Returns error string if no files match, null otherwise.
@@ -218,7 +224,8 @@ const HANDLERS = {
             }
             return { ok: false, error: `Symbol "${p.name}" not found.` };
         }
-        return { ok: true, result, showConfidence: !!p.showConfidence };
+        const tNote = truncationNote(index);
+        return { ok: true, result, showConfidence: !!p.showConfidence, ...(tNote && { note: tNote }) };
     },
 
     context: (index, p) => {
@@ -401,6 +408,8 @@ const HANDLERS = {
             if (limited) notes.push(limitNote(limit, total));
             result = items;
         }
+        const tNote = truncationNote(index);
+        if (tNote) notes.push(tNote);
         return { ok: true, result, note: notes.length ? notes.join('\n') : undefined };
     },
 
@@ -431,6 +440,8 @@ const HANDLERS = {
     },
 
     toc: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.getToc({
             detailed: p.detailed,
             topLevel: p.topLevel,
@@ -482,10 +493,14 @@ const HANDLERS = {
                 note = limitNote(limit, totalEntries);
             }
         }
+        const tNote = truncationNote(index);
+        if (tNote) note = note ? `${note}\n${tNote}` : tNote;
         return { ok: true, result, note };
     },
 
     search: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         // Detect structural search mode: any of these flags triggers index-based search
         const isStructural = p.type || p.param || p.receiver || p.returns || p.decorator || p.exported || p.unused;
         if (isStructural) {
@@ -527,7 +542,8 @@ const HANDLERS = {
             file: p.file,
         });
         if (result.meta) result.meta.testsExcluded = testsExcluded;
-        return { ok: true, result };
+        const tNote = truncationNote(index);
+        return { ok: true, result, ...(tNote && { note: tNote }) };
     },
 
     tests: (index, p) => {
@@ -584,6 +600,8 @@ const HANDLERS = {
             if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
             result = sliced;
         }
+        const tNote = truncationNote(index);
+        if (tNote) note = note ? `${note}\n${tNote}` : tNote;
         return { ok: true, result, note };
     },
 
@@ -591,13 +609,19 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         const { detectEntrypoints } = require('./entrypoints');
-        const result = detectEntrypoints(index, {
+        let result = detectEntrypoints(index, {
             type: p.type,
             framework: p.framework,
             file: p.file,
             exclude: p.exclude,
         });
-        return { ok: true, result };
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
+            note = limitNote(limit, result.length);
+            result = result.slice(0, limit);
+        }
+        return { ok: true, result, note };
     },
 
     // ── Extracting Code ─────────────────────────────────────────────────
@@ -870,12 +894,18 @@ const HANDLERS = {
     },
 
     diffImpact: (index, p) => {
-        const result = index.diffImpact({
+        let result = index.diffImpact({
             base: p.base || 'HEAD',
             staged: p.staged || false,
             file: p.file,
         });
-        return { ok: true, result };
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && result && result.changed && result.changed.length > limit) {
+            note = limitNote(limit, result.changed.length);
+            result = { ...result, changed: result.changed.slice(0, limit) };
+        }
+        return { ok: true, result, note };
     },
 
     // ── Other ───────────────────────────────────────────────────────────
@@ -884,6 +914,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.typedef(p.name, { exact: p.exact || false, className: p.className, file: p.file });
         return { ok: true, result };
     },
@@ -897,6 +929,10 @@ const HANDLERS = {
     },
 
     api: (index, p) => {
+        if (p.file) {
+            const fileErr = checkFilePatternMatch(index, p.file);
+            if (fileErr) return { ok: false, error: fileErr };
+        }
         let result = index.api(p.file);
         if (p.file) {
             const fileErr = checkFileError(result, p.file);

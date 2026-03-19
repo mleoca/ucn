@@ -240,16 +240,16 @@ const tests = [
     {
         category: 'Correctness',
         tool: 'ucn',
-        desc: 'api(file=nonexistent) returns soft error',
+        desc: 'api(file=nonexistent) returns error message',
         args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' },
-        assert: (res, text, isError) => isError === false || 'Expected soft error (no isError flag) for nonexistent file'
+        assert: (res, text, isError) => (isError === false && /no files matched/i.test(text)) || 'Expected soft error with "No files matched" message'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
-        desc: 'api(file=nonexistent) message contains "not found"',
+        desc: 'api(file=nonexistent) message contains "No files matched"',
         args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent.js' },
-        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected file-not-found message (soft error)'
+        assert: (res, text, isError) => (!isError && /no files matched/i.test(text)) || 'Expected file-not-found error message'
     },
     {
         category: 'Correctness',

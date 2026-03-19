@@ -1652,3 +1652,135 @@ describe('Confidence Scoring', () => {
         });
     });
 });
+
+// ============================================================================
+// K8s Bug Hunt Fixes — Phase 1: File pattern validation
+// ============================================================================
+describe('K8s Bug Hunt: file pattern validation', () => {
+    const { execute } = require('../core/execute');
+
+    it('search returns error for non-matching --file pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/app.js': 'function foo() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'search', { term: 'foo', file: 'nonexistent' });
+            assert.ok(!result.ok, 'should return error');
+            assert.ok(result.error.includes('No files matched'));
+        } finally { rm(dir); }
+    });
+
+    it('toc returns error for non-matching --file pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/app.js': 'function foo() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'toc', { file: 'nonexistent' });
+            assert.ok(!result.ok, 'should return error');
+            assert.ok(result.error.includes('No files matched'));
+        } finally { rm(dir); }
+    });
+
+    it('typedef returns error for non-matching --file pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/app.js': 'class Foo {}',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'typedef', { name: 'Foo', file: 'nonexistent' });
+            assert.ok(!result.ok, 'should return error');
+            assert.ok(result.error.includes('No files matched'));
+        } finally { rm(dir); }
+    });
+
+    it('search still works with valid --file pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/app.js': 'function foo() { return 1; }',
+            'src/bar.js': 'function bar() { return 2; }',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'search', { term: 'return', file: 'app' });
+            assert.ok(result.ok);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt Fixes — Phase 2: Truncation warning
+// ============================================================================
+describe('K8s Bug Hunt: truncation warning', () => {
+    const { execute } = require('../core/execute');
+
+    it('find shows truncation note when index is limited', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function foo() {}',
+        });
+        try {
+            const index = idx(dir);
+            // Simulate truncation
+            index.truncated = { indexed: 100, maxFiles: 100 };
+            const result = execute(index, 'find', { name: 'foo' });
+            assert.ok(result.ok);
+            assert.ok(result.note && result.note.includes('limited'), 'should include truncation note');
+        } finally { rm(dir); }
+    });
+
+    it('about shows truncation note when index is limited', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function foo() {}',
+        });
+        try {
+            const index = idx(dir);
+            index.truncated = { indexed: 100, maxFiles: 100 };
+            const result = execute(index, 'about', { name: 'foo' });
+            assert.ok(result.ok);
+            assert.ok(result.note && result.note.includes('limited'), 'should include truncation note');
+        } finally { rm(dir); }
+    });
+
+    it('no truncation note when index is complete', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function foo() {}',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'find', { name: 'foo' });
+            assert.ok(result.ok);
+            assert.ok(!result.note || !result.note.includes('limited'), 'should not include truncation note');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt Fixes — Phase 3: Output limiting extension
+// ============================================================================
+describe('K8s Bug Hunt: output limiting', () => {
+    const { execute } = require('../core/execute');
+
+    it('entrypoints respects --limit', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","main":"index.js"}',
+            'index.js': 'function main() {}\nfunction init() {}\nmodule.exports = { main, init };',
+        });
+        try {
+            const index = idx(dir);
+            const all = execute(index, 'entrypoints', {});
+            const limited = execute(index, 'entrypoints', { limit: 1 });
+            assert.ok(all.ok && limited.ok);
+            if (all.result.length > 1) {
+                assert.strictEqual(limited.result.length, 1);
+                assert.ok(limited.note && limited.note.includes('Showing 1'));
+            }
+        } finally { rm(dir); }
+    });
+});

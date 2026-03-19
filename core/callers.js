@@ -136,6 +136,7 @@ function findCallers(index, name, options = {}) {
     const pendingByFile = new Map(); // filePath -> [{ call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver }]
     let pendingCount = 0;
     const maxResults = options.maxResults;
+    const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
 
     // Use inverted callee index to skip files that don't contain calls to this name
     const calleeFiles = index.getCalleeFiles(name);
@@ -437,6 +438,19 @@ function findCallers(index, name, options = {}) {
                         if (td.className) targetTypes.add(td.className);
                         if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
                     }
+                    // Expand targetTypes with types that embed the target (Go/Java/Rust)
+                    // e.g., if target is Base.Start() and Child embeds Base, accept Child.Start() callers
+                    if (targetTypes.size > 0 && (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
+                        for (const tt of [...targetTypes]) {
+                            const children = index.extendedByGraph?.get(tt);
+                            if (children) {
+                                for (const child of children) {
+                                    const cName = typeof child === 'string' ? child : child.name;
+                                    if (cName) targetTypes.add(cName);
+                                }
+                            }
+                        }
+                    }
                     if (targetTypes.size > 0) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
                         const knownType = call.receiverType;
@@ -450,32 +464,68 @@ function findCallers(index, name, options = {}) {
                                     continue;
                                 }
                             }
-                        } else if (options.targetDefinitions && definitions.length > 1) {
-                            // No inferred type — fall back to receiver variable name matching
-                            // only when we have multiple definitions to disambiguate
-                            const receiverLower = call.receiver.toLowerCase();
-                            const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
-                            if (!matchesTarget) {
-                                // Rust/Go path calls (Type::method() / pkg.Method()): receiver IS the type name
-                                // If it doesn't match target, it's definitely a different type — filter it
-                                if (call.isPathCall && /^[A-Z]/.test(call.receiver)) {
-                                    isUncertain = true;
-                                    if (!options.includeUncertain) {
-                                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
-                                        continue;
+                        } else {
+                            // No parser-inferred type — try local type inference
+                            // for Go/Java/Rust (nominal type systems)
+                            let inferredMatch = false;
+                            let inferredMismatch = false;
+                            if (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust') {
+                                const callerSym = index.findEnclosingFunction(filePath, call.line, true);
+                                if (callerSym && callerSym.startLine != null && callerSym.endLine != null) {
+                                    const cacheKey = `${filePath}:${callerSym.startLine}`;
+                                    let localTypes = localTypeCache.get(cacheKey);
+                                    if (localTypes === undefined) {
+                                        const callsForFile = getCachedCalls(index, filePath);
+                                        localTypes = callsForFile ? _buildTypedLocalTypeMap(index,
+                                            { file: filePath, startLine: callerSym.startLine, endLine: callerSym.endLine },
+                                            callsForFile) : null;
+                                        localTypeCache.set(cacheKey, localTypes);
+                                    }
+                                    if (localTypes) {
+                                        const inferredType = localTypes.get(call.receiver);
+                                        if (inferredType) {
+                                            if (targetTypes.has(inferredType)) {
+                                                inferredMatch = true;
+                                            } else {
+                                                inferredMismatch = true;
+                                            }
+                                        }
                                     }
                                 }
-                                const nonTargetClasses = new Set();
-                                for (const d of definitions) {
-                                    const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
-                                    if (t && !targetTypes.has(t)) nonTargetClasses.add(t);
+                            }
+                            if (inferredMismatch) {
+                                isUncertain = true;
+                                if (!options.includeUncertain) {
+                                    if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                    continue;
                                 }
-                                const matchesOther = [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
-                                if (matchesOther) {
-                                    isUncertain = true;
-                                    if (!options.includeUncertain) {
-                                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
-                                        continue;
+                            }
+                            // Still no type — fall back to receiver name matching when multiple defs exist
+                            if (!inferredMatch && !inferredMismatch && definitions.length > 1) {
+                                const receiverLower = call.receiver.toLowerCase();
+                                const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
+                                if (!matchesTarget) {
+                                    // Rust/Go path calls (Type::method() / pkg.Method()): receiver IS the type name
+                                    // If it doesn't match target, it's definitely a different type — filter it
+                                    if (call.isPathCall && /^[A-Z]/.test(call.receiver)) {
+                                        isUncertain = true;
+                                        if (!options.includeUncertain) {
+                                            if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                            continue;
+                                        }
+                                    }
+                                    const nonTargetClasses = new Set();
+                                    for (const d of definitions) {
+                                        const t = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
+                                        if (t && !targetTypes.has(t)) nonTargetClasses.add(t);
+                                    }
+                                    const matchesOther = [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
+                                    if (matchesOther) {
+                                        isUncertain = true;
+                                        if (!options.includeUncertain) {
+                                            if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                            continue;
+                                        }
                                     }
                                 }
                             }
@@ -644,10 +694,23 @@ function findCallees(index, def, options = {}) {
                     const symbols = index.symbols.get(call.name);
                     const isCallable = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
-                    const match = symbols?.find(s =>
+                    let match = symbols?.find(s =>
                         isCallable(s) && (
                         s.className === typeName ||
                         (s.receiver && s.receiver.replace(/^\*/, '') === typeName)));
+                    // Walk embedding/inheritance chain if no direct match (Go/Java/Rust)
+                    if (!match && (language === 'go' || language === 'java' || language === 'rust')) {
+                        const parentNames = index._getInheritanceParents?.(typeName, def.file);
+                        if (parentNames) {
+                            for (const pName of parentNames) {
+                                match = symbols?.find(s =>
+                                    isCallable(s) && (
+                                    s.className === pName ||
+                                    (s.receiver && s.receiver.replace(/^\*/, '') === pName)));
+                                if (match) break;
+                            }
+                        }
+                    }
                     if (match) {
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
@@ -667,10 +730,23 @@ function findCallees(index, def, options = {}) {
                     const symbols = index.symbols.get(call.name);
                     const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
-                    const match = symbols?.find(s =>
+                    let match = symbols?.find(s =>
                         isCallableRT(s) && (
                         (s.receiver && s.receiver.replace(/^\*/, '') === typeName) ||
                         s.className === typeName));
+                    // Walk embedding/inheritance chain if no direct match (Go/Java/Rust)
+                    if (!match && (language === 'go' || language === 'java' || language === 'rust')) {
+                        const parentNames = index._getInheritanceParents?.(typeName, def.file);
+                        if (parentNames) {
+                            for (const pName of parentNames) {
+                                match = symbols?.find(s =>
+                                    isCallableRT(s) && (
+                                    (s.receiver && s.receiver.replace(/^\*/, '') === pName) ||
+                                    s.className === pName));
+                                if (match) break;
+                            }
+                        }
+                    }
                     if (match) {
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
@@ -687,8 +763,11 @@ function findCallees(index, def, options = {}) {
                     // Check if receiver is an import alias and resolve to correct package
                     const goImports = fileEntry?.imports || [];
                     // Find import whose package name matches the receiver
+                    // Handle Go version suffixes: k8s.io/klog/v2 → klog, not v2
                     const importModule = goImports.find(mod => {
-                        const pkgName = mod.split('/').pop();
+                        const parts = mod.split('/');
+                        const last = parts[parts.length - 1];
+                        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
                         return pkgName === call.receiver;
                     });
                     if (importModule) {

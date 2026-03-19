@@ -1168,6 +1168,26 @@ class ProjectIndex {
                     imports++;
                 }
             }
+            // Go same-package: files in same directory don't need imports to reference symbols
+            const defEntry = this.files.get(defFile);
+            if (defEntry?.language === 'go') {
+                const pkgDir = path.dirname(defFile);
+                for (const [fp, fe] of this.files) {
+                    if (fp === defFile || !fp.endsWith('.go') || path.dirname(fp) !== pkgDir) continue;
+                    if (hasFilters && !this.matchesFilters(fe.relativePath, { exclude: options.exclude })) continue;
+                    // Check if already counted as importer
+                    if (importers.includes(fp)) continue;
+                    // Check callee index for actual calls from this file
+                    if (calleeFiles && calleeFiles.has(fp)) {
+                        // Already counted in calls — don't double-count
+                        continue;
+                    }
+                    // Check if this same-package file has text references to the symbol
+                    if (fe.importNames && fe.importNames.includes(name)) {
+                        imports++;
+                    }
+                }
+            }
 
             const total = calls + definitions + imports;
             return { total, calls, definitions, imports, references: 0 };
@@ -2982,7 +3002,8 @@ class ProjectIndex {
 
         this._completenessCache = {
             complete: warnings.length === 0,
-            warnings
+            warnings,
+            projectLanguage: this._getPredominantLanguage()
         };
 
         return this._completenessCache;
@@ -4410,7 +4431,7 @@ class ProjectIndex {
             results.push(...truncated);
         }
 
-        results.meta = { filesScanned, filesSkipped, filesFilteredByFlag, totalFiles: this.files.size, regexFallback, totalMatches, truncatedMatches };
+        results.meta = { filesScanned, filesSkipped, filesFilteredByFlag, totalFiles: this.files.size, regexFallback, totalMatches, truncatedMatches, projectLanguage: this._getPredominantLanguage() };
         return results;
         } finally { this._endOp(); }
     }

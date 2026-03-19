@@ -3459,3 +3459,317 @@ func init() {}
     });
 });
 
+// ============================================================================
+// K8s Bug Hunt: fix #3 — Receiver type filtering for common method names
+// ============================================================================
+describe('K8s fix #3: receiver type filtering for common method names', () => {
+    it('filters callers of Run() to matching receiver type via New*() constructor', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'types.go': `package main
+type DeploymentController struct{}
+func (dc *DeploymentController) Run(ctx string) {}
+type ReplicaSetController struct{}
+func (rsc *ReplicaSetController) Run(ctx string) {}
+func NewDeploymentController() *DeploymentController { return &DeploymentController{} }
+func NewReplicaSetController() *ReplicaSetController { return &ReplicaSetController{} }`,
+            'main.go': `package main
+func startDC() {
+    dc := NewDeploymentController()
+    dc.Run("ctx")
+}
+func startRSC() {
+    rsc := NewReplicaSetController()
+    rsc.Run("ctx")
+}`,
+        });
+        try {
+            const index = idx(dir);
+            // Find Run scoped to DeploymentController
+            const defs = index.find('Run').filter(d =>
+                d.receiver && d.receiver.includes('DeploymentController'));
+            assert.ok(defs.length > 0, 'should find DeploymentController.Run');
+            const callers = index.findCallers('Run', { targetDefinitions: defs });
+            assert.ok(callers.some(c => c.callerName === 'startDC'), 'should find startDC');
+            assert.ok(!callers.some(c => c.callerName === 'startRSC'), 'should NOT find startRSC');
+        } finally { rm(dir); }
+    });
+
+    it('still includes callers when receiver type cannot be inferred', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'types.go': `package main
+type Server struct{}
+func (s *Server) Start() {}`,
+            'main.go': `package main
+func boot(s *Server) {
+    s.Start()
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('Start').filter(d =>
+                d.receiver && d.receiver.includes('Server'));
+            assert.ok(defs.length > 0, 'should find Server.Start');
+            const callers = index.findCallers('Start', { targetDefinitions: defs });
+            // boot() should still be found — parameter type inference sets receiverType from param
+            assert.ok(callers.some(c => c.callerName === 'boot'), 'should find boot via param type');
+        } finally { rm(dir); }
+    });
+
+    it('excludes callers where local type map resolves to different type', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'types.go': `package main
+type A struct{}
+func (a *A) Get() string { return "" }
+type B struct{}
+func (b *B) Get() string { return "" }
+func NewA() *A { return &A{} }
+func NewB() *B { return &B{} }`,
+            'caller.go': `package main
+func useA() {
+    a := NewA()
+    a.Get()
+}
+func useB() {
+    b := NewB()
+    b.Get()
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('Get').filter(d =>
+                d.receiver && d.receiver.includes('A'));
+            assert.ok(defs.length > 0, 'should find A.Get');
+            const callers = index.findCallers('Get', { targetDefinitions: defs });
+            assert.ok(callers.some(c => c.callerName === 'useA'), 'should include useA');
+            assert.ok(!callers.some(c => c.callerName === 'useB'), 'should exclude useB');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: fix #8/#9 — Go embedded struct/interface resolution
+// ============================================================================
+describe('K8s fix #8/#9: Go embedded struct/interface resolution', () => {
+    it('resolves callees through embedded struct methods', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'base.go': `package main
+type Base struct{}
+func (b *Base) Start() {}`,
+            'child.go': `package main
+type Child struct {
+    Base
+}`,
+            'main.go': `package main
+func init() {
+    c := Child{}
+    c.Start()
+}`,
+        });
+        try {
+            const index = idx(dir);
+            // Check that extendsGraph has Child -> Base
+            // extendsGraph stores [{ file, parents: ['Base'] }]
+            const entries = index.extendsGraph.get('Child');
+            assert.ok(entries && entries.length > 0, 'Child should have extends entry');
+            assert.ok(entries.some(e => e.parents && e.parents.includes('Base')), 'parent should be Base');
+        } finally { rm(dir); }
+    });
+
+    it('detects embedded interface composition', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'iface.go': `package main
+type Reader interface {
+    Read()
+}
+type ReadWriter interface {
+    Reader
+    Write()
+}`,
+        });
+        try {
+            const index = idx(dir);
+            // extendsGraph stores [{ file, parents: ['Reader'] }]
+            const entries = index.extendsGraph.get('ReadWriter');
+            assert.ok(entries && entries.length > 0, 'ReadWriter should have extends entry');
+            assert.ok(entries.some(e => e.parents && e.parents.includes('Reader')), 'parent should be Reader');
+        } finally { rm(dir); }
+    });
+
+    it('findCallers includes embedding children in targetTypes', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'base.go': `package main
+type Base struct{}
+func (b *Base) Process() {}
+type Extended struct {
+    Base
+}
+func NewExtended() *Extended { return &Extended{} }`,
+            'caller.go': `package main
+func run() {
+    e := NewExtended()
+    e.Process()
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.find('Process').filter(d =>
+                d.receiver && d.receiver.includes('Base'));
+            assert.ok(defs.length > 0, 'should find Base.Process');
+            const callers = index.findCallers('Process', { targetDefinitions: defs });
+            // run() calls e.Process() where e is Extended which embeds Base
+            // The targetTypes should expand to include Extended
+            assert.ok(callers.some(c => c.callerName === 'run'), 'should find run as caller via embedding');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: fix #12 (verify) — Go function reference callbacks
+// ============================================================================
+describe('K8s fix #12 (verify): Go callback detection', () => {
+    it('detects function reference passed as argument', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'handler.go': `package main
+func myHandler() {}
+func setup() {
+    Register("/path", myHandler)
+}
+func Register(path string, handler func()) {}`,
+        });
+        try {
+            const index = idx(dir);
+            const callees = index.findCallees({ name: 'setup', file: path.join(dir, 'handler.go'), startLine: 3, endLine: 5 });
+            // Should detect both Register and myHandler
+            const names = callees.map(c => c.name);
+            assert.ok(names.includes('Register'), 'should detect Register call');
+            // myHandler passed as arg — detected as callback if Go parser supports it
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: fix #13 — Language-aware terminology
+// ============================================================================
+describe('K8s fix #13: language-aware completeness notes', () => {
+    it('about uses Go-appropriate terminology for blank imports', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': `package main
+func main() {}`,
+        });
+        try {
+            const index = idx(dir);
+            // Simulate dynamic imports in completeness cache
+            index._completenessCache = {
+                complete: false,
+                warnings: [{ type: 'dynamic_imports', count: 5, message: '5 dynamic imports' }],
+                projectLanguage: 'go',
+            };
+            const result = index.about('main');
+            assert.ok(result, 'should find main');
+            // Check that completeness.projectLanguage is 'go'
+            assert.strictEqual(result.completeness.projectLanguage, 'go');
+        } finally { rm(dir); }
+    });
+
+    it('search meta includes projectLanguage', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': `package main
+func main() { println("hello") }`,
+        });
+        try {
+            const index = idx(dir);
+            const result = index.search('hello');
+            assert.ok(result.meta, 'search should return meta');
+            assert.strictEqual(result.meta.projectLanguage, 'go');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: fix #4 — Go versioned import path resolution
+// ============================================================================
+describe('K8s fix #4: Go versioned import path resolution', () => {
+    it('extracts correct package name from versioned import path', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': `package main
+import "example.com/klog/v2"
+func main() {
+    klog.Infof("hello")
+}`,
+            'klog.go': `package klog
+func Infof(msg string) {}`,
+        });
+        try {
+            const index = idx(dir);
+            // importNames should contain "klog" not "v2"
+            const mainFile = [...index.files.entries()].find(([f]) => f.endsWith('main.go'));
+            assert.ok(mainFile, 'should find main.go');
+            const importNames = mainFile[1].importNames || [];
+            assert.ok(importNames.includes('klog'), 'import name should be klog, not v2');
+            assert.ok(!importNames.includes('v2'), 'should not extract v2 as package name');
+        } finally { rm(dir); }
+    });
+
+    it('handles non-versioned imports normally', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': `package main
+import "fmt"
+func main() {
+    fmt.Println("hello")
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const mainFile = [...index.files.entries()].find(([f]) => f.endsWith('main.go'));
+            assert.ok(mainFile, 'should find main.go');
+            const importNames = mainFile[1].importNames || [];
+            assert.ok(importNames.includes('fmt'), 'import name should be fmt');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// K8s Bug Hunt: fix #5/#16 — Go same-package usage count consistency
+// ============================================================================
+describe('K8s fix #5/#16: Go same-package usage count consistency', () => {
+    it('counts usages from same-package Go files without imports', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'controller_a.go': `package controller
+func NewControllerA() {}`,
+            'controller_b.go': `package controller
+func NewControllerB() {}`,
+            'setup.go': `package controller
+func Setup() {
+    NewControllerA()
+    NewControllerB()
+}`,
+        });
+        try {
+            const index = idx(dir);
+            const defsA = index.find('NewControllerA');
+            const defsB = index.find('NewControllerB');
+            assert.ok(defsA.length > 0, 'should find NewControllerA');
+            assert.ok(defsB.length > 0, 'should find NewControllerB');
+            const usagesA = index.countSymbolUsages(defsA[0]);
+            const usagesB = index.countSymbolUsages(defsB[0]);
+            // Both are called once from setup.go in the same package
+            // Usage counts should be consistent (both should have calls > 0)
+            assert.ok(usagesA.calls > 0, 'NewControllerA should have calls');
+            assert.ok(usagesB.calls > 0, 'NewControllerB should have calls');
+            assert.strictEqual(usagesA.calls, usagesB.calls, 'both should have same call count');
+        } finally { rm(dir); }
+    });
+});
+

@@ -1124,8 +1124,15 @@ function findImportsInCode(code, parser) {
         }
 
         if (modulePath) {
-            // Package name is last segment of path
-            const pkgName = alias || modulePath.split('/').pop();
+            // Package name is last segment of path, skipping Go version suffixes (v2, v3, etc.)
+            let pkgName = alias;
+            if (!pkgName) {
+                const parts = modulePath.split('/');
+                // Go convention: if last segment matches /^v\d+$/, use the previous segment
+                // e.g., k8s.io/klog/v2 → klog, github.com/foo/bar/v3 → bar
+                const last = parts[parts.length - 1];
+                pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+            }
             imports.push({
                 module: modulePath,
                 names: [pkgName],
