@@ -19,7 +19,7 @@ const fs = require('fs');
 const os = require('os');
 
 const { McpClient, runCli, runInteractive, FIXTURES_PATH: BASE_FIXTURES } = require('./helpers');
-const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY } = require('../core/registry');
+const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY, BROAD_COMMANDS } = require('../core/registry');
 const FIXTURES_PATH = path.join(BASE_FIXTURES, 'javascript');
 
 // ============================================================================
@@ -920,6 +920,13 @@ describe('Architecture Guards', () => {
         for (const cmd of CANONICAL_COMMANDS) {
             assert.ok(cmd in FLAG_APPLICABILITY,
                 `Canonical command "${cmd}" missing from FLAG_APPLICABILITY`);
+        }
+    });
+
+    it('BROAD_COMMANDS are all canonical commands', () => {
+        for (const cmd of BROAD_COMMANDS) {
+            assert.ok(CANONICAL_COMMANDS.includes(cmd),
+                `BROAD_COMMANDS has "${cmd}" which is not a canonical command`);
         }
     });
 

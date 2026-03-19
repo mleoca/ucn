@@ -627,6 +627,28 @@ function formatDisambiguation(matches, name, command) {
     return lines.join('\n');
 }
 
+/**
+ * Format disambiguation prompt - JSON
+ */
+function formatDisambiguationJson(matches, name, command) {
+    return JSON.stringify({
+        query: name,
+        command,
+        count: matches.length,
+        matches: matches.map(m => ({
+            name: m.name,
+            type: m.type,
+            file: m.relativePath,
+            startLine: m.startLine,
+            endLine: m.endLine,
+            ...(m.params !== undefined && { params: m.params }),
+            ...(m.className && { className: m.className }),
+            ...(m.usageCount !== undefined && { usageCount: m.usageCount }),
+        })),
+        hint: `Use: ucn . ${command} ${name} --file <pattern>`
+    }, null, 2);
+}
+
 // ============================================================================
 // NEW JSON FORMATTERS
 // ============================================================================
@@ -3195,6 +3217,7 @@ module.exports = {
     formatTests,
     formatApi,
     formatDisambiguation,
+    formatDisambiguationJson,
     formatExportersJson,
     formatTypedefJson,
     formatTestsJson,

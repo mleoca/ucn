@@ -33,7 +33,7 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getMcpCommandEnum, normalizeParams } = require('../core/registry');
+const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
@@ -120,8 +120,8 @@ const DEFAULT_OUTPUT_CHARS = 10000;  // ~2.5K tokens — targeted commands (abou
 const BROAD_OUTPUT_CHARS = 3000;     // ~750 tokens — broad commands where truncated listings are useless
 const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars override
 
-// Broad commands: output is project-wide, truncation means you need a filter, not more text
-const BROAD_COMMANDS = new Set(['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages', 'reverse_trace', 'circular_deps']);
+// Broad commands (derived from registry): output is project-wide, truncation means you need a filter
+const BROAD_COMMANDS = new Set([...BROAD_CANONICAL].map(toMcpName));
 
 function toolResult(text, command, maxChars) {
     if (!text) return { content: [{ type: 'text', text: '(no output)' }] };

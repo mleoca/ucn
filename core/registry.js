@@ -136,6 +136,13 @@ const FLAG_APPLICABILITY = {
     stats:        ['functions', 'top'],
 };
 
+// Commands whose output is project-wide — truncation means you need a filter, not more text.
+// Used by MCP server for tighter default output limits.
+const BROAD_COMMANDS = new Set([
+    'toc', 'entrypoints', 'diffImpact', 'affectedTests',
+    'deadcode', 'usages', 'reverseTrace', 'circularDeps',
+]);
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -223,6 +230,7 @@ module.exports = {
     MCP_ALIASES,
     PARAM_MAP,
     FLAG_APPLICABILITY,
+    BROAD_COMMANDS,
     resolveCommand,
     normalizeParams,
     getCliCommandSet,
