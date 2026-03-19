@@ -381,7 +381,7 @@ function api(index, filePath, options = {}) {
         fileIterator = index.files.entries();
     }
 
-    for (const [absPath, fileEntry] of fileIterator) {
+    for (const [, fileEntry] of fileIterator) {
         if (!fileEntry) continue;
 
         // Skip test files by default (test classes aren't part of public API)
@@ -469,12 +469,9 @@ function graph(index, filePath, options = {}) {
             // Stop traversal at max depth but still register the node above
             if (depth >= maxDepth) return;
 
-            let neighbors = [];
-            if (dir === 'imports') {
-                neighbors = index.importGraph.get(file) || [];
-            } else {
-                neighbors = index.exportGraph.get(file) || [];
-            }
+            const neighbors = dir === 'imports'
+                ? (index.importGraph.get(file) || [])
+                : (index.exportGraph.get(file) || []);
 
             // Deduplicate neighbors (same file may be imported multiple times, e.g. Java inner classes)
             const uniqueNeighbors = [...new Set(neighbors)];

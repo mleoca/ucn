@@ -7,7 +7,6 @@
 
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
-const { escapeRegExp } = require('./shared');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 
 /** Check if a position in a line is inside a string literal (quotes/backticks) */
@@ -267,7 +266,7 @@ function deadcode(index, options = {}) {
                         }
                     }
                 }
-            } catch {}
+            } catch { /* skip unreadable files */ }
         }
     }
 

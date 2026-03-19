@@ -161,7 +161,8 @@ function loadTreeSitter() {
         } catch (e) {
             throw new Error(
                 'tree-sitter is required but not installed.\n' +
-                'Install with: npm install'
+                'Install with: npm install',
+                { cause: e }
             );
         }
     }
@@ -191,7 +192,8 @@ function getParser(language) {
         throw new Error(
             `Failed to load tree-sitter grammar for ${language}.\n` +
             `Install with: npm install tree-sitter-${language}\n` +
-            `Original error: ${e.message}`
+            `Original error: ${e.message}`,
+            { cause: e }
         );
     }
 

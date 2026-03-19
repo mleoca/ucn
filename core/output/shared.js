@@ -179,7 +179,7 @@ function formatLineRanges(lineNums) {
  */
 function detectDoubleEscaping(term) {
     // Look for \\. \\d \\w \\s \\b \\D \\W \\S \\B \\( \\) \\[ \\] — common double-escaped sequences
-    const doubleEscaped = term.match(/\\\\[.dDwWsSbB()\[\]*+?^${}|]/g);
+    const doubleEscaped = term.match(/\\\\[.dDwWsSbB()\[\]*+?^${}|]/g);  // eslint-disable-line no-useless-escape
     if (!doubleEscaped) return '';
     const examples = [...new Set(doubleEscaped)].slice(0, 3);
     const fixed = examples.map(e => e.slice(1)); // remove one backslash

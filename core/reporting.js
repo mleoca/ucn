@@ -54,6 +54,14 @@ function getStats(index, options = {}) {
         }
     }
 
+    // Surface build warnings (parse failures, skipped files)
+    if (index.failedFiles && index.failedFiles.size > 0) {
+        stats.warnings = {
+            failedFiles: [...index.failedFiles].map(f => path.relative(index.root, f)),
+            count: index.failedFiles.size
+        };
+    }
+
     // Per-function line counts for complexity audits
     if (options.functions) {
         const functions = [];

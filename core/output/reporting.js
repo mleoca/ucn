@@ -127,6 +127,16 @@ function formatStats(stats, options = {}) {
         lines.push(`  ${type}: ${count}`);
     }
 
+    if (stats.warnings) {
+        lines.push(`\nWarnings: ${stats.warnings.count} file(s) failed to parse:`);
+        for (const f of stats.warnings.failedFiles.slice(0, 10)) {
+            lines.push(`  ${f}`);
+        }
+        if (stats.warnings.count > 10) {
+            lines.push(`  ... and ${stats.warnings.count - 10} more`);
+        }
+    }
+
     if (stats.functions) {
         const top = options.top || 30;
         const shown = stats.functions.slice(0, top);

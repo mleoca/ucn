@@ -886,7 +886,7 @@ function runGlobCommand(pattern, command, arg) {
     }
 
     switch (command) {
-        case 'toc':
+        case 'toc': {
             let totalFunctions = 0;
             let totalClasses = 0;
             let totalState = 0;
@@ -937,6 +937,7 @@ function runGlobCommand(pattern, command, arg) {
                 }));
             }
             break;
+        }
 
         case 'find':
             if (!arg) {

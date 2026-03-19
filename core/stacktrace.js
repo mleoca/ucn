@@ -296,7 +296,7 @@ function parseStackTrace(index, stackText) {
         // Also handles method syntax: "package.(*Type).Method(...)"
         { regex: /^\s*((?:[^\s(]|\([^)]*\))+)\(.*\)$/, extract: null }, // Skip function-only lines
         // Java: "at package.Class.method(File.java:line)"
-        { regex: /at\s+([^\(]+)\(([^:]+):(\d+)\)/, extract: (m) => ({ funcName: m[1].split('.').pop(), file: m[2], line: parseInt(m[3]), col: null }) },
+        { regex: /at\s+([^(]+)\(([^:]+):(\d+)\)/, extract: (m) => ({ funcName: m[1].split('.').pop(), file: m[2], line: parseInt(m[3]), col: null }) },
         // Rust: "at src/main.rs:line:col" or panic location
         { regex: /(?:at\s+)?([^\s:]+\.rs):(\d+)(?::(\d+))?/, extract: (m) => ({ file: m[1], line: parseInt(m[2]), col: m[3] ? parseInt(m[3]) : null, funcName: null }) },
         // Generic: "file:line" as last resort

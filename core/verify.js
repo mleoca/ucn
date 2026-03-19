@@ -164,8 +164,9 @@ function identifyCallPatterns(callSites, funcName) {
         if (new RegExp('\\.' + escapeRegExp(funcName) + '\\s*\\(').test(expr)) patterns.chainedCalls++;
 
         if (site.args && site.args.length > 0) {
+            const literalPattern = /^[\d'"{\[]/; // eslint-disable-line no-useless-escape
             const hasLiteral = site.args.some(a =>
-                /^[\d'"{\[]/.test(a) || a === 'true' || a === 'false' || a === 'null'
+                literalPattern.test(a) || a === 'true' || a === 'false' || a === 'null'
             );
             if (hasLiteral) patterns.constantArgs++;
             if (site.hasVariable) patterns.variableArgs++;

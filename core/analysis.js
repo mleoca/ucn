@@ -26,7 +26,7 @@ function context(index, name, options = {}) {
     index._beginOp();
     try {
     const resolved = index.resolveSymbol(name, { file: options.file, className: options.className });
-    let { def, definitions, warnings } = resolved;
+    let { def, warnings } = resolved;
     if (!def) {
         return null;
     }
@@ -219,8 +219,6 @@ function detectCompleteness(index) {
     let dynamicImports = 0;
     let evalUsage = 0;
     let reflectionUsage = 0;
-
-    const predominantLang = index._getPredominantLanguage();
 
     for (const [filePath, fileEntry] of index.files) {
         // Skip node_modules - we don't care about their patterns
@@ -943,7 +941,7 @@ function diffImpact(index, options = {}) {
     const { base = 'HEAD', staged = false, file } = options;
 
     // Validate base ref format to prevent argument injection
-    if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {
+    if (base && !/^[a-zA-Z0-9._\-~\/^@{}:]+$/.test(base)) {  // eslint-disable-line no-useless-escape
         throw new Error(`Invalid git ref format: ${base}`);
     }
 
@@ -952,7 +950,7 @@ function diffImpact(index, options = {}) {
     try {
         gitRoot = execFileSync('git', ['rev-parse', '--show-toplevel'], { cwd: index.root, encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
     } catch (e) {
-        throw new Error('Not a git repository. diff-impact requires git.');
+        throw new Error('Not a git repository. diff-impact requires git.', { cause: e });
     }
 
     // Build git diff command (use execFileSync to avoid shell expansion)
@@ -974,7 +972,7 @@ function diffImpact(index, options = {}) {
         if (e.stdout) {
             diffText = e.stdout;
         } else {
-            throw new Error(`git diff failed: ${e.message}`);
+            throw new Error(`git diff failed: ${e.message}`, { cause: e });
         }
     }
 

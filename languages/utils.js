@@ -372,7 +372,7 @@ function extractRustDocstring(codeOrLines, startLine) {
             commentStart--;
         }
         // Return first line of comment block
-        const firstLine = lines[commentStart].trim().replace(/^\/\/[\/!]\s?/, '');
+        const firstLine = lines[commentStart].trim().replace(/^\/\/[/!]\s?/, '');
         if (firstLine) return firstLine;
     }
     return null;

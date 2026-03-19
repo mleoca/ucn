@@ -956,6 +956,73 @@ describe('Architecture Guards', () => {
             }
         }
     });
+
+    it('every FLAG_APPLICABILITY flag has a Zod schema field in MCP (no drift)', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        // Collect all unique flags across all commands
+        const allFlags = new Set();
+        for (const flags of Object.values(FLAG_APPLICABILITY)) {
+            for (const f of flags) allFlags.add(f);
+        }
+        // Map camelCase flag names to their snake_case Zod field equivalents
+        const reverseParamMap = {};
+        for (const [snake, camel] of Object.entries(PARAM_MAP)) {
+            reverseParamMap[camel] = snake;
+        }
+        for (const flag of allFlags) {
+            const zodName = reverseParamMap[flag] || flag;
+            assert.ok(
+                serverCode.includes(`${zodName}:`) || serverCode.includes(`${zodName} :`),
+                `FLAG_APPLICABILITY flag "${flag}" (Zod: "${zodName}") must have a field in MCP Zod schema`
+            );
+        }
+    });
+
+    it('every CLI knownFlags entry maps to a FLAG_APPLICABILITY flag', () => {
+        const cliCode = fs.readFileSync(path.join(__dirname, '..', 'cli', 'index.js'), 'utf-8');
+        // Extract knownFlags set from parseFlags
+        const knownMatch = cliCode.match(/const knownFlags = new Set\(\[([\s\S]*?)\]\)/);
+        if (!knownMatch) return; // Skip if pattern changed
+        const knownFlags = knownMatch[1].match(/'([^']+)'/g).map(s => s.slice(1, -1).replace(/^-{1,2}/, ''));
+        // All flags across all commands
+        const allApplicableFlags = new Set();
+        for (const flags of Object.values(FLAG_APPLICABILITY)) {
+            for (const f of flags) allApplicableFlags.add(f);
+        }
+        // CLI flags that are structural (not per-command) — exempt from FLAG_APPLICABILITY
+        // CLI structural/mode flags not per-command — exempt from FLAG_APPLICABILITY
+        const exemptFlags = new Set([
+            'json', 'no-cache', 'clear-cache', 'interactive', 'i',
+            'help', 'h', 'version', 'mcp', 'no-quiet', 'quiet', 'verbose',
+            'expand', 'not', 'no-follow-symlinks', 'no-regex', 'default',
+            'max-files', 'max-chars', 'item',
+        ]);
+        for (const flag of knownFlags) {
+            if (exemptFlags.has(flag)) continue;
+            // Negation flags (no-*): verify the underlying setting exists in FLAG_APPLICABILITY
+            if (flag.startsWith('no-')) {
+                // Known negation → positive mappings (where the names don't match by simple strip)
+                const negationMap = {
+                    'no-confidence': 'showConfidence',
+                    'no-regex': 'regex',
+                    'no-follow-symlinks': 'followSymlinks',
+                };
+                const mapped = negationMap[flag];
+                if (mapped) {
+                    assert.ok(allApplicableFlags.has(mapped),
+                        `CLI negation flag "--${flag}" maps to "${mapped}" which must be in FLAG_APPLICABILITY`);
+                }
+                // Structural no-* flags (no-cache, no-quiet) are already exempted above
+                continue;
+            }
+            // Convert CLI hyphenated to camelCase
+            const camel = flag.replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+            assert.ok(
+                allApplicableFlags.has(camel) || allApplicableFlags.has(flag),
+                `CLI knownFlags "${flag}" (camel: "${camel}") should map to a FLAG_APPLICABILITY flag`
+            );
+        }
+    });
 });
 
 // ============================================================================

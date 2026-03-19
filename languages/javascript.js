@@ -1776,7 +1776,7 @@ function findImportsInCode(code, parser) {
                     const firstArg = argsNode.namedChild(0);
                     const line = node.startPosition.row + 1;
                     const names = [];
-                    let modulePath = null;
+                    let modulePath;
                     let dynamic = false;
 
                     if (firstArg && firstArg.type === 'string') {

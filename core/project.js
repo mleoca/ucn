@@ -8,13 +8,12 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { execFileSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
-const { parse, parseFile, cleanHtmlScriptTags } = require('./parser');
+const { parse, cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
-const { escapeRegExp, NON_CALLABLE_TYPES, addTestExclusions } = require('./shared');
+const { escapeRegExp, NON_CALLABLE_TYPES } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 const deadcodeModule = require('./deadcode');
@@ -293,22 +292,17 @@ class ProjectIndex {
         // These are build artifacts, not user-written source code
         // Count lines without splitting: count newlines + 1 (avoids allocating array)
         let lineCount = 1;
-        let maxLineLen = 0;
         let longLineCount = 0;
         let lineStart = 0;
         for (let ci = 0; ci < content.length; ci++) {
             if (content.charCodeAt(ci) === 10) { // '\n'
-                const lineLen = ci - lineStart;
-                if (lineLen > maxLineLen) maxLineLen = lineLen;
-                if (lineLen > 1000) longLineCount++;
+                if (ci - lineStart > 1000) longLineCount++;
                 lineStart = ci + 1;
                 lineCount++;
             }
         }
         // Handle last line (no trailing newline)
-        const lastLineLen = content.length - lineStart;
-        if (lastLineLen > maxLineLen) maxLineLen = lastLineLen;
-        if (lastLineLen > 1000) longLineCount++;
+        if (content.length - lineStart > 1000) longLineCount++;
 
         const isBundled = (() => {
             // Webpack bundles contain __webpack_require__ or __webpack_modules__
