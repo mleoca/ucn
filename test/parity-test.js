@@ -19,7 +19,7 @@ const fs = require('fs');
 const os = require('os');
 
 const { McpClient, runCli, runInteractive, FIXTURES_PATH: BASE_FIXTURES } = require('./helpers');
-const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP } = require('../core/registry');
+const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY } = require('../core/registry');
 const FIXTURES_PATH = path.join(BASE_FIXTURES, 'javascript');
 
 // ============================================================================
@@ -913,6 +913,40 @@ describe('Architecture Guards', () => {
         for (const snakeKey of Object.keys(PARAM_MAP)) {
             assert.ok(serverCode.includes(`${snakeKey}:`),
                 `PARAM_MAP key "${snakeKey}" should have a matching field in MCP Zod schema`);
+        }
+    });
+
+    it('every canonical command has a FLAG_APPLICABILITY entry', () => {
+        for (const cmd of CANONICAL_COMMANDS) {
+            assert.ok(cmd in FLAG_APPLICABILITY,
+                `Canonical command "${cmd}" missing from FLAG_APPLICABILITY`);
+        }
+    });
+
+    it('no stale entries in FLAG_APPLICABILITY', () => {
+        for (const cmd of Object.keys(FLAG_APPLICABILITY)) {
+            assert.ok(CANONICAL_COMMANDS.includes(cmd),
+                `FLAG_APPLICABILITY has entry "${cmd}" which is not a canonical command`);
+        }
+    });
+
+    it('FLAG_APPLICABILITY flags are valid camelCase param names', () => {
+        // Collect all known param names: camelCase values from PARAM_MAP + common direct-use names
+        const knownCamelParams = new Set(Object.values(PARAM_MAP));
+        // Also accept params that aren't in PARAM_MAP but are used directly (already camelCase in CLI)
+        const directParams = [
+            'file', 'exclude', 'name', 'term', 'depth', 'top', 'limit', 'context',
+            'direction', 'all', 'exact', 'regex', 'in', 'range', 'stack', 'base',
+            'staged', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported',
+            'unused', 'functions', 'framework', 'detailed',
+        ];
+        for (const p of directParams) knownCamelParams.add(p);
+
+        for (const [cmd, flags] of Object.entries(FLAG_APPLICABILITY)) {
+            for (const flag of flags) {
+                assert.ok(knownCamelParams.has(flag),
+                    `FLAG_APPLICABILITY["${cmd}"] references unknown flag "${flag}"`);
+            }
         }
     });
 });

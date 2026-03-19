@@ -47,6 +47,7 @@ const expandCacheInstance = new ExpandCache();
 
 function getIndex(projectDir, options) {
     const maxFiles = options && options.maxFiles;
+    const followSymlinks = options && options.followSymlinks;
     const absDir = path.resolve(projectDir);
     if (!fs.existsSync(absDir) || !fs.statSync(absDir).isDirectory()) {
         throw new Error(`Project directory not found: ${absDir}`);
@@ -67,6 +68,7 @@ function getIndex(projectDir, options) {
     const index = new ProjectIndex(root);
     const buildOpts = { quiet: true, forceRebuild: false };
     if (maxFiles) buildOpts.maxFiles = maxFiles;
+    if (followSymlinks === false) buildOpts.followSymlinks = false;
     const loaded = index.loadCache();
     if (loaded && !maxFiles && !index.isCacheStale()) {
         // Disk cache is fresh (skip when maxFiles is set — cached index may have different file count)
@@ -300,7 +302,8 @@ server.registerTool(
             decorator: z.string().optional().describe('Filter by decorator/annotation (structural search). E.g. "Route", "Test".'),
             exported: z.boolean().optional().describe('Only exported/public symbols (structural search).'),
             unused: z.boolean().optional().describe('Only symbols with zero callers (structural search).'),
-            framework: z.string().optional().describe('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.')
+            framework: z.string().optional().describe('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.'),
+            follow_symlinks: z.boolean().optional().describe('Follow symlinks during file discovery (default: true)')
 
         })
     },
@@ -340,30 +343,36 @@ server.registerTool(
 
             case 'context': {
                 index = getIndex(project_dir, ep);
-                const { ok, result: ctx, error } = execute(index, 'context', ep);
+                const { ok, result: ctx, error, note } = execute(index, 'context', ep);
                 if (!ok) return tr(error); // context uses soft error (not toolError)
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
                     showConfidence: ep.showConfidence !== false,
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
-                return tr(text);
+                let ctxText = text;
+                if (note) ctxText += '\n\n' + note;
+                return tr(ctxText);
             }
 
             case 'impact': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'impact', ep);
+                const { ok, result, error, note } = execute(index, 'impact', ep);
                 if (!ok) return tr(error); // soft error
-                return tr(output.formatImpact(result));
+                let impactText = output.formatImpact(result);
+                if (note) impactText += '\n\n' + note;
+                return tr(impactText);
             }
 
             case 'blast': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'blast', ep);
+                const { ok, result, error, note } = execute(index, 'blast', ep);
                 if (!ok) return tr(error); // soft error
-                return tr(output.formatBlast(result, {
+                let blastText = output.formatBlast(result, {
                     allHint: 'Set depth to expand all children.',
-                }));
+                });
+                if (note) blastText += '\n\n' + note;
+                return tr(blastText);
             }
 
             case 'smart': {
@@ -375,21 +384,25 @@ server.registerTool(
 
             case 'trace': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'trace', ep);
+                const { ok, result, error, note } = execute(index, 'trace', ep);
                 if (!ok) return tr(error); // soft error
-                return tr(output.formatTrace(result, {
+                let traceText = output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
-                }));
+                });
+                if (note) traceText += '\n\n' + note;
+                return tr(traceText);
             }
 
             case 'reverse_trace': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'reverseTrace', ep);
+                const { ok, result, error, note } = execute(index, 'reverseTrace', ep);
                 if (!ok) return tr(error);
-                return tr(output.formatReverseTrace(result, {
+                let rtText = output.formatReverseTrace(result, {
                     allHint: 'Set depth to expand all children.',
-                }));
+                });
+                if (note) rtText += '\n\n' + note;
+                return tr(rtText);
             }
 
             case 'example': {
@@ -402,13 +415,15 @@ server.registerTool(
 
             case 'related': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'related', ep);
+                const { ok, result, error, note } = execute(index, 'related', ep);
                 if (!ok) return tr(error);
                 if (!result) return tr(`Symbol "${ep.name}" not found.`);
-                return tr(output.formatRelated(result, {
+                let relText = output.formatRelated(result, {
                     all: ep.all || false, top: ep.top,
                     allHint: 'Repeat with all=true to show all.'
-                }));
+                });
+                if (note) relText += '\n\n' + note;
+                return tr(relText);
             }
 
             // ── Finding Code ────────────────────────────────────────────
@@ -461,9 +476,11 @@ server.registerTool(
 
             case 'affected_tests': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'affectedTests', ep);
+                const { ok, result, error, note } = execute(index, 'affectedTests', ep);
                 if (!ok) return tr(error);
-                return tr(output.formatAffectedTests(result, { all: ep.all }));
+                let atText = output.formatAffectedTests(result, { all: ep.all });
+                if (note) atText += '\n\n' + note;
+                return tr(atText);
             }
 
             case 'deadcode': {

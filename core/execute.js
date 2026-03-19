@@ -161,6 +161,21 @@ function truncationNote(index) {
     return `Index limited to ${index.truncated.indexed} files (max ${index.truncated.maxFiles}). Results may be incomplete. Use --max-files N to increase.`;
 }
 
+/** Build notes for tree-based results (blast, trace, reverseTrace, affectedTests). */
+function treeNote(result) {
+    const parts = [];
+    if (result?.warnings?.length > 0) {
+        for (const w of result.warnings) parts.push(w.message || w);
+    }
+    if (result?.tree?.truncatedChildren > 0) {
+        parts.push(`${result.tree.truncatedChildren} children truncated. Use --depth=N or --all to expand.`);
+    }
+    if (result?.truncatedCallers > 0) {
+        parts.push(`${result.truncatedCallers} callers truncated. Use --all to expand.`);
+    }
+    return parts.length > 0 ? parts.join('\n') : null;
+}
+
 /**
  * Check if a --file pattern matches any files in the index.
  * Returns error string if no files match, null otherwise.
@@ -250,7 +265,8 @@ const HANDLERS = {
             ...buildCallerOptions(p),
         });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
-        return { ok: true, result, showConfidence: !!p.showConfidence };
+        const tNote = truncationNote(index);
+        return { ok: true, result, showConfidence: !!p.showConfidence, ...(tNote && { note: tNote }) };
     },
 
     impact: (index, p) => {
@@ -268,7 +284,8 @@ const HANDLERS = {
             top: num(p.top, undefined),
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const tNote = truncationNote(index);
+        return { ok: true, result, ...(tNote && { note: tNote }) };
     },
 
     blast: (index, p) => {
@@ -286,7 +303,10 @@ const HANDLERS = {
             all: p.all || depthVal !== undefined,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const note = treeNote(result);
+        const tNote = truncationNote(index);
+        const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
+        return { ok: true, result, ...(combined && { note: combined }) };
     },
 
     reverseTrace: (index, p) => {
@@ -304,7 +324,10 @@ const HANDLERS = {
             all: p.all || depthVal !== undefined,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const note = treeNote(result);
+        const tNote = truncationNote(index);
+        const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
+        return { ok: true, result, ...(combined && { note: combined }) };
     },
 
     smart: (index, p) => {
@@ -313,6 +336,8 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.smart(p.name, {
             ...buildCallerOptions(p),
             withTypes: p.withTypes || false,
@@ -327,6 +352,8 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const depthVal = num(p.depth, undefined);
         const result = index.trace(p.name, {
             ...buildCallerOptions(p),
@@ -334,7 +361,10 @@ const HANDLERS = {
             all: p.all || depthVal !== undefined,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const note = treeNote(result);
+        const tNote = truncationNote(index);
+        const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
+        return { ok: true, result, ...(combined && { note: combined }) };
     },
 
     example: (index, p) => {
@@ -343,6 +373,8 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.example(p.name, { file: p.file, className: p.className });
         if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
         return { ok: true, result };
@@ -361,7 +393,8 @@ const HANDLERS = {
             all: p.all,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const tNote = truncationNote(index);
+        return { ok: true, result, ...(tNote && { note: tNote }) };
     },
 
     // ── Finding Code ────────────────────────────────────────────────────
@@ -541,6 +574,8 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.tests(p.name, {
             callsOnly: p.callsOnly || false,
             className: p.className,
@@ -562,7 +597,10 @@ const HANDLERS = {
             depth: depthVal ?? 3,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const note = treeNote(result);
+        const tNote = truncationNote(index);
+        const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
+        return { ok: true, result, ...(combined && { note: combined }) };
     },
 
     deadcode: (index, p) => {
@@ -596,11 +634,12 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         const { detectEntrypoints } = require('./entrypoints');
+        const exclude = applyTestExclusions(p.exclude, p.includeTests);
         let result = detectEntrypoints(index, {
             type: p.type,
             framework: p.framework,
             file: p.file,
-            exclude: p.exclude,
+            exclude,
         });
         const limit = num(p.limit, undefined);
         let note;
@@ -903,6 +942,8 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.typedef(p.name, { exact: p.exact || false, className: p.className, file: p.file });
         return { ok: true, result };
     },

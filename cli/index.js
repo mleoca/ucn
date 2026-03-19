@@ -475,7 +475,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'context': {
-            const { ok, result: ctx, error } = execute(index, 'context', { name: arg, ...flags });
+            const { ok, result: ctx, error, note } = execute(index, 'context', { name: arg, ...flags });
             if (!ok) fail(error);
             if (flags.json) {
                 console.log(output.formatContextJson(ctx));
@@ -513,6 +513,7 @@ function runProjectCommand(rootDir, command, arg) {
 
                 // Save expandable items to cache for 'expand' command
                 saveExpandableItems(expandable, index.root);
+                if (note) console.error(note);
             }
             break;
         }
@@ -554,16 +555,18 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'impact': {
-            const { ok, result, error } = execute(index, 'impact', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'impact', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatImpactJson, output.formatImpact);
+            if (note) console.error(note);
             break;
         }
 
         case 'blast': {
-            const { ok, result, error } = execute(index, 'blast', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'blast', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatBlastJson, output.formatBlast);
+            if (note) console.error(note);
             break;
         }
 
@@ -575,16 +578,18 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'trace': {
-            const { ok, result, error } = execute(index, 'trace', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'trace', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatTraceJson, output.formatTrace);
+            if (note) console.error(note);
             break;
         }
 
         case 'reverseTrace': {
-            const { ok, result, error } = execute(index, 'reverseTrace', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'reverseTrace', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatReverseTraceJson, output.formatReverseTrace);
+            if (note) console.error(note);
             break;
         }
 
@@ -603,9 +608,10 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'related': {
-            const { ok, result, error } = execute(index, 'related', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'related', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatRelatedJson, r => output.formatRelated(r, { all: flags.all, top: flags.top }));
+            if (note) console.error(note);
             break;
         }
 
@@ -713,9 +719,10 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'affectedTests': {
-            const { ok, result, error } = execute(index, 'affectedTests', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'affectedTests', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatAffectedTestsJson, r => output.formatAffectedTests(r, { all: flags.all }));
+            if (note) console.error(note);
             break;
         }
 
@@ -1113,31 +1120,34 @@ Common Flags:
   --file <pattern>    Filter by file path (e.g., --file=routes)
   --exclude=a,b       Exclude patterns (e.g., --exclude=test,mock)
   --in=<path>         Only in path (e.g., --in=src/core)
-  --depth=N           Trace/graph depth (default: 3, also expands all children)
+  --depth=N           Max depth: blast=3, trace=3, reverse-trace=5, graph=2, affected-tests=3
   --direction=X       Graph direction: imports, importers, or both (default: both)
-  --all               Expand truncated sections (about, trace, graph, related)
-  --top=N             Limit results (find, deadcode)
-  --limit=N           Limit result count (find, usages, search, deadcode, api, toc)
+  --all               Show full results: all callers/callees (about), full tree (trace/blast),
+                        all names (related/find/fn/class/toc), all changed (diff-impact)
+  --top=N             Limit callers/callees (about), similar functions (related), search results
+  --limit=N           Limit result count (find, usages, search, deadcode, api, toc, entrypoints, diff-impact)
   --max-files=N       Max files to index (large projects)
-  --context=N         Lines of context around matches
+  --context=N         Lines of context around matches (search, usages)
   --json              Machine-readable output
-  --code-only         Filter out comments and strings
-  --with-types        Include type definitions
+  --code-only         Filter out comments/strings (search, usages)
+  --with-types        Include type definitions (about, smart)
+  --detailed          Show all symbols in toc (not just counts)
   --include-tests     Include test files
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
-  --no-confidence     Hide confidence scores (shown by default)
-  --min-confidence=N  Filter edges below confidence threshold (0.0-1.0)
+  --no-confidence     Hide confidence scores (shown by default in about, context)
+  --min-confidence=N  Filter low-confidence edges (about, context, blast, trace,
+                        reverse-trace, smart, affected-tests)
+  --show-confidence   Show confidence scores on caller/callee edges (about, context)
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)
   --functions         Show per-function line counts (stats command)
   --include-decorated Include decorated/annotated symbols in deadcode
   --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
-  --exact             Exact name match only (find)
+  --exact             Exact name match only (find, typedef)
   --calls-only        Only show call/test-case matches (tests)
   --case-sensitive    Case-sensitive text search (search)
-  --detailed          List all symbols in toc (compact by default)
   --top-level         Show only top-level functions in toc
   --max-lines=N       Max source lines for class (large classes show summary)
   --no-cache          Disable caching

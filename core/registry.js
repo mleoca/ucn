@@ -84,6 +84,56 @@ const PARAM_MAP = {
     top_level:         'topLevel',
     max_files:         'maxFiles',
     max_chars:         'maxChars',
+    follow_symlinks:   'followSymlinks',
+};
+
+// ============================================================================
+// FLAG APPLICABILITY MATRIX
+// ============================================================================
+
+// Per-command list of accepted flag names (camelCase). Source of truth for help text,
+// MCP schema validation, and architecture guards.
+// file* = file is the command subject (required), not a filter pattern.
+const FLAG_APPLICABILITY = {
+    // Understanding code
+    about:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
+    context:      ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence'],
+    impact:       ['file', 'exclude', 'className', 'top'],
+    blast:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    reverseTrace: ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    smart:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
+    trace:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    example:      ['file', 'className'],
+    related:      ['file', 'className', 'top', 'all'],
+    // Finding code
+    find:         ['file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all'],
+    usages:       ['file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
+    toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
+    search:       ['file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
+    tests:        ['className', 'callsOnly'],
+    affectedTests:['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
+    deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
+    entrypoints:  ['file', 'exclude', 'includeTests', 'limit', 'type', 'framework'],
+    // Extracting code
+    fn:           ['file', 'className', 'all'],
+    class:        ['file', 'className', 'all', 'maxLines'],
+    lines:        ['file', 'range'],
+    expand:       [],
+    // File dependencies
+    imports:      ['file'],
+    exporters:    ['file'],
+    fileExports:  ['file'],
+    graph:        ['file', 'depth', 'direction'],
+    circularDeps: ['file', 'exclude'],
+    // Refactoring
+    verify:       ['file', 'className'],
+    plan:         ['file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
+    diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],
+    // Other
+    typedef:      ['file', 'className', 'exact'],
+    stacktrace:   ['stack'],
+    api:          ['file', 'limit'],
+    stats:        ['functions', 'top'],
 };
 
 // ============================================================================
@@ -172,6 +222,7 @@ module.exports = {
     CLI_ALIASES,
     MCP_ALIASES,
     PARAM_MAP,
+    FLAG_APPLICABILITY,
     resolveCommand,
     normalizeParams,
     getCliCommandSet,
