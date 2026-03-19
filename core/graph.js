@@ -546,6 +546,7 @@ function circularDeps(index, options = {}) {
             const neighbors = [...new Set(index.importGraph.get(file) || [])];
 
             for (const neighbor of neighbors) {
+                if (neighbor === file) continue;  // Skip self-imports (not a cycle)
                 if (shouldSkip(neighbor)) continue;
                 const nc = color.get(neighbor) || WHITE;
                 if (nc === GRAY) {

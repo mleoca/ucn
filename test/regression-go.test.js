@@ -3773,3 +3773,142 @@ func Setup() {
     });
 });
 
+// ============================================================================
+// K8s stress test regressions (2026-03-19)
+// ============================================================================
+
+describe('K8s stress test: BUG-1 — Go package-qualified callee picks longest suffix match', () => {
+    it('prefers longer import path suffix over shorter one', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/proj\ngo 1.21',
+            // Two packages both ending in /metrics, different parent paths
+            'pkg/client/kubernetes/metrics/metrics.go': `
+package metrics
+func Register() error { return nil }
+`,
+            'pkg/admin/metrics/metrics.go': `
+package metrics
+func Register() error { return nil }
+`,
+            // Caller imports the client/kubernetes/metrics path
+            'cmd/app/main.go': `
+package main
+import "example.com/proj/pkg/client/kubernetes/metrics"
+func main() {
+    metrics.Register()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'main', file: 'cmd/app/main.go' });
+            assert.ok(result.ok, 'context should succeed');
+            // The callee Register should resolve to the client/kubernetes/metrics path,
+            // not the admin/metrics path (which has a shorter suffix match)
+            const regCallee = result.result.callees.find(c => c.name === 'Register');
+            assert.ok(regCallee, 'should find Register callee');
+            assert.ok(regCallee.relativePath.includes('client/kubernetes/metrics'),
+                `Expected Register from client/kubernetes/metrics, got ${regCallee.relativePath}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('K8s stress test: BUG-3 — find usage counts are per-definition for Go', () => {
+    it('returns different usage counts for same-name functions in different packages', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/proj\ngo 1.21',
+            'pkg/a/serve.go': `
+package a
+func Serve() {}
+`,
+            'pkg/b/serve.go': `
+package b
+func Serve() {}
+`,
+            // Only imports and calls a.Serve
+            'cmd/main.go': `
+package main
+import "example.com/proj/pkg/a"
+func main() {
+    a.Serve()
+    a.Serve()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const results = index.find('Serve');
+            assert.strictEqual(results.length, 2, 'should find 2 Serve definitions');
+            const serveA = results.find(r => r.relativePath.includes('pkg/a'));
+            const serveB = results.find(r => r.relativePath.includes('pkg/b'));
+            assert.ok(serveA, 'should find Serve in pkg/a');
+            assert.ok(serveB, 'should find Serve in pkg/b');
+            // a.Serve has 2 calls from main.go, b.Serve has 0
+            assert.ok(serveA.usageCounts.calls > serveB.usageCounts.calls,
+                `pkg/a Serve calls (${serveA.usageCounts.calls}) should be > pkg/b Serve calls (${serveB.usageCounts.calls})`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('K8s stress test: BUG-4 — circularDeps skips self-imports', () => {
+    it('does not report Go test file importing own package as circular', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/proj\ngo 1.21',
+            'pkg/foo/foo.go': `
+package foo
+func Helper() {}
+`,
+            // Test file in same package — references own package symbols
+            'pkg/foo/foo_test.go': `
+package foo
+import "testing"
+func TestHelper(t *testing.T) {
+    Helper()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'circularDeps', {});
+            assert.ok(result.ok, 'circularDeps should succeed');
+            // Should NOT report single-file self-cycles
+            const singleFileCycles = result.result.cycles.filter(c => c.length === 1);
+            assert.strictEqual(singleFileCycles.length, 0,
+                `Should have no self-cycles, found ${singleFileCycles.length}: ${JSON.stringify(singleFileCycles)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('K8s stress test: PERF-1 — deadcode --file pre-filters names', () => {
+    it('deadcode with --file only scans names from target scope', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/proj\ngo 1.21',
+            'pkg/target/target.go': `
+package target
+func UsedFunc() {}
+func UnusedFunc() {}
+`,
+            'pkg/other/other.go': `
+package other
+func OtherUnused() {}
+`,
+            'cmd/main.go': `
+package main
+import "example.com/proj/pkg/target"
+func main() {
+    target.UsedFunc()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            // deadcode scoped to pkg/target should only report UnusedFunc, not OtherUnused
+            const result = execute(index, 'deadcode', { file: 'pkg/target' });
+            assert.ok(result.ok, 'deadcode should succeed');
+            const names = result.result.map(r => r.name);
+            assert.ok(!names.includes('OtherUnused'),
+                'Should not include OtherUnused (outside --file scope)');
+        } finally { rm(dir); }
+    });
+});
+

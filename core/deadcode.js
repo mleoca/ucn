@@ -205,11 +205,25 @@ function deadcode(index, options = {}) {
     }
 
     // Pre-filter: names in the callee index have call sites → definitely used → not dead.
-    const potentiallyDeadNames = new Set();
+    let potentiallyDeadNames = new Set();
     for (const name of callableNames) {
         if (!index.calleeIndex.has(name)) {
             potentiallyDeadNames.add(name);
         }
+    }
+
+    // When --file is provided, pre-filter to only names of symbols in the target scope.
+    // The text scan below is O(potentiallyDeadNames × files) — narrowing the name set
+    // avoids scanning all files for names that will be filtered out at the result stage.
+    if (options.file) {
+        const filteredNames = new Set();
+        for (const name of potentiallyDeadNames) {
+            const syms = index.symbols.get(name) || [];
+            if (syms.some(s => s.relativePath && s.relativePath.includes(options.file))) {
+                filteredNames.add(name);
+            }
+        }
+        potentiallyDeadNames = filteredNames;
     }
 
     // Build usage index for potentially dead names using text scan (no tree-sitter reparsing).

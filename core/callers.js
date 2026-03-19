@@ -778,17 +778,28 @@ function findCallees(index, def, options = {}) {
                         // Receiver is an import alias — resolve to definitions from that package
                         const symbols = index.symbols.get(call.name);
                         if (symbols) {
-                            // Match by checking if the definition's directory path matches the import path suffix
+                            // Match by checking if the definition's directory path matches the import path suffix.
+                            // Pick the symbol with the LONGEST suffix match to avoid false positives
+                            // (e.g., import "k8s.io/client-go/kubernetes/scheme" should prefer a definition
+                            // in .../client-go/kubernetes/scheme/ over one in .../kubeadm/scheme/).
                             const importParts = importModule.split('/');
-                            const match = symbols.find(s => {
+                            let bestMatch = null;
+                            let bestMatchLen = 0;
+                            for (const s of symbols) {
                                 const sDir = path.dirname(s.relativePath || path.relative(index.root, s.file));
-                                // Try matching progressively shorter suffixes of the import path
-                                for (let i = importParts.length - 1; i >= 0; i--) {
+                                for (let i = 0; i < importParts.length; i++) {
                                     const suffix = importParts.slice(i).join('/');
-                                    if (sDir === suffix || sDir.endsWith('/' + suffix)) return true;
+                                    if (sDir === suffix || sDir.endsWith('/' + suffix)) {
+                                        const matchLen = importParts.length - i;
+                                        if (matchLen > bestMatchLen) {
+                                            bestMatchLen = matchLen;
+                                            bestMatch = s;
+                                        }
+                                        break; // this symbol's best suffix found, try next
+                                    }
                                 }
-                                return false;
-                            });
+                            }
+                            const match = bestMatch;
                             if (match) {
                                 const key = match.bindingId || `${call.receiver}.${call.name}`;
                                 const existing = callees.get(key);

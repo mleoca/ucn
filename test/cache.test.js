@@ -1769,11 +1769,12 @@ describe('fix: callsCache persisted to disk after command execution', () => {
         });
         try {
             const index = idx(dir);
-            assert.strictEqual(index.callsCache.size, 0, 'callsCache empty before findCallers');
+            // callsCache is eagerly populated during build() via buildCalleeIndex()
+            assert.ok(index.callsCache.size > 0, 'callsCache populated eagerly during build');
 
-            // findCallers populates callsCache
+            // findCallers uses the already-populated callsCache
             index.findCallers('helper');
-            assert.ok(index.callsCache.size > 0, 'callsCache populated after findCallers');
+            assert.ok(index.callsCache.size > 0, 'callsCache still populated after findCallers');
             assert.ok(index.callsCacheDirty, 'dirty flag set');
 
             // Save and reload — callsCache should persist in separate file

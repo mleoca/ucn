@@ -35,6 +35,11 @@ function trace(index, name, options = {}) {
         return null;
     }
     const visited = new Set();
+    // Memoize findCallees/findCallers results within this trace operation.
+    // At depth 5, the same function appears at multiple tree positions — without
+    // caching, findCallees is called redundantly (O(10^depth) → O(unique functions)).
+    const calleeCache = new Map();
+    const callerCache = new Map();
 
     const buildTree = (funcDef, currentDepth, dir) => {
         const funcName = funcDef.name;
@@ -64,7 +69,11 @@ function trace(index, name, options = {}) {
         };
 
         if (dir === 'down' || dir === 'both') {
-            const callees = index.findCallees(funcDef, { includeMethods, includeUncertain: options.includeUncertain });
+            let callees = calleeCache.get(key);
+            if (!callees) {
+                callees = index.findCallees(funcDef, { includeMethods, includeUncertain: options.includeUncertain });
+                calleeCache.set(key, callees);
+            }
             for (const callee of callees.slice(0, maxChildren)) {
                 // callee already has the best-matched definition from findCallees
                 const childTree = buildTree(callee, currentDepth + 1, 'down');
@@ -152,6 +161,7 @@ function blast(index, name, options = {}) {
         if (!def) return null;
 
         const visited = new Set();
+        const callerCache = new Map();
         const affectedFunctions = new Set();
         const affectedFiles = new Set();
         let maxDepthReached = 0;
@@ -186,11 +196,18 @@ function blast(index, name, options = {}) {
             };
 
             if (currentDepth < maxDepth) {
-                const callers = index.findCallers(funcDef.name, {
-                    includeMethods,
-                    includeUncertain,
-                    targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
-                });
+                const callerCacheKey = funcDef.bindingId
+                    ? `${funcDef.name}:${funcDef.bindingId}`
+                    : `${funcDef.name}:${key}`;
+                let callers = callerCache.get(callerCacheKey);
+                if (!callers) {
+                    callers = index.findCallers(funcDef.name, {
+                        includeMethods,
+                        includeUncertain,
+                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                    });
+                    callerCache.set(callerCacheKey, callers);
+                }
 
                 // Deduplicate callers by enclosing function (multiple call sites → one tree node)
                 const uniqueCallers = new Map();
@@ -319,6 +336,7 @@ function reverseTrace(index, name, options = {}) {
         if (!def) return null;
 
         const visited = new Set();
+        const callerCache = new Map();
         const entryPoints = [];
         let maxDepthReached = 0;
 
@@ -347,11 +365,18 @@ function reverseTrace(index, name, options = {}) {
             };
 
             if (currentDepth < maxDepth) {
-                const callers = index.findCallers(funcDef.name, {
-                    includeMethods,
-                    includeUncertain,
-                    targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
-                });
+                const callerCacheKey = funcDef.bindingId
+                    ? `${funcDef.name}:${funcDef.bindingId}`
+                    : `${funcDef.name}:${key}`;
+                let callers = callerCache.get(callerCacheKey);
+                if (!callers) {
+                    callers = index.findCallers(funcDef.name, {
+                        includeMethods,
+                        includeUncertain,
+                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                    });
+                    callerCache.set(callerCacheKey, callers);
+                }
 
                 // Deduplicate callers by enclosing function
                 const uniqueCallers = new Map();
