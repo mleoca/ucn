@@ -1311,10 +1311,74 @@ Flags can be added per-command: context myFunc --include-methods
 
 // parseInteractiveFlags removed — both global and interactive mode now use parseFlags()
 
-function executeInteractiveCommand(index, command, arg, iflags = {}, cache = null) {
-    switch (command) {
+// ── Data-driven interactive command dispatch ─────────────────────────────
+//
+// Each entry maps a canonical command name to:
+//   params: (arg, iflags) => execute() params object
+//   format: (result, arg, iflags, index) => formatted string
+//
+// The generic handler calls execute(), checks errors, prints notes, and
+// formats the result. Only commands with truly unique behavior (expand
+// cache save, file writing, conditional formatters) keep explicit cases.
 
-        // ── Extraction commands (via execute) ────────────────────────────
+const INTERACTIVE_DISPATCH = {
+    // ── Understanding Code ───────────────────────────────────────────
+    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence }) },
+    smart:        { params: 'name', format: (r) => output.formatSmart(r, { uncertainHint: 'use --include-uncertain to include all' }) },
+    impact:       { params: 'name', format: (r) => output.formatImpact(r) },
+    blast:        { params: 'name', format: (r) => output.formatBlast(r) },
+    trace:        { params: 'name', format: (r) => output.formatTrace(r) },
+    reverseTrace: { params: 'name', format: (r) => output.formatReverseTrace(r) },
+    related:      { params: 'name', format: (r, _a, f) => output.formatRelated(r, { all: f.all, top: f.top }) },
+    example:      { params: (a) => ({ name: a }), format: (r, a) => output.formatExample(r, a) },
+
+    // ── Finding Code ─────────────────────────────────────────────────
+    find:          { params: 'name', format: (r, a, f) => output.formatFindDetailed(r, a, { depth: f.depth, top: f.top, all: f.all }) },
+    usages:        { params: 'name', format: (r, a) => output.formatUsages(r, a) },
+    toc:           { params: 'flags', format: (r) => output.formatToc(r, { detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol', uncertainHint: 'use --include-uncertain to include all' }) },
+    tests:         { params: 'name', format: (r, a) => output.formatTests(r, a) },
+    affectedTests: { params: 'name', format: (r, _a, f) => output.formatAffectedTests(r, { all: f.all }) },
+    typedef:       { params: 'name', format: (r, a) => output.formatTypedef(r, a) },
+
+    // ── File Dependencies ────────────────────────────────────────────
+    imports:      { params: 'file', format: (r, a) => output.formatImports(r, a) },
+    exporters:    { params: 'file', format: (r, a) => output.formatExporters(r, a) },
+    fileExports:  { params: 'file', format: (r, a) => output.formatFileExports(r, a) },
+    graph:        { params: (a, f) => ({ file: a || f.file, direction: f.direction, depth: f.depth, all: f.all }), format: (r, a, f) => { const d = f.depth ? parseInt(f.depth) : 2; return output.formatGraph(r, { showAll: f.all || !!f.depth, maxDepth: d, file: a }); } },
+    circularDeps: { params: (a, f) => ({ file: f.file, exclude: f.exclude }), format: (r) => output.formatCircularDeps(r) },
+
+    // ── Refactoring Helpers ──────────────────────────────────────────
+    plan:         { params: 'name', format: (r) => output.formatPlan(r) },
+    verify:       { params: 'name', format: (r) => output.formatVerify(r) },
+    diffImpact:   { params: 'flags', format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
+    entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude }), format: (r) => output.formatEntrypoints(r) },
+
+    // ── Other ────────────────────────────────────────────────────────
+    api:          { params: (a) => ({ file: a }), format: (r, a) => output.formatApi(r, a || '.') },
+    stacktrace:   { params: (a) => ({ stack: a }), format: (r) => output.formatStackTrace(r) },
+    stats:        { params: 'flags', format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
+};
+
+/**
+ * Build execute() params from a dispatch entry's params descriptor.
+ *   'name'  → { name: arg, ...iflags }
+ *   'file'  → { file: arg }
+ *   'flags' → iflags (no arg)
+ *   function → custom builder
+ */
+function buildInteractiveParams(descriptor, arg, iflags) {
+    if (typeof descriptor === 'function') return descriptor(arg, iflags);
+    switch (descriptor) {
+        case 'name':  return { name: arg, ...iflags };
+        case 'file':  return { file: arg };
+        case 'flags': return iflags;
+        default:      return { name: arg, ...iflags };
+    }
+}
+
+function executeInteractiveCommand(index, command, arg, iflags = {}, cache = null) {
+    // ── Commands with unique behavior (not data-driven) ──────────────
+    switch (command) {
 
         case 'fn': {
             if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>]'); return; }
@@ -1372,16 +1436,6 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
-        case 'find': {
-            const { ok, result, error, note } = execute(index, 'find', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            if (note) console.log(note);
-            console.log(output.formatFindDetailed(result, arg, { depth: iflags.depth, top: iflags.top, all: iflags.all }));
-            break;
-        }
-
-        // ── context: needs expandable items cache ────────────────────────
-
         case 'context': {
             const { ok, result, error } = execute(index, 'context', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
@@ -1400,8 +1454,6 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
-        // ── deadcode: needs result fields for hint construction ──────────
-
         case 'deadcode': {
             const { ok, result, error } = execute(index, 'deadcode', iflags);
             if (!ok) { console.log(error); return; }
@@ -1410,126 +1462,6 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 decoratedHint: !iflags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
                 exportedHint: !iflags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined
             }));
-            break;
-        }
-
-        case 'entrypoints': {
-            const { ok, result, error } = execute(index, 'entrypoints', { type: iflags.type, framework: iflags.framework, file: iflags.file, exclude: iflags.exclude });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatEntrypoints(result));
-            break;
-        }
-
-        // ── Standard commands routed through execute() ───────────────────
-
-        case 'toc': {
-            const { ok, result, error } = execute(index, 'toc', iflags);
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatToc(result, {
-                detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol',
-                uncertainHint: 'use --include-uncertain to include all'
-            }));
-            break;
-        }
-
-        case 'about': {
-            const { ok, result, error } = execute(index, 'about', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatAbout(result, { expand: iflags.expand, root: index.root, showAll: iflags.all, depth: iflags.depth, showConfidence: iflags.showConfidence }));
-            break;
-        }
-
-        case 'usages': {
-            const { ok, result, error } = execute(index, 'usages', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatUsages(result, arg));
-            break;
-        }
-
-        case 'smart': {
-            const { ok, result, error } = execute(index, 'smart', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatSmart(result, {
-                uncertainHint: 'use --include-uncertain to include all'
-            }));
-            break;
-        }
-
-        case 'impact': {
-            const { ok, result, error } = execute(index, 'impact', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatImpact(result));
-            break;
-        }
-
-        case 'blast': {
-            const { ok, result, error } = execute(index, 'blast', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatBlast(result));
-            break;
-        }
-
-        case 'trace': {
-            const { ok, result, error } = execute(index, 'trace', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatTrace(result));
-            break;
-        }
-
-        case 'reverseTrace': {
-            const { ok, result, error } = execute(index, 'reverseTrace', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatReverseTrace(result));
-            break;
-        }
-
-        case 'graph': {
-            const { ok, result, error } = execute(index, 'graph', { file: arg || iflags.file, direction: iflags.direction, depth: iflags.depth, all: iflags.all });
-            if (!ok) { console.log(error); return; }
-            const graphDepth = iflags.depth ? parseInt(iflags.depth) : 2;
-            console.log(output.formatGraph(result, { showAll: iflags.all || !!iflags.depth, maxDepth: graphDepth, file: arg }));
-            break;
-        }
-
-        case 'circularDeps': {
-            const { ok, result, error } = execute(index, 'circularDeps', { file: iflags.file, exclude: iflags.exclude });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatCircularDeps(result));
-            break;
-        }
-
-        case 'fileExports': {
-            const { ok, result, error } = execute(index, 'fileExports', { file: arg });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatFileExports(result, arg));
-            break;
-        }
-
-        case 'imports': {
-            const { ok, result, error } = execute(index, 'imports', { file: arg });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatImports(result, arg));
-            break;
-        }
-
-        case 'exporters': {
-            const { ok, result, error } = execute(index, 'exporters', { file: arg });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatExporters(result, arg));
-            break;
-        }
-
-        case 'tests': {
-            const { ok, result, error } = execute(index, 'tests', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatTests(result, arg));
-            break;
-        }
-
-        case 'affectedTests': {
-            const { ok, result, error } = execute(index, 'affectedTests', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatAffectedTests(result, { all: iflags.all }));
             break;
         }
 
@@ -1544,71 +1476,19 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             break;
         }
 
-        case 'typedef': {
-            const { ok, result, error } = execute(index, 'typedef', { name: arg, ...iflags });
+        default: {
+            // ── Data-driven dispatch for standard commands ────────────
+            const entry = INTERACTIVE_DISPATCH[command];
+            if (!entry) {
+                console.log(`Unknown command: ${command}. Type "help" for available commands.`);
+                return;
+            }
+            const params = buildInteractiveParams(entry.params, arg, iflags);
+            const { ok, result, error, note } = execute(index, command, params);
             if (!ok) { console.log(error); return; }
-            console.log(output.formatTypedef(result, arg));
-            break;
+            if (note) console.log(note);
+            console.log(entry.format(result, arg, iflags, index));
         }
-
-        case 'api': {
-            const { ok, result, error } = execute(index, 'api', { file: arg });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatApi(result, arg || '.'));
-            break;
-        }
-
-        case 'diffImpact': {
-            const { ok, result, error } = execute(index, 'diffImpact', iflags);
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatDiffImpact(result, { all: iflags.all }));
-            break;
-        }
-
-        case 'stats': {
-            const { ok, result, error } = execute(index, 'stats', iflags);
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatStats(result, { top: iflags.top }));
-            break;
-        }
-
-        case 'related': {
-            const { ok, result, error } = execute(index, 'related', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatRelated(result, { all: iflags.all, top: iflags.top }));
-            break;
-        }
-
-        case 'example': {
-            const { ok, result, error } = execute(index, 'example', { name: arg });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatExample(result, arg));
-            break;
-        }
-
-        case 'plan': {
-            const { ok, result, error } = execute(index, 'plan', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatPlan(result));
-            break;
-        }
-
-        case 'verify': {
-            const { ok, result, error } = execute(index, 'verify', { name: arg, ...iflags });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatVerify(result));
-            break;
-        }
-
-        case 'stacktrace': {
-            const { ok, result, error } = execute(index, 'stacktrace', { stack: arg });
-            if (!ok) { console.log(error); return; }
-            console.log(output.formatStackTrace(result));
-            break;
-        }
-
-        default:
-            console.log(`Unknown command: ${command}. Type "help" for available commands.`);
     }
 }
 

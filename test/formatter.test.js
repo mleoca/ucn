@@ -218,14 +218,15 @@ describe('JSON formatters', () => {
     it('example --json flag works via CLI', () => {
         const { execFileSync } = require('child_process');
         // Run CLI with --json flag to ensure example command goes through printOutput
-        const result = execFileSync('node', [CLI_PATH, '.', 'example', 'formatExample', '--json'], {
+        // Use formatFn which has call sites in the codebase (formatExample has none after output split)
+        const result = execFileSync('node', [CLI_PATH, '.', 'example', 'formatFn', '--json'], {
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
         });
         const json = JSON.parse(result);
-        // Should have structured output, not raw formatExample text
+        // Should have structured output, not raw text
         assert.ok(json.found !== undefined || json.query !== undefined, 'JSON output should have structured fields');
     });
 });
