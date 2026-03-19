@@ -115,6 +115,12 @@ function parseFlags(tokens) {
         showConfidence: !tokens.includes('--no-confidence'),
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
         framework: getValueFlag('--framework'),
+        workers: (() => {
+            const v = getValueFlag('--workers');
+            if (v === null) return undefined;
+            const n = parseInt(v, 10);
+            return isNaN(n) ? undefined : n;
+        })(),
     };
 }
 
@@ -142,7 +148,7 @@ const knownFlags = new Set([
     '--max-lines', '--class-name', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
     '--show-confidence', '--no-confidence', '--min-confidence',
-    '--framework'
+    '--framework', '--workers'
 ]);
 
 // Handle help flag
@@ -171,7 +177,8 @@ const VALUE_FLAGS = new Set([
     '--add-param', '--remove-param', '--rename-to', '--default',
     '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name',
     '--type', '--param', '--receiver', '--returns', '--decorator',
-    '--limit', '--max-files', '--min-confidence', '--stack', '--framework'
+    '--limit', '--max-files', '--min-confidence', '--stack', '--framework',
+    '--workers'
 ]);
 
 // Remove flags from args, then add args after -- (which are all positional)
@@ -418,7 +425,7 @@ function runProjectCommand(rootDir, command, arg) {
     // If cache was loaded but stale, force rebuild to avoid duplicates
     let needsCacheSave = false;
     if (!usedCache) {
-        index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles });
+        index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles, workers: flags.workers });
         needsCacheSave = flags.cache;
     }
 
@@ -1166,6 +1173,7 @@ Common Flags:
   --case-sensitive    Case-sensitive text search (search)
   --top-level         Show only top-level functions in toc
   --max-lines=N       Max source lines for class (large classes show summary)
+  --workers=N         Parallel build workers (auto-detect; 0 to disable, env: UCN_WORKERS)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
   --base=<ref>        Git ref for diff-impact (default: HEAD)
@@ -1191,7 +1199,7 @@ function runInteractive(rootDir) {
 
     console.log('Building index...');
     const index = new ProjectIndex(rootDir);
-    index.build(null, { quiet: true });
+    index.build(null, { quiet: true, workers: flags.workers });
     const iExpandCache = new ExpandCache({ maxSize: 20 });
     console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
     console.log('Type commands (e.g., "find parseFile", "about main", "toc")');
@@ -1265,7 +1273,7 @@ Flags can be added per-command: context myFunc --include-methods
 
         if (input === 'rebuild') {
             console.log('Rebuilding index...');
-            index.build(null, { quiet: true, forceRebuild: true });
+            index.build(null, { quiet: true, forceRebuild: true, workers: flags.workers });
             console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
             rl.prompt();
             return;

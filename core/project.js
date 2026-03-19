@@ -211,15 +211,43 @@ class ProjectIndex {
         let indexed = 0;
         let changed = 0;
         if (!this.failedFiles) this.failedFiles = new Set();
-        for (const file of files) {
+
+        // Try parallel build for large projects
+        const workersSetting = options.workers;
+        const envWorkers = parseInt(process.env.UCN_WORKERS, 10);
+        const disableParallel = workersSetting === 0 || envWorkers === 0;
+        let usedParallel = false;
+
+        if (!disableParallel && files.length > 500) {
             try {
-                if (this.indexFile(file)) changed++;
-                indexed++;
-                this.failedFiles.delete(file); // Succeeded now, remove from failed
+                const { parallelBuild } = require('./parallel-build');
+                const result = parallelBuild(this, files, {
+                    workerCount: workersSetting > 0 ? workersSetting : (envWorkers > 0 ? envWorkers : undefined),
+                    quiet,
+                });
+                if (result !== false) {
+                    changed = result;
+                    indexed = files.length;
+                    usedParallel = true;
+                }
             } catch (e) {
-                this.failedFiles.add(file); // Track files that fail to index
                 if (!quiet) {
-                    console.error(`  Warning: Could not index ${file}: ${e.message}`);
+                    console.error(`Parallel build failed, falling back to sequential: ${e.message}`);
+                }
+            }
+        }
+
+        if (!usedParallel) {
+            for (const file of files) {
+                try {
+                    if (this.indexFile(file)) changed++;
+                    indexed++;
+                    this.failedFiles.delete(file); // Succeeded now, remove from failed
+                } catch (e) {
+                    this.failedFiles.add(file); // Track files that fail to index
+                    if (!quiet) {
+                        console.error(`  Warning: Could not index ${file}: ${e.message}`);
+                    }
                 }
             }
         }
@@ -475,7 +503,9 @@ class ProjectIndex {
         this.calleeIndex = new Map();
 
         for (const [filePath] of this.files) {
-            const calls = getCachedCalls(this, filePath);
+            // Fast path: use pre-populated callsCache (avoids stat per file)
+            const cached = this.callsCache.get(filePath);
+            const calls = cached ? cached.calls : getCachedCalls(this, filePath);
             if (!calls) continue;
             for (const call of calls) {
                 const name = call.name;

@@ -995,7 +995,7 @@ describe('Architecture Guards', () => {
             'json', 'no-cache', 'clear-cache', 'interactive', 'i',
             'help', 'h', 'version', 'mcp', 'no-quiet', 'quiet', 'verbose',
             'expand', 'not', 'no-follow-symlinks', 'no-regex', 'default',
-            'max-files', 'max-chars', 'item',
+            'max-files', 'max-chars', 'item', 'workers',
         ]);
         for (const flag of knownFlags) {
             if (exemptFlags.has(flag)) continue;
