@@ -214,10 +214,14 @@ function findCallers(index, name, options = {}) {
                     // For Go, also check sibling files in same directory (same package scope)
                     if (bindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(filePath);
-                        for (const [fp, fe] of index.files) {
-                            if (fp !== filePath && path.dirname(fp) === dir) {
-                                const sibling = (fe.bindings || []).filter(b => b.name === call.name);
-                                bindings = bindings.concat(sibling);
+                        const siblings = index.dirToFiles?.get(dir) || [];
+                        for (const fp of siblings) {
+                            if (fp !== filePath) {
+                                const fe = index.files.get(fp);
+                                if (fe) {
+                                    const sibling = (fe.bindings || []).filter(b => b.name === call.name);
+                                    bindings = bindings.concat(sibling);
+                                }
                             }
                         }
                     }
@@ -1348,6 +1352,7 @@ function _buildLocalTypeMap(index, def, calls) {
  */
 function _buildTypedLocalTypeMap(index, def, calls) {
     const localTypes = new Map();
+    let _cachedLines = null;
 
     for (const call of calls) {
         if (call.line < def.startLine || call.line > def.endLine) continue;
@@ -1361,12 +1366,12 @@ function _buildTypedLocalTypeMap(index, def, calls) {
         // Handles: x := NewFoo(), x, err := NewFoo(), x := pkg.NewFoo(), x, err := pkg.NewFoo()
         const newName = call.isMethod ? call.name : call.name;
         if (/^New[A-Z]/.test(newName) && !call.isPotentialCallback) {
-            let content;
-            try {
-                content = index._readFile(def.file);
-            } catch { continue; }
-            const lines = content.split('\n');
-            const sourceLine = lines[call.line - 1];
+            if (!_cachedLines) {
+                try {
+                    _cachedLines = index._readFile(def.file).split('\n');
+                } catch { continue; }
+            }
+            const sourceLine = _cachedLines[call.line - 1];
             if (!sourceLine) continue;
             // Match: x := [pkg.]NewFoo( or x, err := [pkg.]NewFoo( or x, _ := [pkg.]NewFoo(
             const assignMatch = sourceLine.match(

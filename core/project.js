@@ -247,6 +247,9 @@ class ProjectIndex {
             this.buildInheritanceGraph();
         }
 
+        // Build directory→files index for O(1) same-package lookups
+        this._buildDirIndex();
+
         this.buildTime = Date.now() - startTime;
 
         if (!quiet) {
@@ -453,6 +456,23 @@ class ProjectIndex {
 
         // Invalidate attribute type cache for this file
         if (this._attrTypeCache) this._attrTypeCache.delete(filePath);
+    }
+
+    /**
+     * Build directory→files index for O(1) same-package lookups.
+     * Replaces O(N) full-index scans in findCallers and countSymbolUsages.
+     */
+    _buildDirIndex() {
+        this.dirToFiles = new Map();
+        for (const filePath of this.files.keys()) {
+            const dir = path.dirname(filePath);
+            let list = this.dirToFiles.get(dir);
+            if (!list) {
+                list = [];
+                this.dirToFiles.set(dir, list);
+            }
+            list.push(filePath);
+        }
     }
 
     /**
@@ -1205,12 +1225,13 @@ class ProjectIndex {
         const relevantFiles = new Set([defFile]);
         const queue = [defFile];
 
-        // Same-package: add all .go files in the same directory
+        // Same-package: add all files in the same directory (Go package scope)
         const defEntry = this.files.get(defFile);
         if (langTraits(defEntry?.language)?.packageScope === 'directory') {
             const pkgDir = path.dirname(defFile);
-            for (const fp of this.files.keys()) {
-                if (fp !== defFile && fp.endsWith('.go') && path.dirname(fp) === pkgDir) {
+            const siblings = this.dirToFiles?.get(pkgDir) || [];
+            for (const fp of siblings) {
+                if (fp !== defFile) {
                     relevantFiles.add(fp);
                 }
             }

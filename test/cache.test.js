@@ -634,17 +634,17 @@ function helper() { return 42; }
             assert.strictEqual(cacheData.version, 7, 'Cache version should be 7');
             assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
 
-            // Verify separate calls-cache.json exists
-            const callsCachePath = path.join(tmpDir, '.ucn-cache', 'calls-cache.json');
-            assert.ok(fs.existsSync(callsCachePath), 'Separate calls-cache.json should exist');
+            // Verify sharded calls cache exists (calls/manifest.json)
+            const callsManifest = path.join(tmpDir, '.ucn-cache', 'calls', 'manifest.json');
+            assert.ok(fs.existsSync(callsManifest), 'Calls manifest should exist');
 
             // Load in new instance
             const index2 = new ProjectIndex(tmpDir);
             const loaded = index2.loadCache();
             assert.ok(loaded, 'Cache should load successfully');
 
-            // callsCache is eagerly loaded from calls-cache.json during loadCache
-            assert.ok(index2.callsCache.size > 0, 'callsCache should be loaded eagerly from calls-cache.json');
+            // callsCache is eagerly loaded from shards during loadCache
+            assert.ok(index2.callsCache.size > 0, 'callsCache should be loaded eagerly from shards');
 
             // Verify calls are usable without reparsing
             const calls = index2.getCachedCalls(filePath);

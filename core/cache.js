@@ -79,6 +79,18 @@ function saveCache(index, cachePath) {
         return result;
     };
 
+    // Persist calleeIndex if built (paths must be absolute from this.files keys)
+    let calleeIndexData;
+    if (index.calleeIndex && index.calleeIndex.size > 0) {
+        calleeIndexData = [];
+        for (const [name, files] of index.calleeIndex) {
+            const relFiles = [...files].map(f =>
+                path.isAbsolute(f) ? path.relative(root, f) : f
+            );
+            calleeIndexData.push([name, relFiles]);
+        }
+    }
+
     const cacheData = {
         version: 7,  // v7: strip symbols/bindings from file entries (dedup ~45% cache reduction)
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
@@ -95,15 +107,44 @@ function saveCache(index, cachePath) {
         extendedByGraph: Array.from(index.extendedByGraph.entries()),
         failedFiles: index.failedFiles
             ? Array.from(index.failedFiles).map(f => path.relative(root, f))
-            : []
+            : [],
+        ...(calleeIndexData && { calleeIndex: calleeIndexData })
     };
 
     fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
 
-    // Save callsCache to a separate file (lazy-loaded on demand)
+    // Save callsCache sharded by directory for lazy loading
     if (callsCacheData.length > 0) {
-        const callsCacheFile = path.join(path.dirname(cacheFile), 'calls-cache.json');
-        fs.writeFileSync(callsCacheFile, JSON.stringify(callsCacheData));
+        const callsDir = path.join(path.dirname(cacheFile), 'calls');
+        // Clean up old shards and legacy monolithic file
+        if (fs.existsSync(callsDir)) {
+            fs.rmSync(callsDir, { recursive: true, force: true });
+        }
+        const legacyFile = path.join(path.dirname(cacheFile), 'calls-cache.json');
+        if (fs.existsSync(legacyFile)) {
+            fs.rmSync(legacyFile, { force: true });
+        }
+        fs.mkdirSync(callsDir, { recursive: true });
+
+        // Group by directory
+        const shards = new Map();
+        for (const [relPath, entry] of callsCacheData) {
+            const dir = path.dirname(relPath) || '.';
+            if (!shards.has(dir)) shards.set(dir, []);
+            shards.get(dir).push([relPath, entry]);
+        }
+
+        // Write one shard per directory
+        const shardManifest = [];
+        for (const [dir, entries] of shards) {
+            const hash = crypto.createHash('md5').update(dir).digest('hex').slice(0, 10);
+            const shardFile = path.join(callsDir, `${hash}.json`);
+            fs.writeFileSync(shardFile, JSON.stringify(entries));
+            shardManifest.push([dir, hash, entries.length]);
+        }
+
+        // Write manifest for lazy loading
+        fs.writeFileSync(path.join(callsDir, 'manifest.json'), JSON.stringify(shardManifest));
     }
 
     return cacheFile;
@@ -208,11 +249,27 @@ function loadCache(index, cachePath) {
             loadCallsCache(index);
         }
 
+        // Build directory→files index from loaded data
+        if (typeof index._buildDirIndex === 'function') {
+            index._buildDirIndex();
+        }
+
         // Restore failedFiles if present (convert relative paths back to absolute)
         if (Array.isArray(cacheData.failedFiles)) {
             index.failedFiles = new Set(
                 cacheData.failedFiles.map(f => path.isAbsolute(f) ? f : path.join(root, f))
             );
+        }
+
+        // Restore calleeIndex if persisted
+        if (Array.isArray(cacheData.calleeIndex)) {
+            index.calleeIndex = new Map();
+            for (const [name, files] of cacheData.calleeIndex) {
+                if (!Array.isArray(files)) continue;
+                index.calleeIndex.set(name, new Set(
+                    files.map(f => path.isAbsolute(f) ? f : path.join(root, f))
+                ));
+            }
         }
 
         // Only rebuild graphs if config changed (e.g., aliases modified)
@@ -294,15 +351,36 @@ function loadCallsCache(index) {
     if (index._callsCacheLoaded) return false;   // Already attempted, file didn't exist
     index._callsCacheLoaded = true;
 
-    const callsCacheFile = path.join(index.root, '.ucn-cache', 'calls-cache.json');
+    const cacheDir = path.join(index.root, '.ucn-cache');
+
+    // Try sharded format first (calls/manifest.json)
+    const manifestFile = path.join(cacheDir, 'calls', 'manifest.json');
+    if (fs.existsSync(manifestFile)) {
+        try {
+            const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8'));
+            // Store manifest for lazy loading
+            index._callsManifest = new Map();
+            for (const [dir, hash, count] of manifest) {
+                index._callsManifest.set(dir, { hash, count, loaded: false });
+            }
+            // Eagerly load all shards (matches previous behavior)
+            for (const [, { hash }] of index._callsManifest) {
+                _loadCallsShard(index, hash);
+            }
+            return true;
+        } catch (e) {
+            // Corrupted manifest — fall through to legacy
+        }
+    }
+
+    // Legacy format: single calls-cache.json
+    const callsCacheFile = path.join(cacheDir, 'calls-cache.json');
     if (!fs.existsSync(callsCacheFile)) return false;
 
     try {
         const data = JSON.parse(fs.readFileSync(callsCacheFile, 'utf-8'));
         if (Array.isArray(data)) {
-            // Convert relative paths back to absolute
             const absData = data.map(([relPath, entry]) => {
-                // Handle both relative (v6+) and absolute (legacy) paths
                 const absPath = path.isAbsolute(relPath) ? relPath : path.join(index.root, relPath);
                 return [absPath, entry];
             });
@@ -313,6 +391,26 @@ function loadCallsCache(index) {
         // Corrupted file — ignore
     }
     return false;
+}
+
+/**
+ * Load a single calls shard by hash.
+ * @param {object} index - ProjectIndex instance
+ * @param {string} hash - Shard hash from manifest
+ */
+function _loadCallsShard(index, hash) {
+    const shardFile = path.join(index.root, '.ucn-cache', 'calls', `${hash}.json`);
+    try {
+        const data = JSON.parse(fs.readFileSync(shardFile, 'utf-8'));
+        if (!Array.isArray(data)) return;
+        for (const [relPath, entry] of data) {
+            if (!relPath || !entry) continue;
+            const absPath = path.isAbsolute(relPath) ? relPath : path.join(index.root, relPath);
+            index.callsCache.set(absPath, entry);
+        }
+    } catch (e) {
+        // Corrupted shard — skip
+    }
 }
 
 module.exports = { saveCache, loadCache, loadCallsCache, isCacheStale };
