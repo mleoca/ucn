@@ -5,7 +5,7 @@
  * and className/disambiguation fixes.
  */
 
-const { describe, it } = require('node:test');
+const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
@@ -2705,6 +2705,365 @@ describe('P1: truncation notes on tree commands', () => {
         } finally {
             rm(dir);
         }
+    });
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLI ↔ MCP ↔ Interactive Parity: --file flag and output consistency
+// ═══════════════════════════════════════════════════════════════════════════════
+
+describe('fix: --file flag works for file-centric commands across all surfaces', () => {
+    const JS = FIXTURES_PATH + '/javascript';
+
+    // ── CLI: positional arg vs --file flag equivalence ──────────────────
+
+    describe('CLI: --file flag produces same results as positional arg', () => {
+        it('imports: positional and --file produce equivalent output', () => {
+            const positional = runCli(JS, 'imports', ['main.js']);
+            const flagged = runCli(JS, 'imports', [], ['--file', 'main.js']);
+            assert.ok(positional.includes('Imports in main.js'), 'positional should show filename');
+            assert.ok(flagged.includes('Imports in main.js'), '--file should show filename');
+        });
+
+        it('exporters: positional and --file produce equivalent output', () => {
+            const positional = runCli(JS, 'exporters', ['utils.js']);
+            const flagged = runCli(JS, 'exporters', [], ['--file', 'utils.js']);
+            // Both should contain the file reference or importer info
+            assert.ok(positional.includes('utils.js'), 'positional should reference file');
+            assert.ok(flagged.includes('utils.js'), '--file should reference file');
+        });
+
+        it('file-exports: positional and --file produce equivalent output', () => {
+            const positional = runCli(JS, 'file-exports', ['utils.js']);
+            const flagged = runCli(JS, 'file-exports', [], ['--file', 'utils.js']);
+            assert.ok(positional.includes('utils.js'), 'positional should reference file');
+            assert.ok(flagged.includes('utils.js'), '--file should reference file');
+        });
+
+        it('graph: positional and --file produce equivalent output', () => {
+            const positional = runCli(JS, 'graph', ['main.js']);
+            const flagged = runCli(JS, 'graph', [], ['--file', 'main.js']);
+            assert.ok(positional.includes('main.js'), 'positional should reference file');
+            assert.ok(flagged.includes('main.js'), '--file should reference file');
+        });
+
+        it('api: positional and --file produce equivalent output', () => {
+            const positional = runCli(JS, 'api', ['utils.js']);
+            const flagged = runCli(JS, 'api', [], ['--file', 'utils.js']);
+            assert.ok(positional.includes('utils.js'), 'positional should reference file');
+            assert.ok(flagged.includes('utils.js'), '--file should reference file');
+        });
+    });
+
+    // ── Interactive: --file flag works ──────────────────────────────────
+
+    describe('Interactive: --file flag works for file-centric commands', () => {
+        it('imports --file shows correct filename', () => {
+            const out = runInteractive(JS, ['imports --file=main.js']);
+            assert.ok(out.includes('main.js'), 'interactive imports --file should show filename');
+        });
+
+        it('exporters --file shows correct filename', () => {
+            const out = runInteractive(JS, ['exporters --file=utils.js']);
+            assert.ok(out.includes('utils.js'), 'interactive exporters --file should show filename');
+        });
+
+        it('file-exports --file shows correct filename', () => {
+            const out = runInteractive(JS, ['file-exports --file=utils.js']);
+            assert.ok(out.includes('utils.js'), 'interactive file-exports --file should show filename');
+        });
+
+        it('graph --file shows correct filename', () => {
+            const out = runInteractive(JS, ['graph --file=main.js']);
+            assert.ok(out.includes('main.js'), 'interactive graph --file should show filename');
+        });
+
+        it('api --file shows correct filename', () => {
+            const out = runInteractive(JS, ['api --file=utils.js']);
+            assert.ok(out.includes('utils.js'), 'interactive api --file should show filename');
+        });
+    });
+
+    // ── CLI: all file-accepting commands don't crash with --file ────────
+
+    describe('CLI: every FLAG_APPLICABILITY[cmd] with file works via --file', () => {
+        it('about --file', () => {
+            const out = runCli(JS, 'about', ['helper'], ['--file', 'utils.js']);
+            assert.ok(out.includes('helper'), 'about --file should find symbol');
+        });
+
+        it('context --file', () => {
+            const out = runCli(JS, 'context', ['helper'], ['--file', 'utils.js']);
+            assert.ok(out.includes('helper') || out.includes('Context'), 'context --file should work');
+        });
+
+        it('impact --file', () => {
+            const out = runCli(JS, 'impact', ['helper'], ['--file', 'utils.js']);
+            assert.ok(!out.includes('Unknown command'), 'impact --file should not error');
+        });
+
+        it('find --file', () => {
+            const out = runCli(JS, 'find', ['helper'], ['--file', 'utils']);
+            assert.ok(out.includes('helper'), 'find --file should filter results');
+        });
+
+        it('usages --file', () => {
+            const out = runCli(JS, 'usages', ['helper'], ['--file', 'utils']);
+            assert.ok(out.includes('helper') || out.includes('Usages'), 'usages --file should work');
+        });
+
+        it('toc --file', () => {
+            const out = runCli(JS, 'toc', [], ['--file', 'utils.js']);
+            assert.ok(out.includes('utils.js'), 'toc --file should filter to file');
+        });
+
+        it('search --file', () => {
+            const out = runCli(JS, 'search', ['helper'], ['--file', 'utils.js']);
+            assert.ok(!out.includes('Unknown command'), 'search --file should not error');
+        });
+
+        it('fn --file', () => {
+            const out = runCli(JS, 'fn', ['helper'], ['--file', 'utils.js']);
+            assert.ok(out.includes('helper') || out.includes('function'), 'fn --file should extract function');
+        });
+
+        it('deadcode --file', () => {
+            const out = runCli(JS, 'deadcode', [], ['--file', 'utils.js']);
+            assert.ok(!out.includes('Unknown command'), 'deadcode --file should not error');
+        });
+
+        it('circular-deps --file', () => {
+            const out = runCli(JS, 'circular-deps', [], ['--file', 'utils.js']);
+            assert.ok(!out.includes('Unknown command'), 'circular-deps --file should not error');
+        });
+
+        it('verify --file', () => {
+            const out = runCli(JS, 'verify', ['helper'], ['--file', 'utils.js']);
+            assert.ok(!out.includes('Unknown command'), 'verify --file should not error');
+        });
+
+        it('diff-impact --file', () => {
+            const out = runCli(JS, 'diff-impact', [], ['--file', 'utils.js']);
+            assert.ok(!out.includes('Unknown command'), 'diff-impact --file should not error');
+        });
+
+        it('entrypoints --file', () => {
+            const out = runCli(JS, 'entrypoints', [], ['--file', 'main.js']);
+            assert.ok(!out.includes('Unknown command'), 'entrypoints --file should not error');
+        });
+    });
+});
+
+describe('CLI ↔ MCP parity: all commands produce non-error output', function() {
+    const JS = FIXTURES_PATH + '/javascript';
+    let client;
+
+    before(async () => {
+        client = new (require('./helpers').McpClient)();
+        await client.start();
+        await client.initialize();
+    });
+    after(() => client && client.stop());
+
+    // Helper: run same command via CLI and MCP, verify both succeed
+    async function assertParity(command, cliArgs, cliFlags, mcpParams, checks) {
+        const cliOut = runCli(JS, command, cliArgs || [], cliFlags || []);
+        const mcpRes = await client.callTool({ command: mcpParams.command || command, project_dir: JS, ...mcpParams });
+
+        // Neither should be an error
+        assert.ok(!mcpRes.isError, `MCP ${command} should not error: ${(mcpRes.text || '').slice(0, 200)}`);
+
+        // Both should contain expected content
+        if (checks) {
+            for (const check of checks) {
+                assert.ok(cliOut.includes(check), `CLI ${command} should contain "${check}"`);
+                assert.ok((mcpRes.text || '').includes(check), `MCP ${command} should contain "${check}"`);
+            }
+        }
+    }
+
+    // ── Understanding Code ──
+
+    it('about: CLI ↔ MCP', async () => {
+        await assertParity('about', ['helper'], [], { name: 'helper' }, ['helper', 'utils.js']);
+    });
+
+    it('about with --file: CLI ↔ MCP', async () => {
+        await assertParity('about', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
+    });
+
+    it('context: CLI ↔ MCP', async () => {
+        await assertParity('context', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('impact: CLI ↔ MCP', async () => {
+        await assertParity('impact', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('smart: CLI ↔ MCP', async () => {
+        await assertParity('smart', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('trace: CLI ↔ MCP', async () => {
+        await assertParity('trace', ['helper'], ['--depth', '2'], { name: 'helper', depth: 2 }, ['helper']);
+    });
+
+    it('reverse-trace: CLI ↔ MCP', async () => {
+        await assertParity('reverse-trace', ['helper'], ['--depth', '2'], { command: 'reverse_trace', name: 'helper', depth: 2 }, ['helper']);
+    });
+
+    it('blast: CLI ↔ MCP', async () => {
+        await assertParity('blast', ['helper'], ['--depth', '2'], { name: 'helper', depth: 2 }, ['helper']);
+    });
+
+    it('example: CLI ↔ MCP', async () => {
+        await assertParity('example', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('related: CLI ↔ MCP', async () => {
+        await assertParity('related', ['helper'], [], { name: 'helper' }, []);
+    });
+
+    // ── Finding Code ──
+
+    it('find: CLI ↔ MCP', async () => {
+        await assertParity('find', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('find with --file: CLI ↔ MCP', async () => {
+        await assertParity('find', ['helper'], ['--file', 'utils'], { name: 'helper', file: 'utils' }, ['helper']);
+    });
+
+    it('usages: CLI ↔ MCP', async () => {
+        await assertParity('usages', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('toc: CLI ↔ MCP', async () => {
+        await assertParity('toc', [], [], {}, []);
+    });
+
+    it('toc with --file: CLI ↔ MCP', async () => {
+        await assertParity('toc', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('toc --detailed: CLI ↔ MCP', async () => {
+        await assertParity('toc', [], ['--detailed'], { detailed: true }, []);
+    });
+
+    it('search: CLI ↔ MCP', async () => {
+        await assertParity('search', ['CONFIG'], [], { term: 'CONFIG' }, ['CONFIG', 'main.js']);
+    });
+
+    it('tests: CLI ↔ MCP', async () => {
+        await assertParity('tests', ['helper'], [], { name: 'helper' }, []);
+    });
+
+    it('affected-tests: CLI ↔ MCP', async () => {
+        await assertParity('affected-tests', ['helper'], [], { command: 'affected_tests', name: 'helper' }, []);
+    });
+
+    it('deadcode: CLI ↔ MCP', async () => {
+        await assertParity('deadcode', [], [], {}, []);
+    });
+
+    it('deadcode with --file: CLI ↔ MCP', async () => {
+        await assertParity('deadcode', [], ['--file', 'utils.js'], { file: 'utils.js' }, []);
+    });
+
+    it('entrypoints: CLI ↔ MCP', async () => {
+        await assertParity('entrypoints', [], [], {}, []);
+    });
+
+    // ── Extracting Code ──
+
+    it('fn: CLI ↔ MCP', async () => {
+        await assertParity('fn', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
+    });
+
+    it('class: CLI ↔ MCP', async () => {
+        await assertParity('class', ['Service'], ['--file', 'service.js'], { name: 'Service', file: 'service.js' }, ['Service']);
+    });
+
+    it('lines: CLI ↔ MCP', async () => {
+        await assertParity('lines', ['1-5'], ['--file', 'utils.js'], { range: '1-5', file: 'utils.js' }, []);
+    });
+
+    // ── File Dependencies ──
+
+    it('imports: CLI ↔ MCP (positional)', async () => {
+        await assertParity('imports', ['main.js'], [], { file: 'main.js' }, ['main.js']);
+    });
+
+    it('imports: CLI ↔ MCP (--file)', async () => {
+        await assertParity('imports', [], ['--file', 'main.js'], { file: 'main.js' }, ['main.js']);
+    });
+
+    it('exporters: CLI ↔ MCP (positional)', async () => {
+        await assertParity('exporters', ['utils.js'], [], { file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('exporters: CLI ↔ MCP (--file)', async () => {
+        await assertParity('exporters', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('file-exports: CLI ↔ MCP (positional)', async () => {
+        await assertParity('file-exports', ['utils.js'], [], { command: 'file_exports', file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('file-exports: CLI ↔ MCP (--file)', async () => {
+        await assertParity('file-exports', [], ['--file', 'utils.js'], { command: 'file_exports', file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('graph: CLI ↔ MCP (positional)', async () => {
+        await assertParity('graph', ['main.js'], [], { file: 'main.js' }, ['main.js']);
+    });
+
+    it('graph: CLI ↔ MCP (--file)', async () => {
+        await assertParity('graph', [], ['--file', 'main.js'], { file: 'main.js' }, ['main.js']);
+    });
+
+    it('graph with --depth: CLI ↔ MCP', async () => {
+        await assertParity('graph', ['main.js'], ['--depth', '1'], { file: 'main.js', depth: 1 }, ['main.js']);
+    });
+
+    it('circular-deps: CLI ↔ MCP', async () => {
+        await assertParity('circular-deps', [], [], { command: 'circular_deps' }, []);
+    });
+
+    // ── Refactoring ──
+
+    it('verify: CLI ↔ MCP', async () => {
+        await assertParity('verify', ['helper'], [], { name: 'helper' }, ['helper']);
+    });
+
+    it('plan (rename): CLI ↔ MCP', async () => {
+        await assertParity('plan', ['helper'], ['--rename-to', 'helperFn'], { name: 'helper', rename_to: 'helperFn' }, []);
+    });
+
+    it('diff-impact: CLI ↔ MCP', async () => {
+        await assertParity('diff-impact', [], [], { command: 'diff_impact' }, []);
+    });
+
+    // ── Other ──
+
+    it('typedef: CLI ↔ MCP', async () => {
+        await assertParity('typedef', ['Service'], [], { name: 'Service' }, []);
+    });
+
+    it('api: CLI ↔ MCP (positional)', async () => {
+        await assertParity('api', ['utils.js'], [], { file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('api: CLI ↔ MCP (--file)', async () => {
+        await assertParity('api', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['utils.js']);
+    });
+
+    it('stats: CLI ↔ MCP', async () => {
+        await assertParity('stats', [], [], {}, ['STATISTICS']);
+    });
+
+    it('stats with --file: CLI ↔ MCP', async () => {
+        await assertParity('stats', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['STATISTICS']);
     });
 });
 

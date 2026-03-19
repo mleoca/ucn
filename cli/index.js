@@ -668,37 +668,41 @@ function runProjectCommand(rootDir, command, arg) {
         // ── File dependency commands ────────────────────────────────────
 
         case 'imports': {
-            const { ok, result, error } = execute(index, 'imports', { file: arg });
+            const filePath = arg || flags.file;
+            const { ok, result, error } = execute(index, 'imports', { file: filePath });
             if (!ok) fail(error);
             printOutput(result,
-                r => output.formatImportsJson(r, arg),
-                r => output.formatImports(r, arg)
+                r => output.formatImportsJson(r, filePath),
+                r => output.formatImports(r, filePath)
             );
             break;
         }
 
         case 'exporters': {
-            const { ok, result, error } = execute(index, 'exporters', { file: arg });
+            const filePath = arg || flags.file;
+            const { ok, result, error } = execute(index, 'exporters', { file: filePath });
             if (!ok) fail(error);
             printOutput(result,
-                r => output.formatExportersJson(r, arg),
-                r => output.formatExporters(r, arg)
+                r => output.formatExportersJson(r, filePath),
+                r => output.formatExporters(r, filePath)
             );
             break;
         }
 
         case 'fileExports': {
-            const { ok, result, error } = execute(index, 'fileExports', { file: arg });
+            const filePath = arg || flags.file;
+            const { ok, result, error } = execute(index, 'fileExports', { file: filePath });
             if (!ok) fail(error);
             printOutput(result,
-                r => JSON.stringify({ file: arg, exports: r }, null, 2),
-                r => output.formatFileExports(r, arg)
+                r => JSON.stringify({ file: filePath, exports: r }, null, 2),
+                r => output.formatFileExports(r, filePath)
             );
             break;
         }
 
         case 'graph': {
-            const { ok, result, error } = execute(index, 'graph', { file: arg, direction: flags.direction, depth: flags.depth, all: flags.all });
+            const filePath = arg || flags.file;
+            const { ok, result, error } = execute(index, 'graph', { file: filePath, direction: flags.direction, depth: flags.depth, all: flags.all });
             if (!ok) fail(error);
             printOutput(result,
                 r => JSON.stringify({
@@ -706,7 +710,7 @@ function runProjectCommand(rootDir, command, arg) {
                     nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
                     edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
                 }, null, 2),
-                r => output.formatGraph(r, { showAll: flags.all || flags.depth != null, maxDepth: flags.depth != null ? parseInt(flags.depth, 10) : 2, file: arg })
+                r => output.formatGraph(r, { showAll: flags.all || flags.depth != null, maxDepth: flags.depth != null ? parseInt(flags.depth, 10) : 2, file: filePath })
             );
             break;
         }
@@ -749,12 +753,13 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'api': {
-            const { ok, result, error, note } = execute(index, 'api', { file: arg || flags.file, limit: flags.limit });
+            const filePath = arg || flags.file;
+            const { ok, result, error, note } = execute(index, 'api', { file: filePath, limit: flags.limit });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result,
-                r => output.formatApiJson(r, arg),
-                r => output.formatApi(r, arg)
+                r => output.formatApiJson(r, filePath),
+                r => output.formatApi(r, filePath)
             );
             break;
         }
@@ -1350,10 +1355,10 @@ const INTERACTIVE_DISPATCH = {
     typedef:       { params: 'name', format: (r, a) => output.formatTypedef(r, a) },
 
     // ── File Dependencies ────────────────────────────────────────────
-    imports:      { params: 'file', format: (r, a) => output.formatImports(r, a) },
-    exporters:    { params: 'file', format: (r, a) => output.formatExporters(r, a) },
-    fileExports:  { params: 'file', format: (r, a) => output.formatFileExports(r, a) },
-    graph:        { params: (a, f) => ({ file: a || f.file, direction: f.direction, depth: f.depth, all: f.all }), format: (r, a, f) => { const d = f.depth ? parseInt(f.depth) : 2; return output.formatGraph(r, { showAll: f.all || !!f.depth, maxDepth: d, file: a }); } },
+    imports:      { params: 'file', format: (r, a, f) => output.formatImports(r, a || f.file) },
+    exporters:    { params: 'file', format: (r, a, f) => output.formatExporters(r, a || f.file) },
+    fileExports:  { params: 'file', format: (r, a, f) => output.formatFileExports(r, a || f.file) },
+    graph:        { params: (a, f) => ({ file: a || f.file, direction: f.direction, depth: f.depth, all: f.all }), format: (r, a, f) => { const d = f.depth ? parseInt(f.depth) : 2; return output.formatGraph(r, { showAll: f.all || !!f.depth, maxDepth: d, file: a || f.file }); } },
     circularDeps: { params: (a, f) => ({ file: f.file, exclude: f.exclude }), format: (r) => output.formatCircularDeps(r) },
 
     // ── Refactoring Helpers ──────────────────────────────────────────
@@ -1363,7 +1368,7 @@ const INTERACTIVE_DISPATCH = {
     entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude }), format: (r) => output.formatEntrypoints(r) },
 
     // ── Other ────────────────────────────────────────────────────────
-    api:          { params: (a) => ({ file: a }), format: (r, a) => output.formatApi(r, a || '.') },
+    api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
     stacktrace:   { params: (a) => ({ stack: a }), format: (r) => output.formatStackTrace(r) },
     stats:        { params: 'flags', format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
 };
@@ -1379,7 +1384,7 @@ function buildInteractiveParams(descriptor, arg, iflags) {
     if (typeof descriptor === 'function') return descriptor(arg, iflags);
     switch (descriptor) {
         case 'name':  return { name: arg, ...iflags };
-        case 'file':  return { file: arg };
+        case 'file':  return { file: arg || iflags.file };
         case 'flags': return iflags;
         default:      return { name: arg, ...iflags };
     }
