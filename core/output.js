@@ -157,57 +157,6 @@ function formatMemberSignature(member) {
     return parts.join(' ').replace(/\s+/g, ' ').trim();
 }
 
-/**
- * Print section header
- */
-function header(title, char = '═') {
-    console.log(title);
-    console.log(char.repeat(60));
-}
-
-/**
- * Print subheader
- */
-function subheader(title) {
-    console.log(title);
-    console.log('─'.repeat(40));
-}
-
-/**
- * Print a usage/call site - FULL expression, never truncated
- * @param {object} usage - Usage object
- * @param {string} [relativePath] - Relative file path
- */
-function printUsage(usage, relativePath) {
-    const file = relativePath || usage.file;
-    // Context before the match
-    if (usage.before && usage.before.length > 0) {
-        for (const line of usage.before) {
-            console.log(`    ... ${line.trim()}`);
-        }
-    }
-    // FULL content - this is the key improvement
-    console.log(`  ${file}:${usage.line}`);
-    console.log(`    ${usage.content.trim()}`);
-    // Context after the match
-    if (usage.after && usage.after.length > 0) {
-        for (const line of usage.after) {
-            console.log(`    ... ${line.trim()}`);
-        }
-    }
-}
-
-/**
- * Print definition with full signature
- */
-function printDefinition(def, relativePath) {
-    const file = relativePath || def.file;
-    console.log(`  ${file}:${def.line}`);
-    if (def.signature) {
-        console.log(`    ${def.signature}`);
-    }
-}
-
 // ============================================================================
 // JSON FORMATTERS
 // ============================================================================
@@ -1181,29 +1130,41 @@ function formatRelated(related, options = {}) {
 
     // Similar names
     if (related.similarNames.length > 0) {
-        lines.push(`SIMILAR NAMES (${related.similarNames.length}):`);
+        const similarTotal = related.similarNamesTotal || related.similarNames.length;
+        const similarLabel = similarTotal > related.similarNames.length
+            ? `${related.similarNames.length} of ${similarTotal}` : `${related.similarNames.length}`;
+        lines.push(`SIMILAR NAMES (${similarLabel}):`);
         for (const s of related.similarNames) {
             lines.push(`  ${s.name} - ${s.file}:${s.line}`);
             lines.push(`    shared: ${s.sharedParts.join(', ')}`);
         }
+        if (similarTotal > related.similarNames.length) relatedTruncated = true;
         lines.push('');
     }
 
     // Shared callers
     if (related.sharedCallers.length > 0) {
-        lines.push(`CALLED BY SAME FUNCTIONS (${related.sharedCallers.length}):`);
+        const callersTotal = related.sharedCallersTotal || related.sharedCallers.length;
+        const callersLabel = callersTotal > related.sharedCallers.length
+            ? `${related.sharedCallers.length} of ${callersTotal}` : `${related.sharedCallers.length}`;
+        lines.push(`CALLED BY SAME FUNCTIONS (${callersLabel}):`);
         for (const s of related.sharedCallers) {
             lines.push(`  ${s.name} - ${s.file}:${s.line} (${s.sharedCallerCount} shared callers)`);
         }
+        if (callersTotal > related.sharedCallers.length) relatedTruncated = true;
         lines.push('');
     }
 
     // Shared callees
     if (related.sharedCallees.length > 0) {
-        lines.push(`CALLS SAME FUNCTIONS (${related.sharedCallees.length}):`);
+        const calleesTotal = related.sharedCalleesTotal || related.sharedCallees.length;
+        const calleesLabel = calleesTotal > related.sharedCallees.length
+            ? `${related.sharedCallees.length} of ${calleesTotal}` : `${related.sharedCallees.length}`;
+        lines.push(`CALLS SAME FUNCTIONS (${calleesLabel}):`);
         for (const s of related.sharedCallees) {
             lines.push(`  ${s.name} - ${s.file}:${s.line} (${s.sharedCalleeCount} shared callees)`);
         }
+        if (calleesTotal > related.sharedCallees.length) relatedTruncated = true;
     }
 
     if (relatedTruncated) {
@@ -3214,12 +3175,6 @@ module.exports = {
     formatFunctionSignature,
     formatClassSignature,
     formatMemberSignature,
-
-    // Text output
-    header,
-    subheader,
-    printUsage,
-    printDefinition,
 
     // JSON formatters
     formatTocJson,

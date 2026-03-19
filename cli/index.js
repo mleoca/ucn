@@ -15,7 +15,7 @@ const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
 // pickBestDefinition moved to execute.js — no longer needed here
-const { getCliCommandSet, resolveCommand } = require('../core/registry');
+const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
@@ -346,11 +346,9 @@ function runFileCommand(filePath, command, arg) {
             );
             break;
         case 'fn':
-            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
             printOutput(result, output.formatFnResultJson, output.formatFnResult);
             break;
         case 'class':
-            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
             printOutput(result, output.formatClassResultJson, output.formatClassResult);
             break;
         case 'lines':
@@ -427,6 +425,23 @@ function runProjectCommand(rootDir, command, arg) {
     try {
     // Resolve CLI aliases to canonical command names — dispatch on canonical
     const canonical = resolveCommand(command, 'cli') || command;
+
+    // Warn about flags that don't apply to this command
+    const applicableFlags = FLAG_APPLICABILITY[canonical];
+    if (applicableFlags) {
+        // Map from camelCase flag name to CLI flag string
+        const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+        // Flags that are global (not command-specific) or have truthy defaults — skip warning for these
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'stack', 'showConfidence']);
+        for (const [key, value] of Object.entries(flags)) {
+            if (globalFlags.has(key)) continue;
+            // Skip falsy/default values (0, undefined, false, empty array)
+            if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            if (!applicableFlags.includes(key)) {
+                console.error(`Warning: ${flagToCli(key)} has no effect on '${toCliName(canonical)}'.`);
+            }
+        }
+    }
 
     switch (canonical) {
         // ── Commands using shared executor ───────────────────────────────
@@ -619,18 +634,18 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
-            const { ok, result, error } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all });
+            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all });
             if (!ok) fail(error);
-            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
+            if (note) console.error(note);
             printOutput(result, output.formatFnResultJson, output.formatFnResult);
             break;
         }
 
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
-            const { ok, result, error } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
+            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
             if (!ok) fail(error);
-            if (result.notes.length) result.notes.forEach(n => console.error('Note: ' + n));
+            if (note) console.error(note);
             printOutput(result, output.formatClassResultJson, output.formatClassResult);
             break;
         }
@@ -1303,18 +1318,18 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
 
         case 'fn': {
             if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>]'); return; }
-            const { ok, result, error } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all });
+            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all });
             if (!ok) { console.log(error); return; }
-            if (result.notes.length) result.notes.forEach(n => console.log('Note: ' + n));
+            if (note) console.log(note);
             console.log(output.formatFnResult(result));
             break;
         }
 
         case 'class': {
             if (!arg) { console.log('Usage: class <name> [--file=<pattern>]'); return; }
-            const { ok, result, error } = execute(index, 'class', { name: arg, file: iflags.file, all: iflags.all, maxLines: iflags.maxLines });
+            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: iflags.file, all: iflags.all, maxLines: iflags.maxLines });
             if (!ok) { console.log(error); return; }
-            if (result.notes.length) result.notes.forEach(n => console.log('Note: ' + n));
+            if (note) console.log(note);
             console.log(output.formatClassResult(result));
             break;
         }

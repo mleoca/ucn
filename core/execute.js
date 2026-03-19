@@ -393,8 +393,17 @@ const HANDLERS = {
             all: p.all,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
+        const parts = [];
+        if (result.similarNamesTotal > result.similarNames.length)
+            parts.push(`similar names: showing ${result.similarNames.length} of ${result.similarNamesTotal}`);
+        if (result.sharedCallersTotal > result.sharedCallers.length)
+            parts.push(`shared callers: showing ${result.sharedCallers.length} of ${result.sharedCallersTotal}`);
+        if (result.sharedCalleesTotal > result.sharedCallees.length)
+            parts.push(`shared callees: showing ${result.sharedCallees.length} of ${result.sharedCalleesTotal}`);
+        const relatedNote = parts.length ? `Truncated: ${parts.join(', ')}. Use --all to show all.` : null;
         const tNote = truncationNote(index);
-        return { ok: true, result, ...(tNote && { note: tNote }) };
+        const combined = [relatedNote, tNote].filter(Boolean).join('\n') || undefined;
+        return { ok: true, result, ...(combined && { note: combined }) };
     },
 
     // ── Finding Code ────────────────────────────────────────────────────
@@ -406,6 +415,10 @@ const HANDLERS = {
         // Check if --file pattern matches any files
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        if (p.className) {
+            const classErr = validateClassName(index, p.name, p.className);
+            if (classErr) return { ok: false, error: classErr };
+        }
         // Auto-include tests when pattern clearly targets test functions
         // But only if the user didn't explicitly set include_tests=false
         let includeTests = p.includeTests;
@@ -444,6 +457,10 @@ const HANDLERS = {
         const exclude = applyTestExclusions(p.exclude, p.includeTests);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        if (p.className) {
+            const classErr = validateClassName(index, p.name, p.className);
+            if (classErr) return { ok: false, error: classErr };
+        }
         const result = index.usages(p.name, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
@@ -658,6 +675,10 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        if (p.className) {
+            const classErr = validateClassName(index, p.name, p.className);
+            if (classErr) return { ok: false, error: classErr };
+        }
 
         const fnNames = p.name.includes(',')
             ? p.name.split(',').map(n => n.trim()).filter(Boolean)
@@ -712,7 +733,7 @@ const HANDLERS = {
         if (entries.length === 0 && notes.length > 0) {
             return { ok: false, error: notes.join('\n') };
         }
-        return { ok: true, result: { entries, notes } };
+        return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
     },
 
     class: (index, p) => {
@@ -743,7 +764,7 @@ const HANDLERS = {
                 const totalLines = m.endLine - m.startLine + 1;
                 entries.push({ match: m, code, totalLines, summaryMode: false, truncated: false });
             }
-            return { ok: true, result: { entries, notes } };
+            return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
         }
 
         const match = matches.length > 1 && !p.file
@@ -762,7 +783,7 @@ const HANDLERS = {
         if (totalLines > 200 && !maxLines) {
             const methods = index.findMethodsForType(match.name);
             entries.push({ match, code: null, methods, totalLines, summaryMode: true, truncated: false });
-            return { ok: true, result: { entries, notes } };
+            return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
         }
 
         // Truncated mode (maxLines specified and class exceeds it)
@@ -772,13 +793,13 @@ const HANDLERS = {
             const truncated = fileLines.slice(match.startLine - 1, match.startLine - 1 + maxLines);
             const code = cleanHtmlScriptTags(truncated, detectLanguage(match.file)).join('\n');
             entries.push({ match, code, totalLines, summaryMode: false, truncated: true, maxLines });
-            return { ok: true, result: { entries, notes } };
+            return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
         }
 
         // Full extraction
         const code = readAndExtract(match);
         entries.push({ match, code, totalLines, summaryMode: false, truncated: false });
-        return { ok: true, result: { entries, notes } };
+        return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
     },
 
     lines: (index, p) => {

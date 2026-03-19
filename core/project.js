@@ -3078,6 +3078,7 @@ class ProjectIndex {
         // Sort by number of shared parts
         related.similarNames.sort((a, b) => b.sharedParts.length - a.sharedParts.length);
         const similarLimit = options.top || (options.all ? Infinity : 10);
+        related.similarNamesTotal = related.similarNames.length;
         if (related.similarNames.length > similarLimit) related.similarNames = related.similarNames.slice(0, similarLimit);
 
         // 3. Shared callers - functions called by the same callers
@@ -3097,9 +3098,10 @@ class ProjectIndex {
             }
             // Sort by shared caller count
             const maxShared = options.top || (options.all ? Infinity : 5);
-            const sorted = Array.from(callerCounts.entries())
-                .sort((a, b) => b[1] - a[1])
-                .slice(0, maxShared);
+            const allSorted = Array.from(callerCounts.entries())
+                .sort((a, b) => b[1] - a[1]);
+            related.sharedCallersTotal = allSorted.length;
+            const sorted = allSorted.slice(0, maxShared);
             for (const [symName, count] of sorted) {
                 const sym = this.symbols.get(symName)?.[0];
                 if (sym) {
@@ -3131,9 +3133,10 @@ class ProjectIndex {
                     }
                 }
                 // Sort by shared callee count
-                const sorted = Array.from(calleeCounts.entries())
-                    .sort((a, b) => b[1] - a[1])
-                    .slice(0, options.top || (options.all ? Infinity : 5));
+                const allSorted = Array.from(calleeCounts.entries())
+                    .sort((a, b) => b[1] - a[1]);
+                related.sharedCalleesTotal = allSorted.length;
+                const sorted = allSorted.slice(0, options.top || (options.all ? Infinity : 5));
                 for (const [symName, count] of sorted) {
                     const sym = this.symbols.get(symName)?.[0];
                     if (sym) {

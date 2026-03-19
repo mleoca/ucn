@@ -35,7 +35,7 @@ function cleanup(dir) {
 
 /** Create a temp dir with files. Returns the dir path. */
 function tmp(files) {
-    const dir = path.join(os.tmpdir(), `ucn-test-${Date.now()}-${++counter}`);
+    const dir = path.join(os.tmpdir(), `ucn-test-${Date.now()}-${++counter}-${Math.random().toString(36).slice(2, 8)}`);
     fs.mkdirSync(dir, { recursive: true });
     for (const [name, content] of Object.entries(files)) {
         const fp = path.join(dir, name);

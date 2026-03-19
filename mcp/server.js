@@ -121,7 +121,7 @@ const BROAD_OUTPUT_CHARS = 3000;     // ~750 tokens — broad commands where tru
 const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars override
 
 // Broad commands: output is project-wide, truncation means you need a filter, not more text
-const BROAD_COMMANDS = new Set(['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']);
+const BROAD_COMMANDS = new Set(['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages', 'reverse_trace', 'circular_deps']);
 
 function toolResult(text, command, maxChars) {
     if (!text) return { content: [{ type: 'text', text: '(no output)' }] };
@@ -607,15 +607,15 @@ server.registerTool(
                 const err = requireName(ep.name);
                 if (err) return err;
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'fn', ep);
+                const { ok, result, error, note } = execute(index, 'fn', ep);
                 if (!ok) return tr(error); // soft error
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
                     if (typeof check !== 'string') return check;
                 }
-                const notes = result.notes.length ? result.notes.map(n => 'Note: ' + n).join('\n') + '\n\n' : '';
-                return tr(notes + output.formatFnResult(result));
+                const fnText = (note ? note + '\n\n' : '') + output.formatFnResult(result);
+                return tr(fnText);
             }
 
             case 'class': {
@@ -625,15 +625,15 @@ server.registerTool(
                     return toolError(`Invalid max_lines: ${ep.maxLines}. Must be a positive integer.`);
                 }
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'class', ep);
+                const { ok, result, error, note } = execute(index, 'class', ep);
                 if (!ok) return tr(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
                     if (typeof check !== 'string') return check;
                 }
-                const notes = result.notes.length ? result.notes.map(n => 'Note: ' + n).join('\n') + '\n\n' : '';
-                return tr(notes + output.formatClassResult(result));
+                const classText = (note ? note + '\n\n' : '') + output.formatClassResult(result);
+                return tr(classText);
             }
 
             case 'lines': {
