@@ -4018,3 +4018,99 @@ func hello() { fmt.Println("hi") }
     });
 });
 
+describe('fix: go.mod replace directives resolve local imports', () => {
+    it('resolves imports redirected via replace directive', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/main\n\ngo 1.21\n\nreplace example.com/lib => ./libs/mylib\n',
+            'main.go': [
+                'package main',
+                'import "example.com/lib/util"',
+                'func main() { util.Helper() }',
+            ].join('\n'),
+            'libs/mylib/util/helpers.go': [
+                'package util',
+                'func Helper() {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const mainFile = path.join(dir, 'main.go');
+            const imports = index.importGraph.get(mainFile) || [];
+            // The replace directive should resolve example.com/lib/util to libs/mylib/util/
+            assert.ok(imports.length > 0, 'Import graph should resolve the replaced import');
+            const utilFile = imports.find(f => f.includes('libs/mylib/util'));
+            assert.ok(utilFile, 'Should resolve to libs/mylib/util/helpers.go');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('replace directive enables callee resolution via import graph', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/main\n\ngo 1.21\n\nreplace example.com/ext => ./staging/ext\n',
+            'main.go': [
+                'package main',
+                'import "example.com/ext/pkg"',
+                'func caller() { pkg.Do() }',
+            ].join('\n'),
+            'staging/ext/pkg/pkg.go': [
+                'package pkg',
+                'func Do() {}',
+                'func Other() {}',
+            ].join('\n'),
+            // A decoy with the same function name in a different package
+            'internal/other.go': [
+                'package internal',
+                'func Do() {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.find('caller')[0];
+            assert.ok(def, 'Should find caller');
+            const callees = index.findCallees(def, {});
+            const doCallee = callees.find(c => c.name === 'Do');
+            assert.ok(doCallee, 'Should find Do as callee');
+            // Should resolve to staging/ext/pkg, not internal/other.go
+            assert.ok(doCallee.file.includes('staging/ext/pkg'),
+                'Do should resolve to the replaced module path, not the decoy');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('block-form replace directives are parsed', () => {
+        const dir = tmp({
+            'go.mod': [
+                'module example.com/app',
+                '',
+                'go 1.21',
+                '',
+                'replace (',
+                '  example.com/a => ./libs/a',
+                '  example.com/b => ./libs/b',
+                ')',
+            ].join('\n'),
+            'main.go': [
+                'package main',
+                'import "example.com/a/core"',
+                'import "example.com/b/util"',
+                'func run() { core.Init(); util.Help() }',
+            ].join('\n'),
+            'libs/a/core/core.go': 'package core\nfunc Init() {}',
+            'libs/b/util/util.go': 'package util\nfunc Help() {}',
+        });
+        try {
+            const index = idx(dir);
+            const mainFile = path.join(dir, 'main.go');
+            const imports = index.importGraph.get(mainFile) || [];
+            const aResolved = imports.find(f => f.includes('libs/a/core'));
+            const bResolved = imports.find(f => f.includes('libs/b/util'));
+            assert.ok(aResolved, 'Should resolve example.com/a/core via replace block');
+            assert.ok(bResolved, 'Should resolve example.com/b/util via replace block');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+

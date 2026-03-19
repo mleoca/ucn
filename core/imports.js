@@ -194,7 +194,26 @@ function findGoModule(startDir) {
                 // Parse module line: module github.com/user/project
                 const match = content.match(/^module\s+(\S+)/m);
                 if (match) {
-                    const result = { modulePath: match[1], root: dir };
+                    // Parse replace directives for local module redirects
+                    // e.g., k8s.io/api => ./staging/src/k8s.io/api
+                    const replaces = [];
+                    // Block form: replace ( ... )
+                    const replaceBlock = content.match(/^replace\s*\(([\s\S]*?)\)/m);
+                    if (replaceBlock) {
+                        for (const line of replaceBlock[1].split('\n')) {
+                            const rm = line.match(/^\s*(\S+)\s.*?=>\s*(\S+)/);
+                            if (rm && rm[2].startsWith('.')) {
+                                replaces.push({ from: rm[1], to: path.resolve(dir, rm[2]) });
+                            }
+                        }
+                    }
+                    // Single-line form: replace k8s.io/foo => ./bar
+                    for (const rm of content.matchAll(/^replace\s+(\S+)\s.*?=>\s*(\S+)/gm)) {
+                        if (rm[2].startsWith('.')) {
+                            replaces.push({ from: rm[1], to: path.resolve(dir, rm[2]) });
+                        }
+                    }
+                    const result = { modulePath: match[1], root: dir, replaces };
                     goModuleCache.set(startDir, result);
                     return result;
                 }
@@ -206,6 +225,25 @@ function findGoModule(startDir) {
     }
 
     goModuleCache.set(startDir, null);
+    return null;
+}
+
+/**
+ * Find the first non-test .go file in a directory (Go packages are directories).
+ * @param {string} pkgDir - Absolute path to the package directory
+ * @returns {string|null}
+ */
+function findFirstGoFile(pkgDir) {
+    try {
+        if (fs.existsSync(pkgDir) && fs.statSync(pkgDir).isDirectory()) {
+            const files = fs.readdirSync(pkgDir).sort();
+            for (const file of files) {
+                if (file.endsWith('.go') && !file.endsWith('_test.go')) {
+                    return path.join(pkgDir, file);
+                }
+            }
+        }
+    } catch (e) { /* ignore */ }
     return null;
 }
 
@@ -224,23 +262,19 @@ function resolveGoImport(importPath, fromFile, projectRoot) {
 
     // Check if the import is within this module
     if (importPath === modulePath || importPath.startsWith(modulePath + '/')) {
-        // Convert module path to relative path
-        // e.g., "github.com/user/proj/pkg/util" -> "pkg/util"
         const relativePath = importPath.slice(modulePath.length).replace(/^\//, '');
-        const pkgDir = path.join(root, relativePath);
+        const resolved = findFirstGoFile(path.join(root, relativePath));
+        if (resolved) return resolved;
+    }
 
-        // Go imports are directories, find a .go file in the directory
-        if (fs.existsSync(pkgDir) && fs.statSync(pkgDir).isDirectory()) {
-            // Return the first .go file in the directory (not _test.go)
-            try {
-                const files = fs.readdirSync(pkgDir).sort();
-                for (const file of files) {
-                    if (file.endsWith('.go') && !file.endsWith('_test.go')) {
-                        return path.join(pkgDir, file);
-                    }
-                }
-            } catch (e) {
-                // Ignore read errors
+    // Check replace directives (e.g., k8s.io/api => ./staging/src/k8s.io/api)
+    if (goMod.replaces) {
+        for (const { from, to } of goMod.replaces) {
+            if (importPath === from || importPath.startsWith(from + '/')) {
+                const relativePath = importPath.slice(from.length).replace(/^\//, '');
+                const resolved = findFirstGoFile(path.join(to, relativePath));
+                if (resolved) return resolved;
+                break;
             }
         }
     }
