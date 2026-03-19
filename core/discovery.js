@@ -6,6 +6,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { langTraits } = require('../languages');
 
 // Always ignore - unambiguous, never user code
 const DEFAULT_IGNORES = [
@@ -504,46 +505,10 @@ function findTestFileFor(sourceFile, language) {
     const ext = path.extname(sourceFile);
     const base = path.basename(sourceFile, ext);
 
-    const candidates = [];
-
-    switch (language) {
-        case 'javascript':
-        case 'typescript':
-        case 'tsx':
-            candidates.push(
-                `${base}.test${ext}`,
-                `${base}.spec${ext}`,
-                `${base}.test.ts`,
-                `${base}.test.js`,
-                `${base}.spec.ts`,
-                `${base}.spec.js`
-            );
-            break;
-        case 'python':
-            candidates.push(
-                `test_${base}.py`,
-                `${base}_test.py`
-            );
-            break;
-        case 'go':
-            candidates.push(`${base}_test.go`);
-            break;
-        case 'java':
-            candidates.push(
-                `${base}Test.java`,
-                `${base}Tests.java`,
-                `${base}TestCase.java`
-            );
-            break;
-        case 'rust':
-            candidates.push(`${base}_test.rs`);
-            break;
-        default:
-            candidates.push(
-                `${base}.test${ext}`,
-                `${base}.spec${ext}`
-            );
-    }
+    const traits = langTraits(language);
+    const candidates = traits?.testFileCandidates
+        ? traits.testFileCandidates(base, ext)
+        : [`${base}.test${ext}`, `${base}.spec${ext}`];
 
     // Check in same directory
     for (const candidate of candidates) {
@@ -553,20 +518,10 @@ function findTestFileFor(sourceFile, language) {
         }
     }
 
-    // Check in __tests__ subdirectory
-    if (language === 'javascript' || language === 'typescript' || language === 'tsx') {
-        const testsDir = path.join(dir, '__tests__');
-        for (const candidate of candidates) {
-            const testPath = path.join(testsDir, candidate);
-            if (fs.existsSync(testPath)) {
-                return testPath;
-            }
-        }
-    }
-
-    // Check in tests subdirectory
-    if (language === 'python' || language === 'rust') {
-        const testsDir = path.join(dir, 'tests');
+    // Check in language-specific test directories
+    const testDirs = traits?.testDirs || [];
+    for (const testDir of testDirs) {
+        const testsDir = path.join(dir, testDir);
         for (const candidate of candidates) {
             const testPath = path.join(testsDir, candidate);
             if (fs.existsSync(testPath)) {

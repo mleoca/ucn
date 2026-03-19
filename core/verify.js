@@ -6,7 +6,7 @@
  */
 
 const path = require('path');
-const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { escapeRegExp } = require('./shared');
 const { extractImports } = require('./imports');
 
@@ -194,11 +194,9 @@ function verify(index, name, options = {}) {
     const fileEntry = index.files.get(def.file);
     const lang = fileEntry?.language;
     let params = def.paramsStructured || [];
-    if ((lang === 'python' || lang === 'rust') && params.length > 0) {
-        const firstName = params[0].name;
-        if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self' || firstName === 'mut self') {
-            params = params.slice(1);
-        }
+    const selfParams = langTraits(lang)?.selfParam;
+    if (selfParams && params.length > 0 && selfParams.includes(params[0].name)) {
+        params = params.slice(1);
     }
     const hasRest = params.some(p => p.rest);
     // Rest params don't count toward expected/min — they accept 0+ extra args
@@ -345,7 +343,7 @@ function verify(index, name, options = {}) {
                 const importedNames = getImportedNames(call.file);
                 if (!importedNames.has(callReceiver)) continue;
                 // Receiver matches target module and is imported — keep it
-            } else if (callReceiver && defLang === 'go') {
+            } else if (callReceiver && langTraits(defLang)?.hasReceiverPackageCalls) {
                 // Go: receiver is package alias (last segment of import path, e.g., "controller"
                 // from "k8s.io/.../pkg/controller"), not the filename ("controller_utils").
                 // Check if receiver matches the directory name of the target file.
@@ -588,11 +586,9 @@ function plan(index, name, options = {}) {
         const fileEntry = index.files.get(def.file);
         const lang = fileEntry?.language;
         let selfOffset = 0;
-        if ((lang === 'python' || lang === 'rust') && currentParams.length > 0) {
-            const firstName = currentParams[0].name;
-            if (firstName === 'self' || firstName === 'cls' || firstName === '&self' || firstName === '&mut self' || firstName === 'mut self') {
-                selfOffset = 1;
-            }
+        const planSelfParams = langTraits(lang)?.selfParam;
+        if (planSelfParams && currentParams.length > 0 && planSelfParams.includes(currentParams[0].name)) {
+            selfOffset = 1;
         }
         const callerArgIndex = paramIndex - selfOffset;
 

@@ -8,7 +8,7 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { detectLanguage, getParser, getLanguageModule } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES } = require('./shared');
 const { scoreEdge } = require('./confidence');
@@ -83,7 +83,7 @@ function getCachedCalls(index, filePath, options = {}) {
         // Pass import alias names to Go parser for package vs method call disambiguation
         // importNames contains resolved alias names (e.g., 'utilversion' for renamed imports)
         const callOpts = {};
-        if (language === 'go') {
+        if (langTraits(language)?.hasReceiverPackageCalls) {
             const fileEntry = index.files.get(filePath);
             if (fileEntry?.importNames) {
                 callOpts.imports = fileEntry.importNames;
@@ -164,7 +164,7 @@ function findCallers(index, name, options = {}) {
 
                     // Go unexported visibility: lowercase functions are package-private.
                     // Only allow callers from the same package directory.
-                    if (fileEntry.language === 'go' && /^[a-z]/.test(name)) {
+                    if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[a-z]/.test(name)) {
                         const targetDefs = options.targetDefinitions || definitions;
                         const targetPkgDirs = new Set(
                             targetDefs.filter(d => d.file).map(d => path.dirname(d.file))
@@ -174,9 +174,9 @@ function findCallers(index, name, options = {}) {
                         }
                     }
 
-                    // Go/Java/Rust receiver disambiguation for callbacks (e.g. dc.worker)
+                    // Nominal type receiver disambiguation for callbacks (e.g. dc.worker)
                     if (call.isMethod && call.receiver &&
-                        (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
+                        langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                         const targetDefs = options.targetDefinitions || definitions;
                         const targetTypes = new Set();
                         for (const td of targetDefs) {
@@ -212,7 +212,7 @@ function findCallers(index, name, options = {}) {
                 if (!bindingId && !skipLocalBinding) {
                     let bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
                     // For Go, also check sibling files in same directory (same package scope)
-                    if (bindings.length === 0 && fileEntry.language === 'go') {
+                    if (bindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(filePath);
                         for (const [fp, fe] of index.files) {
                             if (fp !== filePath && path.dirname(fp) === dir) {
@@ -279,7 +279,7 @@ function findCallers(index, name, options = {}) {
                     // over-reporting is preferred to losing callers. These languages' nominal
                     // type systems also make method links more reliable.
                     if (bindings.length === 0 && call.isMethod &&
-                        fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
+                        langTraits(fileEntry.language)?.typeSystem === 'structural') {
                         const hasReceiverEvidence = call.receiver &&
                             (fileEntry.bindings || []).some(b => b.name === call.receiver);
                         if (!hasReceiverEvidence) {
@@ -349,7 +349,7 @@ function findCallers(index, name, options = {}) {
                         // Java method calls are always obj.method() - include by default
                         // Rust Type::method() calls - include by default (associated functions)
                         // For other languages, skip method calls unless explicitly requested
-                        if (fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust' && !options.includeMethods) continue;
+                        if (langTraits(fileEntry.language)?.methodCallInclusion === 'explicit' && !options.includeMethods) continue;
                     }
                 }
 
@@ -376,7 +376,7 @@ function findCallers(index, name, options = {}) {
                 // user_b importing from b.js being reported as a caller of a.js:process.
                 // Go/Java/Rust are excluded — they use package/module scoping, not file imports.
                 if (!bindingId && options.targetDefinitions && definitions.length > 1 &&
-                    fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
                     if (targetFiles.size > 0 && !targetFiles.has(filePath)) {
                         const imports = index.importGraph.get(filePath) || [];
@@ -398,7 +398,7 @@ function findCallers(index, name, options = {}) {
 
                 // Go unexported visibility: lowercase functions are package-private.
                 // Only allow callers from the same package directory.
-                if (fileEntry.language === 'go' && /^[a-z]/.test(name)) {
+                if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[a-z]/.test(name)) {
                     const targetPkgDirs = new Set(
                         targetDefs.filter(d => d.file).map(d => path.dirname(d.file))
                     );
@@ -413,7 +413,7 @@ function findCallers(index, name, options = {}) {
                 // Rust path calls (module::func(), Type::new()) bypass this filter — they're
                 // scoped_identifier calls that can target both standalone functions and impl methods.
                 if (!bindingId && !resolvedBySameClass && !call.isPathCall &&
-                    (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     const targetHasClass = targetDefs.some(d => d.className);
                     if (call.isMethod && !targetHasClass) {
                         // Method call but target is a standalone function — skip
@@ -431,7 +431,7 @@ function findCallers(index, name, options = {}) {
                 // All languages use receiverType when available (constructor/annotation inference).
                 // Go/Java/Rust additionally fall back to variable name matching.
                 if (call.isMethod && call.receiver && !resolvedBySameClass && !bindingId &&
-                    (call.receiverType || fileEntry.language === 'java' || fileEntry.language === 'go' || fileEntry.language === 'rust')) {
+                    (call.receiverType || langTraits(fileEntry.language)?.typeSystem === 'nominal')) {
                     // Build target type set from both className (Java) and receiver (Go/Rust)
                     const targetTypes = new Set();
                     for (const td of targetDefs) {
@@ -440,7 +440,7 @@ function findCallers(index, name, options = {}) {
                     }
                     // Expand targetTypes with types that embed the target (Go/Java/Rust)
                     // e.g., if target is Base.Start() and Child embeds Base, accept Child.Start() callers
-                    if (targetTypes.size > 0 && (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust')) {
+                    if (targetTypes.size > 0 && langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                         for (const tt of [...targetTypes]) {
                             const children = index.extendedByGraph?.get(tt);
                             if (children) {
@@ -469,7 +469,7 @@ function findCallers(index, name, options = {}) {
                             // for Go/Java/Rust (nominal type systems)
                             let inferredMatch = false;
                             let inferredMismatch = false;
-                            if (fileEntry.language === 'go' || fileEntry.language === 'java' || fileEntry.language === 'rust') {
+                            if (langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                                 const callerSym = index.findEnclosingFunction(filePath, call.line, true);
                                 if (callerSym && callerSym.startLine != null && callerSym.endLine != null) {
                                     const cacheKey = `${filePath}:${callerSym.startLine}`;
@@ -565,7 +565,7 @@ function findCallers(index, name, options = {}) {
                             // Method calls where binding resolution was skipped (non-self receiver)
                             // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
                             skipLocalBinding && call.isMethod && !resolvedBySameClass &&
-                            fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust' &&
+                            langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                             !(call.receiver && (fileEntry.bindings || []).some(b => b.name === call.receiver))
                         ),
                         hasReceiverType: !!call.receiverType,
@@ -654,9 +654,9 @@ function findCallees(index, def, options = {}) {
         // Build local variable type map for receiver resolution
         // Scans for patterns like: bt = Backtester(...) → bt maps to Backtester
         let localTypes = null;
-        if (language === 'python' || language === 'javascript') {
+        if (langTraits(language)?.typeSystem === 'structural') {
             localTypes = _buildLocalTypeMap(index, def, calls);
-        } else if (language === 'go' || language === 'java' || language === 'rust') {
+        } else if (langTraits(language)?.typeSystem === 'nominal') {
             localTypes = _buildTypedLocalTypeMap(index, def, calls);
         }
 
@@ -698,8 +698,8 @@ function findCallees(index, def, options = {}) {
                         isCallable(s) && (
                         s.className === typeName ||
                         (s.receiver && s.receiver.replace(/^\*/, '') === typeName)));
-                    // Walk embedding/inheritance chain if no direct match (Go/Java/Rust)
-                    if (!match && (language === 'go' || language === 'java' || language === 'rust')) {
+                    // Walk embedding/inheritance chain if no direct match (nominal type systems)
+                    if (!match && langTraits(language)?.typeSystem === 'nominal') {
                         const parentNames = index._getInheritanceParents?.(typeName, def.file);
                         if (parentNames) {
                             for (const pName of parentNames) {
@@ -734,8 +734,8 @@ function findCallees(index, def, options = {}) {
                         isCallableRT(s) && (
                         (s.receiver && s.receiver.replace(/^\*/, '') === typeName) ||
                         s.className === typeName));
-                    // Walk embedding/inheritance chain if no direct match (Go/Java/Rust)
-                    if (!match && (language === 'go' || language === 'java' || language === 'rust')) {
+                    // Walk embedding/inheritance chain if no direct match (nominal type systems)
+                    if (!match && langTraits(language)?.typeSystem === 'nominal') {
                         const parentNames = index._getInheritanceParents?.(typeName, def.file);
                         if (parentNames) {
                             for (const pName of parentNames) {
@@ -758,7 +758,7 @@ function findCallees(index, def, options = {}) {
                         continue;
                     }
                     // No match found with inferred type — fall through to include as unresolved
-                } else if (language === 'go' && call.receiver) {
+                } else if (langTraits(language)?.hasReceiverPackageCalls && call.receiver) {
                     // Go package-qualified calls: klog.Infof(), wait.UntilWithContext()
                     // Check if receiver is an import alias and resolve to correct package
                     const goImports = fileEntry?.imports || [];
@@ -797,7 +797,7 @@ function findCallees(index, def, options = {}) {
                             }
                         }
                     }
-                } else if (language !== 'go' && language !== 'java' && language !== 'rust' && !options.includeMethods) {
+                } else if (langTraits(language)?.methodCallInclusion === 'explicit' && !options.includeMethods) {
                     continue;
                 }
             }
@@ -860,7 +860,7 @@ function findCallees(index, def, options = {}) {
             if (!call.bindingId && fileEntry?.bindings) {
                 let bindings = fileEntry.bindings.filter(b => b.name === call.name);
                 // For Go, also check sibling files in same directory (same package scope)
-                if (bindings.length === 0 && language === 'go') {
+                if (bindings.length === 0 && langTraits(language)?.packageScope === 'directory') {
                     const dir = path.dirname(def.file);
                     for (const [fp, fe] of index.files) {
                         if (fp !== def.file && path.dirname(fp) === dir) {
@@ -872,7 +872,7 @@ function findCallees(index, def, options = {}) {
                 // Method call with no binding for the method name:
                 // Different strategies by language family:
                 if (bindings.length === 0 && call.isMethod) {
-                    if (language !== 'go' && language !== 'java' && language !== 'rust') {
+                    if (langTraits(language)?.typeSystem === 'structural') {
                         // JS/TS/Python: mark uncertain unless receiver has import/binding
                         // evidence in file scope AND that binding can plausibly have this method.
                         // Prevents false positives like m.get() → repository.get() when m is
@@ -897,7 +897,7 @@ function findCallees(index, def, options = {}) {
                             // Go: if receiverType is known, check if it matches exactly one def
                             // This resolves ambiguity like Framework.Run vs Scheduler.Run
                             const rType = call.receiverType || localTypes?.get(call.receiver);
-                            if (rType && (language === 'go' || language === 'java' || language === 'rust')) {
+                            if (rType && langTraits(language)?.typeSystem === 'nominal') {
                                 const matchingDef = defs.find(d =>
                                     d.className === rType ||
                                     (d.receiver && d.receiver.replace(/^\*/, '') === rType));
@@ -919,7 +919,7 @@ function findCallees(index, def, options = {}) {
                     // matches the binding's class. Prevents plt.close() → ReportGenerator.close()
                     // when close is defined in the same file as a class method.
                     if (call.isMethod && call.receiver && bindings[0].type === 'method' &&
-                        language !== 'go' && language !== 'java' && language !== 'rust') {
+                        langTraits(language)?.typeSystem === 'structural') {
                         // The binding is a class method — check if the receiver could be an instance
                         const bindingSym = index.symbols.get(call.name)?.find(
                             s => s.bindingId === bindings[0].id);

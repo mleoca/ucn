@@ -1173,6 +1173,18 @@ function findUsagesInCode(code, name, parser) {
     return usages;
 }
 
+/**
+ * Check if a symbol is a Java-convention entry point.
+ * These are invoked by the JVM runtime, test runners, or required by type system.
+ */
+function isEntryPoint(symbol) {
+    const m = symbol.modifiers || [];
+    if (symbol.name === 'main' && m.includes('public') && m.includes('static')) return true;
+    if (m.includes('test')) return true;
+    if (m.includes('override')) return true;
+    return false;
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -1181,5 +1193,6 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    isEntryPoint,
     parse
 };

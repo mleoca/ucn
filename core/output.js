@@ -7,6 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { langTraits } = require('../languages');
 
 /**
  * Format dynamic imports note with language-appropriate terminology.
@@ -14,7 +15,7 @@ const path = require('path');
  */
 function dynamicImportsNote(count, meta) {
     if (!count) return null;
-    if (meta?.projectLanguage === 'go') {
+    if (meta?.projectLanguage && !langTraits(meta.projectLanguage)?.hasDynamicImports) {
         return `${count} blank/dot import(s)`;
     }
     return `${count} dynamic import(s)`;
@@ -1625,7 +1626,7 @@ function formatAbout(about, options = {}) {
     if (about.completeness && about.completeness.warnings && about.completeness.warnings.length > 0) {
         const lang = about.completeness?.projectLanguage;
         const parts = about.completeness.warnings.map(w => {
-            if (w.type === 'dynamic_imports' && lang === 'go') return `${w.count} blank/dot import(s)`;
+            if (w.type === 'dynamic_imports' && lang && !langTraits(lang)?.hasDynamicImports) return `${w.count} blank/dot import(s)`;
             return `${w.count} ${w.type.replace('_', ' ')}`;
         });
         lines.push('');
@@ -1825,6 +1826,21 @@ function formatFind(symbols, query, top) {
     }
 
     return lines.join('\n');
+}
+
+function formatFindJson(items) {
+    return JSON.stringify({
+        meta: { command: 'find', count: items.length },
+        data: items.map(m => ({
+            name: m.name,
+            type: m.type,
+            file: m.relativePath || m.file,
+            line: m.startLine,
+            endLine: m.endLine,
+            ...(m.className && { className: m.className }),
+            ...(m.receiver && { receiver: m.receiver }),
+        })),
+    }, null, 2);
 }
 
 /**
@@ -2504,6 +2520,18 @@ function formatFileExports(exports, filePath) {
         lines.push(`  ${lineRange(exp.startLine, exp.endLine)} ${exp.signature || exp.name}`);
     }
     return lines.join('\n');
+}
+
+function formatFileExportsJson(result) {
+    if (!result) return JSON.stringify({ found: false });
+    return JSON.stringify({
+        meta: { command: 'fileExports', file: result.file },
+        data: {
+            file: result.file,
+            exports: result.exports || [],
+            reExports: result.reExports || [],
+        },
+    }, null, 2);
 }
 
 /**
@@ -3267,6 +3295,7 @@ module.exports = {
     // Shared text formatters (CLI + MCP)
     formatToc,
     formatFind,
+    formatFindJson,
     formatUsages,
     formatContext,
     formatSmart,
@@ -3281,6 +3310,7 @@ module.exports = {
     formatStructuralSearchJson,
     detectDoubleEscaping,
     formatFileExports,
+    formatFileExportsJson,
     formatStats,
 
     // Diff impact command

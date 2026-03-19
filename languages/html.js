@@ -311,6 +311,13 @@ function findUsagesInCode(code, name, parser) {
     return jsUsages.concat(handlerUsages);
 }
 
+/**
+ * HTML has no entry points of its own.
+ */
+function isEntryPoint() {
+    return false;
+}
+
 module.exports = {
     parse,
     findFunctions,
@@ -322,6 +329,7 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    isEntryPoint,
     // Exported for testing
     extractScriptBlocks,
     buildVirtualJSContent,

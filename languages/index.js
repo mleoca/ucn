@@ -12,55 +12,133 @@ let TreeSitter = null;
 // Cached parser instances
 const parsers = {};
 
+// Shared trait presets for languages with the same type-system characteristics
+const STRUCTURAL_TRAITS = {
+    typeSystem: 'structural',
+    methodCallInclusion: 'explicit',
+    packageScope: 'file',
+    hasReceiverPackageCalls: false,
+    exportVisibility: 'keyword',
+    hasDynamicImports: true,
+    testDirs: [],
+};
+const NOMINAL_TRAITS = {
+    typeSystem: 'nominal',
+    methodCallInclusion: 'auto',
+    packageScope: 'file',
+    hasReceiverPackageCalls: false,
+    exportVisibility: 'keyword',
+    hasDynamicImports: true,
+    testDirs: [],
+};
+
 // Language configurations
 const LANGUAGES = {
     javascript: {
         name: 'javascript',
         extensions: ['.js', '.jsx', '.mjs', '.cjs'],
         treeSitterLang: 'javascript',
-        module: () => require('./javascript')
+        module: () => require('./javascript'),
+        treeSitterModule: () => require('tree-sitter-javascript'),
+        traits: {
+            ...STRUCTURAL_TRAITS,
+            selfParam: ['this'],
+            testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
+            testDirs: ['__tests__'],
+        },
     },
     typescript: {
         name: 'typescript',
         extensions: ['.ts'],
         treeSitterLang: 'typescript',
-        module: () => require('./javascript')  // Same module, different parser
+        module: () => require('./javascript'),  // Same module, different parser
+        treeSitterModule: () => require('tree-sitter-typescript').typescript,
+        traits: {
+            ...STRUCTURAL_TRAITS,
+            selfParam: ['this'],
+            testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
+            testDirs: ['__tests__'],
+        },
     },
     tsx: {
         name: 'tsx',
         extensions: ['.tsx'],
         treeSitterLang: 'tsx',
-        module: () => require('./javascript')
+        module: () => require('./javascript'),
+        treeSitterModule: () => require('tree-sitter-typescript').tsx,
+        traits: {
+            ...STRUCTURAL_TRAITS,
+            selfParam: ['this'],
+            testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`, `${base}.test.ts`, `${base}.test.js`, `${base}.spec.ts`, `${base}.spec.js`],
+            testDirs: ['__tests__'],
+        },
     },
     python: {
         name: 'python',
         extensions: ['.py', '.pyi'],
         treeSitterLang: 'python',
-        module: () => require('./python')
+        module: () => require('./python'),
+        treeSitterModule: () => require('tree-sitter-python'),
+        traits: {
+            ...STRUCTURAL_TRAITS,
+            selfParam: ['self', 'cls'],
+            testFileCandidates: (base, ext) => [`test_${base}.py`, `${base}_test.py`],
+            testDirs: ['tests'],
+        },
     },
     go: {
         name: 'go',
         extensions: ['.go'],
         treeSitterLang: 'go',
-        module: () => require('./go')
+        module: () => require('./go'),
+        treeSitterModule: () => require('tree-sitter-go'),
+        traits: {
+            ...NOMINAL_TRAITS,
+            selfParam: null,
+            packageScope: 'directory',
+            hasReceiverPackageCalls: true,
+            exportVisibility: 'capitalization',
+            hasDynamicImports: false,
+            testFileCandidates: (base, ext) => [`${base}_test.go`],
+        },
     },
     rust: {
         name: 'rust',
         extensions: ['.rs'],
         treeSitterLang: 'rust',
-        module: () => require('./rust')
+        module: () => require('./rust'),
+        treeSitterModule: () => require('tree-sitter-rust'),
+        traits: {
+            ...NOMINAL_TRAITS,
+            selfParam: ['self', '&self', '&mut self', 'mut self'],
+            hasDynamicImports: false,
+            testFileCandidates: (base, ext) => [`${base}_test.rs`],
+            testDirs: ['tests'],
+        },
     },
     java: {
         name: 'java',
         extensions: ['.java'],
         treeSitterLang: 'java',
-        module: () => require('./java')
+        module: () => require('./java'),
+        treeSitterModule: () => require('tree-sitter-java'),
+        traits: {
+            ...NOMINAL_TRAITS,
+            selfParam: ['this'],
+            testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],
+        },
     },
     html: {
         name: 'html',
         extensions: ['.html', '.htm'],
         treeSitterLang: 'html',
-        module: () => require('./html')
+        module: () => require('./html'),
+        treeSitterModule: () => require('tree-sitter-html'),
+        traits: {
+            ...STRUCTURAL_TRAITS,
+            selfParam: ['this'],
+            testFileCandidates: (base, ext) => [`${base}.test${ext}`, `${base}.spec${ext}`],
+        },
     }
 };
 
@@ -107,39 +185,11 @@ function getParser(language) {
     }
 
     try {
-        let lang;
-        switch (language) {
-            case 'javascript':
-                lang = require('tree-sitter-javascript');
-                break;
-            case 'typescript':
-                lang = require('tree-sitter-typescript').typescript;
-                break;
-            case 'tsx':
-                lang = require('tree-sitter-typescript').tsx;
-                break;
-            case 'python':
-                lang = require('tree-sitter-python');
-                break;
-            case 'go':
-                lang = require('tree-sitter-go');
-                break;
-            case 'java':
-                lang = require('tree-sitter-java');
-                break;
-            case 'rust':
-                lang = require('tree-sitter-rust');
-                break;
-            case 'html':
-                lang = require('tree-sitter-html');
-                break;
-            default:
-                throw new Error(`No tree-sitter grammar for: ${language}`);
-        }
+        const lang = config.treeSitterModule();
         parser.setLanguage(lang);
     } catch (e) {
         throw new Error(
-            `Failed to load tree-sitter-${language}.\n` +
+            `Failed to load tree-sitter grammar for ${language}.\n` +
             `Install with: npm install tree-sitter-${language}\n` +
             `Original error: ${e.message}`
         );
@@ -282,6 +332,15 @@ function safeParse(parser, content, oldTree = undefined, options = {}) {
     throw lastError;
 }
 
+/**
+ * Get trait object for a language.
+ * @param {string} language - Language name (e.g. 'go', 'python')
+ * @returns {object|undefined} Trait object or undefined if unknown language
+ */
+function langTraits(language) {
+    return LANGUAGES[language]?.traits;
+}
+
 module.exports = {
     detectLanguage,
     getParser,
@@ -293,6 +352,7 @@ module.exports = {
     PARSE_OPTIONS,
     getParseOptions,
     safeParse,
+    langTraits,
     DEFAULT_BUFFER_SIZE,
     MAX_BUFFER_SIZE
 };

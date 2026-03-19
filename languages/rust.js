@@ -1459,6 +1459,18 @@ function findUsagesInCode(code, name, parser) {
     return usages;
 }
 
+/**
+ * Check if a symbol is a Rust-convention entry point.
+ * These are invoked by the Rust runtime, test harness, or required by trait contracts.
+ */
+function isEntryPoint(symbol) {
+    const m = symbol.modifiers || [];
+    if (symbol.name === 'main') return true;
+    if (m.includes('test') || m.includes('bench')) return true;
+    if (symbol.isMethod && symbol.className && symbol.traitImpl) return true;
+    return false;
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -1467,5 +1479,6 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    isEntryPoint,
     parse
 };

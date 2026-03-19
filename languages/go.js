@@ -1352,6 +1352,17 @@ function findUsagesInCode(code, name, parser) {
     return usages;
 }
 
+/**
+ * Check if a symbol is a Go-convention entry point.
+ * These are invoked by the Go runtime or test runner, not user code.
+ */
+function isEntryPoint(symbol) {
+    const { name } = symbol;
+    if (name === 'main' || name === 'init') return true;
+    if (/^(Test|Benchmark|Example|Fuzz)[A-Z_]/.test(name)) return true;
+    return false;
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -1360,5 +1371,6 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    isEntryPoint,
     parse
 };

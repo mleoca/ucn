@@ -12,7 +12,7 @@ const { execFileSync } = require('child_process');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parse, parseFile, cleanHtmlScriptTags } = require('./parser');
-const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 const { escapeRegExp, NON_CALLABLE_TYPES, addTestExclusions } = require('./shared');
 const stacktrace = require('./stacktrace');
@@ -570,7 +570,7 @@ class ProjectIndex {
         // Pre-build filename→files map for Java import resolution (O(1) vs O(n) scan)
         const javaFileIndex = new Map();
         for (const [fp, fe] of this.files) {
-            if (fe.language === 'go') {
+            if (langTraits(fe.language)?.packageScope === 'directory') {
                 const dir = path.dirname(fp);
                 if (!dirToGoFiles.has(dir)) dirToGoFiles.set(dir, []);
                 dirToGoFiles.get(dir).push(fp);
@@ -610,7 +610,7 @@ class ProjectIndex {
                     // For Go, a package import means all files in that directory are dependencies
                     // (Go packages span multiple files in the same directory)
                     const filesToLink = [resolved];
-                    if (fileEntry.language === 'go') {
+                    if (langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const pkgDir = path.dirname(resolved);
                         const dirFiles = dirToGoFiles.get(pkgDir) || [];
                         const importerIsTest = filePath.endsWith('_test.go');
@@ -961,7 +961,7 @@ class ProjectIndex {
                 }
                 // For Go, also count importers of sibling files (same package)
                 const candidateEntry = this.files.get(candidate.def.file);
-                if (candidateEntry?.language === 'go') {
+                if (langTraits(candidateEntry?.language)?.packageScope === 'directory') {
                     const candidateDir = path.dirname(candidate.def.file);
                     for (const [, importedFiles] of this.importGraph) {
                         for (const imp of importedFiles) {
@@ -1168,9 +1168,9 @@ class ProjectIndex {
                     imports++;
                 }
             }
-            // Go same-package: files in same directory don't need imports to reference symbols
+            // Same-package: files in same directory don't need imports to reference symbols
             const defEntry = this.files.get(defFile);
-            if (defEntry?.language === 'go') {
+            if (langTraits(defEntry?.language)?.packageScope === 'directory') {
                 const pkgDir = path.dirname(defFile);
                 for (const [fp, fe] of this.files) {
                     if (fp === defFile || !fp.endsWith('.go') || path.dirname(fp) !== pkgDir) continue;
@@ -1205,9 +1205,9 @@ class ProjectIndex {
         const relevantFiles = new Set([defFile]);
         const queue = [defFile];
 
-        // Go same-package: add all .go files in the same directory
+        // Same-package: add all .go files in the same directory
         const defEntry = this.files.get(defFile);
-        if (defEntry?.language === 'go') {
+        if (langTraits(defEntry?.language)?.packageScope === 'directory') {
             const pkgDir = path.dirname(defFile);
             for (const fp of this.files.keys()) {
                 if (fp !== defFile && fp.endsWith('.go') && path.dirname(fp) === pkgDir) {
@@ -2465,7 +2465,7 @@ class ProjectIndex {
                 const isExported = exportedNames.has(symbol.name) ||
                     (symbol.modifiers && symbol.modifiers.includes('export')) ||
                     (symbol.modifiers && symbol.modifiers.includes('public')) ||
-                    (fileEntry.language === 'go' && /^[A-Z]/.test(symbol.name));
+                    (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbol.name));
 
                 if (isExported) {
                     results.push({
@@ -2577,7 +2577,7 @@ class ProjectIndex {
             const isExported = exportedNames.has(symbol.name) ||
                 (symbol.modifiers && symbol.modifiers.includes('export')) ||
                 (symbol.modifiers && symbol.modifiers.includes('public')) ||
-                (fileEntry.language === 'go' && /^[A-Z]/.test(symbol.name));
+                (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbol.name));
 
             if (isExported) {
                 results.push({
@@ -2956,7 +2956,7 @@ class ProjectIndex {
             try {
                 const content = this._readFile(filePath);
 
-                if (fileEntry.language !== 'go') {
+                if (langTraits(fileEntry.language)?.hasDynamicImports) {
                     // Dynamic imports: import(), require(variable), __import__
                     dynamicImports += (content.match(/import\s*\([^'"]/g) || []).length;
                     dynamicImports += (content.match(/require\s*\([^'"]/g) || []).length;
@@ -3457,7 +3457,7 @@ class ProjectIndex {
                 const fileEntry = this.files.get(u.file);
                 if (fileEntry && targetBindingId) {
                     let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
-                    if (localBindings.length === 0 && fileEntry.language === 'go') {
+                    if (localBindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(u.file);
                         for (const [fp, fe] of this.files) {
                             if (fp !== u.file && path.dirname(fp) === dir) {
@@ -4588,7 +4588,7 @@ class ProjectIndex {
                             const isExp = (fileEntry && fileEntry.exports.includes(symbolName)) ||
                                 mods.includes('export') || mods.includes('public') ||
                                 mods.some(m => m.startsWith('pub')) ||
-                                (fileEntry && fileEntry.language === 'go' && /^[A-Z]/.test(symbolName));
+                                (fileEntry && langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbolName));
                             if (!isExp) continue;
                         }
 
@@ -5215,7 +5215,7 @@ class ProjectIndex {
                 // For Go/Java/Rust methods with a className, filter callers whose
                 // receiver clearly belongs to a different type (same logic as impact()).
                 const targetDef = targetDefs[0] || symbol;
-                if (targetDef.className && (lang === 'go' || lang === 'java' || lang === 'rust')) {
+                if (targetDef.className && langTraits(lang)?.typeSystem === 'nominal') {
                     const targetClassName = targetDef.className;
                     // Pre-compute how many types share this method name
                     const methodDefs = this.symbols.get(symbol.name);

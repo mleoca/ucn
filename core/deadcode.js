@@ -5,7 +5,7 @@
  * as the first argument instead of using `this`.
  */
 
-const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
 const { escapeRegExp } = require('./shared');
 const { isFrameworkEntrypoint } = require('./entrypoints');
@@ -305,67 +305,10 @@ function deadcode(index, options = {}) {
 
             const mods = symbol.modifiers || [];
 
-            // Language-specific entry points (called by runtime, no AST-visible callers)
-            // Go: main() and init() are called by runtime
-            const isGoEntryPoint = lang === 'go' && (name === 'main' || name === 'init');
-
-            // Java: public static void main(String[] args) is the entry point
-            const isJavaEntryPoint = lang === 'java' && name === 'main' &&
-                mods.includes('public') && mods.includes('static');
-
-            // Python: Magic/dunder methods are called by the interpreter, not user code
-            // test_* functions/methods are called by pytest/unittest via reflection
-            // setUp/tearDown are unittest.TestCase framework methods called by test runner
-            // pytest_* are pytest plugin hooks called by the framework
-            const isPythonEntryPoint = lang === 'python' &&
-                (/^__\w+__$/.test(name) || /^test_/.test(name) ||
-                 /^(setUp|tearDown)(Class|Module)?$/.test(name) ||
-                 /^pytest_/.test(name));
-
-            // Rust: main() is entry point, #[test] and #[bench] functions are called by test/bench runner
-            const isRustEntryPoint = lang === 'rust' &&
-                (name === 'main' || mods.includes('test') || mods.includes('bench'));
-
-            // Rust: trait impl methods are invoked via trait dispatch, not direct calls
-            // They can never be "dead" - the trait contract requires them to exist
-            const isRustTraitImpl = lang === 'rust' && symbol.isMethod &&
-                symbol.className && symbol.traitImpl;
-
-            // Go: Test*, Benchmark*, Example* functions are called by go test
-            const isGoTestFunc = lang === 'go' &&
-                /^(Test|Benchmark|Example)[A-Z]/.test(name);
-
-            // Java: @Test annotated methods are called by JUnit
-            const isJavaTestMethod = lang === 'java' && mods.includes('test');
-
-            // Java: @Override methods are invoked via polymorphic dispatch
-            // They implement interface/superclass contracts and can't be dead
-            const isJavaOverride = lang === 'java' && mods.includes('override');
-
-            // Skip trait impl / @Override methods entirely - they're required by the type system
-            if (isRustTraitImpl || isJavaOverride) {
-                continue;
-            }
-
-            // JavaScript/TypeScript: framework lifecycle methods called by runtime
-            // React class components, Web Components, Angular, Vue
-            const jsLifecycleMethods = new Set([
-                // React class component lifecycle
-                'render', 'componentDidMount', 'componentDidUpdate', 'componentWillUnmount',
-                'getDerivedStateFromProps', 'getDerivedStateFromError', 'componentDidCatch',
-                'getSnapshotBeforeUpdate', 'shouldComponentUpdate',
-                // Web Components lifecycle
-                'connectedCallback', 'disconnectedCallback', 'attributeChangedCallback', 'adoptedCallback'
-            ]);
-            const isJsEntryPoint = (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') &&
-                symbol.isMethod && jsLifecycleMethods.has(name);
-
-            const isEntryPoint = isGoEntryPoint || isGoTestFunc ||
-                isJavaEntryPoint || isJavaTestMethod ||
-                isPythonEntryPoint || isRustEntryPoint || isJsEntryPoint;
-
-            // Entry points are always excluded — they're invoked by the runtime, not user code
-            if (isEntryPoint) {
+            // Language-specific entry points (called by runtime/test runner, not user code)
+            // Each language module declares its own isEntryPoint() rules.
+            const langModule = getLanguageModule(lang);
+            if (langModule.isEntryPoint?.(symbol)) {
                 continue;
             }
 
@@ -384,7 +327,7 @@ function deadcode(index, options = {}) {
                 fileEntry.exports.includes(name) ||
                 mods.includes('export') ||
                 mods.includes('public') ||
-                (lang === 'go' && /^[A-Z]/.test(name))
+                (langTraits(lang)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(name))
             );
 
             // Skip exported unless requested

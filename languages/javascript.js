@@ -2141,6 +2141,21 @@ function findUsagesInCode(code, name, parser) {
     return usages;
 }
 
+const _JS_LIFECYCLE_METHODS = new Set([
+    'render', 'componentDidMount', 'componentDidUpdate', 'componentWillUnmount',
+    'getDerivedStateFromProps', 'getDerivedStateFromError', 'componentDidCatch',
+    'getSnapshotBeforeUpdate', 'shouldComponentUpdate',
+    'connectedCallback', 'disconnectedCallback', 'attributeChangedCallback', 'adoptedCallback'
+]);
+
+/**
+ * Check if a symbol is a JS/TS-convention entry point.
+ * These are framework lifecycle methods invoked by React or Web Components.
+ */
+function isEntryPoint(symbol) {
+    return !!(symbol.isMethod && _JS_LIFECYCLE_METHODS.has(symbol.name));
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -2151,5 +2166,6 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    isEntryPoint,
     parse
 };

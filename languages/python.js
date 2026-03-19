@@ -1198,6 +1198,19 @@ function extractConstructorName(node) {
     return null;
 }
 
+/**
+ * Check if a symbol is a Python-convention entry point.
+ * These are invoked by the Python runtime, test runners, or frameworks.
+ */
+function isEntryPoint(symbol) {
+    const { name } = symbol;
+    if (/^__\w+__$/.test(name)) return true;
+    if (/^test_/.test(name)) return true;
+    if (/^(setUp|tearDown)(Class|Module)?$/.test(name)) return true;
+    if (/^pytest_/.test(name)) return true;
+    return false;
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -1207,5 +1220,6 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     findInstanceAttributeTypes,
+    isEntryPoint,
     parse
 };

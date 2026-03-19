@@ -7,6 +7,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { ProjectIndex } = require('../../core/project');
+const { LANGUAGES, langTraits } = require('../../languages');
 
 // ── Path constants ──────────────────────────────────────────────────────────
 
@@ -212,6 +213,29 @@ class McpClient {
     }
 }
 
+// ── Language helpers ─────────────────────────────────────────────────────────
+
+/**
+ * Iterate over all primary languages (skips html/tsx which delegate to JS).
+ * Calls fn(langName, traits, primaryExtension) for each.
+ */
+function forEachLanguage(fn) {
+    for (const [name, config] of Object.entries(LANGUAGES)) {
+        if (name === 'html' || name === 'tsx') continue;
+        fn(name, config.traits, config.extensions[0]);
+    }
+}
+
+/**
+ * Get primary file extension for a language (without dot).
+ * @param {string} lang - Language name (e.g. 'go')
+ * @returns {string|null} Extension without dot (e.g. 'go')
+ */
+function extensionFor(lang) {
+    const ext = LANGUAGES[lang]?.extensions[0];
+    return ext ? ext.slice(1) : null;
+}
+
 module.exports = {
     PROJECT_DIR,
     FIXTURES_PATH,
@@ -226,4 +250,8 @@ module.exports = {
     runCli,
     runInteractive,
     McpClient,
+    LANGUAGES,
+    langTraits,
+    forEachLanguage,
+    extensionFor,
 };

@@ -86,6 +86,21 @@ function applyTestExclusions(exclude, includeTests) {
     return includeTests ? arr : addTestExclusions(arr);
 }
 
+/**
+ * Build common caller/callee analysis options from handler params.
+ * Used by about, context, blast, reverseTrace, smart, trace, affectedTests.
+ */
+function buildCallerOptions(p) {
+    return {
+        file: p.file,
+        className: p.className,
+        includeMethods: p.includeMethods,
+        includeUncertain: p.includeUncertain || false,
+        exclude: toExcludeArray(p.exclude),
+        minConfidence: num(p.minConfidence, 0),
+    };
+}
+
 /** Check if a file-based result has a file error. */
 function checkFileError(result, file) {
     if (!result) return null;
@@ -196,16 +211,11 @@ const HANDLERS = {
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
         const result = index.about(p.name, {
+            ...buildCallerOptions(p),
             withTypes: p.withTypes || false,
-            file: p.file,
-            className: p.className,
             all: p.all,
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
-            exclude: toExcludeArray(p.exclude),
             maxCallers: num(p.top, undefined),
             maxCallees: num(p.top, undefined),
-            minConfidence: num(p.minConfidence, 0),
         });
         if (!result) {
             // Give better error if file/className filter is the problem
@@ -237,12 +247,7 @@ const HANDLERS = {
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const result = index.context(p.name, {
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
-            file: p.file,
-            className: p.className,
-            exclude: toExcludeArray(p.exclude),
-            minConfidence: num(p.minConfidence, 0),
+            ...buildCallerOptions(p),
         });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
         return { ok: true, result, showConfidence: !!p.showConfidence };
@@ -276,13 +281,9 @@ const HANDLERS = {
         if (classErr) return { ok: false, error: classErr };
         const depthVal = num(p.depth, undefined);
         const result = index.blast(p.name, {
+            ...buildCallerOptions(p),
             depth: depthVal ?? 3,
-            file: p.file,
-            className: p.className,
             all: p.all || depthVal !== undefined,
-            exclude: toExcludeArray(p.exclude),
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
@@ -298,13 +299,9 @@ const HANDLERS = {
         if (classErr) return { ok: false, error: classErr };
         const depthVal = num(p.depth, undefined);
         const result = index.reverseTrace(p.name, {
+            ...buildCallerOptions(p),
             depth: depthVal ?? 5,
-            file: p.file,
-            className: p.className,
             all: p.all || depthVal !== undefined,
-            exclude: toExcludeArray(p.exclude),
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
@@ -317,11 +314,8 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         const result = index.smart(p.name, {
-            file: p.file,
-            className: p.className,
+            ...buildCallerOptions(p),
             withTypes: p.withTypes || false,
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
@@ -335,12 +329,9 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const depthVal = num(p.depth, undefined);
         const result = index.trace(p.name, {
+            ...buildCallerOptions(p),
             depth: depthVal ?? 3,
-            file: p.file,
-            className: p.className,
             all: p.all || depthVal !== undefined,
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
@@ -567,12 +558,8 @@ const HANDLERS = {
         if (classErr) return { ok: false, error: classErr };
         const depthVal = num(p.depth, undefined);
         const result = index.affectedTests(p.name, {
+            ...buildCallerOptions(p),
             depth: depthVal ?? 3,
-            file: p.file,
-            className: p.className,
-            exclude: toExcludeArray(p.exclude),
-            includeMethods: p.includeMethods,
-            includeUncertain: p.includeUncertain || false,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         return { ok: true, result };
