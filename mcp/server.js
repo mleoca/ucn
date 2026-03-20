@@ -314,11 +314,9 @@ server.registerTool(
         const strippedParams = [];
         const applicable = FLAG_APPLICABILITY[command];
         if (applicable) {
-            // Core params that are always allowed (primary args, global options)
-            const coreParams = new Set([
-                'name', 'term', 'stack', 'range', 'base', 'staged',
-                'all', 'json', 'maxChars', 'maxFiles', 'workers',
-            ]);
+            // Truly global options — apply to all commands (build/display control).
+            // Command-specific params (name, term, stack, range, etc.) are in FLAG_APPLICABILITY.
+            const coreParams = new Set(['maxChars', 'maxFiles', 'followSymlinks']);
             for (const key of Object.keys(ep)) {
                 if (coreParams.has(key)) continue;
                 if (!applicable.includes(key) && ep[key] !== undefined &&

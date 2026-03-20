@@ -4706,6 +4706,38 @@ describe('MCP per-command param validation: stripping note', () => {
             rm(dir);
         }
     });
+
+    it('command-specific primary params (term, range, base, staged) are stripped when inapplicable', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // term is only for search, range is only for lines — both inapplicable to about
+            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', term: 'x', range: '1-2' });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('term'), 'note should mention "term"');
+            assert.ok(result.text.includes('range'), 'note should mention "range"');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('base and staged are stripped when inapplicable', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // base and staged are only for diff_impact
+            const result = await client.callTool({ command: 'tests', project_dir: dir, name: 'helper', base: 'HEAD', staged: true });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('base'), 'note should mention "base"');
+            assert.ok(result.text.includes('staged'), 'note should mention "staged"');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: expand cache invalidation on rebuild', () => {

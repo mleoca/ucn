@@ -941,7 +941,7 @@ describe('Architecture Guards', () => {
         const knownCamelParams = new Set(Object.values(PARAM_MAP));
         // Also accept params that aren't in PARAM_MAP but are used directly (already camelCase in CLI)
         const directParams = [
-            'file', 'exclude', 'name', 'term', 'depth', 'top', 'limit', 'context',
+            'file', 'exclude', 'name', 'term', 'item', 'depth', 'top', 'limit', 'context',
             'direction', 'all', 'exact', 'regex', 'in', 'range', 'stack', 'base',
             'staged', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported',
             'unused', 'functions', 'framework', 'detailed',
@@ -998,6 +998,8 @@ describe('Architecture Guards', () => {
             'TOOL_DESCRIPTION should use generateMcpParamSection()');
         assert.ok(generateMcpParamSection().includes('ACCEPTED FLAGS PER COMMAND'),
             'Generated section should have ACCEPTED FLAGS PER COMMAND header');
+        assert.ok(generateMcpParamSection().includes('max_chars'),
+            'Generated section header should mention max_chars as always accepted');
     });
 
     it('every CLI knownFlags entry maps to a FLAG_APPLICABILITY flag', () => {
@@ -1017,7 +1019,7 @@ describe('Architecture Guards', () => {
             'json', 'no-cache', 'clear-cache', 'interactive', 'i',
             'help', 'h', 'version', 'mcp', 'no-quiet', 'quiet', 'verbose',
             'expand', 'not', 'no-follow-symlinks', 'no-regex', 'default',
-            'max-files', 'max-chars', 'item', 'workers',
+            'max-files', 'max-chars', 'workers',
         ]);
         for (const flag of knownFlags) {
             if (exemptFlags.has(flag)) continue;

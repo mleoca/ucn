@@ -96,29 +96,29 @@ const PARAM_MAP = {
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
     // Understanding code
-    about:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
-    context:      ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence'],
-    impact:       ['file', 'exclude', 'className', 'top'],
-    blast:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    reverseTrace: ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    smart:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
-    trace:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    example:      ['file', 'className'],
-    related:      ['file', 'className', 'top', 'all'],
+    about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
+    context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence'],
+    impact:       ['name', 'file', 'exclude', 'className', 'top'],
+    blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
+    trace:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    example:      ['name', 'file', 'className'],
+    related:      ['name', 'file', 'className', 'top', 'all'],
     // Finding code
-    find:         ['file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth'],
-    usages:       ['file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
+    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth'],
+    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
     toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
-    search:       ['file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
-    tests:        ['file', 'exclude', 'className', 'callsOnly'],
-    affectedTests:['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
+    search:       ['name', 'term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
+    tests:        ['name', 'file', 'exclude', 'className', 'callsOnly'],
+    affectedTests:['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
     entrypoints:  ['file', 'exclude', 'includeTests', 'limit', 'type', 'framework'],
     // Extracting code
-    fn:           ['file', 'className', 'all'],
-    class:        ['file', 'all', 'maxLines'],
+    fn:           ['name', 'file', 'className', 'all'],
+    class:        ['name', 'file', 'all', 'maxLines'],
     lines:        ['file', 'range'],
-    expand:       [],
+    expand:       ['item'],
     // File dependencies
     imports:      ['file'],
     exporters:    ['file'],
@@ -126,11 +126,11 @@ const FLAG_APPLICABILITY = {
     graph:        ['file', 'depth', 'direction', 'all'],
     circularDeps: ['file', 'exclude'],
     // Refactoring
-    verify:       ['file', 'className'],
-    plan:         ['file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
+    verify:       ['name', 'file', 'className'],
+    plan:         ['name', 'file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],
     // Other
-    typedef:      ['file', 'className', 'exact'],
+    typedef:      ['name', 'file', 'className', 'exact'],
     stacktrace:   ['stack'],
     api:          ['file', 'limit'],
     stats:        ['functions', 'top'],
@@ -244,7 +244,7 @@ const REVERSE_PARAM_MAP = buildReverseParamMap();
  * One line per command: `about: file, exclude, class_name, ...`
  */
 function generateMcpParamSection() {
-    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (name, term, stack, range, base, staged, max_chars always accepted; flags not listed below are ignored):'];
+    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (max_chars, max_files always accepted; flags not listed below are ignored):'];
     for (const cmd of CANONICAL_COMMANDS) {
         const flags = FLAG_APPLICABILITY[cmd];
         if (!flags || flags.length === 0) continue;
