@@ -109,7 +109,14 @@ function getCachedCalls(index, filePath, options = {}) {
 }
 
 /**
- * Find all callers of a function using AST-based detection
+ * Find all call sites that invoke the named symbol.
+ *
+ * ReceiverType filtering (nominal vs structural):
+ * - Nominal languages (Go/Java/Rust): uses call.receiverType (from parser-inferred
+ *   method receivers, constructors, composite literals) to filter false positives.
+ * - Structural languages (JS/TS/Python): checks receiver binding evidence from imports
+ *   instead of receiverType, since structural typing makes receiver types ambiguous.
+ *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name to find callers for
  * @param {object} [options] - Options
@@ -652,7 +659,15 @@ function findCallers(index, name, options = {}) {
 }
 
 /**
- * Find all functions called by a function using AST-based detection
+ * Find all symbols called from within a function definition.
+ *
+ * Method resolution uses receiverType when available:
+ * - Go: receiverType from method receiver params + _buildTypedLocalTypeMap (New*() patterns)
+ * - Java: receiverType from `new Foo()` constructors + typed parameter declarations
+ * - Rust: receiverType from impl block context + _buildTypedLocalTypeMap
+ * - JS/TS: receiverType from constructor calls + import binding evidence
+ * - Python: receiverType from __init__ attribute type inference (getInstanceAttributeTypes)
+ *
  * @param {object} index - ProjectIndex instance
  * @param {object} def - Symbol definition with file, name, startLine, endLine
  * @param {object} [options] - Options
@@ -1395,6 +1410,11 @@ function _buildLocalTypeMap(index, def, calls) {
  * @param {object} index - ProjectIndex instance
  * @param {object} def - Function definition with file, startLine, endLine
  * @param {Array} calls - Cached call sites for the file
+ *
+ * Sources: parser-inferred receiverType from method receivers, constructor calls,
+ * composite literals. Used by Go, Java, Rust (nominal languages) to infer local
+ * variable types for method resolution. Not used by JS/TS/Python -- structural
+ * languages use import evidence via _buildLocalTypeMap instead.
  */
 function _buildTypedLocalTypeMap(index, def, calls) {
     const localTypes = new Map();
@@ -1437,7 +1457,10 @@ function _buildTypedLocalTypeMap(index, def, calls) {
 }
 
 /**
- * Check if a function is used as a callback anywhere in the codebase
+ * Find higher-order function usages where `name` is passed as a callback argument.
+ * Handles patterns like .map(fn), setTimeout(fn), promise.then(handler).
+ * Delegates to per-language findCallbackUsages implementations.
+ *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
  * @returns {Array} Callback usages

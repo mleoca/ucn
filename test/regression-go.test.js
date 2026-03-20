@@ -663,8 +663,8 @@ func (r Cache[K, V]) Get() {}
         const get = fns.find(f => f.name === 'Get');
         assert.ok(post, 'Post should be found');
         assert.ok(get, 'Get should be found');
-        assert.ok(post.receiver.includes('Router'), 'generic pointer receiver should include Router');
-        assert.ok(get.receiver.includes('Cache'), 'generic receiver should include Cache');
+        assert.strictEqual(post.receiver, '*Router[T]', 'generic pointer receiver should be *Router[T]');
+        assert.strictEqual(get.receiver, 'Cache[K, V]', 'generic receiver should be Cache[K, V]');
     });
 
     it('should associate unnamed receiver methods with their struct', () => {

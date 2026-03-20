@@ -45,14 +45,14 @@ function extractGoParams(paramsNode) {
  */
 function extractReceiver(receiverNode) {
     if (!receiverNode) return null;
-    const text = receiverNode.text;
-    // Match named receiver: (r *Router) or (r Router[T])
-    const namedMatch = text.match(/\(\s*\w+\s+(\*?\w+(?:\[[\w,\s]+\])?)\s*\)/);
-    if (namedMatch) return namedMatch[1];
-    // Match unnamed receiver: (Router) or (*Router) or (Router[T])
-    const unnamedMatch = text.match(/\(\s*(\*?\w+(?:\[[\w,\s]+\])?)\s*\)/);
-    if (unnamedMatch) return unnamedMatch[1];
-    return text.replace(/^\(|\)$/g, '').trim();
+    // receiverNode is a parameter_list: (r *Router)
+    // Find the parameter_declaration child
+    const param = receiverNode.namedChildren.find(c => c.type === 'parameter_declaration');
+    if (!param) return receiverNode.text.replace(/^\(|\)$/g, '').trim();
+    // The type is the last named child (name is first for named receivers)
+    const typeNode = param.namedChildren[param.namedChildren.length - 1];
+    if (!typeNode) return null;
+    return typeNode.text;
 }
 
 // --- Single-pass helpers: extracted from find* callbacks ---

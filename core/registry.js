@@ -143,6 +143,10 @@ const BROAD_COMMANDS = new Set([
     'deadcode', 'usages', 'reverseTrace', 'circularDeps',
 ]);
 
+// Commands that can operate on a single file without a project index.
+// Used by CLI to decide whether to build a file-local or project-wide index.
+const FILE_LOCAL_COMMANDS = new Set(['toc', 'fn', 'class', 'find', 'usages', 'search', 'lines', 'typedef', 'api']);
+
 // ============================================================================
 // HELPERS
 // ============================================================================
@@ -263,6 +267,7 @@ module.exports = {
     REVERSE_PARAM_MAP,
     FLAG_APPLICABILITY,
     BROAD_COMMANDS,
+    FILE_LOCAL_COMMANDS,
     resolveCommand,
     normalizeParams,
     getCliCommandSet,

@@ -19,7 +19,7 @@ const fs = require('fs');
 const os = require('os');
 
 const { McpClient, runCli, runInteractive, FIXTURES_PATH: BASE_FIXTURES } = require('./helpers');
-const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY, BROAD_COMMANDS, generateMcpParamSection, REVERSE_PARAM_MAP } = require('../core/registry');
+const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY, BROAD_COMMANDS, FILE_LOCAL_COMMANDS, generateMcpParamSection, REVERSE_PARAM_MAP } = require('../core/registry');
 const FIXTURES_PATH = path.join(BASE_FIXTURES, 'javascript');
 
 // ============================================================================
@@ -926,6 +926,22 @@ describe('Architecture Guards', () => {
         for (const cmd of BROAD_COMMANDS) {
             assert.ok(CANONICAL_COMMANDS.includes(cmd),
                 `BROAD_COMMANDS has "${cmd}" which is not a canonical command`);
+        }
+    });
+
+    it('FILE_LOCAL_COMMANDS are all canonical commands', () => {
+        for (const cmd of FILE_LOCAL_COMMANDS) {
+            assert.ok(CANONICAL_COMMANDS.includes(cmd),
+                `FILE_LOCAL_COMMANDS has "${cmd}" which is not a canonical command`);
+        }
+    });
+
+    it('graph-build.js exports match project.js delegation targets', () => {
+        const graphBuild = require(path.join(__dirname, '..', 'core', 'graph-build'));
+        const expected = ['buildDirIndex', 'buildImportGraph', 'buildInheritanceGraph', '_resolveJavaPackageImport'];
+        for (const fn of expected) {
+            assert.strictEqual(typeof graphBuild[fn], 'function',
+                `graph-build.js should export ${fn}`);
         }
     });
 

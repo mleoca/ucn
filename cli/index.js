@@ -14,7 +14,7 @@ const { detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName } = require('../core/registry');
+const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName, FILE_LOCAL_COMMANDS } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
@@ -322,7 +322,7 @@ function runFileCommand(filePath, command, arg) {
     const canonical = resolveCommand(command, 'cli') || command;
 
     // Commands that need full project index — auto-route to project mode
-    const fileLocalCommands = new Set(['toc', 'fn', 'class', 'find', 'usages', 'search', 'lines', 'typedef', 'api']);
+    const fileLocalCommands = FILE_LOCAL_COMMANDS;
 
     if (!fileLocalCommands.has(canonical)) {
         // Auto-detect project root and route to project mode

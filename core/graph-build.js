@@ -1,0 +1,224 @@
+/**
+ * core/graph-build.js - Import/export and inheritance graph construction
+ *
+ * Extracted from project.js. All functions take an `index` (ProjectIndex)
+ * as the first argument instead of using `this`.
+ */
+
+const path = require('path');
+const { resolveImport } = require('./imports');
+const { langTraits } = require('../languages');
+
+/**
+ * Build directory→files index for O(1) same-package lookups.
+ * Replaces O(N) full-index scans in findCallers and countSymbolUsages.
+ */
+function buildDirIndex(index) {
+    index.dirToFiles = new Map();
+    for (const filePath of index.files.keys()) {
+        const dir = path.dirname(filePath);
+        let list = index.dirToFiles.get(dir);
+        if (!list) {
+            list = [];
+            index.dirToFiles.set(dir, list);
+        }
+        list.push(filePath);
+    }
+}
+
+/**
+ * Resolve a Java package import to a project file.
+ * Handles regular imports, static imports (strips member name), and wildcards (strips .*).
+ * Progressively strips trailing segments to find the class file.
+ */
+function _resolveJavaPackageImport(index, importModule, javaFileIndex) {
+    const isWildcard = importModule.endsWith('.*');
+    // Strip wildcard suffix (e.g., "com.pkg.Class.*" -> "com.pkg.Class")
+    const mod = isWildcard ? importModule.slice(0, -2) : importModule;
+    const segments = mod.split('.');
+
+    // Try progressively shorter paths: full path, then strip last segment, etc.
+    // This handles static imports where path includes member name after class
+    if (javaFileIndex) {
+        // Fast path: use pre-built filename→files index (O(candidates) vs O(all files))
+        for (let i = segments.length; i > 0; i--) {
+            const className = segments[i - 1];
+            const candidates = javaFileIndex.get(className);
+            if (candidates) {
+                const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
+                for (const absPath of candidates) {
+                    if (absPath.endsWith(fileSuffix)) {
+                        return absPath;
+                    }
+                }
+            }
+        }
+    } else {
+        // Fallback: scan all files (used by imports() method outside buildImportGraph)
+        for (let i = segments.length; i > 0; i--) {
+            const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
+            for (const absPath of index.files.keys()) {
+                if (absPath.endsWith(fileSuffix)) {
+                    return absPath;
+                }
+            }
+        }
+    }
+
+    // For wildcard imports (com.pkg.model.*), the package may be a directory
+    // containing .java files. Check if any file lives under this package path.
+    if (isWildcard) {
+        const dirSuffix = '/' + segments.join('/') + '/';
+        for (const absPath of index.files.keys()) {
+            if (absPath.includes(dirSuffix)) {
+                return absPath;
+            }
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Build import/export relationship graphs
+ */
+function buildImportGraph(index) {
+    index.importGraph.clear();
+    index.exportGraph.clear();
+
+    // Pre-build directory→files map for Go package linking (O(1) lookup vs O(n) scan)
+    const dirToGoFiles = new Map();
+    // Pre-build filename→files map for Java import resolution (O(1) vs O(n) scan)
+    const javaFileIndex = new Map();
+    for (const [fp, fe] of index.files) {
+        if (langTraits(fe.language)?.packageScope === 'directory') {
+            const dir = path.dirname(fp);
+            if (!dirToGoFiles.has(dir)) dirToGoFiles.set(dir, []);
+            dirToGoFiles.get(dir).push(fp);
+        } else if (fe.language === 'java') {
+            const name = path.basename(fp, '.java');
+            if (!javaFileIndex.has(name)) javaFileIndex.set(name, []);
+            javaFileIndex.get(name).push(fp);
+        }
+    }
+
+    for (const [filePath, fileEntry] of index.files) {
+        const importedFiles = [];
+        const seenModules = new Set();
+
+        for (const importModule of fileEntry.imports) {
+            // Skip null modules (e.g., dynamic include! macros in Rust)
+            if (!importModule) continue;
+
+            // Deduplicate: same module imported multiple times in one file
+            // (e.g., lazy imports inside different functions)
+            if (seenModules.has(importModule)) continue;
+            seenModules.add(importModule);
+
+            let resolved = resolveImport(importModule, filePath, {
+                aliases: index.config.aliases,
+                language: fileEntry.language,
+                root: index.root
+            });
+
+            // Java package imports: resolve by progressive suffix matching
+            // Handles regular, static (com.pkg.Class.method), and wildcard (com.pkg.Class.*) imports
+            if (!resolved && fileEntry.language === 'java' && !importModule.startsWith('.')) {
+                resolved = _resolveJavaPackageImport(index, importModule, javaFileIndex);
+            }
+
+            if (resolved && index.files.has(resolved)) {
+                // For Go, a package import means all files in that directory are dependencies
+                // (Go packages span multiple files in the same directory)
+                const filesToLink = [resolved];
+                if (langTraits(fileEntry.language)?.packageScope === 'directory') {
+                    const pkgDir = path.dirname(resolved);
+                    const dirFiles = dirToGoFiles.get(pkgDir) || [];
+                    const importerIsTest = filePath.endsWith('_test.go');
+                    for (const fp of dirFiles) {
+                        if (fp !== resolved) {
+                            if (!importerIsTest && fp.endsWith('_test.go')) continue;
+                            filesToLink.push(fp);
+                        }
+                    }
+                }
+
+                for (const linkedFile of filesToLink) {
+                    importedFiles.push(linkedFile);
+                    if (!index.exportGraph.has(linkedFile)) {
+                        index.exportGraph.set(linkedFile, []);
+                    }
+                    index.exportGraph.get(linkedFile).push(filePath);
+                }
+            }
+        }
+
+        index.importGraph.set(filePath, importedFiles);
+    }
+}
+
+/**
+ * Build inheritance relationship graphs
+ */
+function buildInheritanceGraph(index) {
+    index.extendsGraph.clear();
+    index.extendedByGraph.clear();
+
+    // Collect all class/interface/struct names for alias resolution
+    const classNames = new Set();
+    for (const [, fileEntry] of index.files) {
+        for (const symbol of fileEntry.symbols) {
+            if (['class', 'interface', 'struct', 'trait', 'record'].includes(symbol.type)) {
+                classNames.add(symbol.name);
+            }
+        }
+    }
+
+    for (const [filePath, fileEntry] of index.files) {
+        for (const symbol of fileEntry.symbols) {
+            if (!['class', 'interface', 'struct', 'trait', 'record'].includes(symbol.type)) {
+                continue;
+            }
+
+            if (symbol.extends) {
+                // Parse comma-separated parents (Python MRO: "Flyable, Swimmable")
+                const parents = symbol.extends.split(',').map(s => s.trim()).filter(Boolean);
+
+                // Resolve aliased parent names via import aliases
+                // e.g., const { BaseHandler: Handler } = require('./base')
+                //        class Child extends Handler → resolve Handler to BaseHandler
+                const resolvedParents = parents.map(parent => {
+                    if (classNames.has(parent)) return parent;
+                    if (fileEntry.importAliases) {
+                        const alias = fileEntry.importAliases.find(a => a.local === parent);
+                        if (alias && classNames.has(alias.original)) return alias.original;
+                    }
+                    return parent;
+                });
+
+                // Store with file scope to avoid collisions when same class name
+                // appears in multiple files (F-002 fix)
+                if (!index.extendsGraph.has(symbol.name)) {
+                    index.extendsGraph.set(symbol.name, []);
+                }
+                index.extendsGraph.get(symbol.name).push({
+                    file: filePath,
+                    parents: resolvedParents
+                });
+
+                for (const parent of resolvedParents) {
+                    if (!index.extendedByGraph.has(parent)) {
+                        index.extendedByGraph.set(parent, []);
+                    }
+                    index.extendedByGraph.get(parent).push({
+                        name: symbol.name,
+                        type: symbol.type,
+                        file: filePath
+                    });
+                }
+            }
+        }
+    }
+}
+
+module.exports = { buildDirIndex, buildImportGraph, buildInheritanceGraph, _resolveJavaPackageImport };
