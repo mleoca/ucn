@@ -3460,6 +3460,128 @@ describe('AST-based tests(): cross-language test-case detection', () => {
     });
 });
 
+describe('AST-based tests(): cross-language className scoping', () => {
+    it('Python: className scopes to instance calls via receiverType', () => {
+        const dir = tmp({
+            'a.py': 'class A:\n    def save(self):\n        return 1',
+            'b.py': 'class B:\n    def save(self):\n        return 2',
+            'test_both.py': [
+                'from a import A',
+                'from b import B',
+                '',
+                'def test_a_save():',
+                '    a = A()',
+                '    a.save()',
+                '',
+                'def test_b_save():',
+                '    svc = B()',
+                '    svc.save()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bTests = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(bTests.ok);
+            assert.ok(bTests.result.length > 0, 'Should find test file for B');
+            const bMatches = bTests.result.flatMap(r => r.matches);
+            assert.ok(bMatches.some(m => m.content.includes('svc.save')),
+                'Should include svc.save() call (B instance)');
+            assert.ok(!bMatches.some(m => m.content.includes('a.save')),
+                'Should not include a.save() call (A instance)');
+
+            const aTests = execute(index, 'tests', { name: 'save', className: 'A' });
+            assert.ok(aTests.ok);
+            const aMatches = aTests.result.flatMap(r => r.matches);
+            assert.ok(aMatches.some(m => m.content.includes('a.save')),
+                'Should include a.save() call (A instance)');
+            assert.ok(!aMatches.some(m => m.content.includes('svc.save')),
+                'Should not include svc.save() call (B instance)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Go: className scopes to instance calls via receiverType', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'a.go': 'package main\n\ntype A struct{}\n\nfunc (a *A) Save() int { return 1 }',
+            'b.go': 'package main\n\ntype B struct{}\n\nfunc (b *B) Save() int { return 2 }',
+            'ab_test.go': [
+                'package main',
+                '',
+                'import "testing"',
+                '',
+                'func TestASave(t *testing.T) {',
+                '    a := &A{}',
+                '    a.Save()',
+                '}',
+                '',
+                'func TestBSave(t *testing.T) {',
+                '    svc := &B{}',
+                '    svc.Save()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bTests = execute(index, 'tests', { name: 'Save', className: 'B' });
+            assert.ok(bTests.ok);
+            assert.ok(bTests.result.length > 0, 'Should find test file for B');
+            const bMatches = bTests.result.flatMap(r => r.matches);
+            assert.ok(bMatches.some(m => m.content.includes('svc.Save')),
+                'Should include svc.Save() call (B instance)');
+            assert.ok(!bMatches.some(m => m.content.includes('a.Save')),
+                'Should not include a.Save() call (A instance)');
+
+            const aTests = execute(index, 'tests', { name: 'Save', className: 'A' });
+            assert.ok(aTests.ok);
+            const aMatches = aTests.result.flatMap(r => r.matches);
+            assert.ok(aMatches.some(m => m.content.includes('a.Save')),
+                'Should include a.Save() call (A instance)');
+            assert.ok(!aMatches.some(m => m.content.includes('svc.Save')),
+                'Should not include svc.Save() call (B instance)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Java: className scopes to receiver calls', () => {
+        const dir = tmp({
+            'A.java': 'public class A {\n  public int save() { return 1; }\n}',
+            'B.java': 'public class B {\n  public int save() { return 2; }\n}',
+            'BothTest.java': [
+                'import org.junit.Test;',
+                '',
+                'public class BothTest {',
+                '    @Test',
+                '    public void testASave() {',
+                '        A a = new A();',
+                '        a.save();',
+                '    }',
+                '    @Test',
+                '    public void testBSave() {',
+                '        B b = new B();',
+                '        b.save();',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bTests = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(bTests.ok);
+            assert.ok(bTests.result.length > 0, 'Should find test file for B');
+            const bMatches = bTests.result.flatMap(r => r.matches);
+            assert.ok(bMatches.some(m => m.content.includes('b.save')),
+                'Should include b.save() call (B instance)');
+            assert.ok(!bMatches.some(m => m.content.includes('a.save')),
+                'Should not include a.save() call (A instance)');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix: CLI fn --class-name passes through to execute', () => {
     it('fn with --class-name disambiguates methods', () => {
         const dir = tmp({

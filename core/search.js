@@ -937,37 +937,41 @@ function tests(index, nameOrFile, options = {}) {
 
 /**
  * Build a map of instance variable names → class names from call objects.
- * e.g., `const svc = new B()` or `svc = B.create()` → { svc: 'B' }
- * Tracks reassignment: scans getCachedCalls for `new ClassName()` patterns.
+ * Language-generic: uses receiverType from getCachedCalls() (already inferred
+ * by _buildTypedLocalTypeMap for Go/Java/Rust and binding analysis for JS/TS/Python).
+ *
+ * Two sources:
+ * 1. receiverType on method calls: `svc.Save()` with receiverType=B → svc maps to B
+ * 2. Constructor calls: `new B()`, `B()`, `&B{}` assigned to a variable
  */
 function _buildInstanceTypeMap(index, filePath, content, targetClassName) {
     const typeMap = new Map(); // varName → className
 
-    // Use getCachedCalls to get call objects with receiver info
     const calls = getCachedCalls(index, filePath);
     if (!calls) return typeMap;
 
     for (const call of calls) {
-        // Pattern 1: `new ClassName()` — constructor call assigns to a variable
-        // The call will have name === targetClassName and be a constructor
+        // Source 1: receiverType from method calls (works across all languages)
+        // e.g., svc.Save() where receiverType='B' → svc maps to 'B'
+        if (call.isMethod && call.receiver && call.receiverType === targetClassName) {
+            typeMap.set(call.receiver, targetClassName);
+        }
+
+        // Source 2: Constructor/factory calls assigned to a variable
+        // e.g., `const svc = new B()` (JS), `svc = B()` (Python), `svc := &B{}` (Go)
         if (call.name === targetClassName && !call.isMethod) {
-            // Find what variable this is assigned to by checking the line content
             const lineContent = index.getLineContent(filePath, call.line);
-            // Match: const/let/var varName = new ClassName(
-            const assignMatch = lineContent.match(/(?:const|let|var)\s+(\w+)\s*=\s*new\s/);
+            // Language-generic assignment detection: look for `varName =` or `varName :=`
+            const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
             if (assignMatch) {
                 typeMap.set(assignMatch[1], targetClassName);
             }
-            // Match: varName = new ClassName( (reassignment)
-            const reassignMatch = lineContent.match(/(\w+)\s*=\s*new\s/);
-            if (reassignMatch && !assignMatch) {
-                typeMap.set(reassignMatch[1], targetClassName);
-            }
         }
-        // Pattern 2: `ClassName.create()` / `ClassName.build()` — factory method
+
+        // Source 3: Factory methods — ClassName.create(), ClassName.build(), etc.
         if (call.isMethod && call.receiver === targetClassName) {
             const lineContent = index.getLineContent(filePath, call.line);
-            const assignMatch = lineContent.match(/(?:const|let|var)\s+(\w+)\s*=/);
+            const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
             if (assignMatch) {
                 typeMap.set(assignMatch[1], targetClassName);
             }
