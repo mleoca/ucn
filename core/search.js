@@ -10,7 +10,8 @@
 const path = require('path');
 const { escapeRegExp } = require('./shared');
 const { isTestFile } = require('./discovery');
-const { detectLanguage, getParser, langTraits } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
+const { getCachedCalls } = require('./callers');
 
 /**
  * Build a glob-style matcher: * matches any sequence, ? matches one char.
@@ -799,11 +800,15 @@ function typedef(index, name, options = {}) {
 }
 
 /**
- * Find tests for a function or file
+ * Find tests for a function or file (AST-based).
+ *
+ * Uses _getCachedUsages() for AST-based detection of imports, calls, and references.
+ * className scoping uses the AST receiver field from findUsagesInCode() instead of
+ * regex heuristics. Test-case detection is language-aware via isEntryPoint().
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} nameOrFile - Function name or file path
- * @param {object} options - { callsOnly }
+ * @param {object} options - { callsOnly, className }
  * @returns {Array} Test files and matches
  */
 function tests(index, nameOrFile, options = {}) {
@@ -824,7 +829,6 @@ function tests(index, nameOrFile, options = {}) {
             testFiles.push({ path: filePath, entry: fileEntry });
         } else if (fileEntry.language === 'rust') {
             // Rust idiomatically puts tests in #[cfg(test)] modules inside source files.
-            // Check if file has any symbols with 'test' modifier (#[test] attribute).
             const hasInlineTests = fileEntry.symbols?.some(s =>
                 s.modifiers?.includes('test')
             );
@@ -838,155 +842,84 @@ function tests(index, nameOrFile, options = {}) {
         ? path.basename(nameOrFile, path.extname(nameOrFile))
         : nameOrFile;
 
-    // Note: no 'g' flag - we only need to test for presence per line
-    // The 'i' flag is kept for case-insensitive matching
-    const regex = new RegExp('\\b' + escapeRegExp(searchTerm) + '\\b', 'i');
-    // Pre-compile patterns used inside per-line loop
-    const callPattern = new RegExp(escapeRegExp(searchTerm) + '\\s*\\(');
+    const className = options.className || null;
+    // Pre-compile string-ref pattern (only regex left — used on single AST-identified lines)
     const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
-
-    // When className is provided, build patterns for match-level scoping.
-    const classNameFilter = options.className
-        ? new RegExp('\\b' + escapeRegExp(options.className) + '\\b')
-        : null;
-    // Match-level class scoping: for calls, check receiver or nearby context;
-    // e.g., "new ClassName().method()" or "instance.method()" where instance is typed.
-    const classReceiverPattern = options.className
-        ? new RegExp('\\b' + escapeRegExp(options.className) + '\\s*[\\.\\(]')
-        : null;
 
     for (const { path: testPath, entry } of testFiles) {
         try {
             const content = index._readFile(testPath);
 
+            // Fast pre-check: skip if searchTerm doesn't appear in file
+            if (!content.includes(searchTerm)) continue;
             // className scoping: skip test files that don't reference the class at all
-            if (classNameFilter && !classNameFilter.test(content)) {
-                continue;
-            }
+            if (className && !content.includes(className)) continue;
 
-            const lines = content.split('\n');
+            // AST-based usage detection
+            const astUsages = index._getCachedUsages(testPath, searchTerm);
+            if (astUsages === null) continue; // no parser available — skip
 
-            // Build a map of variable names → line ranges where they're bound to the target class.
-            // Tracks reassignment: a variable is only an instance of the target class between
-            // its assignment to that class and any subsequent reassignment to something else.
-            // Pre-compiles receiver regexes for O(1) per-line checks.
-            const instanceVarReceiverRegexes = []; // [{regex, fromLine, toLine}]
-            if (options.className) {
-                const cn = escapeRegExp(options.className);
-                const bindingPattern = new RegExp(
-                    '(?:const|let|var|)\\s+(\\w+)\\s*=\\s*(?:new\\s+' + cn + '|' + cn + '\\.\\w+)\\s*\\(', 'g'
-                );
-                // Also detect reassignment to a DIFFERENT class/value
-                const reassignPattern = /(\w+)\s*=\s*(?:new\s+\w|[^=])/g;
+            if (astUsages.length === 0) continue;
 
-                // First pass: find all bindings to the target class
-                const bindings = []; // [{varName, line}]
-                for (let i = 0; i < lines.length; i++) {
-                    let m;
-                    bindingPattern.lastIndex = 0;
-                    while ((m = bindingPattern.exec(lines[i])) !== null) {
-                        bindings.push({ varName: m[1], line: i });
-                    }
-                }
-
-                // Second pass: for each binding, find where the var is reassigned (scope end)
-                const escapedTerm = escapeRegExp(searchTerm);
-                for (const b of bindings) {
-                    let toLine = lines.length; // default: valid until end of file
-                    for (let i = b.line + 1; i < lines.length; i++) {
-                        // Check if this variable is reassigned to something else
-                        const line = lines[i];
-                        if (new RegExp('\\b' + escapeRegExp(b.varName) + '\\s*=\\s*(?!\\s*=)').test(line)
-                            && !bindingPattern.test(line)) {
-                            toLine = i;
-                            break;
-                        }
-                    }
-                    instanceVarReceiverRegexes.push({
-                        regex: new RegExp('\\b' + escapeRegExp(b.varName) + '\\.' + escapedTerm + '\\s*\\('),
-                        fromLine: b.line,
-                        toLine,
-                    });
-                }
-            }
-
-            // Check if a line's receiver is the target class (direct or via bound variable).
-            function lineHasClassReceiver(line, lineIdx) {
-                if (classNameFilter.test(line)) return true;
-                // Check pre-compiled instance variable regexes (scoped to assignment range).
-                // Only matches receiver position: varName.methodName( — not bare varName as argument.
-                for (const entry of instanceVarReceiverRegexes) {
-                    if (lineIdx >= entry.fromLine && lineIdx < entry.toLine) {
-                        if (entry.regex.test(line)) return true;
-                    }
-                }
-                return false;
+            // Build instance variable → className map from getCachedCalls()
+            // for receiver-precise className scoping.
+            // e.g., `const svc = new B()` → svc maps to 'B'
+            let instanceTypeMap = null; // lazily built
+            if (className) {
+                instanceTypeMap = _buildInstanceTypeMap(index, testPath, content, className);
             }
 
             const matches = [];
+            const seenLines = new Set(); // deduplicate same-line matches
 
-            lines.forEach((line, idx) => {
-                if (regex.test(line)) {
-                    let matchType = 'reference';
-                    if (/\b(describe|it|test|spec)\s*\(/.test(line)) {
-                        matchType = 'test-case';
-                    } else if (/\b(import|require|from)\b/.test(line)) {
-                        matchType = 'import';
-                    } else if (callPattern.test(line)) {
-                        matchType = 'call';
-                    }
-                    // Detect if the match is inside a string literal (e.g., 'parseFile' or "parseFile")
-                    if (matchType === 'reference' || matchType === 'call') {
-                        if (strPattern.test(line)) {
-                            matchType = 'string-ref';
-                        }
-                    }
+            for (const usage of astUsages) {
+                if (usage.usageType === 'definition') continue; // not relevant in test files
 
-                    // Match-level className scoping: for call matches,
-                    // the class name or a bound instance variable must appear
-                    // on the same line as the method call.
-                    if (classReceiverPattern && matchType === 'call') {
-                        if (!lineHasClassReceiver(line, idx)) return; // skip — different receiver
-                    }
+                const lineKey = `${usage.line}:${usage.usageType}`;
+                if (seenLines.has(lineKey)) continue;
+                seenLines.add(lineKey);
 
-                    // For reference matches, check same line or ±1 line.
-                    if (classReceiverPattern && matchType === 'reference') {
-                        let classNearby = lineHasClassReceiver(line, idx);
-                        if (!classNearby && idx > 0) classNearby = lineHasClassReceiver(lines[idx - 1], idx - 1);
-                        if (!classNearby && idx + 1 < lines.length) classNearby = lineHasClassReceiver(lines[idx + 1], idx + 1);
-                        if (!classNearby) return; // skip this match
-                    }
+                const lineContent = index.getLineContent(testPath, usage.line);
 
-                    // For test-case matches with className, keep if the test
-                    // description mentions the class or the test body
-                    // references the class (directly or via bound instance).
-                    if (classNameFilter && matchType === 'test-case') {
-                        let classInContext = classNameFilter.test(line);
-                        if (!classInContext) {
-                            // Look forward into the test body for class usage
-                            for (let d = 1; d <= 5 && !classInContext; d++) {
-                                if (idx + d < lines.length) {
-                                    const bodyLine = lines[idx + d];
-                                    // Stop at next test-case boundary
-                                    if (/\b(describe|it|test|spec)\s*\(/.test(bodyLine)) break;
-                                    if (lineHasClassReceiver(bodyLine, idx + d)) classInContext = true;
-                                }
-                            }
-                        }
-                        if (!classInContext) return; // skip test-case not related to this class
-                    }
-
-                    matches.push({
-                        line: idx + 1,
-                        content: line.trim(),
-                        matchType
-                    });
+                let matchType;
+                if (usage.usageType === 'import') {
+                    matchType = 'import';
+                } else if (usage.usageType === 'call') {
+                    matchType = 'call';
+                } else {
+                    // 'reference' — check if inside string literal
+                    matchType = strPattern.test(lineContent) ? 'string-ref' : 'reference';
                 }
-            });
+
+                // className scoping for calls: check receiver
+                if (className && matchType === 'call') {
+                    if (!_receiverMatchesClass(usage, className, instanceTypeMap, lineContent)) continue;
+                }
+
+                // className scoping for references: check receiver
+                if (className && (matchType === 'reference' || matchType === 'string-ref')) {
+                    if (usage.receiver && usage.receiver !== className &&
+                        !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === className)) {
+                        continue;
+                    }
+                }
+
+                matches.push({
+                    line: usage.line,
+                    content: lineContent.trim(),
+                    matchType
+                });
+            }
+
+            // Language-aware test-case detection
+            _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
+
+            // Deduplicate: if a line already has a 'call' or 'import', don't also add 'test-case'
+            const finalMatches = _deduplicateMatches(matches);
 
             const filtered = options.callsOnly
-                ? matches.filter(m => m.matchType === 'call' || m.matchType === 'test-case')
-                : matches;
+                ? finalMatches.filter(m => m.matchType === 'call' || m.matchType === 'test-case')
+                : finalMatches;
             if (filtered.length > 0) {
                 results.push({
                     file: entry.relativePath,
@@ -1000,6 +933,217 @@ function tests(index, nameOrFile, options = {}) {
 
     return results;
     } finally { index._endOp(); }
+}
+
+/**
+ * Build a map of instance variable names → class names from call objects.
+ * e.g., `const svc = new B()` or `svc = B.create()` → { svc: 'B' }
+ * Tracks reassignment: scans getCachedCalls for `new ClassName()` patterns.
+ */
+function _buildInstanceTypeMap(index, filePath, content, targetClassName) {
+    const typeMap = new Map(); // varName → className
+
+    // Use getCachedCalls to get call objects with receiver info
+    const calls = getCachedCalls(index, filePath);
+    if (!calls) return typeMap;
+
+    for (const call of calls) {
+        // Pattern 1: `new ClassName()` — constructor call assigns to a variable
+        // The call will have name === targetClassName and be a constructor
+        if (call.name === targetClassName && !call.isMethod) {
+            // Find what variable this is assigned to by checking the line content
+            const lineContent = index.getLineContent(filePath, call.line);
+            // Match: const/let/var varName = new ClassName(
+            const assignMatch = lineContent.match(/(?:const|let|var)\s+(\w+)\s*=\s*new\s/);
+            if (assignMatch) {
+                typeMap.set(assignMatch[1], targetClassName);
+            }
+            // Match: varName = new ClassName( (reassignment)
+            const reassignMatch = lineContent.match(/(\w+)\s*=\s*new\s/);
+            if (reassignMatch && !assignMatch) {
+                typeMap.set(reassignMatch[1], targetClassName);
+            }
+        }
+        // Pattern 2: `ClassName.create()` / `ClassName.build()` — factory method
+        if (call.isMethod && call.receiver === targetClassName) {
+            const lineContent = index.getLineContent(filePath, call.line);
+            const assignMatch = lineContent.match(/(?:const|let|var)\s+(\w+)\s*=/);
+            if (assignMatch) {
+                typeMap.set(assignMatch[1], targetClassName);
+            }
+        }
+    }
+
+    return typeMap;
+}
+
+/**
+ * Check if a usage's receiver matches the target className.
+ * Uses direct receiver check and instance type map for indirect bindings.
+ * @param {object} usage - AST usage with optional receiver field
+ * @param {string} className - Target class name
+ * @param {Map} instanceTypeMap - varName → className map
+ * @param {string} [lineContent] - Line content for fallback checks
+ */
+function _receiverMatchesClass(usage, className, instanceTypeMap, lineContent) {
+    // Direct receiver: ClassName.method() or ClassName.staticMethod()
+    if (usage.receiver === className) return true;
+    // Instance variable: check if receiver is bound to the target class
+    if (usage.receiver && instanceTypeMap && instanceTypeMap.get(usage.receiver) === className) return true;
+    // Receiver is some other known identifier — doesn't match
+    if (usage.receiver) return false;
+    // No receiver: could be `new ClassName().method()` (complex expression receiver)
+    // or a bare function call. Check the line content for class evidence.
+    if (lineContent && lineContent.includes(className)) return true;
+    return false;
+}
+
+/**
+ * Language-aware test-case detection.
+ *
+ * JS/TS: describe, it, test, spec calls with searchTerm in the description.
+ * Go: TestXxx, BenchmarkXxx, ExampleXxx functions containing a usage of searchTerm.
+ * Python: test_ functions or TestCase methods containing a usage of searchTerm.
+ * Java: @Test-annotated methods containing a usage of searchTerm.
+ * Rust: #[test]-attributed functions containing a usage of searchTerm.
+ */
+function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, instanceTypeMap, matches) {
+    const matchLines = new Set(matches.map(m => m.line));
+    const lang = fileEntry.language;
+
+    if (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') {
+        // JS/TS: find describe/it/test/spec calls from getCachedCalls
+        const calls = getCachedCalls(index, filePath);
+        if (!calls) return;
+        const testFrameworkCalls = new Set(['describe', 'it', 'test', 'spec']);
+        for (const call of calls) {
+            if (!testFrameworkCalls.has(call.name)) continue;
+            const lineContent = index.getLineContent(filePath, call.line);
+            // Check if searchTerm appears in the description string on this line
+            if (lineContent.includes(searchTerm) && !matchLines.has(call.line)) {
+                // className scoping for test-case: check if the test body references the class
+                if (className) {
+                    if (!_testBodyReferencesClass(index, filePath, fileEntry, call.line, className, instanceTypeMap)) continue;
+                }
+                matches.push({
+                    line: call.line,
+                    content: lineContent.trim(),
+                    matchType: 'test-case'
+                });
+                matchLines.add(call.line);
+            }
+        }
+    } else {
+        // Go/Python/Java/Rust: check if any AST usage falls within a test function's range
+        if (!fileEntry.symbols) return;
+        try {
+            const langModule = getLanguageModule(lang);
+            if (!langModule || !langModule.isEntryPoint) return;
+
+            // Find test symbols
+            for (const symbol of fileEntry.symbols) {
+                if (!langModule.isEntryPoint(symbol)) continue;
+                // Check if any usage of searchTerm falls within this test function's range
+                const usageInRange = matches.some(m =>
+                    m.line >= symbol.startLine && m.line <= symbol.endLine
+                );
+                if (usageInRange && !matchLines.has(symbol.startLine)) {
+                    // className scoping: verify the test references the class
+                    if (className) {
+                        if (!_testBodyReferencesClass(index, filePath, fileEntry, symbol.startLine, className, instanceTypeMap)) continue;
+                    }
+                    const lineContent = index.getLineContent(filePath, symbol.startLine);
+                    matches.push({
+                        line: symbol.startLine,
+                        content: lineContent.trim(),
+                        matchType: 'test-case'
+                    });
+                    matchLines.add(symbol.startLine);
+                }
+            }
+        } catch (e) {
+            // Skip if language module unavailable
+        }
+    }
+}
+
+/**
+ * Check if a test body references the target class (directly or via instance variable).
+ * Looks at AST usages of className within the test function's line range.
+ */
+function _testBodyReferencesClass(index, filePath, fileEntry, testLine, className, instanceTypeMap) {
+    // Find the enclosing test function to get its line range
+    const enclosing = index.findEnclosingFunction(filePath, testLine, true);
+    let startLine, endLine;
+    if (enclosing) {
+        startLine = enclosing.startLine;
+        endLine = enclosing.endLine;
+    } else {
+        // No enclosing function found (common for JS/TS it/test callbacks which
+        // aren't in the symbol table). Estimate range from file content.
+        startLine = testLine;
+        endLine = _estimateTestBlockEnd(index, filePath, testLine);
+    }
+
+    // Check if className appears as AST usage in the range
+    const classUsages = index._getCachedUsages(filePath, className);
+    if (classUsages) {
+        for (const u of classUsages) {
+            if (u.line >= startLine && u.line <= endLine) return true;
+        }
+    }
+
+    // Check if any instance variable bound to className is used in the range
+    if (instanceTypeMap) {
+        for (const [varName, cls] of instanceTypeMap) {
+            if (cls !== className) continue;
+            const varUsages = index._getCachedUsages(filePath, varName);
+            if (varUsages) {
+                for (const u of varUsages) {
+                    if (u.line >= startLine && u.line <= endLine) return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Estimate the end line of a test block (it/test/describe callback) by tracking
+ * brace nesting from the start line.
+ */
+function _estimateTestBlockEnd(index, filePath, startLine) {
+    const content = index._readFile(filePath);
+    if (!content) return startLine + 5;
+    const lines = content.split('\n');
+    let depth = 0;
+    let started = false;
+    for (let i = startLine - 1; i < lines.length; i++) {
+        const line = lines[i];
+        for (const ch of line) {
+            if (ch === '{' || ch === '(') { depth++; started = true; }
+            else if (ch === '}' || ch === ')') { depth--; }
+        }
+        if (started && depth <= 0) return i + 1; // 1-based
+    }
+    return Math.min(startLine + 10, lines.length);
+}
+
+/**
+ * Deduplicate matches: prefer more specific matchTypes on the same line.
+ * Priority: test-case > call > import > string-ref > reference
+ */
+function _deduplicateMatches(matches) {
+    const byLine = new Map();
+    const priority = { 'test-case': 5, 'call': 4, 'import': 3, 'string-ref': 2, 'reference': 1 };
+    for (const m of matches) {
+        const existing = byLine.get(m.line);
+        if (!existing || (priority[m.matchType] || 0) > (priority[existing.matchType] || 0)) {
+            byLine.set(m.line, m);
+        }
+    }
+    return [...byLine.values()].sort((a, b) => a.line - b.line);
 }
 
 module.exports = { find, _applyFindFilters, usages, search, structuralSearch, example, typedef, tests };

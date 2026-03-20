@@ -2033,8 +2033,10 @@ function findUsagesInCode(code, name, parser) {
 
     traverseTreeCached(tree.rootNode, (node) => {
         // Look for identifier, property_identifier (method names in obj.method() calls),
-        // and type_identifier (TypeScript type annotations like `params: MyType`)
-        const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier' || node.type === 'type_identifier';
+        // type_identifier (TypeScript type annotations), and shorthand_property_identifier_pattern
+        // (destructured names in `const { name } = require(...)`)
+        const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier' ||
+            node.type === 'type_identifier' || node.type === 'shorthand_property_identifier_pattern';
         if (!isIdentifier || node.text !== name) {
             return true;
         }
@@ -2098,6 +2100,21 @@ function findUsagesInCode(code, name, parser) {
                     if (grandparent && grandparent.type === 'variable_declarator' &&
                         grandparent.childForFieldName('name')?.text === name) {
                         usageType = 'import';
+                    }
+                }
+            }
+            // Destructured require: const { name } = require('...')
+            else if (node.type === 'shorthand_property_identifier_pattern' &&
+                     parent.type === 'object_pattern') {
+                // Check if the object_pattern is part of a variable_declarator with require()
+                const declarator = parent.parent;
+                if (declarator && declarator.type === 'variable_declarator') {
+                    const value = declarator.childForFieldName('value');
+                    if (value && value.type === 'call_expression') {
+                        const func = value.childForFieldName('function');
+                        if (func && func.text === 'require') {
+                            usageType = 'import';
+                        }
                     }
                 }
             }

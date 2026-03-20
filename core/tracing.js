@@ -10,6 +10,8 @@
 const path = require('path');
 const { escapeRegExp } = require('./shared');
 const { isTestFile } = require('./discovery');
+const { getCachedCalls } = require('./callers');
+const { detectLanguage, getLanguageModule } = require('../languages');
 
 /**
  * Trace execution flow — build a tree of callees (down), callers (up), or both.
@@ -541,17 +543,7 @@ function affectedTests(index, name, options = {}) {
         };
         collectNames(blastResult.tree);
 
-        // Step 3: Build regex patterns for all names
-        const namePatterns = new Map();
-        for (const n of affectedNames) {
-            const escaped = escapeRegExp(n);
-            namePatterns.set(n, {
-                regex: new RegExp('\\b' + escaped + '\\b'),
-                callPattern: new RegExp(escaped + '\\s*\\('),
-            });
-        }
-
-        // Step 4: Scan test files once for all affected names
+        // Step 3: Scan test files for all affected names using AST
         const exclude = options.exclude;
         const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
         const results = [];
@@ -565,39 +557,63 @@ function affectedTests(index, name, options = {}) {
             if (excludeArr.length > 0 && !index.matchesFilters(fileEntry.relativePath, { exclude: excludeArr })) continue;
             try {
                 const content = index._readFile(filePath);
-                const lines = content.split('\n');
                 const fileMatches = new Map();
 
-                lines.forEach((line, idx) => {
-                    for (const [funcName, patterns] of namePatterns) {
-                        if (patterns.regex.test(line)) {
-                            let matchType = 'reference';
-                            if (/\b(describe|it|test|spec)\s*\(/.test(line)) {
-                                matchType = 'test-case';
-                            } else if (/\b(import|require|from)\b/.test(line)) {
-                                matchType = 'import';
-                            } else if (patterns.callPattern.test(line)) {
-                                matchType = 'call';
-                            }
-                            if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
-                            fileMatches.get(funcName).push({
-                                line: idx + 1, content: line.trim(),
-                                matchType, functionName: funcName
-                            });
+                for (const funcName of affectedNames) {
+                    // Fast pre-check
+                    if (!content.includes(funcName)) continue;
+
+                    // AST-based usage detection
+                    const astUsages = index._getCachedUsages(filePath, funcName);
+                    if (!astUsages || astUsages.length === 0) continue;
+
+                    const seenLines = new Set();
+                    for (const usage of astUsages) {
+                        if (usage.usageType === 'definition') continue;
+                        const lineKey = `${usage.line}:${usage.usageType}`;
+                        if (seenLines.has(lineKey)) continue;
+                        seenLines.add(lineKey);
+
+                        let matchType;
+                        if (usage.usageType === 'import') {
+                            matchType = 'import';
+                        } else if (usage.usageType === 'call') {
+                            matchType = 'call';
+                        } else {
+                            matchType = 'reference';
                         }
+
+                        const lineContent = index.getLineContent(filePath, usage.line);
+                        if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
+                        fileMatches.get(funcName).push({
+                            line: usage.line, content: lineContent.trim(),
+                            matchType, functionName: funcName
+                        });
                     }
-                });
+
+                    // Language-aware test-case detection
+                    _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches);
+                }
 
                 if (fileMatches.size > 0) {
                     const coveredFunctions = [...fileMatches.keys()];
                     const allMatches = [];
                     for (const matches of fileMatches.values()) allMatches.push(...matches);
-                    allMatches.sort((a, b) => a.line - b.line);
+                    // Deduplicate same line+function (test-case line might overlap with call line)
+                    const dedupMap = new Map();
+                    for (const m of allMatches) {
+                        const key = `${m.line}:${m.functionName}`;
+                        const existing = dedupMap.get(key);
+                        if (!existing || _matchPriority(m.matchType) > _matchPriority(existing.matchType)) {
+                            dedupMap.set(key, m);
+                        }
+                    }
+                    const deduped = [...dedupMap.values()].sort((a, b) => a.line - b.line);
                     results.push({
                         file: fileEntry.relativePath,
                         coveredFunctions,
-                        matchCount: allMatches.length,
-                        matches: allMatches
+                        matchCount: deduped.length,
+                        matches: deduped
                     });
                 }
             } catch (e) { /* skip unreadable */ }
@@ -626,6 +642,59 @@ function affectedTests(index, name, options = {}) {
             warnings: blastResult.warnings,
         };
     } finally { index._endOp(); }
+}
+
+/**
+ * Add test-case matches for a function name in a test file (language-aware).
+ */
+function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches) {
+    const lang = fileEntry.language;
+    const existingMatches = fileMatches.get(funcName) || [];
+    const existingLines = new Set(existingMatches.map(m => m.line));
+
+    if (lang === 'javascript' || lang === 'typescript' || lang === 'tsx') {
+        const calls = getCachedCalls(index, filePath);
+        if (!calls) return;
+        const testFrameworkCalls = new Set(['describe', 'it', 'test', 'spec']);
+        for (const call of calls) {
+            if (!testFrameworkCalls.has(call.name)) continue;
+            const lineContent = index.getLineContent(filePath, call.line);
+            if (lineContent.includes(funcName) && !existingLines.has(call.line)) {
+                if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
+                fileMatches.get(funcName).push({
+                    line: call.line, content: lineContent.trim(),
+                    matchType: 'test-case', functionName: funcName
+                });
+                existingLines.add(call.line);
+            }
+        }
+    } else {
+        if (!fileEntry.symbols) return;
+        try {
+            const langModule = getLanguageModule(lang);
+            if (!langModule || !langModule.isEntryPoint) return;
+            for (const symbol of fileEntry.symbols) {
+                if (!langModule.isEntryPoint(symbol)) continue;
+                const usageInRange = existingMatches.some(m =>
+                    m.line >= symbol.startLine && m.line <= symbol.endLine
+                );
+                if (usageInRange && !existingLines.has(symbol.startLine)) {
+                    const lineContent = index.getLineContent(filePath, symbol.startLine);
+                    if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
+                    fileMatches.get(funcName).push({
+                        line: symbol.startLine, content: lineContent.trim(),
+                        matchType: 'test-case', functionName: funcName
+                    });
+                    existingLines.add(symbol.startLine);
+                }
+            }
+        } catch (e) { /* skip */ }
+    }
+}
+
+function _matchPriority(matchType) {
+    const p = { 'test-case': 5, 'call': 4, 'import': 3, 'string-ref': 2, 'reference': 1 };
+    return p[matchType] || 0;
 }
 
 module.exports = { trace, blast, reverseTrace, affectedTests };

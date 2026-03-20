@@ -3285,6 +3285,181 @@ describe('fix: tests() className scoping', () => {
     });
 });
 
+describe('AST-based tests(): cross-language test-case detection', () => {
+    it('Go: Test* functions detected as test-case', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'lib.go': 'package lib\n\nfunc Save() int { return 1 }',
+            'lib_test.go': [
+                'package lib',
+                '',
+                'import "testing"',
+                '',
+                'func TestSave(t *testing.T) {',
+                '    result := Save()',
+                '    if result != 1 {',
+                '        t.Fatal("wrong")',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'Save' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length > 0, 'Should find test file');
+            const matches = result.result.flatMap(r => r.matches);
+            assert.ok(matches.some(m => m.matchType === 'test-case'),
+                'Should detect TestSave as test-case');
+            assert.ok(matches.some(m => m.matchType === 'call'),
+                'Should detect Save() as call');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Python: test_ functions detected as test-case', () => {
+        const dir = tmp({
+            'lib.py': 'def save():\n    return 1',
+            'test_lib.py': [
+                'from lib import save',
+                '',
+                'def test_save():',
+                '    result = save()',
+                '    assert result == 1',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length > 0, 'Should find test file');
+            const matches = result.result.flatMap(r => r.matches);
+            assert.ok(matches.some(m => m.matchType === 'test-case'),
+                'Should detect test_save as test-case');
+            assert.ok(matches.some(m => m.matchType === 'call'),
+                'Should detect save() as call');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Java: @Test methods detected as test-case', () => {
+        const dir = tmp({
+            'Helper.java': 'public class Helper {\n  public static int save() { return 1; }\n}',
+            'HelperTest.java': [
+                'import org.junit.Test;',
+                'import static org.junit.Assert.*;',
+                '',
+                'public class HelperTest {',
+                '    @Test',
+                '    public void testSave() {',
+                '        int result = Helper.save();',
+                '        assertEquals(1, result);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length > 0, 'Should find test file');
+            const matches = result.result.flatMap(r => r.matches);
+            assert.ok(matches.some(m => m.matchType === 'test-case'),
+                'Should detect @Test testSave as test-case');
+            assert.ok(matches.some(m => m.matchType === 'call'),
+                'Should detect save() as call');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Rust: #[test] functions detected as test-case', () => {
+        const dir = tmp({
+            'lib.rs': 'pub fn save() -> i32 { 1 }',
+            'test_lib.rs': [
+                'use crate::save;',
+                '',
+                '#[test]',
+                'fn test_save() {',
+                '    let result = save();',
+                '    assert_eq!(result, 1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length > 0, 'Should find test file');
+            const matches = result.result.flatMap(r => r.matches);
+            assert.ok(matches.some(m => m.matchType === 'call'),
+                'Should detect save() as call');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('JS: test-case detected from describe/it/test calls', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': [
+                'const { save } = require("../lib");',
+                '',
+                'describe("save", () => {',
+                '  it("returns 1", () => {',
+                '    expect(save()).toBe(1);',
+                '  });',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length > 0, 'Should find test file');
+            const matches = result.result.flatMap(r => r.matches);
+            assert.ok(matches.some(m => m.matchType === 'test-case'),
+                'Should detect describe("save"...) as test-case');
+            assert.ok(matches.some(m => m.matchType === 'call'),
+                'Should detect save() as call');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('AST-based tests() does not return comment-only mentions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'test/lib.test.js': [
+                'const { helper } = require("../lib");',
+                '// helper is great',
+                '/* helper works */  ',
+                'helper();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'helper' });
+            assert.ok(result.ok);
+            const matches = result.result.flatMap(r => r.matches);
+            // Should NOT find comment-only lines
+            assert.ok(!matches.some(m => m.content.startsWith('//')),
+                'Should not include single-line comment mentions');
+            assert.ok(!matches.some(m => m.content.startsWith('/*')),
+                'Should not include block comment mentions');
+            // Should find the actual call and import
+            assert.ok(matches.some(m => m.matchType === 'call'), 'Should find call');
+            assert.ok(matches.some(m => m.matchType === 'import'), 'Should find import');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix: CLI fn --class-name passes through to execute', () => {
     it('fn with --class-name disambiguates methods', () => {
         const dir = tmp({
