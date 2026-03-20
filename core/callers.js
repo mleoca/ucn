@@ -48,6 +48,11 @@ function getLine(content, lineNum) {
  */
 function getCachedCalls(index, filePath, options = {}) {
     try {
+        // Trigger lazy calls cache load if prepared but not yet loaded
+        if (index._callsCachePrepared && !index._callsCacheLoaded) {
+            const { ensureCallsCacheLoaded } = require('./cache');
+            ensureCallsCacheLoaded(index);
+        }
         const cached = index.callsCache.get(filePath);
 
         // Fast path: check mtime first (stat is much faster than read+hash)
@@ -99,6 +104,8 @@ function getCachedCalls(index, filePath, options = {}) {
         }
         const calls = langModule.findCallsInCode(content, parser, callOpts);
 
+        // Remove old callee index entries before overwriting cache
+        if (cached) index._removeFromCalleeIndex(filePath, cached.calls);
         index.callsCache.set(filePath, {
             mtime,
             hash,
@@ -106,7 +113,7 @@ function getCachedCalls(index, filePath, options = {}) {
             content: options.includeContent ? content : undefined
         });
         index.callsCacheDirty = true;
-        // Incrementally update callee index (avoids full rebuild)
+        // Incrementally update callee index with new calls
         index._addToCalleeIndex(filePath, calls);
 
         if (options.includeContent) {
@@ -1446,10 +1453,11 @@ function _buildTypedLocalTypeMap(index, def, calls) {
         // Handles: x := NewFoo(), x, err := NewFoo(), x := pkg.NewFoo(), x, err := pkg.NewFoo()
         const newName = call.isMethod ? call.name : call.name;
         if (/^New[A-Z]/.test(newName) && !call.isPotentialCallback) {
+            if (_cachedLines === false) continue; // File unreadable, skip all
             if (!_cachedLines) {
                 try {
                     _cachedLines = index._readFile(def.file).split('\n');
-                } catch { continue; }
+                } catch { _cachedLines = false; continue; }
             }
             const sourceLine = _cachedLines[call.line - 1];
             if (!sourceLine) continue;

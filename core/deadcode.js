@@ -212,6 +212,28 @@ function deadcode(index, options = {}) {
         }
     }
 
+    // Pre-filter exported symbols from the scan set when not auditing exports.
+    // Go exports ~63K capitalized names on K8s — scanning these in Phase 2 only to
+    // skip them in Phase 3 wastes O(63K × 11K files) = ~700M comparisons.
+    if (!options.includeExported) {
+        const narrowed = new Set();
+        for (const name of potentiallyDeadNames) {
+            const syms = index.symbols.get(name) || [];
+            // Keep the name only if at least one definition is NOT exported
+            const allExported = syms.every(s => {
+                const fe = index.files.get(s.file);
+                const lang = fe?.language;
+                if (!fe) return false;
+                return fe.exports.includes(name) ||
+                    (s.modifiers || []).includes('export') ||
+                    (s.modifiers || []).includes('public') ||
+                    (langTraits(lang)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(name));
+            });
+            if (!allExported) narrowed.add(name);
+        }
+        potentiallyDeadNames = narrowed;
+    }
+
     // When --file is provided, pre-filter to only names of symbols in the target scope.
     // The text scan below is O(potentiallyDeadNames × files) — narrowing the name set
     // avoids scanning all files for names that will be filtered out at the result stage.

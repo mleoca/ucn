@@ -113,18 +113,18 @@ function saveCache(index, cachePath) {
 
     fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
 
-    // Save callsCache sharded by directory for lazy loading
+    // Save callsCache sharded by directory for lazy loading.
+    // Write to a temp directory first, then atomic swap to avoid data loss on crash.
     if (callsCacheData.length > 0) {
-        const callsDir = path.join(path.dirname(cacheFile), 'calls');
-        // Clean up old shards and legacy monolithic file
-        if (fs.existsSync(callsDir)) {
-            fs.rmSync(callsDir, { recursive: true, force: true });
+        const cacheDir = path.dirname(cacheFile);
+        const callsDir = path.join(cacheDir, 'calls');
+        const callsTmpDir = path.join(cacheDir, 'calls.tmp');
+
+        // Clean up any leftover temp dir from a previous crashed save
+        if (fs.existsSync(callsTmpDir)) {
+            fs.rmSync(callsTmpDir, { recursive: true, force: true });
         }
-        const legacyFile = path.join(path.dirname(cacheFile), 'calls-cache.json');
-        if (fs.existsSync(legacyFile)) {
-            fs.rmSync(legacyFile, { force: true });
-        }
-        fs.mkdirSync(callsDir, { recursive: true });
+        fs.mkdirSync(callsTmpDir, { recursive: true });
 
         // Group by directory
         const shards = new Map();
@@ -134,17 +134,29 @@ function saveCache(index, cachePath) {
             shards.get(dir).push([relPath, entry]);
         }
 
-        // Write one shard per directory
+        // Write all shards to temp directory
         const shardManifest = [];
         for (const [dir, entries] of shards) {
             const hash = crypto.createHash('md5').update(dir).digest('hex').slice(0, 10);
-            const shardFile = path.join(callsDir, `${hash}.json`);
+            const shardFile = path.join(callsTmpDir, `${hash}.json`);
             fs.writeFileSync(shardFile, JSON.stringify(entries));
             shardManifest.push([dir, hash, entries.length]);
         }
 
-        // Write manifest for lazy loading
-        fs.writeFileSync(path.join(callsDir, 'manifest.json'), JSON.stringify(shardManifest));
+        // Write manifest to temp directory
+        fs.writeFileSync(path.join(callsTmpDir, 'manifest.json'), JSON.stringify(shardManifest));
+
+        // Atomic swap: remove old, rename temp to final
+        if (fs.existsSync(callsDir)) {
+            fs.rmSync(callsDir, { recursive: true, force: true });
+        }
+        fs.renameSync(callsTmpDir, callsDir);
+
+        // Clean up legacy monolithic file
+        const legacyFile = path.join(cacheDir, 'calls-cache.json');
+        if (fs.existsSync(legacyFile)) {
+            fs.rmSync(legacyFile, { force: true });
+        }
     }
 
     return cacheFile;
@@ -243,10 +255,10 @@ function loadCache(index, cachePath) {
             index.extendedByGraph = new Map(cacheData.extendedByGraph);
         }
 
-        // Eagerly load callsCache from separate file.
-        // Prevents 10K cold tree-sitter re-parses (2GB+ peak) when findCallers runs.
+        // Prepare lazy calls cache loading — load manifest but defer shard parsing.
+        // Shards are loaded on first getCachedCalls access via ensureCallsCacheLoaded().
         if (index.callsCache.size === 0) {
-            loadCallsCache(index);
+            _prepareCallsCache(index);
         }
 
         // Build directory→files index from loaded data
@@ -349,6 +361,37 @@ function isCacheStale(index) {
 }
 
 /**
+ * Prepare calls cache for lazy loading — reads manifest but defers shard parsing.
+ * Called during loadCache() to set up the manifest without the ~1s shard parse cost.
+ * Actual shards are loaded on first ensureCallsCacheLoaded() call.
+ * @param {object} index - ProjectIndex instance
+ */
+function _prepareCallsCache(index) {
+    if (index._callsCacheLoaded) return;
+    const cacheDir = path.join(index.root, '.ucn-cache');
+    const manifestFile = path.join(cacheDir, 'calls', 'manifest.json');
+    if (fs.existsSync(manifestFile)) {
+        try {
+            const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8'));
+            index._callsManifest = new Map();
+            for (const [dir, hash, count] of manifest) {
+                index._callsManifest.set(dir, { hash, count, loaded: false });
+            }
+            index._callsCachePrepared = true;
+            return;
+        } catch (e) {
+            // Corrupted manifest — fall through
+        }
+    }
+    // Check legacy format
+    const legacyFile = path.join(cacheDir, 'calls-cache.json');
+    if (fs.existsSync(legacyFile)) {
+        index._callsCacheLegacyFile = legacyFile;
+        index._callsCachePrepared = true;
+    }
+}
+
+/**
  * Load callsCache from separate file on demand.
  * Only loads if callsCache is empty (not already populated from inline or prior load).
  * @param {object} index - ProjectIndex instance
@@ -359,30 +402,17 @@ function loadCallsCache(index) {
     if (index._callsCacheLoaded) return false;   // Already attempted, file didn't exist
     index._callsCacheLoaded = true;
 
-    const cacheDir = path.join(index.root, '.ucn-cache');
-
-    // Try sharded format first (calls/manifest.json)
-    const manifestFile = path.join(cacheDir, 'calls', 'manifest.json');
-    if (fs.existsSync(manifestFile)) {
-        try {
-            const manifest = JSON.parse(fs.readFileSync(manifestFile, 'utf-8'));
-            // Store manifest for lazy loading
-            index._callsManifest = new Map();
-            for (const [dir, hash, count] of manifest) {
-                index._callsManifest.set(dir, { hash, count, loaded: false });
-            }
-            // Eagerly load all shards (matches previous behavior)
-            for (const [, { hash }] of index._callsManifest) {
-                _loadCallsShard(index, hash);
-            }
-            return true;
-        } catch (e) {
-            // Corrupted manifest — fall through to legacy
+    // If manifest was prepared lazily, load all shards now
+    if (index._callsManifest) {
+        for (const [, { hash }] of index._callsManifest) {
+            _loadCallsShard(index, hash);
         }
+        return index.callsCache.size > 0;
     }
 
     // Legacy format: single calls-cache.json
-    const callsCacheFile = path.join(cacheDir, 'calls-cache.json');
+    const callsCacheFile = index._callsCacheLegacyFile ||
+        path.join(index.root, '.ucn-cache', 'calls-cache.json');
     if (!fs.existsSync(callsCacheFile)) return false;
 
     try {
@@ -399,6 +429,17 @@ function loadCallsCache(index) {
         // Corrupted file — ignore
     }
     return false;
+}
+
+/**
+ * Ensure calls cache is fully loaded (trigger lazy load if prepared but not loaded).
+ * Call this before any operation that needs callsCache (findCallers, buildCalleeIndex, etc.)
+ * @param {object} index - ProjectIndex instance
+ */
+function ensureCallsCacheLoaded(index) {
+    if (index._callsCachePrepared && !index._callsCacheLoaded) {
+        loadCallsCache(index);
+    }
 }
 
 /**
@@ -421,4 +462,4 @@ function _loadCallsShard(index, hash) {
     }
 }
 
-module.exports = { saveCache, loadCache, loadCallsCache, isCacheStale };
+module.exports = { saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded };

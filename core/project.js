@@ -85,6 +85,7 @@ class ProjectIndex {
 
     /** End a per-operation content cache scope (only clears when outermost scope ends) */
     _endOp() {
+        if (!this._opContentCache) return; // Mismatched call — no active operation
         if (--this._opDepth <= 0) {
             this._opContentCache = null;
             this._opUsagesCache = null;
@@ -563,6 +564,8 @@ class ProjectIndex {
      */
     buildCalleeIndex() {
         const { getCachedCalls } = require('./callers');
+        const { ensureCallsCacheLoaded } = require('./cache');
+        ensureCallsCacheLoaded(this);
         this.calleeIndex = new Map();
 
         for (const [filePath] of this.files) {
@@ -1604,7 +1607,7 @@ class ProjectIndex {
         if (!fileEntry) return null;
 
         // Per-operation cache: avoid rescanning symbols for same (file, line)
-        const cacheKey = filePath + ':' + lineNum;
+        const cacheKey = filePath + '\0' + lineNum;
         if (this._opEnclosingFnCache) {
             const cached = this._opEnclosingFnCache.get(cacheKey);
             if (cached !== undefined) {

@@ -643,10 +643,7 @@ function helper() { return 42; }
             const loaded = index2.loadCache();
             assert.ok(loaded, 'Cache should load successfully');
 
-            // callsCache is eagerly loaded from shards during loadCache
-            assert.ok(index2.callsCache.size > 0, 'callsCache should be loaded eagerly from shards');
-
-            // Verify calls are usable without reparsing
+            // callsCache is lazily loaded from shards — trigger via getCachedCalls
             const calls = index2.getCachedCalls(filePath);
             assert.ok(calls, 'Should get calls from restored cache');
             assert.ok(calls.some(c => c.name === 'helper'), 'Should find helper call');
@@ -1769,20 +1766,22 @@ describe('fix: callsCache persisted to disk after command execution', () => {
         });
         try {
             const index = idx(dir);
-            // callsCache is eagerly populated during build() via buildCalleeIndex()
-            assert.ok(index.callsCache.size > 0, 'callsCache populated eagerly during build');
+            // callsCache is populated during build() via buildCalleeIndex()
+            assert.ok(index.callsCache.size > 0, 'callsCache populated during build');
 
             // findCallers uses the already-populated callsCache
             index.findCallers('helper');
             assert.ok(index.callsCache.size > 0, 'callsCache still populated after findCallers');
             assert.ok(index.callsCacheDirty, 'dirty flag set');
 
-            // Save and reload — callsCache should persist in separate file
+            // Save and reload — callsCache should persist and load lazily
             index.saveCache();
             const index2 = new ProjectIndex(dir);
             index2.loadCache();
-            // callsCache is eagerly loaded from separate calls-cache.json
-            assert.ok(index2.callsCache.size > 0, 'callsCache loaded eagerly from calls-cache.json');
+            // callsCache is lazily loaded — trigger via getCachedCalls or buildCalleeIndex
+            const calls = index2.getCachedCalls(path.join(dir, 'app.js'));
+            assert.ok(calls, 'callsCache loaded lazily from shards');
+            assert.ok(index2.callsCache.size > 0, 'callsCache populated after lazy load');
         } finally {
             rm(dir);
         }
@@ -1942,17 +1941,16 @@ describe('perf: loadCache and findCallers baseline', () => {
             index1.findCallers('run');
             index1.saveCache();
 
-            // Measure loadCache time (eagerly loads callsCache from separate file)
+            // Measure loadCache time (defers callsCache shard loading)
             const start = Date.now();
             const index2 = new ProjectIndex(dir);
             index2.loadCache();
             const loadTime = Date.now() - start;
 
-            // callsCache should be eagerly loaded (prevents 10K cold tree-sitter parses)
-            assert.ok(index2.callsCache.size > 0, 'callsCache should be loaded eagerly from calls-cache.json');
+            // loadCache is fast because callsCache shards are deferred
             assert.ok(loadTime < 500, `loadCache should be fast: ${loadTime}ms`);
 
-            // findCallers should be fast since callsCache is warm
+            // findCallers triggers lazy callsCache load via buildCalleeIndex
             const start2 = Date.now();
             const callers = index2.findCallers('run');
             const callersTime = Date.now() - start2;
