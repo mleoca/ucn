@@ -10,11 +10,10 @@
 const fs = require('fs');
 const path = require('path');
 
-const { parseFile, detectLanguage } = require('../core/parser');
+const { detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { escapeRegExp } = require('../core/shared');
 const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
@@ -904,164 +903,85 @@ function runGlobCommand(pattern, command, arg) {
         process.exit(1);
     }
 
-    switch (command) {
-        case 'toc': {
-            let totalFunctions = 0;
-            let totalClasses = 0;
-            let totalState = 0;
-            let totalLines = 0;
-            const byFile = [];
+    const canonical = resolveCommand(command, 'cli') || command;
 
-            for (const file of files) {
-                try {
-                    const result = parseFile(file);
-                    let functions = result.functions;
-                    if (flags.topLevel) {
-                        functions = functions.filter(fn => !fn.isNested && (!fn.indent || fn.indent === 0));
-                    }
-                    totalFunctions += functions.length;
-                    totalClasses += result.classes.length;
-                    totalState += result.stateObjects.length;
-                    totalLines += result.totalLines;
-                    byFile.push({
-                        file,
-                        language: result.language,
-                        lines: result.totalLines,
-                        functions,
-                        classes: result.classes,
-                        state: result.stateObjects
-                    });
-                } catch (e) {
-                    // Skip unparseable files
-                }
-            }
+    // Build a temporary index over the matched files and route through execute().
+    // This gives glob mode the same semantics as project mode: test exclusions,
+    // limit, all flags — no bespoke logic, no parity drift.
+    const rootDir = findProjectRoot(path.dirname(files[0]));
+    const index = new ProjectIndex(rootDir);
+    index.build(files, { quiet: true });
 
-            // Convert glob toc to shared formatter format
-            const toc = {
-                totals: { files: files.length, lines: totalLines, functions: totalFunctions, classes: totalClasses, state: totalState },
-                files: byFile.map(f => ({
-                    file: f.file,
-                    lines: f.lines,
-                    functions: f.functions.length,
-                    classes: f.classes.length,
-                    state: f.stateObjects ? f.stateObjects.length : (f.state ? f.state.length : 0)
-                })),
-                meta: {}
-            };
-            if (flags.json) {
-                console.log(output.formatTocJson(toc));
-            } else {
-                console.log(output.formatToc(toc, {
-                    detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol'
-                }));
-            }
-            break;
-        }
+    // Supported commands — anything that works with an index
+    const supportedGlobCommands = new Set(['toc', 'find', 'search', 'fn', 'class', 'usages', 'deadcode', 'typedef', 'stats']);
+    if (!supportedGlobCommands.has(canonical)) {
+        console.error(`Command "${command}" not supported in glob mode. Supported: ${[...supportedGlobCommands].join(', ')}`);
+        process.exit(1);
+    }
 
-        case 'find':
-            if (!arg) {
-                console.error('Usage: ucn "pattern" find <name>');
-                process.exit(1);
-            }
-            findInGlobFiles(files, arg);
-            break;
-
-        case 'search':
-            if (!arg) {
-                console.error('Usage: ucn "pattern" search <term>');
-                process.exit(1);
-            }
-            searchGlobFiles(files, arg);
-            break;
-
-        default:
-            console.error(`Command "${command}" not supported in glob mode`);
+    // Build params — same as project mode
+    const params = {};
+    if (['find', 'usages', 'fn', 'class', 'typedef'].includes(canonical)) {
+        if (!arg) {
+            console.error(`Usage: ucn "pattern" ${command} <name>`);
             process.exit(1);
-    }
-}
-
-function findInGlobFiles(files, name) {
-    const allMatches = [];
-    const lowerName = name.toLowerCase();
-
-    for (const file of files) {
-        try {
-            const result = parseFile(file);
-
-            for (const fn of result.functions) {
-                if (flags.exact ? fn.name === name : fn.name.toLowerCase().includes(lowerName)) {
-                    allMatches.push({ ...fn, type: 'function', relativePath: file });
-                }
-            }
-
-            for (const cls of result.classes) {
-                if (flags.exact ? cls.name === name : cls.name.toLowerCase().includes(lowerName)) {
-                    allMatches.push({ ...cls, relativePath: file });
-                }
-            }
-        } catch (e) {
-            // Skip
         }
+        params.name = arg;
     }
-
-    if (flags.json) {
-        console.log(output.formatSymbolJson(allMatches, name));
-    } else {
-        console.log(output.formatFindDetailed(allMatches, name, { depth: flags.depth, top: flags.top, all: flags.all }));
-    }
-}
-
-function searchGlobFiles(files, term) {
-    const results = [];
-    const useRegex = flags.regex !== false; // Default: regex ON
-    let regex;
-    if (useRegex) {
-        try { regex = new RegExp(term, flags.caseSensitive ? '' : 'i'); } catch (e) { regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i'); }
-    } else {
-        regex = new RegExp(escapeRegExp(term), flags.caseSensitive ? '' : 'i');
-    }
-
-    for (const file of files) {
-        try {
-            const content = fs.readFileSync(file, 'utf-8');
-            const lines = content.split('\n');
-            const matches = [];
-
-            lines.forEach((line, idx) => {
-                if (regex.test(line)) {
-                    if (flags.codeOnly && isCommentOrString(line)) {
-                        return;
-                    }
-
-                    const match = { line: idx + 1, content: line };
-
-                    if (flags.context > 0) {
-                        const before = [];
-                        const after = [];
-                        for (let i = 1; i <= flags.context; i++) {
-                            if (idx - i >= 0) before.unshift(lines[idx - i]);
-                            if (idx + i < lines.length) after.push(lines[idx + i]);
-                        }
-                        match.before = before;
-                        match.after = after;
-                    }
-
-                    matches.push(match);
-                }
-            });
-
-            if (matches.length > 0) {
-                results.push({ file, matches });
-            }
-        } catch (e) {
-            // Skip
+    if (canonical === 'search') {
+        if (!arg && !flags.type) {
+            console.error('Usage: ucn "pattern" search <term>');
+            process.exit(1);
         }
+        params.term = arg;
     }
+    Object.assign(params, flags);
 
-    if (flags.json) {
-        console.log(output.formatSearchJson(results, term));
-    } else {
-        console.log(output.formatSearch(results, term));
+    const { ok, result, error, note, structural } = execute(index, canonical, params);
+    if (!ok) fail(error);
+    if (note) console.error(note);
+
+    // Format output — same formatters as project mode
+    switch (canonical) {
+        case 'toc':
+            printOutput(result, output.formatTocJson, r => output.formatToc(r, {
+                detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol'
+            }));
+            break;
+        case 'find':
+            printOutput(result,
+                r => output.formatSymbolJson(r, arg),
+                r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all })
+            );
+            break;
+        case 'search':
+            if (structural) {
+                printOutput(result, output.formatStructuralSearchJson, output.formatStructuralSearch);
+            } else {
+                printOutput(result,
+                    r => output.formatSearchJson(r, arg),
+                    r => output.formatSearch(r, arg)
+                );
+            }
+            break;
+        case 'fn':
+            printOutput(result, output.formatFnResultJson, output.formatFnResult);
+            break;
+        case 'class':
+            printOutput(result, output.formatClassResultJson, output.formatClassResult);
+            break;
+        case 'usages':
+            printOutput(result, r => output.formatUsagesJson(r, arg), r => output.formatUsages(r, arg));
+            break;
+        case 'deadcode':
+            printOutput(result, output.formatDeadcodeJson, r => output.formatDeadcode(r, { top: flags.top }));
+            break;
+        case 'typedef':
+            printOutput(result, r => output.formatTypedefJson(r, arg), r => output.formatTypedef(r, arg));
+            break;
+        case 'stats':
+            printOutput(result, output.formatStatsJson, r => output.formatStats(r, { top: flags.top }));
+            break;
     }
 }
 
@@ -1069,13 +989,6 @@ function searchGlobFiles(files, term) {
 // HELPERS
 // ============================================================================
 
-function isCommentOrString(line) {
-    const trimmed = line.trim();
-    return trimmed.startsWith('//') ||
-        trimmed.startsWith('#') ||
-        trimmed.startsWith('*') ||
-        trimmed.startsWith('/*');
-}
 
 function printUsage() {
     console.log(`UCN - Universal Code Navigator

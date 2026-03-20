@@ -865,6 +865,64 @@ function tests(index, nameOrFile, options = {}) {
             }
 
             const lines = content.split('\n');
+
+            // Build a map of variable names → line ranges where they're bound to the target class.
+            // Tracks reassignment: a variable is only an instance of the target class between
+            // its assignment to that class and any subsequent reassignment to something else.
+            // Pre-compiles receiver regexes for O(1) per-line checks.
+            const instanceVarReceiverRegexes = []; // [{regex, fromLine, toLine}]
+            if (options.className) {
+                const cn = escapeRegExp(options.className);
+                const bindingPattern = new RegExp(
+                    '(?:const|let|var|)\\s+(\\w+)\\s*=\\s*(?:new\\s+' + cn + '|' + cn + '\\.\\w+)\\s*\\(', 'g'
+                );
+                // Also detect reassignment to a DIFFERENT class/value
+                const reassignPattern = /(\w+)\s*=\s*(?:new\s+\w|[^=])/g;
+
+                // First pass: find all bindings to the target class
+                const bindings = []; // [{varName, line}]
+                for (let i = 0; i < lines.length; i++) {
+                    let m;
+                    bindingPattern.lastIndex = 0;
+                    while ((m = bindingPattern.exec(lines[i])) !== null) {
+                        bindings.push({ varName: m[1], line: i });
+                    }
+                }
+
+                // Second pass: for each binding, find where the var is reassigned (scope end)
+                const escapedTerm = escapeRegExp(searchTerm);
+                for (const b of bindings) {
+                    let toLine = lines.length; // default: valid until end of file
+                    for (let i = b.line + 1; i < lines.length; i++) {
+                        // Check if this variable is reassigned to something else
+                        const line = lines[i];
+                        if (new RegExp('\\b' + escapeRegExp(b.varName) + '\\s*=\\s*(?!\\s*=)').test(line)
+                            && !bindingPattern.test(line)) {
+                            toLine = i;
+                            break;
+                        }
+                    }
+                    instanceVarReceiverRegexes.push({
+                        regex: new RegExp('\\b' + escapeRegExp(b.varName) + '\\.' + escapedTerm + '\\s*\\('),
+                        nameRegex: new RegExp('\\b' + escapeRegExp(b.varName) + '\\b'),
+                        fromLine: b.line,
+                        toLine,
+                    });
+                }
+            }
+
+            // Check if a line's receiver is the target class (direct or via bound variable).
+            function lineHasClassReceiver(line, lineIdx) {
+                if (classNameFilter.test(line)) return true;
+                // Check pre-compiled instance variable regexes (scoped to assignment range)
+                for (const entry of instanceVarReceiverRegexes) {
+                    if (lineIdx >= entry.fromLine && lineIdx < entry.toLine) {
+                        if (entry.regex.test(line) || entry.nameRegex.test(line)) return true;
+                    }
+                }
+                return false;
+            }
+
             const matches = [];
 
             lines.forEach((line, idx) => {
@@ -885,23 +943,23 @@ function tests(index, nameOrFile, options = {}) {
                     }
 
                     // Match-level className scoping: for call matches,
-                    // the class name must appear on the SAME line as receiver
-                    // (e.g., "new ClassName().method()" or "className.method()").
+                    // the class name or a bound instance variable must appear
+                    // on the same line as the method call.
                     if (classReceiverPattern && matchType === 'call') {
-                        if (!classNameFilter.test(line)) return; // skip — different receiver
+                        if (!lineHasClassReceiver(line, idx)) return; // skip — different receiver
                     }
 
                     // For reference matches, check same line or ±1 line.
                     if (classReceiverPattern && matchType === 'reference') {
-                        let classNearby = classNameFilter.test(line);
-                        if (!classNearby && idx > 0) classNearby = classNameFilter.test(lines[idx - 1]);
-                        if (!classNearby && idx + 1 < lines.length) classNearby = classNameFilter.test(lines[idx + 1]);
+                        let classNearby = lineHasClassReceiver(line, idx);
+                        if (!classNearby && idx > 0) classNearby = lineHasClassReceiver(lines[idx - 1], idx - 1);
+                        if (!classNearby && idx + 1 < lines.length) classNearby = lineHasClassReceiver(lines[idx + 1], idx + 1);
                         if (!classNearby) return; // skip this match
                     }
 
                     // For test-case matches with className, keep if the test
-                    // description mentions the class or the test body (next few
-                    // lines) references the class as a receiver.
+                    // description mentions the class or the test body
+                    // references the class (directly or via bound instance).
                     if (classNameFilter && matchType === 'test-case') {
                         let classInContext = classNameFilter.test(line);
                         if (!classInContext) {
@@ -911,7 +969,7 @@ function tests(index, nameOrFile, options = {}) {
                                     const bodyLine = lines[idx + d];
                                     // Stop at next test-case boundary
                                     if (/\b(describe|it|test|spec)\s*\(/.test(bodyLine)) break;
-                                    if (classNameFilter.test(bodyLine)) classInContext = true;
+                                    if (lineHasClassReceiver(bodyLine, idx + d)) classInContext = true;
                                 }
                             }
                         }

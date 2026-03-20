@@ -80,7 +80,7 @@ describe('ProjectIndex', () => {
     });
 
     it('gets usages grouped by type', () => {
-        const usages = index.usages('parseFile');
+        const usages = index.usages('execute');
         const defs = usages.filter(u => u.isDefinition);
         const calls = usages.filter(u => u.usageType === 'call');
 

@@ -158,28 +158,35 @@ class ProjectIndex {
         const startTime = Date.now();
         const quiet = options.quiet !== false;
 
-        if (!pattern) {
-            pattern = detectProjectPattern(this.root);
+        // Accept pre-expanded file array (glob mode) or a pattern string
+        let files;
+        if (Array.isArray(pattern)) {
+            files = pattern;
+        } else {
+            if (!pattern) {
+                pattern = detectProjectPattern(this.root);
+            }
+
+            const globOpts = {
+                root: this.root,
+                maxFiles: options.maxFiles || this.config.maxFiles || 50000,
+                followSymlinks: options.followSymlinks
+            };
+
+            // Merge .gitignore and .ucn.json exclude into file discovery
+            const gitignorePatterns = parseGitignore(this.root);
+            const configExclude = this.config.exclude || [];
+            if (gitignorePatterns.length > 0 || configExclude.length > 0) {
+                globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
+            }
+
+            files = expandGlob(pattern, globOpts);
         }
-
-        const globOpts = {
-            root: this.root,
-            maxFiles: options.maxFiles || this.config.maxFiles || 50000,
-            followSymlinks: options.followSymlinks
-        };
-
-        // Merge .gitignore and .ucn.json exclude into file discovery
-        const gitignorePatterns = parseGitignore(this.root);
-        const configExclude = this.config.exclude || [];
-        if (gitignorePatterns.length > 0 || configExclude.length > 0) {
-            globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
-        }
-
-        const files = expandGlob(pattern, globOpts);
 
         // Track if files were truncated by maxFiles limit
-        if (files.length >= globOpts.maxFiles) {
-            this.truncated = { indexed: files.length, maxFiles: globOpts.maxFiles };
+        const maxFiles = options.maxFiles || this.config.maxFiles || 50000;
+        if (!Array.isArray(pattern) && files.length >= maxFiles) {
+            this.truncated = { indexed: files.length, maxFiles };
         } else {
             this.truncated = null;
         }
