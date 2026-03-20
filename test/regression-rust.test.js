@@ -170,9 +170,9 @@ impl Settings {
             index.build(null, { quiet: true });
 
             // Test mod declaration resolution: main.rs imports display/ and config.rs
-            const mainImporters = index.importGraph.get(path.join(srcDir, 'main.rs')) || [];
-            assert.ok(mainImporters.length >= 2,
-                `main.rs should import at least 2 files (display + config), got ${mainImporters.length}`);
+            const mainImporters = index.importGraph.get(path.join(srcDir, 'main.rs')) || new Set();
+            assert.ok(mainImporters.size >= 2,
+                `main.rs should import at least 2 files (display + config), got ${mainImporters.size}`);
 
             // Test exporters: display/mod.rs should be imported by main.rs
             const displayExporters = index.exporters('src/display/mod.rs');
@@ -182,9 +182,11 @@ impl Settings {
                 `main.rs should import display/mod.rs`);
 
             // Test crate:: resolution: display/mod.rs imports config.rs via crate::config
-            const displayImports = index.importGraph.get(path.join(displayDir, 'mod.rs')) || [];
-            assert.ok(displayImports.some(i => i.includes('config.rs')),
-                `display/mod.rs should import config.rs via crate::config, got ${displayImports.map(i => path.basename(i))}`);
+            const displayImports = index.importGraph.get(path.join(displayDir, 'mod.rs')) || new Set();
+            let hasConfig = false;
+            for (const i of displayImports) { if (i.includes('config.rs')) { hasConfig = true; break; } }
+            assert.ok(hasConfig,
+                `display/mod.rs should import config.rs via crate::config, got ${[...displayImports].map(i => path.basename(i))}`);
 
             // Test exporters for config.rs: should be imported by both main.rs and display/mod.rs
             const configExporters = index.exporters('src/config.rs');
@@ -234,9 +236,11 @@ impl Rgb {
             index.build(null, { quiet: true });
 
             // main.rs should resolve crate::display::color::Rgb to display/color.rs
-            const mainImports = index.importGraph.get(path.join(srcDir, 'main.rs')) || [];
-            assert.ok(mainImports.some(i => i.includes('color.rs')),
-                `main.rs should import display/color.rs via crate::display::color::Rgb, got ${mainImports.map(i => path.basename(i))}`);
+            const mainImports = index.importGraph.get(path.join(srcDir, 'main.rs')) || new Set();
+            let hasColor = false;
+            for (const i of mainImports) { if (i.includes('color.rs')) { hasColor = true; break; } }
+            assert.ok(hasColor,
+                `main.rs should import display/color.rs via crate::display::color::Rgb, got ${[...mainImports].map(i => path.basename(i))}`);
 
             // color.rs exporters should include main.rs
             const colorExporters = index.exporters('src/display/color.rs');

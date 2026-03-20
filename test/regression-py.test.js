@@ -129,15 +129,17 @@ def helper():
 
             // models.py should be found as an exporter (imported by __init__.py)
             const modelsPath = path.join(pkgDir, 'models.py');
-            const exporters = index.exportGraph.get(modelsPath) || [];
-            assert.ok(exporters.length > 0,
-                `models.py should have importers, got ${exporters.length}`);
+            const exporters = index.exportGraph.get(modelsPath) || new Set();
+            assert.ok(exporters.size > 0,
+                `models.py should have importers, got ${exporters.size}`);
 
             // __init__.py should import models.py
             const initPath = path.join(pkgDir, '__init__.py');
-            const imports = index.importGraph.get(initPath) || [];
-            assert.ok(imports.some(i => i.includes('models')),
-                `__init__.py should import models.py, got: ${imports.map(i => path.basename(i))}`);
+            const imports = index.importGraph.get(initPath) || new Set();
+            let hasModels = false;
+            for (const i of imports) { if (i.includes('models')) { hasModels = true; break; } }
+            assert.ok(hasModels,
+                `__init__.py should import models.py, got: ${[...imports].map(i => path.basename(i))}`);
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
@@ -305,11 +307,16 @@ compute()
             index.build(null, { quiet: true });
 
             // imports for main.py should resolve tools.analyzer
-            const mainImports = index.importGraph.get(path.join(tmpDir, 'main.py')) || [];
-            assert.ok(mainImports.some(i => i.includes('analyzer.py')),
-                `main.py should import tools/analyzer.py, got ${mainImports.map(i => path.relative(tmpDir, i))}`);
-            assert.ok(mainImports.some(i => i.includes('helper.py')),
-                `main.py should import tools/helper.py, got ${mainImports.map(i => path.relative(tmpDir, i))}`);
+            const mainImports = index.importGraph.get(path.join(tmpDir, 'main.py')) || new Set();
+            let hasAnalyzer = false, hasHelper = false;
+            for (const i of mainImports) {
+                if (i.includes('analyzer.py')) hasAnalyzer = true;
+                if (i.includes('helper.py')) hasHelper = true;
+            }
+            assert.ok(hasAnalyzer,
+                `main.py should import tools/analyzer.py, got ${[...mainImports].map(i => path.relative(tmpDir, i))}`);
+            assert.ok(hasHelper,
+                `main.py should import tools/helper.py, got ${[...mainImports].map(i => path.relative(tmpDir, i))}`);
 
             // exporters for analyzer.py should include main.py
             const exporters = index.exporters('tools/analyzer.py');
@@ -367,10 +374,11 @@ def cmd_list():
                 `pkg/db.py should have exactly 1 exporter entry for app.py, got ${appEntries.length}`);
 
             // importGraph should also be deduplicated
-            const appImports = index.importGraph.get(path.join(tmpDir, 'app.py')) || [];
-            const dbImports = appImports.filter(i => i.includes('db.py'));
-            assert.strictEqual(dbImports.length, 1,
-                `app.py importGraph should have db.py once, got ${dbImports.length}`);
+            const appImports = index.importGraph.get(path.join(tmpDir, 'app.py')) || new Set();
+            let dbImportCount = 0;
+            for (const i of appImports) { if (i.includes('db.py')) dbImportCount++; }
+            assert.strictEqual(dbImportCount, 1,
+                `app.py importGraph should have db.py once, got ${dbImportCount}`);
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }

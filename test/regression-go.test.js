@@ -4035,10 +4035,11 @@ describe('fix: go.mod replace directives resolve local imports', () => {
         try {
             const index = idx(dir);
             const mainFile = path.join(dir, 'main.go');
-            const imports = index.importGraph.get(mainFile) || [];
+            const imports = index.importGraph.get(mainFile) || new Set();
             // The replace directive should resolve example.com/lib/util to libs/mylib/util/
-            assert.ok(imports.length > 0, 'Import graph should resolve the replaced import');
-            const utilFile = imports.find(f => f.includes('libs/mylib/util'));
+            assert.ok(imports.size > 0, 'Import graph should resolve the replaced import');
+            let utilFile;
+            for (const f of imports) { if (f.includes('libs/mylib/util')) { utilFile = f; break; } }
             assert.ok(utilFile, 'Should resolve to libs/mylib/util/helpers.go');
         } finally {
             rm(dir);
@@ -4103,9 +4104,12 @@ describe('fix: go.mod replace directives resolve local imports', () => {
         try {
             const index = idx(dir);
             const mainFile = path.join(dir, 'main.go');
-            const imports = index.importGraph.get(mainFile) || [];
-            const aResolved = imports.find(f => f.includes('libs/a/core'));
-            const bResolved = imports.find(f => f.includes('libs/b/util'));
+            const imports = index.importGraph.get(mainFile) || new Set();
+            let aResolved, bResolved;
+            for (const f of imports) {
+                if (f.includes('libs/a/core')) aResolved = f;
+                if (f.includes('libs/b/util')) bResolved = f;
+            }
             assert.ok(aResolved, 'Should resolve example.com/a/core via replace block');
             assert.ok(bResolved, 'Should resolve example.com/b/util via replace block');
         } finally {

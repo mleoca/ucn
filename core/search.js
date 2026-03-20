@@ -221,11 +221,15 @@ function usages(index, name, options = {}) {
                 let _importedHasDef = null;
                 const importedFileHasDef = () => {
                     if (_importedHasDef !== null) return _importedHasDef;
-                    const importedFiles = index.importGraph.get(filePath) || [];
-                    _importedHasDef = importedFiles.some(imp => {
+                    const importedFiles = index.importGraph.get(filePath);
+                    _importedHasDef = false;
+                    if (importedFiles) for (const imp of importedFiles) {
                         const impEntry = index.files.get(imp);
-                        return impEntry?.symbols?.some(s => s.name === name);
-                    });
+                        if (impEntry?.symbols?.some(s => s.name === name)) {
+                            _importedHasDef = true;
+                            break;
+                        }
+                    }
                     return _importedHasDef;
                 };
 
@@ -1008,7 +1012,7 @@ function _buildSourceFileImporters(index, defs) {
 
     while (queue.length > 0) {
         const current = queue.shift();
-        const directImporters = index.exportGraph?.get(current) || [];
+        const directImporters = index.exportGraph?.get(current) || new Set();
         for (const imp of directImporters) {
             importers.add(imp);
             // Check if this importer re-exports the symbol (barrel pattern).

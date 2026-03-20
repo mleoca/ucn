@@ -638,7 +638,7 @@ class ProjectIndex {
             if (contextFile) {
                 const imports = this.importGraph.get(contextFile);
                 if (imports) {
-                    const imported = entries.find(e => imports.includes(e.file));
+                    const imported = entries.find(e => imports.has(e.file));
                     if (imported) return imported.parents;
                 }
             }
@@ -670,7 +670,7 @@ class ProjectIndex {
         if (contextFile) {
             const imports = this.importGraph.get(contextFile);
             if (imports) {
-                const imported = classSymbols.find(s => imports.includes(s.file));
+                const imported = classSymbols.find(s => imports.has(s.file));
                 if (imported) return imported.file;
             }
         }
@@ -880,7 +880,7 @@ class ProjectIndex {
             for (const candidate of tiedCandidates) {
                 let importerCount = 0;
                 for (const [, importedFiles] of this.importGraph) {
-                    if (importedFiles.includes(candidate.def.file)) {
+                    if (importedFiles.has(candidate.def.file)) {
                         importerCount++;
                     }
                 }
@@ -955,8 +955,7 @@ class ProjectIndex {
             const hasFilters = options.exclude && options.exclude.length > 0;
 
             // Pre-compute which files can reference THIS specific definition
-            const importers = this.exportGraph.get(defFile) || [];
-            const importersSet = new Set(importers);
+            const importersSet = this.exportGraph.get(defFile) || new Set();
             const defEntry = this.files.get(defFile);
             const isDirectoryScope = langTraits(defEntry?.language)?.packageScope === 'directory';
             const defDir = isDirectoryScope ? path.dirname(defFile) : null;
@@ -1019,7 +1018,7 @@ class ProjectIndex {
 
             // Count imports from import graph (files that import from defFile and use this name)
             let imports = 0;
-            for (const importer of importers) {
+            for (const importer of importersSet) {
                 const fe = this.files.get(importer);
                 if (!fe) continue;
                 if (hasFilters && !this.matchesFilters(fe.relativePath, { exclude: options.exclude })) continue;
@@ -1078,7 +1077,7 @@ class ProjectIndex {
 
         while (queue.length > 0) {
             const file = queue.pop();
-            const importersArr = this.exportGraph.get(file) || [];
+            const importersArr = this.exportGraph.get(file) || new Set();
             for (const importer of importersArr) {
                 if (!relevantFiles.has(importer)) {
                     relevantFiles.add(importer);

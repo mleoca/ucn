@@ -119,9 +119,9 @@ function exporters(index, filePath) {
 
     const targetPath = resolved;
 
-    const importers = index.exportGraph.get(targetPath) || [];
+    const importers = index.exportGraph.get(targetPath) || new Set();
 
-    return importers.map(importerPath => {
+    return [...importers].map(importerPath => {
         const fileEntry = index.files.get(importerPath);
 
         // Find the import line
@@ -470,13 +470,10 @@ function graph(index, filePath, options = {}) {
             if (depth >= maxDepth) return;
 
             const neighbors = dir === 'imports'
-                ? (index.importGraph.get(file) || [])
-                : (index.exportGraph.get(file) || []);
+                ? (index.importGraph.get(file) || new Set())
+                : (index.exportGraph.get(file) || new Set());
 
-            // Deduplicate neighbors (same file may be imported multiple times, e.g. Java inner classes)
-            const uniqueNeighbors = [...new Set(neighbors)];
-
-            for (const neighbor of uniqueNeighbors) {
+            for (const neighbor of neighbors) {
                 edges.push({ from: file, to: neighbor });
                 traverse(neighbor, depth + 1);
             }
@@ -543,7 +540,7 @@ function circularDeps(index, options = {}) {
             color.set(file, GRAY);
             stack.push(file);
 
-            const neighbors = [...new Set(index.importGraph.get(file) || [])];
+            const neighbors = index.importGraph.get(file) || new Set();
 
             for (const neighbor of neighbors) {
                 if (neighbor === file) continue;  // Skip self-imports (not a cycle)
@@ -594,7 +591,7 @@ function circularDeps(index, options = {}) {
         // Count files that participate in import graph (have edges)
         let filesWithImports = 0;
         for (const [, targets] of index.importGraph) {
-            if (targets && targets.length > 0) filesWithImports++;
+            if (targets && targets.size > 0) filesWithImports++;
         }
 
         return {

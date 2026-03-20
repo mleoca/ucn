@@ -103,7 +103,7 @@ function buildImportGraph(index) {
     }
 
     for (const [filePath, fileEntry] of index.files) {
-        const importedFiles = [];
+        const importedFiles = new Set();
         const seenModules = new Set();
 
         for (const importModule of fileEntry.imports) {
@@ -144,11 +144,11 @@ function buildImportGraph(index) {
                 }
 
                 for (const linkedFile of filesToLink) {
-                    importedFiles.push(linkedFile);
+                    importedFiles.add(linkedFile);
                     if (!index.exportGraph.has(linkedFile)) {
-                        index.exportGraph.set(linkedFile, []);
+                        index.exportGraph.set(linkedFile, new Set());
                     }
-                    index.exportGraph.get(linkedFile).push(filePath);
+                    index.exportGraph.get(linkedFile).add(filePath);
                 }
             }
         }

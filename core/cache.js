@@ -68,12 +68,12 @@ function saveCache(index, cachePath) {
         strippedFiles.push([rp, rest]);
     }
 
-    // Convert graph paths from absolute to relative
+    // Convert graph paths from absolute to relative (Sets serialized as arrays)
     const relGraph = (graph) => {
         const result = [];
         for (const [absKey, absValues] of graph) {
             const relKey = path.relative(root, absKey);
-            const relValues = absValues.map(v => path.relative(root, v));
+            const relValues = [...absValues].map(v => path.relative(root, v));
             result.push([relKey, relValues]);
         }
         return result;
@@ -222,11 +222,11 @@ function loadCache(index, cachePath) {
             }
         }
 
-        // Reconstruct graphs: relative paths → absolute paths
+        // Reconstruct graphs: relative paths → absolute paths (as Sets)
         const absGraph = (data) => {
             const m = new Map();
             for (const [relKey, relValues] of data) {
-                m.set(path.join(root, relKey), relValues.map(v => path.join(root, v)));
+                m.set(path.join(root, relKey), new Set(relValues.map(v => path.join(root, v))));
             }
             return m;
         };

@@ -13,6 +13,14 @@ const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES } = require('./shared');
 const { scoreEdge } = require('./confidence');
 
+/** Set.some() helper — like Array.some() but for Sets */
+function setSome(set, predicate) {
+    for (const item of set) {
+        if (predicate(item)) return true;
+    }
+    return false;
+}
+
 /**
  * Extract a single line from content without splitting the entire string.
  * @param {string} content - Full file content
@@ -392,14 +400,14 @@ function findCallers(index, name, options = {}) {
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
                     if (targetFiles.size > 0 && !targetFiles.has(filePath)) {
-                        const imports = index.importGraph.get(filePath) || [];
-                        const importsTarget = imports.some(imp => targetFiles.has(imp));
+                        const imports = index.importGraph.get(filePath);
+                        const importsTarget = imports && setSome(imports, imp => targetFiles.has(imp));
                         if (!importsTarget) {
                             // Check one level of re-exports (barrel files)
                             let foundViaReexport = false;
-                            for (const imp of imports) {
-                                const transImports = index.importGraph.get(imp) || [];
-                                if (transImports.some(ti => targetFiles.has(ti))) {
+                            if (imports) for (const imp of imports) {
+                                const transImports = index.importGraph.get(imp);
+                                if (transImports && setSome(transImports, ti => targetFiles.has(ti))) {
                                     foundViaReexport = true;
                                     break;
                                 }
@@ -457,10 +465,10 @@ function findCallers(index, name, options = {}) {
                             continue;
                         }
                         // Multi-segment import — verify via import graph
-                        const callerImportedFiles = index.importGraph.get(filePath) || [];
+                        const callerImportedFiles = index.importGraph.get(filePath);
                         const targetFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
                         if (!targetFiles.has(filePath)) {
-                            const hasImportEdge = callerImportedFiles.some(imp => targetFiles.has(imp));
+                            const hasImportEdge = callerImportedFiles && setSome(callerImportedFiles, imp => targetFiles.has(imp));
                             if (!hasImportEdge) {
                                 // No import edge — allow same-package (same directory) calls
                                 const callerDir = path.dirname(filePath);
@@ -585,13 +593,13 @@ function findCallers(index, name, options = {}) {
                 // Check import graph evidence: does this file import from the target definition's file?
                 const targetDefs2 = options.targetDefinitions || definitions;
                 const targetFiles2 = new Set(targetDefs2.map(d => d.file).filter(Boolean));
-                const callerImports = index.importGraph.get(filePath) || [];
-                let hasImportLink = targetFiles2.has(filePath) || callerImports.some(imp => targetFiles2.has(imp));
+                const callerImports = index.importGraph.get(filePath);
+                let hasImportLink = targetFiles2.has(filePath) || (callerImports && setSome(callerImports, imp => targetFiles2.has(imp)));
                 // Check one level of re-exports (barrel files) for import evidence
-                if (!hasImportLink) {
+                if (!hasImportLink && callerImports) {
                     for (const imp of callerImports) {
-                        const transImports = index.importGraph.get(imp) || [];
-                        if (transImports.some(ti => targetFiles2.has(ti))) {
+                        const transImports = index.importGraph.get(imp);
+                        if (transImports && setSome(transImports, ti => targetFiles2.has(ti))) {
                             hasImportLink = true;
                             break;
                         }
@@ -1177,7 +1185,7 @@ function findCallees(index, def, options = {}) {
         const defFileEntry = fileEntry;
         const callerIsTest = defFileEntry && isTestFile(defFileEntry.relativePath, defFileEntry.language);
         // Pre-compute import graph for callee confidence scoring
-        const callerImportSet = new Set(index.importGraph.get(def.file) || []);
+        const callerImportSet = index.importGraph.get(def.file) || new Set();
 
         for (const { name: calleeName, bindingId, count, isConstructor } of callees.values()) {
             const symbols = index.symbols.get(calleeName);
