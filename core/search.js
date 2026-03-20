@@ -936,43 +936,61 @@ function tests(index, nameOrFile, options = {}) {
 }
 
 /**
- * Build a map of instance variable names → class names from call objects.
+ * Build a map of instance variable names → class names from call objects and AST usages.
  * Language-generic: uses receiverType from getCachedCalls() (already inferred
- * by _buildTypedLocalTypeMap for Go/Java/Rust and binding analysis for JS/TS/Python).
+ * by _buildTypedLocalTypeMap for Go/Java/Rust and binding analysis for JS/TS/Python),
+ * plus AST usages of targetClassName for assignment patterns not captured by calls
+ * (e.g., Rust `let svc = B;` inside macro bodies).
  *
- * Two sources:
+ * Three sources:
  * 1. receiverType on method calls: `svc.Save()` with receiverType=B → svc maps to B
  * 2. Constructor calls: `new B()`, `B()`, `&B{}` assigned to a variable
+ * 3. AST usages of className on assignment lines: `let svc = B;` or `svc = B{}`
  */
 function _buildInstanceTypeMap(index, filePath, content, targetClassName) {
     const typeMap = new Map(); // varName → className
 
     const calls = getCachedCalls(index, filePath);
-    if (!calls) return typeMap;
+    if (calls) {
+        for (const call of calls) {
+            // Source 1: receiverType from method calls (works across all languages)
+            // e.g., svc.Save() where receiverType='B' → svc maps to 'B'
+            if (call.isMethod && call.receiver && call.receiverType === targetClassName) {
+                typeMap.set(call.receiver, targetClassName);
+            }
 
-    for (const call of calls) {
-        // Source 1: receiverType from method calls (works across all languages)
-        // e.g., svc.Save() where receiverType='B' → svc maps to 'B'
-        if (call.isMethod && call.receiver && call.receiverType === targetClassName) {
-            typeMap.set(call.receiver, targetClassName);
-        }
+            // Source 2: Constructor/factory calls assigned to a variable
+            // e.g., `const svc = new B()` (JS), `svc = B()` (Python), `svc := &B{}` (Go)
+            if (call.name === targetClassName && !call.isMethod) {
+                const lineContent = index.getLineContent(filePath, call.line);
+                const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
+                if (assignMatch) {
+                    typeMap.set(assignMatch[1], targetClassName);
+                }
+            }
 
-        // Source 2: Constructor/factory calls assigned to a variable
-        // e.g., `const svc = new B()` (JS), `svc = B()` (Python), `svc := &B{}` (Go)
-        if (call.name === targetClassName && !call.isMethod) {
-            const lineContent = index.getLineContent(filePath, call.line);
-            // Language-generic assignment detection: look for `varName =` or `varName :=`
-            const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
-            if (assignMatch) {
-                typeMap.set(assignMatch[1], targetClassName);
+            // Source 3: Factory methods — ClassName.create(), ClassName.build(), etc.
+            if (call.isMethod && call.receiver === targetClassName) {
+                const lineContent = index.getLineContent(filePath, call.line);
+                const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
+                if (assignMatch) {
+                    typeMap.set(assignMatch[1], targetClassName);
+                }
             }
         }
+    }
 
-        // Source 3: Factory methods — ClassName.create(), ClassName.build(), etc.
-        if (call.isMethod && call.receiver === targetClassName) {
-            const lineContent = index.getLineContent(filePath, call.line);
+    // Source 4: AST usages of targetClassName on assignment lines.
+    // Catches patterns not visible to getCachedCalls (e.g., Rust macro bodies
+    // where `let svc = B;` is inside a token_tree, or Go `svc := B{}`).
+    const classUsages = index._getCachedUsages(filePath, targetClassName);
+    if (classUsages) {
+        for (const u of classUsages) {
+            if (u.usageType === 'import' || u.usageType === 'definition') continue;
+            const lineContent = index.getLineContent(filePath, u.line);
+            // Match: `let/const/var varName = ClassName` or `varName := ClassName`
             const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
-            if (assignMatch) {
+            if (assignMatch && assignMatch[1] !== targetClassName) {
                 typeMap.set(assignMatch[1], targetClassName);
             }
         }

@@ -1319,6 +1319,13 @@ function findExportsInCode(code, parser) {
  * @param {object} parser - Tree-sitter parser instance
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
+function _indexInParent(node, parent) {
+    for (let i = 0; i < parent.childCount; i++) {
+        if (parent.child(i) === node) return i;
+    }
+    return -1;
+}
+
 function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
@@ -1431,6 +1438,28 @@ function findUsagesInCode(code, name, parser) {
                 if (value && value.type === 'identifier') {
                     usages.push({ line, column, usageType, receiver: value.text });
                     return true;
+                }
+            }
+            // Macro body: tree-sitter parses macro arguments as flat token_tree
+            // nodes, so `svc.save()` inside `assert_eq!(svc.save(), 1)` appears
+            // as sibling identifiers: [svc] [.] [save] [()] rather than a
+            // field_expression. Detect the `obj.name(` pattern via siblings.
+            else if (parent.type === 'token_tree') {
+                const idx = _indexInParent(node, parent);
+                if (idx >= 2) {
+                    const dot = parent.child(idx - 1);
+                    const obj = parent.child(idx - 2);
+                    const next = parent.child(idx + 1);
+                    if (dot && dot.text === '.' && obj &&
+                        (obj.type === 'identifier' || obj.type === 'self')) {
+                        // Check for call: next sibling is a token_tree starting with '('
+                        if (next && next.type === 'token_tree' &&
+                            next.childCount > 0 && next.child(0).text === '(') {
+                            usageType = 'call';
+                        }
+                        usages.push({ line, column, usageType, receiver: obj.text });
+                        return true;
+                    }
                 }
             }
         }

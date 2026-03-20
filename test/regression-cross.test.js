@@ -3580,6 +3580,45 @@ describe('AST-based tests(): cross-language className scoping', () => {
             rm(dir);
         }
     });
+
+    it('Rust: className scopes to instance calls inside macros', () => {
+        const dir = tmp({
+            'a.rs': [
+                'pub struct A;',
+                'impl A { pub fn save(&self) -> i32 { 1 } }',
+            ].join('\n'),
+            'b.rs': [
+                'pub struct B;',
+                'impl B { pub fn save(&self) -> i32 { 2 } }',
+            ].join('\n'),
+            'test_both.rs': [
+                '#[test]',
+                'fn test_a_save() {',
+                '    let a = A;',
+                '    assert_eq!(a.save(), 1);',
+                '}',
+                '',
+                '#[test]',
+                'fn test_b_save() {',
+                '    let svc = B;',
+                '    assert_eq!(svc.save(), 2);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const bTests = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(bTests.ok);
+            assert.ok(bTests.result.length > 0, 'Should find test file for B');
+            const bMatches = bTests.result.flatMap(r => r.matches);
+            assert.ok(bMatches.some(m => m.matchType === 'call' && m.content.includes('svc.save')),
+                'Should include svc.save() as call (B instance)');
+            assert.ok(!bMatches.some(m => m.matchType === 'call' && m.content.includes('a.save')),
+                'Should not include a.save() call (A instance)');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: CLI fn --class-name passes through to execute', () => {
