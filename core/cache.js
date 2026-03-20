@@ -79,20 +79,11 @@ function saveCache(index, cachePath) {
         return result;
     };
 
-    // Persist calleeIndex if built (paths must be absolute from this.files keys)
-    let calleeIndexData;
-    if (index.calleeIndex && index.calleeIndex.size > 0) {
-        calleeIndexData = [];
-        for (const [name, files] of index.calleeIndex) {
-            const relFiles = [...files].map(f =>
-                path.isAbsolute(f) ? path.relative(root, f) : f
-            );
-            calleeIndexData.push([name, relFiles]);
-        }
-    }
+    // calleeIndex is NOT persisted in index.json — it's rebuilt lazily from callsCache
+    // on first findCallers/buildCalleeIndex call. Removing it saves ~22MB (14%) on large projects.
 
     const cacheData = {
-        version: 7,  // v7: strip symbols/bindings from file entries (dedup ~45% cache reduction)
+        version: 8,  // v8: remove calleeIndex from index.json (rebuilt from callsCache)
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
@@ -108,7 +99,6 @@ function saveCache(index, cachePath) {
         failedFiles: index.failedFiles
             ? Array.from(index.failedFiles).map(f => path.relative(root, f))
             : [],
-        ...(calleeIndexData && { calleeIndex: calleeIndexData })
     };
 
     fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
@@ -180,7 +170,8 @@ function loadCache(index, cachePath) {
 
         // Check version compatibility
         // v7: symbols/bindings stripped from file entries (dedup)
-        if (cacheData.version !== 7) {
+        // v8: calleeIndex removed from index.json (rebuilt from callsCache)
+        if (cacheData.version !== 7 && cacheData.version !== 8) {
             return false;
         }
 

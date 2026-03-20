@@ -258,9 +258,16 @@ function deadcode(index, options = {}) {
         for (const [filePath, fileEntry] of index.files) {
             try {
                 const content = index._readFile(filePath);
-                const lines = content.split('\n');
+                // Fast pre-filter: extract identifiers from file, intersect with target names.
+                // One regex pass over content (O(content)) vs O(names × content) substring searches.
+                const fileIdentifiers = new Set(content.match(/\b[a-zA-Z_]\w*\b/g));
+                const namesInFile = [];
                 for (const name of potentiallyDeadNames) {
-                    if (!content.includes(name)) continue;
+                    if (fileIdentifiers.has(name)) namesInFile.push(name);
+                }
+                if (namesInFile.length === 0) continue;
+                const lines = content.split('\n');
+                for (const name of namesInFile) {
                     const nameLen = name.length;
                     for (let i = 0; i < lines.length; i++) {
                         const line = lines[i];

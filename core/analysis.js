@@ -353,13 +353,24 @@ function related(index, name, options = {}) {
     if (related.similarNames.length > similarLimit) related.similarNames = related.similarNames.slice(0, similarLimit);
 
     // 3. Shared callers - functions called by the same callers
-    const myCallers = new Set(index.findCallers(name).map(c => c.callerName).filter(Boolean));
+    // Cap findCallers to avoid O(hundreds × findCallees) on ambiguous names
+    const maxSharedCallerScan = options.all ? 50 : 20;
+    const myCallersRaw = index.findCallers(name, { maxResults: maxSharedCallerScan * 3 });
+    const myCallers = new Set(myCallersRaw.map(c => c.callerName).filter(Boolean));
     if (myCallers.size > 0) {
         const callerCounts = new Map();
+        const calleeCache = new Map();
+        let scannedCallers = 0;
         for (const callerName of myCallers) {
+            if (scannedCallers >= maxSharedCallerScan) break;
             const callerDef = index.symbols.get(callerName)?.[0];
             if (callerDef) {
-                const callees = index.findCallees(callerDef);
+                let callees = calleeCache.get(callerName);
+                if (!callees) {
+                    callees = index.findCallees(callerDef);
+                    calleeCache.set(callerName, callees);
+                }
+                scannedCallers++;
                 for (const callee of callees) {
                     if (callee.name !== name) {
                         callerCounts.set(callee.name, (callerCounts.get(callee.name) || 0) + 1);
@@ -394,9 +405,14 @@ function related(index, name, options = {}) {
         const myCalleeNames = new Set(myCallees.map(c => c.name));
         if (myCalleeNames.size > 0) {
             const calleeCounts = new Map();
+            // Cap callee scan to avoid O(callees × findCallers) explosion
+            const maxCalleeScan = options.all ? 30 : 15;
+            let scannedCallees = 0;
             for (const calleeName of myCalleeNames) {
+                if (scannedCallees >= maxCalleeScan) break;
+                scannedCallees++;
                 // Find other functions that also call this callee
-                const callers = index.findCallers(calleeName);
+                const callers = index.findCallers(calleeName, { maxResults: 50 });
                 for (const caller of callers) {
                     if (caller.callerName && caller.callerName !== name) {
                         calleeCounts.set(caller.callerName, (calleeCounts.get(caller.callerName) || 0) + 1);

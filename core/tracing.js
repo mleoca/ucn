@@ -435,13 +435,22 @@ function reverseTrace(index, name, options = {}) {
                 if (callerEntries.length > maxChildren) {
                     node.truncatedChildren = callerEntries.length - maxChildren;
                     // Count entry points in truncated branches so summary is accurate
+                    // Use callerCache to avoid redundant findCallers calls
                     for (const { def: cDef } of callerEntries.slice(maxChildren)) {
-                        const key = `${cDef.file}:${cDef.startLine}`;
-                        if (!visited.has(key)) {
-                            const cCallers = index.findCallers(cDef.name, {
-                                includeMethods, includeUncertain,
-                                targetDefinitions: cDef.bindingId ? [cDef] : undefined,
-                            });
+                        const cKey = `${cDef.file}:${cDef.startLine}`;
+                        if (!visited.has(cKey)) {
+                            const cCacheKey = cDef.bindingId
+                                ? `${cDef.name}:${cDef.bindingId}`
+                                : `${cDef.name}:${cKey}`;
+                            let cCallers = callerCache.get(cCacheKey);
+                            if (!cCallers) {
+                                cCallers = index.findCallers(cDef.name, {
+                                    includeMethods, includeUncertain,
+                                    targetDefinitions: cDef.bindingId ? [cDef] : undefined,
+                                    maxResults: 1, // Only need to know if any exist
+                                });
+                                callerCache.set(cCacheKey, cCallers);
+                            }
                             if (cCallers.length === 0) {
                                 entryPoints.push({ name: cDef.name, file: cDef.relativePath || path.relative(index.root, cDef.file), line: cDef.startLine });
                             }
