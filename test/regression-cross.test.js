@@ -3665,6 +3665,54 @@ describe('AST-based tests(): cross-language className scoping', () => {
             rm(dir);
         }
     });
+
+    it('bare references (fn = save, assert save) are not false positives with className', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': 'class B { save() {} }\nfunction save() {}\nmodule.exports = { B, save };',
+            'test/app.test.js': [
+                'const { B, save } = require("../app");',
+                'it("save reference", () => {',
+                '  const svc = new B();',
+                '  const fn = save;',
+                '  expect(fn).toBe(save);',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(result.ok);
+            // No B.save() call — only bare `save` references and `new B()` constructor
+            assert.strictEqual(result.result.length, 0,
+                'Bare references to save should not match className=B');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('Python bare references are not false positives with className', () => {
+        const dir = tmp({
+            'app.py': 'class B:\n    def save(self):\n        return 1\ndef save():\n    pass',
+            'test_app.py': [
+                'from app import B, save',
+                '',
+                'def test_save_ref():',
+                '    svc = B()',
+                '    fn = save',
+                '    assert fn is save',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(result.ok);
+            assert.strictEqual(result.result.length, 0,
+                'Bare references to save should not match className=B');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: CLI fn --class-name passes through to execute', () => {

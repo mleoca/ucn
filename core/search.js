@@ -896,9 +896,13 @@ function tests(index, nameOrFile, options = {}) {
                     if (!_receiverMatchesClass(usage, className, instanceTypeMap, lineContent, searchTerm)) continue;
                 }
 
-                // className scoping for references: check receiver
+                // className scoping for references: require class-associated receiver
                 if (className && (matchType === 'reference' || matchType === 'string-ref')) {
-                    if (usage.receiver && usage.receiver !== className &&
+                    // Bare references (no receiver) like `fn = save` have no class
+                    // association — skip them. Only keep member-access references
+                    // where the receiver matches the target class.
+                    if (!usage.receiver) continue;
+                    if (usage.receiver !== className &&
                         !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === className)) {
                         continue;
                     }
@@ -1063,9 +1067,16 @@ function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, 
             const lineContent = index.getLineContent(filePath, call.line);
             // Check if searchTerm appears in the description string on this line
             if (lineContent.includes(searchTerm) && !matchLines.has(call.line)) {
-                // className scoping for test-case: check if the test body references the class
+                // className scoping: only add test-case if the test body has a
+                // class-scoped match (call or class-receiver reference) — not just
+                // any mention of className.
                 if (className) {
-                    if (!_testBodyReferencesClass(index, filePath, fileEntry, call.line, className, instanceTypeMap)) continue;
+                    const endLine = _estimateTestBlockEnd(index, filePath, call.line);
+                    const hasClassScopedMatch = matches.some(m =>
+                        m.line >= call.line && m.line <= endLine &&
+                        m.matchType !== 'import'
+                    );
+                    if (!hasClassScopedMatch) continue;
                 }
                 matches.push({
                     line: call.line,
@@ -1085,14 +1096,19 @@ function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, 
             // Find test symbols
             for (const symbol of fileEntry.symbols) {
                 if (!langModule.isEntryPoint(symbol)) continue;
-                // Check if any usage of searchTerm falls within this test function's range
+                // Check if any non-import usage of searchTerm falls within this test function
                 const usageInRange = matches.some(m =>
-                    m.line >= symbol.startLine && m.line <= symbol.endLine
+                    m.line >= symbol.startLine && m.line <= symbol.endLine &&
+                    m.matchType !== 'import'
                 );
                 if (usageInRange && !matchLines.has(symbol.startLine)) {
-                    // className scoping: verify the test references the class
+                    // className scoping: verify the test body has class-scoped matches
                     if (className) {
-                        if (!_testBodyReferencesClass(index, filePath, fileEntry, symbol.startLine, className, instanceTypeMap)) continue;
+                        const hasClassScopedMatch = matches.some(m =>
+                            m.line >= symbol.startLine && m.line <= symbol.endLine &&
+                            m.matchType !== 'import'
+                        );
+                        if (!hasClassScopedMatch) continue;
                     }
                     const lineContent = index.getLineContent(filePath, symbol.startLine);
                     matches.push({
