@@ -904,7 +904,6 @@ function tests(index, nameOrFile, options = {}) {
                     }
                     instanceVarReceiverRegexes.push({
                         regex: new RegExp('\\b' + escapeRegExp(b.varName) + '\\.' + escapedTerm + '\\s*\\('),
-                        nameRegex: new RegExp('\\b' + escapeRegExp(b.varName) + '\\b'),
                         fromLine: b.line,
                         toLine,
                     });
@@ -914,10 +913,11 @@ function tests(index, nameOrFile, options = {}) {
             // Check if a line's receiver is the target class (direct or via bound variable).
             function lineHasClassReceiver(line, lineIdx) {
                 if (classNameFilter.test(line)) return true;
-                // Check pre-compiled instance variable regexes (scoped to assignment range)
+                // Check pre-compiled instance variable regexes (scoped to assignment range).
+                // Only matches receiver position: varName.methodName( — not bare varName as argument.
                 for (const entry of instanceVarReceiverRegexes) {
                     if (lineIdx >= entry.fromLine && lineIdx < entry.toLine) {
-                        if (entry.regex.test(line) || entry.nameRegex.test(line)) return true;
+                        if (entry.regex.test(line)) return true;
                     }
                 }
                 return false;
