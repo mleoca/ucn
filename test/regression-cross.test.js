@@ -3815,6 +3815,17 @@ describe('CLI file-mode scoping', () => {
             rm(dir);
         }
     });
+
+    it('file mode api shows file-scoped header', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript/utils.js', 'api');
+        assert.ok(out.includes('utils.js'), 'api header should show filename');
+        assert.ok(!out.includes('Project API'), 'api should not show project-wide header');
+    });
+
+    it('file mode does not emit spurious --file warning', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript/utils.js', 'tests', ['helper']);
+        assert.ok(!out.includes('Warning'), 'Should not warn about injected --file');
+    });
 });
 
 describe('CLI glob-mode parity', () => {
@@ -3898,11 +3909,21 @@ describe('CLI glob-mode parity', () => {
             'about --expand should produce more output than plain about');
     });
 
-    it('glob mode context does not advertise expand', () => {
+    it('glob mode context advertises --expand, not two-phase expand', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
         const out = runCli(pattern, 'context', ['helper']);
         assert.ok(!out.includes('ucn_expand'), 'glob context should not mention ucn_expand');
-        assert.ok(!out.includes('expand'), 'glob context should not advertise expand');
+        assert.ok(!out.includes('expand <N>'), 'glob context should not advertise two-phase expand');
+        assert.ok(out.includes('--expand'), 'glob context should advertise --expand flag');
+    });
+
+    it('glob mode context --expand shows inline callee previews', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const plain = runCli(pattern, 'context', ['helper']);
+        const expanded = runCli(pattern, 'context', ['helper'], ['--expand']);
+        assert.ok(expanded.length > plain.length,
+            'context --expand should produce more output (callee previews)');
+        assert.ok(expanded.includes('│'), 'expanded output should contain │ preview lines');
     });
 
     it('glob mode graph --all suppresses truncation', () => {

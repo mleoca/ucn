@@ -227,6 +227,33 @@ function printOutput(result, jsonFn, textFn) {
     }
 }
 
+/**
+ * Print inline 3-line code previews for each callee (--expand support).
+ * Used by context in project, interactive, and glob modes.
+ */
+function printInlineExpand(ctx, root) {
+    if (!root || !ctx || !ctx.callees) return;
+    for (const c of ctx.callees) {
+        if (c.relativePath && c.startLine) {
+            try {
+                const filePath = path.join(root, c.relativePath);
+                const content = fs.readFileSync(filePath, 'utf-8');
+                const codeLines = content.split('\n');
+                const endLine = c.endLine || c.startLine + 5;
+                const previewLines = Math.min(3, endLine - c.startLine + 1);
+                for (let i = 0; i < previewLines && c.startLine - 1 + i < codeLines.length; i++) {
+                    console.log(`      │ ${codeLines[c.startLine - 1 + i]}`);
+                }
+                if (endLine - c.startLine + 1 > 3) {
+                    console.log(`      │ ... (${endLine - c.startLine - 2} more lines)`);
+                }
+            } catch (e) {
+                // Skip on error
+            }
+        }
+    }
+}
+
 // ============================================================================
 // MAIN
 // ============================================================================
@@ -308,6 +335,7 @@ function runFileCommand(filePath, command, arg) {
         if (!flags.file) {
             const relPath = path.relative(projectRoot, path.resolve(filePath));
             flags.file = relPath;
+            flags._fileFromFileMode = true; // suppress inapplicable-flag warning
         }
         runProjectCommand(projectRoot, command, effectiveArg);
         return;
@@ -379,9 +407,11 @@ function runFileCommand(filePath, command, arg) {
         case 'typedef':
             printOutput(result, r => output.formatTypedefJson(r, arg), r => output.formatTypedef(r, arg));
             break;
-        case 'api':
-            printOutput(result, r => output.formatApiJson(r, arg), r => output.formatApi(r, arg));
+        case 'api': {
+            const apiFile = relativePath;
+            printOutput(result, r => output.formatApiJson(r, apiFile), r => output.formatApi(r, apiFile));
             break;
+        }
     }
 }
 
@@ -449,11 +479,13 @@ function runProjectCommand(rootDir, command, arg) {
         // Map from camelCase flag name to CLI flag string
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
         // Flags that are global (not command-specific) or have truthy defaults — skip warning for these
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence', '_fileFromFileMode']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
             // Skip falsy/default values (0, undefined, false, empty array)
             if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            // Skip --file when it was injected by file-mode routing, not user input
+            if (key === 'file' && flags._fileFromFileMode) continue;
             if (!applicableFlags.includes(key)) {
                 console.error(`Warning: ${flagToCli(key)} has no effect on '${toCliName(canonical)}'.`);
             }
@@ -521,26 +553,8 @@ function runProjectCommand(rootDir, command, arg) {
                 console.log(text);
 
                 // Inline expansion of callees when --expand flag is set
-                if (flags.expand && index.root && ctx.callees) {
-                    for (const c of ctx.callees) {
-                        if (c.relativePath && c.startLine) {
-                            try {
-                                const filePath = path.join(index.root, c.relativePath);
-                                const content = fs.readFileSync(filePath, 'utf-8');
-                                const codeLines = content.split('\n');
-                                const endLine = c.endLine || c.startLine + 5;
-                                const previewLines = Math.min(3, endLine - c.startLine + 1);
-                                for (let i = 0; i < previewLines && c.startLine - 1 + i < codeLines.length; i++) {
-                                    console.log(`      │ ${codeLines[c.startLine - 1 + i]}`);
-                                }
-                                if (endLine - c.startLine + 1 > 3) {
-                                    console.log(`      │ ... (${endLine - c.startLine - 2} more lines)`);
-                                }
-                            } catch (e) {
-                                // Skip on error
-                            }
-                        }
-                    }
+                if (flags.expand) {
+                    printInlineExpand(ctx, index.root);
                 }
 
                 // Save expandable items to cache for 'expand' command
@@ -1013,10 +1027,13 @@ function runGlobCommand(pattern, command, arg) {
                 const { text } = output.formatContext(result, {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     uncertainHint: 'use --include-uncertain to include all',
-                    expandHint: '',  // expand not available in glob mode
+                    expandHint: 'Use --expand to see inline callee previews',
                     showConfidence: flags.showConfidence,
                 });
                 console.log(text);
+                if (flags.expand) {
+                    printInlineExpand(result, index.root);
+                }
             }
             break;
         case 'smart':
@@ -1498,6 +1515,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 showConfidence: iflags.showConfidence,
             });
             console.log(text);
+            if (iflags.expand) {
+                printInlineExpand(result, index.root);
+            }
             if (note) console.log(note);
             if (cache) {
                 cache.save(index.root, arg, iflags.file, expandable);
