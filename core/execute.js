@@ -592,11 +592,16 @@ const HANDLERS = {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
+        if (p.file) {
+            const fileErr = checkFilePatternMatch(index, p.file);
+            if (fileErr) return { ok: false, error: fileErr };
+        }
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const result = index.tests(p.name, {
             callsOnly: p.callsOnly || false,
             className: p.className,
+            file: p.file,
         });
         return { ok: true, result };
     },

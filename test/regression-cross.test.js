@@ -3828,6 +3828,68 @@ describe('CLI file-mode scoping', () => {
     });
 });
 
+describe('tests --file scoping', () => {
+    it('tests --file scopes to test files that import from the target source', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A { save() { return 1; } }\nmodule.exports = { A };',
+            'b.js': 'class B { save() { return 2; } }\nmodule.exports = { B };',
+            'test/a.test.js': 'const { A } = require("../a");\nit("A save", () => { new A().save(); });',
+            'test/b.test.js': 'const { B } = require("../b");\nit("B save", () => { new B().save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', file: 'b.js' });
+            assert.ok(result.ok);
+            assert.ok(result.result.some(r => r.file.includes('b.test')),
+                'Should include test file for b.js');
+            assert.ok(!result.result.some(r => r.file.includes('a.test')),
+                'Should not include test file for a.js');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('file-mode CLI routes tests with --file scoping', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A { save() { return 1; } }\nmodule.exports = { A };',
+            'b.js': 'class B { save() { return 2; } }\nmodule.exports = { B };',
+            'test/a.test.js': 'const { A } = require("../a");\nit("A save", () => { new A().save(); });',
+            'test/b.test.js': 'const { B } = require("../b");\nit("B save", () => { new B().save(); });',
+        });
+        try {
+            const out = runCli(dir + '/b.js', 'tests', ['save']);
+            assert.ok(out.includes('b.test'), 'Should include b.test');
+            assert.ok(!out.includes('a.test'), 'Should not include a.test');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('about --file scopes embedded TESTS section', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A { save() { return 1; } }\nmodule.exports = { A };',
+            'b.js': 'class B { save() { return 2; } }\nmodule.exports = { B };',
+            'test/a.test.js': 'const { A } = require("../a");\nit("A save", () => { new A().save(); });',
+            'test/b.test.js': 'const { B } = require("../b");\nit("B save", () => { new B().save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'about', { name: 'save', file: 'b.js' });
+            assert.ok(result.ok);
+            const testFiles = result.result.tests?.files || [];
+            assert.ok(testFiles.some(f => f.includes('b.test')),
+                'about TESTS should include b.test');
+            assert.ok(!testFiles.some(f => f.includes('a.test')),
+                'about TESTS should not include a.test');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('CLI glob-mode parity', () => {
     it('glob mode supports about, context, tests commands', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';

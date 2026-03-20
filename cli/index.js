@@ -546,7 +546,7 @@ function runProjectCommand(rootDir, command, arg) {
             } else {
                 const { text, expandable } = output.formatContext(ctx, {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
-                    expandHint: 'Use "ucn . expand <N>" to see code for item N',
+                    expandHint: 'Use "expand <N>" or --expand to see code for items',
                     uncertainHint: 'use --include-uncertain to include all',
                     showConfidence: flags.showConfidence,
                 });
@@ -758,7 +758,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'tests': {
-            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly, className: flags.className });
+            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly, className: flags.className, file: flags.file });
             if (!ok) fail(error);
             printOutput(result,
                 r => output.formatTestsJson(r, arg),

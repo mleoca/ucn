@@ -836,8 +836,11 @@ function about(index, name, options = {}) {
         }));
     }
 
-    // Find tests
-    const tests = index.tests(symbolName);
+    // Find tests — scope to the same file/class as the primary definition
+    const tests = index.tests(symbolName, {
+        file: options.file,
+        className: options.className || primary.className,
+    });
     const testSummary = {
         fileCount: tests.length,
         totalMatches: tests.reduce((sum, t) => sum + t.matches.length, 0),

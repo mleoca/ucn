@@ -808,7 +808,7 @@ function typedef(index, name, options = {}) {
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} nameOrFile - Function name or file path
- * @param {object} options - { callsOnly, className }
+ * @param {object} options - { callsOnly, className, file }
  * @returns {Array} Test files and matches
  */
 function tests(index, nameOrFile, options = {}) {
@@ -821,6 +821,16 @@ function tests(index, nameOrFile, options = {}) {
         nameOrFile.endsWith('.js') || nameOrFile.endsWith('.ts') ||
         nameOrFile.endsWith('.py') || nameOrFile.endsWith('.go') ||
         nameOrFile.endsWith('.java') || nameOrFile.endsWith('.rs');
+
+    // Resolve --file scoping: find the source file that defines this symbol
+    // and only include test files that import from it.
+    let sourceFileFilter = null;
+    if (options.file && !isFilePath) {
+        const defs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className });
+        if (defs.length > 0) {
+            sourceFileFilter = new Set(defs.map(d => d.relativePath));
+        }
+    }
 
     // Find all test files
     const testFiles = [];
@@ -854,6 +864,29 @@ function tests(index, nameOrFile, options = {}) {
             if (!content.includes(searchTerm)) continue;
             // className scoping: skip test files that don't reference the class at all
             if (className && !content.includes(className)) continue;
+
+            // --file scoping: only include test files that import from the target source file
+            if (sourceFileFilter) {
+                const testImports = entry.imports || [];
+                // Build base names for matching unresolved imports like '../b' against 'b.js'
+                const sourceBaseNames = new Set();
+                for (const sf of sourceFileFilter) {
+                    sourceBaseNames.add(path.basename(sf, path.extname(sf)));
+                }
+                const importsSourceFile = testImports.some(imp => {
+                    const source = typeof imp === 'string' ? imp : (imp.resolved || imp.source || '');
+                    // Check resolved path match
+                    if (sourceFileFilter.has(source)) return true;
+                    // Check base name match (e.g., '../b' → basename 'b' matches 'b.js' → basename 'b')
+                    const importBase = path.basename(source, path.extname(source));
+                    return sourceBaseNames.has(importBase);
+                });
+                // Also check if the test file's name matches a test-file pattern for the source
+                const matchesByName = [...sourceBaseNames].some(base =>
+                    entry.relativePath.includes(base)
+                );
+                if (!importsSourceFile && !matchesByName) continue;
+            }
 
             // AST-based usage detection
             const astUsages = index._getCachedUsages(testPath, searchTerm);
