@@ -4184,6 +4184,33 @@ describe('about/context includeTests flag', () => {
     });
 });
 
+describe('flag validation parity across surfaces', () => {
+    it('interactive mode warns about inapplicable flags', () => {
+        const out = runInteractive(FIXTURES_PATH + '/javascript', ['context helper --include-tests']);
+        assert.ok(out.includes('no effect'), 'interactive context --include-tests should warn');
+    });
+
+    it('MCP strips inapplicable params silently', async () => {
+        const { McpClient } = require('./helpers');
+        const client = new McpClient();
+        await client.start();
+        await client.initialize();
+        try {
+            // tests does not accept 'top' — it should be stripped, not cause an error
+            const res = await client.callTool({
+                command: 'tests',
+                project_dir: FIXTURES_PATH + '/javascript',
+                name: 'helper',
+                top: 1,
+            });
+            assert.ok(!res.isError, 'MCP should not error on inapplicable param');
+            assert.ok(res.text.includes('Tests for'), 'Should produce normal output');
+        } finally {
+            client.stop();
+        }
+    });
+});
+
 describe('tests --file: no basename collision across directories', () => {
     it('Go: same-basename files in different packages are separated', () => {
         const dir = tmp({

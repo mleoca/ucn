@@ -163,7 +163,7 @@ ucn [target] <command> [name] [--flags]
 | `--in=src/core` | Limit search to a subdirectory |
 | `--depth=N` | Control tree depth for `trace`, `graph`, and detail level for `find` (default 3). Also expands all children — no breadth limit |
 | `--all` | Expand truncated sections in `about`, `trace`, `graph`, `related` |
-| `--include-tests` | Include test files in results (excluded by default) |
+| `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
 | `--include-methods` | Include `obj.method()` calls in `context`/`smart` (only direct calls shown by default) |
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |

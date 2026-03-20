@@ -1446,6 +1446,20 @@ function buildInteractiveParams(descriptor, arg, iflags) {
 }
 
 function executeInteractiveCommand(index, command, arg, iflags = {}, cache = null) {
+    // Warn about inapplicable flags (same check as project mode)
+    const applicableFlags = FLAG_APPLICABILITY[command];
+    if (applicableFlags) {
+        const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence', '_fileFromFileMode']);
+        for (const [key, value] of Object.entries(iflags)) {
+            if (globalFlags.has(key)) continue;
+            if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            if (!applicableFlags.includes(key)) {
+                console.log(`Warning: ${flagToCli(key)} has no effect on '${command}'.`);
+            }
+        }
+    }
+
     // ── Commands with unique behavior (not data-driven) ──────────────
     switch (command) {
 

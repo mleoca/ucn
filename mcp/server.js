@@ -33,7 +33,7 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName } = require('../core/registry');
+const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName, FLAG_APPLICABILITY } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
@@ -307,6 +307,25 @@ server.registerTool(
         // This eliminates per-case param selection and prevents CLI/MCP drift.
         const { command: _c, project_dir: _p, ...rawParams } = args;
         const ep = normalizeParams(rawParams);
+
+        // Strip params not applicable to this command (prevents silent no-ops).
+        // Global/core params are always allowed — only optional flags are filtered.
+        const applicable = FLAG_APPLICABILITY[command];
+        if (applicable) {
+            // Core params that are always allowed (primary args, global options)
+            const coreParams = new Set([
+                'name', 'term', 'stack', 'range', 'base', 'staged', 'direction',
+                'all', 'json', 'maxChars', 'showConfidence', 'maxFiles', 'workers',
+            ]);
+            for (const key of Object.keys(ep)) {
+                if (coreParams.has(key)) continue;
+                if (!applicable.includes(key) && ep[key] !== undefined && ep[key] !== false &&
+                    !(Array.isArray(ep[key]) && ep[key].length === 0)) {
+                    delete ep[key];
+                }
+            }
+        }
+
         // all=true bypasses both formatter caps AND char truncation (parity with CLI --all)
         const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
 
