@@ -915,7 +915,17 @@ function tests(index, nameOrFile, options = {}) {
             _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
 
             // Deduplicate: if a line already has a 'call' or 'import', don't also add 'test-case'
-            const finalMatches = _deduplicateMatches(matches);
+            let finalMatches = _deduplicateMatches(matches);
+
+            // className scoping: only include imports if the file has class-scoped
+            // call/reference/test-case matches. An import of the searchTerm alone
+            // (e.g., `from app import B, save`) is not evidence of B.save() usage.
+            if (className) {
+                const hasClassScopedMatch = finalMatches.some(m => m.matchType !== 'import');
+                if (!hasClassScopedMatch) {
+                    finalMatches = [];
+                }
+            }
 
             const filtered = options.callsOnly
                 ? finalMatches.filter(m => m.matchType === 'call' || m.matchType === 'test-case')

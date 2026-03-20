@@ -3643,6 +3643,28 @@ describe('AST-based tests(): cross-language className scoping', () => {
             rm(dir);
         }
     });
+
+    it('import-only file is not a false positive with className', () => {
+        const dir = tmp({
+            'app.py': 'class B:\n    def save(self):\n        return 1\ndef save():\n    pass',
+            'test_app.py': [
+                'from app import B, save',
+                '',
+                'def test_save_mixed():',
+                '    svc = B(); save()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(result.ok);
+            // File only has an import of save and a bare save() call — no B.save()
+            assert.strictEqual(result.result.length, 0,
+                'Should not return file with only import and bare call when className is set');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: CLI fn --class-name passes through to execute', () => {
