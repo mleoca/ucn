@@ -33,7 +33,7 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName, FLAG_APPLICABILITY } = require('../core/registry');
+const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName, FLAG_APPLICABILITY, REVERSE_PARAM_MAP, generateMcpParamSection } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
@@ -238,7 +238,7 @@ OTHER:
 - typedef <name>: Find type definitions matching a name: interfaces, enums, structs, traits, type aliases. See field shapes, required methods, or enum values.
 - stacktrace: Parse a stack trace, show source context per frame. Requires stack param. Handles JS, Python, Go, Rust, Java formats.
 - api: Public API surface of project or file: all exported/public symbols with signatures. Use to understand what a library exposes. Pass file to scope to one file. Python needs __all__; use toc instead.
-- stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type. Use functions=true for per-function line counts sorted by size (complexity audit).`;
+- stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type. Use functions=true for per-function line counts sorted by size (complexity audit).` + generateMcpParamSection();
 
 server.registerTool(
     'ucn',
@@ -310,6 +310,7 @@ server.registerTool(
 
         // Strip params not applicable to this command (prevents silent no-ops).
         // Global/core params are always allowed — only optional flags are filtered.
+        const strippedParams = [];
         const applicable = FLAG_APPLICABILITY[command];
         if (applicable) {
             // Core params that are always allowed (primary args, global options)
@@ -321,6 +322,7 @@ server.registerTool(
                 if (coreParams.has(key)) continue;
                 if (!applicable.includes(key) && ep[key] !== undefined && ep[key] !== false &&
                     !(Array.isArray(ep[key]) && ep[key].length === 0)) {
+                    strippedParams.push(REVERSE_PARAM_MAP[key] || key);
                     delete ep[key];
                 }
             }
@@ -329,8 +331,13 @@ server.registerTool(
         // all=true bypasses both formatter caps AND char truncation (parity with CLI --all)
         const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
 
-        // Wrap toolResult to auto-inject command + maxChars from this request
-        const tr = (text) => toolResult(text, command, maxChars);
+        // Build stripping note (appended inside truncation boundary on success paths)
+        const strippedNote = strippedParams.length > 0
+            ? `\n\nNote: ${strippedParams.join(', ')} ignored (not applicable to ${command}).`
+            : '';
+
+        // Wrap toolResult to auto-inject command + maxChars + stripping note
+        const tr = (text) => toolResult(text + strippedNote, command, maxChars);
 
         let index = null; // Track for post-command cache save
         try {

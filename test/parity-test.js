@@ -19,7 +19,7 @@ const fs = require('fs');
 const os = require('os');
 
 const { McpClient, runCli, runInteractive, FIXTURES_PATH: BASE_FIXTURES } = require('./helpers');
-const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY, BROAD_COMMANDS } = require('../core/registry');
+const { CANONICAL_COMMANDS, CLI_ALIASES, MCP_ALIASES, getCliCommandSet, getMcpCommandEnum, resolveCommand, normalizeParams, PARAM_MAP, FLAG_APPLICABILITY, BROAD_COMMANDS, generateMcpParamSection, REVERSE_PARAM_MAP } = require('../core/registry');
 const FIXTURES_PATH = path.join(BASE_FIXTURES, 'javascript');
 
 // ============================================================================
@@ -975,6 +975,29 @@ describe('Architecture Guards', () => {
                 `FLAG_APPLICABILITY flag "${flag}" (Zod: "${zodName}") must have a field in MCP Zod schema`
             );
         }
+    });
+
+    it('generateMcpParamSection includes all FLAG_APPLICABILITY flags', () => {
+        const section = generateMcpParamSection();
+        for (const [cmd, flags] of Object.entries(FLAG_APPLICABILITY)) {
+            if (flags.length === 0) continue;
+            const mcpCmd = cmd.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
+            assert.ok(section.includes(`${mcpCmd}:`),
+                `Generated section should include command "${mcpCmd}"`);
+            for (const flag of flags) {
+                const mcpFlag = REVERSE_PARAM_MAP[flag] || flag;
+                assert.ok(section.includes(mcpFlag),
+                    `Generated section should include flag "${mcpFlag}" (from ${cmd}.${flag})`);
+            }
+        }
+    });
+
+    it('MCP tool description includes auto-generated per-command param section', () => {
+        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
+        assert.ok(serverCode.includes('generateMcpParamSection()'),
+            'TOOL_DESCRIPTION should use generateMcpParamSection()');
+        assert.ok(serverCode.includes('PARAMS PER COMMAND') || generateMcpParamSection().includes('PARAMS PER COMMAND'),
+            'Generated section should have PARAMS PER COMMAND header');
     });
 
     it('every CLI knownFlags entry maps to a FLAG_APPLICABILITY flag', () => {

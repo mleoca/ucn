@@ -4571,6 +4571,68 @@ describe('fix: class --class-name removed from FLAG_APPLICABILITY', () => {
     });
 });
 
+describe('MCP per-command param validation: stripping note', () => {
+    let client;
+
+    before(async () => {
+        const { McpClient } = require('./helpers');
+        client = new McpClient();
+        await client.start();
+        await client.initialize();
+    });
+
+    after(() => client.stop());
+
+    it('MCP response includes stripping note for inapplicable params', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // depth is not applicable to about — should be stripped and reported
+            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', depth: 3 });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('Note:'), 'should include a Note about stripped params');
+            assert.ok(result.text.includes('depth'), 'note should mention "depth"');
+            assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('no stripping note when all params are applicable', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // file is applicable to about — no stripping note
+            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', file: 'lib.js' });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(!result.text.includes('ignored (not applicable'), 'should not include stripping note');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('multiple stripped params listed together', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // depth and direction are not applicable to about
+            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', depth: 3, direction: 'imports' });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('depth'), 'note should mention "depth"');
+            assert.ok(result.text.includes('direction'), 'note should mention "direction"');
+            assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix: expand cache invalidation on rebuild', () => {
     it('CLI clears expandable.json when index is rebuilt', () => {
         const dir = tmp({

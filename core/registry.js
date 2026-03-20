@@ -224,11 +224,43 @@ function toCliName(canonical) {
     return canonical.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
 }
 
+/**
+ * Build a reverse map: camelCase → snake_case from PARAM_MAP.
+ * Flags not in PARAM_MAP are already snake_case-safe (single words).
+ */
+function buildReverseParamMap() {
+    const rev = {};
+    for (const [snake, camel] of Object.entries(PARAM_MAP)) {
+        rev[camel] = snake;
+    }
+    return rev;
+}
+
+const REVERSE_PARAM_MAP = buildReverseParamMap();
+
+/**
+ * Generate per-command parameter listing for the MCP tool description.
+ * Maps camelCase flags back to snake_case for MCP clients.
+ * One line per command: `about: file, exclude, class_name, ...`
+ */
+function generateMcpParamSection() {
+    const lines = ['', 'PARAMS PER COMMAND (only these are used — others are ignored):'];
+    for (const cmd of CANONICAL_COMMANDS) {
+        const flags = FLAG_APPLICABILITY[cmd];
+        if (!flags || flags.length === 0) continue;
+        const mcpCmd = toMcpName(cmd);
+        const mcpFlags = flags.map(f => REVERSE_PARAM_MAP[f] || f);
+        lines.push(`  ${mcpCmd}: ${mcpFlags.join(', ')}`);
+    }
+    return lines.join('\n');
+}
+
 module.exports = {
     CANONICAL_COMMANDS,
     CLI_ALIASES,
     MCP_ALIASES,
     PARAM_MAP,
+    REVERSE_PARAM_MAP,
     FLAG_APPLICABILITY,
     BROAD_COMMANDS,
     resolveCommand,
@@ -237,4 +269,5 @@ module.exports = {
     getMcpCommandEnum,
     toMcpName,
     toCliName,
+    generateMcpParamSection,
 };
