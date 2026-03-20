@@ -96,6 +96,7 @@ function buildCallerOptions(p) {
         className: p.className,
         includeMethods: p.includeMethods,
         includeUncertain: p.includeUncertain || false,
+        includeTests: p.includeTests,
         exclude: toExcludeArray(p.exclude),
         minConfidence: num(p.minConfidence, 0),
     };

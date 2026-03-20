@@ -96,8 +96,8 @@ const PARAM_MAP = {
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
     // Understanding code
-    about:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
-    context:      ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence'],
+    about:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
+    context:      ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'minConfidence', 'showConfidence'],
     impact:       ['file', 'exclude', 'className', 'top'],
     blast:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],

@@ -4110,6 +4110,46 @@ describe('tests/about --exclude propagation', () => {
     });
 });
 
+describe('about/context includeTests flag', () => {
+    it('about --include-tests makes usage counts include test files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            // Default: usage counts exclude tests
+            const r1 = execute(index, 'about', { name: 'save' });
+            assert.ok(r1.ok);
+            const defaultTotal = r1.result.usages.calls + r1.result.usages.imports + r1.result.usages.references;
+
+            // With includeTests: usage counts include tests
+            const r2 = execute(index, 'about', { name: 'save', includeTests: true });
+            assert.ok(r2.ok);
+            const inclTotal = r2.result.usages.calls + r2.result.usages.imports + r2.result.usages.references;
+            assert.ok(inclTotal > defaultTotal,
+                'includeTests should increase usage count');
+        } finally { rm(dir); }
+    });
+
+    it('about always shows test callers in CALLERS (by design)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': 'const { save } = require("../lib");\nfunction testSave() { save(); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'save' });
+            assert.ok(r.ok);
+            // Callers always include tests (complete call graph)
+            assert.ok(r.result.callers.total > 0,
+                'Callers should include test callers by default');
+        } finally { rm(dir); }
+    });
+});
+
 describe('tests --file: no basename collision across directories', () => {
     it('Go: same-basename files in different packages are separated', () => {
         const dir = tmp({

@@ -1160,7 +1160,7 @@ FIND CODE
   toc                 Table of contents (compact; --detailed lists all symbols)
   search <term>       Text search (regex default, --context=N, --exclude=, --in=)
                       Structural: --type=function|class|call --param= --returns= --decorator= --exported --unused
-  tests <name>        Find test files for a function (--file, --class-name, --exclude)
+  tests <name>        Find test files for a function (--file, --class-name, --exclude, --calls-only)
   affected-tests <n>  Tests affected by a change (blast + test detection, --depth=N)
 
 ═══════════════════════════════════════════════════════════════════════════════
