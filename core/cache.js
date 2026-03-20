@@ -189,12 +189,19 @@ function loadCache(index, cachePath) {
         }
 
         const root = cacheData.root || index.root;
+        // Fast path conversion: string concat is ~70x faster than path.join for
+        // cache-stored relative paths (no '..' segments). On Windows, path.relative
+        // produces backslash paths, so rootPrefix uses the native separator.
+        const rootPrefix = root.endsWith(path.sep) ? root : root + path.sep;
+        const toAbs = path.sep === '/'
+            ? (relPath) => rootPrefix + relPath
+            : (relPath) => rootPrefix + relPath.replace(/\//g, path.sep);
 
         // Reconstruct files Map: relative key → absolute key, restore path and relativePath
         // Initialize symbols/bindings arrays (will be populated from top-level symbols)
         index.files = new Map();
         for (const [relPath, entry] of cacheData.files) {
-            const absPath = path.join(root, relPath);
+            const absPath = toAbs(relPath);
             entry.path = absPath;
             entry.relativePath = relPath;
             if (!entry.symbols) entry.symbols = [];
@@ -207,7 +214,7 @@ function loadCache(index, cachePath) {
         index.symbols = new Map(cacheData.symbols);
         for (const [, defs] of index.symbols) {
             for (const s of defs) {
-                if (!s.file && s.relativePath) s.file = path.join(root, s.relativePath);
+                if (!s.file && s.relativePath) s.file = toAbs(s.relativePath);
                 if (!s.bindingId && s.relativePath && s.type && s.startLine) {
                     s.bindingId = `${s.relativePath}:${s.type}:${s.startLine}`;
                 }
@@ -226,10 +233,13 @@ function loadCache(index, cachePath) {
         }
 
         // Reconstruct graphs: relative paths → absolute paths (as Sets)
+        // Uses string concat (toAbs) instead of path.join — 70x faster on 464K edges
         const absGraph = (data) => {
             const m = new Map();
             for (const [relKey, relValues] of data) {
-                m.set(path.join(root, relKey), new Set(relValues.map(v => path.join(root, v))));
+                const absValues = new Set();
+                for (const v of relValues) absValues.add(toAbs(v));
+                m.set(toAbs(relKey), absValues);
             }
             return m;
         };
@@ -260,17 +270,17 @@ function loadCache(index, cachePath) {
         // Restore failedFiles if present (convert relative paths back to absolute)
         if (Array.isArray(cacheData.failedFiles)) {
             index.failedFiles = new Set(
-                cacheData.failedFiles.map(f => path.isAbsolute(f) ? f : path.join(root, f))
+                cacheData.failedFiles.map(f => path.isAbsolute(f) ? f : toAbs(f))
             );
         }
 
-        // Restore calleeIndex if persisted
+        // Restore calleeIndex if persisted (v7 caches only; v8+ rebuilds lazily)
         if (Array.isArray(cacheData.calleeIndex)) {
             index.calleeIndex = new Map();
             for (const [name, files] of cacheData.calleeIndex) {
                 if (!Array.isArray(files)) continue;
                 index.calleeIndex.set(name, new Set(
-                    files.map(f => path.isAbsolute(f) ? f : path.join(root, f))
+                    files.map(f => path.isAbsolute(f) ? f : toAbs(f))
                 ));
             }
         }
@@ -443,9 +453,13 @@ function _loadCallsShard(index, hash) {
     try {
         const data = JSON.parse(fs.readFileSync(shardFile, 'utf-8'));
         if (!Array.isArray(data)) return;
+        const rootPrefix = index.root.endsWith(path.sep) ? index.root : index.root + path.sep;
+        const toAbsShard = path.sep === '/'
+            ? (rp) => rootPrefix + rp
+            : (rp) => rootPrefix + rp.replace(/\//g, path.sep);
         for (const [relPath, entry] of data) {
             if (!relPath || !entry) continue;
-            const absPath = path.isAbsolute(relPath) ? relPath : path.join(index.root, relPath);
+            const absPath = path.isAbsolute(relPath) ? relPath : toAbsShard(relPath);
             index.callsCache.set(absPath, entry);
         }
     } catch (e) {
