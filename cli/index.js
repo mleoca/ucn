@@ -961,6 +961,20 @@ function runGlobCommand(pattern, command, arg) {
     }
     // Merge flags first, then set positional overrides so they aren't wiped
     Object.assign(params, flags);
+
+    // Warn about inapplicable flags (same check as project/interactive mode)
+    const applicableFlags = FLAG_APPLICABILITY[canonical];
+    if (applicableFlags) {
+        const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence', '_fileFromFileMode']);
+        for (const [key, value] of Object.entries(flags)) {
+            if (globalFlags.has(key)) continue;
+            if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            if (!applicableFlags.includes(key)) {
+                console.error(`Warning: ${flagToCli(key)} has no effect on '${toCliName(canonical)}'.`);
+            }
+        }
+    }
     if (canonical === 'stacktrace' && arg) {
         params.stack = arg;
     }

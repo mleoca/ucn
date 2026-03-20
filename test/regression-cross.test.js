@@ -4209,6 +4209,17 @@ describe('flag validation parity across surfaces', () => {
             client.stop();
         }
     });
+
+    it('glob mode warns about inapplicable flags', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const { spawnSync } = require('child_process');
+        const result = spawnSync('node', [
+            require('path').join(__dirname, '..', 'cli', 'index.js'),
+            pattern, 'context', 'helper', '--include-tests'
+        ], { timeout: 30000, encoding: 'utf-8' });
+        assert.ok((result.stderr || '').includes('no effect'),
+            'glob mode should warn about inapplicable --include-tests on context');
+    });
 });
 
 describe('tests --file: no basename collision across directories', () => {

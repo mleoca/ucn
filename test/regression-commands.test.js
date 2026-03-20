@@ -3487,8 +3487,9 @@ describe('fix: affected-tests --exclude filters test files', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'src/helper.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
-            'test/unit/helper.test.js': 'const { helper } = require("../../src/helper");\nhelper();',
-            'test/e2e/smoke.test.js': 'const { helper } = require("../../src/helper");\nhelper();'
+            'src/caller.js': 'const { helper } = require("./helper");\nfunction caller() { return helper(); }\nmodule.exports = { caller };',
+            'test/unit/helper.test.js': 'const { helper } = require("../../src/helper");\nit("h", () => { helper(); });',
+            'test/e2e/smoke.test.js': 'const { helper } = require("../../src/helper");\nit("h", () => { helper(); });'
         });
         try {
             const index = idx(dir);

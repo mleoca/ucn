@@ -314,8 +314,8 @@ server.registerTool(
         if (applicable) {
             // Core params that are always allowed (primary args, global options)
             const coreParams = new Set([
-                'name', 'term', 'stack', 'range', 'base', 'staged', 'direction',
-                'all', 'json', 'maxChars', 'showConfidence', 'maxFiles', 'workers',
+                'name', 'term', 'stack', 'range', 'base', 'staged',
+                'all', 'json', 'maxChars', 'maxFiles', 'workers',
             ]);
             for (const key of Object.keys(ep)) {
                 if (coreParams.has(key)) continue;
