@@ -157,11 +157,11 @@ ucn [target] <command> [name] [--flags]
 
 | Flag | When to use it |
 |------|---------------|
-| `--class-name=X` | Scope to specific class (e.g., `--class-name=Repository` for method `save`) |
+| `--class-name=X` | Scope to specific class (e.g., `--class-name=Repository` for method `save`). Works with `fn`, `about`, `context`, `impact`, `tests`, `example`, `typedef`, `verify`, `plan` |
 | `--file=<pattern>` | Disambiguate when a name exists in multiple files (e.g., `--file=api`) |
 | `--exclude=test,mock` | Focus on production code only |
 | `--in=src/core` | Limit search to a subdirectory |
-| `--depth=N` | Control tree depth for `trace` and `graph` (default 3). Also expands all children — no breadth limit |
+| `--depth=N` | Control tree depth for `trace`, `graph`, and detail level for `find` (default 3). Also expands all children — no breadth limit |
 | `--all` | Expand truncated sections in `about`, `trace`, `graph`, `related` |
 | `--include-tests` | Include test files in results (excluded by default) |
 | `--include-methods` | Include `obj.method()` calls in `context`/`smart` (only direct calls shown by default) |

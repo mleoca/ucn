@@ -845,10 +845,14 @@ function tests(index, nameOrFile, options = {}) {
     const callPattern = new RegExp(escapeRegExp(searchTerm) + '\\s*\\(');
     const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
 
-    // When className is provided, build a pattern to scope matches.
-    // We require the test file to also reference the class name (import, instantiation, or receiver).
+    // When className is provided, build patterns for match-level scoping.
     const classNameFilter = options.className
         ? new RegExp('\\b' + escapeRegExp(options.className) + '\\b')
+        : null;
+    // Match-level class scoping: for calls, check receiver or nearby context;
+    // e.g., "new ClassName().method()" or "instance.method()" where instance is typed.
+    const classReceiverPattern = options.className
+        ? new RegExp('\\b' + escapeRegExp(options.className) + '\\s*[\\.\\(]')
         : null;
 
     for (const { path: testPath, entry } of testFiles) {
@@ -878,6 +882,40 @@ function tests(index, nameOrFile, options = {}) {
                         if (strPattern.test(line)) {
                             matchType = 'string-ref';
                         }
+                    }
+
+                    // Match-level className scoping: for call matches,
+                    // the class name must appear on the SAME line as receiver
+                    // (e.g., "new ClassName().method()" or "className.method()").
+                    if (classReceiverPattern && matchType === 'call') {
+                        if (!classNameFilter.test(line)) return; // skip — different receiver
+                    }
+
+                    // For reference matches, check same line or ±1 line.
+                    if (classReceiverPattern && matchType === 'reference') {
+                        let classNearby = classNameFilter.test(line);
+                        if (!classNearby && idx > 0) classNearby = classNameFilter.test(lines[idx - 1]);
+                        if (!classNearby && idx + 1 < lines.length) classNearby = classNameFilter.test(lines[idx + 1]);
+                        if (!classNearby) return; // skip this match
+                    }
+
+                    // For test-case matches with className, keep if the test
+                    // description mentions the class or the test body (next few
+                    // lines) references the class as a receiver.
+                    if (classNameFilter && matchType === 'test-case') {
+                        let classInContext = classNameFilter.test(line);
+                        if (!classInContext) {
+                            // Look forward into the test body for class usage
+                            for (let d = 1; d <= 5 && !classInContext; d++) {
+                                if (idx + d < lines.length) {
+                                    const bodyLine = lines[idx + d];
+                                    // Stop at next test-case boundary
+                                    if (/\b(describe|it|test|spec)\s*\(/.test(bodyLine)) break;
+                                    if (classNameFilter.test(bodyLine)) classInContext = true;
+                                }
+                            }
+                        }
+                        if (!classInContext) return; // skip test-case not related to this class
                     }
 
                     matches.push({

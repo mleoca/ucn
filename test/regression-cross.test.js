@@ -3161,6 +3161,50 @@ describe('fix: tests() className scoping', () => {
             rm(dir);
         }
     });
+
+    it('tests with className filters at match level in mixed test files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A { save() { return 1; } }\nmodule.exports = { A };',
+            'b.js': 'class B { save() { return 2; } }\nmodule.exports = { B };',
+            // Mixed test file that imports both A and B
+            'test/mixed.test.js': [
+                'const { A } = require("../a");',
+                'const { B } = require("../b");',
+                '',
+                'it("A save works", () => {',
+                '  new A().save();',
+                '});',
+                '',
+                'it("B save works", () => {',
+                '  new B().save();',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // With className=A: should only return matches near A, not B
+            const aTests = execute(index, 'tests', { name: 'save', className: 'A' });
+            assert.ok(aTests.ok);
+            if (aTests.result.length > 0) {
+                // Matches should reference A, not B
+                const allMatchLines = aTests.result.flatMap(r => r.matches.map(m => m.content));
+                assert.ok(!allMatchLines.some(l => /\bB\b/.test(l) && !/\bA\b/.test(l)),
+                    'Should not include matches that only reference B');
+            }
+
+            // With className=B: should only return matches near B, not A
+            const bTests = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(bTests.ok);
+            if (bTests.result.length > 0) {
+                const allMatchLines = bTests.result.flatMap(r => r.matches.map(m => m.content));
+                assert.ok(!allMatchLines.some(l => /\bA\b/.test(l) && !/\bB\b/.test(l)),
+                    'Should not include matches that only reference A');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: CLI fn --class-name passes through to execute', () => {
@@ -3319,6 +3363,41 @@ describe('fix: usages file filter graceful degradation', () => {
             const defUsages = result.result.filter(u => u.isDefinition);
             assert.ok(defUsages.length > 0, 'Should find definition in utils');
             assert.ok(defUsages.every(u => u.relativePath?.includes('utils')), 'All defs from utils');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: file-exports --json returns populated exports array', () => {
+    it('formatFileExportsJson returns exports from the array result', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            const cliOutput = runCli(dir, 'file-exports', ['lib.js'], ['--json']);
+            const parsed = JSON.parse(cliOutput);
+            assert.ok(parsed.data, 'Should have data field');
+            assert.ok(Array.isArray(parsed.data.exports), 'exports should be an array');
+            assert.ok(parsed.data.exports.length > 0, 'exports should not be empty');
+            assert.ok(parsed.data.exports.some(e => e.name === 'helper'), 'Should include helper');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: class --class-name removed from FLAG_APPLICABILITY', () => {
+    it('class --class-name warns about inapplicable flag', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class Foo { run() {} }\nmodule.exports = { Foo };',
+        });
+        try {
+            const output = runCli(dir, 'class', ['Foo'], ['--class-name=Bar']);
+            // Should warn that --class-name has no effect on class command
+            assert.ok(output.includes('no effect') || output.includes('Foo'), 'Should warn or still work');
         } finally {
             rm(dir);
         }

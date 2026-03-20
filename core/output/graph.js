@@ -120,14 +120,14 @@ function formatFileExports(exports, filePath) {
     return lines.join('\n');
 }
 
-function formatFileExportsJson(result) {
+function formatFileExportsJson(result, filePath) {
     if (!result) return JSON.stringify({ found: false });
+    // result is an array of exported symbols from index.fileExports()
     return JSON.stringify({
-        meta: { command: 'fileExports', file: result.file },
+        meta: { command: 'fileExports', file: filePath || (Array.isArray(result) ? result[0]?.file : result.file) },
         data: {
-            file: result.file,
-            exports: result.exports || [],
-            reExports: result.reExports || [],
+            file: filePath || (Array.isArray(result) ? result[0]?.file : result.file),
+            exports: Array.isArray(result) ? result : (result.exports || []),
         },
     }, null, 2);
 }

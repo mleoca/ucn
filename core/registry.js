@@ -116,7 +116,7 @@ const FLAG_APPLICABILITY = {
     entrypoints:  ['file', 'exclude', 'includeTests', 'limit', 'type', 'framework'],
     // Extracting code
     fn:           ['file', 'className', 'all'],
-    class:        ['file', 'className', 'all', 'maxLines'],
+    class:        ['file', 'all', 'maxLines'],
     lines:        ['file', 'range'],
     expand:       [],
     // File dependencies

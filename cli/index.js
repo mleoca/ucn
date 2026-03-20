@@ -658,7 +658,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
-            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines, className: flags.className });
+            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatClassResultJson, output.formatClassResult);
@@ -703,7 +703,7 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error } = execute(index, 'fileExports', { file: filePath });
             if (!ok) fail(error);
             printOutput(result,
-                output.formatFileExportsJson,
+                r => output.formatFileExportsJson(r, filePath),
                 r => output.formatFileExports(r, filePath)
             );
             break;
