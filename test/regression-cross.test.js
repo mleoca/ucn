@@ -3985,6 +3985,117 @@ describe('tests --file scoping', () => {
     });
 });
 
+describe('tests --file: language-aware test discovery', () => {
+    it('Go: finds same-package tests (no imports needed)', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'util.go': 'package util\n\nfunc Save() int { return 1 }',
+            'util_test.go': 'package util\n\nimport "testing"\n\nfunc TestSave(t *testing.T) {\n\tresult := Save()\n\tif result != 1 { t.Fatal() }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'Save', file: 'util.go' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('util_test')),
+                'Should find Go same-package test');
+        } finally { rm(dir); }
+    });
+
+    it('Java: finds *Test.java convention tests', () => {
+        const dir = tmp({
+            'Util.java': 'public class Util { public static int save() { return 1; } }',
+            'UtilTest.java': [
+                'import org.junit.Test;',
+                'public class UtilTest {',
+                '    @Test public void testSave() { Util.save(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'save', file: 'Util.java' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('UtilTest')),
+                'Should find Java naming-convention test');
+        } finally { rm(dir); }
+    });
+
+    it('Rust: finds inline #[cfg(test)] module tests', () => {
+        const dir = tmp({
+            'lib.rs': [
+                'pub fn save() -> i32 { 1 }',
+                '',
+                '#[cfg(test)]',
+                'mod tests {',
+                '    use super::*;',
+                '    #[test]',
+                '    fn test_save() {',
+                '        assert_eq!(save(), 1);',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'save', file: 'lib.rs' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('lib.rs')),
+                'Should find Rust inline test in same file');
+        } finally { rm(dir); }
+    });
+
+    it('about --file TESTS section finds Go same-package tests', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'util.go': 'package util\n\nfunc Save() int { return 1 }',
+            'util_test.go': 'package util\n\nimport "testing"\n\nfunc TestSave(t *testing.T) {\n\tresult := Save()\n\tif result != 1 { t.Fatal() }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'Save', file: 'util.go' });
+            assert.ok(r.ok);
+            assert.ok(r.result.tests?.fileCount > 0,
+                'about TESTS should find Go same-package test');
+        } finally { rm(dir); }
+    });
+});
+
+describe('tests/about --exclude propagation', () => {
+    it('tests --exclude filters test files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+            'spec/lib.spec.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const all = execute(index, 'tests', { name: 'save' });
+            const excluded = execute(index, 'tests', { name: 'save', exclude: ['spec'] });
+            assert.ok(all.result.length > excluded.result.length,
+                'Exclude should reduce test file count');
+            assert.ok(!excluded.result.some(r => r.file.includes('spec')),
+                'Excluded files should not appear');
+        } finally { rm(dir); }
+    });
+
+    it('about --exclude propagates to TESTS section', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+            'spec/lib.spec.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'save', exclude: ['test', 'spec'] });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.tests?.fileCount, 0,
+                'about --exclude should filter TESTS section');
+        } finally { rm(dir); }
+    });
+});
+
 describe('CLI glob-mode parity', () => {
     it('glob mode supports about, context, tests commands', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';

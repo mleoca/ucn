@@ -840,6 +840,7 @@ function about(index, name, options = {}) {
     const tests = index.tests(symbolName, {
         file: options.file,
         className: options.className || primary.className,
+        exclude: options.exclude,
     });
     const testSummary = {
         fileCount: tests.length,

@@ -110,7 +110,7 @@ const FLAG_APPLICABILITY = {
     usages:       ['file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
     toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
     search:       ['file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
-    tests:        ['file', 'className', 'callsOnly'],
+    tests:        ['file', 'exclude', 'className', 'callsOnly'],
     affectedTests:['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
     entrypoints:  ['file', 'exclude', 'includeTests', 'limit', 'type', 'framework'],

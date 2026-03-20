@@ -808,7 +808,7 @@ function typedef(index, name, options = {}) {
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} nameOrFile - Function name or file path
- * @param {object} options - { callsOnly, className, file }
+ * @param {object} options - { callsOnly, className, file, exclude }
  * @returns {Array} Test files and matches
  */
 function tests(index, nameOrFile, options = {}) {
@@ -859,8 +859,14 @@ function tests(index, nameOrFile, options = {}) {
     // Pre-compile string-ref pattern (only regex left — used on single AST-identified lines)
     const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
 
+    // --exclude filtering
+    const excludeArr = options.exclude ? (Array.isArray(options.exclude) ? options.exclude : [options.exclude]) : [];
+
     for (const { path: testPath, entry } of testFiles) {
         try {
+            // Apply exclude filters
+            if (excludeArr.length > 0 && !index.matchesFilters(entry.relativePath, { exclude: excludeArr })) continue;
+
             const content = index._readFile(testPath);
 
             // Fast pre-check: skip if searchTerm doesn't appear in file
@@ -1013,6 +1019,48 @@ function _buildSourceFileImporters(index, defs) {
                     visited.add(imp);
                     queue.push(imp);
                 }
+            }
+        }
+    }
+
+    // Language-aware test file discovery: add test files matched by naming
+    // convention or same-package membership, which don't use import statements.
+    // Go: same directory (package-scoped), Java: *Test.java convention,
+    // Rust: inline #[cfg(test)] in the source file itself.
+    for (const srcPath of sourceAbsPaths) {
+        const srcEntry = index.files.get(srcPath);
+        if (!srcEntry) continue;
+        const traits = langTraits(srcEntry.language);
+        if (!traits?.testFileCandidates) continue;
+
+        const srcBase = path.basename(srcPath, path.extname(srcPath));
+        const srcExt = path.extname(srcPath);
+        const srcDir = path.dirname(srcPath);
+        const candidates = traits.testFileCandidates(srcBase, srcExt);
+
+        for (const [absPath, fe] of index.files) {
+            if (importers.has(absPath)) continue; // already included
+            if (!isTestFile(fe.relativePath, fe.language) &&
+                !(fe.language === 'rust' && fe.symbols?.some(s => s.modifiers?.includes('test')))) {
+                continue; // not a test file
+            }
+
+            // Check naming convention match
+            const testBaseName = path.basename(absPath);
+            if (candidates.some(c => testBaseName === c)) {
+                importers.add(absPath);
+                continue;
+            }
+
+            // Go: same-directory tests (package-scoped, no imports needed)
+            if (traits.packageScope === 'directory' && path.dirname(absPath) === srcDir) {
+                importers.add(absPath);
+                continue;
+            }
+
+            // Rust: inline tests in the source file itself
+            if (srcPath === absPath) {
+                importers.add(absPath);
             }
         }
     }

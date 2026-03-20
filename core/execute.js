@@ -612,6 +612,7 @@ const HANDLERS = {
             callsOnly: p.callsOnly || false,
             className: p.className,
             file: p.file,
+            exclude: toExcludeArray(p.exclude),
         });
         return { ok: true, result };
     },
