@@ -823,12 +823,15 @@ function tests(index, nameOrFile, options = {}) {
         nameOrFile.endsWith('.java') || nameOrFile.endsWith('.rs');
 
     // Resolve --file scoping: find the source file that defines this symbol
-    // and only include test files that import from it.
+    // and only include test files that import from it (directly or via re-exports).
     let sourceFileFilter = null;
     if (options.file && !isFilePath) {
         const defs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className });
         if (defs.length > 0) {
-            sourceFileFilter = new Set(defs.map(d => d.relativePath));
+            sourceFileFilter = _buildSourceFileImporters(index, defs);
+        } else {
+            // Symbol not found in the target file — return empty, don't fall back to global
+            return results;
         }
     }
 
@@ -865,27 +868,9 @@ function tests(index, nameOrFile, options = {}) {
             // className scoping: skip test files that don't reference the class at all
             if (className && !content.includes(className)) continue;
 
-            // --file scoping: only include test files that import from the target source file
-            if (sourceFileFilter) {
-                const testImports = entry.imports || [];
-                // Build base names for matching unresolved imports like '../b' against 'b.js'
-                const sourceBaseNames = new Set();
-                for (const sf of sourceFileFilter) {
-                    sourceBaseNames.add(path.basename(sf, path.extname(sf)));
-                }
-                const importsSourceFile = testImports.some(imp => {
-                    const source = typeof imp === 'string' ? imp : (imp.resolved || imp.source || '');
-                    // Check resolved path match
-                    if (sourceFileFilter.has(source)) return true;
-                    // Check base name match (e.g., '../b' → basename 'b' matches 'b.js' → basename 'b')
-                    const importBase = path.basename(source, path.extname(source));
-                    return sourceBaseNames.has(importBase);
-                });
-                // Also check if the test file's name matches a test-file pattern for the source
-                const matchesByName = [...sourceBaseNames].some(base =>
-                    entry.relativePath.includes(base)
-                );
-                if (!importsSourceFile && !matchesByName) continue;
+            // --file scoping: only include test files that import from the target source
+            if (sourceFileFilter && !sourceFileFilter.has(testPath)) {
+                continue;
             }
 
             // AST-based usage detection
@@ -980,6 +965,52 @@ function tests(index, nameOrFile, options = {}) {
 
     return results;
     } finally { index._endOp(); }
+}
+
+/**
+ * Build a map of instance variable names → class names from call objects and AST usages.
+ * Language-generic: uses receiverType from getCachedCalls() (already inferred
+ * by _buildTypedLocalTypeMap for Go/Java/Rust and binding analysis for JS/TS/Python),
+ * plus AST usages of targetClassName for assignment patterns not captured by calls
+ * (e.g., Rust `let svc = B;` inside macro bodies).
+ *
+ * Three sources:
+/**
+ * Build a set of absolute file paths that import (directly or transitively via
+ * re-exports) from the source files where the symbol is defined.
+ * Uses the index's resolved importGraph/exportGraph for path-precise matching.
+ */
+function _buildSourceFileImporters(index, defs) {
+    const sourceAbsPaths = new Set();
+    for (const d of defs) {
+        // Find the absolute path for this definition
+        for (const [absPath, fe] of index.files) {
+            if (fe.relativePath === d.relativePath) {
+                sourceAbsPaths.add(absPath);
+                break;
+            }
+        }
+    }
+
+    // Collect all files that import the source files (direct importers via exportGraph)
+    const importers = new Set();
+    for (const srcPath of sourceAbsPaths) {
+        const directImporters = index.exportGraph?.get(srcPath) || [];
+        for (const imp of directImporters) importers.add(imp);
+
+        // Also check files that re-export from the source file (barrel imports):
+        // if file X imports source S, and test T imports X, then T transitively imports S.
+        // Walk one extra level via exportGraph.
+        for (const reExporter of directImporters) {
+            // Check if this file re-exports the symbol (has it in its exports)
+            const reExporterEntry = index.files.get(reExporter);
+            if (!reExporterEntry) continue;
+            const reExporterImporters = index.exportGraph?.get(reExporter) || [];
+            for (const imp of reExporterImporters) importers.add(imp);
+        }
+    }
+
+    return importers;
 }
 
 /**

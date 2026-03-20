@@ -3888,6 +3888,63 @@ describe('tests --file scoping', () => {
             rm(dir);
         }
     });
+
+    it('tests --file handles same-basename files in different directories', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/a/util.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'src/b/util.js': 'function save() { return 2; }\nmodule.exports = { save };',
+            'test/a.test.js': 'const { save } = require("../src/a/util");\nit("A", () => { save(); });',
+            'test/b.test.js': 'const { save } = require("../src/b/util");\nit("B", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', file: 'src/b/util.js' });
+            assert.ok(result.ok);
+            assert.ok(result.result.some(r => r.file.includes('b.test')),
+                'Should include b.test');
+            assert.ok(!result.result.some(r => r.file.includes('a.test')),
+                'Should not include a.test (same basename, different dir)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('tests --file finds tests via barrel re-exports', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/b/util.js': 'function save() { return 2; }\nmodule.exports = { save };',
+            'src/b/index.js': 'module.exports = require("./util");',
+            'test/b.test.js': 'const { save } = require("../src/b");\nit("B", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', file: 'src/b/util.js' });
+            assert.ok(result.ok);
+            assert.ok(result.result.some(r => r.file.includes('b.test')),
+                'Should find test via barrel import');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('tests --file returns empty when symbol not defined in target file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'b.js': 'function other() { return 2; }\nmodule.exports = { other };',
+            'test/a.test.js': 'const { save } = require("../a");\nit("A", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', file: 'b.js' });
+            assert.ok(result.ok);
+            assert.strictEqual(result.result.length, 0,
+                'Should return empty when symbol not in target file');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('CLI glob-mode parity', () => {
