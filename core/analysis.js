@@ -789,7 +789,9 @@ function about(index, name, options = {}) {
     let aboutConfFiltered = 0;
     if (primary.type === 'function' || primary.params !== undefined) {
         // Use maxResults to limit file iteration (with buffer for exclude filtering)
-        const callerCap = maxCallers === Infinity ? undefined : maxCallers * 3;
+        // Reduce buffer for highly ambiguous names (many definitions = more noise, less value per caller)
+        const callerMultiplier = definitions.length > 5 ? 1.5 : 3;
+        const callerCap = maxCallers === Infinity ? undefined : Math.ceil(maxCallers * callerMultiplier);
         allCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap });
         // Apply exclude filter before slicing
         if (options.exclude && options.exclude.length > 0) {
@@ -837,7 +839,8 @@ function about(index, name, options = {}) {
     }
 
     // Find tests — scope to the same file/class as the primary definition
-    const tests = index.tests(symbolName, {
+    // Skip expensive test search for highly ambiguous names (>10 other definitions)
+    const tests = (others.length > 10 && !options.all) ? [] : index.tests(symbolName, {
         file: options.file,
         className: options.className || primary.className,
         exclude: options.exclude,

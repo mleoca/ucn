@@ -77,6 +77,7 @@ class ProjectIndex {
             this._opContentCache = new Map();
             this._opUsagesCache = new Map();
             this._opCallsCountCache = new Map();
+            this._opEnclosingFnCache = new Map();
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -88,6 +89,12 @@ class ProjectIndex {
             this._opContentCache = null;
             this._opUsagesCache = null;
             this._opCallsCountCache = null;
+            this._opEnclosingFnCache = null;
+            // Free cached file content from callsCache entries (retained during
+            // operation for _readFile caching, not needed between operations)
+            for (const entry of this.callsCache.values()) {
+                if (entry.content !== undefined) entry.content = undefined;
+            }
             this._opDepth = 0;
         }
     }
@@ -474,14 +481,18 @@ class ProjectIndex {
             }
         }
 
-        // Invalidate cached call data for this file
+        // Incrementally update callee index before deleting cached calls
+        const oldCached = this.callsCache.get(filePath);
+        if (oldCached) {
+            this._removeFromCalleeIndex(filePath, oldCached.calls);
+        }
         this.callsCache.delete(filePath);
-
-        // Invalidate callee index (will be rebuilt lazily)
-        this.calleeIndex = null;
 
         // Invalidate attribute type cache for this file
         if (this._attrTypeCache) this._attrTypeCache.delete(filePath);
+
+        // Invalidate lazy Java file index (will be rebuilt on next use)
+        this._javaFileIndex = null;
     }
 
     /**
@@ -489,6 +500,61 @@ class ProjectIndex {
      * Replaces O(N) full-index scans in findCallers and countSymbolUsages.
      */
     _buildDirIndex() { graphBuildModule.buildDirIndex(this); }
+
+    /**
+     * Add a file's calls to the callee index (name → Set<filePath>).
+     * Used by buildCalleeIndex (full build) and getCachedCalls (incremental update).
+     */
+    _addToCalleeIndex(filePath, calls) {
+        if (!this.calleeIndex || !calls) return;
+        for (const call of calls) {
+            const name = call.name;
+            if (!this.calleeIndex.has(name)) {
+                this.calleeIndex.set(name, new Set());
+            }
+            this.calleeIndex.get(name).add(filePath);
+            if (call.resolvedName && call.resolvedName !== name) {
+                if (!this.calleeIndex.has(call.resolvedName)) {
+                    this.calleeIndex.set(call.resolvedName, new Set());
+                }
+                this.calleeIndex.get(call.resolvedName).add(filePath);
+            }
+            if (call.resolvedNames) {
+                for (const rn of call.resolvedNames) {
+                    if (rn !== name) {
+                        if (!this.calleeIndex.has(rn)) {
+                            this.calleeIndex.set(rn, new Set());
+                        }
+                        this.calleeIndex.get(rn).add(filePath);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * Remove a file's calls from the callee index.
+     * Used by removeFileSymbols for incremental updates instead of full invalidation.
+     */
+    _removeFromCalleeIndex(filePath, calls) {
+        if (!this.calleeIndex || !calls) return;
+        for (const call of calls) {
+            const removeName = (n) => {
+                const fileSet = this.calleeIndex.get(n);
+                if (fileSet) {
+                    fileSet.delete(filePath);
+                    if (fileSet.size === 0) this.calleeIndex.delete(n);
+                }
+            };
+            removeName(call.name);
+            if (call.resolvedName && call.resolvedName !== call.name) removeName(call.resolvedName);
+            if (call.resolvedNames) {
+                for (const rn of call.resolvedNames) {
+                    if (rn !== call.name) removeName(rn);
+                }
+            }
+        }
+    }
 
     /**
      * Build inverted call index: callee name -> Set<filePath>.
@@ -503,31 +569,7 @@ class ProjectIndex {
             // Fast path: use pre-populated callsCache (avoids stat per file)
             const cached = this.callsCache.get(filePath);
             const calls = cached ? cached.calls : getCachedCalls(this, filePath);
-            if (!calls) continue;
-            for (const call of calls) {
-                const name = call.name;
-                if (!this.calleeIndex.has(name)) {
-                    this.calleeIndex.set(name, new Set());
-                }
-                this.calleeIndex.get(name).add(filePath);
-                // Also index resolvedName and resolvedNames for alias resolution
-                if (call.resolvedName && call.resolvedName !== name) {
-                    if (!this.calleeIndex.has(call.resolvedName)) {
-                        this.calleeIndex.set(call.resolvedName, new Set());
-                    }
-                    this.calleeIndex.get(call.resolvedName).add(filePath);
-                }
-                if (call.resolvedNames) {
-                    for (const rn of call.resolvedNames) {
-                        if (rn !== name) {
-                            if (!this.calleeIndex.has(rn)) {
-                                this.calleeIndex.set(rn, new Set());
-                            }
-                            this.calleeIndex.get(rn).add(filePath);
-                        }
-                    }
-                }
-            }
+            this._addToCalleeIndex(filePath, calls);
         }
     }
 
@@ -548,6 +590,20 @@ class ProjectIndex {
      * Progressively strips trailing segments to find the class file.
      */
     _resolveJavaPackageImport(importModule, javaFileIndex) {
+        if (!javaFileIndex) {
+            // Lazy-build index to avoid O(N) fallback scan of all files
+            if (!this._javaFileIndex) {
+                this._javaFileIndex = new Map();
+                for (const [fp, fe] of this.files) {
+                    if (fe.language === 'java') {
+                        const name = path.basename(fp, '.java');
+                        if (!this._javaFileIndex.has(name)) this._javaFileIndex.set(name, []);
+                        this._javaFileIndex.get(name).push(fp);
+                    }
+                }
+            }
+            javaFileIndex = this._javaFileIndex;
+        }
         return graphBuildModule._resolveJavaPackageImport(this, importModule, javaFileIndex);
     }
 
@@ -1548,6 +1604,15 @@ class ProjectIndex {
         const fileEntry = this.files.get(filePath);
         if (!fileEntry) return null;
 
+        // Per-operation cache: avoid rescanning symbols for same (file, line)
+        const cacheKey = filePath + ':' + lineNum;
+        if (this._opEnclosingFnCache) {
+            const cached = this._opEnclosingFnCache.get(cacheKey);
+            if (cached !== undefined) {
+                return cached === null ? null : (returnSymbol ? cached : cached.name);
+            }
+        }
+
         let best = null;
         for (const symbol of fileEntry.symbols) {
             if (!NON_CALLABLE_TYPES.has(symbol.type) &&
@@ -1558,8 +1623,11 @@ class ProjectIndex {
                 }
             }
         }
-        if (!best) return null;
-        return returnSymbol ? best : best.name;
+
+        if (this._opEnclosingFnCache) {
+            this._opEnclosingFnCache.set(cacheKey, best);
+        }
+        return best ? (returnSymbol ? best : best.name) : null;
     }
 
     /** Get instance attribute types for a class in a file */

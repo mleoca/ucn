@@ -40,12 +40,6 @@ function parallelBuild(index, files, options = {}) {
         console.error(`Parallel build: ${workerCount} workers for ${files.length} files`);
     }
 
-    // Prepare existing hash data for skip-if-unchanged checks in workers
-    const existingHashes = Object.create(null);
-    for (const [fp, entry] of index.files) {
-        existingHashes[fp] = { mtime: entry.mtime, size: entry.size, hash: entry.hash };
-    }
-
     // Partition files round-robin for balanced work distribution
     const chunks = Array.from({ length: workerCount }, () => []);
     for (let i = 0; i < files.length; i++) {
@@ -63,11 +57,20 @@ function parallelBuild(index, files, options = {}) {
         const { port1, port2 } = new MessageChannel();
         ports.push(port1);
 
+        // Build per-worker hash subset (each worker only needs hashes for its chunk)
+        const workerHashes = Object.create(null);
+        for (const fp of chunks[i]) {
+            const entry = index.files.get(fp);
+            if (entry) {
+                workerHashes[fp] = { mtime: entry.mtime, size: entry.size, hash: entry.hash };
+            }
+        }
+
         const worker = new Worker(path.join(__dirname, 'build-worker.js'), {
             workerData: {
                 files: chunks[i],
                 rootDir: index.root,
-                existingHashes,
+                existingHashes: workerHashes,
                 signal: sab,
                 workerIndex: i,
                 port: port2,

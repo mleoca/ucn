@@ -98,6 +98,8 @@ function getCachedCalls(index, filePath, options = {}) {
             content: options.includeContent ? content : undefined
         });
         index.callsCacheDirty = true;
+        // Incrementally update callee index (avoids full rebuild)
+        index._addToCalleeIndex(filePath, calls);
 
         if (options.includeContent) {
             return { calls, content };
@@ -1366,6 +1368,7 @@ function _buildLocalTypeMap(index, def, calls) {
     }
     const lines = content.split('\n');
     const localTypes = new Map();
+    const regexCache = new Map();
 
     for (const call of calls) {
         // Only look at calls within this function's scope
@@ -1383,18 +1386,21 @@ function _buildLocalTypeMap(index, def, calls) {
         const sourceLine = lines[call.line - 1];
         if (!sourceLine) continue;
 
-        // Match: identifier = ClassName(...) or identifier: Type = ClassName(...)
-        const escapedName = call.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        const assignMatch = sourceLine.match(
-            new RegExp(`(\\w+)\\s*(?::\\s*\\w+)?\\s*=\\s*${escapedName}\\s*\\(`)
-        );
+        // Memoize compiled regex per call name (same name → same pattern)
+        let patterns = regexCache.get(call.name);
+        if (!patterns) {
+            const esc = call.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            patterns = {
+                assign: new RegExp(`(\\w+)\\s*(?::\\s*\\w+)?\\s*=\\s*${esc}\\s*\\(`),
+                with: new RegExp(`with\\s+${esc}\\s*\\([^)]*\\)\\s+as\\s+(\\w+)`)
+            };
+            regexCache.set(call.name, patterns);
+        }
+        const assignMatch = sourceLine.match(patterns.assign);
         if (assignMatch) {
             localTypes.set(assignMatch[1], call.name);
         }
-        // Match: with ClassName(...) as identifier:
-        const withMatch = sourceLine.match(
-            new RegExp(`with\\s+${escapedName}\\s*\\([^)]*\\)\\s+as\\s+(\\w+)`)
-        );
+        const withMatch = sourceLine.match(patterns.with);
         if (withMatch) {
             localTypes.set(withMatch[1], call.name);
         }

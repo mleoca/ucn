@@ -292,6 +292,12 @@ function loadCache(index, cachePath) {
  * @returns {boolean} - True if cache needs rebuilding
  */
 function isCacheStale(index) {
+    // Ultra-fast path: skip full check if last confirmed-fresh < 2s ago (covers MCP burst calls).
+    // Only uses _lastFreshAt (set at the end of a successful full check), not cache save timestamp.
+    if (index._lastFreshAt && Date.now() - index._lastFreshAt < 2000) {
+        return false;
+    }
+
     // Fast path: check cached files for modifications/deletions first (stat-only).
     // This returns early without the expensive directory walk when any file changed.
     for (const [filePath, fileEntry] of index.files) {
@@ -337,6 +343,8 @@ function isCacheStale(index) {
         }
     }
 
+    // Record when we last confirmed the cache is fresh (enables 2s skip on burst calls)
+    index._lastFreshAt = Date.now();
     return false;
 }
 
