@@ -133,7 +133,7 @@ ucn entrypoints --file=routes/           # Scoped to files
 | File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Setting `--depth=N` expands all children. Can be noisy — use depth=1 for large projects. For function-level flow, use `trace` instead |
 | Are there circular dependencies? | `ucn circular-deps` | Detect circular import chains. `--file=<pattern>` filters to cycles involving a file. `--exclude=test` skips test files |
 | What are the framework entry points? | `ucn entrypoints` | Lists all detected routes, DI beans, tasks, etc. Filter: `--type=http`, `--framework=express` |
-| Find which tests cover a function | `ucn tests <name>` | Test files and test function names |
+| Find which tests cover a function | `ucn tests <name>` | Test files and test function names. Scope with `--file`, `--class-name`, `--exclude` |
 | Extract specific lines from a file | `ucn lines --file=<file> --range=10-20` | Pull a line range without reading the whole file |
 | Find type definitions | `ucn typedef <name>` | Interfaces, enums, structs, traits, type aliases |
 | See a project's public API | `ucn api` or `ucn api --file=<file>` | All exported/public symbols with signatures |

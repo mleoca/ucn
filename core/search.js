@@ -1038,6 +1038,18 @@ function _buildSourceFileImporters(index, defs) {
         const srcDir = path.dirname(srcPath);
         const candidates = traits.testFileCandidates(srcBase, srcExt);
 
+        // Build set of directories to check for convention-based test files:
+        // same directory + configured testDirs (e.g., __tests__, tests/)
+        // + Java src/main→src/test mirror convention
+        const candidateDirs = new Set([srcDir]);
+        for (const td of (traits.testDirs || [])) {
+            candidateDirs.add(path.join(srcDir, td));
+        }
+        // Java convention: src/main/java/com/pkg → src/test/java/com/pkg
+        if (srcDir.includes(path.sep + 'main' + path.sep)) {
+            candidateDirs.add(srcDir.replace(path.sep + 'main' + path.sep, path.sep + 'test' + path.sep));
+        }
+
         for (const [absPath, fe] of index.files) {
             if (importers.has(absPath)) continue; // already included
             if (!isTestFile(fe.relativePath, fe.language) &&
@@ -1045,15 +1057,19 @@ function _buildSourceFileImporters(index, defs) {
                 continue; // not a test file
             }
 
-            // Check naming convention match
-            const testBaseName = path.basename(absPath);
-            if (candidates.some(c => testBaseName === c)) {
-                importers.add(absPath);
-                continue;
+            const testDir = path.dirname(absPath);
+
+            // Check naming convention match — must be in same dir or a test subdir
+            if (candidateDirs.has(testDir)) {
+                const testBaseName = path.basename(absPath);
+                if (candidates.some(c => testBaseName === c)) {
+                    importers.add(absPath);
+                    continue;
+                }
             }
 
             // Go: same-directory tests (package-scoped, no imports needed)
-            if (traits.packageScope === 'directory' && path.dirname(absPath) === srcDir) {
+            if (traits.packageScope === 'directory' && testDir === srcDir) {
                 importers.add(absPath);
                 continue;
             }

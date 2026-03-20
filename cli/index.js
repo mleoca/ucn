@@ -758,7 +758,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'tests': {
-            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly, className: flags.className, file: flags.file });
+            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly, className: flags.className, file: flags.file, exclude: flags.exclude });
             if (!ok) fail(error);
             printOutput(result,
                 r => output.formatTestsJson(r, arg),
@@ -1160,7 +1160,7 @@ FIND CODE
   toc                 Table of contents (compact; --detailed lists all symbols)
   search <term>       Text search (regex default, --context=N, --exclude=, --in=)
                       Structural: --type=function|class|call --param= --returns= --decorator= --exported --unused
-  tests <name>        Find test files for a function
+  tests <name>        Find test files for a function (--file, --class-name, --exclude)
   affected-tests <n>  Tests affected by a change (blast + test detection, --depth=N)
 
 ═══════════════════════════════════════════════════════════════════════════════
@@ -1308,7 +1308,7 @@ Commands:
   file-exports <file>    File's exported symbols
   imports <file>         What file imports
   exporters <file>       Who imports file
-  tests <name>           Find tests (--calls-only)
+  tests <name>           Find tests (--file, --class-name, --exclude, --calls-only)
   affected-tests <n>     Tests affected by a change (--depth=N)
   search <term>          Text search (--context=N, --exclude=, --in=)
                          Structural: --type= --param= --returns= --decorator= --exported --unused

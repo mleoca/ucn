@@ -4094,6 +4094,59 @@ describe('tests/about --exclude propagation', () => {
                 'about --exclude should filter TESTS section');
         } finally { rm(dir); }
     });
+
+    it('CLI project mode passes --exclude to tests', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+            'spec/lib.spec.js': 'const { save } = require("../lib");\nit("s", () => { save(); });',
+        });
+        try {
+            const out = runCli(dir, 'tests', ['save'], ['--exclude', 'spec']);
+            assert.ok(!out.includes('spec'), 'CLI --exclude should filter spec files');
+            assert.ok(out.includes('test/'), 'CLI should still show test files');
+        } finally { rm(dir); }
+    });
+});
+
+describe('tests --file: no basename collision across directories', () => {
+    it('Go: same-basename files in different packages are separated', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\ngo 1.21',
+            'a/util.go': 'package a\n\nfunc Save() int { return 1 }',
+            'a/util_test.go': 'package a\n\nimport "testing"\n\nfunc TestSave(t *testing.T) { Save() }',
+            'b/util.go': 'package b\n\nfunc Save() int { return 2 }',
+            'b/util_test.go': 'package b\n\nimport "testing"\n\nfunc TestSave(t *testing.T) { Save() }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'Save', file: 'a/util.go' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('a/util_test')),
+                'Should include a/util_test.go');
+            assert.ok(!r.result.some(t => t.file.includes('b/util_test')),
+                'Should NOT include b/util_test.go');
+        } finally { rm(dir); }
+    });
+
+    it('Java: same-basename classes in different packages are separated', () => {
+        const dir = tmp({
+            'com/a/Util.java': 'package com.a;\npublic class Util { public static int save() { return 1; } }',
+            'com/a/UtilTest.java': 'package com.a;\nimport org.junit.Test;\npublic class UtilTest { @Test public void testSave() { Util.save(); } }',
+            'com/b/Util.java': 'package com.b;\npublic class Util { public static int save() { return 2; } }',
+            'com/b/UtilTest.java': 'package com.b;\nimport org.junit.Test;\npublic class UtilTest { @Test public void testSave() { Util.save(); } }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'save', file: 'com/a/Util.java' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('com/a/UtilTest')),
+                'Should include com/a/UtilTest');
+            assert.ok(!r.result.some(t => t.file.includes('com/b/UtilTest')),
+                'Should NOT include com/b/UtilTest');
+        } finally { rm(dir); }
+    });
 });
 
 describe('CLI glob-mode parity', () => {
