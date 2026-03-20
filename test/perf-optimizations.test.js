@@ -258,7 +258,7 @@ describe('perf: importGraph/exportGraph as Sets', () => {
         }
     });
 
-    it('graph Sets survive cache save/load roundtrip', () => {
+    it('graph Sets survive cache save/load roundtrip with correct paths', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
@@ -273,8 +273,31 @@ describe('perf: importGraph/exportGraph as Sets', () => {
             index2.loadCache();
 
             const appPath = path.join(dir, 'app.js');
+            const libPath = path.join(dir, 'lib.js');
+
+            // Verify importGraph path resolution after cache roundtrip
             const imports = index2.importGraph.get(appPath);
             assert.ok(imports instanceof Set, 'importGraph values should be Sets after cache load');
+            assert.ok(imports.has(libPath), 'import edge path should resolve correctly after reload');
+
+            // Verify exportGraph path resolution
+            const exporters = index2.exportGraph.get(libPath);
+            assert.ok(exporters instanceof Set, 'exportGraph values should be Sets after cache load');
+            assert.ok(exporters.has(appPath), 'export edge path should resolve correctly after reload');
+
+            // Verify files Map uses correct absolute paths
+            assert.ok(index2.files.has(appPath), 'files Map should have absolute path for app.js');
+            assert.ok(index2.files.has(libPath), 'files Map should have absolute path for lib.js');
+
+            // Verify symbols have correct file paths
+            const helperDefs = index2.symbols.get('helper');
+            assert.ok(helperDefs, 'should have helper symbol');
+            assert.strictEqual(helperDefs[0].file, libPath, 'symbol file should be absolute path');
+
+            // Verify callers still work through cached paths (end-to-end accuracy check)
+            const callers = index2.findCallers('helper');
+            assert.ok(callers.length > 0, 'findCallers should work after cache reload');
+            assert.ok(callers.some(c => c.callerName === 'main'), 'should find main as caller of helper');
         } finally {
             rm(dir);
         }
