@@ -109,7 +109,7 @@ const FLAG_APPLICABILITY = {
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth'],
     usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
     toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
-    search:       ['name', 'term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
+    search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
     tests:        ['name', 'file', 'exclude', 'className', 'callsOnly'],
     affectedTests:['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
@@ -244,7 +244,7 @@ const REVERSE_PARAM_MAP = buildReverseParamMap();
  * One line per command: `about: file, exclude, class_name, ...`
  */
 function generateMcpParamSection() {
-    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (max_chars, max_files always accepted; flags not listed below are ignored):'];
+    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (max_chars, max_files, follow_symlinks always accepted; flags not listed below are ignored):'];
     for (const cmd of CANONICAL_COMMANDS) {
         const flags = FLAG_APPLICABILITY[cmd];
         if (!flags || flags.length === 0) continue;
