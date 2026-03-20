@@ -97,7 +97,7 @@ const PARAM_MAP = {
 const FLAG_APPLICABILITY = {
     // Understanding code
     about:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
-    context:      ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'minConfidence', 'showConfidence'],
+    context:      ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence'],
     impact:       ['file', 'exclude', 'className', 'top'],
     blast:        ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],

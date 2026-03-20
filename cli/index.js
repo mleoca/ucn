@@ -1213,7 +1213,7 @@ Common Flags:
   --code-only         Filter out comments/strings (search, usages)
   --with-types        Include type definitions (about, smart)
   --detailed          Show all symbols in toc (not just counts)
-  --include-tests     Include test files
+  --include-tests     Include test files in usage counts (about) and results (find, usages, deadcode)
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches

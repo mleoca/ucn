@@ -4148,6 +4148,40 @@ describe('about/context includeTests flag', () => {
                 'Callers should include test callers by default');
         } finally { rm(dir); }
     });
+
+    it('context always shows test callers (includeTests not applicable)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'test/lib.test.js': 'const { save } = require("../lib");\nfunction testSave() { save(); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'save' });
+            assert.ok(r.ok);
+            // context callers always include tests — no usage counts to control
+            assert.ok(r.result.callers.length > 0,
+                'context callers should include test callers');
+            assert.ok(r.result.callers.some(c => c.relativePath?.includes('test')),
+                'context should show test file as caller');
+        } finally { rm(dir); }
+    });
+
+    it('context --include-tests warns as inapplicable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
+        });
+        try {
+            const { spawnSync } = require('child_process');
+            const result = spawnSync('node', [
+                require('path').join(__dirname, '..', 'cli', 'index.js'),
+                dir, 'context', 'save', '--include-tests'
+            ], { timeout: 30000, encoding: 'utf-8' });
+            assert.ok((result.stderr || '').includes('no effect'),
+                'context --include-tests should warn on stderr');
+        } finally { rm(dir); }
+    });
 });
 
 describe('tests --file: no basename collision across directories', () => {
