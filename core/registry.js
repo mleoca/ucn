@@ -106,7 +106,7 @@ const FLAG_APPLICABILITY = {
     example:      ['file', 'className'],
     related:      ['file', 'className', 'top', 'all'],
     // Finding code
-    find:         ['file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all'],
+    find:         ['file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth'],
     usages:       ['file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
     toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
     search:       ['file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],

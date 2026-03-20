@@ -161,7 +161,10 @@ function usages(index, name, options = {}) {
     const usagesList = [];
 
     // Resolve file pattern for --file filter
-    const fileFilter = options.file ? index.resolveFilePathForQuery(options.file) : null;
+    const fileFilterRaw = options.file ? index.resolveFilePathForQuery(options.file) : null;
+    // resolveFilePathForQuery may return error objects for ambiguous/not-found — fall back to substring matching
+    const fileFilter = typeof fileFilterRaw === 'string' ? fileFilterRaw : null;
+    const fileSubstring = options.file || null; // fallback for unresolved patterns
 
     // Get definitions (filtered)
     let allDefinitions = index.symbols.get(name) || [];
@@ -170,6 +173,8 @@ function usages(index, name, options = {}) {
     }
     if (fileFilter) {
         allDefinitions = allDefinitions.filter(d => d.file === fileFilter);
+    } else if (fileSubstring) {
+        allDefinitions = allDefinitions.filter(d => d.relativePath && d.relativePath.includes(fileSubstring));
     }
     const definitions = options.exclude || options.in
         ? allDefinitions.filter(d => index.matchesFilters(d.relativePath, options))
@@ -187,8 +192,10 @@ function usages(index, name, options = {}) {
 
     // Scan all files for usages
     for (const [filePath, fileEntry] of index.files) {
-        // Apply --file filter
+        // Apply --file filter (exact match if resolved, substring fallback otherwise)
         if (fileFilter && filePath !== fileFilter) {
+            continue;
+        } else if (!fileFilter && fileSubstring && !fileEntry.relativePath.includes(fileSubstring)) {
             continue;
         }
         // Apply filters
@@ -838,9 +845,21 @@ function tests(index, nameOrFile, options = {}) {
     const callPattern = new RegExp(escapeRegExp(searchTerm) + '\\s*\\(');
     const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
 
+    // When className is provided, build a pattern to scope matches.
+    // We require the test file to also reference the class name (import, instantiation, or receiver).
+    const classNameFilter = options.className
+        ? new RegExp('\\b' + escapeRegExp(options.className) + '\\b')
+        : null;
+
     for (const { path: testPath, entry } of testFiles) {
         try {
             const content = index._readFile(testPath);
+
+            // className scoping: skip test files that don't reference the class at all
+            if (classNameFilter && !classNameFilter.test(content)) {
+                continue;
+            }
+
             const lines = content.split('\n');
             const matches = [];
 

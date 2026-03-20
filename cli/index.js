@@ -14,7 +14,7 @@ const { parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-// pickBestDefinition moved to execute.js — no longer needed here
+const { escapeRegExp } = require('../core/shared');
 const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
@@ -115,6 +115,7 @@ function parseFlags(tokens) {
         showConfidence: !tokens.includes('--no-confidence'),
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
         framework: getValueFlag('--framework'),
+        stack: getValueFlag('--stack'),
         workers: (() => {
             const v = getValueFlag('--workers');
             if (v === null) return undefined;
@@ -327,11 +328,11 @@ function runFileCommand(filePath, command, arg) {
         fn:      { name: arg, file: relativePath, ...flags },
         class:   { name: arg, file: relativePath, ...flags },
         find:    { name: arg, file: relativePath, ...flags },
-        usages:  { name: arg, ...flags },
+        usages:  { name: arg, file: relativePath, ...flags },
         search:  { term: arg, ...flags },
         lines:   { file: relativePath, range: arg },
-        typedef: { name: arg, ...flags },
-        api:     { file: relativePath },
+        typedef: { name: arg, file: relativePath, ...flags },
+        api:     { file: relativePath, limit: flags.limit },
     };
 
     const { ok, result, error, note } = execute(index, canonical, paramsByCommand[canonical]);
@@ -427,6 +428,11 @@ function runProjectCommand(rootDir, command, arg) {
     if (!usedCache) {
         index.build(null, { quiet: flags.quiet, forceRebuild: cacheWasLoaded, followSymlinks: flags.followSymlinks, maxFiles: flags.maxFiles, workers: flags.workers });
         needsCacheSave = flags.cache;
+        // Clear stale expand cache — line ranges may have shifted after rebuild
+        try {
+            const expandPath = path.join(index.root, '.ucn-cache', 'expandable.json');
+            if (fs.existsSync(expandPath)) fs.unlinkSync(expandPath);
+        } catch (_) { /* best-effort */ }
     }
 
     try {
@@ -439,7 +445,7 @@ function runProjectCommand(rootDir, command, arg) {
         // Map from camelCase flag name to CLI flag string
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
         // Flags that are global (not command-specific) or have truthy defaults — skip warning for these
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'stack', 'showConfidence']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
             // Skip falsy/default values (0, undefined, false, empty array)
@@ -487,7 +493,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'example': {
-            const { ok, result, error } = execute(index, 'example', { name: arg });
+            const { ok, result, error } = execute(index, 'example', { name: arg, file: flags.file, className: flags.className });
             if (!ok) fail(error);
             printOutput(result,
                 r => output.formatExampleJson(r, arg),
@@ -550,7 +556,7 @@ function runProjectCommand(rootDir, command, arg) {
             const items = cached?.items || [];
             const match = items.find(i => i.num === expandNum);
             const { ok, result, error } = execute(index, 'expand', {
-                match, itemNum: expandNum, itemCount: items.length
+                match, itemNum: expandNum, itemCount: items.length, validateRoot: true
             });
             if (!ok) fail(error);
             console.log(result.text);
@@ -558,21 +564,23 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'smart': {
-            const { ok, result, error } = execute(index, 'smart', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'smart', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatSmartJson, r => output.formatSmart(r, {
                 uncertainHint: 'use --include-uncertain to include all'
             }));
+            if (note) console.error(note);
             break;
         }
 
         case 'about': {
-            const { ok, result, error } = execute(index, 'about', { name: arg, ...flags });
+            const { ok, result, error, note } = execute(index, 'about', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result,
                 output.formatAboutJson,
                 r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence })
             );
+            if (note) console.error(note);
             break;
         }
 
@@ -616,7 +624,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'stacktrace': {
-            const { ok, result, error } = execute(index, 'stacktrace', { stack: arg });
+            const { ok, result, error } = execute(index, 'stacktrace', { stack: flags.stack || arg });
             if (!ok) fail(error);
             printOutput(result, output.formatStackTraceJson, output.formatStackTrace);
             break;
@@ -641,7 +649,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
-            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all });
+            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all, className: flags.className });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatFnResultJson, output.formatFnResult);
@@ -650,7 +658,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
-            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
+            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines, className: flags.className });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatClassResultJson, output.formatClassResult);
@@ -659,8 +667,9 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'lines': {
             requireArg(arg, 'Usage: ucn . lines <range> --file <path>');
-            const { ok, result, error } = execute(index, 'lines', { file: flags.file, range: arg });
+            const { ok, result, error, note } = execute(index, 'lines', { file: flags.file, range: arg });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result, output.formatLinesJson, r => output.formatLines(r));
             break;
         }
@@ -694,7 +703,7 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error } = execute(index, 'fileExports', { file: filePath });
             if (!ok) fail(error);
             printOutput(result,
-                r => JSON.stringify({ file: filePath, exports: r }, null, 2),
+                output.formatFileExportsJson,
                 r => output.formatFileExports(r, filePath)
             );
             break;
@@ -705,11 +714,7 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error } = execute(index, 'graph', { file: filePath, direction: flags.direction, depth: flags.depth, all: flags.all });
             if (!ok) fail(error);
             printOutput(result,
-                r => JSON.stringify({
-                    root: path.relative(index.root, r.root),
-                    nodes: r.nodes.map(n => ({ file: n.relativePath, depth: n.depth })),
-                    edges: r.edges.map(e => ({ from: path.relative(index.root, e.from), to: path.relative(index.root, e.to) }))
-                }, null, 2),
+                output.formatGraphJson,
                 r => output.formatGraph(r, { showAll: flags.all || flags.depth != null, maxDepth: flags.depth != null ? parseInt(flags.depth, 10) : 2, file: filePath })
             );
             break;
@@ -725,7 +730,7 @@ function runProjectCommand(rootDir, command, arg) {
         // ── Remaining commands ──────────────────────────────────────────
 
         case 'typedef': {
-            const { ok, result, error } = execute(index, 'typedef', { name: arg, exact: flags.exact });
+            const { ok, result, error } = execute(index, 'typedef', { name: arg, exact: flags.exact, file: flags.file, className: flags.className });
             if (!ok) fail(error);
             printOutput(result,
                 r => output.formatTypedefJson(r, arg),
@@ -735,7 +740,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'tests': {
-            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly });
+            const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly, className: flags.className });
             if (!ok) fail(error);
             printOutput(result,
                 r => output.formatTestsJson(r, arg),
@@ -794,8 +799,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'entrypoints': {
-            const { ok, result, error } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file, exclude: flags.exclude });
+            const { ok, result, error, note } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file, exclude: flags.exclude, includeTests: flags.includeTests, limit: flags.limit });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result,
                 output.formatEntrypointsJson,
                 r => output.formatEntrypoints(r)
@@ -814,8 +820,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'diffImpact': {
-            const { ok, result, error } = execute(index, 'diffImpact', { base: flags.base, staged: flags.staged, file: flags.file });
+            const { ok, result, error, note } = execute(index, 'diffImpact', { base: flags.base, staged: flags.staged, file: flags.file, limit: flags.limit, all: flags.all });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result, output.formatDiffImpactJson, r => output.formatDiffImpact(r, { all: flags.all }));
             break;
         }
@@ -1062,10 +1069,6 @@ function searchGlobFiles(files, term) {
 // HELPERS
 // ============================================================================
 
-function escapeRegExp(text) {
-    return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
 function isCommentOrString(line) {
     const trimmed = line.trim();
     return trimmed.startsWith('//') ||
@@ -1279,6 +1282,8 @@ Flags can be added per-command: context myFunc --include-methods
         if (input === 'rebuild') {
             console.log('Rebuilding index...');
             index.build(null, { quiet: true, forceRebuild: true, workers: flags.workers });
+            // Clear expand cache — stale line ranges after rebuild
+            if (iExpandCache) iExpandCache.clearForRoot(index.root);
             console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
             rl.prompt();
             return;
@@ -1344,7 +1349,7 @@ const INTERACTIVE_DISPATCH = {
     trace:        { params: 'name', format: (r) => output.formatTrace(r) },
     reverseTrace: { params: 'name', format: (r) => output.formatReverseTrace(r) },
     related:      { params: 'name', format: (r, _a, f) => output.formatRelated(r, { all: f.all, top: f.top }) },
-    example:      { params: (a) => ({ name: a }), format: (r, a) => output.formatExample(r, a) },
+    example:      { params: 'name', format: (r, a) => output.formatExample(r, a) },
 
     // ── Finding Code ─────────────────────────────────────────────────
     find:          { params: 'name', format: (r, a, f) => output.formatFindDetailed(r, a, { depth: f.depth, top: f.top, all: f.all }) },
@@ -1364,12 +1369,12 @@ const INTERACTIVE_DISPATCH = {
     // ── Refactoring Helpers ──────────────────────────────────────────
     plan:         { params: 'name', format: (r) => output.formatPlan(r) },
     verify:       { params: 'name', format: (r) => output.formatVerify(r) },
-    diffImpact:   { params: 'flags', format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
-    entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude }), format: (r) => output.formatEntrypoints(r) },
+    diffImpact:   { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit, all: f.all }), format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
+    entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude, includeTests: f.includeTests, limit: f.limit }), format: (r) => output.formatEntrypoints(r) },
 
     // ── Other ────────────────────────────────────────────────────────
     api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
-    stacktrace:   { params: (a) => ({ stack: a }), format: (r) => output.formatStackTrace(r) },
+    stacktrace:   { params: (a, f) => ({ stack: f.stack || a }), format: (r) => output.formatStackTrace(r) },
     stats:        { params: 'flags', format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
 };
 
@@ -1395,8 +1400,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
     switch (command) {
 
         case 'fn': {
-            if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>]'); return; }
-            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all });
+            if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>] [--class-name=<class>]'); return; }
+            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all, className: iflags.className });
             if (!ok) { console.log(error); return; }
             if (note) console.log(note);
             console.log(output.formatFnResult(result));
@@ -1443,7 +1448,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 itemCount = items.length;
             }
             const { ok, result, error } = execute(index, 'expand', {
-                match, itemNum: expandNum, itemCount, symbolName
+                match, itemNum: expandNum, itemCount, symbolName, validateRoot: true
             });
             if (!ok) { console.log(error); return; }
             console.log(result.text);
@@ -1451,7 +1456,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'context': {
-            const { ok, result, error } = execute(index, 'context', { name: arg, ...iflags });
+            const { ok, result, error, note } = execute(index, 'context', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
             const { text, expandable } = output.formatContext(result, {
                 methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
@@ -1460,6 +1465,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 showConfidence: iflags.showConfidence,
             });
             console.log(text);
+            if (note) console.log(note);
             if (cache) {
                 cache.save(index.root, arg, iflags.file, expandable);
             } else {
@@ -1469,8 +1475,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'deadcode': {
-            const { ok, result, error } = execute(index, 'deadcode', iflags);
+            const { ok, result, error, note } = execute(index, 'deadcode', iflags);
             if (!ok) { console.log(error); return; }
+            if (note) console.log(note);
             console.log(output.formatDeadcode(result, {
                 top: iflags.top,
                 decoratedHint: !iflags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
@@ -1480,8 +1487,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'search': {
-            const { ok, result, error, structural } = execute(index, 'search', { term: arg, ...iflags });
+            const { ok, result, error, structural, note } = execute(index, 'search', { term: arg, ...iflags });
             if (!ok) { console.log(error); return; }
+            if (note) console.log(note);
             if (structural) {
                 console.log(output.formatStructuralSearch(result));
             } else {

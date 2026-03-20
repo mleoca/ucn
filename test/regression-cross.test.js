@@ -3067,3 +3067,290 @@ describe('CLI ↔ MCP parity: all commands produce non-error output', function()
     });
 });
 
+// =============================================================================
+// Handoff report fixes: MCP error semantics, tests className scoping,
+// CLI adapter param gaps, expand cache invalidation
+// =============================================================================
+
+describe('fix: MCP isError semantics — !ok returns isError=true', () => {
+    let client;
+    before(async () => {
+        const { McpClient } = require('./helpers');
+        client = new McpClient();
+        await client.start();
+        await client.initialize();
+    });
+    after(() => client && client.stop());
+
+    it('about(nonexistent) returns isError=true', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'about',
+            project_dir: FIXTURES_PATH + '/javascript',
+            name: 'zzz_nonexistent_xyz',
+        });
+        assert.strictEqual(res.result?.isError, true, 'isError must be true for not-found symbol');
+        const text = res.result?.content?.[0]?.text || '';
+        assert.ok(/not found/i.test(text), 'Error text should mention "not found"');
+    });
+
+    it('context(nonexistent) returns isError=true', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context',
+            project_dir: FIXTURES_PATH + '/javascript',
+            name: 'zzz_nonexistent_xyz',
+        });
+        assert.strictEqual(res.result?.isError, true);
+    });
+
+    it('find(valid) returns isError absent/false', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'find',
+            project_dir: FIXTURES_PATH + '/javascript',
+            name: 'processData',
+        });
+        assert.ok(!res.result?.isError, 'Valid find should not set isError');
+    });
+
+    it('fn(nonexistent) returns isError=true', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'fn',
+            project_dir: FIXTURES_PATH + '/javascript',
+            name: 'zzz_nonexistent_xyz',
+        });
+        assert.strictEqual(res.result?.isError, true);
+    });
+
+    it('imports(nonexistent file) returns isError=true', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'imports',
+            project_dir: FIXTURES_PATH + '/javascript',
+            file: 'nonexistent.js',
+        });
+        assert.strictEqual(res.result?.isError, true);
+    });
+});
+
+describe('fix: tests() className scoping', () => {
+    it('tests with className filters to class-relevant test files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A { save() { return 1; } }\nmodule.exports = { A };',
+            'b.js': 'class B { save() { return 2; } }\nmodule.exports = { B };',
+            'test/a.test.js': 'const { A } = require("../a");\nit("A save", () => { new A().save(); });',
+            'test/b.test.js': 'const { B } = require("../b");\nit("B save", () => { new B().save(); });',
+        });
+        try {
+            const index = idx(dir);
+            // Without className: both test files match 'save'
+            const allTests = execute(index, 'tests', { name: 'save' });
+            assert.ok(allTests.ok);
+            assert.ok(allTests.result.length >= 2, 'Without className, both test files should match');
+
+            // With className=A: only a.test.js should match
+            const aTests = execute(index, 'tests', { name: 'save', className: 'A' });
+            assert.ok(aTests.ok);
+            assert.ok(aTests.result.length >= 1, 'Should find at least one test file for A');
+            assert.ok(aTests.result.every(r => !r.file.includes('b.test')), 'Should not include B test file');
+
+            // With className=B: only b.test.js should match
+            const bTests = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(bTests.ok);
+            assert.ok(bTests.result.length >= 1, 'Should find at least one test file for B');
+            assert.ok(bTests.result.every(r => !r.file.includes('a.test')), 'Should not include A test file');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: CLI fn --class-name passes through to execute', () => {
+    it('fn with --class-name disambiguates methods', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class A {\n  save() { return "A"; }\n}\nmodule.exports = { A };',
+            'b.js': 'class B {\n  save() { return "B"; }\n}\nmodule.exports = { B };',
+        });
+        try {
+            const index = idx(dir);
+            // Direct execute with className=A
+            const resultA = execute(index, 'fn', { name: 'save', className: 'A' });
+            assert.ok(resultA.ok, 'fn with className=A should succeed');
+            assert.ok(resultA.result.entries.length > 0);
+            assert.ok(resultA.result.entries[0].match.file.endsWith('a.js'), 'Should resolve to a.js');
+
+            // Direct execute with className=B
+            const resultB = execute(index, 'fn', { name: 'save', className: 'B' });
+            assert.ok(resultB.ok, 'fn with className=B should succeed');
+            assert.ok(resultB.result.entries.length > 0);
+            assert.ok(resultB.result.entries[0].match.file.endsWith('b.js'), 'Should resolve to b.js');
+
+            // CLI passes --class-name through
+            const cliOutput = runCli(dir, 'fn', ['save'], ['--class-name=A']);
+            assert.ok(cliOutput.includes('a.js'), 'CLI fn --class-name=A should show a.js');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: CLI example passes --file and --class-name to execute', () => {
+    it('example with --file narrows results', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }\nmodule.exports = { main };',
+        });
+        try {
+            // CLI should pass --file to execute
+            const cliOutput = runCli(dir, 'example', ['helper'], ['--file=app']);
+            assert.ok(cliOutput.includes('app.js') || cliOutput.includes('helper'), 'Should find example in app.js');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: CLI typedef passes --file and --class-name to execute', () => {
+    it('typedef with --file narrows results', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'types.ts': 'interface Config { name: string; }\nexport { Config };',
+            'other.ts': 'interface Config { value: number; }\nexport { Config };',
+        });
+        try {
+            const index = idx(dir);
+            // Execute directly with file filter
+            const result = execute(index, 'typedef', { name: 'Config', file: 'types.ts' });
+            assert.ok(result.ok);
+            assert.ok(result.result.length >= 1, 'Should find Config in types.ts');
+            assert.ok(result.result.every(r => r.relativePath.includes('types.ts')), 'All results from types.ts');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: CLI entrypoints passes --include-tests and --limit', () => {
+    it('entrypoints with --limit caps results via execute', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'const express = require("express");',
+                'const app = express();',
+                'app.get("/one", (req, res) => {});',
+                'app.get("/two", (req, res) => {});',
+                'app.get("/three", (req, res) => {});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'entrypoints', { limit: 1 });
+            assert.ok(result.ok);
+            // If there are entrypoints, limit should cap them
+            if (result.result.length > 0) {
+                assert.ok(result.result.length <= 1, 'Should respect limit=1');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: CLI diffImpact passes --limit', () => {
+    it('diffImpact limit applies to changed array', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function a() {}\nfunction b() {}\nmodule.exports = { a, b };',
+        });
+        try {
+            // Initialize a git repo so diffImpact can work
+            execSync('git init && git add -A && git commit -m init', { cwd: dir, stdio: 'pipe' });
+            // Make a change
+            fs.writeFileSync(path.join(dir, 'lib.js'), 'function a() { return 1; }\nfunction b() { return 2; }\nmodule.exports = { a, b };');
+
+            const index = idx(dir);
+            const result = execute(index, 'diffImpact', { limit: 1 });
+            assert.ok(result.ok);
+            // If there are changes, limit should cap them
+            if (result.result && result.result.changed && result.result.changed.length > 1) {
+                assert.ok(result.result.changed.length <= 1, 'Should respect limit=1');
+                assert.ok(result.note, 'Should have limit note');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: applyClassMethodSyntax splits name even when className is set', () => {
+    it('Bar.method --class-name=Foo uses Foo as class, method as name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class Foo {\n  method() { return "Foo"; }\n}\nmodule.exports = { Foo };',
+            'b.js': 'class Bar {\n  method() { return "Bar"; }\n}\nmodule.exports = { Bar };',
+        });
+        try {
+            const index = idx(dir);
+            // When className is explicit, dot-split should still extract method name
+            const result = execute(index, 'fn', { name: 'Bar.method', className: 'Foo' });
+            assert.ok(result.ok, 'Should succeed');
+            // Should find Foo.method, not Bar.method (explicit --class-name wins)
+            assert.ok(result.result.entries.length > 0);
+            assert.ok(result.result.entries[0].match.file.endsWith('a.js'), 'Should resolve to Foo in a.js');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: usages file filter graceful degradation', () => {
+    it('usages with file filter works with substring match', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib/utils.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib/utils");\nhelper();\n',
+        });
+        try {
+            const index = idx(dir);
+            // Use a partial file pattern that matches
+            const result = execute(index, 'usages', { name: 'helper', file: 'utils' });
+            assert.ok(result.ok);
+            // Should find usages filtered to utils.js
+            const defUsages = result.result.filter(u => u.isDefinition);
+            assert.ok(defUsages.length > 0, 'Should find definition in utils');
+            assert.ok(defUsages.every(u => u.relativePath?.includes('utils')), 'All defs from utils');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: expand cache invalidation on rebuild', () => {
+    it('CLI clears expandable.json when index is rebuilt', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }',
+        });
+        try {
+            // Run context to create expandable.json
+            runCli(dir, 'context', ['main']);
+            const expandPath = path.join(dir, '.ucn-cache', 'expandable.json');
+            assert.ok(fs.existsSync(expandPath), 'expandable.json should exist after context');
+
+            // Modify a file to make cache stale — forces rebuild
+            fs.writeFileSync(path.join(dir, 'lib.js'),
+                'function helper() { return 2; }\nfunction helper2() {}\nmodule.exports = { helper, helper2 };'
+            );
+
+            // Run another command that triggers rebuild
+            runCli(dir, 'toc', []);
+
+            // expandable.json should be cleared
+            assert.ok(!fs.existsSync(expandPath), 'expandable.json should be cleared after rebuild');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+

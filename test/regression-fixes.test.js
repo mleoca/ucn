@@ -2536,12 +2536,12 @@ describe('Bug Hunt: imports content.split performance', () => {
 
 describe('Bug hunt 2026-03-02 regressions', () => {
 
-    // Bug 1: example/related returned isError:true for not-found in MCP
-    // Fix: mcp/server.js — changed toolError to toolResult for soft errors
-    describe('fix: example/related MCP soft errors', () => {
+    // Bug 1: example/related returned soft errors for not-found in MCP
+    // Fix: mcp/server.js — all !ok results now return isError=true for reliable client branching
+    describe('fix: example/related MCP error semantics', () => {
         let client;
 
-        it('example(nonexistent) returns soft result, not isError', async () => {
+        it('example(nonexistent) returns isError=true', async () => {
             const { McpClient } = require('./helpers');
             client = new McpClient();
             await client.start();
@@ -2553,20 +2553,18 @@ describe('Bug hunt 2026-03-02 regressions', () => {
                 name: 'zzz_nonexistent_symbol_xyz',
             });
 
-            // Should NOT be a protocol-level error (isError should be false/absent)
-            assert.ok(!res.error, 'Should not be a protocol error');
+            // Should be a protocol-level error so MCP clients can reliably branch on failure
+            assert.ok(!res.error, 'Should not be a transport error');
             const content = res.result?.content;
             assert.ok(Array.isArray(content), 'Should have content array');
             const text = content.map(c => c.text).join('');
-            assert.ok(/no.*examples found/i.test(text), `Text should mention "no examples found", got: ${text}`);
-            // Verify isError is NOT true
-            const isError = content.some(c => c.isError) || res.result?.isError;
-            assert.ok(!isError, 'isError should not be true for not-found example');
+            assert.ok(/no.*examples found/i.test(text) || /not found/i.test(text), `Text should mention "no examples found" or "not found", got: ${text}`);
+            assert.strictEqual(res.result?.isError, true, 'isError should be true for not-found example');
 
             client.stop();
         });
 
-        it('related(nonexistent) returns soft result, not isError', async () => {
+        it('related(nonexistent) returns isError=true', async () => {
             const { McpClient } = require('./helpers');
             client = new McpClient();
             await client.start();
@@ -2578,13 +2576,12 @@ describe('Bug hunt 2026-03-02 regressions', () => {
                 name: 'zzz_nonexistent_symbol_xyz',
             });
 
-            assert.ok(!res.error, 'Should not be a protocol error');
+            assert.ok(!res.error, 'Should not be a transport error');
             const content = res.result?.content;
             assert.ok(Array.isArray(content), 'Should have content array');
             const text = content.map(c => c.text).join('');
             assert.ok(/not found/i.test(text), `Text should mention "not found", got: ${text}`);
-            const isError = content.some(c => c.isError) || res.result?.isError;
-            assert.ok(!isError, 'isError should not be true for not-found related');
+            assert.strictEqual(res.result?.isError, true, 'isError should be true for not-found related');
 
             client.stop();
         });

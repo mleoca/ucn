@@ -62,14 +62,14 @@ function splitClassMethod(name) {
 /**
  * Apply Class.method syntax to params object.
  * If name contains ".", splits it and sets p.name and p.className.
- * Only applies if p.className is not already set.
+ * When p.className is already set, still split the name to extract the method
+ * part (explicit --class-name takes precedence over the class from dot notation).
  */
 function applyClassMethodSyntax(p) {
-    if (p.className) return; // already set explicitly
     const split = splitClassMethod(p.name);
     if (split) {
         p.name = split.methodName;
-        p.className = split.className;
+        if (!p.className) p.className = split.className;
     }
 }
 
@@ -343,7 +343,8 @@ const HANDLERS = {
             withTypes: p.withTypes || false,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
-        return { ok: true, result };
+        const tNote = truncationNote(index);
+        return { ok: true, result, ...(tNote && { note: tNote }) };
     },
 
     trace: (index, p) => {

@@ -242,49 +242,49 @@ const tests = [
         tool: 'ucn',
         desc: 'api(file=nonexistent) returns error message',
         args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' },
-        assert: (res, text, isError) => (isError === false && /no files matched/i.test(text)) || 'Expected soft error with "No files matched" message'
+        assert: (res, text, isError) => (isError === true && /no files matched/i.test(text)) || 'Expected isError with "No files matched" message'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'api(file=nonexistent) message contains "No files matched"',
         args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent.js' },
-        assert: (res, text, isError) => (!isError && /no files matched/i.test(text)) || 'Expected file-not-found error message'
+        assert: (res, text, isError) => (isError && /no files matched/i.test(text)) || 'Expected file-not-found error message'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'smart(nonexistent) returns "not found" message',
         args: { command: 'smart', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
-        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent smart target'
+        assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent smart target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'context(nonexistent) returns "not found" message',
         args: { command: 'context', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
-        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent context target'
+        assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent context target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'example(nonexistent) returns "no examples" message',
         args: { command: 'example', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
-        assert: (res, text, isError) => (!isError && /no.*examples found|not found/i.test(text)) || 'Expected "no examples found" message for nonexistent example target'
+        assert: (res, text, isError) => (isError && /no.*examples found|not found/i.test(text)) || 'Expected "no examples found" message for nonexistent example target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'related(nonexistent) returns "not found" message',
         args: { command: 'related', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
-        assert: (res, text, isError) => (!isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent related target'
+        assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent related target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
-        desc: 'lines(range="5-0") returns error message',
+        desc: 'lines(range="5-0") returns validation error for end=0',
         args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '5-0' },
-        assert: (res, text, isError) => (!isError && text.length > 0) || 'Expected soft error with message for invalid range'
+        assert: (res, text, isError) => (isError && /line numbers must be >= 1/i.test(text)) || 'Expected validation error for end line 0'
     },
     {
         category: 'Correctness',

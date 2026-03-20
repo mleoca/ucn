@@ -714,11 +714,10 @@ function testProcessData() {
     });
 
     describe('P1 fix: McpClient.callTool propagates isError', () => {
-        it('callTool shorthand returns soft error for analysis failures', async () => {
-            // api with nonexistent file returns a soft error (no isError flag)
-            // to avoid killing sibling calls in parallel batches
+        it('callTool returns isError=true for analysis failures', async () => {
+            // api with nonexistent file returns isError=true so MCP clients can branch on failure
             const res = await mcpClient.callTool({ command: 'api', project_dir: FIXTURES_PATH, file: 'nonexistent/path.js' });
-            assert.strictEqual(res.isError, false, 'Analysis errors should be soft (no isError flag)');
+            assert.strictEqual(res.isError, true, 'Analysis errors should set isError=true');
             assert.ok(res.text.includes('not found') || res.text.includes('No file'), 'Should contain error message in text');
         });
 
@@ -741,10 +740,10 @@ function testProcessData() {
             assert.ok(!output.includes('at '), 'Should not show stack trace');
         });
 
-        it('MCP rejects invalid base ref with soft error', async () => {
-            // Invalid ref returns soft error to avoid killing sibling calls
+        it('MCP rejects invalid base ref with isError=true', async () => {
+            // Invalid ref returns isError=true so MCP clients can detect failures
             const res = await mcpClient.callTool({ command: 'diff_impact', project_dir: FIXTURES_PATH, base: '$(evil)' });
-            assert.strictEqual(res.isError, false, 'Should be soft error (no isError flag)');
+            assert.strictEqual(res.isError, true, 'Should return isError=true for invalid ref');
             assert.ok(res.text.includes('Invalid git ref'), 'Should mention invalid ref');
         });
     });

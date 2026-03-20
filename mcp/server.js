@@ -178,13 +178,6 @@ function resolveAndValidatePath(index, file) {
     return resolved;
 }
 
-function requireName(name) {
-    if (!name || !name.trim()) {
-        return toolError('Symbol name is required.');
-    }
-    return null;
-}
-
 // ============================================================================
 // CONSOLIDATED TOOL REGISTRATION
 // ============================================================================
@@ -332,19 +325,21 @@ server.registerTool(
 
             case 'about': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'about', ep);
-                if (!ok) return tr(error); // soft error — won't kill sibling calls
-                return tr(output.formatAbout(result, {
+                const { ok, result, error, note } = execute(index, 'about', ep);
+                if (!ok) return toolError(error);
+                let aboutText = output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.',
                     showConfidence: ep.showConfidence !== false,
-                }));
+                });
+                if (note) aboutText += '\n\n' + note;
+                return tr(aboutText);
             }
 
             case 'context': {
                 index = getIndex(project_dir, ep);
                 const { ok, result: ctx, error, note } = execute(index, 'context', ep);
-                if (!ok) return tr(error); // context uses soft error (not toolError)
+                if (!ok) return toolError(error);
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
                     showConfidence: ep.showConfidence !== false,
@@ -358,7 +353,7 @@ server.registerTool(
             case 'impact': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'impact', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let impactText = output.formatImpact(result);
                 if (note) impactText += '\n\n' + note;
                 return tr(impactText);
@@ -367,7 +362,7 @@ server.registerTool(
             case 'blast': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'blast', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let blastText = output.formatBlast(result, {
                     allHint: 'Set depth to expand all children.',
                 });
@@ -377,15 +372,17 @@ server.registerTool(
 
             case 'smart': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'smart', ep);
-                if (!ok) return tr(error); // soft error
-                return tr(output.formatSmart(result));
+                const { ok, result, error, note } = execute(index, 'smart', ep);
+                if (!ok) return toolError(error);
+                let smartText = output.formatSmart(result);
+                if (note) smartText += '\n\n' + note;
+                return tr(smartText);
             }
 
             case 'trace': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'trace', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let traceText = output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
@@ -397,7 +394,7 @@ server.registerTool(
             case 'reverse_trace': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'reverseTrace', ep);
-                if (!ok) return tr(error);
+                if (!ok) return toolError(error);
                 let rtText = output.formatReverseTrace(result, {
                     allHint: 'Set depth to expand all children.',
                 });
@@ -408,16 +405,14 @@ server.registerTool(
             case 'example': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'example', ep);
-                if (!ok) return tr(error);
-                if (!result) return tr(`No usage examples found for "${ep.name}".`);
+                if (!ok) return toolError(error);
                 return tr(output.formatExample(result, ep.name));
             }
 
             case 'related': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'related', ep);
-                if (!ok) return tr(error);
-                if (!result) return tr(`Symbol "${ep.name}" not found.`);
+                if (!ok) return toolError(error);
                 let relText = output.formatRelated(result, {
                     all: ep.all || false, top: ep.top,
                     allHint: 'Repeat with all=true to show all.'
@@ -431,7 +426,7 @@ server.registerTool(
             case 'find': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'find', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let text = output.formatFind(result, ep.name, ep.top);
                 if (note) text += '\n\n' + note;
                 return tr(text);
@@ -440,7 +435,7 @@ server.registerTool(
             case 'usages': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'usages', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let text = output.formatUsages(result, ep.name);
                 if (note) text += '\n\n' + note;
                 return tr(text);
@@ -449,7 +444,7 @@ server.registerTool(
             case 'toc': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'toc', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let text = output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 });
@@ -459,25 +454,31 @@ server.registerTool(
 
             case 'search': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error, structural } = execute(index, 'search', ep);
-                if (!ok) return tr(error); // soft error
+                const { ok, result, error, structural, note } = execute(index, 'search', ep);
+                if (!ok) return toolError(error);
+                let searchText;
                 if (structural) {
-                    return tr(output.formatStructuralSearch(result));
+                    searchText = output.formatStructuralSearch(result);
+                } else {
+                    searchText = output.formatSearch(result, ep.term);
                 }
-                return tr(output.formatSearch(result, ep.term));
+                if (note) searchText += '\n\n' + note;
+                return tr(searchText);
             }
 
             case 'tests': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'tests', ep);
-                if (!ok) return tr(error); // soft error
-                return tr(output.formatTests(result, ep.name));
+                const { ok, result, error, note } = execute(index, 'tests', ep);
+                if (!ok) return toolError(error);
+                let testsText = output.formatTests(result, ep.name);
+                if (note) testsText += '\n\n' + note;
+                return tr(testsText);
             }
 
             case 'affected_tests': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'affectedTests', ep);
-                if (!ok) return tr(error);
+                if (!ok) return toolError(error);
                 let atText = output.formatAffectedTests(result, { all: ep.all });
                 if (note) atText += '\n\n' + note;
                 return tr(atText);
@@ -486,7 +487,7 @@ server.registerTool(
             case 'deadcode': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'deadcode', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 const dcNote = note;
                 let dcText = output.formatDeadcode(result, {
                     top: ep.top || 0,
@@ -499,9 +500,11 @@ server.registerTool(
 
             case 'entrypoints': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'entrypoints', ep);
-                if (!ok) return tr(error);
-                return tr(output.formatEntrypoints(result));
+                const { ok, result, error, note } = execute(index, 'entrypoints', ep);
+                if (!ok) return toolError(error);
+                let epText = output.formatEntrypoints(result);
+                if (note) epText += '\n\n' + note;
+                return tr(epText);
             }
 
             // ── File Dependencies ───────────────────────────────────────
@@ -509,28 +512,28 @@ server.registerTool(
             case 'imports': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'imports', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatImports(result, ep.file));
             }
 
             case 'exporters': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'exporters', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatExporters(result, ep.file));
             }
 
             case 'file_exports': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fileExports', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatFileExports(result, ep.file));
             }
 
             case 'graph': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'graph', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatGraph(result, {
                     showAll: ep.all || ep.depth !== undefined,
                     maxDepth: ep.depth ?? 2, file: ep.file,
@@ -542,7 +545,7 @@ server.registerTool(
             case 'circular_deps': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'circularDeps', ep);
-                if (!ok) return tr(error);
+                if (!ok) return toolError(error);
                 return tr(output.formatCircularDeps(result));
             }
 
@@ -551,22 +554,24 @@ server.registerTool(
             case 'verify': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'verify', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatVerify(result));
             }
 
             case 'plan': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'plan', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatPlan(result));
             }
 
             case 'diff_impact': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'diffImpact', ep);
-                if (!ok) return tr(error); // soft error — e.g. "not a git repo"
-                return tr(output.formatDiffImpact(result, { all: ep.all }));
+                const { ok, result, error, note } = execute(index, 'diffImpact', ep);
+                if (!ok) return toolError(error);
+                let diText = output.formatDiffImpact(result, { all: ep.all });
+                if (note) diText += '\n\n' + note;
+                return tr(diText);
             }
 
             // ── Other ───────────────────────────────────────────────────
@@ -574,21 +579,21 @@ server.registerTool(
             case 'typedef': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'typedef', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatTypedef(result, ep.name));
             }
 
             case 'stacktrace': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stacktrace', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(output.formatStackTrace(result));
             }
 
             case 'api': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'api', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 let apiText = output.formatApi(result, ep.file || '.');
                 if (note) apiText += '\n\n' + note;
                 return tr(apiText);
@@ -596,19 +601,19 @@ server.registerTool(
 
             case 'stats': {
                 index = getIndex(project_dir, ep);
-                const { ok, result, error } = execute(index, 'stats', ep);
-                if (!ok) return tr(error); // soft error
-                return tr(output.formatStats(result, { top: ep.top || 0 }));
+                const { ok, result, error, note } = execute(index, 'stats', ep);
+                if (!ok) return toolError(error);
+                let statsText = output.formatStats(result, { top: ep.top || 0 });
+                if (note) statsText += '\n\n' + note;
+                return tr(statsText);
             }
 
             // ── Extracting Code (via execute) ────────────────────────────
 
             case 'fn': {
-                const err = requireName(ep.name);
-                if (err) return err;
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'fn', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
@@ -619,14 +624,9 @@ server.registerTool(
             }
 
             case 'class': {
-                const err = requireName(ep.name);
-                if (err) return err;
-                if (ep.maxLines !== undefined && (!Number.isInteger(ep.maxLines) || ep.maxLines < 1)) {
-                    return toolError(`Invalid max_lines: ${ep.maxLines}. Must be a positive integer.`);
-                }
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'class', ep);
-                if (!ok) return tr(error);  // soft error (class not found)
+                if (!ok) return toolError(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
@@ -639,7 +639,7 @@ server.registerTool(
             case 'lines': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'lines', ep);
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 // MCP path security: validate file is within project root
                 const check = resolveAndValidatePath(index, result.relativePath);
                 if (typeof check !== 'string') return check;
@@ -657,7 +657,7 @@ server.registerTool(
                     itemCount: lookup.itemCount, symbolName: lookup.symbolName,
                     validateRoot: true
                 });
-                if (!ok) return tr(error); // soft error
+                if (!ok) return toolError(error);
                 return tr(result.text);
             }
 
