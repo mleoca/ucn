@@ -1004,7 +1004,7 @@ function runGlobCommand(pattern, command, arg) {
             break;
         case 'about':
             printOutput(result, output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, depth: flags.depth, showConfidence: flags.showConfidence }));
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence }));
             break;
         case 'context':
             if (flags.json) {
@@ -1013,6 +1013,7 @@ function runGlobCommand(pattern, command, arg) {
                 const { text } = output.formatContext(result, {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     uncertainHint: 'use --include-uncertain to include all',
+                    expandHint: '',  // expand not available in glob mode
                     showConfidence: flags.showConfidence,
                 });
                 console.log(text);
@@ -1074,7 +1075,8 @@ function runGlobCommand(pattern, command, arg) {
             break;
         }
         case 'graph':
-            printOutput(result, output.formatGraphJson, output.formatGraph);
+            printOutput(result, output.formatGraphJson,
+                r => output.formatGraph(r, { showAll: flags.all || flags.depth != null, maxDepth: flags.depth }));
             break;
         case 'circularDeps':
             printOutput(result, output.formatCircularDepsJson, output.formatCircularDeps);

@@ -123,7 +123,7 @@ const FLAG_APPLICABILITY = {
     imports:      ['file'],
     exporters:    ['file'],
     fileExports:  ['file'],
-    graph:        ['file', 'depth', 'direction'],
+    graph:        ['file', 'depth', 'direction', 'all'],
     circularDeps: ['file', 'exclude'],
     // Refactoring
     verify:       ['file', 'className'],

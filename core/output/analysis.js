@@ -80,7 +80,7 @@ function formatContextJson(context) {
 function formatContext(ctx, options = {}) {
     if (!ctx) return { text: 'Symbol not found.', expandable: [] };
 
-    const expandHint = options.expandHint || 'Use ucn_expand with item number to see code for any item.';
+    const expandHint = options.expandHint != null ? options.expandHint : 'Use ucn_expand with item number to see code for any item.';
     const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded. Use include_methods=true to include them.';
 
     const lines = [];

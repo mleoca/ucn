@@ -3888,6 +3888,36 @@ describe('CLI glob-mode parity', () => {
         assert.ok(out.includes('utils.js:1-3'), 'lines should show file:range header');
         assert.ok(!out.includes('"file"'), 'lines text mode should not be JSON');
     });
+
+    it('glob mode about --expand shows callee previews', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const expandOut = runCli(pattern, 'about', ['helper'], ['--expand']);
+        const plainOut = runCli(pattern, 'about', ['helper']);
+        // --expand should produce more output (inline code previews)
+        assert.ok(expandOut.length > plainOut.length,
+            'about --expand should produce more output than plain about');
+    });
+
+    it('glob mode context does not advertise expand', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const out = runCli(pattern, 'context', ['helper']);
+        assert.ok(!out.includes('ucn_expand'), 'glob context should not mention ucn_expand');
+        assert.ok(!out.includes('expand'), 'glob context should not advertise expand');
+    });
+
+    it('glob mode graph --all suppresses truncation', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const defaultOut = runCli(pattern, 'graph', ['utils.js']);
+        const allOut = runCli(pattern, 'graph', ['utils.js'], ['--all']);
+        // --all should not truncate; at minimum should not have fewer lines
+        assert.ok(allOut.split('\n').length >= defaultOut.split('\n').length,
+            'graph --all should show at least as many lines as default');
+    });
+
+    it('graph --all no longer warns as inapplicable', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'graph', ['utils.js'], ['--all']);
+        assert.ok(!out.includes('has no effect'), 'graph --all should not warn as inapplicable');
+    });
 });
 
 describe('fix: CLI fn --class-name passes through to execute', () => {
