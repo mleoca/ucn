@@ -3817,6 +3817,79 @@ describe('CLI file-mode scoping', () => {
     });
 });
 
+describe('CLI glob-mode parity', () => {
+    it('glob mode supports about, context, tests commands', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        // about
+        const aboutOut = runCli(pattern, 'about', ['helper'], ['--json']);
+        const about = JSON.parse(aboutOut);
+        assert.ok(about.found, 'glob about should find helper');
+        // context
+        const ctxOut = runCli(pattern, 'context', ['helper']);
+        assert.ok(ctxOut.includes('Context for helper'), 'glob context should show header');
+        assert.ok(!ctxOut.includes('[object Object]'), 'glob context should not print raw object');
+        // tests
+        const testsOut = runCli(pattern, 'tests', ['helper']);
+        assert.ok(testsOut.includes('Tests for "helper"'), 'glob tests should show header');
+    });
+
+    it('glob mode passes filePath to imports/exporters/file-exports formatters', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const importsOut = runCli(pattern, 'imports', ['utils.js']);
+        assert.ok(importsOut.includes('utils.js'), 'imports header should show filename');
+        assert.ok(!importsOut.includes('undefined'), 'imports header should not show undefined');
+
+        const exportersOut = runCli(pattern, 'exporters', ['utils.js']);
+        assert.ok(!exportersOut.includes('undefined'), 'exporters header should not show undefined');
+
+        const feOut = runCli(pattern, 'file-exports', ['utils.js']);
+        assert.ok(!feOut.includes('undefined'), 'file-exports header should not show undefined');
+    });
+
+    it('glob mode passes --show-confidence to about formatter', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        // --show-confidence adds confidence annotations to caller lines;
+        // verify glob output matches project mode
+        const globOut = runCli(pattern, 'about', ['helper'], ['--show-confidence']);
+        const projOut = runCli(FIXTURES_PATH + '/javascript', 'about', ['helper'], ['--show-confidence']);
+        const globConf = (globOut.match(/confidence/g) || []).length;
+        const projConf = (projOut.match(/confidence/g) || []).length;
+        assert.strictEqual(globConf, projConf,
+            'glob and project mode should show same number of confidence annotations');
+    });
+
+    it('glob mode passes --show-confidence to context formatter', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const withConf = runCli(pattern, 'context', ['helper'], ['--show-confidence']);
+        assert.ok(withConf.includes('confidence'), 'glob context --show-confidence should show confidence');
+    });
+
+    it('glob mode passes --top to related formatter', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const topOne = runCli(pattern, 'related', ['helper'], ['--top', '1']);
+        const topAll = runCli(pattern, 'related', ['helper']);
+        // --top 1 should produce fewer or equal lines than default
+        assert.ok(topOne.split('\n').length <= topAll.split('\n').length,
+            'glob related --top 1 should limit output');
+    });
+
+    it('glob mode api passes positional file arg', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const out = runCli(pattern, 'api', ['utils.js'], ['--json']);
+        const parsed = JSON.parse(out);
+        // Should only show utils.js exports, not all files
+        assert.ok(parsed.exports.every(e => e.file === 'utils.js'),
+            'glob api utils.js should only show utils.js exports');
+    });
+
+    it('glob mode lines has proper formatter', () => {
+        const pattern = FIXTURES_PATH + '/javascript/**/*.js';
+        const out = runCli(pattern, 'lines', ['1-3'], ['--file', 'utils.js']);
+        assert.ok(out.includes('utils.js:1-3'), 'lines should show file:range header');
+        assert.ok(!out.includes('"file"'), 'lines text mode should not be JSON');
+    });
+});
+
 describe('fix: CLI fn --class-name passes through to execute', () => {
     it('fn with --class-name disambiguates methods', () => {
         const dir = tmp({

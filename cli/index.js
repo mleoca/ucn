@@ -947,10 +947,10 @@ function runGlobCommand(pattern, command, arg) {
     }
     // Merge flags first, then set positional overrides so they aren't wiped
     Object.assign(params, flags);
-    if (canonical === 'stacktrace') {
-        params.stack = arg || '';
+    if (canonical === 'stacktrace' && arg) {
+        params.stack = arg;
     }
-    if (canonical === 'lines') {
+    if (canonical === 'lines' && arg) {
         params.range = arg;
     }
     if (['imports', 'exporters', 'fileExports', 'graph', 'api'].includes(canonical)) {
@@ -1003,7 +1003,8 @@ function runGlobCommand(pattern, command, arg) {
             printOutput(result, output.formatStatsJson, r => output.formatStats(r, { top: flags.top }));
             break;
         case 'about':
-            printOutput(result, output.formatAboutJson, output.formatAbout);
+            printOutput(result, output.formatAboutJson,
+                r => output.formatAbout(r, { expand: flags.expand, depth: flags.depth, showConfidence: flags.showConfidence }));
             break;
         case 'context':
             if (flags.json) {
@@ -1012,6 +1013,7 @@ function runGlobCommand(pattern, command, arg) {
                 const { text } = output.formatContext(result, {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     uncertainHint: 'use --include-uncertain to include all',
+                    showConfidence: flags.showConfidence,
                 });
                 console.log(text);
             }
@@ -1023,7 +1025,8 @@ function runGlobCommand(pattern, command, arg) {
             printOutput(result, output.formatImpactJson, output.formatImpact);
             break;
         case 'related':
-            printOutput(result, output.formatRelatedJson, output.formatRelated);
+            printOutput(result, output.formatRelatedJson,
+                r => output.formatRelated(r, { all: flags.all, top: flags.top }));
             break;
         case 'trace':
             printOutput(result, output.formatTraceJson, output.formatTrace);
@@ -1038,7 +1041,8 @@ function runGlobCommand(pattern, command, arg) {
             printOutput(result, r => output.formatTestsJson(r, arg), r => output.formatTests(r, arg));
             break;
         case 'affectedTests':
-            printOutput(result, output.formatAffectedTestsJson, output.formatAffectedTests);
+            printOutput(result, output.formatAffectedTestsJson,
+                r => output.formatAffectedTests(r, { all: flags.all }));
             break;
         case 'example':
             printOutput(result, r => output.formatExampleJson(r, arg), r => output.formatExample(r, arg));
@@ -1049,18 +1053,26 @@ function runGlobCommand(pattern, command, arg) {
         case 'plan':
             printOutput(result, output.formatPlanJson, output.formatPlan);
             break;
-        case 'imports':
-            printOutput(result, output.formatImportsJson, output.formatImports);
+        case 'imports': {
+            const filePath = params.file;
+            printOutput(result, r => output.formatImportsJson(r, filePath), r => output.formatImports(r, filePath));
             break;
-        case 'exporters':
-            printOutput(result, output.formatExportersJson, output.formatExporters);
+        }
+        case 'exporters': {
+            const filePath = params.file;
+            printOutput(result, r => output.formatExportersJson(r, filePath), r => output.formatExporters(r, filePath));
             break;
-        case 'fileExports':
-            printOutput(result, output.formatFileExportsJson, output.formatFileExports);
+        }
+        case 'fileExports': {
+            const filePath = params.file;
+            printOutput(result, r => output.formatFileExportsJson(r, filePath), r => output.formatFileExports(r, filePath));
             break;
-        case 'api':
-            printOutput(result, output.formatApiJson, output.formatApi);
+        }
+        case 'api': {
+            const filePath = params.file;
+            printOutput(result, r => output.formatApiJson(r, filePath), r => output.formatApi(r, filePath));
             break;
+        }
         case 'graph':
             printOutput(result, output.formatGraphJson, output.formatGraph);
             break;
