@@ -304,6 +304,11 @@ function runFileCommand(filePath, command, arg) {
         if (['imports', 'exporters', 'fileExports', 'graph'].includes(canonical) && !arg) {
             effectiveArg = filePath;
         }
+        // Scope to the target file unless an explicit --file was provided
+        if (!flags.file) {
+            const relPath = path.relative(projectRoot, path.resolve(filePath));
+            flags.file = relPath;
+        }
         runProjectCommand(projectRoot, command, effectiveArg);
         return;
     }
@@ -912,28 +917,42 @@ function runGlobCommand(pattern, command, arg) {
     const index = new ProjectIndex(rootDir);
     index.build(files, { quiet: true });
 
-    // Supported commands — anything that works with an index
-    const supportedGlobCommands = new Set(['toc', 'find', 'search', 'fn', 'class', 'usages', 'deadcode', 'typedef', 'stats']);
-    if (!supportedGlobCommands.has(canonical)) {
-        console.error(`Command "${command}" not supported in glob mode. Supported: ${[...supportedGlobCommands].join(', ')}`);
+    // Supported commands — anything that works with an index.
+    // All execute() commands are supported; only expand (requires cached state)
+    // and interactive-only commands are excluded.
+    const unsupportedGlobCommands = new Set(['expand']);
+    if (unsupportedGlobCommands.has(canonical)) {
+        console.error(`Command "${command}" not supported in glob mode.`);
         process.exit(1);
     }
 
     // Build params — same as project mode
     const params = {};
-    if (['find', 'usages', 'fn', 'class', 'typedef'].includes(canonical)) {
+    const needsName = new Set(['find', 'usages', 'fn', 'class', 'typedef', 'about', 'context',
+        'smart', 'impact', 'trace', 'blast', 'reverseTrace', 'tests', 'affectedTests',
+        'example', 'verify', 'plan', 'related']);
+    if (needsName.has(canonical)) {
         if (!arg) {
             console.error(`Usage: ucn "pattern" ${command} <name>`);
             process.exit(1);
         }
         params.name = arg;
     }
-    if (canonical === 'search') {
+    if (canonical === 'search' || canonical === 'structuralSearch') {
         if (!arg && !flags.type) {
             console.error('Usage: ucn "pattern" search <term>');
             process.exit(1);
         }
         params.term = arg;
+    }
+    if (canonical === 'stacktrace') {
+        params.stack = arg || '';
+    }
+    if (canonical === 'lines') {
+        params.range = arg;
+    }
+    if (['imports', 'exporters', 'fileExports', 'graph'].includes(canonical)) {
+        if (arg) params.file = arg;
     }
     Object.assign(params, flags);
 
@@ -982,6 +1001,81 @@ function runGlobCommand(pattern, command, arg) {
         case 'stats':
             printOutput(result, output.formatStatsJson, r => output.formatStats(r, { top: flags.top }));
             break;
+        case 'about':
+            printOutput(result, output.formatAboutJson, output.formatAbout);
+            break;
+        case 'context':
+            printOutput(result, output.formatContextJson, output.formatContext);
+            break;
+        case 'smart':
+            printOutput(result, output.formatSmartJson, output.formatSmart);
+            break;
+        case 'impact':
+            printOutput(result, output.formatImpactJson, output.formatImpact);
+            break;
+        case 'related':
+            printOutput(result, output.formatRelatedJson, output.formatRelated);
+            break;
+        case 'trace':
+            printOutput(result, output.formatTraceJson, output.formatTrace);
+            break;
+        case 'blast':
+            printOutput(result, output.formatBlastJson, output.formatBlast);
+            break;
+        case 'reverseTrace':
+            printOutput(result, output.formatReverseTraceJson, output.formatReverseTrace);
+            break;
+        case 'tests':
+            printOutput(result, r => output.formatTestsJson(r, arg), r => output.formatTests(r, arg));
+            break;
+        case 'affectedTests':
+            printOutput(result, output.formatAffectedTestsJson, output.formatAffectedTests);
+            break;
+        case 'example':
+            printOutput(result, r => output.formatExampleJson(r, arg), r => output.formatExample(r, arg));
+            break;
+        case 'verify':
+            printOutput(result, output.formatVerifyJson, output.formatVerify);
+            break;
+        case 'plan':
+            printOutput(result, output.formatPlanJson, output.formatPlan);
+            break;
+        case 'imports':
+            printOutput(result, output.formatImportsJson, output.formatImports);
+            break;
+        case 'exporters':
+            printOutput(result, output.formatExportersJson, output.formatExporters);
+            break;
+        case 'fileExports':
+            printOutput(result, output.formatFileExportsJson, output.formatFileExports);
+            break;
+        case 'api':
+            printOutput(result, output.formatApiJson, output.formatApi);
+            break;
+        case 'graph':
+            printOutput(result, output.formatGraphJson, output.formatGraph);
+            break;
+        case 'circularDeps':
+            printOutput(result, output.formatCircularDepsJson, output.formatCircularDeps);
+            break;
+        case 'entrypoints':
+            printOutput(result, output.formatEntrypointsJson, output.formatEntrypoints);
+            break;
+        case 'diffImpact':
+            printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
+            break;
+        case 'stacktrace':
+            printOutput(result, output.formatStacktraceJson, output.formatStacktrace);
+            break;
+        default: {
+            // Fallback: output JSON for any command without a dedicated formatter
+            if (flags.json) {
+                console.log(JSON.stringify({ meta: {}, data: result }, null, 2));
+            } else {
+                console.log(JSON.stringify(result, null, 2));
+            }
+            break;
+        }
     }
 }
 

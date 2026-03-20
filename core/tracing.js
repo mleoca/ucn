@@ -544,8 +544,10 @@ function affectedTests(index, name, options = {}) {
         collectNames(blastResult.tree);
 
         // Step 3: Scan test files for all affected names using AST
+        // Only count call and test-case matches as real coverage — not imports or bare references.
         const exclude = options.exclude;
         const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
+        const className = options.className || null;
         const results = [];
         for (const [filePath, fileEntry] of index.files) {
             let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
@@ -567,6 +569,12 @@ function affectedTests(index, name, options = {}) {
                     const astUsages = index._getCachedUsages(filePath, funcName);
                     if (!astUsages || astUsages.length === 0) continue;
 
+                    // Build instance type map for className scoping (if applicable)
+                    let instanceTypeMap = null;
+                    if (className) {
+                        instanceTypeMap = _buildInstanceTypeMapForTracing(index, filePath, content, className);
+                    }
+
                     const seenLines = new Set();
                     for (const usage of astUsages) {
                         if (usage.usageType === 'definition') continue;
@@ -581,6 +589,21 @@ function affectedTests(index, name, options = {}) {
                             matchType = 'call';
                         } else {
                             matchType = 'reference';
+                        }
+
+                        // className scoping for calls: check receiver
+                        if (className && matchType === 'call') {
+                            if (!_receiverMatchesClassTracing(usage, className, instanceTypeMap,
+                                index.getLineContent(filePath, usage.line), funcName)) continue;
+                        }
+
+                        // className scoping for references: require class-associated receiver
+                        if (className && matchType === 'reference') {
+                            if (!usage.receiver) continue;
+                            if (usage.receiver !== className &&
+                                !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === className)) {
+                                continue;
+                            }
                         }
 
                         const lineContent = index.getLineContent(filePath, usage.line);
@@ -609,12 +632,27 @@ function affectedTests(index, name, options = {}) {
                         }
                     }
                     const deduped = [...dedupMap.values()].sort((a, b) => a.line - b.line);
-                    results.push({
-                        file: fileEntry.relativePath,
-                        coveredFunctions,
-                        matchCount: deduped.length,
-                        matches: deduped
+
+                    // Only count functions with call or test-case matches as covered.
+                    // Import-only or reference-only functions are not real coverage.
+                    const realCoveredFunctions = coveredFunctions.filter(fn => {
+                        const fnMatches = deduped.filter(m => m.functionName === fn);
+                        return fnMatches.some(m => m.matchType === 'call' || m.matchType === 'test-case');
                     });
+
+                    // Only include file if it has real coverage
+                    const realMatches = deduped.filter(m =>
+                        m.matchType === 'call' || m.matchType === 'test-case' ||
+                        realCoveredFunctions.includes(m.functionName)
+                    );
+                    if (realCoveredFunctions.length > 0) {
+                        results.push({
+                            file: fileEntry.relativePath,
+                            coveredFunctions: realCoveredFunctions,
+                            matchCount: realMatches.length,
+                            matches: realMatches
+                        });
+                    }
                 }
             } catch (e) { /* skip unreadable */ }
         }
@@ -622,18 +660,35 @@ function affectedTests(index, name, options = {}) {
         // Sort by coverage breadth then alphabetically
         results.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || a.file.localeCompare(b.file));
 
-        // Compute coverage stats
+        // Compute coverage stats.
+        // Filter out test function names from affectedNames — they are callers,
+        // not production symbols that need test coverage.
+        const productionNames = new Set();
+        for (const n of affectedNames) {
+            // Check if this name is only found in test files
+            let foundInSource = false;
+            for (const [fp, fe] of index.files) {
+                if (isTestFile(fe.relativePath, fe.language)) continue;
+                if (fe.symbols?.some(s => s.name === n)) { foundInSource = true; break; }
+            }
+            if (foundInSource) productionNames.add(n);
+        }
+        // Fall back to full set if filtering removed everything (e.g., test-only project)
+        const namesForCoverage = productionNames.size > 0 ? productionNames : affectedNames;
+
         const coveredSet = new Set();
-        for (const r of results) for (const f of r.coveredFunctions) coveredSet.add(f);
-        const uncovered = [...affectedNames].filter(n => !coveredSet.has(n));
+        for (const r of results) for (const f of r.coveredFunctions) {
+            if (namesForCoverage.has(f)) coveredSet.add(f);
+        }
+        const uncovered = [...namesForCoverage].filter(n => !coveredSet.has(n));
 
         return {
             root: blastResult.root, file: blastResult.file, line: blastResult.line,
             depth: blastResult.maxDepth,
-            affectedFunctions: [...affectedNames],
+            affectedFunctions: [...namesForCoverage],
             testFiles: results,
             summary: {
-                totalAffected: affectedNames.size,
+                totalAffected: namesForCoverage.size,
                 totalTestFiles: results.length,
                 coveredFunctions: coveredSet.size,
                 uncoveredCount: uncovered.length,
@@ -646,6 +701,7 @@ function affectedTests(index, name, options = {}) {
 
 /**
  * Add test-case matches for a function name in a test file (language-aware).
+ * Only adds test-case when the test body has a call match (not just import/reference).
  */
 function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches) {
     const lang = fileEntry.language;
@@ -660,6 +716,13 @@ function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches
             if (!testFrameworkCalls.has(call.name)) continue;
             const lineContent = index.getLineContent(filePath, call.line);
             if (lineContent.includes(funcName) && !existingLines.has(call.line)) {
+                // Only add test-case if a call match exists in the test body
+                const endLine = _estimateTestBlockEndTracing(index, filePath, call.line);
+                const hasCallMatch = existingMatches.some(m =>
+                    m.line >= call.line && m.line <= endLine &&
+                    m.matchType === 'call'
+                );
+                if (!hasCallMatch) continue;
                 if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
                 fileMatches.get(funcName).push({
                     line: call.line, content: lineContent.trim(),
@@ -675,10 +738,12 @@ function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches
             if (!langModule || !langModule.isEntryPoint) return;
             for (const symbol of fileEntry.symbols) {
                 if (!langModule.isEntryPoint(symbol)) continue;
-                const usageInRange = existingMatches.some(m =>
-                    m.line >= symbol.startLine && m.line <= symbol.endLine
+                // Only add test-case if a call match exists in the test body
+                const hasCallInRange = existingMatches.some(m =>
+                    m.line >= symbol.startLine && m.line <= symbol.endLine &&
+                    m.matchType === 'call'
                 );
-                if (usageInRange && !existingLines.has(symbol.startLine)) {
+                if (hasCallInRange && !existingLines.has(symbol.startLine)) {
                     const lineContent = index.getLineContent(filePath, symbol.startLine);
                     if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
                     fileMatches.get(funcName).push({
@@ -690,6 +755,84 @@ function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches
             }
         } catch (e) { /* skip */ }
     }
+}
+
+/**
+ * Build instance type map for className scoping in affectedTests.
+ * Same logic as _buildInstanceTypeMap in search.js.
+ */
+function _buildInstanceTypeMapForTracing(index, filePath, content, targetClassName) {
+    const typeMap = new Map();
+    const calls = getCachedCalls(index, filePath);
+    if (calls) {
+        for (const call of calls) {
+            if (call.isMethod && call.receiver && call.receiverType === targetClassName) {
+                typeMap.set(call.receiver, targetClassName);
+            }
+            if (call.name === targetClassName && !call.isMethod) {
+                const lineContent = index.getLineContent(filePath, call.line);
+                const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
+                if (assignMatch) typeMap.set(assignMatch[1], targetClassName);
+            }
+            if (call.isMethod && call.receiver === targetClassName) {
+                const lineContent = index.getLineContent(filePath, call.line);
+                const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
+                if (assignMatch) typeMap.set(assignMatch[1], targetClassName);
+            }
+        }
+    }
+    const classUsages = index._getCachedUsages(filePath, targetClassName);
+    if (classUsages) {
+        for (const u of classUsages) {
+            if (u.usageType === 'import' || u.usageType === 'definition') continue;
+            const lineContent = index.getLineContent(filePath, u.line);
+            const assignMatch = lineContent.match(/(?:const|let|var|)\s*(\w+)\s*:?=\s/);
+            if (assignMatch && assignMatch[1] !== targetClassName) {
+                typeMap.set(assignMatch[1], targetClassName);
+            }
+        }
+    }
+    return typeMap;
+}
+
+/**
+ * Check if a usage's receiver matches the target className (for affectedTests).
+ * Same logic as _receiverMatchesClass in search.js.
+ */
+function _receiverMatchesClassTracing(usage, className, instanceTypeMap, lineContent, searchTerm) {
+    if (usage.receiver === className) return true;
+    if (usage.receiver && instanceTypeMap && instanceTypeMap.get(usage.receiver) === className) return true;
+    if (usage.receiver) return false;
+    if (lineContent && searchTerm) {
+        const pat = new RegExp(
+            '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
+            escapeRegExp(searchTerm) + '\\s*\\(|' +
+            'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
+            escapeRegExp(searchTerm) + '\\s*\\()'
+        );
+        if (pat.test(lineContent)) return true;
+    }
+    return false;
+}
+
+/**
+ * Estimate the end line of a test block by tracking brace/paren nesting.
+ */
+function _estimateTestBlockEndTracing(index, filePath, startLine) {
+    const content = index._readFile(filePath);
+    if (!content) return startLine + 5;
+    const lines = content.split('\n');
+    let depth = 0;
+    let started = false;
+    for (let i = startLine - 1; i < lines.length; i++) {
+        const line = lines[i];
+        for (const ch of line) {
+            if (ch === '{' || ch === '(') { depth++; started = true; }
+            else if (ch === '}' || ch === ')') { depth--; }
+        }
+        if (started && depth <= 0) return i + 1;
+    }
+    return Math.min(startLine + 10, lines.length);
 }
 
 function _matchPriority(matchType) {

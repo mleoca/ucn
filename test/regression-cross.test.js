@@ -3715,6 +3715,108 @@ describe('AST-based tests(): cross-language className scoping', () => {
     });
 });
 
+describe('affectedTests: className scoping and coverage accuracy', () => {
+    it('affectedTests --className scopes test file scan to target class', () => {
+        const dir = tmp({
+            'app.py': [
+                'class A:',
+                '    def save(self): return 1',
+                'class B:',
+                '    def save(self): return 2',
+            ].join('\n'),
+            'test_a.py': 'from app import A\ndef test_a_save():\n    svc = A()\n    svc.save()',
+            'test_b.py': 'from app import B\ndef test_b_save():\n    svc = B()\n    svc.save()',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'affectedTests', { name: 'save', className: 'B' });
+            assert.ok(result.ok);
+            const files = result.result.testFiles.map(r => r.file);
+            assert.ok(files.some(f => f.includes('test_b')), 'Should include B test file');
+            assert.ok(!files.some(f => f.includes('test_a')), 'Should NOT include A test file');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('affectedTests does not count import-only files as coverage', () => {
+        const dir = tmp({
+            'app.py': 'def save(): pass',
+            'test_import.py': [
+                'from app import save',
+                '',
+                'def test_import_only():',
+                '    assert True',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'affectedTests', { name: 'save' });
+            assert.ok(result.ok);
+            assert.strictEqual(result.result.testFiles.length, 0,
+                'Import-only file should not count as test coverage');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('affectedTests does not count bare references as coverage', () => {
+        const dir = tmp({
+            'app.py': 'def save(): pass',
+            'test_ref.py': [
+                'from app import save',
+                '',
+                'def test_ref_only():',
+                '    fn = save',
+                '    assert fn is save',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'affectedTests', { name: 'save' });
+            assert.ok(result.ok);
+            assert.strictEqual(result.result.testFiles.length, 0,
+                'Bare reference file should not count as test coverage');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('affectedTests summary excludes test functions from affectedFunctions', () => {
+        const dir = tmp({
+            'app.py': 'class B:\n    def save(self): return 1',
+            'test_b.py': 'from app import B\ndef test_b_only():\n    svc = B()\n    svc.save()',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'affectedTests', { name: 'save', className: 'B' });
+            assert.ok(result.ok);
+            const hasTestFn = result.result.affectedFunctions.some(n => n.startsWith('test_'));
+            assert.ok(!hasTestFn,
+                'Test functions should not appear in affectedFunctions');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('CLI file-mode scoping', () => {
+    it('file mode passes --file to project commands', () => {
+        const dir = tmp({
+            'a.py': 'class A:\n    def save(self): return 1',
+            'b.py': 'class B:\n    def save(self): return 2',
+        });
+        try {
+            // Target b.py specifically — should resolve to B.save, not A.save
+            const out = runCli(dir + '/b.py', 'about', ['save'], ['--json']);
+            assert.ok(out.includes('b.py'), 'Should resolve to b.py');
+            assert.ok(!out.includes('a.py'), 'Should not include a.py');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 describe('fix: CLI fn --class-name passes through to execute', () => {
     it('fn with --class-name disambiguates methods', () => {
         const dir = tmp({

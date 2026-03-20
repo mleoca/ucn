@@ -1446,19 +1446,30 @@ function findUsagesInCode(code, name, parser) {
             // field_expression. Detect the `obj.name(` pattern via siblings.
             else if (parent.type === 'token_tree') {
                 const idx = _indexInParent(node, parent);
+                // Method call pattern: [obj] [.] [name] [()] inside macro
                 if (idx >= 2) {
                     const dot = parent.child(idx - 1);
                     const obj = parent.child(idx - 2);
                     const next = parent.child(idx + 1);
                     if (dot && dot.text === '.' && obj &&
                         (obj.type === 'identifier' || obj.type === 'self')) {
-                        // Check for call: next sibling is a token_tree starting with '('
                         if (next && next.type === 'token_tree' &&
                             next.childCount > 0 && next.child(0).text === '(') {
                             usageType = 'call';
                         }
                         usages.push({ line, column, usageType, receiver: obj.text });
                         return true;
+                    }
+                }
+                // Bare function call pattern: [name] [()] inside macro
+                if (idx >= 0) {
+                    const next = parent.child(idx + 1);
+                    // Check no preceding dot (would be method call handled above)
+                    const prev = idx > 0 ? parent.child(idx - 1) : null;
+                    if ((!prev || prev.text !== '.') &&
+                        next && next.type === 'token_tree' &&
+                        next.childCount > 0 && next.child(0).text === '(') {
+                        usageType = 'call';
                     }
                 }
             }
