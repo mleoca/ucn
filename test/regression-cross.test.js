@@ -3928,7 +3928,7 @@ describe('tests --file scoping', () => {
         }
     });
 
-    it('tests --file returns empty when symbol not defined in target file', () => {
+    it('tests --file returns error when symbol not defined in target file', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function save() { return 1; }\nmodule.exports = { save };',
@@ -3938,9 +3938,47 @@ describe('tests --file scoping', () => {
         try {
             const index = idx(dir);
             const result = execute(index, 'tests', { name: 'save', file: 'b.js' });
+            assert.ok(!result.ok, 'Should return error when symbol not in target file');
+            assert.ok(result.error.includes('a.js'),
+                'Error should mention where the symbol is actually defined');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('tests --file follows multi-hop barrel re-export chains', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/core/util.js': 'function save() { return 1; }\nmodule.exports = { save };',
+            'src/core/index.js': 'module.exports = require("./util");',
+            'src/public/index.js': 'module.exports = require("../core");',
+            'test/public.test.js': 'const { save } = require("../src/public");\nit("pub", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', file: 'src/core/util.js' });
             assert.ok(result.ok);
-            assert.strictEqual(result.result.length, 0,
-                'Should return empty when symbol not in target file');
+            assert.ok(result.result.some(r => r.file.includes('public.test')),
+                'Should find test through 3-hop barrel chain');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('tests --file does not overmatch barrels importing a different symbol', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/core/util.js': 'function save() { return 1; }\nfunction other() {}\nmodule.exports = { save, other };',
+            'src/alt.js': 'function save() { return 99; }\nmodule.exports = { save };',
+            'src/public/index.js': 'const { other } = require("../core/util");\nmodule.exports = { other };',
+            'test/alt.test.js': 'const { save } = require("../src/alt");\nit("alt", () => { save(); });',
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', file: 'src/core/util.js' });
+            assert.ok(result.ok);
+            assert.ok(!result.result.some(r => r.file.includes('alt.test')),
+                'Should not include test for alt.js (different source file)');
         } finally {
             rm(dir);
         }

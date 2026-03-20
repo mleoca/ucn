@@ -829,10 +829,10 @@ function tests(index, nameOrFile, options = {}) {
         const defs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className });
         if (defs.length > 0) {
             sourceFileFilter = _buildSourceFileImporters(index, defs);
-        } else {
-            // Symbol not found in the target file — return empty, don't fall back to global
-            return results;
         }
+        // If no defs found, sourceFileFilter stays null → no file scoping applied.
+        // The execute handler validates before calling, so this path means
+        // the file matched but no exact symbol — fall through gracefully.
     }
 
     // Find all test files
@@ -981,9 +981,9 @@ function tests(index, nameOrFile, options = {}) {
  * Uses the index's resolved importGraph/exportGraph for path-precise matching.
  */
 function _buildSourceFileImporters(index, defs) {
+    const symbolName = defs[0]?.name;
     const sourceAbsPaths = new Set();
     for (const d of defs) {
-        // Find the absolute path for this definition
         for (const [absPath, fe] of index.files) {
             if (fe.relativePath === d.relativePath) {
                 sourceAbsPaths.add(absPath);
@@ -992,25 +992,50 @@ function _buildSourceFileImporters(index, defs) {
         }
     }
 
-    // Collect all files that import the source files (direct importers via exportGraph)
+    // BFS through the export graph: walk from source files outward through
+    // re-export chains. At each hop, verify the intermediate file actually
+    // exports the target symbol (prevents overmatching barrels that import
+    // the source file for a different symbol).
     const importers = new Set();
-    for (const srcPath of sourceAbsPaths) {
-        const directImporters = index.exportGraph?.get(srcPath) || [];
-        for (const imp of directImporters) importers.add(imp);
+    const queue = [...sourceAbsPaths];
+    const visited = new Set(sourceAbsPaths);
 
-        // Also check files that re-export from the source file (barrel imports):
-        // if file X imports source S, and test T imports X, then T transitively imports S.
-        // Walk one extra level via exportGraph.
-        for (const reExporter of directImporters) {
-            // Check if this file re-exports the symbol (has it in its exports)
-            const reExporterEntry = index.files.get(reExporter);
-            if (!reExporterEntry) continue;
-            const reExporterImporters = index.exportGraph?.get(reExporter) || [];
-            for (const imp of reExporterImporters) importers.add(imp);
+    while (queue.length > 0) {
+        const current = queue.shift();
+        const directImporters = index.exportGraph?.get(current) || [];
+        for (const imp of directImporters) {
+            importers.add(imp);
+            // Check if this importer re-exports the symbol (barrel pattern).
+            // If so, add it to the queue so its importers are also discovered.
+            if (!visited.has(imp)) {
+                const fe = index.files.get(imp);
+                if (fe && _fileReExportsSymbol(fe, symbolName, current)) {
+                    visited.add(imp);
+                    queue.push(imp);
+                }
+            }
         }
     }
 
     return importers;
+}
+
+/**
+ * Check if a file re-exports a symbol from a source file.
+ * Handles: named re-exports, `module.exports = require(...)` blanket re-exports,
+ * `export * from ...`, and files that both import from source and export the symbol.
+ */
+function _fileReExportsSymbol(fileEntry, symbolName, sourceAbsPath) {
+    if (!fileEntry.exports || fileEntry.exports.length === 0) return false;
+    // Check if any export matches the symbol name
+    if (symbolName && fileEntry.exports.some(exp => exp.name === symbolName)) return true;
+    // Blanket re-exports: module.exports = require(...), export * from ...
+    // These have undefined or generic names but re-export everything from the imported module
+    const hasBlanketExport = fileEntry.exports.some(exp =>
+        !exp.name || exp.type === 'module.exports' || exp.type === 're-export' || exp.type === 'export-all'
+    );
+    if (hasBlanketExport) return true;
+    return false;
 }
 
 /**

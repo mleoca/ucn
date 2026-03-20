@@ -595,6 +595,16 @@ const HANDLERS = {
         if (p.file) {
             const fileErr = checkFilePatternMatch(index, p.file);
             if (fileErr) return { ok: false, error: fileErr };
+            // Validate that the symbol exists in the target file
+            const defs = index.find(p.name, { exact: true, file: p.file, className: p.className });
+            if (defs.length === 0) {
+                const allDefs = index.find(p.name, { exact: true });
+                if (allDefs.length > 0) {
+                    const files = allDefs.map(d => d.relativePath).join(', ');
+                    return { ok: false, error: `Symbol "${p.name}" not found in files matching "${p.file}". Defined in: ${files}` };
+                }
+                return { ok: false, error: `Symbol "${p.name}" not found.` };
+            }
         }
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
