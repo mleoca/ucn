@@ -996,8 +996,8 @@ describe('Architecture Guards', () => {
         const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
         assert.ok(serverCode.includes('generateMcpParamSection()'),
             'TOOL_DESCRIPTION should use generateMcpParamSection()');
-        assert.ok(serverCode.includes('PARAMS PER COMMAND') || generateMcpParamSection().includes('PARAMS PER COMMAND'),
-            'Generated section should have PARAMS PER COMMAND header');
+        assert.ok(generateMcpParamSection().includes('ACCEPTED FLAGS PER COMMAND'),
+            'Generated section should have ACCEPTED FLAGS PER COMMAND header');
     });
 
     it('every CLI knownFlags entry maps to a FLAG_APPLICABILITY flag', () => {

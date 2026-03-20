@@ -123,8 +123,9 @@ const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars overrid
 // Broad commands (derived from registry): output is project-wide, truncation means you need a filter
 const BROAD_COMMANDS = new Set([...BROAD_CANONICAL].map(toMcpName));
 
-function toolResult(text, command, maxChars) {
-    if (!text) return { content: [{ type: 'text', text: '(no output)' }] };
+function toolResult(text, command, maxChars, suffixNote) {
+    const suffix = suffixNote || '';
+    if (!text) return { content: [{ type: 'text', text: '(no output)' + suffix }] };
     const defaultLimit = BROAD_COMMANDS.has(command) ? BROAD_OUTPUT_CHARS : DEFAULT_OUTPUT_CHARS;
     const limit = Math.min(maxChars || defaultLimit, MAX_OUTPUT_CHARS);
     if (text.length > limit) {
@@ -144,9 +145,9 @@ function toolResult(text, command, maxChars) {
             usages: 'Use file= to scope to specific files.',
         };
         const narrow = hints[command] || 'Use file=/in=/exclude= to narrow scope.';
-        return { content: [{ type: 'text', text: cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Or use all=true to see everything (warning: ~${fullTokens} tokens).` }] };
+        return { content: [{ type: 'text', text: cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Or use all=true to see everything (warning: ~${fullTokens} tokens).` + suffix }] };
     }
-    return { content: [{ type: 'text', text }] };
+    return { content: [{ type: 'text', text: text + suffix }] };
 }
 
 function toolError(message) {
@@ -320,7 +321,7 @@ server.registerTool(
             ]);
             for (const key of Object.keys(ep)) {
                 if (coreParams.has(key)) continue;
-                if (!applicable.includes(key) && ep[key] !== undefined && ep[key] !== false &&
+                if (!applicable.includes(key) && ep[key] !== undefined &&
                     !(Array.isArray(ep[key]) && ep[key].length === 0)) {
                     strippedParams.push(REVERSE_PARAM_MAP[key] || key);
                     delete ep[key];
@@ -337,7 +338,11 @@ server.registerTool(
             : '';
 
         // Wrap toolResult to auto-inject command + maxChars + stripping note
-        const tr = (text) => toolResult(text + strippedNote, command, maxChars);
+        const tr = (text) => toolResult(text, command, maxChars, strippedNote);
+        // Wrap toolError to include stripping note on error paths too
+        const te = strippedNote
+            ? (msg) => toolError(msg + strippedNote)
+            : toolError;
 
         let index = null; // Track for post-command cache save
         try {
@@ -352,7 +357,7 @@ server.registerTool(
             case 'about': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'about', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let aboutText = output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.',
@@ -365,7 +370,7 @@ server.registerTool(
             case 'context': {
                 index = getIndex(project_dir, ep);
                 const { ok, result: ctx, error, note } = execute(index, 'context', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
                     showConfidence: ep.showConfidence !== false,
@@ -379,7 +384,7 @@ server.registerTool(
             case 'impact': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'impact', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let impactText = output.formatImpact(result);
                 if (note) impactText += '\n\n' + note;
                 return tr(impactText);
@@ -388,7 +393,7 @@ server.registerTool(
             case 'blast': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'blast', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let blastText = output.formatBlast(result, {
                     allHint: 'Set depth to expand all children.',
                 });
@@ -399,7 +404,7 @@ server.registerTool(
             case 'smart': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'smart', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let smartText = output.formatSmart(result);
                 if (note) smartText += '\n\n' + note;
                 return tr(smartText);
@@ -408,7 +413,7 @@ server.registerTool(
             case 'trace': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'trace', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let traceText = output.formatTrace(result, {
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
@@ -420,7 +425,7 @@ server.registerTool(
             case 'reverse_trace': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'reverseTrace', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let rtText = output.formatReverseTrace(result, {
                     allHint: 'Set depth to expand all children.',
                 });
@@ -431,14 +436,14 @@ server.registerTool(
             case 'example': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'example', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatExample(result, ep.name));
             }
 
             case 'related': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'related', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let relText = output.formatRelated(result, {
                     all: ep.all || false, top: ep.top,
                     allHint: 'Repeat with all=true to show all.'
@@ -452,7 +457,7 @@ server.registerTool(
             case 'find': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'find', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let text = output.formatFind(result, ep.name, ep.top);
                 if (note) text += '\n\n' + note;
                 return tr(text);
@@ -461,7 +466,7 @@ server.registerTool(
             case 'usages': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'usages', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let text = output.formatUsages(result, ep.name);
                 if (note) text += '\n\n' + note;
                 return tr(text);
@@ -470,7 +475,7 @@ server.registerTool(
             case 'toc': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'toc', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let text = output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 });
@@ -481,7 +486,7 @@ server.registerTool(
             case 'search': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, structural, note } = execute(index, 'search', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let searchText;
                 if (structural) {
                     searchText = output.formatStructuralSearch(result);
@@ -495,7 +500,7 @@ server.registerTool(
             case 'tests': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'tests', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let testsText = output.formatTests(result, ep.name);
                 if (note) testsText += '\n\n' + note;
                 return tr(testsText);
@@ -504,7 +509,7 @@ server.registerTool(
             case 'affected_tests': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'affectedTests', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let atText = output.formatAffectedTests(result, { all: ep.all });
                 if (note) atText += '\n\n' + note;
                 return tr(atText);
@@ -513,7 +518,7 @@ server.registerTool(
             case 'deadcode': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'deadcode', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 const dcNote = note;
                 let dcText = output.formatDeadcode(result, {
                     top: ep.top || 0,
@@ -527,7 +532,7 @@ server.registerTool(
             case 'entrypoints': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'entrypoints', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let epText = output.formatEntrypoints(result);
                 if (note) epText += '\n\n' + note;
                 return tr(epText);
@@ -538,28 +543,28 @@ server.registerTool(
             case 'imports': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'imports', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatImports(result, ep.file));
             }
 
             case 'exporters': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'exporters', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatExporters(result, ep.file));
             }
 
             case 'file_exports': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'fileExports', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatFileExports(result, ep.file));
             }
 
             case 'graph': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'graph', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatGraph(result, {
                     showAll: ep.all || ep.depth !== undefined,
                     maxDepth: ep.depth ?? 2, file: ep.file,
@@ -571,7 +576,7 @@ server.registerTool(
             case 'circular_deps': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'circularDeps', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatCircularDeps(result));
             }
 
@@ -580,21 +585,21 @@ server.registerTool(
             case 'verify': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'verify', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatVerify(result));
             }
 
             case 'plan': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'plan', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatPlan(result));
             }
 
             case 'diff_impact': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'diffImpact', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let diText = output.formatDiffImpact(result, { all: ep.all });
                 if (note) diText += '\n\n' + note;
                 return tr(diText);
@@ -605,21 +610,21 @@ server.registerTool(
             case 'typedef': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'typedef', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatTypedef(result, ep.name));
             }
 
             case 'stacktrace': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'stacktrace', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(output.formatStackTrace(result));
             }
 
             case 'api': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'api', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let apiText = output.formatApi(result, ep.file || '.');
                 if (note) apiText += '\n\n' + note;
                 return tr(apiText);
@@ -628,7 +633,7 @@ server.registerTool(
             case 'stats': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'stats', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 let statsText = output.formatStats(result, { top: ep.top || 0 });
                 if (note) statsText += '\n\n' + note;
                 return tr(statsText);
@@ -639,7 +644,7 @@ server.registerTool(
             case 'fn': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'fn', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
@@ -652,7 +657,7 @@ server.registerTool(
             case 'class': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'class', ep);
-                if (!ok) return toolError(error);  // soft error (class not found)
+                if (!ok) return te(error);  // soft error (class not found)
                 // MCP path security: validate all result files are within project root
                 for (const entry of result.entries) {
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
@@ -665,7 +670,7 @@ server.registerTool(
             case 'lines': {
                 index = getIndex(project_dir, ep);
                 const { ok, result, error } = execute(index, 'lines', ep);
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 // MCP path security: validate file is within project root
                 const check = resolveAndValidatePath(index, result.relativePath);
                 if (typeof check !== 'string') return check;
@@ -674,7 +679,7 @@ server.registerTool(
 
             case 'expand': {
                 if (ep.item === undefined || ep.item === null) {
-                    return toolError('Item number is required (e.g. item=1).');
+                    return te('Item number is required (e.g. item=1).');
                 }
                 index = getIndex(project_dir, ep);
                 const lookup = expandCacheInstance.lookup(index.root, ep.item);
@@ -683,15 +688,15 @@ server.registerTool(
                     itemCount: lookup.itemCount, symbolName: lookup.symbolName,
                     validateRoot: true
                 });
-                if (!ok) return toolError(error);
+                if (!ok) return te(error);
                 return tr(result.text);
             }
 
             default:
-                return toolError(`Unknown command: ${command}`);
+                return te(`Unknown command: ${command}`);
             }
         } catch (e) {
-            return toolError(e.message);
+            return te(e.message);
         } finally {
             // Persist calls cache after command execution.
             // getIndex() only saves after build (when callsCache is empty).

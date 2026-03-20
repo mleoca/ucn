@@ -74,19 +74,19 @@ function parseFlags(tokens) {
         exclude: parseExclude(),
         in: getValueFlag('--in'),
         includeTests: tokens.includes('--include-tests') ? true : undefined,
-        includeExported: tokens.includes('--include-exported'),
-        includeDecorated: tokens.includes('--include-decorated'),
-        includeUncertain: tokens.includes('--include-uncertain'),
+        includeExported: tokens.includes('--include-exported') || undefined,
+        includeDecorated: tokens.includes('--include-decorated') || undefined,
+        includeUncertain: tokens.includes('--include-uncertain') || undefined,
         includeMethods: tokens.some(a => a === '--include-methods=false') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
-        detailed: tokens.includes('--detailed'),
-        topLevel: tokens.includes('--top-level'),
-        all: tokens.includes('--all'),
-        exact: tokens.includes('--exact'),
-        callsOnly: tokens.includes('--calls-only'),
-        codeOnly: tokens.includes('--code-only'),
-        caseSensitive: tokens.includes('--case-sensitive'),
-        withTypes: tokens.includes('--with-types'),
-        expand: tokens.includes('--expand'),
+        detailed: tokens.includes('--detailed') || undefined,
+        topLevel: tokens.includes('--top-level') || undefined,
+        all: tokens.includes('--all') || undefined,
+        exact: tokens.includes('--exact') || undefined,
+        callsOnly: tokens.includes('--calls-only') || undefined,
+        codeOnly: tokens.includes('--code-only') || undefined,
+        caseSensitive: tokens.includes('--case-sensitive') || undefined,
+        withTypes: tokens.includes('--with-types') || undefined,
+        expand: tokens.includes('--expand') || undefined,
         depth: getValueFlag('--depth'),
         top: parseInt(getValueFlag('--top') || '0'),
         context: parseInt(getValueFlag('--context') || '0'),
@@ -96,10 +96,10 @@ function parseFlags(tokens) {
         renameTo: getValueFlag('--rename-to'),
         defaultValue: getValueFlag('--default'),
         base: getValueFlag('--base'),
-        staged: tokens.includes('--staged'),
+        staged: tokens.includes('--staged') || undefined,
         maxLines: getValueFlag('--max-lines') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
-        functions: tokens.includes('--functions'),
+        functions: tokens.includes('--functions') || undefined,
         className: getValueFlag('--class-name'),
         limit: parseInt(getValueFlag('--limit') || '0') || undefined,
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
@@ -109,9 +109,9 @@ function parseFlags(tokens) {
         receiver: getValueFlag('--receiver'),
         returns: getValueFlag('--returns'),
         decorator: getValueFlag('--decorator'),
-        exported: tokens.includes('--exported'),
-        unused: tokens.includes('--unused'),
-        showConfidence: !tokens.includes('--no-confidence'),
+        exported: tokens.includes('--exported') || undefined,
+        unused: tokens.includes('--unused') || undefined,
+        showConfidence: tokens.includes('--no-confidence') ? false : undefined,
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
         framework: getValueFlag('--framework'),
         stack: getValueFlag('--stack'),
@@ -478,12 +478,12 @@ function runProjectCommand(rootDir, command, arg) {
     if (applicableFlags) {
         // Map from camelCase flag name to CLI flag string
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        // Flags that are global (not command-specific) or have truthy defaults — skip warning for these
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence', '_fileFromFileMode']);
+        // Flags that are global (not command-specific) — skip warning for these
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
-            // Skip falsy/default values (0, undefined, false, empty array)
-            if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            // Skip unset values (undefined, null, 0, empty array) — but NOT false (explicit negation)
+            if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
             // Skip --file when it was injected by file-mode routing, not user input
             if (key === 'file' && flags._fileFromFileMode) continue;
             if (!applicableFlags.includes(key)) {
@@ -548,7 +548,7 @@ function runProjectCommand(rootDir, command, arg) {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     expandHint: 'Use "expand <N>" or --expand to see code for items',
                     uncertainHint: 'use --include-uncertain to include all',
-                    showConfidence: flags.showConfidence,
+                    showConfidence: flags.showConfidence !== false,
                 });
                 console.log(text);
 
@@ -596,7 +596,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) fail(error);
             printOutput(result,
                 output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence })
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false })
             );
             if (note) console.error(note);
             break;
@@ -966,10 +966,10 @@ function runGlobCommand(pattern, command, arg) {
     const applicableFlags = FLAG_APPLICABILITY[canonical];
     if (applicableFlags) {
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence', '_fileFromFileMode']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
-            if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
             if (!applicableFlags.includes(key)) {
                 console.error(`Warning: ${flagToCli(key)} has no effect on '${toCliName(canonical)}'.`);
             }
@@ -1032,7 +1032,7 @@ function runGlobCommand(pattern, command, arg) {
             break;
         case 'about':
             printOutput(result, output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence }));
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false }));
             break;
         case 'context':
             if (flags.json) {
@@ -1042,7 +1042,7 @@ function runGlobCommand(pattern, command, arg) {
                     methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     uncertainHint: 'use --include-uncertain to include all',
                     expandHint: 'Use --expand to see inline callee previews',
-                    showConfidence: flags.showConfidence,
+                    showConfidence: flags.showConfidence !== false,
                 });
                 console.log(text);
                 if (flags.expand) {
@@ -1406,7 +1406,7 @@ Flags can be added per-command: context myFunc --include-methods
 
 const INTERACTIVE_DISPATCH = {
     // ── Understanding Code ───────────────────────────────────────────
-    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence }) },
+    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence !== false }) },
     smart:        { params: 'name', format: (r) => output.formatSmart(r, { uncertainHint: 'use --include-uncertain to include all' }) },
     impact:       { params: 'name', format: (r) => output.formatImpact(r) },
     blast:        { params: 'name', format: (r) => output.formatBlast(r) },
@@ -1464,10 +1464,10 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
     const applicableFlags = FLAG_APPLICABILITY[command];
     if (applicableFlags) {
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', 'showConfidence', '_fileFromFileMode']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode']);
         for (const [key, value] of Object.entries(iflags)) {
             if (globalFlags.has(key)) continue;
-            if (!value || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
+            if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
             if (!applicableFlags.includes(key)) {
                 console.log(`Warning: ${flagToCli(key)} has no effect on '${command}'.`);
             }
@@ -1540,7 +1540,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                 expandHint: 'Use "expand <N>" to see code for item N',
                 uncertainHint: 'use --include-uncertain to include all',
-                showConfidence: iflags.showConfidence,
+                showConfidence: iflags.showConfidence !== false,
             });
             console.log(text);
             if (iflags.expand) {

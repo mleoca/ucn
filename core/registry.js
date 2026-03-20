@@ -92,7 +92,7 @@ const PARAM_MAP = {
 // ============================================================================
 
 // Per-command list of accepted flag names (camelCase). Source of truth for help text,
-// MCP schema validation, and architecture guards.
+// MCP param stripping, CLI inapplicable-flag warnings, and architecture guards.
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
     // Understanding code
@@ -244,7 +244,7 @@ const REVERSE_PARAM_MAP = buildReverseParamMap();
  * One line per command: `about: file, exclude, class_name, ...`
  */
 function generateMcpParamSection() {
-    const lines = ['', 'PARAMS PER COMMAND (only these are used — others are ignored):'];
+    const lines = ['', 'ACCEPTED FLAGS PER COMMAND (name, term, stack, range, base, staged, max_chars always accepted; flags not listed below are ignored):'];
     for (const cmd of CANONICAL_COMMANDS) {
         const flags = FLAG_APPLICABILITY[cmd];
         if (!flags || flags.length === 0) continue;

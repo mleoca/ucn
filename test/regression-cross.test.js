@@ -4190,13 +4190,13 @@ describe('flag validation parity across surfaces', () => {
         assert.ok(out.includes('no effect'), 'interactive context --include-tests should warn');
     });
 
-    it('MCP strips inapplicable params silently', async () => {
+    it('MCP strips inapplicable params and reports them', async () => {
         const { McpClient } = require('./helpers');
         const client = new McpClient();
         await client.start();
         await client.initialize();
         try {
-            // tests does not accept 'top' — it should be stripped, not cause an error
+            // tests does not accept 'top' — it should be stripped and reported
             const res = await client.callTool({
                 command: 'tests',
                 project_dir: FIXTURES_PATH + '/javascript',
@@ -4205,9 +4205,36 @@ describe('flag validation parity across surfaces', () => {
             });
             assert.ok(!res.isError, 'MCP should not error on inapplicable param');
             assert.ok(res.text.includes('Tests for'), 'Should produce normal output');
+            assert.ok(res.text.includes('top') && res.text.includes('not applicable'),
+                'Should report stripped param in note');
         } finally {
             client.stop();
         }
+    });
+
+    it('CLI warns about inapplicable negation flags (--no-regex)', () => {
+        const { spawnSync } = require('child_process');
+        const result = spawnSync('node', [
+            require('path').join(__dirname, '..', 'cli', 'index.js'),
+            FIXTURES_PATH + '/javascript', 'about', 'helper', '--no-regex'
+        ], { timeout: 30000, encoding: 'utf-8' });
+        const combined = (result.stdout || '') + (result.stderr || '');
+        assert.ok(combined.includes('no effect'), 'about --no-regex should warn (regex not applicable)');
+    });
+
+    it('CLI warns about inapplicable negation flags (--no-confidence)', () => {
+        const { spawnSync } = require('child_process');
+        const result = spawnSync('node', [
+            require('path').join(__dirname, '..', 'cli', 'index.js'),
+            FIXTURES_PATH + '/javascript', 'tests', 'helper', '--no-confidence'
+        ], { timeout: 30000, encoding: 'utf-8' });
+        const combined = (result.stdout || '') + (result.stderr || '');
+        assert.ok(combined.includes('no effect'), 'tests --no-confidence should warn (showConfidence not applicable)');
+    });
+
+    it('interactive mode warns about inapplicable negation flags', () => {
+        const out = runInteractive(FIXTURES_PATH + '/javascript', ['about helper --no-regex']);
+        assert.ok(out.includes('no effect'), 'interactive about --no-regex should warn');
     });
 
     it('glob mode warns about inapplicable flags', () => {
@@ -4626,6 +4653,54 @@ describe('MCP per-command param validation: stripping note', () => {
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('depth'), 'note should mention "depth"');
             assert.ok(result.text.includes('direction'), 'note should mention "direction"');
+            assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('stripping note survives truncation', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // depth is inapplicable to toc; max_chars=120 forces truncation
+            const result = await client.callTool({ command: 'toc', project_dir: dir, depth: 3, max_chars: 120 });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('depth'), 'stripping note should survive truncation');
+            assert.ok(result.text.includes('not applicable to toc'), 'should mention the command');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('stripping note appears on error paths', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // about without name is an error; depth is inapplicable
+            const result = await client.callTool({ command: 'about', project_dir: dir, depth: 3 });
+            assert.ok(result.isError, 'should be an error (missing name)');
+            assert.ok(result.text.includes('depth'), 'stripping note should appear on error path');
+            assert.ok(result.text.includes('not applicable to about'), 'should mention the command');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('false-valued inapplicable params are stripped and reported', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // regex=false is not applicable to about
+            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', regex: false });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('regex'), 'note should mention "regex"');
             assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
         } finally {
             rm(dir);
