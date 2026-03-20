@@ -945,16 +945,17 @@ function runGlobCommand(pattern, command, arg) {
         }
         params.term = arg;
     }
+    // Merge flags first, then set positional overrides so they aren't wiped
+    Object.assign(params, flags);
     if (canonical === 'stacktrace') {
         params.stack = arg || '';
     }
     if (canonical === 'lines') {
         params.range = arg;
     }
-    if (['imports', 'exporters', 'fileExports', 'graph'].includes(canonical)) {
+    if (['imports', 'exporters', 'fileExports', 'graph', 'api'].includes(canonical)) {
         if (arg) params.file = arg;
     }
-    Object.assign(params, flags);
 
     const { ok, result, error, note, structural } = execute(index, canonical, params);
     if (!ok) fail(error);
@@ -1005,7 +1006,15 @@ function runGlobCommand(pattern, command, arg) {
             printOutput(result, output.formatAboutJson, output.formatAbout);
             break;
         case 'context':
-            printOutput(result, output.formatContextJson, output.formatContext);
+            if (flags.json) {
+                console.log(output.formatContextJson(result));
+            } else {
+                const { text } = output.formatContext(result, {
+                    methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
+                    uncertainHint: 'use --include-uncertain to include all',
+                });
+                console.log(text);
+            }
             break;
         case 'smart':
             printOutput(result, output.formatSmartJson, output.formatSmart);
@@ -1065,7 +1074,10 @@ function runGlobCommand(pattern, command, arg) {
             printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
             break;
         case 'stacktrace':
-            printOutput(result, output.formatStacktraceJson, output.formatStacktrace);
+            printOutput(result, output.formatStackTraceJson, output.formatStackTrace);
+            break;
+        case 'lines':
+            printOutput(result, output.formatLinesJson, output.formatLines);
             break;
         default: {
             // Fallback: output JSON for any command without a dedicated formatter
