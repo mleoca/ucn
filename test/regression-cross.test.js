@@ -3619,6 +3619,30 @@ describe('AST-based tests(): cross-language className scoping', () => {
             rm(dir);
         }
     });
+
+    it('bare function call on same line as className is not a false positive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'class B { save() {} }\nfunction save() {}\nmodule.exports = { B, save };',
+            'test/lib.test.js': [
+                'const { B, save } = require("../lib");',
+                'it("test", () => {',
+                '  const svc = new B(); save();',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', { name: 'save', className: 'B' });
+            assert.ok(result.ok);
+            const calls = result.result.flatMap(r => r.matches).filter(m => m.matchType === 'call');
+            // Bare save() is not B.save() — should not be included
+            assert.ok(!calls.some(m => m.content.match(/;\s*save\(\)/)),
+                'Bare save() on same line as B should not match className=B');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: CLI fn --class-name passes through to execute', () => {

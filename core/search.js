@@ -893,7 +893,7 @@ function tests(index, nameOrFile, options = {}) {
 
                 // className scoping for calls: check receiver
                 if (className && matchType === 'call') {
-                    if (!_receiverMatchesClass(usage, className, instanceTypeMap, lineContent)) continue;
+                    if (!_receiverMatchesClass(usage, className, instanceTypeMap, lineContent, searchTerm)) continue;
                 }
 
                 // className scoping for references: check receiver
@@ -1007,16 +1007,26 @@ function _buildInstanceTypeMap(index, filePath, content, targetClassName) {
  * @param {Map} instanceTypeMap - varName → className map
  * @param {string} [lineContent] - Line content for fallback checks
  */
-function _receiverMatchesClass(usage, className, instanceTypeMap, lineContent) {
+function _receiverMatchesClass(usage, className, instanceTypeMap, lineContent, searchTerm) {
     // Direct receiver: ClassName.method() or ClassName.staticMethod()
     if (usage.receiver === className) return true;
     // Instance variable: check if receiver is bound to the target class
     if (usage.receiver && instanceTypeMap && instanceTypeMap.get(usage.receiver) === className) return true;
     // Receiver is some other known identifier — doesn't match
     if (usage.receiver) return false;
-    // No receiver: could be `new ClassName().method()` (complex expression receiver)
-    // or a bare function call. Check the line content for class evidence.
-    if (lineContent && lineContent.includes(className)) return true;
+    // No receiver: bare function call. Only match if className is the direct
+    // receiver expression — e.g., `new B().save()`, `B().save()`, `B{}.save()`.
+    // Reject cases like `svc = B(); save()` where className is elsewhere on the line.
+    if (lineContent && searchTerm) {
+        // Check for chained call: ClassName followed by constructor/call then .methodName(
+        const pat = new RegExp(
+            '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
+            escapeRegExp(searchTerm) + '\\s*\\(|' +
+            'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
+            escapeRegExp(searchTerm) + '\\s*\\()'
+        );
+        if (pat.test(lineContent)) return true;
+    }
     return false;
 }
 
