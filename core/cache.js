@@ -83,7 +83,7 @@ function saveCache(index, cachePath) {
     // on first findCallers/buildCalleeIndex call. Removing it saves ~22MB (14%) on large projects.
 
     const cacheData = {
-        version: 8,  // v8: remove calleeIndex from index.json (rebuilt from callsCache)
+        version: 9,  // v9: addSymbol now propagates isAsync/isGenerator/paramTypes; older caches drop these
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
@@ -170,8 +170,8 @@ function loadCache(index, cachePath) {
 
         // Check version compatibility
         // v7: symbols/bindings stripped from file entries (dedup)
-        // v8: calleeIndex removed from index.json (rebuilt from callsCache)
-        if (cacheData.version !== 7 && cacheData.version !== 8) {
+        // v9: addSymbol propagates isAsync/isGenerator/paramTypes (force rebuild for old)
+        if (cacheData.version !== 9) {
             return false;
         }
 

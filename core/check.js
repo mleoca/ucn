@@ -72,7 +72,10 @@ function check(index, options = {}) {
         } catch (e) {
             verifyResult = null;
         }
-        const mismatches = verifyResult && verifyResult.mismatches ? verifyResult.mismatches : [];
+        // Note: verify() returns `mismatches` as a COUNT and `mismatchDetails` as the array.
+        const mismatches = verifyResult && Array.isArray(verifyResult.mismatchDetails)
+            ? verifyResult.mismatchDetails
+            : [];
 
         // For modified functions, the existing diffImpact result has `callers` already
         let callers = Array.isArray(fn.callers) ? fn.callers : [];

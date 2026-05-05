@@ -404,6 +404,8 @@ class ProjectIndex {
                 paramsStructured: item.paramsStructured,
                 returnType: item.returnType,
                 ...(item.paramTypes && { paramTypes: item.paramTypes }),
+                ...(item.isAsync && { isAsync: true }),
+                ...(item.isGenerator && { isGenerator: true }),
                 modifiers: item.modifiers,
                 docstring: item.docstring,
                 bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,

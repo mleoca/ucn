@@ -63,12 +63,24 @@ function extractModifiers(node) {
         }
     }
 
-    // Also check text before parameter list for modifiers (avoid matching keywords in params)
-    // Use the parameters node position to find the real paren (not annotation parens)
+    // Also check text before the parameter list (methods) or the class body
+    // opening brace (classes/interfaces). Without this scope, the fallback
+    // would scan into field declarations and leak `private`/`final` from the
+    // body up onto the class signature.
     const text = node.text;
     const paramsNode = node.childForFieldName('parameters');
-    const paramOffset = paramsNode ? paramsNode.startIndex - node.startIndex : -1;
-    const preParams = paramOffset >= 0 ? text.substring(0, paramOffset) : text.split('\n').slice(0, 3).join(' ');
+    const bodyNode = node.childForFieldName('body');
+    let preParams;
+    if (paramsNode) {
+        preParams = text.substring(0, paramsNode.startIndex - node.startIndex);
+    } else if (bodyNode) {
+        preParams = text.substring(0, bodyNode.startIndex - node.startIndex);
+    } else {
+        // Last-resort fallback: only the first line. Class bodies start on
+        // their own line nearly always, so this avoids leaking field modifiers.
+        const firstLine = text.split('\n')[0] || '';
+        preParams = firstLine;
+    }
     const keywords = ['public', 'private', 'protected', 'static', 'final', 'abstract', 'synchronized', 'native', 'default'];
     for (const kw of keywords) {
         if (preParams.includes(kw + ' ') && !modifiers.includes(kw)) {
@@ -1180,7 +1192,10 @@ function findUsagesInCode(code, name, parser) {
 function isEntryPoint(symbol) {
     const m = symbol.modifiers || [];
     if (symbol.name === 'main' && m.includes('public') && m.includes('static')) return true;
-    if (m.includes('test')) return true;
+    // JUnit @Test family — full lowercase set so deadcode/test detection treats
+    // ParameterizedTest, RepeatedTest, TestFactory, TestTemplate as test entry points.
+    const TEST_ANNOTATIONS = ['test', 'parameterizedtest', 'repeatedtest', 'testfactory', 'testtemplate'];
+    if (m.some(x => TEST_ANNOTATIONS.includes(x))) return true;
     if (m.includes('override')) return true;
     return false;
 }

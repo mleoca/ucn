@@ -1001,6 +1001,11 @@ function about(index, name, options = {}) {
         callers = allCallers.slice(0, maxCallers).map(c => ({
             file: c.relativePath,
             line: c.line,
+            // Stable handle for the *caller function*, not the call site.
+            // Lets the caller copy-paste the handle to drill into who-called-this.
+            ...(c.callerStartLine && c.callerName && {
+                handle: `${c.relativePath}:${c.callerStartLine}:${c.callerName}`
+            }),
             expression: c.content.trim(),
             callerName: c.callerName,
             confidence: c.confidence,
@@ -1034,12 +1039,15 @@ function about(index, name, options = {}) {
             line: c.startLine,
             startLine: c.startLine,
             endLine: c.endLine,
+            handle: c.startLine ? `${c.relativePath}:${c.startLine}:${c.name}` : undefined,
             weight: c.weight,
             callCount: c.callCount,
             confidence: c.confidence,
             resolution: c.resolution,
             reachable: c.reachable,
             ...(c.returnType && { returnType: c.returnType }),
+            ...(c.paramTypes && { paramTypes: c.paramTypes }),
+            ...(c.paramsStructured && { paramsStructured: c.paramsStructured }),
             ...(c.docstring && { docstring: c.docstring }),
             ...(c.sideEffects && c.sideEffects.length && { sideEffects: c.sideEffects }),
         }));
@@ -1111,8 +1119,12 @@ function about(index, name, options = {}) {
             endLine: primary.endLine,
             handle: require('./shared').formatSymbolHandle(primary),
             params: primary.params,
+            ...(primary.paramsStructured && { paramsStructured: primary.paramsStructured }),
             returnType: primary.returnType,
             ...(primary.paramTypes && { paramTypes: primary.paramTypes }),
+            ...(primary.isAsync && { isAsync: true }),
+            ...(primary.isGenerator && { isGenerator: true }),
+            ...(primary.decorators && primary.decorators.length && { decorators: primary.decorators }),
             modifiers: primary.modifiers,
             docstring: primary.docstring,
             signature: index.formatSignature(primary)

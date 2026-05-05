@@ -4348,8 +4348,9 @@ describe('CLI glob-mode parity', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
         const out = runCli(pattern, 'api', ['utils.js'], ['--json']);
         const parsed = JSON.parse(out);
-        // Should only show utils.js exports, not all files
-        assert.ok(parsed.exports.every(e => e.file === 'utils.js'),
+        // formatApiJson now wraps in {meta, data}; accept either shape
+        const exports = (parsed.data && parsed.data.exports) || parsed.exports;
+        assert.ok(exports.every(e => e.file === 'utils.js'),
             'glob api utils.js should only show utils.js exports');
     });
 

@@ -2016,9 +2016,11 @@ func main() {
         } finally { rm(dir); }
     });
 
-    it('Java: public static void main is NOT a framework entrypoint', () => {
-        // Java's main() is a language entry point, not a framework entry point.
-        // It should not be detected by spring/DI patterns (no annotations).
+    it('Java: public static void main IS a runtime entrypoint, but not a framework one', () => {
+        // Java's main() is a runtime entry point (JVM-invoked), parallel to Go's main.
+        // It must be detected so reachability for Java projects is non-empty — otherwise
+        // every symbol shows as "(unreachable from any entry point)".
+        // Spring/JUnit framework annotations are separate and only attach to annotated methods.
         const dir = tmp({
             'pom.xml': '<project></project>',
             'App.java': `
@@ -2037,12 +2039,11 @@ public class App {
             const index = idx(dir);
             const { ok, result } = execute(index, 'entrypoints', {});
             assert.ok(ok);
-            // main() has modifiers [public, static] which are excluded by the
-            // java-custom-annotation catch-all pattern's negative lookahead.
             const mainEntrypoints = result.filter(r => r.name === 'main');
-            assert.strictEqual(mainEntrypoints.length, 0,
-                'Java main() should not be detected as framework entrypoint, got patterns: ' +
-                mainEntrypoints.map(r => r.patternId).join(', '));
+            assert.strictEqual(mainEntrypoints.length, 1,
+                'Java main() should be detected as a runtime entrypoint');
+            assert.strictEqual(mainEntrypoints[0].patternId, 'java-main');
+            assert.strictEqual(mainEntrypoints[0].type, 'runtime');
         } finally { rm(dir); }
     });
 

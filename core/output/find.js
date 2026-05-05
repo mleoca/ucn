@@ -236,6 +236,7 @@ function formatSymbolJson(symbols, query) {
  * Format usages as JSON - FULL expressions, never truncated
  */
 function formatUsagesJson(usages, name) {
+    const { formatSymbolHandle } = require('../shared');
     const definitions = usages.filter(u => u.isDefinition);
     const refs = usages.filter(u => !u.isDefinition);
 
@@ -243,9 +244,14 @@ function formatUsagesJson(usages, name) {
     const imports = refs.filter(u => u.usageType === 'import');
     const references = refs.filter(u => u.usageType === 'reference');
 
+    // Each usage record points at a call site; the handle for the *enclosing
+    // function* (when known) is the most useful jump-back target.
     const formatUsage = (u) => ({
         file: u.relativePath || u.file,
         line: u.line,
+        ...(u.callerStartLine && u.callerName && {
+            handle: `${u.relativePath || u.file}:${u.callerStartLine}:${u.callerName}`
+        }),
         expression: u.content,  // FULL expression - key improvement
         ...(u.args && { args: u.args }),  // Parsed arguments
         ...(u.before && u.before.length > 0 && { before: u.before }),
@@ -261,15 +267,20 @@ function formatUsagesJson(usages, name) {
             importCount: imports.length,
             referenceCount: references.length,
             totalUsages: refs.length,
-            definitions: definitions.map(d => ({
-                file: d.relativePath || d.file,
-                line: d.line,
-                signature: d.signature || null,  // FULL signature
-                type: d.type || null,
-                ...(d.returnType && { returnType: d.returnType }),
-                ...(d.before && d.before.length > 0 && { before: d.before }),
-                ...(d.after && d.after.length > 0 && { after: d.after })
-            })),
+            definitions: definitions.map(d => {
+                const handle = formatSymbolHandle({ ...d, name: d.name || name });
+                return {
+                    file: d.relativePath || d.file,
+                    line: d.line,
+                    ...(handle && { handle }),
+                    signature: d.signature || null,  // FULL signature
+                    type: d.type || null,
+                    ...(d.returnType && { returnType: d.returnType }),
+                    ...(d.docstring && { docstring: d.docstring }),
+                    ...(d.before && d.before.length > 0 && { before: d.before }),
+                    ...(d.after && d.after.length > 0 && { after: d.after })
+                };
+            }),
             calls: calls.map(formatUsage),
             imports: imports.map(formatUsage),
             references: references.map(formatUsage)

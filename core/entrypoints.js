@@ -23,14 +23,36 @@ const JS_LANGS = new Set(['javascript', 'typescript', 'tsx']);
 const FRAMEWORK_PATTERNS = [
     // ── HTTP Routes ─────────────────────────────────────────────────────
 
-    // Express / Fastify / Koa (JS/TS) — call-pattern: app.get('/path', handler)
+    // Express — call-pattern: app.get('/path', handler), router.get(...), etc.
     {
         id: 'express-route',
         languages: JS_LANGS,
         type: 'http',
         framework: 'express',
         detection: 'callPattern',
-        receiverPattern: /^(app|router|server|fastify)$/i,
+        receiverPattern: /^(app|router|server)$/i,
+        methodPattern: /^(get|post|put|delete|patch|all|use|options|head)$/,
+    },
+
+    // Fastify — call-pattern: fastify.get('/path', handler)
+    {
+        id: 'fastify-route',
+        languages: JS_LANGS,
+        type: 'http',
+        framework: 'fastify',
+        detection: 'callPattern',
+        receiverPattern: /^fastify$/i,
+        methodPattern: /^(get|post|put|delete|patch|all|use|options|head|route)$/,
+    },
+
+    // Koa-router — call-pattern: koaRouter.get('/path', handler)
+    {
+        id: 'koa-route',
+        languages: JS_LANGS,
+        type: 'http',
+        framework: 'koa',
+        detection: 'callPattern',
+        receiverPattern: /^(koaRouter|koa)$/i,
         methodPattern: /^(get|post|put|delete|patch|all|use|options|head)$/,
     },
 
@@ -204,6 +226,63 @@ const FRAMEWORK_PATTERNS = [
         framework: 'go',
         detection: 'namePattern',
         pattern: /^(Test|Benchmark|Example|Fuzz)[A-Z_]/,
+    },
+
+    // ── Java entry points ─────────────────────────────────────────────
+
+    // Java main(String[] args) — JVM entry point
+    {
+        id: 'java-main',
+        languages: new Set(['java']),
+        type: 'runtime',
+        framework: 'java',
+        detection: 'namePattern',
+        pattern: /^main$/,
+    },
+
+    // JUnit @Test family — Java parser lowercases annotations into `modifiers`,
+    // not `decorators`, so detection must run against modifiers.
+    {
+        id: 'java-junit-test',
+        languages: new Set(['java']),
+        type: 'test',
+        framework: 'junit',
+        detection: 'modifier',
+        pattern: /^(test|parameterizedtest|repeatedtest|testfactory|testtemplate)$/,
+    },
+
+    // Spring HTTP route annotations — same lowercase-modifier rule
+    {
+        id: 'spring-http-mapping',
+        languages: new Set(['java']),
+        type: 'http',
+        framework: 'spring',
+        detection: 'modifier',
+        pattern: /^(getmapping|postmapping|putmapping|deletemapping|patchmapping|requestmapping)$/,
+    },
+
+    // ── Rust entry points ─────────────────────────────────────────────
+
+    // Rust main() — fn main() is the binary entry point
+    {
+        id: 'rust-main',
+        languages: new Set(['rust']),
+        type: 'runtime',
+        framework: 'rust',
+        detection: 'namePattern',
+        pattern: /^main$/,
+    },
+
+    // Rust #[test] attribute — Rust parser stores attributes as `modifiers`,
+    // not `decorators`, so detection has to run against modifiers.
+    // (The older tokio-main pattern at line 169 already uses 'modifier' correctly.)
+    {
+        id: 'rust-test-attr',
+        languages: new Set(['rust']),
+        type: 'test',
+        framework: 'rust',
+        detection: 'modifier',
+        pattern: /^(test|tokio::test|cfg\(test\))$/,
     },
 
     // ── Go Framework Patterns ─────────────────────────────────────────

@@ -348,8 +348,8 @@ describe('perf: cache v8', () => {
             index.saveCache();
             const cachePath = path.join(dir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 8, 'should save as version 8');
-            assert.ok(!cacheData.calleeIndex, 'should not include calleeIndex in v8');
+            assert.strictEqual(cacheData.version, 9, 'should save as current version');
+            assert.ok(!cacheData.calleeIndex, 'should not include calleeIndex');
         } finally {
             rm(dir);
         }

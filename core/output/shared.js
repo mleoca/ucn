@@ -93,7 +93,15 @@ function formatFunctionSignature(fn) {
     if (fn.generics) sig += fn.generics;
     // If paramsStructured + paramTypes are available, render typed params
     const typed = renderTypedParams(fn);
-    sig += `(${typed != null ? typed : normalizeParams(fn.params)})`;
+    // When paramsStructured is an empty array, the function has zero params —
+    // render `()` rather than the legacy `(...)` placeholder.
+    const noParams = Array.isArray(fn.paramsStructured) && fn.paramsStructured.length === 0;
+    let paramText;
+    if (typed != null) paramText = typed;
+    else if (noParams) paramText = '';
+    else if (fn.params != null && fn.params !== '...') paramText = normalizeParams(fn.params);
+    else paramText = '...';
+    sig += `(${paramText})`;
 
     // Return type
     if (fn.returnType) sig += `: ${fn.returnType}`;

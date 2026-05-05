@@ -238,18 +238,27 @@ function formatTypedef(types, name) {
  * Format typedef as JSON
  */
 function formatTypedefJson(types, name) {
+    const { formatSymbolHandle } = require('../shared');
     return JSON.stringify({
-        query: name,
-        count: types.length,
-        types: types.map(t => ({
-            name: t.name,
-            type: t.type,
-            file: t.relativePath || t.file,
-            startLine: t.startLine,
-            endLine: t.endLine,
-            ...(t.usageCount !== undefined && { usageCount: t.usageCount }),
-            ...(t.code && { code: t.code })
-        }))
+        meta: { command: 'typedef', count: types.length },
+        data: {
+            query: name,
+            count: types.length,
+            types: types.map(t => {
+                const handle = formatSymbolHandle(t);
+                return {
+                    name: t.name,
+                    type: t.type,
+                    file: t.relativePath || t.file,
+                    startLine: t.startLine,
+                    endLine: t.endLine,
+                    ...(handle && { handle }),
+                    ...(t.docstring && { docstring: t.docstring }),
+                    ...(t.usageCount !== undefined && { usageCount: t.usageCount }),
+                    ...(t.code && { code: t.code }),
+                };
+            }),
+        },
     }, null, 2);
 }
 

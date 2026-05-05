@@ -96,14 +96,49 @@ function extractModifiers(text) {
  */
 function extractDecorators(node) {
     const decorators = [];
+    const consume = (n) => {
+        if (n.type !== 'decorator') return;
+        let text = n.text.replace(/^@/, '');
+        const parenIdx = text.indexOf('(');
+        if (parenIdx > 0) text = text.substring(0, parenIdx);
+        decorators.push(text);
+    };
+
+    // 1. Direct children — covers most class/method decorators.
     for (let i = 0; i < node.namedChildCount; i++) {
-        const child = node.namedChild(i);
-        if (child.type === 'decorator') {
-            let text = child.text.replace(/^@/, '');
-            // Strip arguments: @Component({...}) → Component
-            const parenIdx = text.indexOf('(');
-            if (parenIdx > 0) text = text.substring(0, parenIdx);
-            decorators.push(text);
+        consume(node.namedChild(i));
+    }
+
+    // 2. When a class/function is wrapped in `export class …`, tree-sitter
+    //    wraps it in an `export_statement`. The decorator becomes a sibling
+    //    of the inner declaration *inside* that export_statement. Walk the
+    //    wrapper's children for any decorator preceding the inner node.
+    if (node.parent && node.parent.type === 'export_statement') {
+        const wrapper = node.parent;
+        let myIdx = -1;
+        for (let i = 0; i < wrapper.namedChildCount; i++) {
+            if (wrapper.namedChild(i).id === node.id) { myIdx = i; break; }
+        }
+        for (let i = myIdx - 1; i >= 0; i--) {
+            const sib = wrapper.namedChild(i);
+            if (sib.type === 'decorator') consume(sib);
+            else break;
+        }
+    }
+
+    // 3. Some grammars place decorators as preceding siblings of the
+    //    declaration itself (rather than wrapping in export_statement).
+    //    Walk back from this node within its parent.
+    if (node.parent && node.parent.type !== 'export_statement') {
+        const parent = node.parent;
+        let myIdx = -1;
+        for (let i = 0; i < parent.namedChildCount; i++) {
+            if (parent.namedChild(i).id === node.id) { myIdx = i; break; }
+        }
+        for (let i = myIdx - 1; i >= 0; i--) {
+            const sib = parent.namedChild(i);
+            if (sib.type === 'decorator') consume(sib);
+            else break;
         }
     }
     return decorators;

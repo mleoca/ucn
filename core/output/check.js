@@ -35,7 +35,10 @@ function formatCheck(result) {
             if (it.mismatches && it.mismatches.length > 0) {
                 for (const m of it.mismatches.slice(0, 3)) {
                     const where = m.file ? ` at ${m.file}:${m.line}` : '';
-                    lines.push(`    ↳ ${m.reason || 'arity mismatch'}${where}`);
+                    const reason = m.expected
+                        ? `expected ${m.expected}, got ${m.actual}`
+                        : (m.reason || 'arity mismatch');
+                    lines.push(`    ↳ ${reason}${where}`);
                 }
             }
         }

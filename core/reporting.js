@@ -271,9 +271,6 @@ function doctor(index, options = {}) {
     const { detectLanguage, langTraits } = require('../languages');
     const path = require('path');
 
-    let totalSymbols = 0;
-    for (const arr of index.symbols.values()) totalSymbols += arr.length;
-
     const inFilter = options.in || options.file || null;
     const matchInFilter = (rel) => {
         if (!inFilter) return true;
@@ -282,6 +279,7 @@ function doctor(index, options = {}) {
 
     const fileCounts = { total: 0, scanned: 0 };
     const langs = {};
+    let totalSymbols = 0;  // counted post-filter for accuracy when --in is set
     const blindSpots = {
         dynamicImports: { count: 0, files: [] },
         evalCalls:      { count: 0, files: [] },
@@ -316,6 +314,7 @@ function doctor(index, options = {}) {
         langs[lang].files++;
         langs[lang].symbols += (fe.symbols || []).length;
         langs[lang].lines += fe.lines || 0;
+        totalSymbols += (fe.symbols || []).length;
 
         if (fe.dynamicImports && fe.dynamicImports > 0) {
             blindSpots.dynamicImports.count += fe.dynamicImports;
@@ -361,19 +360,55 @@ function doctor(index, options = {}) {
         cache.buildMs = index.buildTime || null;
     } catch (e) { /* ignore */ }
 
-    // Compute trust verdict
+    // Compute trust verdict.
+    //
+    // 1. If a deep sample produced no edges (empty project, --in matches nothing),
+    //    don't pretend that's "0% confident" — return UNKNOWN.
+    // 2. Coverage gives the headline %, but blind spots (eval/reflection/dynamic
+    //    imports) downgrade the verdict by one tier each — a project that resolves
+    //    99% of edges but is full of `getattr` is not actually "HIGH" trust.
+    // 3. Parse failures always cap at MEDIUM regardless of coverage.
     let trust = 'UNKNOWN';
     let trustReason = '';
-    if (coverage) {
+    const reasons = [];
+
+    if (coverage && coverage.total > 0) {
         const safe = coverage.high + coverage.medium;
-        const total = coverage.total || 1;
-        const safePct = safe / total;
-        if (safePct >= 0.85) { trust = 'HIGH'; trustReason = `${(safePct * 100).toFixed(1)}% of edges have confidence ≥ 0.5`; }
-        else if (safePct >= 0.6) { trust = 'MEDIUM'; trustReason = `${(safePct * 100).toFixed(1)}% of edges have confidence ≥ 0.5`; }
-        else { trust = 'LOW'; trustReason = `only ${(safePct * 100).toFixed(1)}% of edges have confidence ≥ 0.5`; }
-    } else if (blindSpots.parseFailures.count === 0 && fileCounts.scanned > 0) {
-        trust = 'HIGH';
-        trustReason = 'no parse failures; coverage not deep-checked';
+        const safePct = safe / coverage.total;
+        let baseLevel;
+        if (safePct >= 0.85) baseLevel = 'HIGH';
+        else if (safePct >= 0.6) baseLevel = 'MEDIUM';
+        else baseLevel = 'LOW';
+        reasons.push(`${(safePct * 100).toFixed(1)}% of edges have confidence ≥ 0.5`);
+
+        // Blind-spot downgrades — each kind drops one tier.
+        const tier = ['HIGH', 'MEDIUM', 'LOW'];
+        let idx = tier.indexOf(baseLevel);
+        const blindSignals = [];
+        if (blindSpots.parseFailures.count > 0) { idx = Math.max(idx, 1); blindSignals.push(`${blindSpots.parseFailures.count} parse failure(s)`); }
+        if (blindSpots.evalCalls.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.evalCalls.count} eval call(s)`); }
+        if (blindSpots.reflection.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.reflection.count} reflection use(s)`); }
+        if (blindSpots.dynamicImports.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s)`); }
+        trust = tier[idx];
+        if (blindSignals.length) reasons.push(`blind spots: ${blindSignals.join(', ')}`);
+        trustReason = reasons.join('; ');
+    } else if (coverage) {
+        // Sampled but zero edges — can't say anything about confidence.
+        trust = 'UNKNOWN';
+        trustReason = 'no edges sampled (empty scope or filter matched nothing)';
+    } else if (fileCounts.scanned > 0) {
+        // Cheap path (no --deep): use blind-spot signals.
+        const tier = ['HIGH', 'MEDIUM', 'LOW'];
+        let idx = 0;
+        const blindSignals = [];
+        if (blindSpots.parseFailures.count > 0) { idx = Math.max(idx, 1); blindSignals.push(`${blindSpots.parseFailures.count} parse failure(s)`); }
+        if (blindSpots.evalCalls.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.evalCalls.count} eval call(s)`); }
+        if (blindSpots.reflection.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.reflection.count} reflection use(s)`); }
+        if (blindSpots.dynamicImports.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s)`); }
+        trust = tier[idx];
+        trustReason = blindSignals.length
+            ? `coverage not deep-checked; blind spots: ${blindSignals.join(', ')}`
+            : 'no parse failures; coverage not deep-checked';
     }
 
     return {

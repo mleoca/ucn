@@ -231,20 +231,29 @@ function formatDeadcode(results, options = {}) {
  * Format deadcode command output - JSON
  */
 function formatDeadcodeJson(results) {
+    const { formatSymbolHandle } = require('../shared');
     return JSON.stringify({
-        count: results.length,
-        ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
-        ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
-        symbols: results.map(item => ({
-            name: item.name,
-            type: item.type,
-            file: item.file,
-            startLine: item.startLine,
-            endLine: item.endLine,
-            ...(item.isExported && { isExported: true }),
-            ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
-            ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations })
-        }))
+        meta: { command: 'deadcode', count: results.length },
+        data: {
+            count: results.length,
+            ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
+            ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
+            symbols: results.map(item => {
+                const handleSym = { ...item, relativePath: item.relativePath || item.file };
+                const handle = formatSymbolHandle(handleSym);
+                return {
+                    name: item.name,
+                    type: item.type,
+                    file: item.file,
+                    startLine: item.startLine,
+                    endLine: item.endLine,
+                    ...(handle && { handle }),
+                    ...(item.isExported && { isExported: true }),
+                    ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
+                    ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations })
+                };
+            }),
+        },
     }, null, 2);
 }
 
@@ -305,16 +314,20 @@ function formatEntrypointsJson(results) {
     return JSON.stringify({
         meta: { total: results.length },
         data: {
-            entrypoints: results.map(ep => ({
-                name: ep.name,
-                file: ep.file,
-                line: ep.line,
-                type: ep.type,
-                framework: ep.framework,
-                patternId: ep.patternId,
-                evidence: ep.evidence,
-                confidence: ep.confidence,
-            }))
+            entrypoints: results.map(ep => {
+                const handle = ep.line && ep.name ? `${ep.file}:${ep.line}:${ep.name}` : null;
+                return {
+                    name: ep.name,
+                    file: ep.file,
+                    line: ep.line,
+                    ...(handle && { handle }),
+                    type: ep.type,
+                    framework: ep.framework,
+                    patternId: ep.patternId,
+                    evidence: ep.evidence,
+                    confidence: ep.confidence,
+                };
+            }),
         }
     }, null, 2);
 }

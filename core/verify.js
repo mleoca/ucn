@@ -479,6 +479,22 @@ function plan(index, name, options = {}) {
     const currentParams = def.paramsStructured || [];
     const currentSignature = index.formatSignature(def);
 
+    // Reject ambiguous multi-op invocations rather than silently coalescing.
+    // The previous behavior reported only the *last* operation in the
+    // headline, which made plan output untrustworthy for multi-op refactors.
+    const requestedOps = [
+        options.addParam ? 'addParam' : null,
+        options.removeParam ? 'removeParam' : null,
+        options.renameTo ? 'renameTo' : null,
+    ].filter(Boolean);
+    if (requestedOps.length > 1) {
+        return {
+            found: true,
+            function: name,
+            error: `plan accepts one operation at a time; got ${requestedOps.length}: ${requestedOps.join(', ')}. Run separately and compose results.`,
+        };
+    }
+
     let newParams = [...currentParams];
     let newSignature = currentSignature;
     let operation = null;

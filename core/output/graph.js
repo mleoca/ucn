@@ -174,19 +174,31 @@ function formatApi(symbols, filePath) {
  * Format api as JSON
  */
 function formatApiJson(symbols, filePath) {
+    const { formatSymbolHandle } = require('../shared');
     return JSON.stringify({
+        meta: { command: 'api', count: symbols.length },
         ...(filePath && { file: filePath }),
-        exportCount: symbols.length,
-        exports: symbols.map(s => ({
-            name: s.name,
-            type: s.type,
-            file: s.file,
-            startLine: s.startLine,
-            endLine: s.endLine,
-            ...(s.params && { params: s.params }),
-            ...(s.returnType && { returnType: s.returnType }),
-            ...(s.signature && { signature: s.signature })
-        }))
+        data: {
+            exportCount: symbols.length,
+            exports: symbols.map(s => {
+                const handleSym = { ...s, relativePath: s.relativePath || s.file };
+                const handle = formatSymbolHandle(handleSym);
+                return {
+                    name: s.name,
+                    type: s.type,
+                    file: s.file,
+                    startLine: s.startLine,
+                    endLine: s.endLine,
+                    ...(handle && { handle }),
+                    ...(s.params && { params: s.params }),
+                    ...(s.paramsStructured && { paramsStructured: s.paramsStructured }),
+                    ...(s.paramTypes && { paramTypes: s.paramTypes }),
+                    ...(s.returnType && { returnType: s.returnType }),
+                    ...(s.docstring && { docstring: s.docstring }),
+                    ...(s.signature && { signature: s.signature }),
+                };
+            }),
+        },
     }, null, 2);
 }
 

@@ -977,6 +977,9 @@ const HANDLERS = {
             direction: p.direction || 'both',
             maxDepth: num(p.depth, 2),
         });
+        if (result && result.error === 'invalid-direction') {
+            return { ok: false, error: result.message };
+        }
         const fileErr = checkFileError(result, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         return { ok: true, result };

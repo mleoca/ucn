@@ -207,7 +207,8 @@ describe('JSON formatters', () => {
         ];
         results.excludedExported = 3;
         results.excludedDecorated = 1;
-        const json = JSON.parse(output.formatDeadcodeJson(results));
+        const parsed = JSON.parse(output.formatDeadcodeJson(results));
+        const json = parsed.data || parsed;  // accept legacy or wrapped shape
         assert.strictEqual(json.count, 2);
         assert.strictEqual(json.excludedExported, 3);
         assert.strictEqual(json.excludedDecorated, 1);
@@ -1859,7 +1860,8 @@ describe('Additional Formatter Coverage', () => {
 
         it('formatTypedefJson includes query and types', () => {
             const types = [{ name: 'Cfg', type: 'interface', file: 'a.ts', startLine: 1, endLine: 5 }];
-            const json = JSON.parse(output.formatTypedefJson(types, 'Cfg'));
+            const parsed = JSON.parse(output.formatTypedefJson(types, 'Cfg'));
+            const json = parsed.data || parsed;
             assert.strictEqual(json.query, 'Cfg', 'Should include query');
             assert.strictEqual(json.count, 1, 'Should count types');
         });
@@ -1873,7 +1875,8 @@ describe('Additional Formatter Coverage', () => {
 
         it('formatApiJson includes exports', () => {
             const symbols = [{ name: 'init', type: 'function', file: 'a.js', startLine: 1, endLine: 3 }];
-            const json = JSON.parse(output.formatApiJson(symbols));
+            const parsed = JSON.parse(output.formatApiJson(symbols));
+            const json = parsed.data || parsed;
             assert.strictEqual(json.exportCount, 1, 'Should count exports');
         });
 
@@ -1929,7 +1932,8 @@ describe('Additional Formatter Coverage', () => {
 
         it('formatDeadcodeJson returns count and symbols', () => {
             const results = [{ name: 'unused', type: 'function', file: 'a.js', startLine: 1, endLine: 3 }];
-            const json = JSON.parse(output.formatDeadcodeJson(results));
+            const parsed = JSON.parse(output.formatDeadcodeJson(results));
+            const json = parsed.data || parsed;
             assert.strictEqual(json.count, 1, 'Should count symbols');
             assert.strictEqual(json.symbols[0].name, 'unused', 'Should include symbol');
         });

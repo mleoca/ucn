@@ -380,6 +380,8 @@ function extractClassMembers(classNode, code) {
                     memberType,
                     isAsync,
                     isMethod: true,  // Mark as method for context() lookups
+                    // Match top-level Python functions: `async def` → ['async'] modifiers.
+                    modifiers: isAsync ? ['async'] : [],
                     ...(returnType && { returnType }),
                     ...(paramTypes && { paramTypes }),
                     ...(docstring && { docstring }),

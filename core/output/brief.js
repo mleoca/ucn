@@ -15,7 +15,15 @@ function signatureLine(sym) {
     if (sym.modifiers && sym.modifiers.length) parts.push(sym.modifiers.join(' '));
     let sig = sym.name;
     const typed = renderTypedParams(sym);
-    sig += `(${typed != null ? typed : (sym.params != null ? sym.params : '...')})`;
+    // If we have a structured-params array of length 0, the function has no params.
+    // Render `()` rather than the legacy `(...)` placeholder.
+    const noParams = Array.isArray(sym.paramsStructured) && sym.paramsStructured.length === 0;
+    let paramText;
+    if (typed != null) paramText = typed;
+    else if (noParams) paramText = '';
+    else if (sym.params != null && sym.params !== '...') paramText = sym.params;
+    else paramText = '...';
+    sig += `(${paramText})`;
     if (sym.returnType) sig += `: ${sym.returnType}`;
     parts.push(sig);
     return parts.join(' ');

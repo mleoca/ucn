@@ -46,10 +46,14 @@ function nodeToLocation(node, codeOrLines) {
  * @returns {string}
  */
 function extractParams(paramsNode) {
+    // Distinguish "we have no node" (genuinely unknown) from "node is empty".
+    // Returning '...' for empty parens caused signatures like `main(...)` for
+    // functions that actually take zero arguments. Empty → '' so callers can
+    // render `main()` cleanly.
     if (!paramsNode) return '...';
     const text = paramsNode.text;
-    // Remove outer parens and trim
-    return text.replace(/^\(|\)$/g, '').trim() || '...';
+    const stripped = text.replace(/^\(|\)$/g, '').trim();
+    return stripped;  // '' for empty params, '...' only when paramsNode missing
 }
 
 /**

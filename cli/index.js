@@ -15,13 +15,46 @@ const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
 const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName, FILE_LOCAL_COMMANDS } = require('../core/registry');
+const { looksLikeHandle, parseSymbolHandle } = require('../core/shared');
+
+/**
+ * Convert a CLI argument that may be a stable handle into the symbol name
+ * that's appropriate for headers / "Usages of X" / "find Y" displays.
+ * Plain names pass through unchanged.
+ */
+function nameForDisplay(arg) {
+    if (typeof arg !== 'string') return arg;
+    if (!looksLikeHandle(arg)) return arg;
+    const h = parseSymbolHandle(arg);
+    return h && h.name ? h.name : arg;
+}
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
 // Sentinel error for command failures that have already printed their message.
 // Thrown instead of process.exit(1) so finally blocks can run (cache save).
 class CommandError extends Error { constructor() { super(); } }
-function fail(msg) { console.error(msg); throw new CommandError(); }
+/**
+ * Print an error message and abort. When `--json` is in effect, write a JSON
+ * error envelope to stdout (so JSON-consuming pipelines see structured output)
+ * and write the same plain message to stderr (for humans piping to a TTY).
+ */
+function fail(msg) {
+    // Honor --json by writing a structured envelope to stdout for pipelines.
+    // We use try/catch around symbol lookups because `flags` may not be initialized
+    // yet when fail() is called from the early arg-parsing path (TDZ).
+    let wantsJson = false;
+    try { if (typeof flags !== 'undefined' && flags && flags.json) wantsJson = true; } catch (_) {}
+    if (!wantsJson) {
+        try { if (Array.isArray(process.argv) && process.argv.includes('--json')) wantsJson = true; } catch (_) {}
+    }
+    if (wantsJson) {
+        const env = { meta: { ok: false }, error: typeof msg === 'string' ? msg : String(msg) };
+        try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) {}
+    }
+    console.error(msg);
+    throw new CommandError();
+}
 
 // ============================================================================
 // ARGUMENT PARSING
@@ -524,9 +557,10 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error, note } = execute(index, 'usages', { name: arg, ...flags });
             if (!ok) fail(error);
             if (note) console.error(note);
+            const displayName = nameForDisplay(arg);
             printOutput(result,
-                r => output.formatUsagesJson(r, arg),
-                r => output.formatUsages(r, arg, { compact: flags.compact })
+                r => output.formatUsagesJson(r, displayName),
+                r => output.formatUsages(r, displayName, { compact: flags.compact })
             );
             break;
         }
@@ -534,9 +568,10 @@ function runProjectCommand(rootDir, command, arg) {
         case 'example': {
             const { ok, result, error } = execute(index, 'example', { name: arg, file: flags.file, className: flags.className });
             if (!ok) fail(error);
+            const displayName = nameForDisplay(arg);
             printOutput(result,
-                r => output.formatExampleJson(r, arg),
-                r => output.formatExample(r, arg)
+                r => output.formatExampleJson(r, displayName),
+                r => output.formatExample(r, displayName)
             );
             break;
         }
@@ -581,7 +616,29 @@ function runProjectCommand(rootDir, command, arg) {
                 match, itemNum: expandNum, itemCount: items.length, validateRoot: true
             });
             if (!ok) fail(error);
-            console.log(result.text);
+            if (flags.json) {
+                // Honor --json: structured output with the expanded code + metadata.
+                const env = {
+                    meta: { command: 'expand', item: expandNum },
+                    data: {
+                        item: expandNum,
+                        ...(match && {
+                            name: match.name,
+                            type: match.type,
+                            file: match.relativePath || match.file,
+                            startLine: match.startLine,
+                            endLine: match.endLine,
+                            handle: match.relativePath && match.startLine && match.name
+                                ? `${match.relativePath}:${match.startLine}:${match.name}`
+                                : null,
+                        }),
+                        text: result.text,
+                    },
+                };
+                console.log(JSON.stringify(env, null, 2));
+            } else {
+                console.log(result.text);
+            }
             break;
         }
 
@@ -792,9 +849,10 @@ function runProjectCommand(rootDir, command, arg) {
         case 'tests': {
             const { ok, result, error } = execute(index, 'tests', { name: arg, callsOnly: flags.callsOnly, className: flags.className, file: flags.file, exclude: flags.exclude });
             if (!ok) fail(error);
+            const displayName = nameForDisplay(arg);
             printOutput(result,
-                r => output.formatTestsJson(r, arg),
-                r => output.formatTests(r, arg)
+                r => output.formatTestsJson(r, displayName),
+                r => output.formatTests(r, displayName)
             );
             break;
         }
@@ -1457,6 +1515,7 @@ const INTERACTIVE_DISPATCH = {
     reverseTrace: { params: 'name', format: (r) => output.formatReverseTrace(r) },
     related:      { params: 'name', format: (r, _a, f) => output.formatRelated(r, { all: f.all, top: f.top }) },
     example:      { params: 'name', format: (r, a) => output.formatExample(r, a) },
+    brief:        { params: 'name', format: (r) => output.formatBrief(r) },
 
     // ── Finding Code ─────────────────────────────────────────────────
     find:          { params: 'name', format: (r, a, f) => output.formatFindDetailed(r, a, { depth: f.depth, top: f.top, all: f.all }) },
@@ -1477,11 +1536,13 @@ const INTERACTIVE_DISPATCH = {
     plan:         { params: 'name', format: (r) => output.formatPlan(r) },
     verify:       { params: 'name', format: (r) => output.formatVerify(r) },
     diffImpact:   { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit, all: f.all }), format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
+    check:        { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit }), format: (r) => output.formatCheck(r) },
     entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude, includeTests: f.includeTests, limit: f.limit }), format: (r) => output.formatEntrypoints(r) },
 
     // ── Other ────────────────────────────────────────────────────────
     api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
     stacktrace:   { params: (a, f) => ({ stack: f.stack || a }), format: (r) => output.formatStackTrace(r) },
+    doctor:       { params: (a, f) => ({ file: f.file, in: f.in, limit: f.limit, deep: f.deep }), format: (r) => output.formatDoctor(r) },
     stats:        { params: 'flags', format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
 };
 

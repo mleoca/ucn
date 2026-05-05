@@ -76,6 +76,9 @@ const SIDE_EFFECT_CALLS_BY_LANG = {
         fs: new Set(['open']),
         process: new Set(['exit', 'system']),
     },
+    // Nominal languages: imports already give a strong signal (e.g. `java.io`),
+    // and direct-call tokens like `exit` would cause false positives across
+    // generic identifiers. We deliberately keep this empty.
     go: {},
     java: {},
     rust: {},

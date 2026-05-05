@@ -179,11 +179,18 @@ function fileExports(index, filePath, _visited) {
     const results = [];
     const exportedNames = new Set(fileEntry.exports);
 
+    // Python convention: when a module declares no `__all__`, every top-level
+    // non-`_` name is considered public. We don't want this in the underlying
+    // export list (deadcode would think everything is exported), so fileExports
+    // applies it locally for display.
+    const isPythonImplicit = fileEntry.language === 'python' && exportedNames.size === 0;
+
     for (const symbol of fileEntry.symbols) {
         const isExported = exportedNames.has(symbol.name) ||
             (symbol.modifiers && symbol.modifiers.includes('export')) ||
             (symbol.modifiers && symbol.modifiers.includes('public')) ||
-            (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbol.name));
+            (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbol.name)) ||
+            (isPythonImplicit && symbol.name && !symbol.name.startsWith('_') && !symbol.className && !symbol.isMethod);
 
         if (isExported) {
             results.push({
@@ -443,7 +450,22 @@ function api(index, filePath, options = {}) {
  * @returns {object} - Graph structure with root, nodes, edges
  */
 function graph(index, filePath, options = {}) {
-    const direction = options.direction || 'both';
+    // Normalize direction. Accept aliases (`in` ≡ importers, `out` ≡ imports),
+    // reject anything else with an explicit error so users don't get a silent
+    // empty-graph answer.
+    const rawDirection = options.direction || 'both';
+    const DIRECTION_ALIASES = {
+        'imports': 'imports', 'out': 'imports', 'outgoing': 'imports', 'downstream': 'imports',
+        'importers': 'importers', 'in': 'importers', 'incoming': 'importers', 'upstream': 'importers',
+        'both': 'both',
+    };
+    const direction = DIRECTION_ALIASES[rawDirection];
+    if (!direction) {
+        return {
+            error: 'invalid-direction',
+            message: `Unknown direction "${rawDirection}". Valid: imports/out/outgoing/downstream, importers/in/incoming/upstream, both.`,
+        };
+    }
     // Sanitize depth: use default for null/undefined, clamp negative to 0
     const rawDepth = options.maxDepth ?? 5;
     const maxDepth = Math.max(0, rawDepth);
