@@ -10,6 +10,18 @@ const {
 } = require('./shared');
 
 /**
+ * Trim a docstring to a single short sentence (max 80 chars) for inline display.
+ */
+function firstSentenceShort(text) {
+    if (!text) return null;
+    const trimmed = text.trim();
+    const m = trimmed.match(/^(.+?[.!?])(?:\s|$)/);
+    let s = m ? m[1] : trimmed;
+    if (s.length > 80) s = s.slice(0, 77) + '...';
+    return s;
+}
+
+/**
  * Format find command output
  */
 function formatFind(symbols, query, top) {
@@ -34,6 +46,10 @@ function formatFind(symbols, query, top) {
             ? formatFunctionSignature(s)
             : formatClassSignature(s);
         lines.push(`${s.relativePath}:${s.startLine}  ${sig}`);
+        if (s.docstring) {
+            const snip = firstSentenceShort(s.docstring);
+            if (snip) lines.push(`  "${snip}"`);
+        }
         if (s.usageCounts !== undefined) {
             const c = s.usageCounts;
             const parts = [];
@@ -116,6 +132,10 @@ function formatFindDetailed(symbols, query, options = {}) {
         const confStr = confidence.level !== 'high' ? ` [${confidence.level}]` : '';
 
         lines.push(`${s.relativePath}:${s.startLine}  ${sig}${confStr}`);
+        if (s.docstring) {
+            const snip = firstSentenceShort(s.docstring);
+            if (snip) lines.push(`  "${snip}"`);
+        }
         if (s.usageCounts !== undefined) {
             const c = s.usageCounts;
             const parts = [];

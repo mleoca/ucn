@@ -4769,3 +4769,246 @@ describe('fix: expand cache invalidation on rebuild', () => {
     });
 });
 
+
+// ============================================================================
+// Trust signals: confidence histogram + reachability tagging
+// ============================================================================
+
+describe('feature: caller/callee confidence histogram', () => {
+    it('histogram appears in context output when there are 2+ callers', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\tdoWork()
+}
+func doWork() {
+\thelper()
+}
+func helper() {}
+func unused1() { helper() }
+func unused2() { helper() }
+`,
+        });
+        try {
+            const out = runCli(dir, 'context', ['helper']);
+            assert.ok(out.includes('CALLERS (3)'), 'should show 3 callers');
+            assert.match(out, /confidence: \d+ high \(>0\.8\), \d+ medium \(0\.5-0\.8\), \d+ low \(<0\.5\)/,
+                'histogram line should be present in caller section');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('histogram is suppressed when there is only 1 caller', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\thelper()
+}
+func helper() {}
+`,
+        });
+        try {
+            const out = runCli(dir, 'context', ['helper']);
+            assert.ok(out.includes('CALLERS (1)'), 'should show 1 caller');
+            assert.ok(!/^\s*confidence: \d+ high/m.test(out),
+                'histogram line should NOT be present when only 1 caller');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('feature: reachability tagging of callers/callees', () => {
+    it('tags callers as reachable/unreachable based on entry-point reachability', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\tdoWork()
+}
+func doWork() {
+\thelper()
+}
+func helper() {}
+func unusedCaller() { helper() }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const ctx = index.context('helper');
+            assert.ok(ctx.callers.length >= 2, 'should find at least 2 callers');
+            const reachableCaller = ctx.callers.find(c => c.callerName === 'doWork');
+            const unreachableCaller = ctx.callers.find(c => c.callerName === 'unusedCaller');
+            assert.ok(reachableCaller, 'should find doWork as caller');
+            assert.ok(unreachableCaller, 'should find unusedCaller as caller');
+            assert.strictEqual(reachableCaller.reachable, true, 'doWork is reachable from main');
+            assert.strictEqual(unreachableCaller.reachable, false, 'unusedCaller is NOT reachable from any entry point');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('text output shows "(unreachable from any entry point)" only when at least one caller is unreachable', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\tdoWork()
+}
+func doWork() {
+\thelper()
+}
+func helper() {}
+func unusedCaller() { helper() }
+`,
+        });
+        try {
+            const out = runCli(dir, 'context', ['helper']);
+            assert.ok(out.includes('unreachable from any entry point'),
+                'should show unreachable marker when at least one caller is unreachable');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('reachability is cached on the index across calls', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\thelper()
+}
+func helper() {}
+`,
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index._reachableSymbols, undefined, 'reachable cache should not exist before first call');
+            index.context('helper');
+            assert.ok(index._reachableSymbols instanceof Set, 'reachable cache should be a Set after context()');
+            const cachedSet = index._reachableSymbols;
+            // Second call must reuse the same Set instance
+            index.context('helper');
+            assert.strictEqual(index._reachableSymbols, cachedSet, 'reachable cache should be reused across calls');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('feature: --unreachable-only flag', () => {
+    it('CLI: --unreachable-only filters context to unreachable callers', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\tdoWork()
+}
+func doWork() {
+\thelper()
+}
+func helper() {}
+func unused1() { helper() }
+func unused2() { helper() }
+`,
+        });
+        try {
+            const fullOut = runCli(dir, 'context', ['helper']);
+            assert.ok(fullOut.includes('CALLERS (3)'), 'without filter: 3 callers');
+
+            const filteredOut = runCli(dir, 'context', ['helper'], ['--unreachable-only']);
+            assert.ok(filteredOut.includes('CALLERS (2)'), 'with --unreachable-only: 2 unreachable callers');
+            assert.ok(!filteredOut.includes('[doWork]'), 'reachable caller doWork should be filtered out');
+            assert.ok(filteredOut.includes('[unused1]'), 'unreachable caller unused1 should remain');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('CLI: --unreachable-only on impact filters the call sites', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\thelper()
+}
+func helper() {}
+func deadCaller() { helper() }
+`,
+        });
+        try {
+            const out = runCli(dir, 'impact', ['helper'], ['--unreachable-only']);
+            assert.ok(out.includes('CALL SITES: 1'), 'only the unreachable caller remains');
+            assert.ok(out.includes('[deadCaller]'), 'deadCaller is the unreachable site');
+            assert.ok(!out.includes('[main]'), 'main is reachable and filtered out');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('feature: histogram and reachable in JSON output', () => {
+    it('context --json includes callerHistogram and per-caller reachable', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\thelper()
+}
+func helper() {}
+func dead1() { helper() }
+func dead2() { helper() }
+`,
+        });
+        try {
+            const out = runCli(dir, 'context', ['helper'], ['--json']);
+            const parsed = JSON.parse(out);
+            assert.ok(parsed.data, 'should have data');
+            assert.ok(parsed.data.callerHistogram, 'callerHistogram should be present');
+            assert.strictEqual(parsed.data.callerHistogram.total, 3, 'total should equal caller count');
+            assert.ok(typeof parsed.data.callerHistogram.high === 'number', 'high bucket is a number');
+            assert.ok(typeof parsed.data.callerHistogram.medium === 'number', 'medium bucket is a number');
+            assert.ok(typeof parsed.data.callerHistogram.low === 'number', 'low bucket is a number');
+            // Per-caller reachable
+            for (const c of parsed.data.callers) {
+                assert.ok(typeof c.reachable === 'boolean',
+                    'every caller should have a boolean reachable field');
+            }
+            const reachableCount = parsed.data.callers.filter(c => c.reachable).length;
+            const unreachableCount = parsed.data.callers.filter(c => !c.reachable).length;
+            assert.strictEqual(reachableCount, 1, 'main is reachable');
+            assert.strictEqual(unreachableCount, 2, 'dead1 and dead2 are unreachable');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('about --json includes histograms and per-caller reachable', () => {
+        const dir = tmp({
+            'main.go': `package main
+
+func main() {
+\thelper()
+}
+func helper() {}
+func unused1() { helper() }
+`,
+        });
+        try {
+            const out = runCli(dir, 'about', ['helper'], ['--json']);
+            const parsed = JSON.parse(out);
+            assert.ok(parsed.callers, 'callers section present');
+            assert.ok(parsed.callers.histogram, 'caller histogram present');
+            assert.strictEqual(parsed.callers.histogram.total, 2);
+            for (const c of parsed.callers.top) {
+                assert.ok(typeof c.reachable === 'boolean',
+                    'every caller in about should have reachable field');
+            }
+        } finally {
+            rm(dir);
+        }
+    });
+});

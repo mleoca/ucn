@@ -3475,3 +3475,86 @@ describe('fix #181: TypeScript optional ? marker preserved in plan after.params'
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Type annotations: TS native + JSDoc paramTypes/returnType extraction
+// ============================================================================
+
+describe('type annotations — TS native', () => {
+    const { execute } = require('../core/execute');
+
+    it('extracts paramTypes and returnType from TypeScript native annotations', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'export function add(x: number, y: number): number { return x + y; }\nexport function fmt(name: string, age?: number): string { return name; }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'add' });
+            assert.ok(r.ok);
+            assert.deepStrictEqual(r.result.symbol.paramTypes, { x: 'number', y: 'number' });
+            assert.strictEqual(r.result.symbol.returnType, 'number');
+            const r2 = execute(i, 'about', { name: 'fmt' });
+            assert.deepStrictEqual(r2.result.symbol.paramTypes, { name: 'string', age: 'number' });
+        } finally { rm(dir); }
+    });
+
+    it('typed signature is rendered in formatSignature', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'export function add(x: number, y: number): number { return x + y; }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'add' });
+            assert.ok(r.ok);
+            assert.match(r.result.symbol.signature, /add \(x: number, y: number\) : number/);
+        } finally { rm(dir); }
+    });
+});
+
+describe('type annotations — JSDoc', () => {
+    const { execute } = require('../core/execute');
+
+    it('extracts paramTypes and returnType from JSDoc tags in plain JS', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': '/**\n * @param {string} name\n * @param {number} count\n * @returns {Promise<User>}\n */\nfunction process(name, count) { return Promise.resolve(); }\nmodule.exports = process;'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'process' });
+            assert.ok(r.ok);
+            assert.deepStrictEqual(r.result.symbol.paramTypes, { name: 'string', count: 'number' });
+            assert.strictEqual(r.result.symbol.returnType, 'Promise<User>');
+        } finally { rm(dir); }
+    });
+
+    it('native TS annotations win over conflicting JSDoc', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': '/**\n * @param {string} x\n * @returns {string}\n */\nexport function foo(x: number): number { return x; }'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'foo' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.symbol.paramTypes.x, 'number', 'native should win');
+            assert.strictEqual(r.result.symbol.returnType, 'number', 'native return should win');
+        } finally { rm(dir); }
+    });
+
+    it('handles optional-bracket form @param {Type} [name]', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': '/**\n * @param {string} [name]\n * @param {number} [count=0]\n */\nfunction f(name, count) {}'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'f' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.symbol.paramTypes.name, 'string');
+            assert.strictEqual(r.result.symbol.paramTypes.count, 'number');
+        } finally { rm(dir); }
+    });
+});

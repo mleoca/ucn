@@ -159,8 +159,10 @@ function parsePythonParam(param, info) {
     } else if (param.type === 'default_parameter' || param.type === 'typed_default_parameter') {
         const nameNode = param.childForFieldName('name');
         const valueNode = param.childForFieldName('value');
+        const typeNode = param.childForFieldName('type');
         if (nameNode) info.name = nameNode.text;
         if (valueNode) info.default = valueNode.text;
+        if (typeNode) info.type = typeNode.text;
         info.optional = true;
     } else if (param.type === 'list_splat_pattern' || param.type === 'dictionary_splat_pattern') {
         info.name = param.text;
@@ -391,6 +393,126 @@ function extractJavaDocstring(code, startLine) {
 }
 
 /**
+ * Build a paramTypes map from a structured-params array.
+ * Skips entries without a `type`. Preserves the structured order via plain object.
+ * @param {Array<{name: string, type?: string}>} paramsStructured
+ * @returns {Object<string,string>|null} map { paramName: typeString } or null if empty
+ */
+function paramTypesFromStructured(paramsStructured) {
+    if (!Array.isArray(paramsStructured) || paramsStructured.length === 0) return null;
+    const map = {};
+    let any = false;
+    for (const p of paramsStructured) {
+        if (p && p.name && p.type) {
+            map[p.name] = p.type;
+            any = true;
+        }
+    }
+    return any ? map : null;
+}
+
+/**
+ * Parse @param and @returns/@return tags from a JSDoc block above the given line.
+ * Returns { paramTypes, returnType } where paramTypes is { name: type } and
+ * returnType is a string, both possibly omitted if not present.
+ *
+ * Tag forms supported:
+ *   @param {Type} name           - typed param
+ *   @param {Type} name - desc    - typed param with description
+ *   @returns {Type} desc         - return type (also @return)
+ * Untyped @param tags are ignored.
+ *
+ * @param {string|string[]} codeOrLines
+ * @param {number} startLine - 1-indexed line of the function/method declaration
+ * @returns {{ paramTypes?: Object, returnType?: string }}
+ */
+function parseJSDocTags(codeOrLines, startLine) {
+    const lines = Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n');
+    const lineIndex = startLine - 1;
+    if (lineIndex <= 0) return {};
+
+    // Walk up past blank lines and decorators to find a JSDoc end line `*/`
+    let i = lineIndex - 1;
+    while (i >= 0 && (lines[i].trim() === '' || lines[i].trim().startsWith('@'))) {
+        i--;
+    }
+    if (i < 0) return {};
+    if (!lines[i].trim().endsWith('*/')) return {};
+
+    const docEnd = i;
+    while (i >= 0 && !lines[i].includes('/**')) {
+        i--;
+    }
+    if (i < 0) return {};
+
+    // Collect block text lines, stripping leading `*` and surrounding whitespace
+    const blockLines = [];
+    for (let j = i; j <= docEnd; j++) {
+        const line = lines[j]
+            .replace(/^\s*\/\*\*\s?/, '')
+            .replace(/\s*\*\/\s*$/, '')
+            .replace(/^\s*\*\s?/, '');
+        blockLines.push(line);
+    }
+    const block = blockLines.join('\n');
+
+    // @param {Type} name  — capture balanced braces (no nested braces in JSDoc types in practice)
+    const paramTypes = {};
+    let any = false;
+    const paramRegex = /@param\s+\{([^}]+)\}\s+([A-Za-z_$][\w$]*)/g;
+    let m;
+    while ((m = paramRegex.exec(block)) !== null) {
+        const type = m[1].trim();
+        const name = m[2];
+        // Strip optional brackets if author wrote @param {Type} [name]; here we already excluded that
+        // but also handle @param {Type} [name=default] form by scanning a separate regex
+        paramTypes[name] = type;
+        any = true;
+    }
+    // Optional-bracket form: @param {Type} [name] or [name=default]
+    const paramOptRegex = /@param\s+\{([^}]+)\}\s+\[([A-Za-z_$][\w$]*)(?:\s*=[^\]]*)?\]/g;
+    while ((m = paramOptRegex.exec(block)) !== null) {
+        const type = m[1].trim();
+        const name = m[2];
+        if (!paramTypes[name]) paramTypes[name] = type;
+        any = true;
+    }
+
+    // @returns {Type} or @return {Type}
+    const retMatch = block.match(/@returns?\s+\{([^}]+)\}/);
+    const result = {};
+    if (any) result.paramTypes = paramTypes;
+    if (retMatch) result.returnType = retMatch[1].trim();
+    return result;
+}
+
+/**
+ * Compute the final paramTypes/returnType for a function symbol.
+ * Native AST types take precedence; JSDoc fills gaps.
+ * @param {Array} paramsStructured - parser output
+ * @param {string|null} nativeReturnType - return type extracted from AST (TS/Py)
+ * @param {string|string[]} codeOrLines - source for JSDoc lookup
+ * @param {number} startLine - function start line
+ * @param {boolean} useJSDoc - whether to consult JSDoc (true for JS/TS, false for Py)
+ * @returns {{ paramTypes?: Object, returnType?: string }}
+ */
+function buildTypeAnnotations(paramsStructured, nativeReturnType, codeOrLines, startLine, useJSDoc) {
+    const native = paramTypesFromStructured(paramsStructured);
+    let jsdoc = {};
+    if (useJSDoc) jsdoc = parseJSDocTags(codeOrLines, startLine);
+
+    const out = {};
+    // Merge: JSDoc first, native overrides
+    if (jsdoc.paramTypes || native) {
+        const merged = { ...(jsdoc.paramTypes || {}), ...(native || {}) };
+        if (Object.keys(merged).length > 0) out.paramTypes = merged;
+    }
+    const rt = nativeReturnType || jsdoc.returnType;
+    if (rt) out.returnType = rt;
+    return out;
+}
+
+/**
  * Get the token type at a specific position using AST
  * @param {object} rootNode - Tree-sitter root node
  * @param {number} line - 1-indexed line number
@@ -604,6 +726,9 @@ module.exports = {
     extractGoDocstring,
     extractRustDocstring,
     extractJavaDocstring,
+    paramTypesFromStructured,
+    parseJSDocTags,
+    buildTypeAnnotations,
     getTokenTypeAtPosition,
     isMatchInCommentOrString,
     findMatchesWithASTFilter

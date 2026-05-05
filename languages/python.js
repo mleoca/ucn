@@ -10,7 +10,8 @@ const {
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
-    extractPythonDocstring
+    extractPythonDocstring,
+    paramTypesFromStructured
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -117,16 +118,19 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             // Only set when different from startLine (i.e., when decorators push startLine earlier)
             const nameLine = nameNode.startPosition.row + 1;
 
+            const paramsStructured = parseStructuredParams(paramsNode, 'python');
+            const paramTypes = paramTypesFromStructured(paramsStructured);
             functions.push({
                 name: nameNode.text,
                 params: extractPythonParams(paramsNode),
-                paramsStructured: parseStructuredParams(paramsNode, 'python'),
+                paramsStructured,
                 startLine: decoratorStartLine,
                 endLine,
                 indent,
                 isAsync,
                 modifiers: isAsync ? ['async'] : [],
                 ...(returnType && { returnType }),
+                ...(paramTypes && { paramTypes }),
                 ...(docstring && { docstring }),
                 ...(decorators.length > 0 && { decorators }),
                 ...(nameLine !== decoratorStartLine && { nameLine })
@@ -365,16 +369,19 @@ function extractClassMembers(classNode, code) {
                 // nameLine: where the name identifier lives (differs from startLine when decorated)
                 const nameLine = nameNode.startPosition.row + 1;
 
+                const paramsStructured = parseStructuredParams(paramsNode, 'python');
+                const paramTypes = paramTypesFromStructured(paramsStructured);
                 members.push({
                     name,
                     params: extractPythonParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'python'),
+                    paramsStructured,
                     startLine,
                     endLine,
                     memberType,
                     isAsync,
                     isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
+                    ...(paramTypes && { paramTypes }),
                     ...(docstring && { docstring }),
                     ...(memberDecorators.length > 0 && { decorators: memberDecorators }),
                     ...(nameLine !== startLine && { nameLine })

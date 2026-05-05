@@ -960,7 +960,7 @@ describe('Architecture Guards', () => {
             'file', 'exclude', 'name', 'term', 'item', 'depth', 'top', 'limit', 'context',
             'direction', 'all', 'exact', 'regex', 'in', 'range', 'stack', 'base',
             'staged', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported',
-            'unused', 'functions', 'framework', 'detailed',
+            'unused', 'functions', 'framework', 'detailed', 'deep', 'compact',
         ];
         for (const p of directParams) knownCamelParams.add(p);
 

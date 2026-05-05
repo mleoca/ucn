@@ -11,7 +11,8 @@ const {
     nodeToLocation,
     extractParams,
     parseStructuredParams,
-    extractJSDocstring
+    extractJSDocstring,
+    buildTypeAnnotations
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -131,6 +132,8 @@ function _processFunction(node, functions, processedRanges, lines) {
             const generics = extractGenerics(node);
             const docstring = extractJSDocstring(lines, startLine);
             const isGen = isGenerator(node);
+            const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+            const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
             // Check parent for export status (function_declaration inside export_statement)
             const modifiers = node.parent && node.parent.type === 'export_statement'
                 ? extractModifiers(node.parent.text)
@@ -139,14 +142,14 @@ function _processFunction(node, functions, processedRanges, lines) {
             functions.push({
                 name: nameNode.text,
                 params: extractParams(paramsNode),
-                paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                paramsStructured,
                 startLine,
                 endLine,
                 indent,
                 isArrow: false,
                 isGenerator: isGen,
                 modifiers,
-                ...(returnType && { returnType }),
+                ...typeAnno,
                 ...(generics && { generics }),
                 ...(docstring && { docstring })
             });
@@ -167,11 +170,13 @@ function _processFunction(node, functions, processedRanges, lines) {
             const returnType = extractReturnType(node);
             const generics = extractGenerics(node);
             const docstring = extractJSDocstring(lines, startLine);
+            const paramsStructured = parseStructuredParams(paramsNode, 'typescript');
+            const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
 
             functions.push({
                 name: nameNode.text,
                 params: extractParams(paramsNode),
-                paramsStructured: parseStructuredParams(paramsNode, 'typescript'),
+                paramsStructured,
                 startLine,
                 endLine,
                 indent,
@@ -179,7 +184,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 isGenerator: false,
                 isSignature: true,
                 modifiers: [],
-                ...(returnType && { returnType }),
+                ...typeAnno,
                 ...(generics && { generics }),
                 ...(docstring && { docstring })
             });
@@ -210,6 +215,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                         const generics = extractGenerics(valueNode);
                         const docstring = extractJSDocstring(lines, startLine);
                         const isGen = isGenerator(valueNode);
+                        const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                        const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
                         // Check parent for export status (lexical_declaration inside export_statement)
                         const modifiers = node.parent && node.parent.type === 'export_statement'
                             ? extractModifiers(node.parent.text)
@@ -218,14 +225,14 @@ function _processFunction(node, functions, processedRanges, lines) {
                         functions.push({
                             name: nameNode.text,
                             params: extractParams(paramsNode),
-                            paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                            paramsStructured,
                             startLine,
                             endLine,
                             indent,
                             isArrow,
                             isGenerator: isGen,
                             modifiers,
-                            ...(returnType && { returnType }),
+                            ...typeAnno,
                             ...(generics && { generics }),
                             ...(docstring && { docstring })
                         });
@@ -255,6 +262,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                                         const returnType = extractReturnType(innerFn);
                                         const generics = extractGenerics(innerFn);
                                         const docstring = extractJSDocstring(lines, startLine);
+                                        const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                                        const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
                                         const modifiers = node.parent && node.parent.type === 'export_statement'
                                             ? extractModifiers(node.parent.text)
                                             : extractModifiers(node.text);
@@ -262,14 +271,14 @@ function _processFunction(node, functions, processedRanges, lines) {
                                         functions.push({
                                             name: nameNode.text,
                                             params: extractParams(paramsNode),
-                                            paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                                            paramsStructured,
                                             startLine,
                                             endLine,
                                             indent,
                                             isArrow: innerFn.type === 'arrow_function',
                                             isGenerator: false,
                                             modifiers,
-                                            ...(returnType && { returnType }),
+                                            ...typeAnno,
                                             ...(generics && { generics }),
                                             ...(docstring && { docstring })
                                         });
@@ -330,18 +339,20 @@ function _processFunction(node, functions, processedRanges, lines) {
                     const generics = extractGenerics(rightNode);
                     const docstring = extractJSDocstring(lines, startLine);
                     const isGen = isGenerator(rightNode);
+                    const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                    const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
 
                     functions.push({
                         name,
                         params: extractParams(paramsNode),
-                        paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                        paramsStructured,
                         startLine,
                         endLine,
                         indent,
                         isArrow,
                         isGenerator: isGen,
                         modifiers: [],
-                        ...(returnType && { returnType }),
+                        ...typeAnno,
                         ...(generics && { generics }),
                         ...(docstring && { docstring })
                     });
@@ -368,18 +379,20 @@ function _processFunction(node, functions, processedRanges, lines) {
                     const generics = extractGenerics(child);
                     const docstring = extractJSDocstring(lines, startLine);
                     const isGen = isGenerator(child);
+                    const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                    const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
 
                     functions.push({
                         name: 'default',
                         params: extractParams(paramsNode),
-                        paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                        paramsStructured,
                         startLine,
                         endLine,
                         indent,
                         isArrow: child.type === 'arrow_function',
                         isGenerator: isGen,
                         modifiers: ['export', 'default'],
-                        ...(returnType && { returnType }),
+                        ...typeAnno,
                         ...(generics && { generics }),
                         ...(docstring && { docstring })
                     });
@@ -656,15 +669,17 @@ function extractInterfaceMembers(interfaceNode, code) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const returnType = extractReturnType(child);
+                const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
                 members.push({
                     name: nameNode.text,
                     params: extractParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                    paramsStructured,
                     startLine,
                     endLine,
                     memberType: 'method',
                     isMethod: true,
-                    ...(returnType && { returnType })
+                    ...typeAnno
                 });
             }
         } else if (child.type === 'property_signature') {
@@ -773,18 +788,20 @@ function extractClassMembers(classNode, codeOrLines) {
                 const isAsync = text.match(/^\s*(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:override\s+)?async\s/) !== null;
                 const returnType = extractReturnType(child);
                 const docstring = extractJSDocstring(code, startLine);
+                const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
 
                 members.push({
                     name,
                     params: extractParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                    paramsStructured,
                     startLine,
                     endLine,
                     memberType,
                     isAsync,
                     isGenerator: isGen,
                     isMethod: true,  // Mark as method for context() lookups
-                    ...(returnType && { returnType }),
+                    ...typeAnno,
                     ...(docstring && { docstring }),
                     ...(decorators.length > 0 && { decorators })
                 });
@@ -799,6 +816,8 @@ function extractClassMembers(classNode, codeOrLines) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const returnType = extractReturnType(child);
                 const docstring = extractJSDocstring(code, startLine);
+                const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
                 // Collect decorators from preceding siblings
                 const decorators = [];
                 for (let j = i - 1; j >= 0; j--) {
@@ -813,12 +832,12 @@ function extractClassMembers(classNode, codeOrLines) {
                 members.push({
                     name: nameNode.text,
                     params: extractParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                    paramsStructured,
                     startLine,
                     endLine,
                     memberType: 'abstract',
                     isMethod: true,
-                    ...(returnType && { returnType }),
+                    ...typeAnno,
                     ...(docstring && { docstring }),
                     ...(decorators.length > 0 && { decorators })
                 });
@@ -862,16 +881,18 @@ function extractClassMembers(classNode, codeOrLines) {
                 if (isArrow) {
                     const paramsNode = valueNode.childForFieldName('parameters');
                     const returnType = extractReturnType(valueNode);
+                    const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                    const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
                     members.push({
                         name,
                         params: extractParams(paramsNode),
-                        paramsStructured: parseStructuredParams(paramsNode, 'javascript'),
+                        paramsStructured,
                         startLine,
                         endLine,
                         memberType: name.startsWith('#') ? 'private' : 'field',
                         isArrow: true,
                         isMethod: true,  // Arrow fields are callable like methods
-                        ...(returnType && { returnType }),
+                        ...typeAnno,
                         ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                     });
                 } else {

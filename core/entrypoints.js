@@ -494,6 +494,102 @@ function detectEntrypoints(index, options = {}) {
     return filtered;
 }
 
+// ============================================================================
+// REACHABILITY
+// ============================================================================
+
+/**
+ * Build a stable key for a symbol-like object based on its file path and start line.
+ * Two functions cannot start at the same line in the same file, so this is unique.
+ *
+ * @param {string} file - Absolute file path
+ * @param {number} line - Start line of the symbol
+ * @returns {string} Symbol key (e.g. "/abs/path/file.js:42")
+ */
+function symbolKey(file, line) {
+    return `${file}:${line}`;
+}
+
+/**
+ * Compute the set of symbols transitively reachable from any detected entry point.
+ *
+ * Performs BFS through the call graph starting from every entry point (framework
+ * handlers, main/init, test functions, etc.) and following findCallees recursively.
+ *
+ * Result is cached on the index instance as `index._reachableSymbols` to avoid
+ * recomputation. Subsequent calls return the cached Set.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @returns {Set<string>} Set of symbol keys (file:startLine) reachable from entry points
+ */
+function computeReachability(index) {
+    if (index._reachableSymbols) return index._reachableSymbols;
+
+    const reachable = new Set();
+    const entryPoints = detectEntrypoints(index);
+
+    // Seed BFS queue from every entry point's matching symbol(s) in the symbol table.
+    // detectEntrypoints returns entry-point hits with absoluteFile + line + name; we resolve
+    // each to a real symbol object by matching name and (absoluteFile, line).
+    const queue = [];
+    for (const ep of entryPoints) {
+        const symbols = index.symbols.get(ep.name);
+        if (!symbols) continue;
+        // Match by absoluteFile + line (entry-point line should match symbol startLine).
+        // Fall back to file-only match if line shifted (e.g. file edited after detection).
+        const match = symbols.find(s =>
+            s.file === ep.absoluteFile && s.startLine === ep.line
+        ) || symbols.find(s => s.file === ep.absoluteFile);
+        if (match) {
+            const key = symbolKey(match.file, match.startLine);
+            if (!reachable.has(key)) {
+                reachable.add(key);
+                queue.push(match);
+            }
+        }
+    }
+
+    // BFS: walk callees of every reachable symbol.
+    // findCallees returns full symbol objects for every callee with file/startLine.
+    while (queue.length > 0) {
+        const sym = queue.shift();
+        if (!sym.file || sym.startLine == null) continue;
+
+        let callees;
+        try {
+            callees = index.findCallees(sym, { includeMethods: true });
+        } catch (_e) {
+            continue;
+        }
+        if (!callees || callees.length === 0) continue;
+
+        for (const c of callees) {
+            if (!c.file || c.startLine == null) continue;
+            const key = symbolKey(c.file, c.startLine);
+            if (!reachable.has(key)) {
+                reachable.add(key);
+                queue.push(c);
+            }
+        }
+    }
+
+    index._reachableSymbols = reachable;
+    return reachable;
+}
+
+/**
+ * Check if a symbol (identified by file + startLine) is reachable from any entry point.
+ * Lazily computes the reachable set on first call.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {string} symbolKeyStr - Key of form "file:startLine"
+ * @returns {boolean}
+ */
+function isReachable(index, symbolKeyStr) {
+    const reachable = computeReachability(index);
+    return reachable.has(symbolKeyStr);
+}
+
 /**
  * Check if a specific symbol is a framework entry point.
  * Used by deadcode to exclude framework-registered functions.
@@ -526,4 +622,7 @@ module.exports = {
     isFrameworkEntrypoint,
     matchDecoratorOrModifier,
     buildCallbackEntrypointMap,
+    computeReachability,
+    isReachable,
+    symbolKey,
 };

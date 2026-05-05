@@ -15,7 +15,7 @@
 // Order: understanding, finding, extracting, file-deps, refactoring, other.
 const CANONICAL_COMMANDS = [
     // Understanding code
-    'about', 'context', 'impact', 'blast', 'smart', 'trace', 'reverseTrace', 'example', 'related',
+    'about', 'context', 'impact', 'blast', 'smart', 'trace', 'reverseTrace', 'example', 'related', 'brief',
     // Finding code
     'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode', 'entrypoints',
     // Extracting code
@@ -23,9 +23,9 @@ const CANONICAL_COMMANDS = [
     // File dependencies
     'imports', 'exporters', 'fileExports', 'graph', 'circularDeps',
     // Refactoring
-    'verify', 'plan', 'diffImpact',
+    'verify', 'plan', 'diffImpact', 'check',
     // Other
-    'typedef', 'stacktrace', 'api', 'stats',
+    'typedef', 'stacktrace', 'api', 'stats', 'doctor',
 ];
 
 // ============================================================================
@@ -85,6 +85,7 @@ const PARAM_MAP = {
     max_files:         'maxFiles',
     max_chars:         'maxChars',
     follow_symlinks:   'followSymlinks',
+    unreachable_only:  'unreachableOnly',
 };
 
 // ============================================================================
@@ -96,15 +97,16 @@ const PARAM_MAP = {
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
     // Understanding code
-    about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence'],
-    context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence'],
-    impact:       ['name', 'file', 'exclude', 'className', 'top'],
+    about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
+    context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
+    impact:       ['name', 'file', 'exclude', 'className', 'top', 'unreachableOnly'],
     blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
     trace:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     example:      ['name', 'file', 'className'],
     related:      ['name', 'file', 'className', 'top', 'all'],
+    brief:        ['name', 'file', 'className'],
     // Finding code
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth'],
     usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
@@ -129,11 +131,13 @@ const FLAG_APPLICABILITY = {
     verify:       ['name', 'file', 'className'],
     plan:         ['name', 'file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],
+    check:        ['file', 'base', 'staged', 'limit'],
     // Other
     typedef:      ['name', 'file', 'className', 'exact'],
     stacktrace:   ['stack'],
     api:          ['file', 'limit'],
     stats:        ['functions', 'top'],
+    doctor:       ['file', 'in', 'limit', 'deep'],
 };
 
 // Commands whose output is project-wide — truncation means you need a filter, not more text.
@@ -141,6 +145,7 @@ const FLAG_APPLICABILITY = {
 const BROAD_COMMANDS = new Set([
     'toc', 'entrypoints', 'diffImpact', 'affectedTests',
     'deadcode', 'usages', 'reverseTrace', 'circularDeps',
+    'doctor', 'check',
 ]);
 
 // Commands that can operate on a single file without a project index.

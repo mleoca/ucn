@@ -403,6 +403,7 @@ class ProjectIndex {
                 params: item.params,
                 paramsStructured: item.paramsStructured,
                 returnType: item.returnType,
+                ...(item.paramTypes && { paramTypes: item.paramTypes }),
                 modifiers: item.modifiers,
                 docstring: item.docstring,
                 bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,
@@ -1364,7 +1365,10 @@ class ProjectIndex {
         }
         parts.push(def.name);
         if (def.params !== undefined) {
-            parts.push(`(${def.params})`);
+            // Prefer typed rendering when paramTypes/paramsStructured carry annotations
+            const { renderTypedParams } = require('./output/shared');
+            const typed = renderTypedParams(def);
+            parts.push(`(${typed != null ? typed : def.params})`);
         }
         if (def.returnType) {
             parts.push(`: ${def.returnType}`);

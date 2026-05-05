@@ -19,4 +19,7 @@ module.exports = {
     ...require('./output/extraction'),
     ...require('./output/reporting'),
     ...require('./output/refactoring'),
+    ...require('./output/brief'),
+    ...require('./output/doctor'),
+    ...require('./output/check'),
 };

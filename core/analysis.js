@@ -13,6 +13,87 @@ const { execFileSync } = require('child_process');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions } = require('./shared');
+const { computeReachability, symbolKey } = require('./entrypoints');
+
+// ============================================================================
+// TRUST SIGNALS: HISTOGRAM + REACHABILITY
+// ============================================================================
+
+/**
+ * Bucket a confidence score into 'high' / 'medium' / 'low'.
+ * Boundaries are inclusive at the lower end:
+ *   confidence > 0.8  → high
+ *   0.5 <= c <= 0.8   → medium
+ *   c < 0.5           → low
+ *
+ * @param {number} c - Confidence score (0.0-1.0)
+ * @returns {'high'|'medium'|'low'}
+ */
+function bucketConfidence(c) {
+    if (c == null) return 'low';
+    if (c > 0.8) return 'high';
+    if (c >= 0.5) return 'medium';
+    return 'low';
+}
+
+/**
+ * Build a confidence histogram from an array of edges (callers/callees).
+ * Returns null when there are no edges (caller drops the section entirely).
+ *
+ * @param {Array} edges - Array of objects with `confidence` field
+ * @returns {{ high: number, medium: number, low: number, total: number }|null}
+ */
+function buildHistogram(edges) {
+    if (!edges || edges.length === 0) return null;
+    const h = { high: 0, medium: 0, low: 0, total: edges.length };
+    for (const e of edges) {
+        h[bucketConfidence(e.confidence)]++;
+    }
+    return h;
+}
+
+/**
+ * Tag a list of caller objects with `reachable: boolean`.
+ * Uses (callerFile, callerStartLine) to look up the caller symbol's reachability.
+ * Module-level callers (no callerStartLine) are treated as unreachable.
+ *
+ * @param {Array} callers - Caller objects from findCallers
+ * @param {Set<string>} reachableSet - Set of reachable symbol keys
+ * @returns {Array} Same callers with `reachable` field added (mutated in place)
+ */
+function tagCallersReachable(callers, reachableSet) {
+    if (!callers) return callers;
+    for (const c of callers) {
+        if (c.callerFile && c.callerStartLine != null) {
+            c.reachable = reachableSet.has(symbolKey(c.callerFile, c.callerStartLine));
+        } else {
+            // Module-level / unknown caller — treat as unreachable (no enclosing function)
+            c.reachable = false;
+        }
+    }
+    return callers;
+}
+
+/**
+ * Tag a list of callee objects with `reachable: boolean`.
+ * Callee objects from findCallees have `file` + `startLine` directly.
+ *
+ * @param {Array} callees - Callee objects from findCallees
+ * @param {Set<string>} reachableSet - Set of reachable symbol keys
+ * @returns {Array} Same callees with `reachable` field added (mutated in place)
+ */
+function tagCalleesReachable(callees, reachableSet) {
+    if (!callees) return callees;
+    for (const c of callees) {
+        if (c.file && c.startLine != null) {
+            c.reachable = reachableSet.has(symbolKey(c.file, c.startLine));
+        } else {
+            c.reachable = false;
+        }
+    }
+    return callees;
+}
+
 
 /**
  * Context: quick caller/callee view for a symbol.
@@ -87,6 +168,21 @@ function context(index, name, options = {}) {
         confidenceFiltered = callerResult.filtered + calleeResult.filtered;
     }
 
+    // Trust signals: tag each caller/callee with reachability and build confidence histograms.
+    // Reachability is computed once per index and cached (see entrypoints.computeReachability).
+    const reachableSet = computeReachability(index);
+    tagCallersReachable(callers, reachableSet);
+    tagCalleesReachable(callees, reachableSet);
+
+    // Optional: filter to unreachable-only (helps surface dead-path callers/callees)
+    if (options.unreachableOnly) {
+        callers = callers.filter(c => !c.reachable);
+        callees = callees.filter(c => !c.reachable);
+    }
+
+    const callerHistogram = buildHistogram(callers);
+    const calleeHistogram = buildHistogram(callees);
+
     const filesInScope = new Set([def.file]);
     callers.forEach(c => filesInScope.add(c.file));
     callees.forEach(c => filesInScope.add(c.file));
@@ -105,6 +201,8 @@ function context(index, name, options = {}) {
         returnType: def.returnType,
         callers,
         callees,
+        callerHistogram,
+        calleeHistogram,
         meta: {
             complete: stats.uncertain === 0 && dynamicImports === 0 && confidenceFiltered === 0,
             skipped: 0,
@@ -600,6 +698,10 @@ function impact(index, name, options = {}) {
                 line: c.line,
                 expression: c.content.trim(),
                 callerName: c.callerName,
+                callerFile: c.callerFile,
+                callerStartLine: c.callerStartLine,
+                confidence: c.confidence,
+                resolution: c.resolution,
                 ...analysis
             });
         }
@@ -620,6 +722,10 @@ function impact(index, name, options = {}) {
             content: c.content,
             usageType: 'call',
             callerName: c.callerName,
+            callerFile: c.callerFile,
+            callerStartLine: c.callerStartLine,
+            confidence: c.confidence,
+            resolution: c.resolution,
         }));
         // Keep the same binding filter for backward compat (findCallers already handles this,
         // but cross-check with usages-based binding filter for safety)
@@ -673,6 +779,10 @@ function impact(index, name, options = {}) {
                 line: call.line,
                 expression: call.content.trim(),
                 callerName: call.callerName || index.findEnclosingFunction(call.file, call.line),
+                callerFile: call.callerFile,
+                callerStartLine: call.callerStartLine,
+                confidence: call.confidence,
+                resolution: call.resolution,
                 ...analysis
             });
         }
@@ -684,6 +794,21 @@ function impact(index, name, options = {}) {
     if (options.exclude && options.exclude.length > 0) {
         filteredSites = callSites.filter(s => index.matchesFilters(s.file, { exclude: options.exclude }));
     }
+
+    // Trust signals: tag each call site with reachability, build a confidence histogram.
+    // Histogram is computed BEFORE top-N truncation so the trust signal reflects the full scope.
+    const impactReachable = computeReachability(index);
+    for (const site of filteredSites) {
+        if (site.callerFile && site.callerStartLine != null) {
+            site.reachable = impactReachable.has(symbolKey(site.callerFile, site.callerStartLine));
+        } else {
+            site.reachable = false;
+        }
+    }
+    if (options.unreachableOnly) {
+        filteredSites = filteredSites.filter(s => !s.reachable);
+    }
+    const callerHistogram = buildHistogram(filteredSites);
 
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
@@ -730,6 +855,7 @@ function impact(index, name, options = {}) {
         paramsStructured: def.paramsStructured,
         totalCallSites: totalBeforeLimit,
         shownCallSites: filteredSites.length,
+        callerHistogram,
         byFile: Array.from(byFile.entries()).map(([file, sites]) => ({
             file,
             count: sites.length,
@@ -820,6 +946,16 @@ function about(index, name, options = {}) {
             allCallers = callerResult.kept;
             aboutConfFiltered += callerResult.filtered;
         }
+        // Tag reachability on raw caller objects so we can preserve the field on the projection.
+        // Reachability is computed once per index and cached.
+        const aboutReachable = computeReachability(index);
+        tagCallersReachable(allCallers, aboutReachable);
+
+        // Optional: filter to unreachable-only callers
+        if (options.unreachableOnly) {
+            allCallers = allCallers.filter(c => !c.reachable);
+        }
+
         callers = allCallers.slice(0, maxCallers).map(c => ({
             file: c.relativePath,
             line: c.line,
@@ -827,6 +963,7 @@ function about(index, name, options = {}) {
             callerName: c.callerName,
             confidence: c.confidence,
             resolution: c.resolution,
+            reachable: c.reachable,
         }));
 
         allCallees = index.findCallees(primary, { includeMethods, includeUncertain: options.includeUncertain });
@@ -841,6 +978,13 @@ function about(index, name, options = {}) {
             allCallees = calleeResult.kept;
             aboutConfFiltered += calleeResult.filtered;
         }
+
+        // Tag callee reachability + optional unreachable-only filter
+        tagCalleesReachable(allCallees, aboutReachable);
+        if (options.unreachableOnly) {
+            allCallees = allCallees.filter(c => !c.reachable);
+        }
+
         callees = allCallees.slice(0, maxCallees).map(c => ({
             name: c.name,
             file: c.relativePath,
@@ -851,6 +995,7 @@ function about(index, name, options = {}) {
             callCount: c.callCount,
             confidence: c.confidence,
             resolution: c.resolution,
+            reachable: c.reachable,
         }));
     }
 
@@ -920,6 +1065,7 @@ function about(index, name, options = {}) {
             endLine: primary.endLine,
             params: primary.params,
             returnType: primary.returnType,
+            ...(primary.paramTypes && { paramTypes: primary.paramTypes }),
             modifiers: primary.modifiers,
             docstring: primary.docstring,
             signature: index.formatSignature(primary)
@@ -928,11 +1074,13 @@ function about(index, name, options = {}) {
         totalUsages: usagesByType.calls + usagesByType.imports + usagesByType.references,
         callers: {
             total: allCallers?.length ?? 0,
-            top: callers
+            top: callers,
+            histogram: buildHistogram(allCallers),
         },
         callees: {
             total: allCallees?.length ?? 0,
-            top: callees
+            top: callees,
+            histogram: buildHistogram(allCallees),
         },
         tests: testSummary,
         otherDefinitions: (options.all ? others : others.slice(0, 3)).map(d => ({

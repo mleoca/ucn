@@ -1786,3 +1786,40 @@ describe('fix G6-PY-002: Python __init__.py fileExports resolves __all__ re-expo
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Type annotations: Python type hints from typed_parameter and typed_default_parameter
+// ============================================================================
+
+describe('type annotations — Python type hints', () => {
+    const { execute } = require('../core/execute');
+
+    it('extracts paramTypes from typed parameters with defaults', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def add(x: int, y: int = 0) -> int:\n    return x + y\n'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'add' });
+            assert.ok(r.ok);
+            assert.deepStrictEqual(r.result.symbol.paramTypes, { x: 'int', y: 'int' });
+            assert.strictEqual(r.result.symbol.returnType, 'int');
+        } finally { rm(dir); }
+    });
+
+    it('extracts complex parameterized types', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def fetch(url: str, headers: dict[str, str]) -> bytes:\n    return b""\n'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'about', { name: 'fetch' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.symbol.paramTypes.url, 'str');
+            assert.strictEqual(r.result.symbol.paramTypes.headers, 'dict[str, str]');
+            assert.strictEqual(r.result.symbol.returnType, 'bytes');
+        } finally { rm(dir); }
+    });
+});

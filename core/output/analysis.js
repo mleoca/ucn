@@ -6,6 +6,43 @@ const path = require('path');
 const { langTraits } = require('../../languages');
 const { dynamicImportsNote } = require('./shared');
 
+/**
+ * One short sentence (~80 chars) of a docstring, suitable for inline display
+ * in caller/callee listings.
+ */
+function calleeDocstringSnippet(text) {
+    if (!text) return null;
+    const trimmed = text.trim();
+    const m = trimmed.match(/^(.+?[.!?])(?:\s|$)/);
+    let s = m ? m[1] : trimmed;
+    if (s.length > 80) s = s.slice(0, 77) + '...';
+    return s;
+}
+
+/**
+ * Render a single-line confidence histogram for caller/callee sections.
+ * Returns null when there are <= 1 edges (not informative).
+ *
+ * @param {{high:number, medium:number, low:number, total:number}|null} h
+ * @returns {string|null}
+ */
+function formatHistogramLine(h) {
+    if (!h || h.total <= 1) return null;
+    return `  confidence: ${h.high} high (>0.8), ${h.medium} medium (0.5-0.8), ${h.low} low (<0.5)`;
+}
+
+/**
+ * Decide whether the formatter should print reachability markers per item.
+ * To reduce noise, markers only appear when at least one item is unreachable.
+ *
+ * @param {Array} items - Caller or callee objects with `reachable` field
+ * @returns {boolean}
+ */
+function shouldShowReachability(items) {
+    if (!items || items.length === 0) return false;
+    return items.some(c => c.reachable === false);
+}
+
 /** Format context (callers + callees) as JSON */
 function formatContextJson(context) {
     const meta = context.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 };
@@ -52,12 +89,15 @@ function formatContextJson(context) {
             file: context.file,
             callerCount: callers.length,
             calleeCount: callees.length,
+            callerHistogram: context.callerHistogram || null,
+            calleeHistogram: context.calleeHistogram || null,
             callers: callers.map(c => ({
                 file: c.relativePath || c.file,
                 line: c.line,
                 expression: c.content,  // FULL expression
                 callerName: c.callerName,
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.reachable !== undefined && { reachable: c.reachable }),
             })),
             callees: callees.map(c => ({
                 name: c.name,
@@ -67,6 +107,7 @@ function formatContextJson(context) {
                 params: c.params,  // FULL params
                 weight: c.weight || 'normal',  // Dependency weight: core, setup, utility
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.reachable !== undefined && { reachable: c.reachable }),
             })),
             ...(context.warnings && { warnings: context.warnings })
         }
@@ -143,8 +184,13 @@ function formatContext(ctx, options = {}) {
     }
 
     // Standard function/method context
-    lines.push(`Context for ${ctx.function}:`);
-    lines.push('═'.repeat(60));
+    const compact = !!options.compact;
+    if (compact) {
+        lines.push(`Context: ${ctx.function}`);
+    } else {
+        lines.push(`Context for ${ctx.function}:`);
+        lines.push('═'.repeat(60));
+    }
 
     if (ctx.meta) {
         const notes = [];
@@ -169,13 +215,25 @@ function formatContext(ctx, options = {}) {
 
     const showConf = options.showConfidence || false;
     const callers = ctx.callers || [];
-    lines.push(`\nCALLERS (${callers.length}):`);
+    lines.push(`${compact ? '' : '\n'}CALLERS (${callers.length}):`);
+    const callerHistLine = showConf ? formatHistogramLine(ctx.callerHistogram) : null;
+    if (callerHistLine) lines.push(callerHistLine);
+    const showCallerReach = shouldShowReachability(callers);
     for (const c of callers) {
         const callerName = c.callerName ? ` [${c.callerName}]` : '';
-        lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
-        lines.push(`    ${c.content.trim()}`);
-        if (showConf && c.confidence != null) {
+        if (compact) {
+            // One line per caller: "[N] file:line [callerName]: expression"
+            const expr = c.content ? c.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}: ${expr}`);
+        } else {
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
+            lines.push(`    ${c.content.trim()}`);
+        }
+        if (showConf && c.confidence != null && !compact) {
             lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+        }
+        if (showCallerReach && c.reachable === false && !compact) {
+            lines.push('    (unreachable from any entry point)');
         }
         expandable.push({
             num: itemNum++,
@@ -196,12 +254,29 @@ function formatContext(ctx, options = {}) {
     }
 
     const callees = ctx.callees || [];
-    lines.push(`\nCALLEES (${callees.length}):`);
+    lines.push(`${compact ? '' : '\n'}CALLEES (${callees.length}):`);
+    const calleeHistLine = showConf ? formatHistogramLine(ctx.calleeHistogram) : null;
+    if (calleeHistLine && !compact) lines.push(calleeHistLine);
+    const showCalleeReach = shouldShowReachability(callees);
     for (const c of callees) {
         const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
-        lines.push(`  [${itemNum}] ${c.name}${weight} - ${c.relativePath}:${c.startLine}`);
-        if (showConf && c.confidence != null) {
+        const returnSuffix = c.returnType ? ` → ${c.returnType}` : '';
+        if (compact) {
+            const snip = c.docstring ? calleeDocstringSnippet(c.docstring) : '';
+            const docPart = snip ? `: ${snip}` : '';
+            lines.push(`  [${itemNum}] ${c.name}${returnSuffix} - ${c.relativePath}:${c.startLine}${docPart}`);
+        } else {
+            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix} - ${c.relativePath}:${c.startLine}`);
+            if (c.docstring) {
+                const snip = calleeDocstringSnippet(c.docstring);
+                if (snip) lines.push(`    "${snip}"`);
+            }
+        }
+        if (showConf && c.confidence != null && !compact) {
             lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+        }
+        if (showCalleeReach && c.reachable === false && !compact) {
+            lines.push('    (unreachable from any entry point)');
         }
         expandable.push({
             num: itemNum++,
@@ -266,6 +341,15 @@ function formatImpact(impact, options = {}) {
     // By file
     lines.push('');
     lines.push('BY FILE:');
+
+    // Histogram (over the trust signals collected before truncation)
+    const impactHistLine = formatHistogramLine(impact.callerHistogram);
+    if (impactHistLine) lines.push(impactHistLine);
+
+    // Compute reachability marker visibility across ALL sites (not per-file)
+    const allSites = impact.byFile.flatMap(g => g.sites);
+    const showImpactReach = shouldShowReachability(allSites);
+
     for (const fileGroup of impact.byFile) {
         lines.push(`\n${fileGroup.file} (${fileGroup.count} calls)`);
         for (const site of fileGroup.sites) {
@@ -274,6 +358,9 @@ function formatImpact(impact, options = {}) {
             lines.push(`    ${site.expression}`);
             if (site.args && site.args.length > 0) {
                 lines.push(`    args: ${site.args.join(', ')}`);
+            }
+            if (showImpactReach && site.reachable === false) {
+                lines.push('    (unreachable from any entry point)');
             }
         }
     }
@@ -362,12 +449,18 @@ function formatAbout(about, options = {}) {
         } else {
             lines.push(`CALLERS (${about.callers.total}):`);
         }
+        const aboutCallerHist = showConf ? formatHistogramLine(about.callers.histogram) : null;
+        if (aboutCallerHist) lines.push(aboutCallerHist);
+        const showAboutCallerReach = shouldShowReachability(about.callers.top);
         for (const c of about.callers.top) {
             const caller = c.callerName ? `[${c.callerName}]` : '';
             lines.push(`  ${c.file}:${c.line} ${caller}`);
             lines.push(`    ${c.expression}`);
             if (showConf && c.confidence != null) {
                 lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+            }
+            if (showAboutCallerReach && c.reachable === false) {
+                lines.push('    (unreachable from any entry point)');
             }
         }
     }
@@ -381,11 +474,17 @@ function formatAbout(about, options = {}) {
         } else {
             lines.push(`CALLEES (${about.callees.total}):`);
         }
+        const aboutCalleeHist = showConf ? formatHistogramLine(about.callees.histogram) : null;
+        if (aboutCalleeHist) lines.push(aboutCalleeHist);
+        const showAboutCalleeReach = shouldShowReachability(about.callees.top);
         for (const c of about.callees.top) {
             const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
             lines.push(`  ${c.name}${weight} - ${c.file}:${c.line} (${c.callCount}x)`);
             if (showConf && c.confidence != null) {
                 lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
+            }
+            if (showAboutCalleeReach && c.reachable === false) {
+                lines.push('    (unreachable from any entry point)');
             }
 
             // Inline expansion: show first 3 lines of callee code

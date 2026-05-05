@@ -561,3 +561,182 @@ module.exports = { helper };
         } finally { rm(dir); }
     });
 });
+
+// ── brief ───────────────────────────────────────────────────────────────────
+
+describe('brief command', () => {
+    it('returns signature, docstring, side effects, and complexity', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `/**
+ * @param {string} name
+ * @returns {Promise<User>}
+ */
+async function fetchUser(name) {
+    if (!name) throw new Error('no name');
+    const fs = require('fs');
+    const data = fs.readFileSync('cache.json');
+    return JSON.parse(data);
+}
+module.exports = fetchUser;`
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'brief', { name: 'fetchUser' });
+            assert.ok(ok);
+            assert.strictEqual(result.symbol.name, 'fetchUser');
+            assert.strictEqual(result.symbol.returnType, 'Promise<User>');
+            assert.deepStrictEqual(result.symbol.paramTypes, { name: 'string' });
+            assert.ok(result.sideEffects.includes('fs'), 'should detect fs side effect');
+            assert.ok(result.complexity.branches >= 1, 'should count if branch');
+            assert.ok(result.lineCount > 0);
+        } finally { rm(dir); }
+    });
+
+    it('classifies pure function as no side effects', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function add(x, y) { return x + y; }\nmodule.exports = add;'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'brief', { name: 'add' });
+            assert.ok(ok);
+            assert.deepStrictEqual(result.sideEffects, []);
+            assert.strictEqual(result.complexity.branches, 0);
+        } finally { rm(dir); }
+    });
+
+    it('detects Python global_mutation', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'svc.py': 'state = {}\n\ndef set_value(key: str, value: int) -> None:\n    global state\n    state[key] = value\n'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'brief', { name: 'set_value' });
+            assert.ok(ok);
+            assert.ok(result.sideEffects.includes('global_mutation'));
+        } finally { rm(dir); }
+    });
+
+    it('handles class types with member count', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cls.js': 'class Foo {\n  bar() {}\n  baz() {}\n}\nmodule.exports = Foo;'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'brief', { name: 'Foo' });
+            assert.ok(ok);
+            assert.strictEqual(result.kind, 'type');
+            assert.strictEqual(result.memberCount, 2);
+        } finally { rm(dir); }
+    });
+
+    it('errors with not-found message for unknown symbol', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function a() {}'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, error } = execute(index, 'brief', { name: 'doesNotExist' });
+            assert.strictEqual(ok, false);
+            assert.match(error, /not found/);
+        } finally { rm(dir); }
+    });
+});
+
+// ── doctor ─────────────────────────────────────────────────────────────────
+
+describe('doctor command', () => {
+    it('returns project trust report with files and languages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function a() {}',
+            'b.js': 'function b() {}',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            assert.ok(result.files.scanned >= 2);
+            assert.ok(result.symbols >= 2);
+            assert.ok(result.languages.javascript);
+            assert.ok(['HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'].includes(result.trust));
+        } finally { rm(dir); }
+    });
+
+    it('detects eval and reflection blind spots', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'evil.js': 'function run() { eval("1+1"); }',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            assert.ok(result.blindSpots.evalCalls.count >= 1, 'should flag eval call');
+        } finally { rm(dir); }
+    });
+
+    it('deep mode produces resolution coverage histogram', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x) { return x + 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(1); helper(2); }\nmain();'
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', { deep: true });
+            assert.ok(ok);
+            assert.ok(result.coverage, 'should have coverage data');
+            assert.ok(result.coverage.total >= 0);
+        } finally { rm(dir); }
+    });
+});
+
+// ── check ──────────────────────────────────────────────────────────────────
+
+describe('check command', () => {
+    it('returns empty result when no diff', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function a() {}',
+        });
+        try {
+            const index = idx(dir);
+            // No git repo — diffImpact returns empty/no changes
+            const { ok, result } = execute(index, 'check', { base: 'HEAD' });
+            assert.ok(ok);
+            assert.ok(result.empty || result.changed.length === 0,
+                'should be empty without git changes');
+        } finally { rm(dir); }
+    });
+
+    it('summarizes changed/added functions when diff exists', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function existing() { return 1; }\nmodule.exports = existing;',
+        });
+        try {
+            // Init a git repo, commit, then modify
+            execFileSync('git', ['init', '-q'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'add', '.'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir });
+
+            // Modify and add a function
+            fs.writeFileSync(path.join(dir, 'a.js'),
+                'function existing() { return 2; }\nfunction brandNew() { return 3; }\nmodule.exports = { existing, brandNew };');
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'check', { base: 'HEAD' });
+            assert.ok(ok);
+            if (!result.empty) {
+                assert.ok(result.changed.length > 0, 'should have changed entries');
+                const names = result.changed.map(c => c.name);
+                assert.ok(names.includes('brandNew') || names.includes('existing'));
+            }
+        } finally { rm(dir); }
+    });
+});

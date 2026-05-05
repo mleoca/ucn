@@ -91,8 +91,9 @@ function formatFunctionSignature(fn) {
     // Name + generics + params (concatenated without spaces)
     let sig = fn.name;
     if (fn.generics) sig += fn.generics;
-    const params = normalizeParams(fn.params);
-    sig += `(${params})`;
+    // If paramsStructured + paramTypes are available, render typed params
+    const typed = renderTypedParams(fn);
+    sig += `(${typed != null ? typed : normalizeParams(fn.params)})`;
 
     // Return type
     if (fn.returnType) sig += `: ${fn.returnType}`;
@@ -104,6 +105,29 @@ function formatFunctionSignature(fn) {
         return prefix.join(' ') + ' ' + sig;
     }
     return sig;
+}
+
+/**
+ * Render parameters with type annotations when available.
+ * Returns null if not enough info — caller falls back to raw params string.
+ */
+function renderTypedParams(fn) {
+    const ps = fn.paramsStructured;
+    if (!Array.isArray(ps) || ps.length === 0) return null;
+    const paramTypes = fn.paramTypes;
+    const hasStructuredTypes = ps.some(p => p && p.type);
+    const hasMappedTypes = paramTypes && Object.keys(paramTypes).length > 0;
+    if (!hasStructuredTypes && !hasMappedTypes) return null;
+    const parts = ps.map(p => {
+        if (!p || !p.name) return '';
+        let s = p.rest ? `...${p.name.replace(/^\.\.\./, '')}` : p.name;
+        const t = p.type || (paramTypes && paramTypes[p.name]);
+        if (t) s += `: ${t}`;
+        if (p.optional && !p.rest && p.default == null) s += '?';
+        if (p.default != null) s += ` = ${p.default}`;
+        return s;
+    });
+    return parts.filter(Boolean).join(', ');
 }
 
 /**
@@ -262,6 +286,7 @@ module.exports = {
     lineRange,
     lineLoc,
     formatFunctionSignature,
+    renderTypedParams,
     formatClassSignature,
     formatMemberSignature,
     formatLineRanges,

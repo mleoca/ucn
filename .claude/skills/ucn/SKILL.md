@@ -91,7 +91,47 @@ ucn deadcode --exclude=test         # Skip test files (most useful)
 ucn deadcode --include-decorated    # Include framework-registered functions
 ```
 
-### 7. `entrypoints` — Detect framework entry points
+### 7. `brief` — One-screen "before-I-touch-this" summary
+
+AST-only summary of a function: typed signature, first sentence of docstring,
+side-effect classification (fs/network/process/global_mutation), and complexity
+metrics (branches, depth, line count). Lighter than `about`, more useful than
+`fn` when you don't need the body.
+
+```bash
+ucn brief fetch_user
+# fetch_user(user_id: int): dict
+#   svc.py:4-8  (5 lines)
+#   "Fetch a user from the API."
+#   async: no  |  side_effects: [fs, network, process]  |  complexity: branches=2, depth=2
+```
+
+### 8. `doctor` — Project trust report
+
+One command that tells you how much UCN trusts the index for this project:
+file/symbol counts, language breakdown, dynamic-import / eval / reflection
+blind spots, parse failures, and a verdict (HIGH/MEDIUM/LOW). Add `--deep` to
+sample resolution coverage and bucket edges by confidence.
+
+```bash
+ucn doctor                # fast: counts + blind spots + verdict
+ucn doctor --deep         # also samples resolution coverage
+ucn doctor --in=src/core  # scope to a subtree
+```
+
+### 9. `check` — Pre-commit summary
+
+Composes `diff-impact` + `verify` + `affected-tests` into one output. Lists
+changed/added/deleted functions, flags signature drift across call sites,
+calls out new functions with no callers, and recommends which tests to run.
+
+```bash
+ucn check                  # vs HEAD
+ucn check --base=main      # vs main branch
+ucn check --staged         # only staged changes
+```
+
+### 10. `entrypoints` — Detect framework entry points
 
 Lists functions registered as framework handlers (HTTP routes, DI beans, job schedulers, etc.). Detects patterns across Express, FastAPI, Flask, Spring, Gin, Actix, Celery, pytest, and more.
 
@@ -140,6 +180,9 @@ ucn entrypoints --file=routes/           # Scoped to files
 | Drill into context results | `ucn expand <N>` | Show source code for item N from a previous `context` call |
 | Best usage example of a function | `ucn example <name>` | Finds and scores the best call site with surrounding context |
 | Debug a stack trace | `ucn stacktrace --stack="<trace>"` | Parses stack frames and shows source context per frame |
+| Quick look before touching a function | `ucn brief <name>` | Signature + docstring + side effects + complexity, one screen |
+| Project trust report | `ucn doctor [--deep]` | Index coverage, blind spots, parse failures, verdict |
+| Pre-commit summary | `ucn check [--base=main]` | Changed funcs + signature drift + affected tests in one shot |
 
 ## Command Format
 
@@ -202,6 +245,8 @@ ucn [target] <command> [name] [--flags]
 | `--unused` | Structural search: only symbols with zero callers |
 | `--no-follow-symlinks` | Don't follow symbolic links during file discovery |
 | `--workers=N` | Parallel build workers (auto-detect by default; `0` to disable; env: `UCN_WORKERS`) |
+| `--deep` | `doctor` only: sample resolution coverage. Slower but produces confidence histogram. |
+| `--compact` | One-line-per-item output for `about`/`context`. Halves token cost; same info. |
 
 ## Workflow Integration
 

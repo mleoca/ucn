@@ -256,6 +256,7 @@ server.registerTool(
             include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches'),
             min_confidence: z.number().optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
             show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),
+            unreachable_only: z.boolean().optional().describe('Show only callers/callees that are unreachable from any detected entry point (about, context, impact).'),
             with_types: z.boolean().optional().describe('Include related type definitions in output'),
             detailed: z.boolean().optional().describe('Show full symbol listing per file'),
             exact: z.boolean().optional().describe('Exact name match only (no substring matching)'),
@@ -281,6 +282,8 @@ server.registerTool(
             range: z.string().optional().describe('Line range to extract, e.g. "10-20" or "15" (lines command)'),
             base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
             staged: z.boolean().optional().describe('Analyze staged changes (diff_impact command)'),
+            deep: z.boolean().optional().describe('Run a deeper analysis (doctor: sample resolution coverage)'),
+            compact: z.boolean().optional().describe('Compact one-line-per-item output for about/context (saves tokens)'),
             case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
             all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
             top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
@@ -448,6 +451,27 @@ server.registerTool(
                 });
                 if (note) relText += '\n\n' + note;
                 return tr(relText);
+            }
+
+            case 'brief': {
+                index = getIndex(project_dir, ep);
+                const { ok, result, error } = execute(index, 'brief', ep);
+                if (!ok) return te(error);
+                return tr(output.formatBrief(result));
+            }
+
+            case 'doctor': {
+                index = getIndex(project_dir, ep);
+                const { ok, result, error } = execute(index, 'doctor', ep);
+                if (!ok) return te(error);
+                return tr(output.formatDoctor(result));
+            }
+
+            case 'check': {
+                index = getIndex(project_dir, ep);
+                const { ok, result, error } = execute(index, 'check', ep);
+                if (!ok) return te(error);
+                return tr(output.formatCheck(result));
             }
 
             // ── Finding Code ────────────────────────────────────────────

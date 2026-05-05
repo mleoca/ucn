@@ -97,6 +97,8 @@ function parseFlags(tokens) {
         defaultValue: getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged') || undefined,
+        deep: tokens.includes('--deep') || undefined,
+        compact: tokens.includes('--compact') || undefined,
         maxLines: getValueFlag('--max-lines') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions') || undefined,
@@ -113,6 +115,7 @@ function parseFlags(tokens) {
         unused: tokens.includes('--unused') || undefined,
         showConfidence: tokens.includes('--no-confidence') ? false : undefined,
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
+        unreachableOnly: tokens.includes('--unreachable-only') || undefined,
         framework: getValueFlag('--framework'),
         stack: getValueFlag('--stack'),
         workers: (() => {
@@ -147,8 +150,8 @@ const knownFlags = new Set([
     '--regex', '--no-regex', '--functions',
     '--max-lines', '--class-name', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
-    '--show-confidence', '--no-confidence', '--min-confidence',
-    '--framework', '--workers'
+    '--show-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
+    '--framework', '--workers', '--deep', '--compact'
 ]);
 
 // Handle help flag
@@ -549,6 +552,7 @@ function runProjectCommand(rootDir, command, arg) {
                     expandHint: 'Use "expand <N>" or --expand to see code for items',
                     uncertainHint: 'use --include-uncertain to include all',
                     showConfidence: flags.showConfidence !== false,
+                    compact: !!flags.compact,
                 });
                 console.log(text);
 
@@ -660,6 +664,34 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) fail(error);
             printOutput(result, output.formatRelatedJson, r => output.formatRelated(r, { all: flags.all, top: flags.top }));
             if (note) console.error(note);
+            break;
+        }
+
+        case 'brief': {
+            requireArg(arg, 'Usage: ucn . brief <name>');
+            const { ok, result, error } = execute(index, 'brief', { name: arg, file: flags.file, className: flags.className });
+            if (!ok) fail(error);
+            printOutput(result, output.formatBriefJson, output.formatBrief);
+            break;
+        }
+
+        case 'doctor': {
+            const { ok, result, error } = execute(index, 'doctor', {
+                file: flags.file, in: flags.in,
+                limit: flags.limit, deep: flags.deep,
+            });
+            if (!ok) fail(error);
+            printOutput(result, output.formatDoctorJson, output.formatDoctor);
+            break;
+        }
+
+        case 'check': {
+            const { ok, result, error } = execute(index, 'check', {
+                base: flags.base, staged: flags.staged,
+                file: flags.file, limit: flags.limit,
+            });
+            if (!ok) fail(error);
+            printOutput(result, output.formatCheckJson, output.formatCheck);
             break;
         }
 
@@ -1043,6 +1075,7 @@ function runGlobCommand(pattern, command, arg) {
                     uncertainHint: 'use --include-uncertain to include all',
                     expandHint: 'Use --expand to see inline callee previews',
                     showConfidence: flags.showConfidence !== false,
+                    compact: !!flags.compact,
                 });
                 console.log(text);
                 if (flags.expand) {
@@ -1059,6 +1092,15 @@ function runGlobCommand(pattern, command, arg) {
         case 'related':
             printOutput(result, output.formatRelatedJson,
                 r => output.formatRelated(r, { all: flags.all, top: flags.top }));
+            break;
+        case 'brief':
+            printOutput(result, output.formatBriefJson, output.formatBrief);
+            break;
+        case 'doctor':
+            printOutput(result, output.formatDoctorJson, output.formatDoctor);
+            break;
+        case 'check':
+            printOutput(result, output.formatCheckJson, output.formatCheck);
             break;
         case 'trace':
             printOutput(result, output.formatTraceJson, output.formatTrace);
@@ -1235,6 +1277,7 @@ Common Flags:
   --min-confidence=N  Filter low-confidence edges (about, context, blast, trace,
                         reverse-trace, smart, affected-tests)
   --show-confidence   Show confidence scores on caller/callee edges (about, context)
+  --unreachable-only  Show only callers/callees that are unreachable from entry points (about, context, impact)
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)
   --functions         Show per-function line counts (stats command)

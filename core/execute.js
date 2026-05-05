@@ -232,6 +232,7 @@ const HANDLERS = {
             all: p.all,
             maxCallers: num(p.top, undefined),
             maxCallees: num(p.top, undefined),
+            unreachableOnly: !!p.unreachableOnly,
         });
         if (!result) {
             // Give better error if file/className filter is the problem
@@ -264,6 +265,7 @@ const HANDLERS = {
         if (classErr) return { ok: false, error: classErr };
         const result = index.context(p.name, {
             ...buildCallerOptions(p),
+            unreachableOnly: !!p.unreachableOnly,
         });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
         const tNote = truncationNote(index);
@@ -283,6 +285,7 @@ const HANDLERS = {
             className: p.className,
             exclude: toExcludeArray(p.exclude),
             top: num(p.top, undefined),
+            unreachableOnly: !!p.unreachableOnly,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const tNote = truncationNote(index);
@@ -406,6 +409,46 @@ const HANDLERS = {
         const tNote = truncationNote(index);
         const combined = [relatedNote, tNote].filter(Boolean).join('\n') || undefined;
         return { ok: true, result, ...(combined && { note: combined }) };
+    },
+
+    brief: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+        applyClassMethodSyntax(p);
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
+        const { brief } = require('./brief');
+        const result = brief(index, p.name, { file: p.file, className: p.className });
+        if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
+        return { ok: true, result };
+    },
+
+    doctor: (index, p) => {
+        const { doctor } = require('./reporting');
+        const result = doctor(index, {
+            in: p.in,
+            file: p.file,
+            deep: !!p.deep,
+            sampleSize: num(p.limit, undefined),
+        });
+        return { ok: true, result };
+    },
+
+    check: (index, p) => {
+        const { check } = require('./check');
+        try {
+            const result = check(index, {
+                base: p.base || 'HEAD',
+                staged: !!p.staged,
+                file: p.file,
+                limit: num(p.limit, undefined),
+            });
+            return { ok: true, result };
+        } catch (e) {
+            return { ok: false, error: e && e.message ? e.message : String(e) };
+        }
     },
 
     // ── Finding Code ────────────────────────────────────────────────────
