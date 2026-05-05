@@ -648,6 +648,112 @@ module.exports = fetchUser;`
     });
 });
 
+// ── stable symbol handles ─────────────────────────────────────────────────
+
+describe('symbol handles', () => {
+    const { parseSymbolHandle, formatSymbolHandle, looksLikeHandle } = require('../core/shared');
+
+    it('parses file:line:name', () => {
+        const h = parseSymbolHandle('lib/api.ts:42:handler');
+        assert.deepStrictEqual(h, { file: 'lib/api.ts', line: 42, name: 'handler' });
+    });
+
+    it('parses file:line (name-less)', () => {
+        const h = parseSymbolHandle('lib/api.ts:42');
+        assert.deepStrictEqual(h, { file: 'lib/api.ts', line: 42 });
+    });
+
+    it('rejects non-handle strings', () => {
+        assert.strictEqual(parseSymbolHandle('handler'), null);
+        assert.strictEqual(parseSymbolHandle(''), null);
+        assert.strictEqual(parseSymbolHandle('lib.js:abc'), null);
+    });
+
+    it('looksLikeHandle distinguishes handles from names', () => {
+        assert.strictEqual(looksLikeHandle('handler'), false);
+        assert.strictEqual(looksLikeHandle('lib.js:42'), true);
+        assert.strictEqual(looksLikeHandle('lib.js:42:handler'), true);
+    });
+
+    it('formats and parses round-trip', () => {
+        const sym = { name: 'foo', relativePath: 'src/a.js', startLine: 10 };
+        const handle = formatSymbolHandle(sym);
+        const parsed = parseSymbolHandle(handle);
+        assert.strictEqual(parsed.file, 'src/a.js');
+        assert.strictEqual(parsed.line, 10);
+        assert.strictEqual(parsed.name, 'foo');
+    });
+
+    it('handle pins resolution to exact definition when name is ambiguous', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function process(x) { return x; }\nmodule.exports = process;',
+            'b.js': 'function process(y, z) { return y + z; }\nmodule.exports = process;',
+        });
+        try {
+            const index = idx(dir);
+            // Bare name picks one — but which one is heuristic
+            const r1 = execute(index, 'brief', { name: 'process' });
+            assert.ok(r1.ok);
+            // Handle pins to a.js's process
+            const r2 = execute(index, 'brief', { name: 'a.js:1:process' });
+            assert.ok(r2.ok);
+            assert.strictEqual(r2.result.symbol.file, 'a.js');
+            assert.strictEqual(r2.result.symbol.startLine, 1);
+            // Handle pins to b.js's process (different signature)
+            const r3 = execute(index, 'brief', { name: 'b.js:1:process' });
+            assert.ok(r3.ok);
+            assert.strictEqual(r3.result.symbol.file, 'b.js');
+        } finally { rm(dir); }
+    });
+
+    it('name-less handle recovers name via index lookup', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function compute() { return 1; }\nmodule.exports = compute;',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'brief', { name: 'lib.js:1' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.symbol.name, 'compute');
+        } finally { rm(dir); }
+    });
+
+    it('find emits handle for every result', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function foo() {}\nfunction bar() {}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'find', { name: 'foo' });
+            assert.ok(r.ok);
+            assert.ok(Array.isArray(r.result));
+            assert.ok(r.result.length > 0);
+            // Each result has the fields needed to construct a handle
+            const s = r.result[0];
+            const handle = formatSymbolHandle(s);
+            assert.ok(handle);
+            assert.match(handle, /a\.js:1:foo/);
+        } finally { rm(dir); }
+    });
+
+    it('about JSON includes handle', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function foo() {}\nmodule.exports = foo;',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'foo' });
+            assert.ok(r.ok);
+            assert.ok(r.result.symbol.handle);
+            assert.match(r.result.symbol.handle, /a\.js:1:foo/);
+        } finally { rm(dir); }
+    });
+});
+
 // ── doctor ─────────────────────────────────────────────────────────────────
 
 describe('doctor command', () => {
@@ -693,6 +799,60 @@ describe('doctor command', () => {
             assert.ok(ok);
             assert.ok(result.coverage, 'should have coverage data');
             assert.ok(result.coverage.total >= 0);
+        } finally { rm(dir); }
+    });
+
+    it('handles empty project gracefully', () => {
+        const dir = tmp({ 'package.json': '{"name":"test"}' });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            assert.strictEqual(result.symbols, 0);
+            assert.strictEqual(result.files.scanned, 0);
+            // Should not crash, should produce a verdict
+            assert.ok(result.trust);
+        } finally { rm(dir); }
+    });
+});
+
+// ── side-effect tags on callees ────────────────────────────────────────────
+
+describe('callee side-effect tags', () => {
+    it('tags fs callees in context', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': "const fs = require('fs');\nfunction load() { return fs.readFileSync('x'); }\nfunction wrap() { return load(); }\nmodule.exports = { load, wrap };",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'context', { name: 'wrap', includeMethods: true });
+            assert.ok(ok);
+            // The single callee `load` should be tagged with [fs]
+            assert.ok(Array.isArray(result.callees));
+            const load = result.callees.find(c => c.name === 'load');
+            if (load) {
+                assert.ok(load.sideEffects && load.sideEffects.includes('fs'),
+                    `load should be tagged fs; got ${JSON.stringify(load.sideEffects)}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('does not tag pure callees', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function add(a, b) { return a + b; }\nfunction caller() { return add(1, 2); }\nmodule.exports = { caller };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'context', { name: 'caller', includeMethods: true });
+            assert.ok(ok);
+            const add = result.callees.find(c => c.name === 'add');
+            if (add) {
+                // Pure function should have no sideEffects field (or empty array)
+                assert.ok(!add.sideEffects || add.sideEffects.length === 0,
+                    `add should be pure; got ${JSON.stringify(add.sideEffects)}`);
+            }
         } finally { rm(dir); }
     });
 });

@@ -32,7 +32,7 @@ function trace(index, name, options = {}) {
     // trace defaults to includeMethods=true (execution flow should show method calls)
     const includeMethods = options.includeMethods ?? true;
 
-    const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return null;
     }
@@ -159,7 +159,7 @@ function blast(index, name, options = {}) {
         const includeUncertain = options.includeUncertain || false;
         const exclude = options.exclude || [];
 
-        const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className });
+        const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
 
         const visited = new Set();
@@ -334,7 +334,7 @@ function reverseTrace(index, name, options = {}) {
         const includeUncertain = options.includeUncertain || false;
         const exclude = options.exclude || [];
 
-        const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className });
+        const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
 
         const visited = new Set();

@@ -184,6 +184,18 @@ ucn entrypoints --file=routes/           # Scoped to files
 | Project trust report | `ucn doctor [--deep]` | Index coverage, blind spots, parse failures, verdict |
 | Pre-commit summary | `ucn check [--base=main]` | Changed funcs + signature drift + affected tests in one shot |
 
+## Symbol Handles (stable IDs)
+
+Every result that lists a symbol emits a **handle** in the form `relativePath:line:name` (e.g. `core/api.ts:42:handler`). Pass it back to any name-accepting command and resolution is pinned to that exact definition — no name disambiguation, no `--file` needed.
+
+```bash
+ucn find handler                  # → emits  src/api.ts:42:handler
+ucn brief src/api.ts:42:handler   # pins to that exact one
+ucn impact src/api.ts:42:handler  # same
+```
+
+The shorter `relativePath:line` form (no `:name`) also works — UCN looks up the symbol by location. Plain names (`handler`) still work for the fuzzy/heuristic path.
+
 ## Command Format
 
 ```
@@ -246,7 +258,7 @@ ucn [target] <command> [name] [--flags]
 | `--no-follow-symlinks` | Don't follow symbolic links during file discovery |
 | `--workers=N` | Parallel build workers (auto-detect by default; `0` to disable; env: `UCN_WORKERS`) |
 | `--deep` | `doctor` only: sample resolution coverage. Slower but produces confidence histogram. |
-| `--compact` | One-line-per-item output for `about`/`context`. Halves token cost; same info. |
+| `--compact` | One-line-per-item output for `about`/`context`/`find`/`usages`/`impact`. Halves token cost; same info. |
 
 ## Workflow Integration
 

@@ -829,6 +829,15 @@ class ProjectIndex {
             }
         }
 
+        // Filter by exact startLine when a handle was supplied. This pins
+        // the resolution to one specific definition — no ambiguity allowed.
+        if (options.line && Number.isFinite(options.line)) {
+            const filtered = definitions.filter(d => d.startLine === options.line);
+            if (filtered.length > 0) {
+                definitions = filtered;
+            }
+        }
+
         // Score each definition for selection
         const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
         const scored = definitions.map(d => {

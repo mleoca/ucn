@@ -99,7 +99,7 @@ const FLAG_APPLICABILITY = {
     // Understanding code
     about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
     context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
-    impact:       ['name', 'file', 'exclude', 'className', 'top', 'unreachableOnly'],
+    impact:       ['name', 'file', 'exclude', 'className', 'top', 'unreachableOnly', 'compact'],
     blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
@@ -108,8 +108,8 @@ const FLAG_APPLICABILITY = {
     related:      ['name', 'file', 'className', 'top', 'all'],
     brief:        ['name', 'file', 'className'],
     // Finding code
-    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth'],
-    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in'],
+    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth', 'compact'],
+    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact'],
     toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
     search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
     tests:        ['name', 'file', 'exclude', 'className', 'callsOnly'],

@@ -1248,3 +1248,67 @@ describe('entrypoints command parity', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Output ordering contract — running the same command twice must produce the
+// exact same output. This guards against Map/Set iteration order leaking.
+// ============================================================================
+
+describe('Output Ordering Contract', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const output = require('../core/output');
+
+    function makeMultiCallerFixture() {
+        return tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x) { return x + 1; }\nmodule.exports = { helper };',
+            'a.js': 'const { helper } = require("./lib");\nfunction a1() { return helper(1); }\nfunction a2() { return helper(2); }\nmodule.exports = { a1, a2 };',
+            'b.js': 'const { helper } = require("./lib");\nfunction b1() { return helper(3); }\nfunction b2() { return helper(4); }\nmodule.exports = { b1, b2 };',
+            'c.js': 'const { helper } = require("./lib");\nfunction c1() { return helper(5); }\nmodule.exports = { c1 };',
+        });
+    }
+
+    it('impact byFile is alphabetical and sites are line-ascending', () => {
+        const dir = makeMultiCallerFixture();
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'impact', { name: 'helper' });
+            assert.ok(r1.ok);
+            const files = r1.result.byFile.map(g => g.file);
+            const sorted = [...files].sort((a, b) => a.localeCompare(b));
+            assert.deepStrictEqual(files, sorted, 'byFile must be alphabetical');
+            for (const group of r1.result.byFile) {
+                const lines = group.sites.map(s => s.line);
+                const sortedLines = [...lines].sort((a, b) => a - b);
+                assert.deepStrictEqual(lines, sortedLines, `sites in ${group.file} must be line-ascending`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('context callers are stable across runs (file, line)', () => {
+        const dir = makeMultiCallerFixture();
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'context', { name: 'helper' });
+            const r2 = execute(index, 'context', { name: 'helper' });
+            assert.ok(r1.ok && r2.ok);
+            const k1 = r1.result.callers.map(c => `${c.relativePath}:${c.line}`).join('|');
+            const k2 = r2.result.callers.map(c => `${c.relativePath}:${c.line}`).join('|');
+            assert.strictEqual(k1, k2, 'caller ordering must be deterministic');
+        } finally { rm(dir); }
+    });
+
+    it('formatted impact output is byte-identical across runs', () => {
+        const dir = makeMultiCallerFixture();
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'impact', { name: 'helper' });
+            const r2 = execute(index, 'impact', { name: 'helper' });
+            assert.ok(r1.ok && r2.ok);
+            const t1 = output.formatImpact(r1.result);
+            const t2 = output.formatImpact(r2.result);
+            assert.strictEqual(t1, t2, 'identical inputs must produce identical impact output');
+        } finally { rm(dir); }
+    });
+});

@@ -515,7 +515,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (note) console.error(note);
             printOutput(result,
                 r => output.formatSymbolJson(r, arg),
-                r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all })
+                r => output.formatFindDetailed(r, arg, { depth: flags.depth, top: flags.top, all: flags.all, compact: flags.compact })
             );
             break;
         }
@@ -526,7 +526,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (note) console.error(note);
             printOutput(result,
                 r => output.formatUsagesJson(r, arg),
-                r => output.formatUsages(r, arg)
+                r => output.formatUsages(r, arg, { compact: flags.compact })
             );
             break;
         }
@@ -600,7 +600,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) fail(error);
             printOutput(result,
                 output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false })
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false, compact: !!flags.compact })
             );
             if (note) console.error(note);
             break;
@@ -609,7 +609,7 @@ function runProjectCommand(rootDir, command, arg) {
         case 'impact': {
             const { ok, result, error, note } = execute(index, 'impact', { name: arg, ...flags });
             if (!ok) fail(error);
-            printOutput(result, output.formatImpactJson, output.formatImpact);
+            printOutput(result, output.formatImpactJson, r => output.formatImpact(r, { compact: flags.compact }));
             if (note) console.error(note);
             break;
         }
@@ -1064,7 +1064,7 @@ function runGlobCommand(pattern, command, arg) {
             break;
         case 'about':
             printOutput(result, output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false }));
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false, compact: !!flags.compact }));
             break;
         case 'context':
             if (flags.json) {

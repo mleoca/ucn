@@ -261,12 +261,13 @@ function formatContext(ctx, options = {}) {
     for (const c of callees) {
         const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
         const returnSuffix = c.returnType ? ` → ${c.returnType}` : '';
+        const sideEffects = (c.sideEffects && c.sideEffects.length) ? ` {${c.sideEffects.join(',')}}` : '';
         if (compact) {
             const snip = c.docstring ? calleeDocstringSnippet(c.docstring) : '';
             const docPart = snip ? `: ${snip}` : '';
-            lines.push(`  [${itemNum}] ${c.name}${returnSuffix} - ${c.relativePath}:${c.startLine}${docPart}`);
+            lines.push(`  [${itemNum}] ${c.name}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${docPart}`);
         } else {
-            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix} - ${c.relativePath}:${c.startLine}`);
+            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}`);
             if (c.docstring) {
                 const snip = calleeDocstringSnippet(c.docstring);
                 if (snip) lines.push(`    "${snip}"`);
@@ -302,14 +303,15 @@ function formatImpact(impact, options = {}) {
         return 'Function not found.';
     }
 
+    const compact = !!options.compact;
     const lines = [];
 
     // Header
     lines.push(`Impact analysis for ${impact.function}`);
-    lines.push('═'.repeat(60));
+    if (!compact) lines.push('═'.repeat(60));
     lines.push(`${impact.file}:${impact.startLine}`);
-    lines.push(impact.signature);
-    lines.push('');
+    if (!compact) lines.push(impact.signature);
+    if (!compact) lines.push('');
 
     // Summary
     if (impact.shownCallSites !== undefined && impact.shownCallSites < impact.totalCallSites) {
@@ -321,7 +323,7 @@ function formatImpact(impact, options = {}) {
 
     // Patterns
     const p = impact.patterns;
-    if (p) {
+    if (p && !compact) {
         const patternParts = [];
         if (p.constantArgs > 0) patternParts.push(`${p.constantArgs} with literals`);
         if (p.variableArgs > 0) patternParts.push(`${p.variableArgs} with variables`);
@@ -339,7 +341,7 @@ function formatImpact(impact, options = {}) {
     }
 
     // By file
-    lines.push('');
+    if (!compact) lines.push('');
     lines.push('BY FILE:');
 
     // Histogram (over the trust signals collected before truncation)
@@ -351,16 +353,26 @@ function formatImpact(impact, options = {}) {
     const showImpactReach = shouldShowReachability(allSites);
 
     for (const fileGroup of impact.byFile) {
-        lines.push(`\n${fileGroup.file} (${fileGroup.count} calls)`);
-        for (const site of fileGroup.sites) {
-            const caller = site.callerName ? `[${site.callerName}]` : '';
-            lines.push(`  :${site.line} ${caller}`);
-            lines.push(`    ${site.expression}`);
-            if (site.args && site.args.length > 0) {
-                lines.push(`    args: ${site.args.join(', ')}`);
+        if (compact) {
+            // One line per call site, prefixed with file: "file (N) line [caller]: expr"
+            for (const site of fileGroup.sites) {
+                const caller = site.callerName ? ` [${site.callerName}]` : '';
+                const expr = site.expression ? site.expression.replace(/\s+/g, ' ').slice(0, 100) : '';
+                const reach = (showImpactReach && site.reachable === false) ? ' (unreachable)' : '';
+                lines.push(`  ${fileGroup.file}:${site.line}${caller}${reach}: ${expr}`);
             }
-            if (showImpactReach && site.reachable === false) {
-                lines.push('    (unreachable from any entry point)');
+        } else {
+            lines.push(`\n${fileGroup.file} (${fileGroup.count} calls)`);
+            for (const site of fileGroup.sites) {
+                const caller = site.callerName ? `[${site.callerName}]` : '';
+                lines.push(`  :${site.line} ${caller}`);
+                lines.push(`    ${site.expression}`);
+                if (site.args && site.args.length > 0) {
+                    lines.push(`    args: ${site.args.join(', ')}`);
+                }
+                if (showImpactReach && site.reachable === false) {
+                    lines.push('    (unreachable from any entry point)');
+                }
             }
         }
     }
@@ -412,10 +424,12 @@ function formatAbout(about, options = {}) {
         return lines.join('\n');
     }
 
+    const compact = !!options.compact;
+
     // Header with signature
     lines.push(`${sym.name} (${sym.type})`);
-    lines.push('═'.repeat(60));
-    lines.push(`${sym.file}:${sym.startLine}-${sym.endLine}`);
+    if (!compact) lines.push('═'.repeat(60));
+    lines.push(`${sym.file}:${sym.startLine}-${sym.endLine}${sym.handle ? '  →  ' + sym.handle : ''}`);
     if (sym.signature) {
         lines.push(sym.signature);
     }
@@ -479,7 +493,13 @@ function formatAbout(about, options = {}) {
         const showAboutCalleeReach = shouldShowReachability(about.callees.top);
         for (const c of about.callees.top) {
             const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
-            lines.push(`  ${c.name}${weight} - ${c.file}:${c.line} (${c.callCount}x)`);
+            const returnSuffix = c.returnType ? ` → ${c.returnType}` : '';
+            const sideEffects = (c.sideEffects && c.sideEffects.length) ? ` {${c.sideEffects.join(',')}}` : '';
+            lines.push(`  ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.file}:${c.line} (${c.callCount}x)`);
+            if (c.docstring) {
+                const snip = calleeDocstringSnippet(c.docstring);
+                if (snip) lines.push(`    "${snip}"`);
+            }
             if (showConf && c.confidence != null) {
                 lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
             }

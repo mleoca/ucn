@@ -37,7 +37,12 @@ function formatBrief(result) {
 
     if (result.kind === 'type') {
         lines.push(`${sym.type} ${sym.name}`);
-        lines.push(`  ${sym.file}:${sym.startLine}-${sym.endLine}  (${result.lineCount} lines, ${result.memberCount} member${result.memberCount === 1 ? '' : 's'})`);
+        const lineLabel = `${result.lineCount} line${result.lineCount === 1 ? '' : 's'}`;
+        const memberPart = result.memberCount > 0
+            ? `, ${result.memberCount} member${result.memberCount === 1 ? '' : 's'}`
+            : '';
+        lines.push(`  ${sym.file}:${sym.startLine}-${sym.endLine}  (${lineLabel}${memberPart})`);
+        if (sym.handle) lines.push(`  handle: ${sym.handle}`);
         if (sym.docstring) lines.push(`  "${sym.docstring}"`);
         return lines.join('\n');
     }
@@ -46,6 +51,7 @@ function formatBrief(result) {
     lines.push(signatureLine(sym));
     // Location + line count
     lines.push(`  ${sym.file}:${sym.startLine}-${sym.endLine}  (${result.lineCount || 0} line${result.lineCount === 1 ? '' : 's'})`);
+    if (sym.handle) lines.push(`  handle: ${sym.handle}`);
     if (sym.docstring) lines.push(`  "${sym.docstring}"`);
     if (sym.className) lines.push(`  in class ${sym.className}`);
 

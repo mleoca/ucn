@@ -186,7 +186,7 @@ function identifyCallPatterns(callSites, funcName) {
 function verify(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return { found: false, function: name };
     }
@@ -473,7 +473,7 @@ function plan(index, name, options = {}) {
         return { found: false, function: name };
     }
 
-    const resolved = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const resolved = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     const def = resolved.def || definitions[0];
     const impact = index.impact(name, { file: options.file, className: options.className });
     const currentParams = def.paramsStructured || [];

@@ -94,6 +94,21 @@ function tagCalleesReachable(callees, reachableSet) {
     return callees;
 }
 
+/**
+ * Attach side-effect tags to each callee by AST scan of its body.
+ * Tags = ['fs', 'network', 'process', 'global_mutation'] subset.
+ * Cached per-symbol on the index so repeat queries are cheap.
+ */
+function tagCalleesSideEffects(index, callees) {
+    if (!callees || callees.length === 0) return callees;
+    const { sideEffectsFor } = require('./brief');
+    for (const c of callees) {
+        const tags = sideEffectsFor(index, c);
+        if (tags && tags.length > 0) c.sideEffects = tags;
+    }
+    return callees;
+}
+
 
 /**
  * Context: quick caller/callee view for a symbol.
@@ -106,7 +121,7 @@ function tagCalleesReachable(callees, reachableSet) {
 function context(index, name, options = {}) {
     index._beginOp();
     try {
-    const resolved = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const resolved = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     let { def, warnings } = resolved;
     if (!def) {
         return null;
@@ -168,11 +183,35 @@ function context(index, name, options = {}) {
         confidenceFiltered = callerResult.filtered + calleeResult.filtered;
     }
 
+    // Stable output ordering: callers by (file, line). Callees retain their
+    // call-count order from findCallees (most-called first) — that's a value
+    // the user expects, not a stability concern, since the secondary sort
+    // by line keeps ties deterministic.
+    callers = [...callers].sort((a, b) => {
+        const fa = a.relativePath || a.file || '';
+        const fb = b.relativePath || b.file || '';
+        if (fa !== fb) return fa.localeCompare(fb);
+        return (a.line || 0) - (b.line || 0);
+    });
+    callees = [...callees].sort((a, b) => {
+        // Primary: callCount desc (preserves "most-called first" UX)
+        const ca = a.callCount || 0, cb = b.callCount || 0;
+        if (ca !== cb) return cb - ca;
+        // Tiebreaker: file then line, for determinism
+        const fa = a.relativePath || a.file || '';
+        const fb = b.relativePath || b.file || '';
+        if (fa !== fb) return fa.localeCompare(fb);
+        return (a.startLine || 0) - (b.startLine || 0);
+    });
+
     // Trust signals: tag each caller/callee with reachability and build confidence histograms.
     // Reachability is computed once per index and cached (see entrypoints.computeReachability).
     const reachableSet = computeReachability(index);
     tagCallersReachable(callers, reachableSet);
     tagCalleesReachable(callees, reachableSet);
+
+    // Side-effect tags on callees (lazy-cached per symbol on the index)
+    tagCalleesSideEffects(index, callees);
 
     // Optional: filter to unreachable-only (helps surface dead-path callers/callees)
     if (options.unreachableOnly) {
@@ -237,7 +276,7 @@ function context(index, name, options = {}) {
 function smart(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return null;
     }
@@ -389,7 +428,7 @@ function detectCompleteness(index) {
 function related(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return null;
     }
@@ -551,7 +590,7 @@ function related(index, name, options = {}) {
 function impact(index, name, options = {}) {
     index._beginOp();
     try {
-    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     if (!def) {
         return null;
     }
@@ -856,11 +895,14 @@ function impact(index, name, options = {}) {
         totalCallSites: totalBeforeLimit,
         shownCallSites: filteredSites.length,
         callerHistogram,
-        byFile: Array.from(byFile.entries()).map(([file, sites]) => ({
-            file,
-            count: sites.length,
-            sites
-        })),
+        // Stable ordering: files alphabetical, sites by line ascending. Documented contract.
+        byFile: Array.from(byFile.entries())
+            .sort((a, b) => a[0].localeCompare(b[0]))
+            .map(([file, sites]) => ({
+                file,
+                count: sites.length,
+                sites: [...sites].sort((s1, s2) => (s1.line || 0) - (s2.line || 0))
+            })),
         patterns,
         scopeWarning
     };
@@ -904,7 +946,7 @@ function about(index, name, options = {}) {
     }
 
     // Use resolveSymbol for consistent primary selection (prefers non-test files)
-    const { def: resolved } = index.resolveSymbol(name, { file: options.file, className: options.className });
+    const { def: resolved } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     const primary = resolved || definitions[0];
     const others = definitions.filter(d =>
         d.relativePath !== primary.relativePath || d.startLine !== primary.startLine
@@ -984,6 +1026,7 @@ function about(index, name, options = {}) {
         if (options.unreachableOnly) {
             allCallees = allCallees.filter(c => !c.reachable);
         }
+        tagCalleesSideEffects(index, allCallees);
 
         callees = allCallees.slice(0, maxCallees).map(c => ({
             name: c.name,
@@ -996,6 +1039,9 @@ function about(index, name, options = {}) {
             confidence: c.confidence,
             resolution: c.resolution,
             reachable: c.reachable,
+            ...(c.returnType && { returnType: c.returnType }),
+            ...(c.docstring && { docstring: c.docstring }),
+            ...(c.sideEffects && c.sideEffects.length && { sideEffects: c.sideEffects }),
         }));
     }
 
@@ -1063,6 +1109,7 @@ function about(index, name, options = {}) {
             file: primary.relativePath,
             startLine: primary.startLine,
             endLine: primary.endLine,
+            handle: require('./shared').formatSymbolHandle(primary),
             params: primary.params,
             returnType: primary.returnType,
             ...(primary.paramTypes && { paramTypes: primary.paramTypes }),

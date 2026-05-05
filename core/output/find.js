@@ -9,6 +9,8 @@ const {
     computeConfidence,
 } = require('./shared');
 
+const { formatSymbolHandle } = require('../shared');
+
 /**
  * Trim a docstring to a single short sentence (max 80 chars) for inline display.
  */
@@ -73,6 +75,7 @@ function formatFind(symbols, query, top) {
 }
 
 function formatFindJson(items) {
+    const { formatSymbolHandle } = require('../shared');
     return JSON.stringify({
         meta: { command: 'find', count: items.length },
         data: items.map(m => ({
@@ -81,6 +84,7 @@ function formatFindJson(items) {
             file: m.relativePath || m.file,
             line: m.startLine,
             endLine: m.endLine,
+            handle: formatSymbolHandle(m),
             ...(m.className && { className: m.className }),
             ...(m.receiver && { receiver: m.receiver }),
         })),
@@ -96,7 +100,7 @@ function formatFindJson(items) {
  * @param {object} options - { depth, top, all }
  */
 function formatFindDetailed(symbols, query, options = {}) {
-    const { depth, top, all } = options;
+    const { depth, top, all, compact } = options;
     const DEFAULT_LIMIT = 5;
 
     if (symbols.length === 0) {
@@ -113,7 +117,7 @@ function formatFindDetailed(symbols, query, options = {}) {
     } else {
         lines.push(`Found ${symbols.length} match(es) for "${query}":`);
     }
-    lines.push('─'.repeat(60));
+    if (!compact) lines.push('─'.repeat(60));
 
     for (let i = 0; i < showing; i++) {
         const s = symbols[i];
@@ -130,8 +134,26 @@ function formatFindDetailed(symbols, query, options = {}) {
 
         const confidence = computeConfidence(s);
         const confStr = confidence.level !== 'high' ? ` [${confidence.level}]` : '';
+        const handle = formatSymbolHandle(s);
+        const loc = handle || (s.relativePath + ':' + s.startLine);
 
-        lines.push(`${s.relativePath}:${s.startLine}  ${sig}${confStr}`);
+        if (compact) {
+            // One line per result: "<handle>  <sig>  <usages?>  <doc snippet?>"
+            const parts = [`${loc}  ${sig}${confStr}`];
+            if (s.usageCounts !== undefined && s.usageCounts.total > 0) {
+                parts.push(`(${s.usageCounts.total} usages)`);
+            } else if (s.usageCount !== undefined) {
+                parts.push(`(${s.usageCount} usages)`);
+            }
+            if (s.docstring) {
+                const snip = firstSentenceShort(s.docstring);
+                if (snip) parts.push(`— ${snip}`);
+            }
+            lines.push(parts.join('  '));
+            continue;
+        }
+
+        lines.push(`${loc}  ${sig}${confStr}`);
         if (s.docstring) {
             const snip = firstSentenceShort(s.docstring);
             if (snip) lines.push(`  "${snip}"`);
@@ -170,7 +192,7 @@ function formatFindDetailed(symbols, query, options = {}) {
                 // Skip code extraction on error
             }
         }
-        lines.push('');
+        if (!compact) lines.push('');
     }
 
     if (hidden > 0) {
@@ -184,6 +206,7 @@ function formatFindDetailed(symbols, query, options = {}) {
  * Format symbol search results as JSON
  */
 function formatSymbolJson(symbols, query) {
+    const { formatSymbolHandle } = require('../shared');
     return JSON.stringify({
         meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
         data: {
@@ -195,9 +218,12 @@ function formatSymbolJson(symbols, query) {
                 file: s.relativePath || s.file,
                 startLine: s.startLine,
                 endLine: s.endLine,
+                handle: formatSymbolHandle(s),
                 ...(s.params && { params: s.params }),  // FULL params
                 ...(s.paramsStructured && { paramsStructured: s.paramsStructured }),
                 ...(s.returnType && { returnType: s.returnType }),
+                ...(s.paramTypes && { paramTypes: s.paramTypes }),
+                ...(s.docstring && { docstring: s.docstring }),
                 ...(s.modifiers && { modifiers: s.modifiers }),
                 ...(s.usageCount !== undefined && { usageCount: s.usageCount }),
                 ...(s.usageCounts !== undefined && { usageCounts: s.usageCounts })
@@ -254,7 +280,8 @@ function formatUsagesJson(usages, name) {
 /**
  * Format usages command output
  */
-function formatUsages(usages, name) {
+function formatUsages(usages, name, options = {}) {
+    const compact = !!options.compact;
     const defs = usages.filter(u => u.isDefinition);
     const calls = usages.filter(u => u.usageType === 'call');
     const imports = usages.filter(u => u.usageType === 'import');
@@ -262,7 +289,7 @@ function formatUsages(usages, name) {
 
     const lines = [];
     lines.push(`Usages of "${name}": ${defs.length} definitions, ${calls.length} calls, ${imports.length} imports, ${refs.length} references`);
-    lines.push('═'.repeat(60));
+    if (!compact) lines.push('═'.repeat(60));
 
     function renderContextLines(usage) {
         if (usage.before && usage.before.length > 0) {
@@ -281,38 +308,57 @@ function formatUsages(usages, name) {
     }
 
     if (defs.length > 0) {
-        lines.push('\nDEFINITIONS:');
+        lines.push(`${compact ? '' : '\n'}DEFINITIONS:`);
         for (const d of defs) {
-            lines.push(`  ${d.relativePath}:${d.line || d.startLine}`);
-            if (d.signature) lines.push(`    ${d.signature}`);
+            if (compact) {
+                lines.push(`  ${d.relativePath}:${d.line || d.startLine}${d.signature ? '  ' + d.signature : ''}`);
+            } else {
+                lines.push(`  ${d.relativePath}:${d.line || d.startLine}`);
+                if (d.signature) lines.push(`    ${d.signature}`);
+            }
         }
     }
 
     if (calls.length > 0) {
-        lines.push('\nCALLS:');
+        lines.push(`${compact ? '' : '\n'}CALLS:`);
         for (const c of calls) {
-            lines.push(`  ${c.relativePath}:${c.line}`);
-            renderContextLines(c);
-            lines.push(`    ${c.content.trim()}`);
-            renderAfterLines(c);
+            if (compact) {
+                const expr = c.content ? c.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+                lines.push(`  ${c.relativePath}:${c.line}: ${expr}`);
+            } else {
+                lines.push(`  ${c.relativePath}:${c.line}`);
+                renderContextLines(c);
+                lines.push(`    ${c.content.trim()}`);
+                renderAfterLines(c);
+            }
         }
     }
 
     if (imports.length > 0) {
-        lines.push('\nIMPORTS:');
+        lines.push(`${compact ? '' : '\n'}IMPORTS:`);
         for (const i of imports) {
-            lines.push(`  ${i.relativePath}:${i.line}`);
-            lines.push(`    ${i.content.trim()}`);
+            if (compact) {
+                const expr = i.content ? i.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+                lines.push(`  ${i.relativePath}:${i.line}: ${expr}`);
+            } else {
+                lines.push(`  ${i.relativePath}:${i.line}`);
+                lines.push(`    ${i.content.trim()}`);
+            }
         }
     }
 
     if (refs.length > 0) {
-        lines.push('\nREFERENCES:');
+        lines.push(`${compact ? '' : '\n'}REFERENCES:`);
         for (const r of refs) {
-            lines.push(`  ${r.relativePath}:${r.line}`);
-            renderContextLines(r);
-            lines.push(`    ${r.content.trim()}`);
-            renderAfterLines(r);
+            if (compact) {
+                const expr = r.content ? r.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+                lines.push(`  ${r.relativePath}:${r.line}: ${expr}`);
+            } else {
+                lines.push(`  ${r.relativePath}:${r.line}`);
+                renderContextLines(r);
+                lines.push(`    ${r.content.trim()}`);
+                renderAfterLines(r);
+            }
         }
     }
 

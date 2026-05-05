@@ -12,7 +12,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { addTestExclusions, pickBestDefinition } = require('./shared');
+const { addTestExclusions, pickBestDefinition, parseSymbolHandle, looksLikeHandle } = require('./shared');
 const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 const { renderExpandItem } = require('./expand-cache');
 
@@ -66,11 +66,35 @@ function splitClassMethod(name) {
  * part (explicit --class-name takes precedence over the class from dot notation).
  */
 function applyClassMethodSyntax(p) {
+    // Run handle normalization first — handles can be passed where a name is expected.
+    applyHandleSyntax(p);
     const split = splitClassMethod(p.name);
     if (split) {
         p.name = split.methodName;
         if (!p.className) p.className = split.className;
     }
+}
+
+/**
+ * If p.name is a stable handle (file:line[:name]), parse it and set p.name,
+ * p.file, p.line so downstream resolution targets the exact symbol. Idempotent.
+ *
+ * Why: lets multi-step workflows roundtrip without name disambiguation. A
+ * `find` result emits `lib/api.ts:42:handler`; piping that to `brief`/`impact`
+ * pins resolution to that exact definition even if 5 other `handler`s exist.
+ */
+function applyHandleSyntax(p) {
+    if (!p || !p.name) return;
+    if (!looksLikeHandle(p.name)) return;
+    const h = parseSymbolHandle(p.name);
+    if (!h) return;
+    // Pull name out of handle. If the handle has no name suffix, we need to
+    // recover it from the index — but at this layer we only have params.
+    // The downstream resolveSymbol path will look up by file+line if name is empty.
+    if (h.name) p.name = h.name;
+    // Only override p.file/p.line if they weren't explicitly set by the user
+    if (h.file && !p.file) p.file = h.file;
+    if (h.line && !p.line) p.line = h.line;
 }
 
 /** Normalize exclude to an array (accepts string CSV, array, or falsy). */
@@ -94,6 +118,7 @@ function buildCallerOptions(p) {
     return {
         file: p.file,
         className: p.className,
+        ...(p.line && { line: p.line }),
         includeMethods: p.includeMethods,
         includeUncertain: p.includeUncertain || false,
         includeTests: p.includeTests,
@@ -1103,10 +1128,43 @@ function execute(index, command, params = {}) {
         return { ok: false, error: `Unknown command: ${command}` };
     }
     try {
+        // Resolve name-less handles (e.g. `lib.js:42`) via index lookup before dispatch.
+        // Handles WITH a name suffix are handled later by applyClassMethodSyntax.
+        if (params && params.name && looksLikeHandle(params.name)) {
+            const h = parseSymbolHandle(params.name);
+            if (h && !h.name && h.file && h.line) {
+                const sym = lookupByLocation(index, h.file, h.line);
+                if (sym) {
+                    params.name = sym.name;
+                    if (!params.file) params.file = h.file;
+                    if (!params.line) params.line = h.line;
+                }
+            }
+        }
         return handler(index, params);
     } catch (e) {
         return { ok: false, error: e.message };
     }
+}
+
+/**
+ * Look up a symbol record by file path + start line. Used to recover a name
+ * from a name-less handle (`relativePath:line`). Returns the first matching
+ * symbol or null. Path matching is permissive (substring) so handles emitted
+ * with relative paths still resolve when callers pass partial paths.
+ */
+function lookupByLocation(index, file, line) {
+    if (!index || !index.symbols || !file || !line) return null;
+    for (const arr of index.symbols.values()) {
+        for (const sym of arr) {
+            if (sym.startLine !== line) continue;
+            const rp = sym.relativePath || '';
+            if (rp === file || rp.endsWith('/' + file) || file.endsWith('/' + rp) || rp.includes(file)) {
+                return sym;
+            }
+        }
+    }
+    return null;
 }
 
 module.exports = { execute };

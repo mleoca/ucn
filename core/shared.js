@@ -52,4 +52,67 @@ function escapeRegExp(text) {
 // Symbol types that are not callable (used to filter class/struct/type declarations from call analysis)
 const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl', 'field']);
 
-module.exports = { pickBestDefinition, addTestExclusions, escapeRegExp, NON_CALLABLE_TYPES };
+/**
+ * Stable symbol handle: `relativePath:line` or `relativePath:line:name`.
+ *
+ * Handles let multi-step workflows roundtrip without name disambiguation —
+ * `find` returns handles, `brief`/`impact`/`context` accept them, and the result
+ * targets the exact same symbol even when names overlap. Renames break handles
+ * (intentionally — that's a real change, not noise).
+ *
+ * Format chosen because:
+ *   - colon is the existing UCN location separator (`file.js:42`)
+ *   - line number is the second-most-stable ID (after path); names move within files
+ *   - the optional :name disambiguates when multiple symbols share a startLine
+ *     (rare but possible: e.g. `class Foo {}` and a same-line method def)
+ */
+function formatSymbolHandle(symbol) {
+    if (!symbol || !symbol.startLine) return null;
+    const file = symbol.relativePath || symbol.file;
+    if (!file) return null;
+    return symbol.name ? `${file}:${symbol.startLine}:${symbol.name}` : `${file}:${symbol.startLine}`;
+}
+
+/**
+ * Parse a handle string back into its components.
+ * Returns { file, line, name? } or null if input doesn't look like a handle.
+ *
+ * Strategy: scan from the right so paths containing `:` (Windows drive letters
+ * if anyone ever uses them as relative paths) survive. The line number is the
+ * rightmost run of digits between two colons or at the end.
+ */
+function parseSymbolHandle(input) {
+    if (!input || typeof input !== 'string') return null;
+    // Two forms:
+    //   path:digits           → file + line
+    //   path:digits:name      → file + line + name (name may contain anything)
+    // The line is always digits; the path is everything before the line; the
+    // optional name is everything after the line.
+    const m = input.match(/^(.+):(\d+)(?::(.+))?$/);
+    if (!m) return null;
+    const file = m[1];
+    const line = parseInt(m[2], 10);
+    if (!Number.isFinite(line) || line < 1) return null;
+    const handle = { file, line };
+    if (m[3] != null) handle.name = m[3];
+    return handle;
+}
+
+/**
+ * Quick predicate: does this string look like a handle (vs a plain symbol name)?
+ * Used to short-circuit handle resolution before name lookup.
+ */
+function looksLikeHandle(input) {
+    if (!input || typeof input !== 'string') return false;
+    return /^.+:\d+(?::.+)?$/.test(input);
+}
+
+module.exports = {
+    pickBestDefinition,
+    addTestExclusions,
+    escapeRegExp,
+    NON_CALLABLE_TYPES,
+    formatSymbolHandle,
+    parseSymbolHandle,
+    looksLikeHandle,
+};

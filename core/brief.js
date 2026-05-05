@@ -18,6 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
+const { formatSymbolHandle } = require('./shared');
 
 // ============================================================================
 // Side-effect signal sets (per-language, conservative)
@@ -95,7 +96,7 @@ const SIDE_EFFECT_CALLS_BY_LANG = {
 function brief(index, name, options = {}) {
     index._beginOp();
     try {
-        const { def } = index.resolveSymbol(name, { file: options.file, className: options.className });
+        const { def } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
 
         const language = detectLanguage(def.relativePath || def.file);
@@ -105,6 +106,7 @@ function brief(index, name, options = {}) {
             file: def.relativePath || def.file,
             startLine: def.startLine,
             endLine: def.endLine,
+            handle: formatSymbolHandle(def),
             language,
             ...(def.params != null && { params: def.params }),
             ...(def.paramsStructured && { paramsStructured: def.paramsStructured }),
@@ -345,8 +347,46 @@ function expandIndent(s) {
     return n;
 }
 
+/**
+ * Lazy classifier: side-effect tags for an arbitrary symbol record.
+ * Used by callee output (`context`, `about`) to surface [fs]/[net]/[proc] tags
+ * inline. Cached on the index in `_sideEffectCache` (key: file:startLine).
+ *
+ * Cheap on cache hit; first hit reads + scans the symbol's body. Returns
+ * `null` for non-callable types or unreadable files.
+ */
+function sideEffectsFor(index, symbol) {
+    if (!index || !symbol) return null;
+    if (NON_CALLABLE_KIND.has(symbol.type)) return null;
+    const key = `${symbol.file || symbol.relativePath}:${symbol.startLine || 0}`;
+    if (!index._sideEffectCache) index._sideEffectCache = new Map();
+    if (index._sideEffectCache.has(key)) return index._sideEffectCache.get(key);
+
+    const filePath = path.isAbsolute(symbol.file || '') ? symbol.file : path.join(index.root, symbol.file || symbol.relativePath || '');
+    let bodyText = '';
+    try {
+        const content = fs.readFileSync(filePath, 'utf-8');
+        const lines = content.split('\n');
+        const start = Math.max(0, (symbol.startLine || 1) - 1);
+        const end = Math.min(lines.length, symbol.endLine || symbol.startLine || 1);
+        bodyText = lines.slice(start, end).join('\n');
+    } catch (e) {
+        index._sideEffectCache.set(key, null);
+        return null;
+    }
+    const language = detectLanguage(symbol.relativePath || symbol.file);
+    const fileEntry = index.files.get(symbol.file);
+    const fileImports = collectImportNames(fileEntry);
+    const tags = classifySideEffects(bodyText, language, fileImports);
+    index._sideEffectCache.set(key, tags);
+    return tags;
+}
+
+const NON_CALLABLE_KIND = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'impl', 'state', 'field']);
+
 module.exports = {
     brief,
+    sideEffectsFor,
     // exposed for tests
     classifySideEffects,
     computeComplexity,
