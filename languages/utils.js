@@ -717,6 +717,186 @@ function clearNodeListCache() {
     _cachedSubtreeEnds = null;
 }
 
+/**
+ * Extract a string value from a tree-sitter argument node, returning
+ * `{ value, interp }` where:
+ *   - value is the literal portion (with quotes stripped)
+ *   - interp is true when the argument is interpolated (template literal,
+ *     f-string, format!() macro, fmt.Sprintf), in which case `value` is the
+ *     literal *prefix* before the first interpolation, suffixed with '*'.
+ *
+ * Returns null when the node isn't a string-like value.
+ *
+ * Used by route extraction: server `app.get('/users/:id')` → '/users/:id';
+ * client `fetch(\`/users/${id}\`)` → '/users/*' (interp).
+ *
+ * @param {object} node - Tree-sitter node (any language)
+ * @returns {{ value: string, interp: boolean }|null}
+ */
+function extractStringArg(node) {
+    if (!node) return null;
+    const t = node.type;
+
+    // JS/TS string literals
+    if (t === 'string') {
+        const text = node.text;
+        return { value: stripQuotes(text), interp: false };
+    }
+
+    // JS/TS template literal: `/users/${id}` or plain `/users/all`
+    if (t === 'template_string' || t === 'template_literal') {
+        return parseTemplateLiteral(node);
+    }
+
+    // Python string
+    if (t === 'string') {
+        return { value: stripQuotes(node.text), interp: false };
+    }
+
+    // Python concatenated strings: 'a' 'b' → 'ab'
+    if (t === 'concatenated_string') {
+        let acc = '';
+        let interp = false;
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            const r = extractStringArg(child);
+            if (r) {
+                acc += r.value;
+                if (r.interp) { interp = true; break; }
+            } else {
+                interp = true;
+                break;
+            }
+        }
+        return { value: acc, interp };
+    }
+
+    // Go interpreted/raw string
+    if (t === 'interpreted_string_literal' || t === 'raw_string_literal') {
+        return { value: stripQuotes(node.text), interp: false };
+    }
+
+    // Java string literal / text block
+    if (t === 'string_literal' || t === 'text_block') {
+        return { value: stripQuotes(node.text), interp: false };
+    }
+
+    // Rust string literal: "..." or raw r"..." / r#"..."#
+    if (t === 'string_literal') {
+        return { value: stripRustString(node.text), interp: false };
+    }
+    if (t === 'raw_string_literal') {
+        return { value: stripRustString(node.text), interp: false };
+    }
+
+    // Rust macro_invocation: format!("/users/{}", id), format!("/path") → extract first string arg
+    if (t === 'macro_invocation') {
+        const argsNode = node.childForFieldName('arguments');
+        if (!argsNode) return null;
+        // Find first string-like child of token_tree
+        const first = findFirstStringInRustMacro(argsNode);
+        if (first == null) return null;
+        // Detect interpolation by presence of `{}` or `{...}` placeholders or extra args
+        const hasPlaceholder = /\{[^}]*\}/.test(first);
+        // Truncate at first placeholder
+        const m = first.match(/^([^{]*)/);
+        return { value: (m ? m[1] : first), interp: hasPlaceholder };
+    }
+
+    return null;
+}
+
+/** Strip surrounding quotes (' " `) from a literal, leaving the inner content. */
+function stripQuotes(text) {
+    if (typeof text !== 'string' || text.length < 2) return text;
+    const first = text[0];
+    const last = text[text.length - 1];
+    if ((first === '"' || first === "'" || first === '`') && first === last) {
+        return text.slice(1, -1);
+    }
+    return text;
+}
+
+/** Strip Rust string literal quoting: "..." or r"..." or r#"..."# etc. */
+function stripRustString(text) {
+    if (typeof text !== 'string') return text;
+    // r#"..."# (any number of #)
+    const rawHash = text.match(/^r(#+)"([\s\S]*)"\1$/);
+    if (rawHash) return rawHash[2];
+    // r"..."
+    const raw = text.match(/^r"([\s\S]*)"$/);
+    if (raw) return raw[1];
+    // "..."
+    if (text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1);
+    return text;
+}
+
+/**
+ * Parse a JS template literal AST node and return literal prefix + interp flag.
+ * `/users/all` → { value: '/users/all', interp: false }
+ * `/users/${id}` → { value: '/users/*', interp: true }
+ */
+function parseTemplateLiteral(node) {
+    let prefix = '';
+    let interp = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+        const child = node.namedChild(i);
+        // template_substitution = ${...}
+        if (child.type === 'template_substitution') {
+            interp = true;
+            break;
+        }
+        // string_fragment / template_chars: literal segment
+        if (child.type === 'string_fragment' || child.type === 'template_chars') {
+            prefix += child.text;
+        }
+    }
+    if (interp && !prefix.endsWith('*')) prefix += '*';
+    return { value: prefix, interp };
+}
+
+/** Find the first quoted string inside a Rust macro_invocation token_tree. */
+function findFirstStringInRustMacro(tokenTree) {
+    if (!tokenTree) return null;
+    for (let i = 0; i < tokenTree.namedChildCount; i++) {
+        const child = tokenTree.namedChild(i);
+        if (child.type === 'string_literal' || child.type === 'raw_string_literal') {
+            return stripRustString(child.text);
+        }
+        // Recurse into nested token_trees (rare)
+        if (child.namedChildCount > 0) {
+            const r = findFirstStringInRustMacro(child);
+            if (r != null) return r;
+        }
+    }
+    // Fallback: scan raw text for first quoted string
+    const m = tokenTree.text.match(/"([^"\\]|\\.)*"/);
+    if (m) {
+        const raw = m[0];
+        return raw.slice(1, -1);
+    }
+    return null;
+}
+
+/**
+ * Extract path/method from a fmt.Sprintf("...", args) call inside Go.
+ * Returns the literal prefix before the first %v/%s/%d etc. with '*' suffix.
+ */
+function extractSprintfPrefix(callNode) {
+    // call_expression with function = selector_expression "fmt.Sprintf"
+    const argsNode = callNode.childForFieldName('arguments');
+    if (!argsNode) return null;
+    const first = argsNode.namedChildCount > 0 ? argsNode.namedChild(0) : null;
+    if (!first) return null;
+    const r = extractStringArg(first);
+    if (!r) return null;
+    // Find first format directive %x and truncate
+    const m = r.value.match(/^([^%]*)/);
+    const literal = m ? m[1] : r.value;
+    const hasFmt = /%/.test(r.value);
+    return { value: hasFmt ? (literal + '*') : literal, interp: hasFmt };
+}
+
 module.exports = {
     traverseTree,
     traverseTreeCached,
@@ -735,5 +915,8 @@ module.exports = {
     buildTypeAnnotations,
     getTokenTypeAtPosition,
     isMatchInCommentOrString,
-    findMatchesWithASTFilter
+    findMatchesWithASTFilter,
+    extractStringArg,
+    stripQuotes,
+    extractSprintfPrefix,
 };

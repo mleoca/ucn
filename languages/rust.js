@@ -93,6 +93,59 @@ function extractAttributes(node, codeOrLines) {
     return attributes;
 }
 
+/**
+ * Extract attributes WITH their argument tokens (for routing decorator detection).
+ * Returns array of { name, args: rawArgString } objects.
+ *   #[get("/users")] → [{ name: 'get', args: '"/users"' }]
+ *   #[tokio::main] → [{ name: 'tokio::main', args: null }]
+ *
+ * @param {Node} node - Function AST node
+ * @param {string|string[]} codeOrLines - Source code or pre-split lines
+ * @returns {Array<{name: string, args: string|null}>}
+ */
+function extractAttributesWithArgs(node, codeOrLines) {
+    const result = [];
+    const lines = Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n');
+
+    const startLine = node.startPosition.row;
+    for (let i = startLine - 1; i >= 0 && i >= startLine - 5; i--) {
+        const line = lines[i]?.trim();
+        if (!line) break;
+        if (line.startsWith('#[')) {
+            // Match #[name(...args...)] or #[name]
+            // Need to handle nested parens; use a simple bracket-matching approach.
+            const m = line.match(/^#\[(.+)\]\s*$/);
+            if (m) {
+                const attrContent = m[1];
+                const parenIdx = attrContent.indexOf('(');
+                if (parenIdx === -1) {
+                    result.unshift({ name: attrContent.trim(), args: null });
+                } else {
+                    const name = attrContent.slice(0, parenIdx).trim();
+                    // Extract content within outer parens (find matching close)
+                    let depth = 0;
+                    let endIdx = -1;
+                    for (let k = parenIdx; k < attrContent.length; k++) {
+                        const ch = attrContent[k];
+                        if (ch === '(') depth++;
+                        else if (ch === ')') {
+                            depth--;
+                            if (depth === 0) { endIdx = k; break; }
+                        }
+                    }
+                    const args = endIdx > parenIdx
+                        ? attrContent.slice(parenIdx + 1, endIdx).trim()
+                        : attrContent.slice(parenIdx + 1).trim();
+                    result.unshift({ name, args });
+                }
+            }
+        } else if (!line.startsWith('//')) {
+            break;
+        }
+    }
+    return result;
+}
+
 // --- Module-scope constants for state object detection ---
 const _STATE_PATTERN = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
 
@@ -172,6 +225,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const docstring = extractRustDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const attributes = extractAttributes(node, lines);
+            const attributesWithArgs = extractAttributesWithArgs(node, lines);
             const inCfgTest = _isInsideCfgTestModule(node, lines);
 
             const modifiers = [];
@@ -198,7 +252,8 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 modifiers,
                 ...(returnType && { returnType }),
                 ...(docstring && { docstring }),
-                ...(generics && { generics })
+                ...(generics && { generics }),
+                ...(attributesWithArgs.length > 0 && { attributesWithArgs })
             });
         }
         return true;
@@ -813,6 +868,29 @@ function findCallsInCode(code, parser) {
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
 
+    // Helper: extract first string-arg literal from a call_expression node.
+    // Used by route extraction to capture path arg of client.get("/users") and
+    // detect format!() macro interpolation: format!("/users/{}", id).
+    const { extractStringArg: _extractStringArg } = require('./utils');
+    const getFirstStringArg = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            // format!() macro inside an arg: client.get(format!("/users/{}", id))
+            if (arg.type === 'macro_invocation') {
+                const macroNode = arg.childForFieldName('macro');
+                const macroName = macroNode ? macroNode.text.replace(/!$/, '') : '';
+                if (macroName === 'format') {
+                    return _extractStringArg(arg);
+                }
+            }
+            return _extractStringArg(arg);
+        }
+        return null;
+    };
+
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['function_item', 'closure_expression'].includes(node.type);
@@ -917,11 +995,13 @@ function findCallsInCode(code, parser) {
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
+                const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: funcNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: false,
-                    enclosingFunction
+                    enclosingFunction,
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
             } else if (funcNode.type === 'field_expression') {
                 // Method call: obj.method()
@@ -931,13 +1011,15 @@ function findCallsInCode(code, parser) {
                 if (fieldNode) {
                     const receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
                     const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
+                    const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: fieldNode.text,
                         line: node.startPosition.row + 1,
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
-                        enclosingFunction
+                        enclosingFunction,
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
                 }
             } else if (funcNode.type === 'scoped_identifier') {
@@ -946,13 +1028,15 @@ function findCallsInCode(code, parser) {
                 const pathText = funcNode.text;
                 const segments = pathText.split('::');
                 const name = segments[segments.length - 1];
+                const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: name,
                     line: node.startPosition.row + 1,
                     isMethod: segments.length > 1,
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
                     receiver: segments.length > 1 ? segments.slice(0, -1).join('::') : undefined,
-                    enclosingFunction
+                    enclosingFunction,
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
             }
             return true;

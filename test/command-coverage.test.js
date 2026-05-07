@@ -9,7 +9,7 @@ const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const { execFileSync } = require('child_process');
-const { tmp, rm, idx } = require('./helpers');
+const { tmp, rm, idx, FIXTURES_PATH, runCli } = require('./helpers');
 const { execute } = require('../core/execute');
 
 // ── Shared Fixtures ──────────────────────────────────────────────────────────
@@ -984,5 +984,305 @@ describe('check command', () => {
                 assert.ok(names.includes('brandNew') || names.includes('existing'));
             }
         } finally { rm(dir); }
+    });
+});
+
+// ── auditAsync ────────────────────────────────────────────────────────────────
+
+describe('audit-async behavioral', () => {
+    it('returns {issues, totalIssues, filesAffected} shape', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': [
+                'async function helper() { return 1; }',
+                'async function caller() { helper(); }',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'auditAsync', {});
+            assert.ok(ok);
+            assert.ok(Array.isArray(result.issues));
+            assert.strictEqual(typeof result.totalIssues, 'number');
+            assert.strictEqual(typeof result.filesAffected, 'number');
+        } finally { rm(dir); }
+    });
+
+    it('respects file= filter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'good.js': [
+                'async function helper1() { return 1; }',
+                'async function caller1() { await helper1(); }',
+                'caller1();',
+            ].join('\n'),
+            'bad.js': [
+                'async function helper2() { return 1; }',
+                'async function caller2() { helper2(); }',
+                'caller2();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Whole project sees one issue from bad.js.
+            const all = execute(index, 'auditAsync', {}).result;
+            assert.strictEqual(all.totalIssues, 1);
+            // file=good.js sees 0.
+            const filtered = execute(index, 'auditAsync', { file: 'good.js' }).result;
+            assert.strictEqual(filtered.totalIssues, 0);
+        } finally { rm(dir); }
+    });
+
+    it('produces stable ordering across runs', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': [
+                'async function fa() { return 1; }',
+                'async function callerA() { fa(); }',
+                'callerA();',
+            ].join('\n'),
+            'b.js': [
+                'async function fb() { return 1; }',
+                'async function callerB() { fb(); }',
+                'callerB();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'auditAsync', {}).result;
+            const r2 = execute(index, 'auditAsync', {}).result;
+            assert.deepStrictEqual(
+                r1.issues.map(i => `${i.file}:${i.line}:${i.calleeName}`),
+                r2.issues.map(i => `${i.file}:${i.line}:${i.calleeName}`),
+                'same input → same output ordering (rule #11)'
+            );
+            // a.js sorts before b.js alphabetically.
+            assert.match(r1.issues[0].file, /a\.js$/);
+        } finally { rm(dir); }
+    });
+});
+
+// ── endpoints command behavioral ─────────────────────────────────────────────
+
+describe('endpoints command behavioral', () => {
+    const JS_FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'javascript');
+    const PY_FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'python');
+
+    it('returns server routes when no flag set', () => {
+        const index = idx(JS_FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        assert.ok(Array.isArray(result.routes));
+        assert.ok(result.routes.length > 0);
+        // No --bridge → no bridge records computed
+        assert.strictEqual(result.bridges.length, 0);
+        // Without --bridge or --unmatched, unmatched lists are not computed (empty)
+        assert.strictEqual(result.unmatchedRoutes.length, 0);
+        assert.strictEqual(result.unmatchedRequests.length, 0);
+    });
+
+    it('--bridge produces bridges + unmatched lists', () => {
+        const index = idx(JS_FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        assert.ok(result.bridges.length > 0, 'should have at least one bridge');
+        // Total bridges + unmatched ≤ total
+        for (const b of result.bridges) {
+            assert.ok(b.confidence > 0 && b.confidence <= 1);
+            assert.ok(['exact', 'partial', 'uncertain'].includes(b.matchType));
+        }
+    });
+
+    it('--unmatched returns only unmatched routes/requests, no bridges', () => {
+        const index = idx(JS_FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { unmatched: true });
+        assert.ok(ok);
+        // bridges array exists but is empty when only --unmatched is set
+        assert.strictEqual(result.bridges.length, 0);
+        // unmatchedRoutes/unmatchedRequests are populated
+        assert.ok(result.unmatchedRoutes.length + result.unmatchedRequests.length > 0,
+            'expected some unmatched entries');
+    });
+
+    it('--method=GET filters routes/requests to only GET method', () => {
+        const index = idx(JS_FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { method: 'GET' });
+        assert.ok(ok);
+        for (const r of result.routes) {
+            // ALL/USE are also kept (catch-all)
+            assert.ok(r.method === 'GET' || r.method === 'ALL' || r.method === 'USE',
+                `expected GET/ALL/USE got ${r.method}`);
+        }
+        for (const r of result.requests) {
+            assert.ok(r.method === 'GET' || r.method === 'ALL',
+                `expected GET/ALL got ${r.method}`);
+        }
+    });
+
+    it('--method is case-insensitive (lowercase get)', () => {
+        const index = idx(JS_FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { method: 'get' });
+        assert.ok(ok);
+        // All listed routes should be GET (or wildcard)
+        for (const r of result.routes) {
+            assert.ok(['GET', 'ALL', 'USE'].includes(r.method));
+        }
+    });
+
+    it('--prefix=/api filters routes/requests by path prefix', () => {
+        const index = idx(JS_FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { prefix: '/api' });
+        assert.ok(ok);
+        for (const r of result.routes) {
+            assert.ok(r.path.startsWith('/api') || r.normalizedPath.startsWith('/api'),
+                `route ${r.path} should start with /api`);
+        }
+    });
+
+    it('exact match: literal route ↔ literal client gives confidence=1', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/health', healthCheck);\nfunction healthCheck() {}\n",
+            'client.js': "function ping() { return fetch('/health'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            assert.strictEqual(result.bridges.length, 1);
+            const b = result.bridges[0];
+            assert.strictEqual(b.matchType, 'exact');
+            assert.strictEqual(b.confidence, 1);
+        } finally { rm(dir); }
+    });
+
+    it('partial match: server /users/:id ↔ client literal /users/123', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/users/:id', handle);\nfunction handle() {}\n",
+            'client.js': "function get() { return fetch('/users/123'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            assert.strictEqual(result.bridges.length, 1);
+            const b = result.bridges[0];
+            assert.strictEqual(b.matchType, 'partial');
+            assert.ok(b.confidence > 0 && b.confidence < 1);
+        } finally { rm(dir); }
+    });
+
+    it('uncertain match: client interp /foo/${id}/bar ↔ server /foo/:id/bar', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/foo/:id/bar', handle);\nfunction handle() {}\n",
+            'client.js': 'function f(id) { return fetch(`/foo/${id}/bar`); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            // The interp client path becomes /foo/* (parser truncates after `${`)
+            // server /foo/:id/bar → /foo/*/bar — these don't overlap normally
+            // but the looser fallback (shared prefix) matches as 'uncertain'
+            assert.ok(result.bridges.length >= 1);
+            const interpMatch = result.bridges.find(b => b.matchType === 'uncertain');
+            assert.ok(interpMatch, 'should produce uncertain match for interp client');
+            // Uncertain has lower confidence
+            assert.ok(interpMatch.confidence < 0.85);
+        } finally { rm(dir); }
+    });
+
+    it('method inference: bare fetch/axios.get default to GET with methodInferred=true', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': "function f() { return fetch('/foo'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', {});
+            assert.ok(ok);
+            assert.strictEqual(result.requests.length, 1);
+            assert.strictEqual(result.requests[0].method, 'GET');
+            assert.strictEqual(result.requests[0].methodInferred, true);
+            assert.strictEqual(result.requests[0].framework, 'fetch');
+        } finally { rm(dir); }
+    });
+
+    it('stable output ordering: same input produces byte-identical results (rule #11)', () => {
+        const index = idx(JS_FIXTURE);
+        // Clear any cache that might affect identity across runs
+        index._endpointsCache = null;
+        const r1 = execute(index, 'endpoints', { bridge: true }).result;
+        index._endpointsCache = null;
+        const r2 = execute(index, 'endpoints', { bridge: true }).result;
+        // Routes ordering (file, line, method, path)
+        assert.deepStrictEqual(
+            r1.routes.map(r => `${r.file}:${r.line}:${r.method}:${r.path}`),
+            r2.routes.map(r => `${r.file}:${r.line}:${r.method}:${r.path}`),
+            'routes ordering must be deterministic'
+        );
+        // Requests ordering
+        assert.deepStrictEqual(
+            r1.requests.map(r => `${r.file}:${r.line}:${r.method}:${r.path}`),
+            r2.requests.map(r => `${r.file}:${r.line}:${r.method}:${r.path}`),
+            'requests ordering must be deterministic'
+        );
+        // Bridges ordering
+        assert.deepStrictEqual(
+            r1.bridges.map(b => `${b.route.file}:${b.route.line}:${b.request.file}:${b.request.line}`),
+            r2.bridges.map(b => `${b.route.file}:${b.route.line}:${b.request.file}:${b.request.line}`),
+            'bridges ordering must be deterministic'
+        );
+    });
+
+    it('JSON output (--bridge --json) matches expected schema', () => {
+        const out = runCli(JS_FIXTURE, 'endpoints', [], ['--bridge', '--json']);
+        const parsed = JSON.parse(out);
+        // Top-level shape: { meta, data }
+        assert.ok(parsed.meta, 'should have meta');
+        assert.ok(parsed.data, 'should have data');
+        // meta fields
+        assert.strictEqual(parsed.meta.ok, true);
+        assert.ok(typeof parsed.meta.totalRoutes === 'number');
+        assert.ok(typeof parsed.meta.totalRequests === 'number');
+        assert.ok(typeof parsed.meta.totalBridges === 'number');
+        assert.ok(parsed.meta.byFramework);
+        // data fields
+        assert.ok(Array.isArray(parsed.data.routes));
+        assert.ok(Array.isArray(parsed.data.requests));
+        assert.ok(Array.isArray(parsed.data.bridges));
+        assert.ok(Array.isArray(parsed.data.unmatchedRoutes));
+        assert.ok(Array.isArray(parsed.data.unmatchedRequests));
+        // Bridges have well-defined fields
+        if (parsed.data.bridges.length > 0) {
+            const b = parsed.data.bridges[0];
+            assert.ok(b.route);
+            assert.ok(b.request);
+            assert.ok(b.matchType);
+            assert.ok(typeof b.confidence === 'number');
+        }
+        // Routes contain method/path/handler/line/framework
+        for (const r of parsed.data.routes) {
+            assert.ok(r.method);
+            assert.ok(r.path);
+            assert.ok(typeof r.line === 'number');
+            assert.ok(r.framework);
+        }
+    });
+
+    it('text output is non-empty and includes Server Routes header', () => {
+        const out = runCli(JS_FIXTURE, 'endpoints', [], []);
+        assert.ok(out.includes('Server Routes:'), 'expected Server Routes: header');
+        // 9 routes → header should reflect this
+        assert.match(out, /Server Routes: 9/);
+    });
+
+    it('--bridge text output includes Endpoint Bridges header', () => {
+        const out = runCli(JS_FIXTURE, 'endpoints', [], ['--bridge']);
+        assert.ok(out.includes('Endpoint Bridges'), 'expected Endpoint Bridges header');
+        assert.match(out, /Matched: \d+/);
     });
 });

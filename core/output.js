@@ -22,4 +22,5 @@ module.exports = {
     ...require('./output/brief'),
     ...require('./output/doctor'),
     ...require('./output/check'),
+    ...require('./output/endpoints'),
 };

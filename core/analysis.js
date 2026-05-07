@@ -14,6 +14,94 @@ const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions } = require('./shared');
 const { computeReachability, symbolKey } = require('./entrypoints');
+const { getLanguageModule } = require('../languages');
+
+// JS/TS test framework helpers — calls to these bracket a test case.
+// Used to flag call sites whose enclosing function is an arrow callback
+// passed to one of these (the common pattern in mocha/jest/vitest).
+const _JS_TEST_FRAMEWORK_CALLS = new Set(['describe', 'it', 'test', 'spec', 'context', 'suite']);
+
+/**
+ * Tag each call site with `inTestCase` based on its enclosing function's
+ * entry-point classification. Uses each language's `getEntryPointKind`
+ * predicate (kind === 'test') so results match `affectedTests`/etc.
+ *
+ * For JS/TS/HTML, function-level entry-point classification only covers
+ * framework lifecycle methods. Test bodies are framework callbacks
+ * (`it('name', () => {...})`), so we additionally tag a site as inTestCase
+ * when its file has a `describe`/`it`/`test` framework call that brackets
+ * the enclosing function — mirroring `_addAffectedTestCases` in tracing.js.
+ *
+ * Mutates each site in place (sets `site.inTestCase = boolean`).
+ */
+function tagInTestCase(index, sites) {
+    if (!Array.isArray(sites) || sites.length === 0) return;
+    // Per-file cache: language module + JS framework call ranges.
+    const fileMeta = new Map();
+    function getFileMeta(filePath) {
+        if (!filePath) return null;
+        if (fileMeta.has(filePath)) return fileMeta.get(filePath);
+        const fe = index.files.get(filePath);
+        if (!fe) { fileMeta.set(filePath, null); return null; }
+        let langModule = null;
+        try { langModule = getLanguageModule(fe.language); } catch (_) { /* ignore */ }
+        const meta = { fileEntry: fe, langModule, language: fe.language, jsTestRanges: null };
+        // For JS-family files, build line ranges of describe/it/test framework calls.
+        if (langModule && (fe.language === 'javascript' || fe.language === 'typescript' ||
+            fe.language === 'tsx' || fe.language === 'html')) {
+            try {
+                const calls = index.getCachedCalls ? index.getCachedCalls(filePath) : null;
+                if (Array.isArray(calls)) {
+                    const ranges = [];
+                    for (const call of calls) {
+                        if (!_JS_TEST_FRAMEWORK_CALLS.has(call.name)) continue;
+                        // Get the enclosing test-block end via existing fn-bound estimate.
+                        // Without a proper bracket scan we use the next-fn-boundary or +200 lines.
+                        let endLine = call.line + 200;
+                        // Try using the enclosing-symbol range as an upper bound when possible.
+                        if (fe.symbols) {
+                            for (const sym of fe.symbols) {
+                                if (sym.startLine <= call.line && (sym.endLine || 0) >= call.line) {
+                                    endLine = Math.min(endLine, sym.endLine || endLine);
+                                }
+                            }
+                        }
+                        ranges.push({ start: call.line, end: endLine });
+                    }
+                    meta.jsTestRanges = ranges;
+                }
+            } catch (_) { /* ignore */ }
+        }
+        fileMeta.set(filePath, meta);
+        return meta;
+    }
+    for (const site of sites) {
+        site.inTestCase = false;
+        const meta = getFileMeta(site.callerFile);
+        if (!meta || !meta.langModule) continue;
+        // First: kinded entry-point predicate (Python/Go/Java/Rust + JS lifecycle).
+        const classify = meta.langModule.getEntryPointKind;
+        if (classify && site.callerFile && site.callerStartLine != null) {
+            const encl = index.findEnclosingFunction
+                ? index.findEnclosingFunction(site.callerFile, site.line, true)
+                : null;
+            if (encl && classify(encl) === 'test') {
+                site.inTestCase = true;
+                continue;
+            }
+        }
+        // Second: JS/TS framework-call brackets (it/test/describe). The site is
+        // inside a test case when its line falls within a describe/it block.
+        if (meta.jsTestRanges && meta.jsTestRanges.length > 0 && site.line != null) {
+            for (const r of meta.jsTestRanges) {
+                if (site.line >= r.start && site.line <= r.end) {
+                    site.inTestCase = true;
+                    break;
+                }
+            }
+        }
+    }
+}
 
 // ============================================================================
 // TRUST SIGNALS: HISTOGRAM + REACHABILITY
@@ -864,6 +952,11 @@ function impact(index, name, options = {}) {
         byFile.get(site.file).push(site);
     }
 
+    // Feature A: tag each call site with `inTestCase` (whether the enclosing
+    // function is a test entry per language's getEntryPointKind predicate).
+    // Done BEFORE identifyCallPatterns so the aggregate count is correct.
+    tagInTestCase(index, filteredSites);
+
     // Identify patterns
     const patterns = index.identifyCallPatterns(filteredSites, name);
 
@@ -1691,6 +1784,359 @@ function parseDiff(diffText, root) {
     return changes;
 }
 
+// ============================================================================
+// AUDIT-ASYNC (Feature B)
+// ============================================================================
+
+// Languages for which audit-async runs (those with async/await keyword we
+// track). Go/Java/Rust have async machinery but audit-async is scoped to
+// JS/TS/Python per spec.
+const _AUDIT_ASYNC_LANGS = new Set(['javascript', 'typescript', 'tsx', 'python', 'html']);
+
+// Built-in/standard-library callees that return promises and are commonly
+// missing-awaited. Conservative starter set (rule #9 — generic, not
+// project-specific). The audit only flags when the caller is async, the
+// callee is provably async, AND the call isn't awaited; this set covers
+// callees we can recognize without project-symbol resolution.
+const _KNOWN_ASYNC_CALLEES = new Set([
+    // JS/TS
+    'fetch',
+    // Node.js fs.promises etc. are method calls — `fs.readFile` resolves
+    // through the symbol table as a method. We avoid hardcoding receiver
+    // names here. setTimeout/setInterval are fire-and-forget by design.
+]);
+
+// Fire-and-forget patterns — calls inside these contexts are intentionally
+// unawaited. Used to suppress false positives.
+//   - Promise.all / Promise.allSettled / Promise.race / Promise.any
+//   - void <expr>
+//   - <expr>.then() / .catch() (the call provides its own handler)
+const _FIRE_AND_FORGET_PROMISE_FNS = new Set(['all', 'allSettled', 'race', 'any']);
+
+/**
+ * Run an async/await audit across the project.
+ *
+ * Finds call sites that are likely missing an `await`. A site is flagged
+ * when ALL of:
+ *   1. The enclosing function is async (or top-level module code in an
+ *      async-context module — JS modules with top-level await).
+ *   2. The callee is provably async (its symbol's `isAsync` is true) OR
+ *      the callee is a known async standard function (e.g., `fetch`).
+ *   3. The call is not wrapped in `await` (or its Python equivalent).
+ *   4. The call is not in a known fire-and-forget context (Promise.all
+ *      arguments, `void fn()`, `.then(...)`, return statement, assignment
+ *      to a variable — these are intentional non-await uses).
+ *
+ * Detection is AST-based per language; the language must support an
+ * `await` keyword (JS/TS/Python). Other languages are skipped.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {object} [options] - { file, exclude }
+ * @returns {{issues: Array<{file:string,line:number,callerName:string,calleeName:string,reason?:string}>}}
+ */
+function auditAsync(index, options = {}) {
+    index._beginOp();
+    try {
+        const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
+        const issues = [];
+
+        // Build a "is this name provably async" lookup from the symbol table.
+        // We accept a name only if EVERY callable definition with that name is
+        // async — this avoids flagging ambiguous calls like `Map.get()` where
+        // the project also has a `DataService.get()` async method.
+        // Names with at least one non-async definition are considered ambiguous
+        // and excluded (the audit prefers false negatives over false positives).
+        const asyncNames = new Set();
+        for (const [name, defs] of index.symbols) {
+            // Filter to definitions that look callable (function/method/etc.).
+            const callable = defs.filter(d => d && (
+                d.type === 'function' || d.type === 'method' ||
+                d.type === 'constructor' || d.type === 'arrow' ||
+                d.params != null || d.paramsStructured != null
+            ));
+            if (callable.length === 0) continue;
+            const allAsync = callable.every(d =>
+                d.isAsync === true ||
+                (Array.isArray(d.modifiers) && d.modifiers.includes('async'))
+            );
+            if (allAsync) asyncNames.add(name);
+        }
+
+        // Helper: does the call site (callExpr node) sit in a "fire-and-forget"
+        // context? Walk up at most a few levels and check for known patterns.
+        function isFireAndForget(callNode, language) {
+            let p = callNode.parent;
+            // 1. Direct `void fn()` (JS/TS only)
+            if (p && p.type === 'unary_expression') {
+                const op = p.childForFieldName('operator');
+                if (op && op.text === 'void') return true;
+                // Some grammars expose first child as the operator
+                const first = p.namedChild(0);
+                if (first && first.type === 'void') return true;
+            }
+            // 2. Argument of `Promise.all([...])` / `Promise.allSettled` / etc.
+            //    Walk up: arguments > call > selector_expression(member) > 'Promise'.<allSettled>.
+            //    The call site is somewhere inside the array; check if the
+            //    enclosing call is a Promise.all-style helper.
+            let cur = callNode.parent;
+            let depth = 0;
+            while (cur && depth++ < 6) {
+                if ((cur.type === 'call_expression' || cur.type === 'call') && cur !== callNode) {
+                    const fn = cur.childForFieldName('function');
+                    if (fn) {
+                        if (fn.type === 'member_expression' || fn.type === 'attribute') {
+                            const obj = fn.childForFieldName('object') || fn.namedChild(0);
+                            const prop = fn.childForFieldName('property') || fn.namedChild(fn.namedChildCount - 1);
+                            if (obj && prop) {
+                                const objText = obj.text;
+                                const propText = prop.text;
+                                if ((objText === 'Promise' || objText === 'asyncio') &&
+                                    _FIRE_AND_FORGET_PROMISE_FNS.has(propText)) {
+                                    return true;
+                                }
+                                // .then(...) / .catch(...) — caller is providing a handler;
+                                // the inner call is intentional.
+                                if (propText === 'then' || propText === 'catch' || propText === 'finally') {
+                                    // Only flag when callNode is INSIDE the chain target,
+                                    // not just an argument
+                                    return true;
+                                }
+                            }
+                        }
+                    }
+                    // Stop at the first enclosing call — we don't want to leak
+                    // analysis past the immediate parent call.
+                    break;
+                }
+                cur = cur.parent;
+            }
+            // 3. Right-hand side of an assignment / variable_declarator — the
+            //    promise is being captured for later use, not lost. NOT
+            //    fire-and-forget but also NOT a missing-await; treat as
+            //    intentional.
+            //    (We keep this distinct so the "captured" call doesn't get
+            //    flagged.)
+            let q = callNode.parent;
+            // Skip await wrappers (already handled by caller)
+            if (q && (q.type === 'await_expression' || q.type === 'await')) {
+                q = q.parent;
+            }
+            if (q) {
+                if (q.type === 'variable_declarator' || q.type === 'assignment_expression') {
+                    return true;
+                }
+                if (q.type === 'return_statement') {
+                    return true;  // returning the promise — caller awaits it
+                }
+                // Yielded as an expression: `yield fn()` — caller awaits / async iterator
+                if (q.type === 'yield_expression' || q.type === 'yield') {
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        // Process one file: find async functions, then call sites within them.
+        function processFile(filePath, fileEntry) {
+            if (!fileEntry || !_AUDIT_ASYNC_LANGS.has(fileEntry.language)) return;
+            const language = fileEntry.language;
+
+            // Collect async functions from the file's symbol list.
+            const asyncFns = [];
+            if (Array.isArray(fileEntry.symbols)) {
+                for (const sym of fileEntry.symbols) {
+                    if (!sym || !sym.startLine || !sym.endLine) continue;
+                    const isAsync = sym.isAsync === true ||
+                                    (Array.isArray(sym.modifiers) && sym.modifiers.includes('async'));
+                    if (isAsync) asyncFns.push(sym);
+                }
+            }
+            if (asyncFns.length === 0) return;
+
+            // Re-parse file to find awaited-vs-not call sites. We use a fresh
+            // parse rather than tree cache because we want to walk every
+            // call_expression in the async function ranges.
+            let parser, content, tree;
+            try {
+                if (language === 'html') {
+                    const htmlModule = getLanguageModule('html');
+                    const htmlParser = getParser('html');
+                    const jsParser = getParser('javascript');
+                    if (!htmlParser || !jsParser) return;
+                    content = index._readFile(filePath);
+                    const blocks = htmlModule.extractScriptBlocks(content, htmlParser);
+                    if (blocks.length === 0) return;
+                    const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
+                    tree = safeParse(jsParser, virtualJS);
+                } else {
+                    parser = getParser(language);
+                    if (!parser) return;
+                    content = index._readFile(filePath);
+                    tree = safeParse(parser, content);
+                }
+            } catch (_) { return; }
+            if (!tree) return;
+
+            // Walk every call_expression within an async function range.
+            const callTypes = new Set(['call_expression', 'call', 'method_invocation', 'object_creation_expression']);
+
+            // Function-boundary nodes per language (used to find the nearest
+            // enclosing function and determine if IT is async — not just any
+            // outer ancestor).
+            const FN_NODE_TYPES = {
+                javascript: new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration']),
+                typescript: new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration', 'function_signature']),
+                tsx:        new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration', 'function_signature']),
+                html:       new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration']),
+                python:     new Set(['function_definition', 'async_function_definition', 'lambda']),
+            }[language] || new Set();
+
+            function isAsyncFnNode(node) {
+                if (!node) return false;
+                // Python: async_function_definition is the explicit marker.
+                if (node.type === 'async_function_definition') return true;
+                // JS/TS arrow_function / function_expression / function_declaration:
+                // the `async` keyword is a child of the node OR appears as
+                // first token in node text.
+                const t = node.text || '';
+                if (t.trimStart().startsWith('async ')) return true;
+                // method_definition: scan first child for 'async' identifier.
+                for (let i = 0; i < node.namedChildCount; i++) {
+                    const c = node.namedChild(i);
+                    if (c.type === 'async') return true;
+                }
+                return false;
+            }
+
+            // Find the nearest enclosing function symbol whose name matches
+            // a top-level async fn. Returns the symbol when the call's
+            // immediate enclosing fn-node is async (so callbacks inside an
+            // async fn aren't misclassified as async themselves).
+            function nearestAsyncEnclosing(callNode) {
+                let cur = callNode.parent;
+                while (cur) {
+                    if (FN_NODE_TYPES.has(cur.type)) {
+                        if (isAsyncFnNode(cur)) {
+                            // Match against asyncFns to get caller name.
+                            const startLine = cur.startPosition.row + 1;
+                            for (const fn of asyncFns) {
+                                if (fn.startLine === startLine) return fn;
+                            }
+                            // Anonymous async fn — return a synthetic record.
+                            return {
+                                name: '<anonymous>',
+                                startLine,
+                                endLine: cur.endPosition.row + 1,
+                            };
+                        }
+                        return null; // Inner non-async fn — stop, don't leak into outer scope.
+                    }
+                    cur = cur.parent;
+                }
+                return null;
+            }
+
+            function visit(node) {
+                if (!node) return;
+                if (callTypes.has(node.type)) {
+                    const line = node.startPosition.row + 1;
+                    const enclosing = nearestAsyncEnclosing(node);
+                    if (enclosing) {
+                        // Get the callee name + skip if not async.
+                        const funcNode = node.childForFieldName('function') ||
+                                         node.childForFieldName('name');
+                        if (funcNode) {
+                            let calleeName;
+                            let isMethodCall = false;
+                            if (funcNode.type === 'member_expression' || funcNode.type === 'attribute' ||
+                                funcNode.type === 'selector_expression' || funcNode.type === 'field_expression') {
+                                const prop = funcNode.childForFieldName('property') ||
+                                             funcNode.childForFieldName('field') ||
+                                             funcNode.childForFieldName('attribute');
+                                calleeName = prop ? prop.text : null;
+                                isMethodCall = true;
+                            } else {
+                                calleeName = funcNode.text;
+                            }
+                            if (calleeName) {
+                                // Check whether the callee is provably async.
+                                const calleeIsAsync = asyncNames.has(calleeName) ||
+                                                      _KNOWN_ASYNC_CALLEES.has(calleeName);
+                                if (calleeIsAsync) {
+                                    // Skip method calls in structural type
+                                    // systems (JS/TS/Python). Without receiver
+                                    // type evidence we can't tell `obj.get()`
+                                    // calling `Map.get` (sync) from a project
+                                    // class's async `get`. Method-call audits
+                                    // need a more sophisticated receiver
+                                    // resolution that we don't have here.
+                                    if (isMethodCall) {
+                                        // (Allow only when callee is in the
+                                        // KNOWN_ASYNC_CALLEES list — those are
+                                        // standard global functions, not
+                                        // methods.)
+                                        if (!_KNOWN_ASYNC_CALLEES.has(calleeName)) {
+                                            // Continue walking — don't flag.
+                                        } else {
+                                            // Fall through to common flag logic
+                                        }
+                                    }
+                                    if (!isMethodCall || _KNOWN_ASYNC_CALLEES.has(calleeName)) {
+                                        // Check: is the call awaited?
+                                        let awaited = false;
+                                        const p = node.parent;
+                                        if (p && (p.type === 'await_expression' || p.type === 'await')) {
+                                            awaited = true;
+                                        }
+                                        if (!awaited && !isFireAndForget(node, language)) {
+                                            issues.push({
+                                                file: fileEntry.relativePath || filePath,
+                                                line,
+                                                callerName: enclosing.name,
+                                                calleeName,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                for (let i = 0; i < node.namedChildCount; i++) {
+                    visit(node.namedChild(i));
+                }
+            }
+            visit(tree.rootNode);
+        }
+
+        // Apply file/exclude filters via index.matchesFilters when available.
+        const exclude = Array.isArray(options.exclude) ? options.exclude : [];
+        const fileFilter = options.file || null;
+
+        for (const [filePath, fileEntry] of index.files) {
+            if (exclude.length > 0 && !index.matchesFilters(filePath, { exclude })) continue;
+            if (fileFilter && !(fileEntry.relativePath || '').includes(fileFilter)) continue;
+            processFile(filePath, fileEntry);
+        }
+
+        // Stable ordering (rule #11): sort by (file, line, callerName, calleeName).
+        issues.sort((a, b) => {
+            const fc = String(a.file).localeCompare(String(b.file));
+            if (fc !== 0) return fc;
+            if (a.line !== b.line) return a.line - b.line;
+            const cc = String(a.callerName || '').localeCompare(String(b.callerName || ''));
+            if (cc !== 0) return cc;
+            return String(a.calleeName || '').localeCompare(String(b.calleeName || ''));
+        });
+
+        return {
+            issues,
+            totalIssues: issues.length,
+            filesAffected: new Set(issues.map(i => i.file)).size,
+        };
+    } finally { index._endOp(); }
+}
+
 module.exports = {
     context,
     smart,
@@ -1702,4 +2148,6 @@ module.exports = {
     parseDiff,
     extractCallableSymbols,
     unquoteDiffPath,
+    auditAsync,
+    tagInTestCase,
 };

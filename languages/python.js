@@ -459,6 +459,37 @@ function findCallsInCode(code, parser) {
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
+    // Helper: extract first string-arg literal from a call node.
+    // Used by route extraction to capture path arg of requests.get('/users'), httpx.get('/users') etc.
+    // Handles both plain strings and f-strings (returns interp:true with literal prefix).
+    const { extractStringArg: _extractStringArg } = require('./utils');
+    const getFirstStringArg = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            // Handle f-string explicitly
+            if (arg.type === 'string') {
+                // f-string detection: tree-sitter-python wraps interpolations as 'interpolation' children.
+                // If any interpolation child exists, this is interpolated; extract literal prefix.
+                let interp = false;
+                let prefix = '';
+                for (let j = 0; j < arg.namedChildCount; j++) {
+                    const sc = arg.namedChild(j);
+                    if (sc.type === 'interpolation') { interp = true; break; }
+                    if (sc.type === 'string_content') prefix += sc.text;
+                }
+                if (interp) {
+                    return { value: prefix + (prefix.endsWith('*') ? '' : '*'), interp: true };
+                }
+                return _extractStringArg(arg);
+            }
+            return _extractStringArg(arg);
+        }
+        return null;
+    };
+
     // Helper to check if a node is a non-callable literal
     const isNonCallableInit = (node) => {
         // Primitive literals
@@ -624,13 +655,15 @@ function findCallsInCode(code, parser) {
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
                 const resolvedName = aliases.get(funcNode.text);
+                const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: funcNode.text,
                     ...(resolvedName && { resolvedName }),
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     enclosingFunction,
-                    uncertain
+                    uncertain,
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
             } else if (funcNode.type === 'attribute') {
                 // Method/attribute call: obj.foo() or self.attr.foo()
@@ -662,6 +695,7 @@ function findCallsInCode(code, parser) {
                     }
 
                     const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
+                    const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: attrNode.text,
                         line: node.startPosition.row + 1,
@@ -670,7 +704,8 @@ function findCallsInCode(code, parser) {
                         ...(receiverType && { receiverType }),
                         ...(selfAttribute && { selfAttribute }),
                         enclosingFunction,
-                        uncertain
+                        uncertain,
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
                 }
             }

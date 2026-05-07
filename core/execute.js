@@ -759,6 +759,76 @@ const HANDLERS = {
         return { ok: true, result, note };
     },
 
+    endpoints: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
+        const { endpoints } = require('./bridge');
+        const result = endpoints(index, {
+            bridge: !!p.bridge,
+            serverOnly: !!p.serverOnly,
+            clientOnly: !!p.clientOnly,
+            unmatched: !!p.unmatched,
+            method: p.method ? String(p.method).toUpperCase() : null,
+            prefix: p.prefix || null,
+            showUncertain: !p.hideUncertain,
+        });
+        // Apply --file pattern as an additional filter on routes/requests
+        if (p.file) {
+            const sub = String(p.file);
+            result.routes = result.routes.filter(r => r.file.includes(sub));
+            result.requests = result.requests.filter(r => r.file.includes(sub));
+            result.bridges = result.bridges.filter(b =>
+                b.route.file.includes(sub) || b.request.file.includes(sub)
+            );
+            result.unmatchedRoutes = result.unmatchedRoutes.filter(r => r.file.includes(sub));
+            result.unmatchedRequests = result.unmatchedRequests.filter(r => r.file.includes(sub));
+        }
+        // Apply --exclude patterns to route/request files (deadcode-style boundary matching)
+        const exclude = toExcludeArray(p.exclude);
+        if (exclude.length > 0) {
+            const regexes = exclude.map(pat =>
+                new RegExp('(^|[/._-])' + pat + 's?([/._-]|$)', 'i'));
+            const matches = (file) => regexes.some(rx => rx.test(file));
+            result.routes = result.routes.filter(r => !matches(r.file));
+            result.requests = result.requests.filter(r => !matches(r.file));
+            result.bridges = result.bridges.filter(b => !matches(b.route.file) && !matches(b.request.file));
+            result.unmatchedRoutes = result.unmatchedRoutes.filter(r => !matches(r.file));
+            result.unmatchedRequests = result.unmatchedRequests.filter(r => !matches(r.file));
+        }
+        // Apply --limit
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0) {
+            const totalListed = result.routes.length + result.requests.length;
+            if (totalListed > limit) {
+                // Limit each list proportionally — but simpler: hard-cap each.
+                const halfLim = Math.max(1, Math.floor(limit / 2));
+                if (result.routes.length > halfLim) {
+                    result.routes = result.routes.slice(0, halfLim);
+                }
+                if (result.requests.length > halfLim) {
+                    result.requests = result.requests.slice(0, halfLim);
+                }
+                note = limitNote(limit, totalListed);
+            }
+        }
+        // Recompute meta after filtering
+        result.meta = {
+            totalRoutes: result.routes.length,
+            totalRequests: result.requests.length,
+            totalBridges: result.bridges.length,
+            unmatchedRoutes: result.unmatchedRoutes.length,
+            unmatchedRequests: result.unmatchedRequests.length,
+            byFramework: result.routes.reduce((acc, r) => {
+                acc[r.framework] = (acc[r.framework] || 0) + 1;
+                return acc;
+            }, {}),
+        };
+        // Pass `bridge` flag through to formatter via a result property
+        result._bridge = !!p.bridge;
+        return { ok: true, result, note };
+    },
+
     // ── Extracting Code ─────────────────────────────────────────────────
 
     fn: (index, p) => {
@@ -1100,6 +1170,27 @@ const HANDLERS = {
             top: num(p.top, undefined),
         });
         return { ok: true, result };
+    },
+
+    auditAsync: (index, p) => {
+        if (p.file) {
+            const fileErr = checkFilePatternMatch(index, p.file);
+            if (fileErr) return { ok: false, error: fileErr };
+        }
+        let result = index.auditAsync({
+            file: p.file,
+            exclude: toExcludeArray(p.exclude),
+        });
+        // Apply limit to the issues array.
+        const limit = num(p.limit, undefined);
+        let note;
+        if (limit && limit > 0 && result && Array.isArray(result.issues) && result.issues.length > limit) {
+            note = limitNote(limit, result.issues.length);
+            result = { ...result, issues: result.issues.slice(0, limit) };
+        }
+        const tNote = truncationNote(index);
+        if (tNote) note = note ? `${note}\n${tNote}` : tNote;
+        return { ok: true, result, note };
     },
 
     // ── Expand (context drill-down) ──────────────────────────────────────

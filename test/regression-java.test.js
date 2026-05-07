@@ -13,6 +13,7 @@ const os = require('os');
 
 const { parse } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
+const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
 const PROJECT_DIR = path.resolve(__dirname, '..');
@@ -1480,5 +1481,152 @@ describe('fix #184: impact detects class field receiver types', () => {
             assert.ok(r.ok);
             assert.ok(r.result.totalCallSites >= 1, 'should find service.execute() via class field type');
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// FEATURE A: CALL-SITE CLASSIFICATION (Java)
+// ============================================================================
+
+describe('Feature A: Java call-site classification', () => {
+    it('Java: inLoop set for calls inside for/while loops', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'src/Main.java': [
+                'public class Main {',
+                '    public static int helper(int x) { return x; }',
+                '    public static void caller() {',
+                '        for (int i = 0; i < 3; i++) {',
+                '            helper(i);',
+                '        }',
+                '        helper(0);',  // outside loop
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.inLoop, 1, 'one of two calls in loop');
+        } finally { rm(dir); }
+    });
+
+    it('Java: inTry set for calls inside try { ... }', () => {
+        const dir = tmp({
+            'pom.xml': '<project></project>',
+            'src/Main.java': [
+                'public class Main {',
+                '    public static int helper() { return 1; }',
+                '    public static void caller() {',
+                '        try { helper(); } catch (Exception e) {}',
+                '        helper();',  // outside try
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.inTry, 1);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// endpoints command — Java (Spring + JAX-RS)
+// ============================================================================
+
+describe('endpoints command (Java)', () => {
+    const FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'java');
+
+    it('extracts Spring + JAX-RS server routes (8 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // UserController.java: 5 routes (GET, GET/{id}, POST, PUT/{id}, DELETE/{id})
+        // JaxRsResource.java: 3 routes (GET, POST/new, DELETE/{id})
+        assert.strictEqual(result.meta.totalRoutes, 8, 'expected 8 routes');
+        assert.strictEqual(result.meta.byFramework.spring, 5);
+        assert.strictEqual(result.meta.byFramework['jax-rs'], 3);
+    });
+
+    it('Spring @RequestMapping class prefix is concatenated to method paths', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // @RestController + @RequestMapping("/api/users") + @GetMapping → /api/users
+        const findAll = result.routes.find(r =>
+            r.framework === 'spring' && r.handler === 'findAll');
+        assert.ok(findAll, 'should find Spring findAll route');
+        assert.strictEqual(findAll.method, 'GET');
+        assert.strictEqual(findAll.path, '/api/users');
+        assert.strictEqual(findAll.classPrefix, '/api/users');
+
+        // @GetMapping("/{id}") on /api/users → /api/users/{id}
+        const findOne = result.routes.find(r =>
+            r.framework === 'spring' && r.handler === 'findOne');
+        assert.ok(findOne);
+        assert.strictEqual(findOne.path, '/api/users/{id}');
+        assert.strictEqual(findOne.normalizedPath, '/api/users/*');
+    });
+
+    it('JAX-RS @Path("/items") class prefix concatenates with @Path subpaths', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // @Path("/items") + @POST + @Path("/new") → /items/new
+        const create = result.routes.find(r =>
+            r.framework === 'jax-rs' && r.handler === 'create');
+        assert.ok(create);
+        assert.strictEqual(create.method, 'POST');
+        assert.strictEqual(create.path, '/items/new');
+    });
+
+    it('JAX-RS @GET without method-level @Path uses class prefix only', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // @Path("/items") + @GET (no method-level @Path) → /items
+        const getAll = result.routes.find(r =>
+            r.framework === 'jax-rs' && r.handler === 'getAll');
+        assert.ok(getAll, 'should find JAX-RS getAll route');
+        assert.strictEqual(getAll.method, 'GET');
+        assert.strictEqual(getAll.path, '/items');
+    });
+
+    it('extracts Java client requests: RestTemplate (2 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        assert.strictEqual(result.meta.totalRequests, 2);
+    });
+
+    it('restTemplate.getForObject infers GET, postForObject infers POST', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const get = result.requests.find(r => r.callerName === 'listUsers');
+        assert.ok(get, 'should find getForObject from listUsers');
+        assert.strictEqual(get.method, 'GET');
+        assert.strictEqual(get.path, '/api/users');
+        const post = result.requests.find(r => r.callerName === 'createUser');
+        assert.ok(post);
+        assert.strictEqual(post.method, 'POST');
+        assert.strictEqual(post.path, '/api/users');
+    });
+
+    it('--bridge: Spring GET /api/users matches restTemplate.getForObject(/api/users)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        const exact = result.bridges.find(b =>
+            b.matchType === 'exact' &&
+            b.route.method === 'GET' &&
+            b.route.path === '/api/users' &&
+            b.request.method === 'GET');
+        assert.ok(exact, 'should produce exact match for Spring GET /api/users');
+        assert.strictEqual(exact.confidence, 1);
     });
 });

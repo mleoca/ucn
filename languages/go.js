@@ -559,6 +559,32 @@ function findCallsInCode(code, parser, options = {}) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
+
+    // Helper: extract first string-arg literal from a call_expression node.
+    // Used by route extraction to capture path arg of http.HandleFunc("/p", h),
+    // r.GET("/users", listUsers), and detect fmt.Sprintf("/users/%d", id).
+    const { extractStringArg: _extractStringArg, extractSprintfPrefix: _extractSprintfPrefix } = require('./utils');
+    const getFirstStringArg = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            // fmt.Sprintf interpolation
+            if (arg.type === 'call_expression') {
+                const inner = arg.childForFieldName('function');
+                if (inner?.type === 'selector_expression') {
+                    const operand = inner.childForFieldName('operand');
+                    const field = inner.childForFieldName('field');
+                    if (operand?.text === 'fmt' && field && /^Sprintf$/.test(field.text)) {
+                        return _extractSprintfPrefix(arg);
+                    }
+                }
+            }
+            return _extractStringArg(arg);
+        }
+        return null;
+    };
     // Skip common non-function identifiers when detecting callback arguments
     const GO_SKIP_IDENTS = new Set(['nil', 'true', 'false', 'err', 'ctx', 'context', 'iota']);
     // Track local closure names per function scope (scopeStartLine -> Set<name>)
@@ -846,12 +872,14 @@ function findCallsInCode(code, parser, options = {}) {
                 if (isFuncTypedParam(callName)) return true;
 
                 // Direct call: foo()
+                const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: callName,
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     enclosingFunction,
-                    uncertain
+                    uncertain,
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
             } else if (funcNode.type === 'selector_expression') {
                 // Method or package call: obj.Method() or pkg.Func()
@@ -864,6 +892,7 @@ function findCallsInCode(code, parser, options = {}) {
                     // If receiver is a known import alias, this is a package call, not a method call
                     const isPkgCall = receiver && importAliases.has(receiver);
                     const receiverType = (!isPkgCall && receiver) ? getReceiverType(receiver) : undefined;
+                    const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: fieldNode.text,
                         line: node.startPosition.row + 1,
@@ -871,7 +900,8 @@ function findCallsInCode(code, parser, options = {}) {
                         receiver,
                         ...(receiverType && { receiverType }),
                         enclosingFunction,
-                        uncertain
+                        uncertain,
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
                 }
             }

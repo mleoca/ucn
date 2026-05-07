@@ -183,6 +183,7 @@ ucn entrypoints --file=routes/           # Scoped to files
 | Quick look before touching a function | `ucn brief <name>` | Signature + docstring + side effects + complexity, one screen |
 | Project trust report | `ucn doctor [--deep]` | Index coverage, blind spots, parse failures, verdict |
 | Pre-commit summary | `ucn check [--base=main]` | Changed funcs + signature drift + affected tests in one shot |
+| Find missing-await bugs | `ucn audit-async` | Lists async calls inside async functions that lack `await`. JS/TS/Python only. Filter with `--file`, `--exclude`, `--limit` |
 
 ## Symbol Handles (stable IDs)
 

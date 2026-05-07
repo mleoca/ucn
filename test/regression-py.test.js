@@ -13,6 +13,7 @@ const os = require('os');
 
 const { parse } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
+const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 
 describe('Regression: Python class methods in context', () => {
@@ -1821,5 +1822,231 @@ describe('type annotations — Python type hints', () => {
             assert.strictEqual(r.result.symbol.paramTypes.headers, 'dict[str, str]');
             assert.strictEqual(r.result.symbol.returnType, 'bytes');
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// FEATURE A: CALL-SITE CLASSIFICATION (Python)
+// ============================================================================
+
+describe('Feature A: Python call-site classification', () => {
+    it('Python: inLoop set for calls inside for/while loops', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'def helper(x):',
+                '    return x',
+                '',
+                'def caller():',
+                '    for i in range(3):',
+                '        helper(i)',
+                '    while True:',
+                '        helper(99)',
+                '        break',
+                '    helper(0)',  // outside loop
+                '',
+                'caller()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 3);
+            assert.strictEqual(r.patterns.inLoop, 2, 'two of three calls in loop');
+        } finally { rm(dir); }
+    });
+
+    it('Python: inTry set for calls inside try block', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'def helper():',
+                '    return 1',
+                '',
+                'def caller():',
+                '    try:',
+                '        helper()',
+                '    except Exception:',
+                '        pass',
+                '    helper()',  // outside try
+                '',
+                'caller()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.inTry, 1);
+        } finally { rm(dir); }
+    });
+
+    it('Python: inTestCase set for calls in test_ functions', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def helper():\n    return 1\n',
+            'test_a.py': [
+                'from a import helper',
+                '',
+                'def test_helper():',
+                '    helper()',
+                '    assert helper() == 1',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.ok(r.totalCalls >= 2, 'at least two calls in test_helper');
+            assert.ok(r.patterns.inTestCase >= 2, 'all calls inside test_helper are inTestCase');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// FEATURE B: AWAITED + AUDIT-ASYNC (Python)
+// ============================================================================
+
+describe('Feature B: Python awaited flag + audit-async', () => {
+    it('Python: awaited flag set on calls wrapped in await', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'async def helper():',
+                '    return 1',
+                '',
+                'async def caller():',
+                '    await helper()',
+                '    helper()',  // not awaited — bug
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.awaitedCalls, 1);
+        } finally { rm(dir); }
+    });
+
+    it('Python: audit-async flags missing-await on async fn call', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'async def helper():',
+                '    return 1',
+                '',
+                'async def caller():',
+                '    helper()',  // missing await
+                '    await helper()',  // ok
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            assert.strictEqual(r.totalIssues, 1);
+            assert.strictEqual(r.issues[0].calleeName, 'helper');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// endpoints command — Python (Flask + FastAPI)
+// ============================================================================
+
+describe('endpoints command (Python)', () => {
+    const FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'python');
+
+    it('extracts Flask + FastAPI server routes (6 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // Flask: 2 routes (app.route GET + POST on /users)
+        // FastAPI: app.get /users/<int:user_id>, router.get /items, router.post /items, router.delete /items/{id}
+        assert.strictEqual(result.meta.totalRoutes, 6, 'expected 6 routes');
+        assert.strictEqual(result.meta.byFramework.flask, 2);
+        assert.strictEqual(result.meta.byFramework.fastapi, 4);
+    });
+
+    it('Flask @app.route decorator detects method from methods=[...] kwarg', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // @app.route('/users', methods=['GET']) → list_users
+        const flaskGet = result.routes.find(r =>
+            r.framework === 'flask' && r.handler === 'list_users');
+        assert.ok(flaskGet, 'should find flask GET /users handler');
+        assert.strictEqual(flaskGet.method, 'GET');
+        assert.strictEqual(flaskGet.path, '/users');
+        assert.strictEqual(flaskGet.line, 8);
+    });
+
+    it('FastAPI @router.delete extracts the path correctly', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // @router.delete('/items/{item_id}') → delete_item
+        const fastDel = result.routes.find(r =>
+            r.framework === 'fastapi' && r.method === 'DELETE');
+        assert.ok(fastDel, 'should find FastAPI DELETE');
+        assert.strictEqual(fastDel.path, '/items/{item_id}');
+        assert.strictEqual(fastDel.normalizedPath, '/items/*');
+        assert.strictEqual(fastDel.handler, 'delete_item');
+    });
+
+    it('Flask <int:user_id> typed param is normalized to /*', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // @app.get('/users/<int:user_id>') → get_user
+        const r = result.routes.find(r => r.handler === 'get_user');
+        assert.ok(r);
+        assert.strictEqual(r.path, '/users/<int:user_id>');
+        assert.strictEqual(r.normalizedPath, '/users/*');
+    });
+
+    it('extracts client requests: requests + httpx (5 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // requests.get/post (3) + client.get (2 httpx)
+        assert.strictEqual(result.meta.totalRequests, 5);
+    });
+
+    it('requests.get is detected with method=GET, callerName populated', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const fetchUsers = result.requests.find(r =>
+            r.callerName === 'fetch_users');
+        assert.ok(fetchUsers, 'should find requests.get from fetch_users');
+        assert.strictEqual(fetchUsers.method, 'GET');
+        assert.strictEqual(fetchUsers.path, '/users');
+        assert.strictEqual(fetchUsers.framework, 'requests');
+    });
+
+    it('--bridge matches Flask GET /users to requests.get(/users) as exact', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        const exact = result.bridges.find(b =>
+            b.matchType === 'exact' &&
+            b.route.method === 'GET' && b.route.path === '/users');
+        assert.ok(exact, 'should produce exact match for GET /users');
+        assert.strictEqual(exact.confidence, 1);
+    });
+
+    it('--bridge: f-string client to typed Flask param produces partial match', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        // client: requests.get(f'/users/{user_id}') → /users/* (interp)
+        // server: @app.get('/users/<int:user_id>') → /users/*
+        const partial = result.bridges.find(b =>
+            b.matchType === 'partial' &&
+            b.route.normalizedPath === '/users/*' &&
+            b.request.interp);
+        assert.ok(partial, 'should produce partial match for typed param vs interp client');
+        assert.ok(partial.confidence < 1 && partial.confidence > 0);
     });
 });

@@ -4118,3 +4118,165 @@ describe('fix: go.mod replace directives resolve local imports', () => {
     });
 });
 
+// ============================================================================
+// FEATURE A: CALL-SITE CLASSIFICATION (Go)
+// ============================================================================
+
+describe('Feature A: Go call-site classification', () => {
+    it('Go: inLoop set for calls inside for loops', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': [
+                'package main',
+                '',
+                'func helper(x int) int { return x }',
+                '',
+                'func caller() {',
+                '    for i := 0; i < 3; i++ {',
+                '        helper(i)',
+                '    }',
+                '    helper(0)',  // outside loop
+                '}',
+                '',
+                'func main() { caller() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.inLoop, 1, 'one of two calls in loop');
+        } finally { rm(dir); }
+    });
+
+    it('Go: inTry is always 0 (no try construct in Go)', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': [
+                'package main',
+                '',
+                'func helper() int { return 1 }',
+                'func caller() { helper() }',
+                'func main() { caller() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.patterns.inTry, 0, 'Go has no try — inTry must be 0');
+        } finally { rm(dir); }
+    });
+
+    it('Go: inTestCase set for calls in TestXxx functions', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': [
+                'package main',
+                '',
+                'func Helper() int { return 1 }',
+            ].join('\n'),
+            'main_test.go': [
+                'package main',
+                '',
+                'import "testing"',
+                '',
+                'func TestHelper(t *testing.T) {',
+                '    if Helper() != 1 { t.Fail() }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('Helper');
+            assert.ok(r.totalCalls >= 1);
+            assert.ok(r.patterns.inTestCase >= 1, 'TestHelper call is inTestCase');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// endpoints command — Go (net/http + gorilla/gin patterns)
+// ============================================================================
+
+describe('endpoints command (Go)', () => {
+    const FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'go');
+
+    it('extracts Go net/http + gin-style routes (5 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // server.go:
+        //   http.HandleFunc /users (line 8) — ALL method
+        //   http.HandleFunc /users/create (line 9) — ALL
+        //   r.GET /api/items (line 14)
+        //   r.POST /api/items (line 15)
+        //   r.PUT /api/items/:id (line 16)
+        assert.strictEqual(result.meta.totalRoutes, 5, 'expected 5 server routes');
+        assert.strictEqual(result.meta.byFramework['go-http'], 5);
+    });
+
+    it('http.HandleFunc registers as method=ALL with handler ref captured', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const handleFunc = result.routes.find(r =>
+            r.path === '/users' && r.framework === 'go-http');
+        assert.ok(handleFunc, 'should find http.HandleFunc /users');
+        // net/http HandleFunc doesn't carry a method — should be 'ALL'
+        assert.strictEqual(handleFunc.method, 'ALL');
+        assert.strictEqual(handleFunc.handler, 'listUsers');
+        assert.strictEqual(handleFunc.line, 8);
+    });
+
+    it('r.GET/POST/PUT register with their explicit HTTP method', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const get = result.routes.find(r =>
+            r.method === 'GET' && r.path === '/api/items');
+        assert.ok(get, 'should find GET /api/items');
+        assert.strictEqual(get.handler, 'listItems');
+        assert.strictEqual(get.line, 14);
+
+        const put = result.routes.find(r =>
+            r.method === 'PUT' && r.path.startsWith('/api/items/'));
+        assert.ok(put);
+        assert.strictEqual(put.path, '/api/items/:id');
+        assert.strictEqual(put.normalizedPath, '/api/items/*');
+    });
+
+    it('extracts Go client requests: http.Get / http.Post (3 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        assert.strictEqual(result.meta.totalRequests, 3);
+    });
+
+    it('http.Get is detected as GET, http.Post as POST', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const get = result.requests.find(r => r.callerName === 'fetchUsers');
+        assert.ok(get, 'should find http.Get from fetchUsers');
+        assert.strictEqual(get.method, 'GET');
+        assert.strictEqual(get.path, '/users');
+        const post = result.requests.find(r => r.callerName === 'createUserRequest');
+        assert.ok(post);
+        assert.strictEqual(post.method, 'POST');
+    });
+
+    it('--bridge: HandleFunc(ALL) /users matches http.Get(/users) since ALL routes accept any method', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        // ALL method matches GET; route /users (literal) ↔ /users (literal) → exact path
+        const match = result.bridges.find(b =>
+            b.route.path === '/users' &&
+            b.route.method === 'ALL' &&
+            b.request.method === 'GET');
+        assert.ok(match, 'should bridge ALL-method route to GET request');
+        // ALL → method-inferred (any method matches), so confidence reduced
+        assert.ok(match.methodInferred);
+    });
+});
+

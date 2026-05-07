@@ -111,6 +111,80 @@ function extractAnnotations(node) {
 }
 
 /**
+ * Extract annotations along with their string-literal first argument.
+ * Returns array of { name, args: string|null, firstStringArg: string|null }.
+ *   @GetMapping("/users/{id}")  →  { name: 'GetMapping', args: '"/users/{id}"', firstStringArg: '/users/{id}' }
+ *   @Override                   →  { name: 'Override', args: null, firstStringArg: null }
+ *   @RequestMapping(value = "/api", method = RequestMethod.GET)
+ *                               →  { name: 'RequestMapping', args: 'value = "/api", method = RequestMethod.GET',
+ *                                    firstStringArg: '/api' }
+ *
+ * @param {Node} node - Method/class node
+ * @returns {Array<{name: string, args: string|null, firstStringArg: string|null}>}
+ */
+function extractAnnotationsWithArgs(node) {
+    const result = [];
+    const modifiersNode = node.childForFieldName('modifiers') || (() => {
+        for (let i = 0; i < node.namedChildCount; i++) {
+            if (node.namedChild(i).type === 'modifiers') return node.namedChild(i);
+        }
+        return null;
+    })();
+    if (!modifiersNode) return result;
+
+    for (let i = 0; i < modifiersNode.namedChildCount; i++) {
+        const mod = modifiersNode.namedChild(i);
+        if (mod.type === 'marker_annotation') {
+            // @Override (no args)
+            const nameNode = mod.childForFieldName('name');
+            if (nameNode) {
+                result.push({ name: nameNode.text, args: null, firstStringArg: null });
+            }
+        } else if (mod.type === 'annotation') {
+            const nameNode = mod.childForFieldName('name');
+            const argsNode = mod.childForFieldName('arguments');
+            const name = nameNode ? nameNode.text : null;
+            const argsRaw = argsNode ? argsNode.text.replace(/^\(|\)$/g, '') : null;
+            // Find first string-literal arg (handles positional and value=... patterns)
+            let firstStringArg = null;
+            if (argsNode) {
+                // Walk children: positional string_literal OR element_value_pair with key 'value'
+                for (let j = 0; j < argsNode.namedChildCount; j++) {
+                    const child = argsNode.namedChild(j);
+                    if (child.type === 'string_literal') {
+                        firstStringArg = stripJavaString(child.text);
+                        break;
+                    }
+                    if (child.type === 'element_value_pair') {
+                        const key = child.childForFieldName('key');
+                        const value = child.childForFieldName('value');
+                        if (key?.text === 'value' && value?.type === 'string_literal') {
+                            firstStringArg = stripJavaString(value.text);
+                            break;
+                        }
+                    }
+                }
+                // Fallback: first string_literal anywhere in subtree (handles path = "/x")
+                if (!firstStringArg) {
+                    const m = argsNode.text.match(/"([^"\\]|\\.)*"/);
+                    if (m) firstStringArg = m[0].slice(1, -1);
+                }
+            }
+            if (name) {
+                result.push({ name, args: argsRaw, firstStringArg });
+            }
+        }
+    }
+    return result;
+}
+
+function stripJavaString(text) {
+    if (!text) return text;
+    if (text.startsWith('"') && text.endsWith('"')) return text.slice(1, -1);
+    return text;
+}
+
+/**
  * Extract return type from method
  */
 function extractReturnType(node) {
@@ -156,6 +230,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const { startLine, endLine, indent } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
+            const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const returnType = extractReturnType(node);
             const generics = extractGenerics(node);
             const docstring = extractJavaDocstring(lines, startLine);
@@ -174,6 +249,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 ...(generics && { generics }),
                 ...(docstring && { docstring }),
                 ...(annotations.length > 0 && { annotations }),
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
                 ...(nameLine !== startLine && { nameLine })
             });
         }
@@ -199,6 +275,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const { startLine, endLine, indent } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
+            const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
             const nameLine = nameNode.startPosition.row + 1;
 
@@ -257,6 +334,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const members = extractClassMembers(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
+            const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const extendsInfo = extractExtends(node);
@@ -277,6 +355,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(annotations.length > 0 && { annotations }),
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
                 ...(extendsInfo && { extends: extendsInfo }),
                 ...(implementsInfo.length > 0 && { implements: implementsInfo })
             });
@@ -295,6 +374,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
+            const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const extendsInfo = extractInterfaceExtends(node);
@@ -309,6 +389,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(annotations.length > 0 && { annotations }),
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
                 ...(extendsInfo.length > 0 && { extends: extendsInfo.join(', ') })
             });
         }
@@ -326,6 +407,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
+            const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
 
             classes.push({
@@ -353,6 +435,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const modifiers = extractModifiers(node);
             const annotations = extractAnnotations(node);
+            const annotationsWithArgs = extractAnnotationsWithArgs(node);
             const docstring = extractJavaDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const implementsInfo = extractImplements(node);
@@ -578,6 +661,7 @@ function extractClassMembers(classNode, codeOrLines) {
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const modifiers = extractModifiers(child);
+                const annotationsWithArgs = extractAnnotationsWithArgs(child);
                 // Interface methods are implicitly public and abstract in Java
                 if (isInterface) {
                     if (!modifiers.includes('public')) modifiers.push('public');
@@ -607,6 +691,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     isMethod: true,  // Mark as method for context() lookups
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring }),
+                    ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
                     ...(nameLine !== startLine && { nameLine })
                 });
             }
@@ -738,6 +823,20 @@ function findCallsInCode(code, parser) {
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
 
+    // Helper: extract first string-arg literal from a method_invocation node.
+    // Used by route extraction to capture path arg of webClient.uri("/users") etc.
+    const { extractStringArg: _extractStringArg } = require('./utils');
+    const getFirstStringArg = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            return _extractStringArg(arg);
+        }
+        return null;
+    };
+
     // Helper to check if a node creates a function scope
     const isFunctionNode = (node) => {
         return ['method_declaration', 'constructor_declaration', 'lambda_expression'].includes(node.type);
@@ -839,13 +938,15 @@ function findCallsInCode(code, parser) {
                 const enclosingFunction = getCurrentEnclosingFunction();
                 const receiver = (objNode?.type === 'identifier' || objNode?.type === 'this') ? objNode.text : undefined;
                 const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
+                const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: nameNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: !!objNode,
                     receiver,
                     ...(receiverType && { receiverType }),
-                    enclosingFunction
+                    enclosingFunction,
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
             }
             return true;

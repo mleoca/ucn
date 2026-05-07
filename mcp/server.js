@@ -139,6 +139,7 @@ function toolResult(text, command, maxChars, suffixNote) {
         const hints = {
             toc: 'Use in= to scope to a subdirectory, or detailed=false for compact view.',
             entrypoints: 'Use framework= to filter by framework, exclude= to skip patterns.',
+            endpoints: 'Use prefix= to filter by URL prefix, method= to filter by HTTP method, server_only/client_only to halve output.',
             diff_impact: 'Use file= to scope to specific files/directories.',
             affected_tests: 'Use file= to scope, exclude= to skip patterns.',
             deadcode: 'Use file= to scope, exclude= to skip patterns.',
@@ -216,6 +217,7 @@ FINDING CODE:
 - affected_tests <name>: Which tests to run after changing a function. Combines blast (transitive callers) with test detection. Shows test files, coverage %, and uncovered functions. Use depth= to control depth.
 - deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
 - entrypoints: Detect framework entry points: routes, handlers, DI providers, tasks. Auto-detects Express, Flask, Spring, Gin, Actix, and more. Use framework= to filter by specific framework.
+- endpoints: HTTP API surface — list server routes (Express/Fastify/Koa/NestJS/Flask/FastAPI/Spring/JAX-RS/Gin/Echo/Chi/Fiber/axum/actix/Next.js) and client requests (fetch/axios/requests/httpx/http/restTemplate/webClient/reqwest). Use bridge=true to match clients to servers across language boundaries; method=/prefix= to filter; server_only/client_only to halve output.
 
 EXTRACTING CODE (use instead of reading entire files):
 - fn <name>: Extract one or more functions. Comma-separated for bulk extraction (e.g. "parse,format,validate"). Use file to disambiguate.
@@ -304,7 +306,15 @@ server.registerTool(
             exported: z.boolean().optional().describe('Only exported/public symbols (structural search).'),
             unused: z.boolean().optional().describe('Only symbols with zero callers (structural search).'),
             framework: z.string().optional().describe('Filter entrypoints by framework (e.g. "express", "spring", "flask"). Comma-separated for multiple.'),
-            follow_symlinks: z.boolean().optional().describe('Follow symlinks during file discovery (default: true)')
+            follow_symlinks: z.boolean().optional().describe('Follow symlinks during file discovery (default: true)'),
+            // endpoints command
+            bridge: z.boolean().optional().describe('Match server routes to client requests (endpoints command).'),
+            server_only: z.boolean().optional().describe('Only list server routes (endpoints command).'),
+            client_only: z.boolean().optional().describe('Only list client requests (endpoints command).'),
+            unmatched: z.boolean().optional().describe('Only show unmatched routes/requests (endpoints command).'),
+            method: z.string().optional().describe('Filter by HTTP method (e.g. "GET", "POST") — endpoints command.'),
+            prefix: z.string().optional().describe('Filter routes/requests by path prefix (endpoints command).'),
+            hide_uncertain: z.boolean().optional().describe('Hide uncertain (interpolated-path) bridges (endpoints command).')
 
         })
     },
@@ -570,6 +580,15 @@ server.registerTool(
                 return tr(epText);
             }
 
+            case 'endpoints': {
+                index = getIndex(project_dir, ep);
+                const { ok, result, error, note } = execute(index, 'endpoints', ep);
+                if (!ok) return te(error);
+                let endText = output.formatEndpoints(result, { bridge: result._bridge });
+                if (note) endText += '\n\n' + note;
+                return tr(endText);
+            }
+
             // ── File Dependencies ───────────────────────────────────────
 
             case 'imports': {
@@ -669,6 +688,15 @@ server.registerTool(
                 let statsText = output.formatStats(result, { top: ep.top || 0 });
                 if (note) statsText += '\n\n' + note;
                 return tr(statsText);
+            }
+
+            case 'audit_async': {
+                index = getIndex(project_dir, ep);
+                const { ok, result, error, note } = execute(index, 'auditAsync', ep);
+                if (!ok) return te(error);
+                let text = output.formatAuditAsync(result);
+                if (note) text += '\n\n' + note;
+                return tr(text);
             }
 
             // ── Extracting Code (via execute) ────────────────────────────

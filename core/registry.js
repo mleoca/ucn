@@ -17,7 +17,7 @@ const CANONICAL_COMMANDS = [
     // Understanding code
     'about', 'context', 'impact', 'blast', 'smart', 'trace', 'reverseTrace', 'example', 'related', 'brief',
     // Finding code
-    'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode', 'entrypoints',
+    'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode', 'entrypoints', 'endpoints',
     // Extracting code
     'fn', 'class', 'lines', 'expand',
     // File dependencies
@@ -25,7 +25,7 @@ const CANONICAL_COMMANDS = [
     // Refactoring
     'verify', 'plan', 'diffImpact', 'check',
     // Other
-    'typedef', 'stacktrace', 'api', 'stats', 'doctor',
+    'typedef', 'stacktrace', 'api', 'stats', 'doctor', 'auditAsync',
 ];
 
 // ============================================================================
@@ -47,6 +47,7 @@ const CLI_ALIASES = {
     'circular-deps':   'circularDeps',
     'circular':        'circularDeps',
     'cycles':          'circularDeps',
+    'audit-async':     'auditAsync',
 };
 
 // MCP uses snake_case for multi-word names.
@@ -56,6 +57,7 @@ const MCP_ALIASES = {
     'affected_tests': 'affectedTests',
     'reverse_trace':  'reverseTrace',
     'circular_deps':  'circularDeps',
+    'audit_async':    'auditAsync',
 };
 
 // ============================================================================
@@ -87,6 +89,9 @@ const PARAM_MAP = {
     max_chars:         'maxChars',
     follow_symlinks:   'followSymlinks',
     unreachable_only:  'unreachableOnly',
+    server_only:       'serverOnly',
+    client_only:       'clientOnly',
+    hide_uncertain:    'hideUncertain',
 };
 
 // ============================================================================
@@ -117,6 +122,7 @@ const FLAG_APPLICABILITY = {
     affectedTests:['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
     entrypoints:  ['file', 'exclude', 'includeTests', 'limit', 'type', 'framework'],
+    endpoints:    ['file', 'exclude', 'limit', 'framework', 'bridge', 'serverOnly', 'clientOnly', 'unmatched', 'method', 'prefix', 'hideUncertain'],
     // Extracting code
     fn:           ['name', 'file', 'className', 'all'],
     class:        ['name', 'file', 'all', 'maxLines'],
@@ -139,14 +145,15 @@ const FLAG_APPLICABILITY = {
     api:          ['file', 'limit'],
     stats:        ['functions', 'hot', 'top'],
     doctor:       ['file', 'in', 'limit', 'deep'],
+    auditAsync:   ['file', 'exclude', 'limit'],
 };
 
 // Commands whose output is project-wide — truncation means you need a filter, not more text.
 // Used by MCP server for tighter default output limits.
 const BROAD_COMMANDS = new Set([
-    'toc', 'entrypoints', 'diffImpact', 'affectedTests',
+    'toc', 'entrypoints', 'endpoints', 'diffImpact', 'affectedTests',
     'deadcode', 'usages', 'reverseTrace', 'circularDeps',
-    'doctor', 'check',
+    'doctor', 'check', 'auditAsync',
 ]);
 
 // Commands that can operate on a single file without a project index.

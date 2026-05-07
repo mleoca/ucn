@@ -13,6 +13,7 @@ const os = require('os');
 
 const { parse } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
+const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
 describe('Regression: Rust impl methods in context', () => {
@@ -1585,5 +1586,122 @@ describe('fix #182: turbofish syntax handled by verify', () => {
             assert.ok(r.ok, 'verify should succeed');
             assert.strictEqual(r.result.uncertain, 0, 'turbofish call should not be uncertain');
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// FEATURE A: CALL-SITE CLASSIFICATION (Rust)
+// ============================================================================
+
+describe('Feature A: Rust call-site classification', () => {
+    it('Rust: inLoop set for calls inside for/while/loop', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/main.rs': [
+                'fn helper(x: i32) -> i32 { x }',
+                'fn caller() {',
+                '    for i in 0..3 {',
+                '        helper(i);',
+                '    }',
+                '    while true {',
+                '        helper(99);',
+                '        break;',
+                '    }',
+                '    helper(0);',  // outside loop
+                '}',
+                'fn main() { caller(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 3);
+            assert.strictEqual(r.patterns.inLoop, 2, 'two of three calls in loop');
+        } finally { rm(dir); }
+    });
+
+    it('Rust: inTry is always 0 (Result-based, no try)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/main.rs': [
+                'fn helper() -> i32 { 1 }',
+                'fn caller() { helper(); }',
+                'fn main() { caller(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.patterns.inTry, 0, 'Rust has no try — inTry must be 0');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// endpoints command — Rust (actix attribute routes)
+// ============================================================================
+
+describe('endpoints command (Rust)', () => {
+    const FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'rust');
+
+    it('extracts actix attribute routes (4 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // server.rs:
+        //   #[get("/users")] list_users (line 5)
+        //   #[post("/users")] create_user (line 8)
+        //   #[get("/users/{id}")] get_user (line 11)
+        //   #[delete("/users/{id}")] remove_user (line 14)
+        assert.strictEqual(result.meta.totalRoutes, 4, 'expected 4 routes');
+        assert.strictEqual(result.meta.byFramework.actix, 4);
+    });
+
+    it('actix #[get("/users")] resolves to GET /users with handler list_users', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const r = result.routes.find(r =>
+            r.framework === 'actix' && r.method === 'GET' && r.path === '/users');
+        assert.ok(r, 'should find #[get("/users")]');
+        assert.strictEqual(r.handler, 'list_users');
+        assert.strictEqual(r.line, 5);
+    });
+
+    it('actix path with {id} placeholder normalizes to /users/*', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const r = result.routes.find(r =>
+            r.framework === 'actix' && r.handler === 'get_user');
+        assert.ok(r);
+        assert.strictEqual(r.path, '/users/{id}');
+        assert.strictEqual(r.normalizedPath, '/users/*');
+    });
+
+    it('extracts reqwest client requests (2 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // client.rs: client.get("/users") + client.post("/users")
+        // Note: client.get(&url) with format!() is not a string-literal call,
+        // so only 2 of 3 are captured.
+        assert.strictEqual(result.meta.totalRequests, 2);
+        const get = result.requests.find(r => r.callerName === 'fetch_users');
+        assert.ok(get, 'should find reqwest GET');
+        assert.strictEqual(get.method, 'GET');
+        assert.strictEqual(get.path, '/users');
+        assert.strictEqual(get.framework, 'reqwest');
+    });
+
+    it('--bridge: actix GET /users matches reqwest client.get(/users) as exact', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        const exact = result.bridges.find(b =>
+            b.matchType === 'exact' &&
+            b.route.method === 'GET' && b.route.path === '/users');
+        assert.ok(exact, 'should bridge actix GET /users to reqwest GET /users');
+        assert.strictEqual(exact.confidence, 1);
     });
 });

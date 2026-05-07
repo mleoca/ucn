@@ -103,6 +103,22 @@ function formatPlanJson(plan) {
 }
 
 /**
+ * Render the per-site pattern flags as a compact suffix.
+ * Returns "" when no flags are set, or " [loop, try, callback, test, awaited]"
+ * with only the active flags.
+ */
+function _formatPatternFlags(p) {
+    if (!p) return '';
+    const flags = [];
+    if (p.inLoop) flags.push('loop');
+    if (p.inTry) flags.push('try');
+    if (p.inCallback) flags.push('callback');
+    if (p.inTestCase) flags.push('test');
+    if (p.awaited) flags.push('awaited');
+    return flags.length ? `  [${flags.join(', ')}]` : '';
+}
+
+/**
  * Format verify command output - text
  * Shows call site validation results
  */
@@ -140,12 +156,27 @@ function formatVerify(result, options = {}) {
         lines.push(`  Note: ${result.scopeWarning.hint}`);
     }
 
+    // Feature A/B: show aggregate patterns counts when any are present.
+    const p = result.patterns;
+    if (p) {
+        const parts = [];
+        if (p.inLoop > 0) parts.push(`${p.inLoop} in loop`);
+        if (p.inTry > 0) parts.push(`${p.inTry} in try`);
+        if (p.inCallback > 0) parts.push(`${p.inCallback} in callback`);
+        if (p.inTestCase > 0) parts.push(`${p.inTestCase} in test`);
+        if (p.awaitedCalls > 0) parts.push(`${p.awaitedCalls} awaited`);
+        if (parts.length > 0) {
+            lines.push(`  Patterns: ${parts.join(', ')}`);
+        }
+    }
+
     // Show mismatches
     if (result.mismatchDetails.length > 0) {
         lines.push('');
         lines.push('MISMATCHES:');
         for (const m of result.mismatchDetails) {
-            lines.push(`  ${m.file}:${m.line}`);
+            const flags = _formatPatternFlags(m.patterns);
+            lines.push(`  ${m.file}:${m.line}${flags}`);
             lines.push(`    ${m.expression}`);
             lines.push(`    Expected ${m.expected}, got ${m.actual}: [${m.args?.join(', ') || ''}]`);
         }
@@ -156,7 +187,8 @@ function formatVerify(result, options = {}) {
         lines.push('');
         lines.push('UNCERTAIN (manual check needed):');
         for (const u of result.uncertainDetails) {
-            lines.push(`  ${u.file}:${u.line}`);
+            const flags = _formatPatternFlags(u.patterns);
+            lines.push(`  ${u.file}:${u.line}${flags}`);
             lines.push(`    ${u.expression}`);
             lines.push(`    Reason: ${u.reason}`);
         }
@@ -187,19 +219,23 @@ function formatVerifyJson(result) {
         valid: result.valid,
         mismatches: result.mismatches,
         uncertain: result.uncertain,
+        // Feature A/B: surface aggregate patterns and per-site flags.
+        patterns: result.patterns,
         mismatchDetails: result.mismatchDetails.map(m => ({
             file: m.file,
             line: m.line,
             expression: m.expression,
             expected: m.expected,
             actual: m.actual,
-            args: m.args || []
+            args: m.args || [],
+            patterns: m.patterns,
         })),
         uncertainDetails: result.uncertainDetails.map(u => ({
             file: u.file,
             line: u.line,
             expression: u.expression,
-            reason: u.reason
+            reason: u.reason,
+            patterns: u.patterns,
         }))
     }, null, 2);
 }
@@ -283,6 +319,54 @@ function formatStackTraceJson(result) {
     }, null, 2);
 }
 
+/**
+ * Format audit-async command output - text.
+ * Lists likely missing-await call sites grouped by file.
+ */
+function formatAuditAsync(result) {
+    if (!result) return 'No async audit data.';
+    const issues = Array.isArray(result.issues) ? result.issues : [];
+    if (issues.length === 0) {
+        return 'Async audit: no missing-await issues found.';
+    }
+    const lines = [];
+    lines.push(`Async audit: ${result.totalIssues} likely missing-await call site(s) across ${result.filesAffected} file(s)`);
+    lines.push('═'.repeat(60));
+
+    // Group by file (issues are already sorted by file then line).
+    const byFile = new Map();
+    for (const issue of issues) {
+        if (!byFile.has(issue.file)) byFile.set(issue.file, []);
+        byFile.get(issue.file).push(issue);
+    }
+    for (const [file, fileIssues] of byFile) {
+        lines.push('');
+        lines.push(`${file} (${fileIssues.length})`);
+        for (const issue of fileIssues) {
+            const caller = issue.callerName ? ` [${issue.callerName}]` : '';
+            lines.push(`  :${issue.line}${caller}  ${issue.calleeName}() — async, not awaited`);
+        }
+    }
+    return lines.join('\n');
+}
+
+/**
+ * Format audit-async command output - JSON.
+ */
+function formatAuditAsyncJson(result) {
+    if (!result) return JSON.stringify({ issues: [] }, null, 2);
+    return JSON.stringify({
+        totalIssues: result.totalIssues || 0,
+        filesAffected: result.filesAffected || 0,
+        issues: (result.issues || []).map(i => ({
+            file: i.file,
+            line: i.line,
+            callerName: i.callerName,
+            calleeName: i.calleeName,
+        })),
+    }, null, 2);
+}
+
 module.exports = {
     formatPlan,
     formatPlanJson,
@@ -290,4 +374,6 @@ module.exports = {
     formatVerifyJson,
     formatStackTrace,
     formatStackTraceJson,
+    formatAuditAsync,
+    formatAuditAsyncJson,
 };

@@ -415,3 +415,197 @@ describe('Cross-language: fixtures exist', () => {
         });
     });
 });
+
+// ── Feature A: every supported language reports patterns for at least one
+//    loop. (try is skipped for Go/Rust which lack the construct.) ─────────
+describe('Cross-language: Feature A — loop classification', () => {
+    // Inline templates per language for a function that has two calls: one
+    // inside a loop, one outside. Languages without a clean loop syntax
+    // skip themselves.
+    const LOOP_FIXTURES = {
+        javascript: {
+            manifest: { 'package.json': '{"name":"t"}' },
+            file: 'app.js',
+            code: [
+                'function helper(x) { return x; }',
+                'function caller() { for (let i = 0; i < 2; i++) { helper(i); } helper(0); }',
+                'caller();',
+            ].join('\n'),
+            verifyName: 'helper',
+        },
+        typescript: {
+            manifest: { 'package.json': '{"name":"t"}', 'tsconfig.json': '{}' },
+            file: 'app.ts',
+            code: [
+                'export function helper(x: number) { return x; }',
+                'export function caller() { for (let i = 0; i < 2; i++) { helper(i); } helper(0); }',
+            ].join('\n'),
+            verifyName: 'helper',
+        },
+        python: {
+            manifest: {},
+            file: 'a.py',
+            code: [
+                'def helper(x):',
+                '    return x',
+                '',
+                'def caller():',
+                '    for i in range(2):',
+                '        helper(i)',
+                '    helper(0)',
+                '',
+                'caller()',
+            ].join('\n'),
+            verifyName: 'helper',
+        },
+        go: {
+            manifest: { 'go.mod': 'module t\n\ngo 1.21\n' },
+            file: 'main.go',
+            code: [
+                'package main',
+                'func helper(x int) int { return x }',
+                'func caller() { for i := 0; i < 2; i++ { helper(i) }; helper(0) }',
+                'func main() { caller() }',
+            ].join('\n'),
+            verifyName: 'helper',
+        },
+        java: {
+            manifest: {},
+            file: 'src/Main.java',
+            code: [
+                'public class Main {',
+                '    public static int helper(int x) { return x; }',
+                '    public static void caller() { for (int i = 0; i < 2; i++) helper(i); helper(0); }',
+                '}',
+            ].join('\n'),
+            verifyName: 'helper',
+        },
+        rust: {
+            manifest: { 'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"' },
+            file: 'src/main.rs',
+            code: [
+                'fn helper(x: i32) -> i32 { x }',
+                'fn caller() { for i in 0..2 { helper(i); } helper(0); }',
+                'fn main() { caller(); }',
+            ].join('\n'),
+            verifyName: 'helper',
+        },
+    };
+    forEachLanguage((lang) => {
+        const fix = LOOP_FIXTURES[lang];
+        if (!fix) return;
+        it(`${lang}: verify reports inLoop > 0 for a call in a loop`, () => {
+            const files = { ...fix.manifest, [fix.file]: fix.code };
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const r = index.verify(fix.verifyName);
+                assert.ok(r && r.found, `${lang}: ${fix.verifyName} should be found`);
+                assert.ok(r.patterns, `${lang}: result should have patterns`);
+                assert.ok(r.patterns.inLoop >= 1,
+                    `${lang}: at least one call should be inLoop, got ${r.patterns.inLoop}`);
+            } finally { rm(dir); }
+        });
+    });
+});
+
+// ── Polyglot endpoint bridging ───────────────────────────────────────────────
+// Genuinely cross-language: multiple languages in the same project must bridge
+// across language boundaries (Python server + JS client, etc.).
+
+describe('Cross-language endpoints: polyglot bridging', () => {
+    const { execute } = require('../core/execute');
+
+    it('Flask Python server + JS axios client → bridges across languages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"polyglot"}',
+            'pyproject.toml': '[project]\nname = "polyglot-server"\nversion = "0.0.1"\n',
+            'server.py': [
+                'from flask import Flask',
+                'app = Flask(__name__)',
+                '',
+                "@app.route('/api/health', methods=['GET'])",
+                'def health():',
+                '    return {}',
+                '',
+                "@app.route('/api/users', methods=['POST'])",
+                'def create_user():',
+                '    return {}',
+                '',
+            ].join('\n'),
+            'client.js': [
+                "async function checkHealth() {",
+                "    return await axios.get('/api/health');",
+                "}",
+                "async function makeUser(data) {",
+                "    return await axios.post('/api/users', data);",
+                "}",
+                "module.exports = { checkHealth, makeUser };",
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            // Server should detect 2 Flask routes
+            assert.strictEqual(result.meta.totalRoutes, 2);
+            assert.strictEqual(result.meta.byFramework.flask, 2);
+            // Client should detect 2 axios requests
+            assert.strictEqual(result.meta.totalRequests, 2);
+            // Bridges: 2 exact matches across language boundary
+            assert.strictEqual(result.meta.totalBridges, 2);
+            // Both should be exact (literal-literal) matches
+            for (const b of result.bridges) {
+                assert.strictEqual(b.matchType, 'exact');
+                assert.strictEqual(b.confidence, 1);
+                // Confirm cross-language: route in .py, request in .js
+                assert.match(b.route.file, /\.py$/);
+                assert.match(b.request.file, /\.js$/);
+            }
+            // Frameworks identified correctly per side
+            const routeFrameworks = new Set(result.routes.map(r => r.framework));
+            assert.ok(routeFrameworks.has('flask'));
+            const reqFrameworks = new Set(result.requests.map(r => r.framework));
+            assert.ok(reqFrameworks.has('axios'));
+        } finally { rm(dir); }
+    });
+
+    it('Go server + Python client: bridges across languages', () => {
+        const dir = tmp({
+            'go.mod': 'module poly\n\ngo 1.21\n',
+            'pyproject.toml': '[project]\nname = "polyglot"\nversion = "0.0.1"\n',
+            'server.go': [
+                'package main',
+                '',
+                'import "net/http"',
+                '',
+                'func main() {',
+                '    http.HandleFunc("/api/items", listItems)',
+                '}',
+                '',
+                'func listItems() {}',
+            ].join('\n'),
+            'client.py': [
+                'import requests',
+                '',
+                'def fetch_items():',
+                "    return requests.get('/api/items')",
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            assert.strictEqual(result.meta.totalRoutes, 1);
+            assert.strictEqual(result.meta.totalRequests, 1);
+            // Go HandleFunc is method=ALL → matches GET request
+            assert.strictEqual(result.bridges.length, 1);
+            const b = result.bridges[0];
+            assert.match(b.route.file, /\.go$/);
+            assert.match(b.request.file, /\.py$/);
+            // Path is exact, method is ALL (inferred match)
+            assert.ok(b.matchType === 'exact' || b.matchType === 'partial');
+            assert.ok(b.methodInferred, 'expected methodInferred=true for ALL→GET');
+        } finally { rm(dir); }
+    });
+});

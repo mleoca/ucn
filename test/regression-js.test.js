@@ -13,6 +13,7 @@ const fs = require('fs');
 const { parse, parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const output = require('../core/output');
+const { execute } = require('../core/execute');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
 const os = require('os');
@@ -4066,5 +4067,295 @@ main();
             const b = computeReachability(index);
             assert.strictEqual(a, b, 'second call returns the same Set instance');
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// FEATURE A: CALL-SITE CLASSIFICATION (inLoop / inTry / inCallback / inTestCase)
+// ============================================================================
+
+describe('Feature A: JS call-site classification', () => {
+    it('JS: inLoop set for calls inside for/while loops', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'function helper(x) { return x; }',
+                'function caller() {',
+                '    for (let i = 0; i < 3; i++) {',
+                '        helper(i);',
+                '    }',
+                '    while (true) {',
+                '        helper(99);',
+                '        break;',
+                '    }',
+                '    helper(0);',  // outside any loop
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            // Three call sites: two inside loops, one outside.
+            assert.strictEqual(r.totalCalls, 3, 'three call sites total');
+            const inLoopCount = r.patterns.inLoop;
+            assert.strictEqual(inLoopCount, 2, 'two of three calls are inLoop');
+            const outsideLoop = r.validDetails.find(s => !s.patterns.inLoop);
+            assert.ok(outsideLoop, 'one site outside any loop');
+        } finally { rm(dir); }
+    });
+
+    it('JS: inTry set for calls inside try { ... }', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'function helper() { return 1; }',
+                'function caller() {',
+                '    try { helper(); } catch (e) {}',
+                '    helper();',  // outside try
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.inTry, 1, 'one call is in try');
+        } finally { rm(dir); }
+    });
+
+    it('JS: inCallback set when call is inside an arrow callback to map/filter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'function helper(x) { return x; }',
+                'function caller() {',
+                '    const arr = [1, 2, 3];',
+                '    arr.map(x => helper(x));',
+                '    helper(99);',  // direct, not in callback
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.inCallback, 1, 'one call inside arrow callback');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// FEATURE B: AWAITED + AUDIT-ASYNC
+// ============================================================================
+
+describe('Feature B: JS awaited flag + audit-async', () => {
+    it('JS: awaited flag set when call is wrapped in await', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'async function helper() { return 1; }',
+                'async function caller() {',
+                '    await helper();',  // awaited
+                '    helper();',         // not awaited
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.verify('helper');
+            assert.strictEqual(r.totalCalls, 2);
+            assert.strictEqual(r.patterns.awaitedCalls, 1, 'one call awaited');
+            const awaited = r.validDetails.find(s => s.patterns.awaited);
+            const unawaited = r.validDetails.find(s => !s.patterns.awaited);
+            assert.ok(awaited, 'awaited site exists');
+            assert.ok(unawaited, 'unawaited site exists');
+        } finally { rm(dir); }
+    });
+
+    it('JS: audit-async flags missing-await on free async function call', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'async function helper() { return 1; }',
+                'async function caller() {',
+                '    helper();',  // missing await
+                '    await helper();',  // ok
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            assert.strictEqual(r.totalIssues, 1, 'one missing-await flagged');
+            assert.strictEqual(r.issues[0].calleeName, 'helper');
+            assert.strictEqual(r.issues[0].callerName, 'caller');
+        } finally { rm(dir); }
+    });
+
+    it('JS: audit-async does NOT flag awaited calls', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'async function helper() { return 1; }',
+                'async function caller() {',
+                '    await helper();',
+                '    const x = helper();',  // captured, not fire-and-forget
+                '    return helper();',     // returned, caller awaits
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            assert.strictEqual(r.totalIssues, 0, 'no missing-await issues');
+        } finally { rm(dir); }
+    });
+
+    it('JS: audit-async does NOT flag calls inside non-async callbacks', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'async function helper() { return 1; }',
+                'async function caller() {',
+                '    [1,2].map(() => helper());',  // sync arrow callback — not async
+                '}',
+                'caller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            // Inner arrow is non-async; helper() not in an async fn context.
+            assert.strictEqual(r.totalIssues, 0);
+        } finally { rm(dir); }
+    });
+
+    it('JS: audit-async does NOT flag calls in non-async functions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'async function helper() { return 1; }',
+                'function syncCaller() {',
+                '    helper();',  // caller not async — don't flag
+                '}',
+                'syncCaller();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            assert.strictEqual(r.totalIssues, 0);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// endpoints command — JS/TS
+// ============================================================================
+
+describe('endpoints command (JS/TS)', () => {
+    const FIXTURE = path.join(FIXTURES_PATH, 'endpoints', 'javascript');
+
+    it('extracts Express + NestJS server routes (9 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // Express server.js: 4 routes (GET/POST/PUT/DELETE on /users[/:id])
+        // NestJS nest-controller.ts: 5 routes
+        assert.strictEqual(result.meta.totalRoutes, 9, 'expected 9 routes');
+        assert.strictEqual(result.meta.byFramework.express, 4);
+        assert.strictEqual(result.meta.byFramework.nestjs, 5);
+    });
+
+    it('Express GET /users handler is listUsers at line 5', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const r = result.routes.find(r =>
+            r.framework === 'express' && r.method === 'GET' && r.path === '/users');
+        assert.ok(r, 'should find Express GET /users');
+        assert.strictEqual(r.handler, 'listUsers');
+        assert.strictEqual(r.line, 5);
+        assert.strictEqual(r.file, 'server.js');
+    });
+
+    it('NestJS class @Controller prefix is concatenated to method paths', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // NestJS: @Controller('/api/posts') + @Get() => /api/posts
+        const findAll = result.routes.find(r =>
+            r.framework === 'nestjs' && r.handler === 'findAll');
+        assert.ok(findAll, 'should find NestJS findAll route');
+        assert.strictEqual(findAll.method, 'GET');
+        assert.strictEqual(findAll.path, '/api/posts');
+        assert.strictEqual(findAll.classPrefix, '/api/posts');
+
+        // @Get(':id') => /api/posts/:id
+        const findOne = result.routes.find(r =>
+            r.framework === 'nestjs' && r.handler === 'findOne');
+        assert.ok(findOne);
+        assert.strictEqual(findOne.path, '/api/posts/:id');
+        assert.strictEqual(findOne.normalizedPath, '/api/posts/*');
+    });
+
+    it('extracts client requests: fetch + axios (4 total)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // client.js: fetch /users, fetch `/users/${id}`, axios.post /users, axios.put `/users/${id}`
+        assert.strictEqual(result.meta.totalRequests, 4);
+    });
+
+    it('bare fetch call defaults to GET and is marked methodInferred', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const fetchUsers = result.requests.find(r =>
+            r.framework === 'fetch' && r.callerName === 'loadUsers');
+        assert.ok(fetchUsers, 'should find fetch from loadUsers');
+        assert.strictEqual(fetchUsers.method, 'GET');
+        assert.strictEqual(fetchUsers.methodInferred, true);
+        assert.strictEqual(fetchUsers.path, '/users');
+        assert.strictEqual(fetchUsers.line, 3);
+    });
+
+    it('axios.post is detected with method=POST (not inferred)', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        const post = result.requests.find(r =>
+            r.framework === 'axios' && r.method === 'POST');
+        assert.ok(post, 'should find axios.post call');
+        assert.strictEqual(post.path, '/users');
+        assert.strictEqual(post.callerName, 'postUser');
+        assert.ok(!post.methodInferred);
+    });
+
+    it('template literal client request is marked interp=true', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', {});
+        assert.ok(ok);
+        // fetch(`/users/${id}`) — interpolated path
+        const interpReq = result.requests.find(r => r.interp === true);
+        assert.ok(interpReq, 'should find at least one interpolated request');
+    });
+
+    it('--bridge produces matched bridges with confidence', () => {
+        const index = idx(FIXTURE);
+        const { ok, result } = execute(index, 'endpoints', { bridge: true });
+        assert.ok(ok);
+        assert.ok(result.meta.totalBridges > 0, 'should produce some bridges');
+        // GET /users (literal) ↔ fetch('/users') (literal) → exact match
+        const exact = result.bridges.find(b =>
+            b.matchType === 'exact' && b.route.path === '/users' && b.route.method === 'GET');
+        assert.ok(exact, 'should find exact GET /users bridge');
+        assert.strictEqual(exact.confidence, 1);
     });
 });

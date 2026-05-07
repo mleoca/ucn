@@ -223,6 +223,9 @@ class ProjectIndex {
         // Always invalidate caches on rebuild
         this._completenessCache = null;
         this._attrTypeCache = null;
+        // Endpoints cache (server routes / client requests / bridges) becomes
+        // stale when files change; clear on every rebuild.
+        this._endpointsCache = null;
 
         let indexed = 0;
         let changed = 0;
@@ -420,6 +423,13 @@ class ProjectIndex {
                 ...(item.memberType && { memberType: item.memberType }),
                 ...(item.fieldType && { fieldType: item.fieldType }),
                 ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
+                // Decorator/annotation/attribute argument capture for endpoints command:
+                // these fields hold the parsed first-string-arg of each route-style annotation.
+                // Only populated when at least one entry has a string-literal arg, keeping memory
+                // overhead minimal for non-route code.
+                ...(item.decoratorsWithArgs && item.decoratorsWithArgs.length > 0 && { decoratorsWithArgs: item.decoratorsWithArgs }),
+                ...(item.annotationsWithArgs && item.annotationsWithArgs.length > 0 && { annotationsWithArgs: item.annotationsWithArgs }),
+                ...(item.attributesWithArgs && item.attributesWithArgs.length > 0 && { attributesWithArgs: item.attributesWithArgs }),
                 ...(item.nameLine && { nameLine: item.nameLine }),
                 ...(item.traitImpl && { traitImpl: true }),
                 ...(item.isSignature && { isSignature: true })
@@ -497,6 +507,8 @@ class ProjectIndex {
 
         // Invalidate lazy Java file index (will be rebuilt on next use)
         this._javaFileIndex = null;
+        // Endpoints cache is project-wide; safest to clear on any file removal.
+        this._endpointsCache = null;
     }
 
     /**
@@ -1958,6 +1970,9 @@ class ProjectIndex {
 
     /** Diff-based impact analysis: find which functions changed and who calls them */
     diffImpact(options) { return analysisModule.diffImpact(this, options); }
+
+    /** Audit async/await: find calls that are likely missing an `await`. */
+    auditAsync(options) { return analysisModule.auditAsync(this, options); }
 }
 
 const { parseDiff } = require('./analysis');

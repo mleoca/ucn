@@ -10,6 +10,134 @@ const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = 
 const { escapeRegExp } = require('./shared');
 const { extractImports } = require('./imports');
 
+// ============================================================================
+// CALL-SITE CLASSIFICATION (Feature A)
+// ============================================================================
+// AST node-type sets per language for walk-up classification of call sites.
+// Detection is structural — we walk parents from the call node and stop at
+// function boundaries to keep the classification scoped to the enclosing fn.
+
+// Loop nodes — call sites inside these are "hot path" (likely repeated).
+const LOOP_NODE_TYPES = {
+    javascript: new Set(['for_statement', 'while_statement', 'do_statement', 'for_in_statement', 'for_of_statement']),
+    typescript: new Set(['for_statement', 'while_statement', 'do_statement', 'for_in_statement', 'for_of_statement']),
+    tsx:        new Set(['for_statement', 'while_statement', 'do_statement', 'for_in_statement', 'for_of_statement']),
+    html:       new Set(['for_statement', 'while_statement', 'do_statement', 'for_in_statement', 'for_of_statement']),
+    python:     new Set(['for_statement', 'while_statement']),
+    go:         new Set(['for_statement']),
+    rust:       new Set(['for_expression', 'while_expression', 'loop_expression']),
+    java:       new Set(['for_statement', 'while_statement', 'do_statement', 'enhanced_for_statement']),
+};
+
+// Try nodes — call sites inside these are "guarded" (errors are caught).
+// Go uses defer/recover (skipped). Rust uses Result-based error handling (skipped).
+const TRY_NODE_TYPES = {
+    javascript: new Set(['try_statement']),
+    typescript: new Set(['try_statement']),
+    tsx:        new Set(['try_statement']),
+    html:       new Set(['try_statement']),
+    python:     new Set(['try_statement']),
+    go:         new Set(),
+    rust:       new Set(),
+    java:       new Set(['try_statement', 'try_with_resources_statement']),
+};
+
+// Function boundary nodes — walk-up stops at these (we don't classify across
+// inner function definitions). These also identify "callback wrappers" when
+// they're the value of an argument to another call_expression.
+const FN_NODE_TYPES = {
+    javascript: new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration']),
+    typescript: new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration', 'function_signature']),
+    tsx:        new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration', 'function_signature']),
+    html:       new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration']),
+    python:     new Set(['function_definition', 'async_function_definition', 'lambda']),
+    go:         new Set(['function_declaration', 'method_declaration', 'func_literal']),
+    rust:       new Set(['function_item', 'closure_expression']),
+    java:       new Set(['method_declaration', 'constructor_declaration', 'lambda_expression']),
+};
+
+// Await-expression node types per language with async/await support.
+// JS/TS: await is a unary expression `await call()`.
+// Python: await is `await call()`.
+// Go/Java/Rust currently have no await keyword tracked here.
+const AWAIT_NODE_TYPES = {
+    javascript: new Set(['await_expression']),
+    typescript: new Set(['await_expression']),
+    tsx:        new Set(['await_expression']),
+    html:       new Set(['await_expression']),
+    python:     new Set(['await']),
+    go:         new Set(),
+    rust:       new Set(),
+    java:       new Set(),
+};
+
+// Argument-list node types — used to detect callback context. When walking up,
+// if a function/lambda we cross has a parent of these types (which is itself
+// inside a call_expression), the inner call is in a callback.
+const ARGUMENTS_NODE_TYPES = new Set(['arguments', 'argument_list']);
+
+/**
+ * Classify a call site by walking up its ancestors.
+ *
+ * Returns flags describing the structural context: `inLoop`, `inTry`,
+ * `inCallback`, `awaited`. Walks from the call node up to the enclosing
+ * function boundary (so an outer try wrapping an inner function does NOT
+ * leak `inTry: true` into a call inside the inner function).
+ *
+ * `inCallback` is set when, while walking up to the boundary, we cross an
+ * inner function/lambda that is itself an argument of another call.
+ *
+ * `awaited` is set when the call expression's immediate parent is an
+ * await-style node. Non-async languages always return `awaited: false`.
+ *
+ * @param {object} callNode - tree-sitter node for the call
+ * @param {string} language - canonical language name
+ * @returns {{inLoop:boolean, inTry:boolean, inCallback:boolean, awaited:boolean}}
+ */
+function classifyCallContext(callNode, language) {
+    const result = { inLoop: false, inTry: false, inCallback: false, awaited: false };
+    if (!callNode) return result;
+
+    const loopTypes = LOOP_NODE_TYPES[language] || new Set();
+    const tryTypes = TRY_NODE_TYPES[language] || new Set();
+    const fnTypes = FN_NODE_TYPES[language] || new Set();
+    const awaitTypes = AWAIT_NODE_TYPES[language] || new Set();
+
+    // awaited: parent of the call must be an await-style node.
+    // Some grammars (Python) wrap the call in `await { call }`; others
+    // (JS/TS) use `await_expression > call_expression`. Both are detected by
+    // checking the immediate parent.
+    if (callNode.parent && awaitTypes.has(callNode.parent.type)) {
+        result.awaited = true;
+    }
+
+    // Walk up to classify loop/try/callback. Stop when we cross a function
+    // boundary — an inner closure isolates the inner call from outer context.
+    let current = callNode.parent;
+    while (current) {
+        const t = current.type;
+        if (loopTypes.has(t)) result.inLoop = true;
+        if (tryTypes.has(t)) result.inTry = true;
+        // Function boundary — stop, but first check if THIS function is an
+        // argument to another call (callback context). The ancestor chain is:
+        //   outer_call > arguments > arrow_function/lambda > … > inner call
+        if (fnTypes.has(t)) {
+            const parent = current.parent;
+            if (parent && ARGUMENTS_NODE_TYPES.has(parent.type)) {
+                const grand = parent.parent;
+                if (grand && (grand.type === 'call_expression' || grand.type === 'call' ||
+                    grand.type === 'method_invocation' || grand.type === 'object_creation_expression' ||
+                    grand.type === 'macro_invocation')) {
+                    result.inCallback = true;
+                }
+            }
+            break;
+        }
+        current = current.parent;
+    }
+    return result;
+}
+
 /**
  * Find a call expression node at the target line matching funcName
  */
@@ -541,8 +669,17 @@ function analyzeCallSite(index, call, funcName) {
             }
         }
 
+        // Feature A/B: classify the call site by structural context.
+        // inLoop/inTry/inCallback come from walking up to the fn boundary.
+        // awaited comes from the immediate parent (await_expression).
+        // inTestCase is computed by the caller via the enclosing function's
+        // entry-point kind — analyzeCallSite doesn't have that info here, so
+        // it's left to be filled in by impact()/about() etc. that have
+        // access to the enclosing-function symbol.
+        const ctx = classifyCallContext(callNode, language);
+
         const argsNode = callNode.childForFieldName('arguments');
-        if (!argsNode) return { args: [], argCount: 0, isMethodCall };
+        if (!argsNode) return { args: [], argCount: 0, isMethodCall, ...ctx };
 
         const args = [];
         for (let i = 0; i < argsNode.namedChildCount; i++) {
@@ -554,7 +691,8 @@ function analyzeCallSite(index, call, funcName) {
             argCount: args.length,
             hasSpread: args.some(a => a.startsWith('...')),
             hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a)),
-            isMethodCall
+            isMethodCall,
+            ...ctx,
         };
     } catch (e) {
         return { args: null, argCount: 0 };
@@ -713,15 +851,25 @@ function identifyCallPatterns(callSites, funcName) {
         constantArgs: 0,    // Call sites with literal/constant arguments
         variableArgs: 0,    // Call sites passing variables
         chainedCalls: 0,    // Calls that are part of method chains
-        awaitedCalls: 0,    // Async calls with await
-        spreadCalls: 0      // Calls using spread operator
+        awaitedCalls: 0,    // Async calls with await (AST-derived from site.awaited)
+        spreadCalls: 0,     // Calls using spread operator
+        // Feature A: structural classification counts.
+        inLoop: 0,          // Call sites inside a loop construct
+        inTry: 0,           // Call sites inside a try block
+        inCallback: 0,      // Call sites inside a callback fn passed as an argument
+        inTestCase: 0       // Call sites whose enclosing function is a test entry
     };
 
     for (const site of callSites) {
         const expr = site.expression;
 
         if (site.hasSpread) patterns.spreadCalls++;
-        if (/await\s/.test(expr)) patterns.awaitedCalls++;
+        // Feature B: prefer the AST-derived `awaited` signal (set by
+        // analyzeCallSite's classifyCallContext walk). Fall back to a text
+        // check on the expression for callers that still pass legacy sites.
+        if (site.awaited === true || (site.awaited !== false && /\bawait\s/.test(expr))) {
+            patterns.awaitedCalls++;
+        }
         if (new RegExp('\\.' + escapeRegExp(funcName) + '\\s*\\(').test(expr)) patterns.chainedCalls++;
 
         if (site.args && site.args.length > 0) {
@@ -732,6 +880,14 @@ function identifyCallPatterns(callSites, funcName) {
             if (hasLiteral) patterns.constantArgs++;
             if (site.hasVariable) patterns.variableArgs++;
         }
+
+        // Feature A counters — these flags are set on each site by
+        // analyzeCallSite (inLoop/inTry/inCallback) or by the caller after
+        // looking up the enclosing function (inTestCase).
+        if (site.inLoop) patterns.inLoop++;
+        if (site.inTry) patterns.inTry++;
+        if (site.inCallback) patterns.inCallback++;
+        if (site.inTestCase) patterns.inTestCase++;
     }
 
     return patterns;
@@ -849,7 +1005,8 @@ function verify(index, name, options = {}) {
         });
     }
 
-    // Convert caller results to usage-like objects for analyzeCallSite
+    // Convert caller results to usage-like objects for analyzeCallSite.
+    // Carry callerFile/callerStartLine through so we can compute inTestCase.
     const calls = callerResults.map(c => ({
         file: c.file,
         relativePath: c.relativePath,
@@ -857,6 +1014,8 @@ function verify(index, name, options = {}) {
         content: c.content,
         usageType: 'call',
         receiver: c.receiver,
+        callerFile: c.callerFile,
+        callerStartLine: c.callerStartLine,
     }));
 
     const valid = [];
@@ -894,6 +1053,18 @@ function verify(index, name, options = {}) {
         return names;
     }
 
+    // Helper: extract pattern flags (Feature A/B) from analyzeCallSite result.
+    // Reused so each valid/mismatch/uncertain entry carries the same shape.
+    function patternFlagsFrom(a) {
+        return {
+            inLoop: !!a.inLoop,
+            inTry: !!a.inTry,
+            inCallback: !!a.inCallback,
+            awaited: !!a.awaited,
+            // inTestCase filled in below via tagInTestCase
+        };
+    }
+
     for (const call of calls) {
         const analysis = analyzeCallSite(index, call, name);
 
@@ -927,13 +1098,22 @@ function verify(index, name, options = {}) {
             }
         }
 
+        // Carry callerFile/callerStartLine so tagInTestCase can resolve the
+        // enclosing function in a later pass.
+        const carry = {
+            callerFile: call.callerFile,
+            callerStartLine: call.callerStartLine,
+        };
+
         if (analysis.args === null) {
             // Couldn't parse arguments
             uncertain.push({
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
-                reason: 'Could not parse call arguments'
+                reason: 'Could not parse call arguments',
+                patterns: patternFlagsFrom(analysis),
+                ...carry,
             });
             continue;
         }
@@ -944,7 +1124,9 @@ function verify(index, name, options = {}) {
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
-                reason: 'Uses spread operator'
+                reason: 'Uses spread operator',
+                patterns: patternFlagsFrom(analysis),
+                ...carry,
             });
             continue;
         }
@@ -955,7 +1137,12 @@ function verify(index, name, options = {}) {
         if (hasRest) {
             // With rest param, need at least minArgs
             if (argCount >= minArgs) {
-                valid.push({ file: call.relativePath, line: call.line });
+                valid.push({
+                    file: call.relativePath,
+                    line: call.line,
+                    patterns: patternFlagsFrom(analysis),
+                    ...carry,
+                });
             } else {
                 mismatches.push({
                     file: call.relativePath,
@@ -963,13 +1150,20 @@ function verify(index, name, options = {}) {
                     expression: call.content.trim(),
                     expected: `at least ${minArgs} arg(s)`,
                     actual: argCount,
-                    args: analysis.args
+                    args: analysis.args,
+                    patterns: patternFlagsFrom(analysis),
+                    ...carry,
                 });
             }
         } else {
             // Without rest, need between minArgs and expectedParamCount
             if (argCount >= minArgs && argCount <= expectedParamCount) {
-                valid.push({ file: call.relativePath, line: call.line });
+                valid.push({
+                    file: call.relativePath,
+                    line: call.line,
+                    patterns: patternFlagsFrom(analysis),
+                    ...carry,
+                });
             } else {
                 mismatches.push({
                     file: call.relativePath,
@@ -979,12 +1173,46 @@ function verify(index, name, options = {}) {
                         ? `${expectedParamCount} arg(s)`
                         : `${minArgs}-${expectedParamCount} arg(s)`,
                     actual: argCount,
-                    args: analysis.args
+                    args: analysis.args,
+                    patterns: patternFlagsFrom(analysis),
+                    ...carry,
                 });
             }
         }
     }
     clearTreeCache(index);
+
+    // Feature A: tag each entry with `inTestCase` based on its enclosing function.
+    // Done after the per-call loop because tagInTestCase prefers a single pass
+    // through file metadata to avoid repeated lookups.
+    {
+        const { tagInTestCase } = require('./analysis');
+        // Build a flat list of entries that need tagging — each carries
+        // callerFile + callerStartLine + line. tagInTestCase mutates in place.
+        const allSites = [...valid, ...mismatches, ...uncertain].map(s => ({
+            ...s,
+            // Mirror inputs tagInTestCase expects
+            line: s.line,
+            callerFile: s.callerFile,
+            callerStartLine: s.callerStartLine,
+        }));
+        // Use a parallel array so we can write back patterns.inTestCase.
+        tagInTestCase(index, allSites);
+        let i = 0;
+        for (const s of valid) { s.patterns.inTestCase = !!allSites[i++].inTestCase; }
+        for (const s of mismatches) { s.patterns.inTestCase = !!allSites[i++].inTestCase; }
+        for (const s of uncertain) { s.patterns.inTestCase = !!allSites[i++].inTestCase; }
+    }
+
+    // Strip carry fields — they were internal scaffolding for tagInTestCase
+    // and shouldn't appear in the public result.
+    function strip(arr) {
+        for (const s of arr) {
+            delete s.callerFile;
+            delete s.callerStartLine;
+        }
+    }
+    strip(valid); strip(mismatches); strip(uncertain);
 
     // Detect scope pollution for methods
     let scopeWarning = null;
@@ -1003,6 +1231,24 @@ function verify(index, name, options = {}) {
             }
         }
     }
+
+    // Feature A/B: build a top-level patterns aggregate across all call
+    // sites verify saw (valid + mismatches + uncertain). Mirrors the shape
+    // identifyCallPatterns returns in impact() so consumers can compare.
+    const allSitesForAgg = [...valid, ...mismatches, ...uncertain].map(s => ({
+        // identifyCallPatterns reads site.expression / site.args / site.hasSpread /
+        // site.hasVariable and the boolean pattern flags.
+        expression: s.expression || '',
+        args: s.args || null,
+        hasSpread: false,    // already filtered out into uncertain
+        hasVariable: false,  // not propagated from analyzeCallSite here; harmless
+        awaited: !!(s.patterns && s.patterns.awaited),
+        inLoop: !!(s.patterns && s.patterns.inLoop),
+        inTry: !!(s.patterns && s.patterns.inTry),
+        inCallback: !!(s.patterns && s.patterns.inCallback),
+        inTestCase: !!(s.patterns && s.patterns.inTestCase),
+    }));
+    const patternsAgg = identifyCallPatterns(allSitesForAgg, name);
 
     return {
         found: true,
@@ -1025,8 +1271,10 @@ function verify(index, name, options = {}) {
         valid: valid.length,
         mismatches: mismatches.length,
         uncertain: uncertain.length,
+        validDetails: valid,
         mismatchDetails: mismatches,
         uncertainDetails: uncertain,
+        patterns: patternsAgg,
         scopeWarning
     };
     } finally { index._endOp(); }

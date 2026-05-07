@@ -153,6 +153,14 @@ function parseFlags(tokens) {
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
         unreachableOnly: tokens.includes('--unreachable-only') || undefined,
         framework: getValueFlag('--framework'),
+        // endpoints command flags
+        bridge: tokens.includes('--bridge') || undefined,
+        serverOnly: tokens.includes('--server-only') || undefined,
+        clientOnly: tokens.includes('--client-only') || undefined,
+        unmatched: tokens.includes('--unmatched') || undefined,
+        method: getValueFlag('--method'),
+        prefix: getValueFlag('--prefix'),
+        hideUncertain: tokens.includes('--hide-uncertain') || tokens.includes('--no-uncertain') || undefined,
         stack: getValueFlag('--stack'),
         workers: (() => {
             const v = getValueFlag('--workers');
@@ -187,7 +195,9 @@ const knownFlags = new Set([
     '--max-lines', '--class-name', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
     '--hide-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
-    '--framework', '--workers', '--deep', '--compact'
+    '--framework', '--workers', '--deep', '--compact',
+    '--bridge', '--server-only', '--client-only', '--unmatched',
+    '--method', '--prefix', '--hide-uncertain', '--no-uncertain'
 ]);
 
 // Handle help flag
@@ -217,7 +227,7 @@ const VALUE_FLAGS = new Set([
     '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name',
     '--type', '--param', '--receiver', '--returns', '--decorator',
     '--limit', '--max-files', '--min-confidence', '--stack', '--framework',
-    '--workers'
+    '--workers', '--method', '--prefix'
 ]);
 
 // Remove flags from args, then add args after -- (which are all positional)
@@ -926,6 +936,29 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        case 'endpoints': {
+            const { ok, result, error, note } = execute(index, 'endpoints', {
+                file: flags.file,
+                exclude: flags.exclude,
+                limit: flags.limit,
+                framework: flags.framework,
+                bridge: flags.bridge,
+                serverOnly: flags.serverOnly,
+                clientOnly: flags.clientOnly,
+                unmatched: flags.unmatched,
+                method: flags.method,
+                prefix: flags.prefix,
+                hideUncertain: flags.hideUncertain,
+            });
+            if (!ok) fail(error);
+            if (note) console.error(note);
+            printOutput(result,
+                output.formatEndpointsJson,
+                r => output.formatEndpoints(r, { bridge: r._bridge })
+            );
+            break;
+        }
+
         case 'stats': {
             const { ok, result, error } = execute(index, 'stats', {
                 functions: flags.functions,
@@ -945,6 +978,18 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatDiffImpactJson, r => output.formatDiffImpact(r, { all: flags.all }));
+            break;
+        }
+
+        case 'auditAsync': {
+            const { ok, result, error, note } = execute(index, 'auditAsync', {
+                file: flags.file,
+                exclude: flags.exclude,
+                limit: flags.limit,
+            });
+            if (!ok) fail(error);
+            if (note) console.error(note);
+            printOutput(result, output.formatAuditAsyncJson, output.formatAuditAsync);
             break;
         }
 
@@ -1228,8 +1273,14 @@ function runGlobCommand(pattern, command, arg) {
         case 'entrypoints':
             printOutput(result, output.formatEntrypointsJson, output.formatEntrypoints);
             break;
+        case 'endpoints':
+            printOutput(result, output.formatEndpointsJson, r => output.formatEndpoints(r, { bridge: r._bridge }));
+            break;
         case 'diffImpact':
             printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
+            break;
+        case 'auditAsync':
+            printOutput(result, output.formatAuditAsyncJson, output.formatAuditAsync);
             break;
         case 'stacktrace':
             printOutput(result, output.formatStackTraceJson, output.formatStackTrace);
@@ -1315,6 +1366,9 @@ REFACTORING HELPERS
   diff-impact         What changed in git diff and who calls it (--base, --staged)
   deadcode            Find unused functions/classes
   entrypoints         Detect framework entry points (routes, DI, tasks)
+  endpoints           HTTP API: list server routes + client requests; --bridge to match
+                        --bridge --server-only --client-only --unmatched
+                        --method=GET --prefix=/api --hide-uncertain
 
 ═══════════════════════════════════════════════════════════════════════════════
 OTHER
@@ -1323,6 +1377,7 @@ OTHER
   typedef <name>      Find type definitions
   stats               Project statistics (--functions for per-function line counts, --hot for top callers)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
+  audit-async         Find calls in async functions that are likely missing await (JS/TS/Python)
 
 Common Flags:
   --file <pattern>    Filter by file path (e.g., --file=routes)
@@ -1473,7 +1528,7 @@ Flags can be added per-command: context myFunc --include-methods
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name', '--framework']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name', '--framework', '--method', '--prefix']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -1553,12 +1608,14 @@ const INTERACTIVE_DISPATCH = {
     diffImpact:   { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit, all: f.all }), format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
     check:        { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit }), format: (r) => output.formatCheck(r) },
     entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude, includeTests: f.includeTests, limit: f.limit }), format: (r) => output.formatEntrypoints(r) },
+    endpoints:    { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit, framework: f.framework, bridge: f.bridge, serverOnly: f.serverOnly, clientOnly: f.clientOnly, unmatched: f.unmatched, method: f.method, prefix: f.prefix, hideUncertain: f.hideUncertain }), format: (r) => output.formatEndpoints(r, { bridge: r._bridge }) },
 
     // ── Other ────────────────────────────────────────────────────────
     api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
     stacktrace:   { params: (a, f) => ({ stack: f.stack || a }), format: (r) => output.formatStackTrace(r) },
     doctor:       { params: (a, f) => ({ file: f.file, in: f.in, limit: f.limit, deep: f.deep }), format: (r) => output.formatDoctor(r) },
     stats:        { params: 'flags', format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
+    auditAsync:   { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit }), format: (r) => output.formatAuditAsync(r) },
 };
 
 /**

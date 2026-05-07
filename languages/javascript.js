@@ -144,6 +144,90 @@ function extractDecorators(node) {
     return decorators;
 }
 
+/**
+ * Extract decorators along with their string-literal first argument.
+ * Returns array of { name, args, firstStringArg } where:
+ *   - name is the decorator name (no @)
+ *   - args is the raw argument text (without outer parens), or null
+ *   - firstStringArg is the literal value of the first string-literal argument, or null
+ *
+ *   @Get(':id')               → { name: 'Get', args: "':id'", firstStringArg: ':id' }
+ *   @Controller('/api/users') → { name: 'Controller', args: "'/api/users'", firstStringArg: '/api/users' }
+ *   @Injectable               → { name: 'Injectable', args: null, firstStringArg: null }
+ *
+ * Used by route extraction (NestJS, etc.) — only the firstStringArg is currently
+ * consumed by core/bridge.js, but `args` is preserved for future structural-search use.
+ */
+function extractDecoratorsWithArgs(node) {
+    const result = [];
+    const { extractStringArg } = require('./utils');
+
+    const consume = (n) => {
+        if (n.type !== 'decorator') return;
+        // tree-sitter-javascript: decorator has a single 'expression' child.
+        // Look for call_expression vs identifier vs member_expression.
+        let inner = null;
+        for (let i = 0; i < n.namedChildCount; i++) {
+            const c = n.namedChild(i);
+            if (c.type !== 'comment') { inner = c; break; }
+        }
+        if (!inner) return;
+
+        if (inner.type === 'call_expression') {
+            const fn = inner.childForFieldName('function');
+            const argsNode = inner.childForFieldName('arguments');
+            if (!fn || !argsNode) return;
+            const name = fn.text;
+            // Get raw arg text without the surrounding parens
+            const argsText = argsNode.text.replace(/^\(|\)$/g, '');
+            // Find first string-literal arg
+            let firstStringArg = null;
+            for (let j = 0; j < argsNode.namedChildCount; j++) {
+                const arg = argsNode.namedChild(j);
+                if (arg.type === 'comment') continue;
+                const s = extractStringArg(arg);
+                if (s && !s.interp) { firstStringArg = s.value; break; }
+                if (s) { firstStringArg = s.value; break; }
+                break;
+            }
+            result.push({ name, args: argsText, firstStringArg });
+        } else if (inner.type === 'identifier' || inner.type === 'member_expression') {
+            // Plain decorator: @Injectable
+            result.push({ name: inner.text, args: null, firstStringArg: null });
+        }
+    };
+
+    // Same traversal as extractDecorators
+    for (let i = 0; i < node.namedChildCount; i++) {
+        consume(node.namedChild(i));
+    }
+    if (node.parent && node.parent.type === 'export_statement') {
+        const wrapper = node.parent;
+        let myIdx = -1;
+        for (let i = 0; i < wrapper.namedChildCount; i++) {
+            if (wrapper.namedChild(i).id === node.id) { myIdx = i; break; }
+        }
+        for (let i = myIdx - 1; i >= 0; i--) {
+            const sib = wrapper.namedChild(i);
+            if (sib.type === 'decorator') consume(sib);
+            else break;
+        }
+    }
+    if (node.parent && node.parent.type !== 'export_statement') {
+        const parent = node.parent;
+        let myIdx = -1;
+        for (let i = 0; i < parent.namedChildCount; i++) {
+            if (parent.namedChild(i).id === node.id) { myIdx = i; break; }
+        }
+        for (let i = myIdx - 1; i >= 0; i--) {
+            const sib = parent.namedChild(i);
+            if (sib.type === 'decorator') consume(sib);
+            else break;
+        }
+    }
+    return result;
+}
+
 // --- Single-pass helpers: extracted from find* callbacks ---
 
 /**
@@ -173,6 +257,9 @@ function _processFunction(node, functions, processedRanges, lines) {
             const modifiers = node.parent && node.parent.type === 'export_statement'
                 ? extractModifiers(node.parent.text)
                 : extractModifiers(node.text);
+            // Feature B: explicit isAsync flag (auditAsync needs to know whether
+            // the fn was declared `async function`).
+            const isAsync = modifiers.includes('async');
 
             functions.push({
                 name: nameNode.text,
@@ -183,6 +270,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 indent,
                 isArrow: false,
                 isGenerator: isGen,
+                isAsync,
                 modifiers,
                 ...typeAnno,
                 ...(generics && { generics }),
@@ -256,6 +344,12 @@ function _processFunction(node, functions, processedRanges, lines) {
                         const modifiers = node.parent && node.parent.type === 'export_statement'
                             ? extractModifiers(node.parent.text)
                             : extractModifiers(node.text);
+                        // Feature B: detect async — for arrow/fn-expressions the `async`
+                        // keyword precedes the parameter list on the value node, NOT on
+                        // the lexical_declaration text. extractModifiers walked the full
+                        // declaration text, so we double-check the value node directly.
+                        const valueIsAsync = valueNode.text.trimStart().startsWith('async ');
+                        const isAsync = valueIsAsync || modifiers.includes('async');
 
                         functions.push({
                             name: nameNode.text,
@@ -266,6 +360,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                             indent,
                             isArrow,
                             isGenerator: isGen,
+                            isAsync,
                             modifiers,
                             ...typeAnno,
                             ...(generics && { generics }),
@@ -476,6 +571,7 @@ function _processClass(node, classes, processedRanges, lines) {
             const extendsInfo = extractExtends(node);
             const implementsInfo = extractImplements(node);
             const decorators = extractDecorators(node);
+            const decoratorsWithArgs = extractDecoratorsWithArgs(node);
 
             const isAbstract = node.type === 'abstract_class_declaration';
             classes.push({
@@ -489,7 +585,8 @@ function _processClass(node, classes, processedRanges, lines) {
                 ...(generics && { generics }),
                 ...(extendsInfo && { extends: extendsInfo }),
                 ...(implementsInfo.length > 0 && { implements: implementsInfo }),
-                ...(decorators.length > 0 && { decorators })
+                ...(decorators.length > 0 && { decorators }),
+                ...(decoratorsWithArgs.some(d => d.firstStringArg) && { decoratorsWithArgs })
             });
         }
         return true;
@@ -826,6 +923,7 @@ function extractClassMembers(classNode, codeOrLines) {
                 const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                 const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
 
+                const decoratorsWithArgs = extractDecoratorsWithArgs(child);
                 members.push({
                     name,
                     params: extractParams(paramsNode),
@@ -838,7 +936,8 @@ function extractClassMembers(classNode, codeOrLines) {
                     isMethod: true,  // Mark as method for context() lookups
                     ...typeAnno,
                     ...(docstring && { docstring }),
-                    ...(decorators.length > 0 && { decorators })
+                    ...(decorators.length > 0 && { decorators }),
+                    ...(decoratorsWithArgs.length > 0 && { decoratorsWithArgs })
                 });
             }
         }
@@ -1059,6 +1158,20 @@ function findCallsInCode(code, parser) {
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
+    // Helper: extract first string-arg literal from a call_expression node.
+    // Used by route extraction to capture path arg of fetch('/path'), app.get('/path', handler) etc.
+    const { extractStringArg: _extractStringArg } = require('./utils');
+    const getFirstStringArg = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            return _extractStringArg(arg);
+        }
+        return null;
+    };
+
     // Helper to check if a node is a non-callable literal
     const isNonCallableInit = (node) => {
         // Primitive literals
@@ -1275,6 +1388,7 @@ function findCallsInCode(code, parser) {
                 const alias = aliases.get(funcNode.text);
                 const resolvedName = typeof alias === 'string' ? alias : undefined;
                 const resolvedNames = Array.isArray(alias) ? alias : undefined;
+                const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: funcNode.text,
                     ...(resolvedName && { resolvedName }),
@@ -1282,7 +1396,8 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     enclosingFunction,
-                    uncertain
+                    uncertain,
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
             } else if (funcNode.type === 'member_expression') {
                 // Method call: obj.foo() or foo.call/apply/bind()
@@ -1327,6 +1442,7 @@ function findCallsInCode(code, parser) {
                             }
                         }
                         const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
+                        const firstArg = getFirstStringArg(node);
                         calls.push({
                             name: propName,
                             line: node.startPosition.row + 1,
@@ -1334,7 +1450,8 @@ function findCallsInCode(code, parser) {
                             receiver,
                             ...(receiverType && { receiverType }),
                             enclosingFunction,
-                            uncertain
+                            uncertain,
+                            ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                         });
                     }
                 }
