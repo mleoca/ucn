@@ -166,6 +166,29 @@ core/discovery.js
   [ 162- 166] legacyResolve (function)
 ```
 
+Find missing-await bugs:
+
+```
+ucn audit-async
+```
+
+Lists async calls inside async functions that lack `await` (JS/TS/Python).
+
+## Map your API surface across languages
+
+UCN can match server routes to client requests across the supported languages — Express/Fastify/Koa/NestJS/Next.js, Flask/FastAPI, Spring/JAX-RS, Go net/http (Gin/Echo/Chi/Fiber), axum/actix-web on the server side; fetch/axios, requests/httpx, RestTemplate/WebClient, reqwest on the client side.
+
+```bash
+ucn endpoints --bridge
+
+# Filters
+ucn endpoints --bridge --unmatched          # routes with no client / clients with no server
+ucn endpoints --bridge --method=POST
+ucn endpoints --bridge --prefix=/api
+```
+
+Match confidence: `EXACT` (literal-literal), `PARTIAL` (server param ↔ client literal), `UNCERTAIN` (template-literal client). Use `--hide-uncertain` to drop the noisy tier.
+
 ## Extract without reading the whole file
 
 ```
@@ -258,114 +281,7 @@ cp -r "$(npm root -g)/ucn/.claude/skills/ucn" ~/.agents/skills/
 
 ## Full help
 
-```text
-UCN - Universal Code Navigator
-
-Supported: JavaScript, TypeScript, Python, Go, Rust, Java, HTML
-
-Usage:
-  ucn [command] [args]            Project mode (current directory)
-  ucn <file> [command] [args]     Single file mode
-  ucn <dir> [command] [args]      Project mode (specific directory)
-  ucn "pattern" [command] [args]  Glob pattern mode
-  (Default output is text; add --json for machine-readable JSON)
-
-═══════════════════════════════════════════════════════════════════════════════
-UNDERSTAND CODE
-═══════════════════════════════════════════════════════════════════════════════
-  about <name>        Full picture (definition, callers, callees, tests, code)
-  context <name>      Who calls this + what it calls (numbered for expand)
-  smart <name>        Function + all dependencies inline
-  impact <name>       What breaks if changed (call sites grouped by file)
-  blast <name>        Transitive blast radius (callers of callers, --depth=N)
-  trace <name>        Call tree visualization (--depth=N expands all children)
-  reverse-trace <name> Upward call chain to entry points (--depth=N, default 5)
-  related <name>      Find similar functions (same file, shared deps)
-  example <name>      Best usage example with context
-
-═══════════════════════════════════════════════════════════════════════════════
-FIND CODE
-═══════════════════════════════════════════════════════════════════════════════
-  find <name>         Find symbol definitions (supports glob: find "handle*")
-  usages <name>       All usages grouped: definitions, calls, imports, references
-  toc                 Table of contents (compact; --detailed lists all symbols)
-  search <term>       Text search (regex default, --context=N, --exclude=, --in=)
-                      Structural: --type=function|class|call --param= --returns= --decorator= --exported --unused
-  tests <name>        Find test files for a function
-  affected-tests <n>  Tests affected by a change (blast + test detection, --depth=N)
-
-═══════════════════════════════════════════════════════════════════════════════
-EXTRACT CODE
-═══════════════════════════════════════════════════════════════════════════════
-  fn <name>[,n2,...]  Extract function(s) (comma-separated for bulk, --file)
-  class <name>        Extract class
-  lines <range>       Extract line range (e.g., lines 50-100)
-  expand <N>          Show code for item N from context output
-
-═══════════════════════════════════════════════════════════════════════════════
-FILE DEPENDENCIES
-═══════════════════════════════════════════════════════════════════════════════
-  imports <file>      What does file import
-  exporters <file>    Who imports this file
-  file-exports <file> What does file export
-  graph <file>        Full dependency tree (--depth=N, --direction=imports|importers|both)
-  circular-deps       Detect circular import chains (--file=, --exclude=)
-
-═══════════════════════════════════════════════════════════════════════════════
-REFACTORING HELPERS
-═══════════════════════════════════════════════════════════════════════════════
-  plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to)
-  verify <name>       Check all call sites match signature
-  diff-impact         What changed in git diff and who calls it (--base, --staged)
-  deadcode            Find unused functions/classes
-  entrypoints         Detect framework entry points (routes, DI, tasks)
-
-═══════════════════════════════════════════════════════════════════════════════
-OTHER
-═══════════════════════════════════════════════════════════════════════════════
-  api                 Show exported/public symbols
-  typedef <name>      Find type definitions
-  stats               Project statistics (--functions for per-function line counts)
-  stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
-
-Common Flags:
-  --file <pattern>    Filter by file path (e.g., --file=routes)
-  --exclude=a,b       Exclude patterns (e.g., --exclude=test,mock)
-  --in=<path>         Only in path (e.g., --in=src/core)
-  --depth=N           Trace/graph depth (default: 3, also expands all children)
-  --direction=X       Graph direction: imports, importers, or both (default: both)
-  --all               Expand truncated sections (about, trace, graph, related)
-  --top=N             Limit results (find, deadcode)
-  --limit=N           Limit result count (find, usages, search, deadcode, api, toc)
-  --max-files=N       Max files to index (large projects)
-  --context=N         Lines of context around matches
-  --json              Machine-readable output
-  --code-only         Filter out comments and strings
-  --with-types        Include type definitions
-  --include-tests     Include test files
-  --class-name=X      Scope to specific class (e.g., --class-name=Repository)
-  --include-methods   Include method calls (obj.fn) in caller/callee analysis
-  --include-uncertain Include ambiguous/uncertain matches
-  --no-confidence     Hide confidence scores (shown by default)
-  --min-confidence=N  Filter edges below confidence threshold (0.0-1.0)
-  --include-exported  Include exported symbols in deadcode
-  --no-regex          Force plain text search (regex is default)
-  --functions         Show per-function line counts (stats command)
-  --include-decorated Include decorated/annotated symbols in deadcode
-  --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
-  --exact             Exact name match only (find)
-  --calls-only        Only show call/test-case matches (tests)
-  --case-sensitive    Case-sensitive text search (search)
-  --detailed          List all symbols in toc (compact by default)
-  --top-level         Show only top-level functions in toc
-  --max-lines=N       Max source lines for class (large classes show summary)
-  --no-cache          Disable caching
-  --clear-cache       Clear cache before running
-  --base=<ref>        Git ref for diff-impact (default: HEAD)
-  --staged            Analyze staged changes (diff-impact)
-  --no-follow-symlinks  Don't follow symbolic links
-  -i, --interactive   Keep index in memory for multiple queries
-```
+Run `ucn --help` for the full command list and flags.
 
 ---
 

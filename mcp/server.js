@@ -198,15 +198,16 @@ QUICK GUIDE — choosing the right command:
 Commands:
 
 UNDERSTANDING CODE:
-- about <name>: Definition, source, callers, callees, and tests — everything in one call. Replaces 3-4 grep+read cycles. Your first stop for any function or class.
+- about <name>: Definition, source, callers, callees, and tests — everything in one call. Replaces 3-4 grep+read cycles. Your first stop for any function or class. Pass git=true for last-modified, author, and recent-changes (last 30d).
 - context <name>: Who calls it and what does it call, without source code. Results are numbered for use with expand. For classes/structs, shows all methods instead.
 - impact <name>: Every call site with actual arguments passed, grouped by file. Essential before changing a function signature — shows exactly what breaks.
 - blast <name>: Transitive blast radius — callers of callers. Shows the full chain of functions affected if you change something. Like impact but recursive. Use depth (default: 3) to control how far up the chain to walk.
 - smart <name>: Get a function's source with all called functions expanded inline (not constants/variables). Use to understand or modify a function and its dependencies in one read.
 - trace <name>: Call tree from a function downward. Use to understand "what happens when X runs" — maps which modules a pipeline touches without reading files. Set depth (default: 3); setting depth expands all children.
-- example <name>: Best real-world usage example. Automatically scores call sites by quality and returns the top one with context. Use to understand expected calling patterns.
+- example <name>: Best real-world usage example. Automatically scores call sites by quality and returns the top one with context. Use to understand expected calling patterns. Set diverse=true to cluster call sites by argument shape and return one representative per cluster (pair with top=N, default 3).
 - reverse_trace <name>: Upward call chain to entry points — who calls this, who calls those callers, etc. Use to find all paths that lead to a function. Set depth (default: 5) to control how far up. Complement to trace (which goes downward).
 - related <name>: Sibling functions: same file, similar names, or shared callers/callees. Find companions to update together (e.g., serialize when you're changing deserialize). Name-based, not semantic.
+- brief <name>: Compact summary of a function: typed signature, first sentence of docstring, side-effect classification (fs/network/process/global_mutation), complexity (branches, depth, lines). Cheaper than about; more useful than fn when you don't need the body. Pass git=true for last-modified info.
 
 FINDING CODE:
 - find <name>: Locate definitions ranked by usage count. Supports glob patterns (e.g. find "handle*" or "_update*"). Use when you know the name but not the file.
@@ -236,12 +237,17 @@ REFACTORING:
 - verify <name>: Check all call sites match function signature (argument count). Run before adding/removing parameters to catch breakage early.
 - plan <name>: Preview refactoring: before/after signatures and call sites needing updates. Use add_param (with optional default_value), remove_param, or rename_to. Pair with verify.
 - diff_impact: Which functions changed in git diff and who calls them. Use to understand impact of recent changes before committing or reviewing. Use base, staged, or file params to scope.
+- check: Pre-commit lint of pending changes against the index. Composes diff_impact + verify + affected_tests; flags ADDED functions with zero callers (ORPHAN), BROKEN_IMPORT, signature drift across call sites, and recommends which tests to run. Use base= to compare against a branch, staged=true for staged changes only.
+
+DIAGNOSTICS:
+- doctor: Index health/coverage report — file/symbol counts, language breakdown, dynamic-import / eval / reflection blind spots, parse failures, and a verdict (HIGH/MEDIUM/LOW trust). Use deep=true to also sample resolution coverage and bucket edges by confidence. Use in= to scope to a subtree.
 
 OTHER:
 - typedef <name>: Find type definitions matching a name: interfaces, enums, structs, traits, type aliases. See field shapes, required methods, or enum values.
 - stacktrace: Parse a stack trace, show source context per frame. Requires stack param. Handles JS, Python, Go, Rust, Java formats.
 - api: Public API surface of project or file: all exported/public symbols with signatures. Use to understand what a library exposes. Pass file to scope to one file. Python needs __all__; use toc instead.
-- stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type. Use functions=true for per-function line counts sorted by size (complexity audit).` + generateMcpParamSection();
+- stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type. Use functions=true for per-function line counts sorted by size (complexity audit). Set hot=true with top=N for the most-called functions (project orientation primitive).
+- audit_async: Find async calls inside async functions that are likely missing await (probable bugs). JS/TS/Python only. Filter with file/exclude/limit.` + generateMcpParamSection();
 
 server.registerTool(
     'ucn',
@@ -584,7 +590,7 @@ server.registerTool(
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'endpoints', ep);
                 if (!ok) return te(error);
-                let endText = output.formatEndpoints(result, { bridge: result._bridge });
+                let endText = output.formatEndpoints(result, { bridge: result._bridge, unmatched: result._unmatched });
                 if (note) endText += '\n\n' + note;
                 return tr(endText);
             }

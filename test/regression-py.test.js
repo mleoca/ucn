@@ -1948,6 +1948,38 @@ describe('Feature B: Python awaited flag + audit-async', () => {
             assert.strictEqual(r.issues[0].calleeName, 'helper');
         } finally { rm(dir); }
     });
+
+    // HIGH-1 regression: file-local resolution wins over global ambiguity.
+    // Sync def of `helper` in another file must NOT mask async def in same
+    // file as the call.
+    it('Python: audit-async flags across name collisions (HIGH-1)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'bad.py': [
+                'async def helper():',
+                '    return 1',
+                '',
+                'async def main():',
+                '    helper()',         // missing await — should flag
+                '',
+            ].join('\n'),
+            'loops.py': [
+                'def helper():',
+                '    return 2',
+                'helper()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            const inBad = r.issues.filter(i => i.file === 'bad.py');
+            assert.ok(inBad.some(i => i.calleeName === 'helper'),
+                `should flag helper() in bad.py, got: ${JSON.stringify(r.issues)}`);
+            const inLoops = r.issues.filter(i => i.file === 'loops.py');
+            assert.strictEqual(inLoops.length, 0,
+                `should not flag sync helper() in loops.py`);
+        } finally { rm(dir); }
+    });
 });
 
 // ============================================================================

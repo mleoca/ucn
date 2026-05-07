@@ -733,15 +733,39 @@ function structuralSearch(index, options = {}) {
 function example(index, name, options = {}) {
     index._beginOp();
     try {
+    // MEDIUM-8: respect --include-tests. By default, test/fixture/mock files
+    // are excluded as low-signal examples. When the user passes
+    // includeTests:true, return matches from those files too.
+    const exclude = options.includeTests
+        ? []
+        : ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'];
     const usageResults = usages(index, name, {
         codeOnly: true,
         className: options.className,
-        exclude: ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'],
+        exclude,
         context: 5
     });
 
     const calls = usageResults.filter(u => u.usageType === 'call' && !u.isDefinition);
-    if (calls.length === 0) return null;
+    if (calls.length === 0) {
+        // No matches in non-test files. Look at how many WERE excluded so we
+        // can tell the user there's something they could see with
+        // --include-tests, instead of saying "no examples found" silently.
+        if (!options.includeTests) {
+            const allUsages = usages(index, name, {
+                codeOnly: true,
+                className: options.className,
+                exclude: [],
+                context: 0,
+            });
+            const excludedCalls = allUsages.filter(u =>
+                u.usageType === 'call' && !u.isDefinition).length;
+            if (excludedCalls > 0) {
+                return { best: null, totalCalls: 0, excludedTestCalls: excludedCalls };
+            }
+        }
+        return null;
+    }
 
     const scored = calls.map(call => {
         let score = 0;

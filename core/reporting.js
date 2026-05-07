@@ -92,7 +92,11 @@ function getStats(index, options = {}) {
     // name-keyed (not per-definition) — same trade-off as `usages` and matches
     // the rest of the codebase's call-graph approximation.
     if (options.hot) {
-        const top = (options.top != null && Number(options.top) > 0) ? Number(options.top) : 10;
+        // MEDIUM-7: caller (execute.js) validates and passes either a
+        // positive integer, 0 (show nothing), or undefined (default 10).
+        const top = options.top === 0
+            ? 0
+            : ((options.top != null && Number(options.top) > 0) ? Number(options.top) : 10);
         const FUNCTION_TYPES = new Set([
             'function', 'method', 'static', 'constructor',
             'public', 'abstract', 'classmethod'
@@ -131,25 +135,57 @@ function getStats(index, options = {}) {
             }
         }
 
-        // Build per-definition entries. Each function symbol gets its name's
-        // count, then we sort and slice. Same name in different files →
-        // separate entries (callers may differ).
+        // MEDIUM-6: aggregate by name. Multiple definitions of the same name
+        // in different files (e.g. `tmp` in test/helpers/index.js AND
+        // test/accuracy.test.js) previously each got the GLOBAL call count,
+        // duplicating the row and inflating the leaderboard. We now emit
+        // one row per name with a `locations` list, so the user sees both
+        // definitions but the count appears exactly once.
         const hotList = [];
         for (const [name, symbols] of index.symbols) {
             const count = callCountByName.get(name) || 0;
             if (count === 0) continue; // skip dead symbols
+            // Filter to function-shaped definitions, dedup by file:line.
+            const seenLoc = new Set();
+            const locations = [];
+            let representative = null;
             for (const sym of symbols) {
                 if (!FUNCTION_TYPES.has(sym.type)) continue;
                 const relativePath = sym.relativePath ||
                     (sym.file ? path.relative(index.root, sym.file) : '');
-                hotList.push({
-                    name: sym.className ? `${sym.className}.${sym.name}` : sym.name,
+                const locKey = `${relativePath}:${sym.startLine}`;
+                if (seenLoc.has(locKey)) continue;
+                seenLoc.add(locKey);
+                locations.push({
                     file: relativePath,
                     startLine: sym.startLine,
                     endLine: sym.endLine,
-                    callCount: count,
+                    ...(sym.className && { className: sym.className }),
                 });
+                if (!representative) representative = sym;
             }
+            if (locations.length === 0) continue;
+            // Sort locations by (file, startLine) for stable display.
+            locations.sort((a, b) =>
+                a.file.localeCompare(b.file) ||
+                (a.startLine || 0) - (b.startLine || 0)
+            );
+            const primary = locations[0];
+            hotList.push({
+                // Use the representative symbol's className for display name
+                // (so "Foo.bar" is preserved when applicable). When defs
+                // disagree on className, just show the bare name.
+                name: representative && representative.className
+                    ? `${representative.className}.${name}`
+                    : name,
+                // Primary location remains for backward-compat with consumers
+                // that read `file`/`startLine`/`endLine` directly.
+                file: primary.file,
+                startLine: primary.startLine,
+                endLine: primary.endLine,
+                callCount: count,
+                ...(locations.length > 1 && { locations }),
+            });
         }
 
         // Stable order: callCount desc, then (relativePath, startLine) asc.

@@ -110,7 +110,7 @@ const FLAG_APPLICABILITY = {
     reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
     trace:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    example:      ['name', 'file', 'className', 'diverse', 'top'],
+    example:      ['name', 'file', 'className', 'diverse', 'top', 'includeTests'],
     related:      ['name', 'file', 'className', 'top', 'all'],
     brief:        ['name', 'file', 'className', 'git'],
     // Finding code

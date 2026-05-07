@@ -30,6 +30,23 @@ function formatEndpoints(result, options = {}) {
     return formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options);
 }
 
+/**
+ * Compute the unique-request match percentage. A single client request that
+ * matches multiple server routes (e.g., trailing-slash dups) must count once,
+ * not once per bridge — otherwise "Matched: N (200%)" shows up. Returns an
+ * integer percentage clamped to [0, 100].
+ */
+function uniqueMatchPercent(bridges, totalRequests) {
+    if (!totalRequests || totalRequests <= 0) return 0;
+    const matchedRequestKeys = new Set();
+    for (const b of bridges) {
+        const r = b.request;
+        matchedRequestKeys.add(`${r.absoluteFile || r.file}:${r.line}:${r.method}:${r.path}`);
+    }
+    const pct = Math.round((matchedRequestKeys.size / totalRequests) * 100);
+    return Math.min(100, Math.max(0, pct));
+}
+
 function formatRoutesAndRequests(routes, requests, meta, options) {
     const lines = [];
     const showServer = !options.clientOnly;
@@ -94,18 +111,23 @@ function formatRoutesAndRequests(routes, requests, meta, options) {
     return lines.join('\n').trimEnd();
 }
 
-function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, _options) {
+function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options = {}) {
     const lines = [];
     const matched = bridges.length;
-    const unmatched = unmatchedRoutes.length + unmatchedRequests.length;
+    const unmatchedOnly = !!options.unmatched;
 
     lines.push(`Endpoint Bridges`);
     lines.push(`================`);
     lines.push(`Server routes: ${meta.totalRoutes}    Client requests: ${meta.totalRequests}`);
-    lines.push(`Matched: ${matched} (${(matched / Math.max(1, meta.totalRequests) * 100).toFixed(0)}%)    Unmatched routes: ${unmatchedRoutes.length}    Unmatched requests: ${unmatchedRequests.length}`);
+    // HIGH-3: percentage = unique matched client requests / total client
+    // requests. Counting bridges directly inflates >100% on many-to-many
+    // matches (trailing-slash dups, wildcard overlap, etc.).
+    const pct = uniqueMatchPercent(bridges, meta.totalRequests);
+    lines.push(`Matched: ${matched} (${pct}%)    Unmatched routes: ${unmatchedRoutes.length}    Unmatched requests: ${unmatchedRequests.length}`);
     lines.push('');
 
-    if (matched > 0) {
+    // HIGH-2: in --unmatched mode, suppress the Matched section entirely.
+    if (matched > 0 && !unmatchedOnly) {
         // Group bridges by route for display
         const byRoute = new Map();
         for (const b of bridges) {
@@ -153,9 +175,13 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, _optio
     return lines.join('\n').trimEnd();
 }
 
-function formatEndpointsJson(result, _options = {}) {
+function formatEndpointsJson(result, options = {}) {
     if (!result) return JSON.stringify({ meta: {}, data: {} }, null, 2);
     const { routes, requests, bridges, unmatchedRoutes, unmatchedRequests, meta } = result;
+    // Read `unmatched` from explicit options OR sticky result property (set by
+    // execute.js when the user passed --unmatched). The CLI/MCP wrappers may
+    // not pass options through to JSON output, so we use both as fallbacks.
+    const unmatchedOnly = !!(options.unmatched || result._unmatched);
 
     const trimRoute = (r) => ({
         method: r.method,
@@ -191,11 +217,16 @@ function formatEndpointsJson(result, _options = {}) {
         meta: {
             ok: true,
             ...meta,
+            // HIGH-2: signal to consumers that bridges array was suppressed
+            // because the user filtered to unmatched-only.
+            ...(unmatchedOnly && { filterMode: 'unmatched' }),
         },
         data: {
             routes: routes.map(trimRoute),
             requests: requests.map(trimReq),
-            bridges: bridges.map(trimBridge),
+            // In unmatched-only mode, the matched bridges array is suppressed
+            // — consumers that want both should not pass --unmatched.
+            bridges: unmatchedOnly ? [] : bridges.map(trimBridge),
             unmatchedRoutes: unmatchedRoutes.map(trimRoute),
             unmatchedRequests: unmatchedRequests.map(trimReq),
         },

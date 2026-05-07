@@ -11,6 +11,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { tmp, rm, idx, FIXTURES_PATH, runCli } = require('./helpers');
 const { execute } = require('../core/execute');
+const output = require('../core/output');
 
 // ── Shared Fixtures ──────────────────────────────────────────────────────────
 
@@ -1094,15 +1095,151 @@ describe('endpoints command behavioral', () => {
         }
     });
 
-    it('--unmatched returns only unmatched routes/requests, no bridges', () => {
+    it('--unmatched populates unmatched routes/requests and implies --bridge', () => {
         const index = idx(JS_FIXTURE);
         const { ok, result } = execute(index, 'endpoints', { unmatched: true });
         assert.ok(ok);
-        // bridges array exists but is empty when only --unmatched is set
-        assert.strictEqual(result.bridges.length, 0);
+        // HIGH-2 fix: --unmatched implies --bridge for computation. Bridges
+        // are computed internally so we know which routes/requests didn't
+        // match, but the formatter suppresses the "Matched" section.
+        assert.ok(result._bridge, 'unmatched should imply bridge mode');
+        assert.ok(result._unmatched, 'unmatched flag should propagate');
         // unmatchedRoutes/unmatchedRequests are populated
         assert.ok(result.unmatchedRoutes.length + result.unmatchedRequests.length > 0,
             'expected some unmatched entries');
+    });
+
+    // HIGH-2: --unmatched (without --bridge) text output omits the Matched section.
+    it('--unmatched text output omits Matched section', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/health', a);\napp.get('/orphan', b);\nfunction a() {}\nfunction b() {}\n",
+            'client.js': "function f() { return fetch('/health'); }\nfunction g() { return fetch('/missing'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { unmatched: true });
+            assert.ok(ok);
+            const text = output.formatEndpoints(result, { bridge: result._bridge, unmatched: result._unmatched });
+            assert.ok(!/Matched \(\d+ routes?\):/.test(text),
+                `--unmatched should not show Matched section, got:\n${text}`);
+            assert.ok(/Unmatched server routes \(1\)/.test(text),
+                `--unmatched should list unmatched server routes`);
+            assert.ok(/Unmatched client requests \(1\)/.test(text),
+                `--unmatched should list unmatched client requests`);
+        } finally { rm(dir); }
+    });
+
+    // HIGH-2: --bridge --unmatched also omits Matched section.
+    it('--bridge --unmatched text output also omits Matched section', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/health', a);\napp.get('/orphan', b);\nfunction a() {}\nfunction b() {}\n",
+            'client.js': "function f() { return fetch('/health'); }\nfunction g() { return fetch('/missing'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true, unmatched: true });
+            assert.ok(ok);
+            const text = output.formatEndpoints(result, { bridge: result._bridge, unmatched: result._unmatched });
+            assert.ok(!/Matched \(\d+ routes?\):/.test(text),
+                `--bridge --unmatched should not show Matched section`);
+        } finally { rm(dir); }
+    });
+
+    // HIGH-2: JSON output suppresses bridges array in unmatched-only mode.
+    it('--unmatched JSON output excludes bridges array', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/health', a);\nfunction a() {}\n",
+            'client.js': "function f() { return fetch('/health'); }\nfunction g() { return fetch('/missing'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { unmatched: true });
+            assert.ok(ok);
+            const json = output.formatEndpointsJson(result, { unmatched: result._unmatched });
+            const parsed = JSON.parse(json);
+            assert.strictEqual(parsed.data.bridges.length, 0,
+                'bridges array should be empty in unmatched JSON output');
+            assert.strictEqual(parsed.meta.filterMode, 'unmatched',
+                'meta.filterMode should signal unmatched-only mode');
+        } finally { rm(dir); }
+    });
+
+    // HIGH-3: trailing-slash dups produce many-to-many matches; percentage
+    // must be ≤100 (count unique matched requests, not raw bridges).
+    it('match percentage ≤100% on many-to-many matches', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/users', a);\napp.get('/users/', b);\nfunction a() {}\nfunction b() {}\n",
+            'client.js': "function get() { return fetch('/users'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            // 2 bridges (1 client matches both server routes), but 1 unique
+            // request → percentage should be 100, NOT 200.
+            assert.ok(result.bridges.length >= 2, 'expected >=2 bridges from trailing-slash dup');
+            const text = output.formatEndpoints(result, { bridge: result._bridge });
+            const m = text.match(/Matched: \d+ \((\d+)%\)/);
+            assert.ok(m, `should have a percentage line, got:\n${text}`);
+            const pct = parseInt(m[1], 10);
+            assert.ok(pct <= 100, `percentage ${pct}% should be ≤100%`);
+        } finally { rm(dir); }
+    });
+
+    // HIGH-4: trailing slash should normalize to EXACT match (1.00).
+    it('trailing slash on server side: server /users/ ↔ client /users is EXACT', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/users/', handle);\nfunction handle() {}\n",
+            'client.js': "function get() { return fetch('/users'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            assert.strictEqual(result.bridges.length, 1);
+            assert.strictEqual(result.bridges[0].matchType, 'exact');
+            assert.strictEqual(result.bridges[0].confidence, 1);
+        } finally { rm(dir); }
+    });
+
+    // MEDIUM-5: fetch(url, { method: 'POST' }) extracts explicit method.
+    it('fetch with options.method: POST matches POST server route', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.post('/users', handle);\nfunction handle() {}\n",
+            'client.js': "function create() { return fetch('/users', { method: 'POST' }); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            assert.strictEqual(result.bridges.length, 1);
+            const b = result.bridges[0];
+            assert.strictEqual(b.request.method, 'POST');
+            assert.strictEqual(b.methodInferred, false,
+                'explicit options.method should not be marked as inferred');
+        } finally { rm(dir); }
+    });
+
+    // HIGH-4 (reverse): trailing slash on client side: server /users ↔ client /users/.
+    it('trailing slash on client side: server /users ↔ client /users/ is EXACT', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': "const express = require('express'); const app = express();\napp.get('/users', handle);\nfunction handle() {}\n",
+            'client.js': "function get() { return fetch('/users/'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'endpoints', { bridge: true });
+            assert.ok(ok);
+            assert.strictEqual(result.bridges.length, 1);
+            assert.strictEqual(result.bridges[0].matchType, 'exact');
+        } finally { rm(dir); }
     });
 
     it('--method=GET filters routes/requests to only GET method', () => {

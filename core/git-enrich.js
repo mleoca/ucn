@@ -43,6 +43,9 @@ function getGitInfo(projectRoot, relativeFilePath) {
     try {
         // Last commit touching this file: ISO timestamp + author name.
         // Use --follow to track renames, but only if the file exists in history.
+        // We capture stderr so we can classify failure modes (not-a-repo,
+        // file-not-tracked, timeout) instead of leaking the raw shell error
+        // to the caller (MEDIUM-9).
         const lastLine = execFileSync(
             'git',
             ['log', '-1', '--format=%aI|%an', '--', relPath],
@@ -50,13 +53,13 @@ function getGitInfo(projectRoot, relativeFilePath) {
                 cwd: projectRoot,
                 encoding: 'utf-8',
                 timeout: GIT_TIMEOUT_MS,
-                stdio: ['ignore', 'pipe', 'ignore'],
+                stdio: ['ignore', 'pipe', 'pipe'],
             }
         ).trim();
 
         if (!lastLine) {
             // File exists but no git history — likely untracked
-            info = { available: false, error: 'untracked or no history' };
+            info = { available: false, error: 'File not tracked' };
         } else {
             const [lastModified, author] = lastLine.split('|');
 
@@ -70,7 +73,7 @@ function getGitInfo(projectRoot, relativeFilePath) {
                     cwd: projectRoot,
                     encoding: 'utf-8',
                     timeout: GIT_TIMEOUT_MS,
-                    stdio: ['ignore', 'pipe', 'ignore'],
+                    stdio: ['ignore', 'pipe', 'pipe'],
                 }
             ).trim();
             const recentChanges = recentLines === '' ? 0 : recentLines.split('\n').length;
@@ -83,12 +86,40 @@ function getGitInfo(projectRoot, relativeFilePath) {
             };
         }
     } catch (e) {
-        // Not a git repo, git not installed, file outside repo, timeout, etc.
-        info = { available: false, error: e?.message || String(e) };
+        // MEDIUM-9: never leak the raw shell command back to the user (which
+        // includes the path being queried — looks like a stack trace and is
+        // surface-level confusing in JSON output). Classify and translate.
+        info = { available: false, error: classifyGitError(e) };
     }
 
     _cache.set(cacheKey, info);
     return info;
+}
+
+/**
+ * Translate a git execFileSync exception into a user-friendly error string.
+ * Inspects exit code, signal, and (when captured) stderr text to pick the
+ * right category. Falls back to a generic "Git unavailable" rather than
+ * leaking the underlying command — the caller renders this as JSON / text.
+ */
+function classifyGitError(e) {
+    if (!e) return 'Git unavailable';
+    // Timeout: child_process throws ENOENT-like errors with `signal: 'SIGTERM'`
+    // or `killed: true` when the timeout fires.
+    if (e.signal === 'SIGTERM' || e.killed === true) return 'Git timed out';
+    // git binary not installed
+    if (e.code === 'ENOENT') return 'Git not installed';
+    // Inspect stderr if captured
+    const stderr = e.stderr ? String(e.stderr) : '';
+    const lower = stderr.toLowerCase();
+    if (lower.includes('not a git repository')) return 'Not a git repository';
+    if (lower.includes("did not match any file") ||
+        lower.includes('pathspec') && lower.includes('did not match')) {
+        return 'File not tracked';
+    }
+    // Exit 128 commonly means "fatal" git error — we already caught the
+    // common cases above, so anything else is generic.
+    return 'Git unavailable';
 }
 
 /** Test helper: clear the in-process cache. */

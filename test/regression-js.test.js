@@ -4253,6 +4253,47 @@ describe('Feature B: JS awaited flag + audit-async', () => {
             assert.strictEqual(r.totalIssues, 0);
         } finally { rm(dir); }
     });
+
+    // HIGH-1 regression: audit-async file-local resolution.
+    // Previously: when ANY file defined a sync function with the same name
+    // as an async function in another file, the async call was silently
+    // unflagged because the global "all-or-nothing" check excluded the
+    // ambiguous name. File-local resolution must win — bad.js's helper()
+    // resolves to bad.js's async helper, ignoring loops.js's sync helper.
+    it('JS: audit-async flags missing-await across name collisions (HIGH-1)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'bad.js': [
+                'async function helper() { return 1; }',
+                'async function noAwait() { return 2; }',
+                'async function main() {',
+                '    helper();',         // line 4: should be flagged
+                '    noAwait();',        // line 5: should be flagged
+                '}',
+                'main();',
+            ].join('\n'),
+            'loops.js': [
+                // Different file, same name, sync — must NOT poison bad.js's
+                // resolution.
+                'function helper() { return 2; }',
+                'helper();',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = index.auditAsync({});
+            // Both helper() and noAwait() in bad.js should be flagged.
+            const inBad = r.issues.filter(i => i.file === 'bad.js');
+            assert.ok(inBad.some(i => i.calleeName === 'helper'),
+                `should flag helper() in bad.js, got: ${JSON.stringify(inBad)}`);
+            assert.ok(inBad.some(i => i.calleeName === 'noAwait'),
+                `should flag noAwait() in bad.js`);
+            // The sync helper() call in loops.js must NOT be flagged.
+            const inLoops = r.issues.filter(i => i.file === 'loops.js');
+            assert.strictEqual(inLoops.length, 0,
+                `should not flag sync helper() in loops.js, got: ${JSON.stringify(inLoops)}`);
+        } finally { rm(dir); }
+    });
 });
 
 // ============================================================================

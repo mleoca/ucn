@@ -160,6 +160,16 @@ function formatStats(stats, options = {}) {
             for (const fn of items) {
                 const loc = `${fn.file}:${fn.startLine}`;
                 lines.push(`  ${String(fn.callCount).padStart(5)} calls  ${fn.name}  (${loc})`);
+                // MEDIUM-6: when the same name has multiple definitions across
+                // files (e.g. test helpers vs. test fixtures both named `tmp`),
+                // list the additional locations indented so the user knows
+                // the count covers ambiguous resolution.
+                if (Array.isArray(fn.locations) && fn.locations.length > 1) {
+                    for (let i = 1; i < fn.locations.length; i++) {
+                        const l = fn.locations[i];
+                        lines.push(`         ↳ also defined at ${l.file}:${l.startLine}`);
+                    }
+                }
             }
             if (total > items.length) {
                 lines.push(`  ... ${total - items.length} more (use --top=N to show more)`);

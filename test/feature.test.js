@@ -1497,14 +1497,100 @@ e();
             const stats1 = index1.getStats({ hot: true, top: 5 });
             const index2 = idx(dir);
             const stats2 = index2.getStats({ hot: true, top: 5 });
-            assert.deepStrictEqual(
-                stats1.hot.items.map(i => `${i.name}:${i.file}:${i.startLine}`),
-                stats2.hot.items.map(i => `${i.name}:${i.file}:${i.startLine}`),
-                'hot list ordering must be stable across builds'
+            // MEDIUM-6: same-named definitions across files now aggregate to
+            // a single hot row with a `locations` list. Stability check uses
+            // the row's primary file:startLine plus its location signatures.
+            const sig = (s) => s.hot.items.map(i =>
+                `${i.name}:${i.file}:${i.startLine}|locs=${(i.locations || []).map(l => `${l.file}:${l.startLine}`).join(',')}`
             );
+            assert.deepStrictEqual(sig(stats1), sig(stats2),
+                'hot list ordering must be stable across builds');
         } finally {
             rm(dir);
         }
+    });
+
+    // MEDIUM-6: same-named functions in different files must NOT each show
+    // the global call count duplicated. Aggregate to a single row with
+    // additional locations listed.
+    it('hot list aggregates same-named definitions in one row (MEDIUM-6)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': "function shared() { return 'a'; }\nmodule.exports = { shared };",
+            'b.js': "function shared() { return 'b'; }\nmodule.exports = { shared };",
+            'main.js': "const a = require('./a'); const b = require('./b');\na.shared(); a.shared(); a.shared();\n",
+        });
+        try {
+            const index = idx(dir);
+            const stats = index.getStats({ hot: true, top: 5 });
+            const sharedItems = stats.hot.items.filter(i => i.name === 'shared');
+            assert.strictEqual(sharedItems.length, 1,
+                `expected exactly one row for 'shared', got ${sharedItems.length}`);
+            const row = sharedItems[0];
+            assert.ok(Array.isArray(row.locations) && row.locations.length === 2,
+                `expected 2 locations on the aggregated row, got ${JSON.stringify(row.locations)}`);
+        } finally { rm(dir); }
+    });
+
+    // MEDIUM-7: invalid --top values must be caught at the execute layer.
+    it('execute(stats, top:"abc") rejects with helpful error', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function f() {}\nf();',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'stats', { hot: true, top: 'abc' });
+            assert.strictEqual(r.ok, false);
+            assert.match(r.error, /--top/);
+        } finally { rm(dir); }
+    });
+
+    it('execute(stats, top:0) returns empty hot list (no fallback to 10)', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function f() {}\nf(); f();',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'stats', { hot: true, top: 0 });
+            assert.strictEqual(r.ok, true);
+            assert.strictEqual(r.result.hot.items.length, 0,
+                'top=0 should produce empty list');
+            assert.strictEqual(r.result.hot.top, 0);
+        } finally { rm(dir); }
+    });
+
+    it('execute(stats, top:-1) rejects negative input (treated as 0 or error)', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function f() {}\nf();',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'stats', { hot: true, top: -1 });
+            // Treat negative as "show nothing" — empty list, not fallback to 10.
+            assert.strictEqual(r.ok, true);
+            assert.strictEqual(r.result.hot.items.length, 0);
+        } finally { rm(dir); }
+    });
+
+    it('execute(stats, top:99999) caps at 10000 with note', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function f() {}\nf();',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'stats', { hot: true, top: 99999 });
+            assert.strictEqual(r.ok, true);
+            assert.ok(r.note && /10000/.test(r.note),
+                `expected cap note, got: ${r.note}`);
+        } finally { rm(dir); }
     });
 
     it('formatStats renders hot section', () => {
@@ -1581,6 +1667,56 @@ send(\`\${HOST}/api\`, JSON.stringify({}));
         } finally {
             rm(dir);
         }
+    });
+
+    // MEDIUM-8: when only test-file callers exist, default `example` returns
+    // null + a count of excluded usages so the user knows --include-tests
+    // would surface them.
+    it('example signals excluded test-file callers when no production callers exist', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': "function tmp(opts) { return opts; }\nmodule.exports = { tmp };",
+            'test/lib.test.js': "const { tmp } = require('../lib');\ntmp({foo:1});\ntmp({foo:2});\n",
+        });
+        try {
+            const index = idx(dir);
+            const result = index.example('tmp');
+            // No examples in production code, but tests exist.
+            assert.ok(result, 'should return a result with excluded count');
+            assert.strictEqual(result.best, null);
+            assert.ok(result.excludedTestCalls >= 1,
+                `expected excludedTestCalls > 0, got ${JSON.stringify(result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('example with includeTests:true returns test-file usages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': "function tmp(opts) { return opts; }\nmodule.exports = { tmp };",
+            'test/lib.test.js': "const { tmp } = require('../lib');\ntmp({foo:1});\n",
+        });
+        try {
+            const index = idx(dir);
+            const result = index.example('tmp', { includeTests: true });
+            assert.ok(result && result.best,
+                `expected an example with includeTests, got ${JSON.stringify(result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('execute(example) with no callers includes user-friendly note', () => {
+        const { execute } = require('../core/execute');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': "function tmp(opts) { return opts; }\nmodule.exports = { tmp };",
+            'test/lib.test.js': "const { tmp } = require('../lib');\ntmp({foo:1});\n",
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'example', { name: 'tmp' });
+            assert.ok(r.ok, 'execute should succeed (with note)');
+            assert.ok(r.note && /test-file/.test(r.note),
+                `expected note mentioning test-file, got: ${r.note}`);
+        } finally { rm(dir); }
     });
 
     it('--top limits the number of clusters returned', () => {
@@ -1710,6 +1846,32 @@ describe('Feature: --git enrichment on about/brief', () => {
             const info = getGitInfo(dir, 'lib.js');
             assert.strictEqual(info.available, false, 'should be unavailable');
             assert.ok(info.error, 'should have error message');
+            // MEDIUM-9: error must be user-friendly, not a leaked shell command.
+            assert.ok(!info.error.startsWith('Command failed:'),
+                `error should be user-friendly, got: ${info.error}`);
+            assert.strictEqual(info.error, 'Not a git repository');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    // MEDIUM-9: error message for tracked-but-untracked file inside a repo.
+    it('getGitInfo returns user-friendly error for untracked file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}',
+        });
+        try {
+            initGitRepo(dir); // Creates repo + commits package.json+lib.js
+            // Add a fresh file that isn't yet committed
+            const fs = require('fs');
+            fs.writeFileSync(require('path').join(dir, 'fresh.js'), 'function f(){}');
+            _clearCache();
+            const info = getGitInfo(dir, 'fresh.js');
+            assert.strictEqual(info.available, false);
+            assert.ok(!info.error.startsWith('Command failed:'),
+                `error should be user-friendly, got: ${info.error}`);
+            assert.strictEqual(info.error, 'File not tracked');
         } finally {
             rm(dir);
         }

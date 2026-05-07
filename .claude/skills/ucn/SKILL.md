@@ -173,6 +173,7 @@ ucn entrypoints --file=routes/           # Scoped to files
 | File-level dependency tree | `ucn graph <file> --depth=1` | Visual import tree. Setting `--depth=N` expands all children. Can be noisy — use depth=1 for large projects. For function-level flow, use `trace` instead |
 | Are there circular dependencies? | `ucn circular-deps` | Detect circular import chains. `--file=<pattern>` filters to cycles involving a file. `--exclude=test` skips test files |
 | What are the framework entry points? | `ucn entrypoints` | Lists all detected routes, DI beans, tasks, etc. Filter: `--type=http`, `--framework=express` |
+| Polyglot route ↔ request matching | `ucn endpoints --bridge` | Server routes (Express/Fastify/Koa/NestJS/Flask/FastAPI/Spring/JAX-RS/Gin/Echo/Chi/Fiber/axum/actix/Next.js) ↔ client requests (fetch/axios/requests/httpx/RestTemplate/WebClient/reqwest). Match confidence: EXACT, PARTIAL, UNCERTAIN. Filter with `--method`, `--prefix`, `--server-only`, `--client-only`, `--unmatched`, `--hide-uncertain` |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names. Scope with `--file`, `--class-name`, `--exclude`, `--calls-only` |
 | Extract specific lines from a file | `ucn lines --file=<file> --range=10-20` | Pull a line range without reading the whole file |
 | Find type definitions | `ucn typedef <name>` | Interfaces, enums, structs, traits, type aliases |
@@ -230,7 +231,7 @@ ucn [target] <command> [name] [--flags]
 | `--functions` | Show per-function line counts in `stats` (complexity audit) |
 | `--hot` | List top N most-called functions in `stats` (use with `--top=N`, default 10). Best orientation primitive when entering a new repo |
 | `--diverse` | Cluster `example` call sites by argument shape and return one representative per cluster (use with `--top=N`, default 3) |
-| `--git` | Attach git enrichment to `about` / `brief` / `context`: last commit (ISO + author) and recent change count (last 30 days). Skipped silently when not a git repo |
+| `--git` | Attach git enrichment to `about` / `brief`: last commit (ISO + author) and recent change count (last 30 days). Skipped silently when not a git repo |
 | `--json` | Machine-readable JSON output (wrapped in `{meta, data}`) |
 | `--code-only` | Exclude matches in comments and strings (`search`/`usages`) |
 | `--with-types` | Include related type definitions in `smart`/`about` output |
@@ -252,6 +253,13 @@ ucn [target] <command> [name] [--flags]
 | `--include-exported` | Include exported symbols in `deadcode` results |
 | `--include-decorated` | Include decorated/annotated symbols in `deadcode` results |
 | `--framework=X` | Filter `entrypoints` by framework (e.g., `express`, `spring`, `celery`) |
+| `--bridge` | Match server routes to client requests (`endpoints`). Confidence tiers: EXACT, PARTIAL, UNCERTAIN |
+| `--server-only` | Only list server routes (`endpoints`) |
+| `--client-only` | Only list client requests (`endpoints`) |
+| `--unmatched` | Only show routes/requests with no match (`endpoints`, pair with `--bridge`) |
+| `--method=GET` | Filter by HTTP method (`endpoints`) |
+| `--prefix=/api` | Filter routes/requests by path prefix (`endpoints`) |
+| `--hide-uncertain` | Hide UNCERTAIN-confidence bridges (`endpoints`) |
 | `--type=<kind>` | Structural search: `function`, `class`, `call`, `method`, `type`. Triggers index query instead of text grep |
 | `--param=<name>` | Structural search: filter by parameter name or type (e.g., `--param=Request`) |
 | `--receiver=<name>` | Structural search: filter calls by receiver (e.g., `--receiver=db` for all db.* calls) |

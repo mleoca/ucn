@@ -411,8 +411,20 @@ const HANDLERS = {
             className: p.className,
             diverse: !!p.diverse,
             top: num(p.top, undefined),
+            // MEDIUM-8: thread includeTests so test-file callers are included
+            // when the user asks for them.
+            includeTests: !!p.includeTests,
         });
         if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
+        // MEDIUM-8: when no non-test examples found but test-file usages
+        // exist, return success with a note so the user knows to retry.
+        if (!result.best && result.excludedTestCalls > 0) {
+            return {
+                ok: true,
+                result,
+                note: `0 examples found (excluded ${result.excludedTestCalls} test-file usage${result.excludedTestCalls === 1 ? '' : 's'} — pass --include-tests to include them)`,
+            };
+        }
         return { ok: true, result };
     },
 
@@ -763,11 +775,16 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         const { endpoints } = require('./bridge');
+        // HIGH-2: --unmatched implies --bridge (we need bridges to know what's
+        // unmatched). Without bridges computed, we can't separate matched from
+        // unmatched on either side.
+        const wantUnmatched = !!p.unmatched;
+        const wantBridge = !!p.bridge || wantUnmatched;
         const result = endpoints(index, {
-            bridge: !!p.bridge,
+            bridge: wantBridge,
             serverOnly: !!p.serverOnly,
             clientOnly: !!p.clientOnly,
-            unmatched: !!p.unmatched,
+            unmatched: wantUnmatched,
             method: p.method ? String(p.method).toUpperCase() : null,
             prefix: p.prefix || null,
             showUncertain: !p.hideUncertain,
@@ -824,8 +841,12 @@ const HANDLERS = {
                 return acc;
             }, {}),
         };
-        // Pass `bridge` flag through to formatter via a result property
-        result._bridge = !!p.bridge;
+        // Pass display flags through to formatter via result properties.
+        // (HIGH-2: --unmatched implies --bridge for computation, but the
+        // formatter needs to know which mode the user ASKED for so it can
+        // suppress the "Matched" section in unmatched-only mode.)
+        result._bridge = wantBridge;
+        result._unmatched = wantUnmatched;
         return { ok: true, result, note };
     },
 
@@ -1164,12 +1185,42 @@ const HANDLERS = {
     },
 
     stats: (index, p) => {
+        // MEDIUM-7: validate `--top`. Previously non-numeric, zero, and
+        // negative values silently fell back to 10 — confusing when a typo
+        // hides a request to show MORE entries.
+        let top;
+        let note;
+        if (p.top != null) {
+            const raw = String(p.top).trim();
+            const n = Number(raw);
+            if (raw === '' || isNaN(n) || !isFinite(n)) {
+                return {
+                    ok: false,
+                    error: `Invalid --top value: must be a positive integer (got "${p.top}")`,
+                };
+            }
+            if (!Number.isInteger(n)) {
+                return {
+                    ok: false,
+                    error: `Invalid --top value: must be an integer (got ${n})`,
+                };
+            }
+            if (n <= 0) {
+                // Treat 0/negative as "show nothing" — return an empty hot list.
+                top = 0;
+            } else if (n > 10000) {
+                top = 10000;
+                note = `--top capped at 10000 (requested ${n})`;
+            } else {
+                top = n;
+            }
+        }
         const result = index.getStats({
             functions: p.functions || false,
             hot: p.hot || false,
-            top: num(p.top, undefined),
+            top,
         });
-        return { ok: true, result };
+        return note ? { ok: true, result, note } : { ok: true, result };
     },
 
     auditAsync: (index, p) => {

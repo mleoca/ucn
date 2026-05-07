@@ -744,14 +744,15 @@ function matchClientRequest(call, lang, allCallsInFile) {
     const conf = CLIENT_PATTERNS[lang];
     if (!conf) return null;
 
-    // 1) Bare-call patterns: fetch('/path')
+    // 1) Bare-call patterns: fetch('/path') or fetch('/path', { method: 'POST' })
     if (!call.isMethod && conf.bareCalls.has(call.name)) {
-        // fetch defaults to GET; second-arg method override is not parsed (would
-        // need full arg AST access — kept simple per spec). Tag as inferred.
-        // Special case: fetch('/path', { method: 'POST' })  — peek at the call's
-        // raw text via a sibling call or skip; we detect later if needed.
-        const inferredMethod = inferMethodFromFetchOptions(call) || 'GET';
-        const methodInferred = inferredMethod === 'GET';
+        // MEDIUM-5: parse-time captured `optionsMethod` from
+        // fetch(url, { method: 'POST' }) wins over default GET.
+        const explicitMethod = call.optionsMethod || inferMethodFromFetchOptions(call);
+        const inferredMethod = explicitMethod || 'GET';
+        // Method is "inferred" only when we fell through to the default GET;
+        // an explicit options.method is exact knowledge from the source.
+        const methodInferred = !explicitMethod;
         return { method: inferredMethod, framework: 'fetch', methodInferred };
     }
 

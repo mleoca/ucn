@@ -1841,25 +1841,34 @@ function auditAsync(index, options = {}) {
         const issues = [];
 
         // Build a "is this name provably async" lookup from the symbol table.
-        // We accept a name only if EVERY callable definition with that name is
-        // async — this avoids flagging ambiguous calls like `Map.get()` where
-        // the project also has a `DataService.get()` async method.
-        // Names with at least one non-async definition are considered ambiguous
-        // and excluded (the audit prefers false negatives over false positives).
+        // We accept a global name only if EVERY callable definition with that
+        // name is async — this avoids flagging ambiguous calls like `Map.get()`
+        // where the project also has a `DataService.get()` async method.
+        //
+        // BUT: we ALSO track per-file async-name resolution. JavaScript/Python
+        // module scope means a same-file definition shadows globals, so when
+        // a caller's file contains an async definition with that name, that
+        // definition wins regardless of what other files contain. This is
+        // critical to avoid silent false-negatives caused by name collisions
+        // across files (HIGH-1 fix).
         const asyncNames = new Set();
+        const ambiguousNames = new Set(); // any non-async def exists somewhere
+        const callableDefs = (defs) => defs.filter(d => d && (
+            d.type === 'function' || d.type === 'method' ||
+            d.type === 'constructor' || d.type === 'arrow' ||
+            d.params != null || d.paramsStructured != null
+        ));
+        const isDefAsync = (d) => d.isAsync === true ||
+            (Array.isArray(d.modifiers) && d.modifiers.includes('async'));
         for (const [name, defs] of index.symbols) {
-            // Filter to definitions that look callable (function/method/etc.).
-            const callable = defs.filter(d => d && (
-                d.type === 'function' || d.type === 'method' ||
-                d.type === 'constructor' || d.type === 'arrow' ||
-                d.params != null || d.paramsStructured != null
-            ));
+            const callable = callableDefs(defs);
             if (callable.length === 0) continue;
-            const allAsync = callable.every(d =>
-                d.isAsync === true ||
-                (Array.isArray(d.modifiers) && d.modifiers.includes('async'))
-            );
-            if (allAsync) asyncNames.add(name);
+            const allAsync = callable.every(isDefAsync);
+            if (allAsync) {
+                asyncNames.add(name);
+            } else if (callable.some(isDefAsync)) {
+                ambiguousNames.add(name);
+            }
         }
 
         // Helper: does the call site (callExpr node) sit in a "fire-and-forget"
@@ -1942,13 +1951,29 @@ function auditAsync(index, options = {}) {
             const language = fileEntry.language;
 
             // Collect async functions from the file's symbol list.
+            // Also build a per-file set of names that are async in THIS file —
+            // these win over the global "all-or-nothing" check (HIGH-1 fix).
+            // JS/Python module scope means a same-file def shadows imports of
+            // the same name, so a sync def of `helper` elsewhere in the project
+            // shouldn't make `helper()` ambiguous in a file that defines
+            // `async function helper()` locally.
             const asyncFns = [];
+            const fileAsyncNames = new Set();
+            const fileAnyDefNames = new Set();
             if (Array.isArray(fileEntry.symbols)) {
                 for (const sym of fileEntry.symbols) {
                     if (!sym || !sym.startLine || !sym.endLine) continue;
                     const isAsync = sym.isAsync === true ||
                                     (Array.isArray(sym.modifiers) && sym.modifiers.includes('async'));
                     if (isAsync) asyncFns.push(sym);
+                    if (sym.name && (
+                        sym.type === 'function' || sym.type === 'method' ||
+                        sym.type === 'constructor' || sym.type === 'arrow' ||
+                        sym.params != null || sym.paramsStructured != null
+                    )) {
+                        fileAnyDefNames.add(sym.name);
+                        if (isAsync) fileAsyncNames.add(sym.name);
+                    }
                 }
             }
             if (asyncFns.length === 0) return;
@@ -2060,8 +2085,27 @@ function auditAsync(index, options = {}) {
                             }
                             if (calleeName) {
                                 // Check whether the callee is provably async.
-                                const calleeIsAsync = asyncNames.has(calleeName) ||
-                                                      _KNOWN_ASYNC_CALLEES.has(calleeName);
+                                // File-local resolution wins (HIGH-1 fix): if
+                                // THIS file defines an async function with that
+                                // name, the call resolves to it regardless of
+                                // what other files contain. This avoids silent
+                                // false-negatives caused by name collisions
+                                // (e.g., async helper in bad.js + sync helper
+                                // in unrelated.js — bad.js's helper() should
+                                // still be flagged).
+                                let calleeIsAsync;
+                                if (fileAsyncNames.has(calleeName)) {
+                                    calleeIsAsync = true;
+                                } else if (fileAnyDefNames.has(calleeName)) {
+                                    // Same-file def exists and isn't async →
+                                    // local def shadows globals → not async.
+                                    calleeIsAsync = false;
+                                } else {
+                                    // No same-file def — fall back to global
+                                    // all-or-nothing check.
+                                    calleeIsAsync = asyncNames.has(calleeName) ||
+                                                    _KNOWN_ASYNC_CALLEES.has(calleeName);
+                                }
                                 if (calleeIsAsync) {
                                     // Skip method calls in structural type
                                     // systems (JS/TS/Python). Without receiver

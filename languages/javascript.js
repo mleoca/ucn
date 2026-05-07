@@ -1172,6 +1172,46 @@ function findCallsInCode(code, parser) {
         return null;
     };
 
+    // MEDIUM-5: extract HTTP method from `fetch(url, { method: 'POST' })`
+    // and similar XHR/Request-init shapes. Returns the upper-cased method
+    // string or null. Looks at argument index `argIdx` (default 1, the
+    // options object after the URL).
+    const getOptionsMethod = (callNode, argIdx = 1) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return null;
+        // Walk named children and pick the argIdx-th non-comment node.
+        let idx = 0;
+        let target = null;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            if (idx === argIdx) { target = arg; break; }
+            idx++;
+        }
+        if (!target || target.type !== 'object') return null;
+        for (let i = 0; i < target.namedChildCount; i++) {
+            const prop = target.namedChild(i);
+            if (prop.type !== 'pair') continue;
+            const keyNode = prop.childForFieldName('key');
+            const valNode = prop.childForFieldName('value');
+            if (!keyNode || !valNode) continue;
+            // Key may be `method`, `'method'`, or `"method"`.
+            let keyName = keyNode.text;
+            if (keyNode.type === 'string' || keyNode.type === 'property_identifier') {
+                keyName = keyName.replace(/^['"`]|['"`]$/g, '');
+            }
+            if (keyName !== 'method') continue;
+            // Value must be a literal string. Skip variables / expressions
+            // (we can't statically resolve those).
+            const v = _extractStringArg(valNode);
+            if (v && !v.interp && typeof v.value === 'string' && v.value.length > 0) {
+                return v.value.toUpperCase();
+            }
+            return null;
+        }
+        return null;
+    };
+
     // Helper to check if a node is a non-callable literal
     const isNonCallableInit = (node) => {
         // Primitive literals
@@ -1389,6 +1429,10 @@ function findCallsInCode(code, parser) {
                 const resolvedName = typeof alias === 'string' ? alias : undefined;
                 const resolvedNames = Array.isArray(alias) ? alias : undefined;
                 const firstArg = getFirstStringArg(node);
+                // MEDIUM-5: capture explicit method for fetch(url, { method }).
+                const optionsMethod = funcNode.text === 'fetch'
+                    ? getOptionsMethod(node, 1)
+                    : null;
                 calls.push({
                     name: funcNode.text,
                     ...(resolvedName && { resolvedName }),
@@ -1397,7 +1441,8 @@ function findCallsInCode(code, parser) {
                     isMethod: false,
                     enclosingFunction,
                     uncertain,
-                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                    ...(optionsMethod && { optionsMethod })
                 });
             } else if (funcNode.type === 'member_expression') {
                 // Method call: obj.foo() or foo.call/apply/bind()

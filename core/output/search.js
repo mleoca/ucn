@@ -151,6 +151,13 @@ function formatStructuralSearchJson(result) {
  * Format example result as text
  */
 function formatExample(result, name) {
+    // MEDIUM-8: when only test-file callers exist and the user didn't ask
+    // for them, surface that fact explicitly instead of saying nothing was
+    // found.
+    if (result && !result.best && result.excludedTestCalls > 0) {
+        const n = result.excludedTestCalls;
+        return `No call examples found for "${name}" (excluded ${n} test-file usage${n === 1 ? '' : 's'} — pass --include-tests to include them)`;
+    }
     if (!result || !result.best) return `No call examples found for "${name}"`;
 
     // Diverse mode: render one block per cluster representative.

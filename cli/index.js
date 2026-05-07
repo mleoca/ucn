@@ -121,7 +121,11 @@ function parseFlags(tokens) {
         withTypes: tokens.includes('--with-types') || undefined,
         expand: tokens.includes('--expand') || undefined,
         depth: getValueFlag('--depth'),
+        // `top` is the parsed numeric value (NaN/0 default → falsy). `topRaw`
+        // preserves the original string so downstream validators can produce
+        // helpful errors for "abc"/"-1"/"0" instead of silently defaulting.
         top: parseInt(getValueFlag('--top') || '0'),
+        topRaw: getValueFlag('--top'),
         context: parseInt(getValueFlag('--context') || '0'),
         direction: getValueFlag('--direction'),
         addParam: getValueFlag('--add-param'),
@@ -528,7 +532,7 @@ function runProjectCommand(rootDir, command, arg) {
         // Map from camelCase flag name to CLI flag string
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
         // Flags that are global (not command-specific) — skip warning for these
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
             // Skip unset values (undefined, null, 0, empty array) — but NOT false (explicit negation)
@@ -579,14 +583,16 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'example': {
-            const { ok, result, error } = execute(index, 'example', {
+            const { ok, result, error, note } = execute(index, 'example', {
                 name: arg,
                 file: flags.file,
                 className: flags.className,
                 diverse: flags.diverse,
                 top: flags.top || undefined,
+                includeTests: flags.includeTests,
             });
             if (!ok) fail(error);
+            if (note) console.error(note);
             const displayName = nameForDisplay(arg);
             printOutput(result,
                 r => output.formatExampleJson(r, displayName),
@@ -954,18 +960,24 @@ function runProjectCommand(rootDir, command, arg) {
             if (note) console.error(note);
             printOutput(result,
                 output.formatEndpointsJson,
-                r => output.formatEndpoints(r, { bridge: r._bridge })
+                r => output.formatEndpoints(r, { bridge: r._bridge, unmatched: r._unmatched })
             );
             break;
         }
 
         case 'stats': {
-            const { ok, result, error } = execute(index, 'stats', {
+            // MEDIUM-7: pass the raw --top value when present so the executor
+            // can validate it and surface "Invalid --top" errors. Without
+            // this, --top=abc is silently coerced to NaN → undefined and
+            // the user gets the default (10) with no warning.
+            const topVal = flags.topRaw != null ? flags.topRaw : (flags.top || undefined);
+            const { ok, result, error, note } = execute(index, 'stats', {
                 functions: flags.functions,
                 hot: flags.hot,
-                top: flags.top || undefined,
+                top: topVal,
             });
             if (!ok) fail(error);
+            if (note) console.error(note);
             printOutput(result,
                 output.formatStatsJson,
                 r => output.formatStats(r, { top: flags.top })
@@ -1114,7 +1126,7 @@ function runGlobCommand(pattern, command, arg) {
     const applicableFlags = FLAG_APPLICABILITY[canonical];
     if (applicableFlags) {
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
             if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
@@ -1274,7 +1286,7 @@ function runGlobCommand(pattern, command, arg) {
             printOutput(result, output.formatEntrypointsJson, output.formatEntrypoints);
             break;
         case 'endpoints':
-            printOutput(result, output.formatEndpointsJson, r => output.formatEndpoints(r, { bridge: r._bridge }));
+            printOutput(result, output.formatEndpointsJson, r => output.formatEndpoints(r, { bridge: r._bridge, unmatched: r._unmatched }));
             break;
         case 'diffImpact':
             printOutput(result, output.formatDiffImpactJson, output.formatDiffImpact);
@@ -1305,6 +1317,8 @@ function runGlobCommand(pattern, command, arg) {
 // ============================================================================
 
 
+// Single source of truth for the public CLI help. README points here ("Run `ucn --help`")
+// rather than carrying a copy — keep it that way.
 function printUsage() {
     console.log(`UCN - Universal Code Navigator
 
@@ -1411,6 +1425,14 @@ Common Flags:
   --git               Attach git enrichment (last modified, author, recent commits) to about/brief
   --include-decorated Include decorated/annotated symbols in deadcode
   --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
+  --bridge            Match server routes to client requests (endpoints command).
+                        Confidence tiers: EXACT, PARTIAL, UNCERTAIN
+  --server-only       Only list server routes (endpoints command)
+  --client-only       Only list client requests (endpoints command)
+  --unmatched         Only show routes/requests with no match (endpoints, pair with --bridge)
+  --method=X          Filter by HTTP method (endpoints, e.g., --method=POST)
+  --prefix=X          Filter routes/requests by path prefix (endpoints, e.g., --prefix=/api)
+  --hide-uncertain    Hide UNCERTAIN-confidence bridges (endpoints command)
   --exact             Exact name match only (find, typedef)
   --calls-only        Only show call/test-case matches (tests)
   --case-sensitive    Case-sensitive text search (search)
@@ -1584,7 +1606,7 @@ const INTERACTIVE_DISPATCH = {
     trace:        { params: 'name', format: (r) => output.formatTrace(r) },
     reverseTrace: { params: 'name', format: (r) => output.formatReverseTrace(r) },
     related:      { params: 'name', format: (r, _a, f) => output.formatRelated(r, { all: f.all, top: f.top }) },
-    example:      { params: (a, f) => ({ name: a, file: f.file, className: f.className, diverse: f.diverse, top: f.top || undefined }), format: (r, a) => output.formatExample(r, a) },
+    example:      { params: (a, f) => ({ name: a, file: f.file, className: f.className, diverse: f.diverse, top: f.top || undefined, includeTests: f.includeTests }), format: (r, a) => output.formatExample(r, a) },
     brief:        { params: 'name', format: (r) => output.formatBrief(r) },
 
     // ── Finding Code ─────────────────────────────────────────────────
@@ -1608,7 +1630,7 @@ const INTERACTIVE_DISPATCH = {
     diffImpact:   { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit, all: f.all }), format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
     check:        { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit }), format: (r) => output.formatCheck(r) },
     entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude, includeTests: f.includeTests, limit: f.limit }), format: (r) => output.formatEntrypoints(r) },
-    endpoints:    { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit, framework: f.framework, bridge: f.bridge, serverOnly: f.serverOnly, clientOnly: f.clientOnly, unmatched: f.unmatched, method: f.method, prefix: f.prefix, hideUncertain: f.hideUncertain }), format: (r) => output.formatEndpoints(r, { bridge: r._bridge }) },
+    endpoints:    { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit, framework: f.framework, bridge: f.bridge, serverOnly: f.serverOnly, clientOnly: f.clientOnly, unmatched: f.unmatched, method: f.method, prefix: f.prefix, hideUncertain: f.hideUncertain }), format: (r) => output.formatEndpoints(r, { bridge: r._bridge, unmatched: r._unmatched }) },
 
     // ── Other ────────────────────────────────────────────────────────
     api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
@@ -1640,7 +1662,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
     const applicableFlags = FLAG_APPLICABILITY[command];
     if (applicableFlags) {
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw']);
         for (const [key, value] of Object.entries(iflags)) {
             if (globalFlags.has(key)) continue;
             if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
