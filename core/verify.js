@@ -968,9 +968,18 @@ function verify(index, name, options = {}) {
 
     // Get all call sites using findCallers for accurate resolution
     // (usages-based approach misses calls when className is set or local names collide)
+    // BUG-H3: accept user-supplied flag. The default keeps the historical behavior:
+    // findCallers always returns method calls (so callers like obj.method() are seen),
+    // and the secondary filter below drops them when verifying a non-method def
+    // (e.g. dict.get() vs standalone get()). Passing --include-methods opts out of
+    // the secondary filter so all method-style calls are treated as candidates.
+    const verifyIncludeMethods = options.includeMethods === true;
+    const verifyIncludeUncertain = options.includeUncertain ?? false;
     let callerResults = index.findCallers(name, {
+        // Always pass true to findCallers so method calls are visible — the secondary
+        // filter inside verify is the one that does the policy-driven filtering.
         includeMethods: true,
-        includeUncertain: false,
+        includeUncertain: verifyIncludeUncertain,
         targetDefinitions: [def],
     });
 
@@ -1113,7 +1122,11 @@ function verify(index, name, options = {}) {
         // Allow module-level calls only when:
         // 1. Receiver matches target file's basename (e.g., jobs == jobs for jobs.py)
         // 2. Receiver is an imported name (not a local variable)
-        if (analysis.isMethodCall && !defIsMethod) {
+        // BUG-H3: when verifyIncludeMethods is true, keep method-style calls that
+        // findCallers already accepted (binding/import resolution did the heavy lifting).
+        // The receiver-based filtering below is a secondary safety net — skip it when
+        // user explicitly opted into method calls.
+        if (analysis.isMethodCall && !defIsMethod && !verifyIncludeMethods) {
             const callReceiver = call.receiver;
             if (callReceiver && callReceiver === targetBasename) {
                 const importedNames = getImportedNames(call.file);

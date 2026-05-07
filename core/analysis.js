@@ -684,14 +684,20 @@ function impact(index, name, options = {}) {
     }
     const defIsMethod = def.isMethod || def.type === 'method' || def.className || def.receiver;
 
+    // BUG-H3: default includeMethods:true for impact ("what breaks if I change this"
+    // should include every callable site — including obj.method() invocations).
+    // User can disable with --no-include-methods to scope down.
+    const impactIncludeMethods = options.includeMethods ?? true;
+    const impactIncludeUncertain = options.includeUncertain ?? false;
+
     // Use findCallers for className-scoped or method queries (sophisticated binding resolution)
     // Fall back to usages-based approach for simple function queries (backward compatible)
     let callSites;
     if (options.className || defIsMethod) {
         // findCallers has proper method call resolution (self/this, binding IDs, receiver checks)
         let callerResults = index.findCallers(name, {
-            includeMethods: true,
-            includeUncertain: false,
+            includeMethods: impactIncludeMethods,
+            includeUncertain: impactIncludeUncertain,
             targetDefinitions: [def],
         });
 
@@ -835,9 +841,12 @@ function impact(index, name, options = {}) {
         index._clearTreeCache();
     } else {
         // Use findCallers (benefits from callee index) instead of usages() for speed
+        // BUG-H3: respect user-supplied includeMethods (defaults true above).
+        // For standalone functions, method-style calls (e.g. `obj.findCallers()`)
+        // resolve to the function when the receiver is a project object.
         const callerResults = index.findCallers(name, {
-            includeMethods: false,
-            includeUncertain: false,
+            includeMethods: impactIncludeMethods,
+            includeUncertain: impactIncludeUncertain,
             targetDefinitions: [def],
         });
         const targetBindingId = def.bindingId;
@@ -884,10 +893,13 @@ function impact(index, name, options = {}) {
         const targetDir = defLang === 'go' ? path.basename(path.dirname(def.file)) : null;
         for (const call of filteredCalls) {
             const analysis = index.analyzeCallSite(call, name);
+            // BUG-H3: when includeMethods is true, keep method-style calls
+            // (e.g. obj.findCallers() resolves to standalone findCallers via the
+            // bindingId path — findCallers already filters by targetDefinitions).
             // Skip method calls (obj.parse()) when target is a standalone function (parse())
             // For Go, allow calls where receiver matches the package directory name
             // (e.g., controller.FilterActive() where file is in pkg/controller/)
-            if (analysis.isMethodCall && !defIsMethod) {
+            if (analysis.isMethodCall && !defIsMethod && !impactIncludeMethods) {
                 if (targetDir) {
                     // Get receiver from parsed calls cache
                     const parsedCalls = index.getCachedCalls(call.file);
@@ -1039,11 +1051,22 @@ function about(index, name, options = {}) {
     }
 
     // Use resolveSymbol for consistent primary selection (prefers non-test files)
-    const { def: resolved } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
+    const { def: resolved, warnings: resolveWarnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     const primary = resolved || definitions[0];
     const others = definitions.filter(d =>
         d.relativePath !== primary.relativePath || d.startLine !== primary.startLine
     );
+
+    // BUG-M4: signal when about auto-picked a primary among multiple candidates
+    // and the user supplied no --file/--class disambiguator. The resolveSymbol
+    // warnings array already includes an "ambiguous" entry — surface it on the
+    // result so formatters can render the note.
+    const aboutWarnings = [];
+    if (!options.file && !options.className && resolveWarnings && resolveWarnings.length > 0) {
+        for (const w of resolveWarnings) {
+            if (w.type === 'ambiguous') aboutWarnings.push(w);
+        }
+    }
 
     // Use the actual symbol name (may differ from query if fuzzy matched)
     const symbolName = primary.name;
@@ -1064,12 +1087,24 @@ function about(index, name, options = {}) {
     let allCallers = null;
     let allCallees = null;
     let aboutConfFiltered = 0;
-    if (primary.type === 'function' || primary.params !== undefined) {
+    // BUG-M3: include classes/structs/interfaces — `new Foo()` invocations are
+    // tracked as calls in the parser (isConstructor:true) and findCallers resolves
+    // them. Without this, `about ClassName` produced "USAGES: 5 calls" but no
+    // CALLERS section, hiding the actual constructor sites.
+    const CALLABLE_TYPES = new Set(['function', 'method', 'static', 'constructor',
+        'public', 'abstract', 'classmethod', 'class', 'struct', 'interface',
+        'type', 'enum', 'trait', 'impl', 'record', 'namespace']);
+    if (CALLABLE_TYPES.has(primary.type) || primary.params !== undefined) {
         // Use maxResults to limit file iteration (with buffer for exclude filtering)
         // Reduce buffer for highly ambiguous names (many definitions = more noise, less value per caller)
         const callerMultiplier = definitions.length > 5 ? 1.5 : 3;
         const callerCap = maxCallers === Infinity ? undefined : Math.ceil(maxCallers * callerMultiplier);
-        allCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap });
+        // BUG-H1: pass needsTotal:true so the returned array's `totalCount` reflects the
+        // true pre-truncation candidate count. Without this, `about` would report the
+        // capped count as the total (e.g. "showing 10 of 30" when there are actually 153).
+        const rawCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap, needsTotal: true });
+        const shadowCallers = rawCallers.shadowEntries || [];
+        allCallers = rawCallers;
         // Apply exclude filter before slicing
         if (options.exclude && options.exclude.length > 0) {
             allCallers = allCallers.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
@@ -1081,6 +1116,16 @@ function about(index, name, options = {}) {
             allCallers = callerResult.kept;
             aboutConfFiltered += callerResult.filtered;
         }
+        // BUG-H1: post-filter total — count the un-enriched shadow candidates that
+        // also pass the same filters, so the displayed "showing N of <total>"
+        // matches what `context` (which runs unbounded) would have shown.
+        let shadowSurvivors = shadowCallers;
+        if (options.exclude && options.exclude.length > 0) {
+            shadowSurvivors = shadowSurvivors.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+        }
+        if (options.minConfidence > 0) {
+            shadowSurvivors = shadowSurvivors.filter(c => (c.confidence || 0) >= options.minConfidence);
+        }
         // Tag reachability on raw caller objects so we can preserve the field on the projection.
         // Reachability is computed once per index and cached.
         const aboutReachable = computeReachability(index);
@@ -1089,7 +1134,19 @@ function about(index, name, options = {}) {
         // Optional: filter to unreachable-only callers
         if (options.unreachableOnly) {
             allCallers = allCallers.filter(c => !c.reachable);
+            // Apply same filter to shadows using their callerStartLine/file when available.
+            // Shadows lack callerStartLine, so they're treated as reachable=false (conservative,
+            // matches the historical behavior where un-enriched callers had no reachability info).
+            // We exclude all shadows here since unreachableOnly is a niche flag and the cost of
+            // building a perfect estimate isn't justified.
+            shadowSurvivors = []; // conservative — drop shadows for unreachableOnly mode
         }
+        // Stash the post-filter total on allCallers so the result builder can use it.
+        Object.defineProperty(allCallers, '__postFilterTotal', {
+            value: allCallers.length + shadowSurvivors.length,
+            enumerable: false,
+            configurable: true,
+        });
 
         callers = allCallers.slice(0, maxCallers).map(c => ({
             file: c.relativePath,
@@ -1106,7 +1163,17 @@ function about(index, name, options = {}) {
             reachable: c.reachable,
         }));
 
-        allCallees = index.findCallees(primary, { includeMethods, includeUncertain: options.includeUncertain });
+        // BUG-M3: classes/structs/interfaces don't have meaningful callees
+        // (their body is methods, not a sequence of calls). Skip findCallees
+        // for type definitions — callers (constructor/instantiation sites)
+        // are the useful signal here.
+        const TYPE_DEF_KINDS = new Set(['class', 'struct', 'interface', 'type',
+            'enum', 'trait', 'impl', 'record', 'namespace']);
+        if (TYPE_DEF_KINDS.has(primary.type)) {
+            allCallees = [];
+        } else {
+            allCallees = index.findCallees(primary, { includeMethods, includeUncertain: options.includeUncertain });
+        }
         // Apply exclude filter before slicing
         if (options.exclude && options.exclude.length > 0) {
             allCallees = allCallees.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
@@ -1236,7 +1303,10 @@ function about(index, name, options = {}) {
         usages: usagesByType,
         totalUsages: usagesByType.calls + usagesByType.imports + usagesByType.references,
         callers: {
-            total: allCallers?.length ?? 0,
+            // BUG-H1: prefer post-filter total (computed from enriched + shadow candidates).
+            // Falls back to allCallers.length when the post-filter total wasn't computed
+            // (e.g., when primary is not a function and findCallers wasn't called).
+            total: allCallers?.__postFilterTotal ?? allCallers?.length ?? 0,
             top: callers,
             histogram: buildHistogram(allCallers),
         },
@@ -1255,6 +1325,9 @@ function about(index, name, options = {}) {
         code,
         includeMethods,
         ...(aboutConfFiltered > 0 && { confidenceFiltered: aboutConfFiltered }),
+        // BUG-M4: surface ambiguous-resolution warnings so formatters can render
+        // a "auto-selected ... pass --file to choose" note.
+        ...(aboutWarnings.length > 0 && { warnings: aboutWarnings }),
         completeness: detectCompleteness(index)
     };
 

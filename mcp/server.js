@@ -33,7 +33,7 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName, FLAG_APPLICABILITY, REVERSE_PARAM_MAP, generateMcpParamSection } = require('../core/registry');
+const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName, FLAG_APPLICABILITY, REVERSE_PARAM_MAP, generateMcpParamSection, resolveCommand } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { ExpandCache } = require('../core/expand-cache');
 
@@ -340,8 +340,12 @@ server.registerTool(
 
         // Strip params not applicable to this command (prevents silent no-ops).
         // Global/core params are always allowed — only optional flags are filtered.
+        // FLAG_APPLICABILITY is keyed by canonical (camelCase) names, but `command`
+        // is the MCP (snake_case) name — resolve to canonical first to avoid
+        // silently skipping multi-word commands (circular_deps, diff_impact, etc.).
         const strippedParams = [];
-        const applicable = FLAG_APPLICABILITY[command];
+        const canonicalCommand = resolveCommand(command, 'mcp') || command;
+        const applicable = FLAG_APPLICABILITY[canonicalCommand];
         if (applicable) {
             // Truly global options — apply to all commands (build/display control).
             // Command-specific params (name, term, stack, range, etc.) are in FLAG_APPLICABILITY.

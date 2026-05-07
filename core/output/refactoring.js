@@ -146,7 +146,19 @@ function formatVerify(result, options = {}) {
     lines.push('');
 
     // Summary
-    const status = result.mismatches === 0 ? '✓ All calls valid' : '✗ Mismatches found';
+    // BUG M1: don't claim "All calls valid" when 0 valid + N uncertain.
+    // Status precedence: mismatches > 0 → fail; total === 0 → empty;
+    // valid === 0 && uncertain > 0 → all-uncertain; valid > 0 && mismatches === 0 → ok.
+    let status;
+    if (result.mismatches > 0) {
+        status = `✗ ${result.mismatches} mismatch${result.mismatches === 1 ? '' : 'es'}`;
+    } else if (result.totalCalls === 0) {
+        status = 'ℹ No calls found';
+    } else if (result.valid === 0 && result.uncertain > 0) {
+        status = '⚠ All calls uncertain (no resolved sites)';
+    } else {
+        status = '✓ All calls valid';
+    }
     lines.push(`STATUS: ${status}`);
     lines.push(`  Total calls: ${result.totalCalls}`);
     lines.push(`  Valid: ${result.valid}`);

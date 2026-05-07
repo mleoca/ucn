@@ -312,6 +312,12 @@ const HANDLERS = {
             exclude: toExcludeArray(p.exclude),
             top: num(p.top, undefined),
             unreachableOnly: !!p.unreachableOnly,
+            // BUG-H3: pass through user-supplied flags. impact defaults to including
+            // method calls because "what breaks if I change this" should include
+            // every callable site, not just bare-name calls. User can disable with
+            // --no-include-methods.
+            ...(p.includeMethods !== undefined && { includeMethods: p.includeMethods }),
+            ...(p.includeUncertain !== undefined && { includeUncertain: p.includeUncertain }),
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const tNote = truncationNote(index);
@@ -1114,7 +1120,16 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
-        const result = index.verify(p.name, { file: p.file, className: p.className });
+        const result = index.verify(p.name, {
+            file: p.file,
+            className: p.className,
+            // BUG-H3: pass through user-supplied flags. Verify defaults to including
+            // method calls (current behavior) so call-arity checks reach all forms,
+            // including obj.method() invocations. User can disable with
+            // --no-include-methods.
+            ...(p.includeMethods !== undefined && { includeMethods: p.includeMethods }),
+            ...(p.includeUncertain !== undefined && { includeUncertain: p.includeUncertain }),
+        });
         return { ok: true, result };
     },
 

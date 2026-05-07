@@ -3032,6 +3032,193 @@ func main() {
             assert.strictEqual(ep.type, 'http');
         } finally { rm(dir); }
     });
+
+    // BUG M2: gin's library code `group.GET(relativePath, handler)` (where
+    // `relativePath` and `handler` are local parameters, not project symbols)
+    // must NOT be classified as HTTP routes — only project-defined symbols can
+    // be entry points. This aligns with bridge.js's extractServerRoutes.
+    it('BUG M2: Go library code with non-symbol callbacks is not flagged as HTTP route', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21',
+            // Mimics gin's routergroup.go staticFileHandler pattern: the call
+            // `group.GET(relativePath, handler)` uses LOCAL PARAMETERS, not
+            // project-defined functions. There is no project symbol named
+            // `relativePath` or `handler`, so neither should appear in HTTP Routes.
+            'lib.go': `package lib
+
+type RouterGroup struct{}
+
+func (group *RouterGroup) GET(path string, handlers ...interface{}) {}
+
+// Library implementation — relativePath is a parameter, NOT a project function.
+func (group *RouterGroup) staticFileHandler(relativePath string, handler func()) {
+    group.GET(relativePath, handler)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const httpEntries = result.filter(r => r.type === 'http');
+            const httpNames = httpEntries.map(r => r.name);
+            assert.ok(!httpNames.includes('relativePath'),
+                'parameter `relativePath` must not be flagged as HTTP route handler');
+            assert.ok(!httpNames.includes('handler'),
+                'parameter `handler` must not be flagged as HTTP route handler');
+        } finally { rm(dir); }
+    });
+
+    // BUG M2 (positive control): when the call HAS a literal-string path AND
+    // the handler resolves to a project symbol, the route IS detected.
+    it('BUG M2 (positive control): named handler with literal path IS detected', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/test\n\ngo 1.21',
+            'main.go': `package main
+
+import "net/http"
+
+func healthHandler(w http.ResponseWriter, r *http.Request) {}
+
+func main() {
+    http.HandleFunc("/health", healthHandler)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const httpNames = result.filter(r => r.type === 'http').map(r => r.name);
+            assert.ok(httpNames.includes('healthHandler'),
+                'named handler with literal path should be detected; got: ' + httpNames.join(', '));
+        } finally { rm(dir); }
+    });
+
+    // BUG M5: Express dual-purpose API — 1-arg `app.get('env')` is a config
+    // getter, not a route registration. Only ≥2-arg .get() calls are routes.
+    it('BUG M5: Express 1-arg app.get("env") (config getter) is NOT a route', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': `
+const express = require('express');
+const app = express();
+
+function listUsers(req, res) { res.json([]); }
+
+// Real route registration (2 args)
+app.get('/users', listUsers);
+
+// Config getter (1 arg) — must NOT be a route
+const isTest = app.get('env') === 'test';
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const httpEntries = result.filter(r => r.type === 'http');
+            const httpNames = httpEntries.map(r => r.name);
+            assert.ok(httpNames.includes('listUsers'),
+                'real route handler should be detected: ' + httpNames.join(', '));
+            // The config-getter call must not produce any spurious route entry.
+            // (No symbol named 'env' or 'isTest' exists, so the easiest check is
+            // counting HTTP entries — only one route exists.)
+            assert.strictEqual(httpEntries.length, 1,
+                `expected exactly 1 HTTP entry (listUsers), got ${httpEntries.length}: ` + httpNames.join(', '));
+        } finally { rm(dir); }
+    });
+
+    // BUG M5 (bridge.js): app.get("/path", handler) is a route, app.get("env") is not.
+    it('BUG M5: bridge.js endpoints excludes 1-arg app.get() config getter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.js': `
+const express = require('express');
+const app = express();
+
+app.get('/users', (req, res) => res.json([]));
+const x = app.get('env');
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { extractServerRoutes } = require('../core/bridge');
+            const routes = extractServerRoutes(index);
+            // Only 1 route expected — the 2-arg .get('/users', handler) call.
+            // The 1-arg .get('env') is a config getter and must be skipped.
+            assert.strictEqual(routes.length, 1,
+                `expected 1 route (got: ${routes.length}); routes: ${JSON.stringify(routes.map(r => `${r.method} ${r.path}`))}`);
+            assert.strictEqual(routes[0].path, '/users');
+        } finally { rm(dir); }
+    });
+
+    // BUG M6: shebang/CLI files — only the actual entry function (main, default
+    // export, top-level invocation target) should be marked as a runtime entry.
+    // Helpers defined in the same file must NOT all be marked as entry points.
+    it('BUG M6: cli.js with main() and helper() — only main is an entry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // 'cli.js' matches js-cli-main filePath pattern
+            'cli.js': `#!/usr/bin/env node
+
+function helper() { return 1; }
+function moreHelper() { return 2; }
+
+function main() {
+    helper();
+    moreHelper();
+}
+
+main();
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            // Filter to runtime entries (file-level pattern matches)
+            const cliEntries = result.filter(r =>
+                r.file.endsWith('cli.js') && r.framework === 'node' && r.type === 'runtime'
+            );
+            const cliNames = cliEntries.map(r => r.name);
+            assert.ok(cliNames.includes('main'),
+                '`main` should be a runtime entry: ' + cliNames.join(', '));
+            assert.ok(!cliNames.includes('helper'),
+                '`helper` should NOT be a runtime entry (over-classification): ' + cliNames.join(', '));
+            assert.ok(!cliNames.includes('moreHelper'),
+                '`moreHelper` should NOT be a runtime entry: ' + cliNames.join(', '));
+        } finally { rm(dir); }
+    });
+
+    // BUG M6 (default export variant): when the file exports a default function,
+    // that function (not its helpers) should be the entry point.
+    it('BUG M6: cli.js with default export — only the export is an entry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cli.js': `
+function helper() { return 1; }
+
+function entry() {
+    helper();
+}
+
+module.exports = entry;
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const cliEntries = result.filter(r =>
+                r.file.endsWith('cli.js') && r.framework === 'node' && r.type === 'runtime'
+            );
+            const cliNames = cliEntries.map(r => r.name);
+            // helper should not be marked as entry; entry (or default-export) should be
+            assert.ok(!cliNames.includes('helper'),
+                '`helper` should NOT be a runtime entry: ' + cliNames.join(', '));
+        } finally { rm(dir); }
+    });
 });
 
 // ============================================================================

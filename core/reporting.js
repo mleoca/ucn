@@ -109,28 +109,110 @@ function getStats(index, options = {}) {
             index.buildCalleeIndex();
         }
 
-        // Compute call counts per name from the calls cache (one pass).
-        // Each call record is (name, line, ...). We dedupe per file by (name,line)
-        // so a single source line that calls foo() once counts as one inbound
-        // call site even if the parser emits multiple records for it.
-        const callCountByName = new Map();
+        // BUG-H2: aggregate calls by *resolution kind* so a method call like
+        // `dict.get()` doesn't get attributed to a standalone `function get()`.
+        //
+        // Buckets per name:
+        //   bareNameCounts[name]     — calls with !isMethod (e.g. `get()`)
+        //   methodByReceiverType[t][name] — calls with isMethod and inferred receiverType
+        //   methodByName[name]       — all isMethod calls (fallback denominator)
+        //   importedReceiverCounts[name] — method calls whose receiver is an imported
+        //                                  module alias in the calling file (e.g.
+        //                                  `mod.foo()` where `mod` is a require alias).
+        //                                  These resolve like top-level function calls.
+        //
+        // self/this/cls/super counted under bareNameCounts since they always resolve
+        // to the enclosing class's method (handled in attribution below).
+        // We dedupe per file by (name, line) so multi-record call sites count once.
+        const SELF_RECEIVERS = new Set(['self', 'this', 'cls', 'super']);
+        const bareNameCounts = new Map();           // name -> count
+        const methodByReceiverType = new Map();      // receiverType -> Map(name -> count)
+        const methodByName = new Map();              // name -> count of all method calls
+        const selfMethodByName = new Map();          // name -> count of self/this.name() calls
+        const importedReceiverCounts = new Map();    // name -> count of `mod.name()` calls
+                                                     //          where mod is an import alias
+
+        // Pre-compute import-alias sets per file. Used to distinguish `mod.foo()`
+        // (resolves to top-level foo) from `obj.foo()` on a local variable.
+        const fileImportAliases = new Map();         // filePath -> Set<string> of alias names
+        for (const [filePath, fileEntry] of index.files) {
+            const aliases = new Set();
+            // importNames are the named imports/exports brought into this file.
+            // importAliases (when present) carry namespace import aliases (e.g.
+            // `import * as mod from "..."` → 'mod').
+            for (const n of (fileEntry.importNames || [])) aliases.add(n);
+            if (Array.isArray(fileEntry.importAliases)) {
+                for (const a of fileEntry.importAliases) {
+                    if (a && a.local) aliases.add(a.local);
+                }
+            }
+            fileImportAliases.set(filePath, aliases);
+        }
+
         for (const [filePath, entry] of index.callsCache) {
             if (!entry || !Array.isArray(entry.calls)) continue;
             const seenInFile = new Set();
+            const aliasesForFile = fileImportAliases.get(filePath) || new Set();
             for (const c of entry.calls) {
                 if (!c || !c.name) continue;
                 const key = `${c.name}::${c.line || 0}`;
                 if (seenInFile.has(key)) continue;
                 seenInFile.add(key);
-                callCountByName.set(c.name, (callCountByName.get(c.name) || 0) + 1);
-                // Also count under resolvedName when distinct (e.g. aliased imports)
+
+                const isSelfMethod = c.isMethod && SELF_RECEIVERS.has(c.receiver);
+                if (!c.isMethod) {
+                    // Bare-name call: foo() or pkg.Foo() (Go package call has receiver
+                    // but isMethod:false — keep counting under bareName since they
+                    // resolve like top-level functions in their package).
+                    bareNameCounts.set(c.name, (bareNameCounts.get(c.name) || 0) + 1);
+                } else if (isSelfMethod) {
+                    // self/this.foo() — attributed to the enclosing class's foo
+                    selfMethodByName.set(c.name, (selfMethodByName.get(c.name) || 0) + 1);
+                    methodByName.set(c.name, (methodByName.get(c.name) || 0) + 1);
+                } else {
+                    methodByName.set(c.name, (methodByName.get(c.name) || 0) + 1);
+                    // Module-alias receiver? `mod.foo()` where `mod` was imported here.
+                    // Treat the call as resolving to a top-level `foo` (the standalone
+                    // function exported from `mod`).
+                    if (c.receiver && aliasesForFile.has(c.receiver)) {
+                        importedReceiverCounts.set(c.name,
+                            (importedReceiverCounts.get(c.name) || 0) + 1);
+                    }
+                    if (c.receiverType) {
+                        let inner = methodByReceiverType.get(c.receiverType);
+                        if (!inner) {
+                            inner = new Map();
+                            methodByReceiverType.set(c.receiverType, inner);
+                        }
+                        inner.set(c.name, (inner.get(c.name) || 0) + 1);
+                    }
+                }
+                // Also account for resolvedName aliases (e.g. `import {foo as bar}; bar()`
+                // resolves to `foo`). Treat the resolved form the same way as the original.
                 if (c.resolvedName && c.resolvedName !== c.name) {
                     const rkey = `${c.resolvedName}::${c.line || 0}`;
                     if (!seenInFile.has(rkey)) {
                         seenInFile.add(rkey);
-                        callCountByName.set(c.resolvedName,
-                            (callCountByName.get(c.resolvedName) || 0) + 1);
+                        if (!c.isMethod) {
+                            bareNameCounts.set(c.resolvedName,
+                                (bareNameCounts.get(c.resolvedName) || 0) + 1);
+                        }
                     }
+                }
+            }
+        }
+
+        // For each name, count how many distinct classes/types own a method with
+        // that name (used to split method-call counts when receiverType is unknown).
+        const classOwnersByName = new Map();         // name -> Set<className>
+        for (const [name, symbols] of index.symbols) {
+            for (const sym of symbols) {
+                if (!FUNCTION_TYPES.has(sym.type)) continue;
+                const owner = sym.className || (sym.receiver && sym.receiver.replace(/^\*/, ''));
+                if (owner) {
+                    let s = classOwnersByName.get(name);
+                    if (!s) { s = new Set(); classOwnersByName.set(name, s); }
+                    s.add(owner);
                 }
             }
         }
@@ -141,14 +223,21 @@ function getStats(index, options = {}) {
         // duplicating the row and inflating the leaderboard. We now emit
         // one row per name with a `locations` list, so the user sees both
         // definitions but the count appears exactly once.
+        //
+        // BUG-H2: with the buckets above, attribute counts per (name, ownerClass):
+        //   - standalone function:   bareNameCounts[name]
+        //   - class method (Foo.bar): methodByReceiverType[Foo][bar]
+        //                              + selfMethodByName[bar] / numOwnerClasses
+        //                              + (residual unresolved method calls split evenly)
+        //   - falls back to methodByName[name] when no receiverType evidence exists.
         const hotList = [];
+        let usedHeuristicSplit = false;  // whether any row's count was approximated
         for (const [name, symbols] of index.symbols) {
-            const count = callCountByName.get(name) || 0;
-            if (count === 0) continue; // skip dead symbols
             // Filter to function-shaped definitions, dedup by file:line.
             const seenLoc = new Set();
             const locations = [];
             let representative = null;
+            const ownerClasses = new Set();      // classes/receivers that own this name
             for (const sym of symbols) {
                 if (!FUNCTION_TYPES.has(sym.type)) continue;
                 const relativePath = sym.relativePath ||
@@ -162,9 +251,57 @@ function getStats(index, options = {}) {
                     endLine: sym.endLine,
                     ...(sym.className && { className: sym.className }),
                 });
+                const owner = sym.className || (sym.receiver && sym.receiver.replace(/^\*/, ''));
+                if (owner) ownerClasses.add(owner);
                 if (!representative) representative = sym;
             }
             if (locations.length === 0) continue;
+
+            // Decide if this row represents a standalone function or a method.
+            // Mixed-type defs (e.g. "tmp" defined as both a function and a class method
+            // somewhere) are rare; for them we use the representative's flavor and
+            // accept that the count may be approximate.
+            const isMethodRow = ownerClasses.size > 0 &&
+                (!representative || !!representative.className || !!representative.receiver);
+
+            let count = 0;
+            let approximate = false;
+            if (!isMethodRow) {
+                // Standalone function (or top-level package call): use bare-name calls
+                // plus method-style calls where the receiver was an imported module
+                // alias (e.g. `lib.foo()` where `lib` is a require/import alias).
+                // We deliberately do NOT include arbitrary `obj.foo()` calls — those
+                // would inflate the count with unrelated method calls (the H2 bug).
+                count = (bareNameCounts.get(name) || 0) +
+                        (importedReceiverCounts.get(name) || 0);
+            } else {
+                // Method definition. Count only calls we can resolve to this owner:
+                //   - typed hits (receiverType matches one of this row's owner classes)
+                //   - self-method calls inside this owner class (counted via callerSymbol)
+                // Calls like `dict.get()` (no receiverType) are NOT attributed — they
+                // would inflate the count with builtin/unrelated method calls.
+                const selfShare = selfMethodByName.get(name) || 0;
+                const totalOwners = (classOwnersByName.get(name) || new Set()).size || 1;
+
+                let typedHits = 0;
+                for (const cls of ownerClasses) {
+                    const inner = methodByReceiverType.get(cls);
+                    if (inner) typedHits += (inner.get(name) || 0);
+                }
+
+                // Self-method calls: split evenly across owner classes (each class's own
+                // self.method() resolves to itself). When this row covers all owners
+                // (locations cover the only class that has this method), give the full
+                // self-share to this row.
+                const selfShareForRow = selfShare * (ownerClasses.size / totalOwners);
+
+                count = typedHits + Math.round(selfShareForRow);
+                // If we used the self-method heuristic across multiple classes, mark approximate.
+                if (selfShare > 0 && totalOwners > 1) approximate = true;
+            }
+            if (count === 0) continue; // skip dead symbols
+
+            if (approximate) usedHeuristicSplit = true;
             // Sort locations by (file, startLine) for stable display.
             locations.sort((a, b) =>
                 a.file.localeCompare(b.file) ||
@@ -184,6 +321,7 @@ function getStats(index, options = {}) {
                 startLine: primary.startLine,
                 endLine: primary.endLine,
                 callCount: count,
+                ...(approximate && { approximate: true }),
                 ...(locations.length > 1 && { locations }),
             });
         }
@@ -199,6 +337,9 @@ function getStats(index, options = {}) {
             top,
             total: hotList.length,
             items: hotList.slice(0, top),
+            ...(usedHeuristicSplit && {
+                note: 'Method-call counts approximated when receiver type was unknown — values within those rows may include unresolved calls split across owner classes.'
+            }),
         };
     }
 

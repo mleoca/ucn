@@ -432,6 +432,18 @@ function matchDecoratorOrModifier(symbol, language) {
 /**
  * Build a map of symbol names used as callbacks in framework route-registration calls.
  * Scans the calls cache for call-pattern-based framework detection.
+ *
+ * BUG M2: only treat a call as a route registration when its first argument is a
+ * literal string path. Library implementations such as gin's
+ * `group.GET(relativePath, handler)` (where `relativePath` is a parameter, not a
+ * literal) would otherwise capture local variable names (`relativePath`,
+ * `handler`, `urlPattern`) as if they were handler functions. The string-literal
+ * check aligns this with bridge.js's `extractServerRoutes` so the route count in
+ * `entrypoints` matches the route count in `endpoints`.
+ *
+ * For HTTP route patterns we additionally apply Express's dual-purpose API check
+ * (1-arg `app.get('env')` is a config getter, not a route registration).
+ *
  * @param {object} index - ProjectIndex
  * @returns {Map<string, { framework, type, patternId, method, file, line }>}
  */
@@ -458,6 +470,13 @@ function buildCallbackEntrypointMap(index) {
                 for (const pattern of relevantCallPatterns) {
                     if (pattern.receiverPattern.test(call.receiver) &&
                         pattern.methodPattern.test(call.name)) {
+                        // BUG M2 (interpolated paths): align with bridge.js's
+                        // extractServerRoutes — skip routes whose path is interpolated.
+                        if (pattern.type === 'http' && call.firstStringArg && call.firstStringArgInterp) continue;
+                        // BUG M5: Express dual-purpose APIs — 1-arg .get('env') is a
+                        // config getter, not a route registration.
+                        if (pattern.framework === 'express' &&
+                            typeof call.argCount === 'number' && call.argCount < 2) continue;
                         routeLines.set(call.line, { pattern, call });
                         break;
                     }
@@ -470,6 +489,15 @@ function buildCallbackEntrypointMap(index) {
                     if (!call.isFunctionReference && !call.isPotentialCallback) continue;
                     const route = routeLines.get(call.line);
                     if (!route) continue;
+
+                    // BUG M2: only treat as a handler if the name resolves to a
+                    // project-defined symbol. Library code like gin's
+                    //   `group.GET(relativePath, handler)`
+                    // (routergroup.go:185) has identifiers that are local parameters,
+                    // not exported handler functions — they must not be marked as
+                    // entry points. This aligns the HTTP Routes section with
+                    // bridge.js's extractServerRoutes.
+                    if (!index.symbols.has(call.name)) continue;
 
                     if (!result.has(call.name)) {
                         result.set(call.name, {
@@ -660,11 +688,100 @@ function detectEntrypoints(index, options = {}) {
         });
     }
 
-    // 3. Add file-level entry points (filePath / shebang). These run last so any
-    // more-specific framework label registered above wins; here we only catch
-    // symbols not already seen. Dedup by (file, name) — not (file, line, name) —
-    // so a generic file-level entry doesn't add a duplicate entry alongside a
-    // specific framework callback registered at a different line.
+    // 3. Add file-level entry points (filePath / shebang).
+    //
+    // BUG M6: previously this marked EVERY top-level symbol in a matched file
+    // as an entry point — way too broad for shebang/CLI files (where only the
+    // main entry function is the real runtime entry; helpers are just helpers).
+    //
+    // Tightened rule for `js-cli-main` and `js-shebang-main` patterns:
+    //   Only mark as entry points:
+    //     - Function whose name is `main` (case-sensitive — Node CLI idiom)
+    //     - The default export of the file (if present)
+    //     - Any function targeted by a top-level invocation (e.g. file calls
+    //       `main()` at module scope → main is the entry)
+    //     - Any function that contains a top-level `if (require.main === module)
+    //       { ... }` block (Node CLI idiom)
+    //
+    // For all other file-level patterns (js-test-file, next-page, python-main-module),
+    // continue using the broad behavior of marking every symbol as an entry.
+    //
+    // These run last so any more-specific framework label registered above wins;
+    // here we only catch symbols not already seen. Dedup by (file, name) — not
+    // (file, line, name) — so a generic file-level entry doesn't add a duplicate
+    // entry alongside a specific framework callback registered at a different line.
+    const NARROW_FILE_PATTERNS = new Set(['js-cli-main', 'js-shebang-main']);
+
+    // For each "narrow" matched file, compute the allowed entry symbol names.
+    // Falls back to permissive when nothing identifies a specific entry, to avoid
+    // hiding the entire file from reachability seeding.
+    const narrowAllowedByFile = new Map(); // absoluteFile -> Set<name> | null (null = allow all)
+    if (fileMatches.size > 0) {
+        for (const [filePath, fmatches] of fileMatches) {
+            const isNarrow = fmatches.every(fm => NARROW_FILE_PATTERNS.has(fm.pattern.id));
+            if (!isNarrow) continue;
+
+            const fileEntry = index.files.get(filePath);
+            if (!fileEntry) continue;
+
+            const allowed = new Set();
+
+            // (1) Function literally named 'main' is conventional for Node CLI idiom.
+            if (index.symbols.has('main')) {
+                for (const sym of index.symbols.get('main')) {
+                    if (sym.file === filePath) allowed.add('main');
+                }
+            }
+
+            // (2) Default export of the file, if any. Across language exporters
+            // we look at several shapes:
+            //   - `module.exports = X`         → type 'module.exports', name = X
+            //   - `export default X`           → isDefault / kind === 'default'
+            //   - Python __all__ single entry  → captured per-language
+            const exportDetails = fileEntry.exportDetails || [];
+            for (const e of exportDetails) {
+                if (!e) continue;
+                if (e.isDefault === true || e.kind === 'default' || e.name === 'default' ||
+                    e.type === 'module.exports' || e.type === 'export-default') {
+                    if (e.localName) allowed.add(e.localName);
+                    else if (e.name && e.name !== 'default') allowed.add(e.name);
+                }
+            }
+
+            // (3) Top-level invocation targets: any non-method call with no
+            //     enclosingFunction is module-load-time, so its callee is reachable.
+            //     We treat the callee as an entry point (the function being kicked off).
+            try {
+                const calls = getCachedCalls(index, filePath);
+                if (calls && calls.length > 0) {
+                    for (const c of calls) {
+                        if (c.enclosingFunction != null) continue;
+                        if (c.isMethod) continue;
+                        // Resolve callee names (handles aliased imports)
+                        const names = c.resolvedNames || (c.resolvedName ? [c.resolvedName] : [c.name]);
+                        for (const n of names) {
+                            if (index.symbols.has(n)) allowed.add(n);
+                        }
+                    }
+
+                    // (4) Function containing a top-level `if (require.main === module) { ... }`
+                    //     wrapping calls — captured by treating any non-method call whose
+                    //     enclosingFunction body is at top level. The simplest detection:
+                    //     scan calls inside any function whose body contains the require.main
+                    //     guard. We approximate via the same `enclosingFunction` data: if a
+                    //     function contains top-level invocation-style entries, it's typically
+                    //     identified by the (3) check above. Skip explicit (4) detection here —
+                    //     (3) already covers `if (require.main === module) { main(); }`.
+                }
+            } catch (_e) { /* best-effort */ }
+
+            // If we identified at least one specific entry, use that set.
+            // Otherwise fall back to permissive (null) so a CLI file with neither
+            // `main()` nor a clear default-export is still seeded somehow.
+            narrowAllowedByFile.set(filePath, allowed.size > 0 ? allowed : null);
+        }
+    }
+
     if (fileMatches.size > 0) {
         const seenByFileName = new Set();
         for (const r of results) {
@@ -674,6 +791,14 @@ function detectEntrypoints(index, options = {}) {
             for (const symbol of symbols) {
                 const fmatches = fileMatches.get(symbol.file);
                 if (!fmatches || fmatches.length === 0) continue;
+
+                // Apply narrow filter: for shebang/cli-main files, only allow
+                // identified entry symbols.
+                if (narrowAllowedByFile.has(symbol.file)) {
+                    const allowed = narrowAllowedByFile.get(symbol.file);
+                    if (allowed && !allowed.has(name)) continue;
+                }
+
                 const fileNameKey = `${symbol.file}:${name}`;
                 if (seenByFileName.has(fileNameKey)) continue;
                 const key = `${symbol.file}:${symbol.startLine}:${name}`;

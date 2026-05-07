@@ -205,6 +205,71 @@ describe('JSON formatters', () => {
         assert.strictEqual(json.mismatchDetails[0].actual, 0);
     });
 
+    // BUG M1: STATUS banner must reflect actual outcome, not just mismatch count.
+    describe('formatVerify status banner (BUG M1)', () => {
+        const baseResult = {
+            found: true,
+            function: 'parse',
+            file: 'src/parser.js',
+            startLine: 5,
+            signature: 'parse(input, options)',
+            expectedArgs: { min: 1, max: 2 },
+            mismatchDetails: [],
+            uncertainDetails: []
+        };
+
+        it('valid > 0, mismatches === 0 → "All calls valid"', () => {
+            const text = output.formatVerify({
+                ...baseResult,
+                totalCalls: 3, valid: 3, mismatches: 0, uncertain: 0
+            });
+            assert.match(text, /STATUS: ✓ All calls valid/);
+        });
+
+        it('valid === 0, uncertain > 0 → "All calls uncertain"', () => {
+            const text = output.formatVerify({
+                ...baseResult,
+                totalCalls: 9, valid: 0, mismatches: 0, uncertain: 9
+            });
+            assert.ok(!text.includes('✓ All calls valid'),
+                'must NOT show "All calls valid" when valid=0 and uncertain>0');
+            assert.match(text, /STATUS: ⚠ All calls uncertain/);
+        });
+
+        it('mismatches > 0 → "N mismatches"', () => {
+            const text = output.formatVerify({
+                ...baseResult,
+                totalCalls: 5, valid: 3, mismatches: 2, uncertain: 0,
+                mismatchDetails: [
+                    { file: 'a.js', line: 1, expression: 'parse()', expected: '1-2', actual: 0, args: [] },
+                    { file: 'b.js', line: 1, expression: 'parse()', expected: '1-2', actual: 0, args: [] }
+                ]
+            });
+            assert.match(text, /STATUS: ✗ 2 mismatches/);
+        });
+
+        it('mismatches === 1 → singular "mismatch"', () => {
+            const text = output.formatVerify({
+                ...baseResult,
+                totalCalls: 2, valid: 1, mismatches: 1, uncertain: 0,
+                mismatchDetails: [
+                    { file: 'a.js', line: 1, expression: 'parse()', expected: '1-2', actual: 0, args: [] }
+                ]
+            });
+            assert.match(text, /STATUS: ✗ 1 mismatch\b/);
+            assert.ok(!text.includes('mismatches'),
+                'singular "mismatch" should not have plural s');
+        });
+
+        it('totalCalls === 0 → "No calls found"', () => {
+            const text = output.formatVerify({
+                ...baseResult,
+                totalCalls: 0, valid: 0, mismatches: 0, uncertain: 0
+            });
+            assert.match(text, /STATUS: ℹ No calls found/);
+        });
+    });
+
     it('formatExampleJson structures output correctly', () => {
         const result = {
             best: {

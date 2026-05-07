@@ -1004,8 +1004,8 @@ describe('fix #13: plan rejects duplicate parameter', () => {
 // BUG #14: about and impact caller count consistency
 // ============================================================================
 
-describe('fix #14: about and impact caller counts match by default', () => {
-    it('about excludes obj.method() callers by default (matching impact)', () => {
+describe('fix #14 (updated by H3): about excludes obj.method, impact defaults to including', () => {
+    it('about excludes obj.method() callers by default; impact now includes them (H3)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function parse(text) { return text; }\nmodule.exports = { parse };',
@@ -1016,13 +1016,19 @@ describe('fix #14: about and impact caller counts match by default', () => {
             const index = idx(dir);
             const aboutResult = execute(index, 'about', { name: 'parse' });
             const impactResult = execute(index, 'impact', { name: 'parse' });
+            const impactNoMethods = execute(index, 'impact', { name: 'parse', includeMethods: false });
             assert.ok(aboutResult.ok);
             assert.ok(impactResult.ok);
-            // Both should agree on caller count by default
+            // BUG-H3: impact now defaults to includeMethods:true ("what breaks if I change this"
+            // should reach all callable sites). about keeps the old default (false for
+            // standalone functions). With includeMethods=false they agree again.
             const aboutCallers = aboutResult.result.callers.total;
             const impactCallers = impactResult.result.totalCallSites;
-            assert.strictEqual(aboutCallers, impactCallers,
-                `about (${aboutCallers}) and impact (${impactCallers}) should agree on default caller count`);
+            const impactNoMethodsCount = impactNoMethods.result.totalCallSites;
+            assert.strictEqual(aboutCallers, impactNoMethodsCount,
+                `about (${aboutCallers}) and impact --no-include-methods (${impactNoMethodsCount}) should agree`);
+            assert.ok(impactCallers >= impactNoMethodsCount,
+                `impact default (${impactCallers}) should include at least as many sites as --no-include-methods (${impactNoMethodsCount})`);
         } finally {
             rm(dir);
         }

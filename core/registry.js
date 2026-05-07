@@ -107,7 +107,7 @@ const FLAG_APPLICABILITY = {
     // Understanding code
     about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git'],
     context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
-    impact:       ['name', 'file', 'exclude', 'className', 'top', 'unreachableOnly', 'compact'],
+    impact:       ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'top', 'unreachableOnly', 'compact'],
     blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
@@ -137,7 +137,7 @@ const FLAG_APPLICABILITY = {
     graph:        ['file', 'depth', 'direction', 'all'],
     circularDeps: ['file', 'exclude'],
     // Refactoring
-    verify:       ['name', 'file', 'className'],
+    verify:       ['name', 'file', 'className', 'includeMethods', 'includeUncertain'],
     plan:         ['name', 'file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],
     check:        ['file', 'base', 'staged', 'limit'],

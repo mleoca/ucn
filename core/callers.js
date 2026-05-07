@@ -160,6 +160,11 @@ function findCallers(index, name, options = {}) {
     const pendingByFile = new Map(); // filePath -> [{ call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver }]
     let pendingCount = 0;
     const maxResults = options.maxResults;
+    // BUG-H1: when consumers (like `about`) need an accurate truncation header
+    // ("showing N of <total>"), they pass needsTotal:true so Phase 1 runs to
+    // completion. Phase 2 still only enriches the first `maxResults` items —
+    // file reads stay bounded, but the candidate count reflects the true total.
+    const needsTotal = !!options.needsTotal;
     const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
 
     // Use inverted callee index to skip files that don't contain calls to this name
@@ -169,8 +174,8 @@ function findCallers(index, name, options = {}) {
         : index.files;
 
     for (const [filePath, fileEntry] of fileIterator) {
-        // Early exit when maxResults is reached
-        if (maxResults && pendingCount >= maxResults) break;
+        // Early exit when maxResults is reached (skip when caller needs the true total)
+        if (maxResults && !needsTotal && pendingCount >= maxResults) break;
         try {
             const calls = getCachedCalls(index, filePath);
             if (!calls) continue;
@@ -643,33 +648,82 @@ function findCallers(index, name, options = {}) {
         }
     }
 
+    // True total candidate count from Phase 1 (before any Phase 2 truncation).
+    // Used by callers that need accurate "showing N of <total>" headers.
+    const totalCount = pendingCount;
+    // When needsTotal is set with a maxResults cap, only enrich the first
+    // `maxResults` candidates in Phase 2 — file reads stay bounded.
+    const enrichLimit = (needsTotal && maxResults) ? maxResults : Infinity;
+    let enrichedCount = 0;
+
+    // BUG-H1: shadow records for un-enriched candidates so post-call filters
+    // (exclude / minConfidence) can produce an accurate total without forcing
+    // a Phase-2 file read for every candidate. Each shadow has just enough
+    // info to drive the filter predicates: relativePath + confidence.
+    const shadowEntries = [];
+
     // Phase 2: Read content only for files with matching calls (eliminates ~98% of file reads)
-    for (const [filePath, pending] of pendingByFile) {
-        try {
-            const content = fs.readFileSync(filePath, 'utf-8');
-            for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, _evidence } of pending) {
-                const scored = scoreEdge(_evidence || {});
-                callers.push({
+    outer: for (const [filePath, pending] of pendingByFile) {
+        let content = null;
+        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, _evidence } of pending) {
+            const scored = scoreEdge(_evidence || {});
+            if (enrichedCount >= enrichLimit) {
+                // Push shadow only — no file read needed.
+                shadowEntries.push({
                     file: filePath,
                     relativePath: fileEntry.relativePath,
                     line: call.line,
-                    content: getLine(content, call.line),
-                    callerName: callerSymbol ? callerSymbol.name : null,
-                    callerFile: callerSymbol ? filePath : null,
-                    callerStartLine: callerSymbol ? callerSymbol.startLine : null,
-                    callerEndLine: callerSymbol ? callerSymbol.endLine : null,
-                    isMethod,
+                    confidence: scored.confidence,
+                    resolution: scored.resolution,
+                    isMethod: call.isMethod || false,
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
-                    confidence: scored.confidence,
-                    resolution: scored.resolution,
                 });
+                continue;
             }
-        } catch (e) {
-            // File may have been deleted between Phase 1 and Phase 2
+            // First time we hit this file's enrichment loop — read the file once.
+            if (content === null) {
+                try { content = fs.readFileSync(filePath, 'utf-8'); }
+                catch (e) { content = ''; /* deleted/unreadable; skip enrichment for rest */ break; }
+            }
+            callers.push({
+                file: filePath,
+                relativePath: fileEntry.relativePath,
+                line: call.line,
+                content: getLine(content, call.line),
+                callerName: callerSymbol ? callerSymbol.name : null,
+                callerFile: callerSymbol ? filePath : null,
+                callerStartLine: callerSymbol ? callerSymbol.startLine : null,
+                callerEndLine: callerSymbol ? callerSymbol.endLine : null,
+                isMethod,
+                ...(isFunctionReference && { isFunctionReference: true }),
+                ...(receiver !== undefined && { receiver }),
+                ...(receiverType && { receiverType }),
+                confidence: scored.confidence,
+                resolution: scored.resolution,
+            });
+            enrichedCount++;
         }
     }
+
+    // Tag the returned array with the true total candidate count (only meaningful
+    // when needsTotal:true was passed). Defined as non-enumerable so JSON.stringify
+    // won't surprise consumers; defaults to callers.length when not set.
+    Object.defineProperty(callers, 'totalCount', {
+        value: needsTotal ? totalCount : callers.length,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
+    // Attach shadow entries so consumers can compute post-filter totals without
+    // re-running findCallers. Empty when needsTotal:false or all candidates fit.
+    Object.defineProperty(callers, 'shadowEntries', {
+        value: shadowEntries,
+        enumerable: false,
+        writable: true,
+        configurable: true,
+    });
 
     return callers;
     } finally { index._endOp(); }

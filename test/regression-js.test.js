@@ -2085,15 +2085,17 @@ function test() {
     assert.ok(!falseCb, 'status (string) in object literal value should NOT be potential callback');
 });
 
-it('FIX 76 — impact excludes method calls for standalone function targets', () => {
-    // impact for a standalone function should NOT include obj.fn() calls
+it('FIX 76 — impact excludes method calls when --no-include-methods is set', () => {
+    // BUG-H3: impact now defaults to includeMethods:true ("what breaks if I change
+    // this" should reach all callable sites). Passing --no-include-methods restores
+    // the old behavior — drop obj.fn() calls when the target is a standalone function.
     const index = new ProjectIndex(PROJECT_DIR);
     index.build(null, { quiet: true });
 
-    const result = index.impact('parse', { file: 'core/parser.js' });
+    const result = index.impact('parse', { file: 'core/parser.js', includeMethods: false });
     assert.ok(result, 'Should find parse');
 
-    // All call sites should be direct calls, not method calls
+    // With --no-include-methods, all call sites should be direct calls, not method calls
     for (const group of result.byFile) {
         for (const site of group.sites) {
             assert.ok(!site.isMethodCall,
@@ -2101,10 +2103,10 @@ it('FIX 76 — impact excludes method calls for standalone function targets', ()
         }
     }
 
-    // impact and verify should agree on call count
+    // With matching include-methods=false, impact and verify should agree on call count
     const verified = index.verify('parse', { file: 'core/parser.js' });
     assert.strictEqual(result.totalCallSites, verified.totalCalls,
-        'impact and verify call counts must match');
+        'impact and verify call counts must match (both filtering method calls)');
 });
 
 it('FIX 77 — find counts match usages via transitive re-exports', () => {

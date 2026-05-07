@@ -1172,6 +1172,22 @@ function findCallsInCode(code, parser) {
         return null;
     };
 
+    // Helper: count the number of (non-comment) arguments in a call_expression.
+    // Used to disambiguate dual-purpose Express APIs (BUG M5):
+    //   app.get('/users', handler)  → 2 args → route registration
+    //   app.get('env')              → 1 arg  → config getter, NOT a route
+    const getArgCount = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return 0;
+        let count = 0;
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            count++;
+        }
+        return count;
+    };
+
     // MEDIUM-5: extract HTTP method from `fetch(url, { method: 'POST' })`
     // and similar XHR/Request-init shapes. Returns the upper-cased method
     // string or null. Looks at argument index `argIdx` (default 1, the
@@ -1488,6 +1504,7 @@ function findCallsInCode(code, parser) {
                         }
                         const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
                         const firstArg = getFirstStringArg(node);
+                        const argCount = getArgCount(node);
                         calls.push({
                             name: propName,
                             line: node.startPosition.row + 1,
@@ -1496,7 +1513,8 @@ function findCallsInCode(code, parser) {
                             ...(receiverType && { receiverType }),
                             enclosingFunction,
                             uncertain,
-                            ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                            ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
+                            argCount
                         });
                     }
                 }

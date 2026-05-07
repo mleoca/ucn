@@ -110,7 +110,7 @@ function parseFlags(tokens) {
         includeExported: tokens.includes('--include-exported') || undefined,
         includeDecorated: tokens.includes('--include-decorated') || undefined,
         includeUncertain: tokens.includes('--include-uncertain') || undefined,
-        includeMethods: tokens.some(a => a === '--include-methods=false') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
+        includeMethods: tokens.some(a => a === '--include-methods=false' || a === '--no-include-methods') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
         detailed: tokens.includes('--detailed') || undefined,
         topLevel: tokens.includes('--top-level') || undefined,
         all: tokens.includes('--all') || undefined,
@@ -190,7 +190,7 @@ const knownFlags = new Set([
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests',
-    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--include-uncertain', '--detailed', '--calls-only',
+    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--no-include-methods', '--include-uncertain', '--detailed', '--calls-only',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
@@ -1335,6 +1335,7 @@ Usage:
 UNDERSTAND CODE
 ═══════════════════════════════════════════════════════════════════════════════
   about <name>        Full picture (definition, callers, callees, tests, code)
+  brief <name>        One-screen summary (signature, docstring, side effects, complexity)
   context <name>      Who calls this + what it calls (numbered for expand)
   smart <name>        Function + all dependencies inline
   impact <name>       What breaks if changed (call sites grouped by file)
@@ -1378,6 +1379,7 @@ REFACTORING HELPERS
   plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to)
   verify <name>       Check all call sites match signature
   diff-impact         What changed in git diff and who calls it (--base, --staged)
+  check               Pre-commit summary: diff-impact + verify + affected-tests in one shot
   deadcode            Find unused functions/classes
   entrypoints         Detect framework entry points (routes, DI, tasks)
   endpoints           HTTP API: list server routes + client requests; --bridge to match
@@ -1390,6 +1392,7 @@ OTHER
   api                 Show exported/public symbols
   typedef <name>      Find type definitions
   stats               Project statistics (--functions for per-function line counts, --hot for top callers)
+  doctor              Project trust report (counts, blind spots, parse failures, verdict; --deep for resolution coverage)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
   audit-async         Find calls in async functions that are likely missing await (JS/TS/Python)
 

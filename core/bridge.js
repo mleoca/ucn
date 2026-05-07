@@ -562,6 +562,16 @@ function matchCallPatternRoute(call, lang) {
         if (!p.receiverPattern.test(call.receiver)) continue;
         if (!p.methodPattern.test(call.name)) continue;
 
+        // BUG M5: Express has dual-purpose APIs where 1-arg .get/.set are config
+        // getters/setters, not route registrations. A real route registration has
+        // path + at least one handler (≥2 args).
+        //   app.get('/users', handler)  → 2+ args → route
+        //   app.get('env')              → 1 arg  → config getter, skip
+        // Only apply when argCount is known (parser provided it).
+        if (p.framework === 'express' && typeof call.argCount === 'number' && call.argCount < 2) {
+            continue;
+        }
+
         // axum router.route('/path', get(handler)) — method comes from the *second* arg's verb,
         // which we don't have direct access to here. Fall back to ALL.
         let method = call.name.toUpperCase();

@@ -854,13 +854,16 @@ class ProjectIndex {
 
         // Score each definition for selection
         const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+        const { isTestPath } = require('./shared');
         const scored = definitions.map(d => {
             let score = 0;
             const rp = d.relativePath || '';
             // Prefer class/struct/interface types (+1000)
             if (typeOrder.has(d.type)) score += 1000;
-            // Deprioritize test files (-500)
-            if (isTestFile(rp, detectLanguage(d.file))) {
+            // BUG-M4: deprioritize test files (-500). Combine the filename-pattern
+            // detector with the path-segment detector so `about` agrees with `find`'s
+            // exclusion logic (e.g. `test/agent-benchmark.js` is treated as a test).
+            if (isTestFile(rp, detectLanguage(d.file)) || isTestPath(rp)) {
                 score -= 500;
             }
             // Deprioritize examples/docs/vendor directories (-300)

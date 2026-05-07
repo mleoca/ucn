@@ -51,21 +51,22 @@ ucn deadcode --exclude=test    # unused code, AST-verified
 $ ucn trace build --depth=2
 
 build
-├── detectProjectPattern (core/discovery.js:399) 1x
-│   ├── checkDir (core/discovery.js:403) 2x
-│   └── shouldIgnore (core/discovery.js:347) 1x
-├── parseGitignore (core/discovery.js:130) 1x
-├── expandGlob (core/discovery.js:190) 1x
-│   ├── parseGlobPattern (core/discovery.js:226) 1x
-│   ├── walkDir (core/discovery.js:283) 1x
-│   └── compareNames (core/discovery.js:169) 1x
-├── indexFile (core/project.js:273) 1x
-│   ├── addSymbol (core/project.js:343) 4x
-│   ├── detectLanguage (languages/index.js:157) 1x
+├── detectProjectPattern (core/discovery.js:400) 1x
+│   ├── checkDir (core/discovery.js:404) 2x
+│   └── shouldIgnore (core/discovery.js:348) 1x
+├── parseGitignore (core/discovery.js:131) 1x
+├── expandGlob (core/discovery.js:191) 1x
+│   ├── parseGlobPattern (core/discovery.js:227) 1x
+│   ├── walkDir (core/discovery.js:284) 1x
+│   └── compareNames (core/discovery.js:170) 1x
+├── parallelBuild (core/parallel-build.js:25) 1x
+├── indexFile (core/project.js:310) 1x
+│   ├── addSymbol (core/project.js:398) 4x
+│   ├── detectLanguage (languages/index.js:209) 1x
 │   ├── parse (core/parser.js:69) 1x
 │   └── extractImports (core/imports.js:19) 1x
-├── buildImportGraph (core/project.js:549) 1x
-└── buildInheritanceGraph (core/project.js:627) 1x
+├── buildImportGraph (core/project.js:631) 1x
+└── buildInheritanceGraph (core/project.js:636) 1x
 ```
 
 One command. No files opened. Every function located by file and line.
@@ -81,23 +82,24 @@ $ ucn about expandGlob
 
 expandGlob (function)
 ════════════════════════════════════════════════════════════
-core/discovery.js:190-221
-expandGlob (pattern, options = {})
+core/discovery.js:191-222  →  core/discovery.js:191:expandGlob
+expandGlob (pattern: string, options: number = {}) : string[]
 
-CALLERS (3):
-  cli/index.js:859 [runGlobCommand]
+CALLERS (7):
+  cli/index.js:1078 [runGlobCommand]
     const files = expandGlob(pattern);
-  core/cache.js:274 [isCacheStale]
+  core/cache.js:350 [isCacheStale]
     const currentFiles = expandGlob(pattern, globOpts);
-  core/project.js:195 [build]
-    const files = expandGlob(pattern, globOpts);
+  core/project.js:192 [build]
+    files = expandGlob(pattern, globOpts);
+  ... (4 more in test/integration.test.js)
 
 CALLEES (3):
-  parseGlobPattern [utility] - core/discovery.js:226
-  walkDir [utility] - core/discovery.js:283
-  compareNames [utility] - core/discovery.js:169
+  parseGlobPattern [utility] - core/discovery.js:227
+  walkDir [utility] {fs} - core/discovery.js:284
+  compareNames [utility] - core/discovery.js:170
 
-TESTS: 6 matches in 2 file(s)
+TESTS: 5 matches in 1 file(s)
 ```
 
 Need to trace execution upward instead? `ucn reverse-trace fn` walks the caller chain back to entry points.
@@ -109,10 +111,18 @@ Before touching a function, check if all existing call sites match its signature
 ```
 $ ucn verify expandGlob
 
-expandGlob (pattern, options = {})
+Verification: expandGlob
+════════════════════════════════════════════════════════════
+core/discovery.js:191
+expandGlob (pattern: string, options: number = {}) : string[]
+
 Expected arguments: 1-2
 
-STATUS: ✓ All calls valid (7 calls, 0 mismatches)
+STATUS: ✓ All calls valid
+  Total calls: 7
+  Valid: 7
+  Mismatches: 0
+  Uncertain: 0
 ```
 
 Then preview the refactoring. UCN shows exactly what needs to change and where:
@@ -120,23 +130,28 @@ Then preview the refactoring. UCN shows exactly what needs to change and where:
 ```
 $ ucn plan expandGlob --rename-to=expandGlobPattern
 
+Refactoring plan: rename
+════════════════════════════════════════════════════════════
+core/discovery.js:191
+
 SIGNATURE CHANGE:
-  Before: expandGlob (pattern, options = {})
-  After:  expandGlobPattern (pattern, options = {})
+  Before: expandGlob (pattern: string, options: number = {}) : string[]
+  After:  expandGlobPattern (pattern: string, options: number = {}) : string[]
 
-CHANGES NEEDED: 7 across 4 files
+CHANGES NEEDED: 11
+  Files affected: 4
 
-cli/index.js :859
-  const files = expandGlob(pattern);
-  → const files = expandGlobPattern(pattern);
+BY FILE:
 
-core/cache.js :274
-  const currentFiles = expandGlob(pattern, globOpts);
-  → const currentFiles = expandGlobPattern(pattern, globOpts);
+cli/index.js (2 changes)
+  :1078
+    const files = expandGlob(pattern);
+    → Rename to: const files = expandGlobPattern(pattern);
+  :15
+    const { expandGlob, findProjectRoot } = require('../core/discovery');
+    → Update import: const { expandGlobPattern, findProjectRoot } = require('../core/discovery');
 
-core/project.js :195
-  const files = expandGlob(pattern, globOpts);
-  → const files = expandGlobPattern(pattern, globOpts);
+... (more changes in core/cache.js, core/project.js, test/integration.test.js)
 ```
 
 Run `ucn diff-impact --staged` before committing to see what you changed and who calls it.
@@ -148,11 +163,22 @@ Which tests should you run after a change? `affected-tests` walks the blast radi
 ```
 $ ucn affected-tests expandGlob
 
-1 function changed → 18 functions affected (depth 3)
-Summary: 18 affected → 12 test files, 11/18 functions covered (61%)
+affected-tests: expandGlob
+════════════════════════════════════════════════════════════
+core/discovery.js:191
+1 function changed → 15 functions affected (depth 3)
 
-Uncovered (7): runGlobCommand, runProjectCommand, ...
+Test files to run (19):
+
+  test/integration.test.js (covers: expandGlob, build, idx, setupProject)
+    L47: index.build(null, { quiet: true });  [call]
+    L167: const files = expandGlob('**/*.go', { root: tmpDir });  [call]
+    ...
+
+Uncovered (10): runGlobCommand, main, runProjectCommand, ...
   ⚠ These affected functions have no test references
+
+Summary: 15 affected → 19 test files, 5/15 functions covered (33%)
 ```
 
 ## Find unused code
@@ -160,10 +186,15 @@ Uncovered (7): runGlobCommand, runProjectCommand, ...
 ```
 $ ucn deadcode --exclude=test
 
-Dead code: 1 unused symbol(s)
+Dead code: 3 unused symbol(s)
 
-core/discovery.js
-  [ 162- 166] legacyResolve (function)
+core/bridge.js
+  [  90-  92] endsWithWildcard (function)
+  [ 251- 258] parsePythonDecorator (function)
+core/search.js
+  [1409-1445] _testBodyReferencesClass (function)
+
+322 exported symbol(s) excluded (all have callers). Use --include-exported to audit them.
 ```
 
 Find missing-await bugs:
@@ -194,8 +225,8 @@ Match confidence: `EXACT` (literal-literal), `PARTIAL` (server param ↔ client 
 ```
 $ ucn fn compareNames
 
-core/discovery.js:169
-[ 169- 177] compareNames(a, b)
+core/discovery.js:170
+[ 170- 178] compareNames(a, b)
 ────────────────────────────────────────────────────────────
 function compareNames(a, b) {
     const aLower = a.toLowerCase();

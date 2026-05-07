@@ -175,7 +175,7 @@ ucn entrypoints --file=routes/           # Scoped to files
 | What are the framework entry points? | `ucn entrypoints` | Lists all detected routes, DI beans, tasks, etc. Filter: `--type=http`, `--framework=express` |
 | Polyglot route ↔ request matching | `ucn endpoints --bridge` | Server routes (Express/Fastify/Koa/NestJS/Flask/FastAPI/Spring/JAX-RS/Gin/Echo/Chi/Fiber/axum/actix/Next.js) ↔ client requests (fetch/axios/requests/httpx/RestTemplate/WebClient/reqwest). Match confidence: EXACT, PARTIAL, UNCERTAIN. Filter with `--method`, `--prefix`, `--server-only`, `--client-only`, `--unmatched`, `--hide-uncertain` |
 | Find which tests cover a function | `ucn tests <name>` | Test files and test function names. Scope with `--file`, `--class-name`, `--exclude`, `--calls-only` |
-| Extract specific lines from a file | `ucn lines --file=<file> --range=10-20` | Pull a line range without reading the whole file |
+| Extract specific lines from a file | `ucn lines 10-20 --file=<file>` | Pull a line range without reading the whole file |
 | Find type definitions | `ucn typedef <name>` | Interfaces, enums, structs, traits, type aliases |
 | See a project's public API | `ucn api` or `ucn api --file=<file>` | All exported/public symbols with signatures |
 | Drill into context results | `ucn expand <N>` | Show source code for item N from a previous `context` call |
@@ -214,14 +214,14 @@ ucn [target] <command> [name] [--flags]
 
 | Flag | When to use it |
 |------|---------------|
-| `--class-name=X` | Scope to specific class (e.g., `--class-name=Repository` for method `save`). Works with `fn`, `about`, `context`, `impact`, `tests`, `example`, `typedef`, `verify`, `plan` |
+| `--class-name=X` | Scope to specific class (e.g., `--class-name=Repository` for method `save`). Works with `about`, `context`, `impact`, `blast`, `smart`, `trace`, `reverse-trace`, `example`, `related`, `brief`, `find`, `usages`, `tests`, `affected-tests`, `fn`, `verify`, `plan`, `typedef` |
 | `--file=<pattern>` | Disambiguate when a name exists in multiple files (e.g., `--file=api`) |
 | `--exclude=test,mock` | Focus on production code only |
 | `--in=src/core` | Limit search to a subdirectory |
 | `--depth=N` | Control tree depth for `trace`, `graph`, and detail level for `find` (default 3). Also expands all children — no breadth limit |
-| `--all` | Expand truncated sections in `about`, `trace`, `graph`, `related` |
+| `--all` | Expand truncated sections. Applies to `about`, `blast`, `trace`, `reverse-trace`, `related`, `find`, `toc`, `fn`, `class`, `graph`, `diff-impact` |
 | `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
-| `--include-methods` | Include `obj.method()` calls in `context`/`smart` (only direct calls shown by default) |
+| `--include-methods` | Include `obj.method()` calls in caller/callee analysis. `impact` defaults to true (show all callable sites); other commands default to false (use `--no-include-methods` to opt out). Applies to `about`, `context`, `impact`, `verify`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |
@@ -232,18 +232,18 @@ ucn [target] <command> [name] [--flags]
 | `--hot` | List top N most-called functions in `stats` (use with `--top=N`, default 10). Best orientation primitive when entering a new repo |
 | `--diverse` | Cluster `example` call sites by argument shape and return one representative per cluster (use with `--top=N`, default 3) |
 | `--git` | Attach git enrichment to `about` / `brief`: last commit (ISO + author) and recent change count (last 30 days). Skipped silently when not a git repo |
-| `--json` | Machine-readable JSON output (wrapped in `{meta, data}`) |
+| `--json` | Machine-readable JSON output. Some commands wrap in `{meta, data}` (e.g., `find`, `deadcode`); others return flat objects (e.g., `about`, `impact`, `verify`, `plan`, `imports`) — check each command's output shape |
 | `--code-only` | Exclude matches in comments and strings (`search`/`usages`) |
 | `--with-types` | Include related type definitions in `smart`/`about` output |
 | `--detailed` | Show full symbol listing per file in `toc` |
 | `--top-level` | Show only top-level functions in `toc` (exclude nested/indented) |
 | `--top=N` | Limit result count (default: 10 for most commands) |
-| `--limit=N` | Limit result count for `find`, `usages`, `search`, `deadcode`, `api`, `toc`, `entrypoints`, `diff-impact` |
+| `--limit=N` | Limit result count for `find`, `usages`, `toc`, `search`, `deadcode`, `entrypoints`, `endpoints`, `diff-impact`, `check`, `api`, `doctor`, `audit-async` |
 | `--max-files=N` | Max files to index (for large projects with 10K+ files) |
 | `--max-lines=N` | Max source lines for `class` (large classes show summary by default) |
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
 | `--exact` | Exact name match only in `find`/`typedef` (no substring) |
-| `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |
+| `--include-uncertain` | Include ambiguous/uncertain matches. Applies to `about`, `context`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
 | `--hide-confidence` | Hide confidence scores (shown by default) in `context`/`about` |
 | `--min-confidence=N` | Filter edges below confidence threshold (e.g., `--min-confidence=0.7` keeps only high-confidence edges) |
 | `--calls-only` | Only show call/test-case matches in `tests` (skip file-level results) |

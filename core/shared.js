@@ -6,28 +6,60 @@ const { isTestFile } = require('./discovery');
 const { detectLanguage } = require('./parser');
 
 /**
+ * Path-based test heuristic — matches the same patterns as `find`'s exclusion
+ * logic so that `about` and `find` agree on which files are de-emphasized.
+ *
+ * Triggers when any of `test|tests|spec|__tests__|__mocks__|fixture|mock`
+ * appears as a path segment (with word boundaries on both sides).
+ *
+ * Complement to `isTestFile` (filename pattern check) — together they catch
+ * both `foo.test.js` (filename) AND `test/agent-benchmark.js` (directory).
+ */
+function isTestPath(rp) {
+    if (!rp) return false;
+    return /(^|[/._-])(test|tests|spec|__tests__|__mocks__|fixture|mock)s?([/._-]|$)/i.test(rp);
+}
+
+/**
  * Pick the best definition from multiple matches.
  * Prefers non-test, src/lib files, larger function bodies.
+ *
+ * BUG-M4: align with `find`'s exclusion ordering so `about` and `find` pick
+ * the same primary. Adds path-based test detection (covers `test/foo.js`
+ * which `isTestFile` misses) and prefers files that are imported by others
+ * (real source) over test/fixture files.
  */
-function pickBestDefinition(matches) {
+function pickBestDefinition(matches, opts = {}) {
     const typeOrder = new Set(['class', 'struct', 'interface', 'type', 'impl']);
+    const importGraph = opts.importGraph;
     const scored = matches.map(m => {
         let score = 0;
         const rp = m.relativePath || '';
         // Prefer class/struct/interface types (+1000) - same as resolveSymbol
         if (typeOrder.has(m.type)) score += 1000;
-        if (isTestFile(rp, detectLanguage(m.file))) score -= 500;
+        // Test file penalties: -500 for filename pattern OR path segment.
+        // Both checks because `isTestFile` only matches `*.test.js`/`__tests__/`,
+        // not `test/agent-benchmark.js` which `find` excludes via path regex.
+        if (isTestFile(rp, detectLanguage(m.file)) || isTestPath(rp)) score -= 500;
         if (/^(examples?|docs?|vendor|third[_-]?party|benchmarks?|samples?)\//i.test(rp)) score -= 300;
         if (/^(lib|src|core|internal|pkg|crates)\//i.test(rp)) score += 200;
+        // Prefer files that are imported by something — real source over scripts/fixtures.
+        if (importGraph && m.file) {
+            for (const [, importedFiles] of importGraph) {
+                if (importedFiles.has(m.file)) { score += 100; break; }
+            }
+        }
         // Deprioritize type-only overload signatures (TypeScript function_signature)
         if (m.isSignature) score -= 200;
         // Tiebreaker: prefer larger function bodies (more important/complex)
         if (m.startLine && m.endLine) {
             score += Math.min(m.endLine - m.startLine, 100);
         }
-        return { match: m, score };
+        return { match: m, score, rp };
     });
-    scored.sort((a, b) => b.score - a.score);
+    // Stable sort: by score desc, then alphabetical relativePath (so two equal-score
+    // matches always pick the same one across runs).
+    scored.sort((a, b) => (b.score - a.score) || a.rp.localeCompare(b.rp));
     return scored[0].match;
 }
 
@@ -115,4 +147,5 @@ module.exports = {
     formatSymbolHandle,
     parseSymbolHandle,
     looksLikeHandle,
+    isTestPath,
 };

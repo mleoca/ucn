@@ -4739,6 +4739,110 @@ describe('MCP per-command param validation: stripping note', () => {
             rm(dir);
         }
     });
+
+    // BUG B1: FLAG_APPLICABILITY is keyed by canonical (camelCase) names but `command`
+    // is the MCP (snake_case) name — multi-word commands silently skipped stripping.
+    // The fix resolves command to canonical first.
+    it('multi-word commands strip inapplicable params (B1: circular_deps)', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'const b = require("./b");\nmodule.exports = {};',
+            'b.js': 'const a = require("./a");\nmodule.exports = {};',
+        });
+        try {
+            // git, diverse, hot are not applicable to circular_deps
+            const result = await client.callTool({ command: 'circular_deps', project_dir: dir, git: true, diverse: true, hot: true });
+            assert.ok(!result.isError, 'should not be an error');
+            assert.ok(result.text.includes('Note:'), 'should include a Note about stripped params');
+            assert.ok(result.text.includes('git') && result.text.includes('diverse') && result.text.includes('hot'),
+                'note should mention git, diverse, and hot');
+            assert.ok(result.text.includes('not applicable to circular_deps'),
+                'note should mention the MCP command name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('multi-word commands strip inapplicable params (B1: diff_impact)', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }',
+        });
+        try {
+            // depth is not applicable to diff_impact
+            const result = await client.callTool({ command: 'diff_impact', project_dir: dir, depth: 3 });
+            // diff_impact may error if not in a git repo, but the stripping note must appear either way
+            assert.ok(result.text.includes('depth'), 'stripping note should mention depth');
+            assert.ok(result.text.includes('not applicable to diff_impact'),
+                'note should mention the MCP command name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('multi-word commands strip inapplicable params (B1: file_exports)', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            // depth is not applicable to file_exports
+            const result = await client.callTool({ command: 'file_exports', project_dir: dir, file: 'lib.js', depth: 3 });
+            assert.ok(result.text.includes('depth'), 'stripping note should mention depth');
+            assert.ok(result.text.includes('not applicable to file_exports'),
+                'note should mention the MCP command name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('multi-word commands strip inapplicable params (B1: reverse_trace)', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nfunction main() { helper(); }',
+        });
+        try {
+            // term is not applicable to reverse_trace
+            const result = await client.callTool({ command: 'reverse_trace', project_dir: dir, name: 'helper', term: 'x' });
+            assert.ok(result.text.includes('term'), 'stripping note should mention term');
+            assert.ok(result.text.includes('not applicable to reverse_trace'),
+                'note should mention the MCP command name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('multi-word commands strip inapplicable params (B1: affected_tests)', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }',
+        });
+        try {
+            // term is not applicable to affected_tests
+            const result = await client.callTool({ command: 'affected_tests', project_dir: dir, name: 'helper', term: 'x' });
+            assert.ok(result.text.includes('term'), 'stripping note should mention term');
+            assert.ok(result.text.includes('not applicable to affected_tests'),
+                'note should mention the MCP command name');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('multi-word commands strip inapplicable params (B1: audit_async)', async () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'async function helper() { return 1; }',
+        });
+        try {
+            // depth is not applicable to audit_async
+            const result = await client.callTool({ command: 'audit_async', project_dir: dir, depth: 3 });
+            assert.ok(result.text.includes('depth'), 'stripping note should mention depth');
+            assert.ok(result.text.includes('not applicable to audit_async'),
+                'note should mention the MCP command name');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 describe('fix: expand cache invalidation on rebuild', () => {
@@ -5057,6 +5161,234 @@ describe('BUG-4: usages reports enclosing function for call sites', () => {
             assert.ok(topCall, 'should find top-level helper(42) call');
             assert.ok(topCall.handle.endsWith(':_topLevel'),
                 `top-level call should still report _topLevel: ${topCall.handle}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-H1: about caller count must reflect true total, not maxResults cap
+// ============================================================================
+
+describe('BUG-H1: about caller total reflects true count, not maxResults cap', () => {
+    it('about reports true caller total even when truncating top list', () => {
+        // Generate 50+ direct callers of `helper`. Without the fix, about's
+        // maxResults*3 cap would clamp the displayed total to ~30.
+        const files = {
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x) { return x; }\nmodule.exports = { helper };',
+        };
+        const callerCount = 60;
+        for (let i = 0; i < callerCount; i++) {
+            files[`call${i}.js`] = `const { helper } = require('./lib');\nfunction caller${i}() { helper(${i}); }`;
+        }
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'about', { name: 'helper' });
+            assert.ok(result.ok, 'about should succeed');
+            // True total should be at least the number of caller files we created.
+            assert.ok(result.result.callers.total >= callerCount,
+                `about should report >= ${callerCount} callers, got ${result.result.callers.total}`);
+            // The displayed top list should be truncated to maxCallers (default 10).
+            assert.ok(result.result.callers.top.length <= 10,
+                `top list should be capped at 10, got ${result.result.callers.top.length}`);
+        } finally { rm(dir); }
+    });
+
+    it('about caller total agrees with context caller count', () => {
+        const files = {
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function shared(x) { return x; }\nmodule.exports = { shared };',
+        };
+        for (let i = 0; i < 40; i++) {
+            files[`u${i}.js`] = `const { shared } = require('./lib');\nfunction f${i}() { shared(${i}); }`;
+        }
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const aboutR = execute(index, 'about', { name: 'shared' });
+            const ctxR = execute(index, 'context', { name: 'shared' });
+            assert.ok(aboutR.ok && ctxR.ok);
+            assert.strictEqual(aboutR.result.callers.total, ctxR.result.callers.length,
+                `about total (${aboutR.result.callers.total}) should equal context length (${ctxR.result.callers.length})`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-H2: stats --hot must not attribute method calls to standalone functions
+// ============================================================================
+
+describe('BUG-H2: stats --hot disambiguates method vs standalone calls', () => {
+    it('standalone get() count excludes obj.get() / dict.get() method calls', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // Standalone function `get` defined here
+            'helper.js': 'function get() { return 1; }\nmodule.exports = { get };',
+            // Direct call to standalone get()
+            'caller.js': 'const { get } = require("./helper");\nfunction useIt() { return get(); }',
+            // Method calls on objects — these should NOT inflate the standalone get count
+            'noisy.js': [
+                'const obj = { get() { return 2; } };',
+                'const dict = new Map();',
+                'function noise() {',
+                '  obj.get();',
+                '  dict.get("k");',
+                '  ({}).get?.();',
+                '  Array.prototype.get?.call({});',
+                '  ({foo: {get(){}}}).foo.get();',
+                '}'
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'stats', { hot: true, top: 10 });
+            assert.ok(result.ok);
+            const getRow = (result.result.hot.items || []).find(i => i.name === 'get');
+            assert.ok(getRow, 'should find a `get` row');
+            // The count should reflect only the bare-name caller(s) — at most a small
+            // number, not 4-5 inflated by method calls.
+            assert.ok(getRow.callCount <= 2,
+                `get callCount should be small (only bare-name calls), got ${getRow.callCount}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-H3: impact and verify must honor --include-methods
+// ============================================================================
+
+describe('BUG-H3: impact and verify honor --include-methods flag', () => {
+    it('impact defaults to includeMethods:true (catches obj.fn() calls)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function process(x) { return x; }\nmodule.exports = { process };',
+            'a.js': 'const { process } = require("./lib");\nfunction a() { process(1); }',
+            'b.js': 'const obj = require("./lib");\nfunction b() { obj.process(2); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'impact', { name: 'process' });
+            assert.ok(r.ok);
+            // Default: should catch both direct call and method call (2 sites).
+            assert.ok(r.result.totalCallSites >= 2,
+                `impact default should include obj.process() — got ${r.result.totalCallSites}`);
+        } finally { rm(dir); }
+    });
+
+    it('impact --no-include-methods drops obj.fn() calls', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function process(x) { return x; }\nmodule.exports = { process };',
+            'a.js': 'const { process } = require("./lib");\nfunction a() { process(1); }',
+            'b.js': 'const obj = require("./lib");\nfunction b() { obj.process(2); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'impact', { name: 'process', includeMethods: false });
+            assert.ok(r.ok);
+            // With --no-include-methods, only the direct call counts.
+            assert.strictEqual(r.result.totalCallSites, 1,
+                `impact --no-include-methods should give 1 site, got ${r.result.totalCallSites}`);
+        } finally { rm(dir); }
+    });
+
+    it('verify --include-methods opts into checking obj.fn() arity', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function fetch(url) { return url; }\nmodule.exports = { fetch };',
+            // Method call with wrong arity — should be flagged when include-methods is on
+            'caller.js': 'const obj = require("./lib");\nfunction call() { obj.fetch("a", "b"); }',
+        });
+        try {
+            const index = idx(dir);
+            const def = execute(index, 'verify', { name: 'fetch' });
+            const inc = execute(index, 'verify', { name: 'fetch', includeMethods: true });
+            assert.ok(def.ok && inc.ok);
+            // Default verify drops method calls (totalCalls 0 here).
+            assert.strictEqual(def.result.totalCalls, 0,
+                `default verify should drop method calls, got ${def.result.totalCalls}`);
+            // With --include-methods, the obj.fetch() call shows up.
+            assert.ok(inc.result.totalCalls >= 1,
+                `verify --include-methods should see method call, got ${inc.result.totalCalls}`);
+        } finally { rm(dir); }
+    });
+
+    it('FLAG_APPLICABILITY exposes includeMethods on impact and verify', () => {
+        const { FLAG_APPLICABILITY } = require('../core/registry');
+        assert.ok(FLAG_APPLICABILITY.impact.includes('includeMethods'),
+            'impact should accept includeMethods');
+        assert.ok(FLAG_APPLICABILITY.verify.includes('includeMethods'),
+            'verify should accept includeMethods');
+    });
+});
+
+// ============================================================================
+// BUG-M3: about for classes must report constructor callers (`new Foo()`)
+// ============================================================================
+
+describe('BUG-M3: about for class symbols reports `new Foo()` callers', () => {
+    it('class with 5 instantiations shows 5 callers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'foo.js': 'class Foo { constructor() {} }\nmodule.exports = { Foo };',
+            'a.js': 'const { Foo } = require("./foo");\nfunction a() { return new Foo(); }',
+            'b.js': 'const { Foo } = require("./foo");\nfunction b() { return new Foo(); }',
+            'c.js': 'const { Foo } = require("./foo");\nfunction c() { return new Foo(); }',
+            'd.js': 'const { Foo } = require("./foo");\nfunction d() { return new Foo(); }',
+            'e.js': 'const { Foo } = require("./foo");\nfunction e() { return new Foo(); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'Foo' });
+            assert.ok(r.ok);
+            // Class symbols should now report constructor callers.
+            assert.ok(r.result.callers.total >= 5,
+                `about Foo should report >= 5 callers, got ${r.result.callers.total}`);
+            // Callees for class types are intentionally empty (class body isn't a call sequence).
+            assert.strictEqual(r.result.callees.total, 0,
+                `about for a class should have 0 callees, got ${r.result.callees.total}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-M4: about and find must agree on auto-picked primary; about emits a note
+// ============================================================================
+
+describe('BUG-M4: about disambiguation note when other definitions exist', () => {
+    it('about emits an ambiguous warning when multiple defs exist and no --file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/main.js': 'function go() { return 1; }\nmodule.exports = { go };',
+            'lib/main.js': 'function go() { return 2; }\nmodule.exports = { go };',
+            'caller.js': 'const { go } = require("./src/main"); function call() { go(); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'go' });
+            assert.ok(r.ok);
+            // Should expose at least one ambiguous warning so the formatter
+            // can render a "auto-selected — pass --file to choose" hint.
+            assert.ok(Array.isArray(r.result.warnings) && r.result.warnings.length > 0,
+                `about should attach warnings when multiple defs exist, got ${JSON.stringify(r.result.warnings)}`);
+            assert.ok(r.result.warnings.some(w => w.type === 'ambiguous'),
+                `expected an 'ambiguous' warning, got types ${r.result.warnings.map(w=>w.type)}`);
+        } finally { rm(dir); }
+    });
+
+    it('about does NOT pick a test/ file when non-test alternatives exist', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/cmd.js': 'function go() { return "src"; }\nmodule.exports = { go };',
+            'test/cmd-test.js': 'function go() { return "test"; }', // path-based test (no .test.js)
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'go' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.symbol.file, 'src/cmd.js',
+                `about should pick src/ over test/, got ${r.result.symbol.file}`);
         } finally { rm(dir); }
     });
 });
