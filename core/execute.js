@@ -258,6 +258,7 @@ const HANDLERS = {
             maxCallers: num(p.top, undefined),
             maxCallees: num(p.top, undefined),
             unreachableOnly: !!p.unreachableOnly,
+            git: !!p.git,
         });
         if (!result) {
             // Give better error if file/className filter is the problem
@@ -405,7 +406,12 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
-        const result = index.example(p.name, { file: p.file, className: p.className });
+        const result = index.example(p.name, {
+            file: p.file,
+            className: p.className,
+            diverse: !!p.diverse,
+            top: num(p.top, undefined),
+        });
         if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
         return { ok: true, result };
     },
@@ -445,7 +451,7 @@ const HANDLERS = {
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const { brief } = require('./brief');
-        const result = brief(index, p.name, { file: p.file, className: p.className });
+        const result = brief(index, p.name, { file: p.file, className: p.className, git: !!p.git });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
         return { ok: true, result };
     },
@@ -1090,6 +1096,8 @@ const HANDLERS = {
     stats: (index, p) => {
         const result = index.getStats({
             functions: p.functions || false,
+            hot: p.hot || false,
+            top: num(p.top, undefined),
         });
         return { ok: true, result };
     },

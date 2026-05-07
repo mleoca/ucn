@@ -153,6 +153,11 @@ function formatStructuralSearchJson(result) {
 function formatExample(result, name) {
     if (!result || !result.best) return `No call examples found for "${name}"`;
 
+    // Diverse mode: render one block per cluster representative.
+    if (result.clusters && result.clusters.length > 0) {
+        return formatExampleDiverse(result, name);
+    }
+
     const best = result.best;
     const lines = [];
     lines.push(`Best example of "${name}":`);
@@ -184,6 +189,55 @@ function formatExample(result, name) {
 }
 
 /**
+ * Render `example --diverse` output: one representative per call-shape cluster.
+ * Each block shows the shape signature, cluster size, and the representative
+ * with code context — so an agent can see "calls fall into N distinct shapes,
+ * here's an example of each".
+ */
+function formatExampleDiverse(result, name) {
+    const lines = [];
+    const total = result.totalClusters || result.clusters.length;
+    lines.push(`Diverse examples of "${name}" — ${result.clusters.length} of ${total} cluster(s), ${result.totalCalls} total calls:`);
+    lines.push('═'.repeat(60));
+
+    for (let i = 0; i < result.clusters.length; i++) {
+        const c = result.clusters[i];
+        const rep = c.representative;
+        const shape = c.argKinds == null
+            ? 'unknown shape'
+            : c.argKinds.length === 0
+                ? 'no arguments'
+                : `args: (${c.argKinds.join(', ')})`;
+
+        lines.push('');
+        lines.push(`[${i + 1}] ${shape}  — ${c.count} call${c.count === 1 ? '' : 's'} in this cluster`);
+        if (!rep) continue;
+        lines.push(`    ${rep.relativePath || rep.file}:${rep.line}`);
+
+        if (rep.before) {
+            for (let j = 0; j < rep.before.length; j++) {
+                const ln = rep.line - rep.before.length + j;
+                lines.push(`    ${ln.toString().padStart(4)}| ${rep.before[j]}`);
+            }
+        }
+        lines.push(`    ${rep.line.toString().padStart(4)}| ${rep.content}  <--`);
+        if (rep.after) {
+            for (let j = 0; j < rep.after.length; j++) {
+                const ln = rep.line + j + 1;
+                lines.push(`    ${ln.toString().padStart(4)}| ${rep.after[j]}`);
+            }
+        }
+    }
+
+    if (total > result.clusters.length) {
+        lines.push('');
+        lines.push(`... ${total - result.clusters.length} more cluster(s) (use --top=N to show more)`);
+    }
+
+    return lines.join('\n');
+}
+
+/**
  * Format example command output - JSON
  */
 function formatExampleJson(result, name) {
@@ -192,7 +246,7 @@ function formatExampleJson(result, name) {
     }
 
     const best = result.best;
-    return JSON.stringify({
+    const env = {
         found: true,
         query: name,
         totalCalls: result.totalCalls,
@@ -205,7 +259,29 @@ function formatExampleJson(result, name) {
             ...(best.before && best.before.length > 0 && { before: best.before }),
             ...(best.after && best.after.length > 0 && { after: best.after })
         }
-    }, null, 2);
+    };
+
+    if (result.clusters && result.clusters.length > 0) {
+        env.totalClusters = result.totalClusters;
+        env.clusters = result.clusters.map(c => ({
+            shapeKey: c.shapeKey,
+            argCount: c.argCount,
+            argKinds: c.argKinds,
+            count: c.count,
+            representative: c.representative ? {
+                file: c.representative.relativePath || c.representative.file,
+                line: c.representative.line,
+                content: c.representative.content,
+                score: c.representative.score,
+                reasons: c.representative.reasons || [],
+                ...(c.representative._argTexts && { argTexts: c.representative._argTexts }),
+                ...(c.representative.before && c.representative.before.length > 0 && { before: c.representative.before }),
+                ...(c.representative.after && c.representative.after.length > 0 && { after: c.representative.after }),
+            } : null,
+        }));
+    }
+
+    return JSON.stringify(env, null, 2);
 }
 
 /**

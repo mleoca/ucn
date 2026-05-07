@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { langTraits } = require('../../languages');
-const { dynamicImportsNote } = require('./shared');
+const { dynamicImportsNote, formatGitLine } = require('./shared');
 
 /**
  * One short sentence (~80 chars) of a docstring, suitable for inline display
@@ -435,6 +435,12 @@ function formatAbout(about, options = {}) {
     }
     if (sym.docstring) {
         lines.push(`"${sym.docstring}"`);
+    }
+
+    // Git enrichment (opt-in via --git). Only render when available — non-git
+    // dirs and untracked files are skipped silently.
+    if (about.git && about.git.available) {
+        lines.push(formatGitLine(about.git));
     }
 
     // Warnings (show early for visibility)

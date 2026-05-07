@@ -1109,6 +1109,16 @@ function about(index, name, options = {}) {
         }
     }
 
+    // Optional git enrichment for the primary symbol's file.
+    // Attached only when options.git is set; skipped silently if not a git repo.
+    // Cheap (single git log invocation, cached per process) and gracefully
+    // degrades — formatters check `git.available` before rendering.
+    let gitInfo = null;
+    if (options.git) {
+        const { getGitInfo } = require('./git-enrich');
+        gitInfo = getGitInfo(index.root, primary.relativePath);
+    }
+
     const result = {
         found: true,
         symbol: {
@@ -1129,6 +1139,7 @@ function about(index, name, options = {}) {
             docstring: primary.docstring,
             signature: index.formatSignature(primary)
         },
+        ...(gitInfo && { git: gitInfo }),
         usages: usagesByType,
         totalUsages: usagesByType.calls + usagesByType.imports + usagesByType.references,
         callers: {

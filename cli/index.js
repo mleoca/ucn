@@ -135,6 +135,9 @@ function parseFlags(tokens) {
         maxLines: getValueFlag('--max-lines') || null,
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions') || undefined,
+        hot: tokens.includes('--hot') || undefined,
+        diverse: tokens.includes('--diverse') || undefined,
+        git: tokens.includes('--git') || undefined,
         className: getValueFlag('--class-name'),
         limit: parseInt(getValueFlag('--limit') || '0') || undefined,
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
@@ -180,7 +183,7 @@ const knownFlags = new Set([
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
-    '--regex', '--no-regex', '--functions',
+    '--regex', '--no-regex', '--functions', '--hot', '--diverse', '--git',
     '--max-lines', '--class-name', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
     '--hide-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
@@ -566,7 +569,13 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'example': {
-            const { ok, result, error } = execute(index, 'example', { name: arg, file: flags.file, className: flags.className });
+            const { ok, result, error } = execute(index, 'example', {
+                name: arg,
+                file: flags.file,
+                className: flags.className,
+                diverse: flags.diverse,
+                top: flags.top || undefined,
+            });
             if (!ok) fail(error);
             const displayName = nameForDisplay(arg);
             printOutput(result,
@@ -657,7 +666,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (!ok) fail(error);
             printOutput(result,
                 output.formatAboutJson,
-                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false, compact: !!flags.compact })
+                r => output.formatAbout(r, { expand: flags.expand, root: index.root, depth: flags.depth, showConfidence: flags.showConfidence !== false, compact: !!flags.compact, git: !!flags.git })
             );
             if (note) console.error(note);
             break;
@@ -726,7 +735,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'brief': {
             requireArg(arg, 'Usage: ucn . brief <name>');
-            const { ok, result, error } = execute(index, 'brief', { name: arg, file: flags.file, className: flags.className });
+            const { ok, result, error } = execute(index, 'brief', { name: arg, file: flags.file, className: flags.className, git: flags.git });
             if (!ok) fail(error);
             printOutput(result, output.formatBriefJson, output.formatBrief);
             break;
@@ -918,7 +927,11 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'stats': {
-            const { ok, result, error } = execute(index, 'stats', { functions: flags.functions });
+            const { ok, result, error } = execute(index, 'stats', {
+                functions: flags.functions,
+                hot: flags.hot,
+                top: flags.top || undefined,
+            });
             if (!ok) fail(error);
             printOutput(result,
                 output.formatStatsJson,
@@ -1308,7 +1321,7 @@ OTHER
 ═══════════════════════════════════════════════════════════════════════════════
   api                 Show exported/public symbols
   typedef <name>      Find type definitions
-  stats               Project statistics (--functions for per-function line counts)
+  stats               Project statistics (--functions for per-function line counts, --hot for top callers)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
 
 Common Flags:
@@ -1338,6 +1351,9 @@ Common Flags:
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)
   --functions         Show per-function line counts (stats command)
+  --hot               Show top N most-called functions (stats command, pair with --top=N)
+  --diverse           Cluster call sites by argument shape (example command, pair with --top=N)
+  --git               Attach git enrichment (last modified, author, recent commits) to about/brief
   --include-decorated Include decorated/annotated symbols in deadcode
   --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
   --exact             Exact name match only (find, typedef)
@@ -1506,14 +1522,14 @@ Flags can be added per-command: context myFunc --include-methods
 
 const INTERACTIVE_DISPATCH = {
     // ── Understanding Code ───────────────────────────────────────────
-    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence !== false }) },
+    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence !== false, git: !!f.git }) },
     smart:        { params: 'name', format: (r) => output.formatSmart(r, { uncertainHint: 'use --include-uncertain to include all' }) },
     impact:       { params: 'name', format: (r) => output.formatImpact(r) },
     blast:        { params: 'name', format: (r) => output.formatBlast(r) },
     trace:        { params: 'name', format: (r) => output.formatTrace(r) },
     reverseTrace: { params: 'name', format: (r) => output.formatReverseTrace(r) },
     related:      { params: 'name', format: (r, _a, f) => output.formatRelated(r, { all: f.all, top: f.top }) },
-    example:      { params: 'name', format: (r, a) => output.formatExample(r, a) },
+    example:      { params: (a, f) => ({ name: a, file: f.file, className: f.className, diverse: f.diverse, top: f.top || undefined }), format: (r, a) => output.formatExample(r, a) },
     brief:        { params: 'name', format: (r) => output.formatBrief(r) },
 
     // ── Finding Code ─────────────────────────────────────────────────

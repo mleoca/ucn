@@ -722,12 +722,13 @@ function structuralSearch(index, options = {}) {
 }
 
 /**
- * Find the best usage example of a function
+ * Find the best usage example of a function (or, with `diverse`, one
+ * representative per distinct argument-shape cluster).
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
- * @param {object} options - { className }
- * @returns {object|null} Best example with score
+ * @param {object} options - { className, diverse, top }
+ * @returns {object|null} Best example with score; with diverse=true, also `clusters`
  */
 function example(index, name, options = {}) {
     index._beginOp();
@@ -781,7 +782,73 @@ function example(index, name, options = {}) {
     });
 
     scored.sort((a, b) => b.score - a.score);
-    return { best: scored[0], totalCalls: calls.length };
+    const best = scored[0];
+
+    // Default behavior: one best representative.
+    if (!options.diverse) {
+        return { best, totalCalls: calls.length };
+    }
+
+    // --diverse: cluster call sites by AST argument-shape and return one
+    // representative per cluster (up to `top`, default 3).
+    //
+    // Shape key = "argCount:argKind1,argKind2,..." (see classifyArgNode in
+    // verify.js for the kind set). Calls with no resolvable AST shape go into
+    // a single 'unknown' cluster so they're still surfaced.
+    //
+    // Representative selection: highest existing example score within the
+    // cluster — this reuses the quality heuristic above (typed assignment,
+    // documented, standalone, etc.) so each cluster's example is the *best*
+    // member of that shape, not just the first-seen one.
+    const top = (options.top != null && Number(options.top) > 0) ? Number(options.top) : 3;
+    const clusterMap = new Map(); // shapeKey -> { shapeKey, kinds, count, members:[] }
+
+    for (const call of scored) {
+        const shape = index._analyzeCallShape(call.file, call.line, name);
+        const key = shape ? shape.shapeKey : 'unknown';
+        if (!clusterMap.has(key)) {
+            clusterMap.set(key, {
+                shapeKey: key,
+                argKinds: shape ? shape.argKinds : null,
+                argCount: shape ? shape.argCount : null,
+                count: 0,
+                members: [],
+            });
+        }
+        const c = clusterMap.get(key);
+        c.count++;
+        c.members.push({ ...call, _argTexts: shape ? shape.argTexts : null });
+    }
+
+    // Order clusters: largest first, ties broken by shapeKey for determinism.
+    const clusterList = [...clusterMap.values()].sort((a, b) =>
+        (b.count - a.count) || a.shapeKey.localeCompare(b.shapeKey)
+    );
+
+    // Pick representative per cluster: highest-scoring member; ties broken
+    // by (file, line) for stable output across runs.
+    const clusters = clusterList.slice(0, top).map(cluster => {
+        const sortedMembers = [...cluster.members].sort((a, b) =>
+            (b.score - a.score) ||
+            (a.relativePath || a.file || '').localeCompare(b.relativePath || b.file || '') ||
+            (a.line || 0) - (b.line || 0)
+        );
+        const rep = sortedMembers[0];
+        return {
+            shapeKey: cluster.shapeKey,
+            argKinds: cluster.argKinds,
+            argCount: cluster.argCount,
+            count: cluster.count,
+            representative: rep,
+        };
+    });
+
+    return {
+        best,
+        totalCalls: calls.length,
+        clusters,
+        totalClusters: clusterList.length,
+    };
     } finally { index._endOp(); }
 }
 

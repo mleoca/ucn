@@ -562,6 +562,147 @@ function analyzeCallSite(index, call, funcName) {
 }
 
 /**
+ * Argument shape analysis for a call site (used by `example --diverse`).
+ *
+ * Returns a per-arg list of AST node types ("string_literal", "number_literal",
+ * "identifier", "member_expression", "call_expression", "arrow_function",
+ * "object", "array", "spread", "other") derived directly from tree-sitter,
+ * plus a stable "shape key" that callers can use for clustering.
+ *
+ * Returns null when the call node can't be located (parse failure, file unreadable).
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {string} filePath - Absolute file path
+ * @param {number} lineNum - 1-indexed line of the call
+ * @param {string} funcName - Function name being called
+ * @returns {{argKinds: string[], argTexts: string[], argCount: number, shapeKey: string}|null}
+ */
+function analyzeCallShape(index, filePath, lineNum, funcName) {
+    try {
+        const language = detectLanguage(filePath);
+        if (!language) return null;
+
+        // Reuse tree cache to avoid re-parsing during a batch (clustering scans many sites)
+        let tree = index._treeCache?.get(filePath);
+        if (!tree) {
+            const content = index._readFile(filePath);
+            if (language === 'html') {
+                const htmlModule = getLanguageModule('html');
+                const htmlParser = getParser('html');
+                const jsParser = getParser('javascript');
+                if (!htmlParser || !jsParser) return null;
+                const blocks = htmlModule.extractScriptBlocks(content, htmlParser);
+                if (blocks.length === 0) return null;
+                const virtualJS = htmlModule.buildVirtualJSContent(content, blocks);
+                tree = safeParse(jsParser, virtualJS);
+            } else {
+                const parser = getParser(language);
+                if (!parser) return null;
+                tree = safeParse(parser, content);
+            }
+            if (!tree) return null;
+            if (!index._treeCache) index._treeCache = new Map();
+            index._treeCache.set(filePath, tree);
+        }
+
+        const callTypes = new Set(['call_expression', 'call', 'method_invocation', 'object_creation_expression']);
+        const callNode = findCallNode(tree.rootNode, callTypes, lineNum - 1, funcName);
+        if (!callNode) return null;
+
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) {
+            return { argKinds: [], argTexts: [], argCount: 0, shapeKey: '0:' };
+        }
+
+        const argKinds = [];
+        const argTexts = [];
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const argNode = argsNode.namedChild(i);
+            argKinds.push(classifyArgNode(argNode));
+            argTexts.push(argNode.text.trim());
+        }
+
+        const shapeKey = `${argKinds.length}:${argKinds.join(',')}`;
+        return {
+            argKinds,
+            argTexts,
+            argCount: argKinds.length,
+            shapeKey,
+        };
+    } catch (e) {
+        return null;
+    }
+}
+
+/**
+ * Map a tree-sitter argument node to a coarse "kind" tag for shape clustering.
+ * The mapping is intentionally tight — a call passing `getUser()` should cluster
+ * with another call passing `loadConfig()` (both `call_expression`), but NOT
+ * with one passing `42` (a `number_literal`).
+ *
+ * Cross-language note: tree-sitter grammars use slightly different node names
+ * (`string_literal` vs `string`, `integer` vs `number_literal`). We canonicalize
+ * to a small set so a JS sample and a Python sample produce the same shape key.
+ */
+function classifyArgNode(node) {
+    if (!node) return 'other';
+    const t = node.type;
+    // Strings
+    if (t === 'string' || t === 'string_literal' || t === 'template_string' ||
+        t === 'raw_string_literal' || t === 'interpreted_string_literal') {
+        return 'string_literal';
+    }
+    // Numbers
+    if (t === 'number' || t === 'integer' || t === 'float' || t === 'number_literal' ||
+        t === 'integer_literal' || t === 'float_literal' || t === 'decimal_integer_literal' ||
+        t === 'hex_integer_literal' || t === 'real_literal') {
+        return 'number_literal';
+    }
+    // Booleans + null
+    if (t === 'true' || t === 'false' || t === 'null' || t === 'null_literal' ||
+        t === 'boolean_literal' || t === 'none' || t === 'nil') {
+        return 'literal';
+    }
+    // Identifiers (bare variable name)
+    if (t === 'identifier' || t === 'shorthand_property_identifier' ||
+        t === 'name' || t === 'simple_identifier' || t === 'type_identifier') {
+        return 'identifier';
+    }
+    // Member access: obj.attr / obj.method (no call)
+    if (t === 'member_expression' || t === 'attribute' || t === 'selector_expression' ||
+        t === 'field_expression' || t === 'field_access' || t === 'scoped_identifier') {
+        return 'member_expression';
+    }
+    // Nested calls: foo(getThing())
+    if (t === 'call_expression' || t === 'call' || t === 'method_invocation' ||
+        t === 'object_creation_expression' || t === 'macro_invocation') {
+        return 'call_expression';
+    }
+    // Anonymous functions
+    if (t === 'arrow_function' || t === 'function_expression' || t === 'function' ||
+        t === 'lambda' || t === 'closure_expression' || t === 'function_literal' ||
+        t === 'lambda_expression') {
+        return 'arrow_function';
+    }
+    // Object/struct literals
+    if (t === 'object' || t === 'object_expression' || t === 'dictionary' ||
+        t === 'struct_expression' || t === 'composite_literal') {
+        return 'object';
+    }
+    // Array/list literals
+    if (t === 'array' || t === 'array_expression' || t === 'list' || t === 'tuple' ||
+        t === 'array_literal') {
+        return 'array';
+    }
+    // Spread / unpacking
+    if (t === 'spread_element' || t === 'spread' || t === 'list_splat' ||
+        t === 'dictionary_splat') {
+        return 'spread';
+    }
+    return 'other';
+}
+
+/**
  * Identify common calling patterns
  * @param {Array} callSites - Array of call site objects
  * @param {string} funcName - Function name
@@ -1201,4 +1342,4 @@ function analyzeCallSiteAST(index, filePath, lineNum, funcName) {
     return result;
 }
 
-module.exports = { verify, plan, analyzeCallSite, analyzeCallSiteAST, findCallNode, clearTreeCache, identifyCallPatterns };
+module.exports = { verify, plan, analyzeCallSite, analyzeCallSiteAST, analyzeCallShape, classifyArgNode, findCallNode, clearTreeCache, identifyCallPatterns };

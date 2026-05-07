@@ -1393,6 +1393,482 @@ function mediumFn(x) {
     });
 });
 
+describe('Feature: stats --hot (top callers)', () => {
+    it('getStats returns top N functions by call count when hot:true', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `
+function popular() { return 1; }
+function moderate() { return 2; }
+function lonely() { return 3; }
+module.exports = { popular, moderate, lonely };
+`,
+            'a.js': `
+const { popular, moderate } = require('./lib');
+function callsAll() {
+  popular();
+  popular();
+  moderate();
+}
+`,
+            'b.js': `
+const { popular } = require('./lib');
+function more() {
+  popular();
+  popular();
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const stats = index.getStats({ hot: true, top: 5 });
+            assert.ok(stats.hot, 'should include hot list');
+            assert.ok(Array.isArray(stats.hot.items), 'hot.items should be an array');
+            assert.ok(stats.hot.items.length > 0, 'should find called functions');
+            // popular is called 4 times → must be first
+            assert.strictEqual(stats.hot.items[0].name, 'popular',
+                `expected 'popular' first, got ${stats.hot.items[0].name}`);
+            assert.ok(stats.hot.items[0].callCount >= 4,
+                `expected ≥4 calls for popular, got ${stats.hot.items[0].callCount}`);
+            // hot list must be sorted by callCount desc
+            for (let i = 1; i < stats.hot.items.length; i++) {
+                assert.ok(stats.hot.items[i - 1].callCount >= stats.hot.items[i].callCount,
+                    `hot list must be sorted desc by callCount`);
+            }
+            // lonely (zero calls) must be excluded from hot list
+            assert.ok(!stats.hot.items.some(it => it.name === 'lonely'),
+                'lonely (uncalled) should not appear in hot list');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('getStats hot list respects --top limit', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `
+function a() {} function b() {} function c() {} function d() {} function e() {}
+module.exports = { a, b, c, d, e };
+`,
+            'main.js': `
+const { a, b, c, d, e } = require('./lib');
+a(); a(); a();
+b(); b();
+c(); c();
+d();
+e();
+`
+        });
+        try {
+            const index = idx(dir);
+            const stats = index.getStats({ hot: true, top: 2 });
+            assert.strictEqual(stats.hot.items.length, 2, 'should return top 2 only');
+            assert.strictEqual(stats.hot.top, 2);
+            assert.ok(stats.hot.total >= 5, `total should reflect all called functions, got ${stats.hot.total}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('getStats default top=10 when not specified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `function only() {}\nmodule.exports = { only };`,
+            'main.js': `const { only } = require('./lib'); only();`
+        });
+        try {
+            const index = idx(dir);
+            const stats = index.getStats({ hot: true });
+            assert.strictEqual(stats.hot.top, 10, 'default top should be 10');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('hot list is deterministic across runs (stable ordering)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // Two functions with the same name in different files
+            'a.js': `function shared() { return 'a'; }\nshared();\nmodule.exports = { shared };`,
+            'b.js': `function shared() { return 'b'; }\nshared();\nmodule.exports = { shared };`
+        });
+        try {
+            const index1 = idx(dir);
+            const stats1 = index1.getStats({ hot: true, top: 5 });
+            const index2 = idx(dir);
+            const stats2 = index2.getStats({ hot: true, top: 5 });
+            assert.deepStrictEqual(
+                stats1.hot.items.map(i => `${i.name}:${i.file}:${i.startLine}`),
+                stats2.hot.items.map(i => `${i.name}:${i.file}:${i.startLine}`),
+                'hot list ordering must be stable across builds'
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('formatStats renders hot section', () => {
+        const output = require('../core/output');
+        const stats = {
+            root: '/test',
+            files: 1,
+            symbols: 2,
+            buildTime: 5,
+            byLanguage: { javascript: { files: 1, lines: 10, symbols: 2 } },
+            byType: { function: 2 },
+            hot: {
+                top: 10,
+                total: 2,
+                items: [
+                    { name: 'foo', file: 'a.js', startLine: 1, endLine: 3, callCount: 5 },
+                    { name: 'bar', file: 'b.js', startLine: 1, endLine: 3, callCount: 2 },
+                ]
+            }
+        };
+        const formatted = output.formatStats(stats);
+        assert.ok(formatted.includes('Hottest functions'), 'should have hot section header');
+        assert.ok(formatted.includes('foo'), 'should list foo');
+        assert.ok(formatted.includes('5 calls'), 'should show call counts');
+    });
+});
+
+describe('Feature: example --diverse (cluster by shape)', () => {
+    it('returns clusters for distinct argument shapes', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `function send(url, body) { return body; }\nmodule.exports = { send };`,
+            'main.js': `
+const { send } = require('./lib');
+send("https://api.example.com", { foo: 1 });
+send("https://api.example.com", { foo: 2 });
+send(loadUrl(), userBody);
+send(\`\${HOST}/api\`, JSON.stringify({}));
+`
+        });
+        try {
+            const index = idx(dir);
+            const result = index.example('send', { diverse: true, top: 5 });
+            assert.ok(result, 'should return result');
+            assert.ok(Array.isArray(result.clusters), 'should include clusters array');
+            assert.ok(result.clusters.length >= 2,
+                `expected ≥2 distinct clusters, got ${result.clusters.length}`);
+            // Each cluster has a representative
+            for (const c of result.clusters) {
+                assert.ok(c.representative, 'every cluster has a representative');
+                assert.ok(c.shapeKey, 'every cluster has a shapeKey');
+                assert.ok(c.count >= 1, 'cluster count >= 1');
+            }
+            // Largest cluster should be the (string, object) pair (count=2)
+            assert.ok(result.clusters[0].count >= result.clusters[1].count,
+                'clusters sorted by count descending');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('without --diverse returns single best (existing behavior)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `function ping() { return 1; }\nmodule.exports = { ping };`,
+            'main.js': `const { ping } = require('./lib'); ping(); ping();`
+        });
+        try {
+            const index = idx(dir);
+            const result = index.example('ping');
+            assert.ok(result, 'should return result');
+            assert.ok(result.best, 'should have best');
+            assert.ok(!result.clusters, 'should NOT include clusters when diverse=false');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('--top limits the number of clusters returned', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `function f(...a) { return a; }\nmodule.exports = { f };`,
+            'main.js': `
+const { f } = require('./lib');
+f(1);
+f("x");
+f([1,2]);
+f({a:1});
+f(getThing());
+`
+        });
+        try {
+            const index = idx(dir);
+            const result = index.example('f', { diverse: true, top: 2 });
+            assert.ok(result.clusters.length <= 2,
+                `top=2 should cap clusters at 2, got ${result.clusters.length}`);
+            assert.ok(result.totalClusters >= result.clusters.length,
+                'totalClusters reflects all distinct shapes');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('formatExample shows cluster blocks when diverse=true', () => {
+        const out = require('../core/output');
+        const result = {
+            best: {
+                relativePath: 'a.js', file: 'a.js', line: 5,
+                content: 'send("x", {})', score: 12, reasons: ['standalone'],
+                before: [], after: [],
+            },
+            totalCalls: 3,
+            totalClusters: 2,
+            clusters: [
+                {
+                    shapeKey: '2:string_literal,object', argCount: 2,
+                    argKinds: ['string_literal', 'object'], count: 2,
+                    representative: {
+                        relativePath: 'a.js', file: 'a.js', line: 5,
+                        content: 'send("x", {})', score: 12, reasons: ['standalone'],
+                        before: [], after: [],
+                    },
+                },
+                {
+                    shapeKey: '2:identifier,identifier', argCount: 2,
+                    argKinds: ['identifier', 'identifier'], count: 1,
+                    representative: {
+                        relativePath: 'b.js', file: 'b.js', line: 7,
+                        content: 'send(u, b)', score: 5, reasons: [],
+                        before: [], after: [],
+                    },
+                },
+            ],
+        };
+        const text = out.formatExample(result, 'send');
+        assert.ok(text.includes('Diverse examples'), 'has diverse header');
+        assert.ok(text.includes('cluster'), 'mentions clusters');
+        assert.ok(text.includes('string_literal, object'), 'shows shape signature');
+    });
+
+    it('cluster output is deterministic across runs', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `function go(x, y) {}\nmodule.exports = { go };`,
+            'main.js': `
+const { go } = require('./lib');
+go(1, 2); go(3, 4); go("a", "b"); go("c", "d");
+`
+        });
+        try {
+            const index1 = idx(dir);
+            const r1 = index1.example('go', { diverse: true, top: 5 });
+            const index2 = idx(dir);
+            const r2 = index2.example('go', { diverse: true, top: 5 });
+            assert.deepStrictEqual(
+                r1.clusters.map(c => c.shapeKey),
+                r2.clusters.map(c => c.shapeKey),
+                'cluster ordering must be stable across builds'
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('Feature: --git enrichment on about/brief', () => {
+    const { execSync } = require('child_process');
+    const { getGitInfo, _clearCache } = require('../core/git-enrich');
+
+    function initGitRepo(dir) {
+        execSync('git init -q', { cwd: dir });
+        execSync('git -c user.email=t@t.example -c user.name=TestAuthor add .', { cwd: dir });
+        execSync('git -c user.email=t@t.example -c user.name=TestAuthor commit -q -m "initial"',
+            { cwd: dir });
+    }
+
+    it('getGitInfo returns available:true with author and ISO timestamp in a git repo', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            initGitRepo(dir);
+            _clearCache();
+            const info = getGitInfo(dir, 'lib.js');
+            assert.strictEqual(info.available, true, 'should be available');
+            assert.strictEqual(info.author, 'TestAuthor', 'author should match');
+            assert.ok(info.lastModified, 'should have lastModified');
+            assert.match(info.lastModified, /^\d{4}-\d{2}-\d{2}T/, 'lastModified should be ISO');
+            assert.ok(info.recentChanges >= 1, 'recentChanges >= 1 (just committed)');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('getGitInfo returns available:false on a non-git directory (no crash)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}',
+        });
+        try {
+            _clearCache();
+            const info = getGitInfo(dir, 'lib.js');
+            assert.strictEqual(info.available, false, 'should be unavailable');
+            assert.ok(info.error, 'should have error message');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('getGitInfo caches results per (root, relPath)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() {}',
+        });
+        try {
+            initGitRepo(dir);
+            _clearCache();
+            const info1 = getGitInfo(dir, 'lib.js');
+            const info2 = getGitInfo(dir, 'lib.js');
+            assert.strictEqual(info1, info2, 'cache should return same object reference');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('about result includes git block when option git:true and in git repo', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'main.js': 'const { helper } = require("./lib"); helper();',
+        });
+        try {
+            initGitRepo(dir);
+            _clearCache();
+            const index = idx(dir);
+            const result = index.about('helper', { git: true });
+            assert.ok(result, 'should find symbol');
+            assert.ok(result.git, 'should attach git block');
+            assert.strictEqual(result.git.available, true);
+            assert.strictEqual(result.git.author, 'TestAuthor');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('about result has NO git block when option git is unset', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            initGitRepo(dir);
+            _clearCache();
+            const index = idx(dir);
+            const result = index.about('helper');
+            assert.ok(result, 'should find symbol');
+            assert.strictEqual(result.git, undefined,
+                'git block should NOT be attached when option not passed');
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('brief result includes git block when option git:true', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            initGitRepo(dir);
+            _clearCache();
+            const index = idx(dir);
+            const { brief } = require('../core/brief');
+            const result = brief(index, 'helper', { git: true });
+            assert.ok(result, 'should find symbol');
+            assert.ok(result.git, 'brief should attach git block');
+            assert.strictEqual(result.git.available, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('formatAbout renders git line gracefully when git.available=false', () => {
+        const out = require('../core/output');
+        const about = {
+            found: true,
+            symbol: {
+                name: 'foo', type: 'function', file: 'a.js',
+                startLine: 1, endLine: 3, signature: 'foo()'
+            },
+            git: { available: false, error: 'not a repo' },
+            usages: { calls: 0, imports: 0, references: 0 },
+            totalUsages: 0,
+            callers: { total: 0, top: [], histogram: null },
+            callees: { total: 0, top: [], histogram: null },
+            tests: { totalMatches: 0, fileCount: 0, files: [] },
+            otherDefinitions: [],
+            types: [],
+            includeMethods: false,
+            completeness: { warnings: [] },
+        };
+        // Must not throw and must not include "Last modified" (since unavailable)
+        const text = out.formatAbout(about);
+        assert.ok(text, 'should render');
+        assert.ok(!text.includes('Last modified'),
+            'should not render git line when unavailable');
+    });
+
+    it('formatAbout renders git line when git.available=true', () => {
+        const out = require('../core/output');
+        const about = {
+            found: true,
+            symbol: {
+                name: 'foo', type: 'function', file: 'a.js',
+                startLine: 1, endLine: 3, signature: 'foo()'
+            },
+            git: {
+                available: true,
+                lastModified: '2026-05-01T12:00:00Z',
+                author: 'Alice',
+                recentChanges: 3,
+            },
+            usages: { calls: 0, imports: 0, references: 0 },
+            totalUsages: 0,
+            callers: { total: 0, top: [], histogram: null },
+            callees: { total: 0, top: [], histogram: null },
+            tests: { totalMatches: 0, fileCount: 0, files: [] },
+            otherDefinitions: [],
+            types: [],
+            includeMethods: false,
+            completeness: { warnings: [] },
+        };
+        const text = out.formatAbout(about);
+        assert.ok(text.includes('Last modified'), 'should render git line');
+        assert.ok(text.includes('Alice'), 'should include author');
+        assert.ok(text.includes('3 commits'), 'should include recent change count');
+    });
+
+    it('formatBrief renders git line when present', () => {
+        const out = require('../core/output');
+        const result = {
+            symbol: {
+                name: 'foo', type: 'function', file: 'a.js',
+                startLine: 1, endLine: 3,
+            },
+            kind: 'function',
+            lineCount: 3,
+            sideEffects: [],
+            complexity: { branches: 0, maxDepth: 0, lineCount: 3 },
+            git: {
+                available: true,
+                lastModified: '2026-05-01T12:00:00Z',
+                author: 'Bob',
+                recentChanges: 1,
+            },
+        };
+        const text = out.formatBrief(result);
+        assert.ok(text.includes('Last modified'), 'should render git line');
+        assert.ok(text.includes('Bob'), 'should include author');
+        assert.ok(text.includes('1 commit'), 'should include recent change count');
+    });
+});
+
 // ============================================================================
 // MCP `all` and `top_level` parameter parity (bug hunt 2026-02-26)
 // ============================================================================

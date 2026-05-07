@@ -98,16 +98,16 @@ const PARAM_MAP = {
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
     // Understanding code
-    about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
+    about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git'],
     context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
     impact:       ['name', 'file', 'exclude', 'className', 'top', 'unreachableOnly', 'compact'],
     blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
     trace:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    example:      ['name', 'file', 'className'],
+    example:      ['name', 'file', 'className', 'diverse', 'top'],
     related:      ['name', 'file', 'className', 'top', 'all'],
-    brief:        ['name', 'file', 'className'],
+    brief:        ['name', 'file', 'className', 'git'],
     // Finding code
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth', 'compact'],
     usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact'],
@@ -137,7 +137,7 @@ const FLAG_APPLICABILITY = {
     typedef:      ['name', 'file', 'className', 'exact'],
     stacktrace:   ['stack'],
     api:          ['file', 'limit'],
-    stats:        ['functions', 'top'],
+    stats:        ['functions', 'hot', 'top'],
     doctor:       ['file', 'in', 'limit', 'deep'],
 };
 

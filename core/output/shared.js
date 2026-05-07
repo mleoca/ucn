@@ -286,6 +286,26 @@ function computeConfidence(symbol) {
     return { level, reasons };
 }
 
+/**
+ * Render a single human-readable line for git enrichment data.
+ * Format: `Last modified: <ISO> by <author> · <N> commits in last 30d`
+ *
+ * Returns null when input is missing or unavailable so callers can decide
+ * whether to push it. Used by `about` and `brief` formatters.
+ */
+function formatGitLine(git) {
+    if (!git || !git.available) return null;
+    const parts = [];
+    if (git.lastModified) parts.push(`Last modified: ${git.lastModified}`);
+    if (git.author) parts.push(`by ${git.author}`);
+    let line = parts.join(' ');
+    if (git.recentChanges != null) {
+        const tail = `${git.recentChanges} commit${git.recentChanges === 1 ? '' : 's'} in last 30d`;
+        line = line ? `${line} · ${tail}` : tail;
+    }
+    return line;
+}
+
 module.exports = {
     dynamicImportsNote,
     formatFileError,
@@ -301,4 +321,5 @@ module.exports = {
     detectDoubleEscaping,
     countNestedGenerics,
     computeConfidence,
+    formatGitLine,
 };

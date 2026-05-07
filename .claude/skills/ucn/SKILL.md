@@ -157,7 +157,7 @@ ucn entrypoints --file=routes/           # Scoped to files
 | Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
 | See what a file exports | `ucn file-exports <file>` | All exported functions, classes, variables with signatures |
 | Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
-| Project complexity stats | `ucn stats` | File counts, symbol counts, lines by language. `--functions` for per-function line counts |
+| Project complexity stats | `ucn stats` | File counts, symbol counts, lines by language. `--functions` for per-function line counts. `--hot --top=N` for the most-called functions (orientation primitive on a new repo) |
 | Find by glob pattern | `ucn find "handle*"` | Locate definitions matching a glob (supports * and ?) |
 | Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |
 | Regex search (default) | `ucn search '\d+'` | Search supports regex by default (alternation, character classes, etc.) |
@@ -227,6 +227,9 @@ ucn [target] <command> [name] [--flags]
 | `--context=N` | Lines of surrounding context in `usages`/`search` output |
 | `--no-regex` | Force plain text search (regex is default) |
 | `--functions` | Show per-function line counts in `stats` (complexity audit) |
+| `--hot` | List top N most-called functions in `stats` (use with `--top=N`, default 10). Best orientation primitive when entering a new repo |
+| `--diverse` | Cluster `example` call sites by argument shape and return one representative per cluster (use with `--top=N`, default 3) |
+| `--git` | Attach git enrichment to `about` / `brief` / `context`: last commit (ISO + author) and recent change count (last 30 days). Skipped silently when not a git repo |
 | `--json` | Machine-readable JSON output (wrapped in `{meta, data}`) |
 | `--code-only` | Exclude matches in comments and strings (`search`/`usages`) |
 | `--with-types` | Include related type definitions in `smart`/`about` output |

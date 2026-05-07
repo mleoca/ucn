@@ -93,7 +93,7 @@ const SIDE_EFFECT_CALLS_BY_LANG = {
  *
  * @param {object} index - ProjectIndex
  * @param {string} name - Symbol name (function/method/class)
- * @param {object} options - { file, className }
+ * @param {object} options - { file, className, git }
  * @returns {object|null}
  */
 function brief(index, name, options = {}) {
@@ -123,6 +123,14 @@ function brief(index, name, options = {}) {
             ...(def.isGenerator && { isGenerator: true }),
         };
 
+        // Optional git enrichment for the primary symbol's file.
+        // Skipped silently outside git repos; formatters check `git.available`.
+        let gitInfo = null;
+        if (options.git) {
+            const { getGitInfo } = require('./git-enrich');
+            gitInfo = getGitInfo(index.root, def.relativePath || def.file);
+        }
+
         // For non-callable types (class/struct/interface/type), most fields don't apply
         if (['class', 'struct', 'interface', 'type', 'enum'].includes(def.type)) {
             return {
@@ -130,6 +138,7 @@ function brief(index, name, options = {}) {
                 kind: 'type',
                 lineCount: (def.endLine || def.startLine) - def.startLine + 1,
                 memberCount: countMembers(index, def),
+                ...(gitInfo && { git: gitInfo }),
             };
         }
 
@@ -151,6 +160,7 @@ function brief(index, name, options = {}) {
                 complexity: { branches: 0, maxDepth: 0, lineCount: 0 },
                 isAsync: !!def.isAsync,
                 error: 'Could not read source',
+                ...(gitInfo && { git: gitInfo }),
             };
         }
 
@@ -168,6 +178,7 @@ function brief(index, name, options = {}) {
             complexity,
             isAsync: !!def.isAsync,
             isGenerator: !!def.isGenerator,
+            ...(gitInfo && { git: gitInfo }),
         };
     } finally {
         index._endOp();

@@ -1953,6 +1953,9 @@ class ProjectIndex {
     /** Analyze a call site using AST for example scoring */
     _analyzeCallSiteAST(filePath, lineNum, funcName) { return verifyModule.analyzeCallSiteAST(this, filePath, lineNum, funcName); }
 
+    /** Analyze a call site's argument shape (used by `example --diverse`) */
+    _analyzeCallShape(filePath, lineNum, funcName) { return verifyModule.analyzeCallShape(this, filePath, lineNum, funcName); }
+
     /** Diff-based impact analysis: find which functions changed and who calls them */
     diffImpact(options) { return analysisModule.diffImpact(this, options); }
 }

@@ -15,7 +15,7 @@ const { isTestFile } = require('./discovery');
  * Get project statistics: file counts, symbol counts, LOC, language breakdown.
  *
  * @param {object} index - ProjectIndex instance
- * @param {object} options - { functions }
+ * @param {object} options - { functions, hot, top }
  * @returns {object}
  */
 function getStats(index, options = {}) {
@@ -83,6 +83,87 @@ function getStats(index, options = {}) {
         }
         functions.sort((a, b) => b.lines - a.lines);
         stats.functions = functions;
+    }
+
+    // Hot list: top N functions by inbound call-site count.
+    // "callCount" = number of distinct call-site lines that resolve to this name
+    // across the project. Multiple definitions of the same name are listed
+    // separately (per file:line) since callers may differ. The count is
+    // name-keyed (not per-definition) — same trade-off as `usages` and matches
+    // the rest of the codebase's call-graph approximation.
+    if (options.hot) {
+        const top = (options.top != null && Number(options.top) > 0) ? Number(options.top) : 10;
+        const FUNCTION_TYPES = new Set([
+            'function', 'method', 'static', 'constructor',
+            'public', 'abstract', 'classmethod'
+        ]);
+
+        // Ensure the calls cache is fully populated before counting.
+        // First-time stats --hot may need to parse files to extract calls;
+        // subsequent runs use the persisted calls cache.
+        if (typeof index.buildCalleeIndex === 'function' && !index.calleeIndex) {
+            index.buildCalleeIndex();
+        }
+
+        // Compute call counts per name from the calls cache (one pass).
+        // Each call record is (name, line, ...). We dedupe per file by (name,line)
+        // so a single source line that calls foo() once counts as one inbound
+        // call site even if the parser emits multiple records for it.
+        const callCountByName = new Map();
+        for (const [filePath, entry] of index.callsCache) {
+            if (!entry || !Array.isArray(entry.calls)) continue;
+            const seenInFile = new Set();
+            for (const c of entry.calls) {
+                if (!c || !c.name) continue;
+                const key = `${c.name}::${c.line || 0}`;
+                if (seenInFile.has(key)) continue;
+                seenInFile.add(key);
+                callCountByName.set(c.name, (callCountByName.get(c.name) || 0) + 1);
+                // Also count under resolvedName when distinct (e.g. aliased imports)
+                if (c.resolvedName && c.resolvedName !== c.name) {
+                    const rkey = `${c.resolvedName}::${c.line || 0}`;
+                    if (!seenInFile.has(rkey)) {
+                        seenInFile.add(rkey);
+                        callCountByName.set(c.resolvedName,
+                            (callCountByName.get(c.resolvedName) || 0) + 1);
+                    }
+                }
+            }
+        }
+
+        // Build per-definition entries. Each function symbol gets its name's
+        // count, then we sort and slice. Same name in different files →
+        // separate entries (callers may differ).
+        const hotList = [];
+        for (const [name, symbols] of index.symbols) {
+            const count = callCountByName.get(name) || 0;
+            if (count === 0) continue; // skip dead symbols
+            for (const sym of symbols) {
+                if (!FUNCTION_TYPES.has(sym.type)) continue;
+                const relativePath = sym.relativePath ||
+                    (sym.file ? path.relative(index.root, sym.file) : '');
+                hotList.push({
+                    name: sym.className ? `${sym.className}.${sym.name}` : sym.name,
+                    file: relativePath,
+                    startLine: sym.startLine,
+                    endLine: sym.endLine,
+                    callCount: count,
+                });
+            }
+        }
+
+        // Stable order: callCount desc, then (relativePath, startLine) asc.
+        hotList.sort((a, b) =>
+            (b.callCount - a.callCount) ||
+            a.file.localeCompare(b.file) ||
+            (a.startLine || 0) - (b.startLine || 0)
+        );
+
+        stats.hot = {
+            top,
+            total: hotList.length,
+            items: hotList.slice(0, top),
+        };
     }
 
     return stats;

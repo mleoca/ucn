@@ -150,6 +150,23 @@ function formatStats(stats, options = {}) {
         }
     }
 
+    if (stats.hot) {
+        const items = stats.hot.items || [];
+        const total = stats.hot.total || items.length;
+        lines.push(`\nHottest functions (top ${items.length} of ${total} called):`);
+        if (items.length === 0) {
+            lines.push('  (no inbound calls detected)');
+        } else {
+            for (const fn of items) {
+                const loc = `${fn.file}:${fn.startLine}`;
+                lines.push(`  ${String(fn.callCount).padStart(5)} calls  ${fn.name}  (${loc})`);
+            }
+            if (total > items.length) {
+                lines.push(`  ... ${total - items.length} more (use --top=N to show more)`);
+            }
+        }
+    }
+
     return lines.join('\n');
 }
 

@@ -4,7 +4,7 @@
 
 'use strict';
 
-const { renderTypedParams } = require('./shared');
+const { renderTypedParams, formatGitLine } = require('./shared');
 
 /**
  * Build a typed signature line for a callable symbol.
@@ -52,6 +52,8 @@ function formatBrief(result) {
         lines.push(`  ${sym.file}:${sym.startLine}-${sym.endLine}  (${lineLabel}${memberPart})`);
         if (sym.handle) lines.push(`  handle: ${sym.handle}`);
         if (sym.docstring) lines.push(`  "${sym.docstring}"`);
+        const gitLineType = formatGitLine(result.git);
+        if (gitLineType) lines.push(`  ${gitLineType}`);
         return lines.join('\n');
     }
 
@@ -62,6 +64,8 @@ function formatBrief(result) {
     if (sym.handle) lines.push(`  handle: ${sym.handle}`);
     if (sym.docstring) lines.push(`  "${sym.docstring}"`);
     if (sym.className) lines.push(`  in class ${sym.className}`);
+    const gitLineFn = formatGitLine(result.git);
+    if (gitLineFn) lines.push(`  ${gitLineFn}`);
 
     // Async/generator/decorators
     const flags = [];
