@@ -12,7 +12,10 @@
 
 'use strict';
 
+const fs = require('fs');
+const path = require('path');
 const { getCachedCalls } = require('./callers');
+const { getLanguageModule } = require('../languages');
 
 // ============================================================================
 // FRAMEWORK PATTERNS
@@ -302,6 +305,72 @@ const FRAMEWORK_PATTERNS = [
     // Go goroutine launch — go func() or go handler()
     // (detected separately in namePattern since it's a language feature)
 
+    // ── JS/TS Runtime Entry Points ────────────────────────────────────
+
+    // Node CLI / app main: symbols defined in conventionally-named entry files.
+    // - bin/* (npm "bin" entries)
+    // - index.{js,ts,mjs,cjs} (package main convention)
+    // - main.{js,ts,mjs,cjs} (electron main, etc.)
+    // - cli.{js,ts,mjs,cjs}
+    // - server.{js,ts,mjs,cjs}
+    {
+        id: 'js-cli-main',
+        languages: JS_LANGS,
+        type: 'runtime',
+        framework: 'node',
+        detection: 'filePath',
+        // Match files under bin/ (any depth), or top-level index/main/cli/server in any directory.
+        // The matcher is run against the project-relative path with forward slashes.
+        pathPattern: /(^|\/)bin\/[^/]+\.(js|ts|mjs|cjs)$|(^|\/)(index|main|cli|server)\.(js|ts|mjs|cjs)$/,
+    },
+
+    // Node shebang entry: any file whose first bytes are `#!/usr/bin/env node`
+    // or `#!/path/to/node`. These are runnable scripts, not libraries.
+    {
+        id: 'js-shebang-main',
+        languages: JS_LANGS,
+        type: 'runtime',
+        framework: 'node',
+        detection: 'shebang',
+        shebangPattern: /^#![^\n]*\bnode\b/,
+    },
+
+    // Jest/Mocha/Vitest test files: any function defined in a *.test.* /
+    // *.spec.* file or under __tests__/, test/, tests/.
+    {
+        id: 'js-test-file',
+        languages: JS_LANGS,
+        type: 'test',
+        framework: 'jest',
+        detection: 'filePath',
+        pathPattern: /(^|\/)(__tests__|tests?)\/|\.(test|spec)\.(js|ts|jsx|tsx|mjs|cjs)$/,
+    },
+
+    // Next.js pages/routes: default-exported functions from files under
+    // pages/ or app/ are runtime entry points (rendered/served by Next.js).
+    {
+        id: 'next-page',
+        languages: JS_LANGS,
+        type: 'runtime',
+        framework: 'next',
+        detection: 'filePath',
+        pathPattern: /(^|\/)(pages|app)\/.*\.(js|ts|jsx|tsx|mjs|cjs)$/,
+    },
+
+    // ── Python Runtime Entry Points ────────────────────────────────────
+
+    // __main__.py — package executable entry (python -m pkg).
+    // The `if __name__ == '__main__':` guard wraps statements not functions,
+    // so we treat any function in __main__.py as runtime-reachable.
+    {
+        id: 'python-main-module',
+        languages: new Set(['python']),
+        type: 'runtime',
+        framework: 'python',
+        detection: 'filePath',
+        pathPattern: /(^|\/)__main__\.py$/,
+    },
+
     // ── Catch-all fallbacks ─────────────────────────────────────────────
 
     // Python: any decorator with '.' (attribute access) — framework registration heuristic
@@ -465,6 +534,56 @@ function detectEntrypoints(index, options = {}) {
 
     // Collect name-based patterns for efficient matching
     const namePatterns = FRAMEWORK_PATTERNS.filter(p => p.detection === 'namePattern');
+    const filePathPatterns = FRAMEWORK_PATTERNS.filter(p => p.detection === 'filePath');
+    const shebangPatterns = FRAMEWORK_PATTERNS.filter(p => p.detection === 'shebang');
+
+    // 0. Pre-compute per-file pattern matches for filePath and shebang detection.
+    //    These mark every symbol in a file as an entry point.
+    const fileMatches = new Map(); // absolutePath -> { pattern, evidence }[]
+    for (const [filePath, fileEntry] of index.files) {
+        const lang = fileEntry.language;
+        const relPath = (fileEntry.relativePath || filePath).split(path.sep).join('/');
+
+        // filePath patterns match against the project-relative path
+        for (const fp of filePathPatterns) {
+            if (!fp.languages.has(lang)) continue;
+            if (!fp.pathPattern.test(relPath)) continue;
+            if (!fileMatches.has(filePath)) fileMatches.set(filePath, []);
+            fileMatches.get(filePath).push({
+                pattern: fp,
+                evidence: `entry-file: ${relPath}`,
+            });
+        }
+
+        // shebang patterns: read the first ~128 bytes safely.
+        if (shebangPatterns.length > 0) {
+            const relevant = shebangPatterns.filter(p => p.languages.has(lang));
+            if (relevant.length > 0) {
+                let head = '';
+                try {
+                    const fd = fs.openSync(filePath, 'r');
+                    try {
+                        const buf = Buffer.alloc(128);
+                        const n = fs.readSync(fd, buf, 0, 128, 0);
+                        head = buf.slice(0, n).toString('utf8');
+                    } finally {
+                        fs.closeSync(fd);
+                    }
+                } catch (_e) { /* unreadable — skip */ }
+                if (head) {
+                    for (const sp of relevant) {
+                        if (sp.shebangPattern.test(head)) {
+                            if (!fileMatches.has(filePath)) fileMatches.set(filePath, []);
+                            fileMatches.get(filePath).push({
+                                pattern: sp,
+                                evidence: 'shebang #!node',
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // 1. Scan all symbols for decorator/modifier/name-based patterns
     for (const [name, symbols] of index.symbols) {
@@ -518,7 +637,9 @@ function detectEntrypoints(index, options = {}) {
         }
     }
 
-    // 2. Add call-pattern-based entry points (route handlers)
+    // 2. Add call-pattern-based entry points (route handlers).
+    // Run BEFORE file-level patterns so framework labels (express, gin, etc.) win
+    // over generic file-level labels (e.g. server.js / index.js js-cli-main).
     for (const [name, info] of callbackMap) {
         const fileEntry = index.files.get(info.file);
         const relPath = fileEntry?.relativePath || info.file;
@@ -537,6 +658,42 @@ function detectEntrypoints(index, options = {}) {
             evidence: [`${info.method} route handler`],
             confidence: 0.90,
         });
+    }
+
+    // 3. Add file-level entry points (filePath / shebang). These run last so any
+    // more-specific framework label registered above wins; here we only catch
+    // symbols not already seen. Dedup by (file, name) — not (file, line, name) —
+    // so a generic file-level entry doesn't add a duplicate entry alongside a
+    // specific framework callback registered at a different line.
+    if (fileMatches.size > 0) {
+        const seenByFileName = new Set();
+        for (const r of results) {
+            seenByFileName.add(`${r.absoluteFile}:${r.name}`);
+        }
+        for (const [name, symbols] of index.symbols) {
+            for (const symbol of symbols) {
+                const fmatches = fileMatches.get(symbol.file);
+                if (!fmatches || fmatches.length === 0) continue;
+                const fileNameKey = `${symbol.file}:${name}`;
+                if (seenByFileName.has(fileNameKey)) continue;
+                const key = `${symbol.file}:${symbol.startLine}:${name}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                seenByFileName.add(fileNameKey);
+                const first = fmatches[0];
+                results.push({
+                    name,
+                    file: symbol.relativePath || symbol.file,
+                    absoluteFile: symbol.file,
+                    line: symbol.startLine,
+                    type: first.pattern.type,
+                    framework: first.pattern.framework,
+                    patternId: first.pattern.id,
+                    evidence: [first.evidence],
+                    confidence: 0.85,
+                });
+            }
+        }
     }
 
     // Apply filters
@@ -624,6 +781,84 @@ function computeReachability(index) {
             if (!reachable.has(key)) {
                 reachable.add(key);
                 queue.push(match);
+            }
+        }
+    }
+
+    // BUG-BE root cause 1: also seed from per-language getEntryPointKind() predicates.
+    // detectEntrypoints() above only knows about FRAMEWORK_PATTERNS; it does not consult
+    // each language module's getEntryPointKind() (which classifies React lifecycle methods,
+    // @Test annotations, Rust #[cfg(test)] modules, Go Test*/main, etc.). Without this
+    // pass those entries are never seeded, so anything reachable only via them is reported
+    // as unreachable. The reachable Set already dedupes against the framework-pattern pass.
+    const langModuleCache = new Map();
+    for (const [, symbols] of index.symbols) {
+        for (const symbol of symbols) {
+            const fileEntry = index.files.get(symbol.file);
+            if (!fileEntry) continue;
+            const lang = fileEntry.language;
+            let langModule;
+            if (langModuleCache.has(lang)) {
+                langModule = langModuleCache.get(lang);
+            } else {
+                try {
+                    langModule = getLanguageModule(lang);
+                } catch (_e) {
+                    langModule = null;
+                }
+                langModuleCache.set(lang, langModule);
+            }
+            if (!langModule || !langModule.getEntryPointKind) continue;
+            let kind;
+            try {
+                kind = langModule.getEntryPointKind(symbol);
+            } catch (_e) {
+                continue;
+            }
+            if (kind == null) continue;
+            const key = symbolKey(symbol.file, symbol.startLine);
+            if (!reachable.has(key)) {
+                reachable.add(key);
+                queue.push(symbol);
+            }
+        }
+    }
+
+    // BUG-BE root cause 3: top-level executable code in JS/TS files is a reachability
+    // source. A call expression at module scope (no enclosing function) is invoked
+    // when the module is loaded; treat its callee as reachable. Walk getCachedCalls
+    // (already AST-derived) and seed callees of enclosingFunction === null calls
+    // for files in JS/TS-language. Resolution mirrors findCallees: name lookup +
+    // disambiguation by import bindings is not necessary here — we just need to seed
+    // the callee symbol(s); the BFS below propagates further reachability.
+    for (const [filePath, fileEntry] of index.files) {
+        const lang = fileEntry.language;
+        if (lang !== 'javascript' && lang !== 'typescript' && lang !== 'tsx') continue;
+        let calls;
+        try {
+            calls = getCachedCalls(index, filePath);
+        } catch (_e) {
+            continue;
+        }
+        if (!calls || calls.length === 0) continue;
+        for (const call of calls) {
+            // Top-level call: AST recorded enclosingFunction === null/undefined.
+            if (call.enclosingFunction != null) continue;
+            // Method calls at top-level (e.g. a.b()) are typically library calls;
+            // we keep the simple identifier case where the callee name is a project symbol.
+            if (call.isMethod) continue;
+            // Resolve possible callee names — supports aliased imports.
+            const names = call.resolvedNames || (call.resolvedName ? [call.resolvedName] : [call.name]);
+            for (const cname of names) {
+                const symbols = index.symbols.get(cname);
+                if (!symbols) continue;
+                for (const sym of symbols) {
+                    const key = symbolKey(sym.file, sym.startLine);
+                    if (!reachable.has(key)) {
+                        reachable.add(key);
+                        queue.push(sym);
+                    }
+                }
             }
         }
     }

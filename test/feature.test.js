@@ -1940,9 +1940,12 @@ public class Service {
     it('JS: app.get(string) without callback is NOT an entrypoint', () => {
         // app.get('port') is Express config lookup, not route registration.
         // String literal args don't produce isFunctionReference/isPotentialCallback.
+        // File is named middleware.js (not server.js / index.js / cli.js) so the
+        // js-cli-main filePath pattern doesn't fire — we want to verify pure
+        // callback-pattern false-positive rejection here.
         const dir = tmp({
             'package.json': '{"name":"test"}',
-            'server.js': `
+            'src/middleware.js': `
 const express = require('express');
 const app = express();
 

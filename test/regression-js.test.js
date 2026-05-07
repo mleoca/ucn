@@ -3771,3 +3771,300 @@ describe('BUG-BY: typed-arrow declaration preserves param and return types', () 
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// BUG-BE: TS reachability — three root causes
+//   1. computeReachability ignored per-language getEntryPointKind() predicates
+//   2. JS/TS had no runtime entry-point patterns in FRAMEWORK_PATTERNS
+//   3. Top-level executable code wasn't a reachability source
+// ============================================================================
+
+describe('BUG-BE: TS reachability', () => {
+    const { computeReachability, symbolKey, detectEntrypoints } = require('../core/entrypoints');
+
+    function reachableSet(dir) {
+        const index = idx(dir);
+        const reach = computeReachability(index);
+        return { index, reach };
+    }
+    function isReach(reach, symbols, name) {
+        const candidates = symbols.get(name) || [];
+        return candidates.some(s => reach.has(symbolKey(s.file, s.startLine)));
+    }
+
+    // Cause 1: per-language getEntryPointKind seeds reachability
+    it('cause 1: React lifecycle componentDidMount seeds reachability', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // Plain user-named file (not bin/index/cli/server, not under pages/),
+            // so reachability MUST flow from componentDidMount via getEntryPointKind
+            // — not from any FRAMEWORK_PATTERNS hit.
+            'comp.ts': `
+class Foo {
+    componentDidMount() {
+        this.fetchData();
+    }
+    fetchData() {
+        return apiCall();
+    }
+}
+
+function apiCall() { return 42; }
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'componentDidMount'),
+                'componentDidMount is a React lifecycle entry');
+            assert.ok(isReach(reach, index.symbols, 'fetchData'),
+                'fetchData is reachable from componentDidMount');
+            assert.ok(isReach(reach, index.symbols, 'apiCall'),
+                'apiCall is transitively reachable');
+        } finally { rm(dir); }
+    });
+
+    // Cause 3: top-level call expressions seed reachability (JS/TS)
+    it('cause 3: top-level call to imported function seeds reachability', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // index.ts (yes, this also matches js-cli-main, but the test is about
+            // the call graph, so we test with a non-conventionally-named file too).
+            'main.ts': `
+import { handler } from './handler';
+handler();
+`,
+            'handler.ts': `
+export function handler() {
+    run();
+}
+export function run() {}
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'handler'),
+                'handler is reachable via top-level call in main.ts');
+            assert.ok(isReach(reach, index.symbols, 'run'),
+                'run is transitively reachable from handler');
+        } finally { rm(dir); }
+    });
+
+    it('cause 3: top-level call from a non-conventionally-named entry file', () => {
+        // This file is NOT named bin/index/main/cli/server, and NOT under pages/.
+        // The ONLY way reachability flows is via the top-level call expression
+        // root-cause-3 fix (no getEntryPointKind match either).
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.ts': `
+import { go } from './lib';
+go();
+`,
+            'lib.ts': `
+export function go() { inner(); }
+export function inner() {}
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'go'),
+                'go is reachable via top-level call in app.ts');
+            assert.ok(isReach(reach, index.symbols, 'inner'),
+                'inner is transitively reachable');
+        } finally { rm(dir); }
+    });
+
+    // Cause 2: file-path patterns for runtime entries
+    it('cause 2: cli.ts is a runtime entry file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cli.ts': `
+function main() { run(); }
+function run() {}
+main();
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'main'), 'main reachable');
+            assert.ok(isReach(reach, index.symbols, 'run'), 'run reachable');
+        } finally { rm(dir); }
+    });
+
+    it('cause 2: bin/foo.ts is a runtime entry file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'bin/foo.ts': `
+export function bar() { baz(); }
+export function baz() {}
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'bar'),
+                'bar is a runtime entry (bin/ file)');
+            assert.ok(isReach(reach, index.symbols, 'baz'),
+                'baz is transitively reachable');
+        } finally { rm(dir); }
+    });
+
+    it('cause 2: server.ts is a runtime entry file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'server.ts': `
+export function startServer() { listen(); }
+export function listen() {}
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'startServer'),
+                'startServer reachable (server.ts entry)');
+            assert.ok(isReach(reach, index.symbols, 'listen'),
+                'listen is transitively reachable');
+        } finally { rm(dir); }
+    });
+
+    it('cause 2: shebang #!/usr/bin/env node makes any file an entry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // Non-conventional file name, but with a node shebang.
+            'tool.js': `#!/usr/bin/env node
+function root() { sub(); }
+function sub() {}
+root();
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'root'),
+                'root reachable via shebang detection');
+            assert.ok(isReach(reach, index.symbols, 'sub'),
+                'sub reachable transitively');
+        } finally { rm(dir); }
+    });
+
+    it('cause 2: test files mark functions as entries', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'foo.test.ts': `
+function helper() { return 1; }
+describe('foo', () => {
+    it('works', () => {
+        helper();
+    });
+});
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'helper'),
+                'helper in test file is an entry');
+        } finally { rm(dir); }
+    });
+
+    it('cause 2: __tests__ directory marks functions as entries', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            '__tests__/foo.ts': `
+export function helper() { return 1; }
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'helper'),
+                'helper under __tests__ is an entry');
+        } finally { rm(dir); }
+    });
+
+    it('cause 2: pages/* is a Next.js runtime entry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'pages/index.tsx': `
+export default function Home() {
+    fetchData();
+    return null;
+}
+function fetchData() {}
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'Home'),
+                'Home in pages/ is a runtime entry');
+            assert.ok(isReach(reach, index.symbols, 'fetchData'),
+                'fetchData is transitively reachable from Home');
+        } finally { rm(dir); }
+    });
+
+    // NestJS controller via existing decorator pattern
+    it('cause 2 smoke: NestJS @Controller / @Get propagates via decorator pattern', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // Non-conventional filename so we test the decorator path, not filePath.
+            'src/items.module.ts': `
+@Controller('items')
+class FooController {
+    @Get()
+    bar() {
+        svc();
+    }
+}
+function svc() {}
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'bar'),
+                'bar is a NestJS handler entry');
+            assert.ok(isReach(reach, index.symbols, 'svc'),
+                'svc reachable via Get-handler bar');
+        } finally { rm(dir); }
+    });
+
+    // Negative case: unreachable function in non-entry file remains unreachable
+    it('negative: function in non-entry file with no callers stays unreachable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            // entry file that calls into another lib...
+            'cli.ts': `
+import { used } from './used';
+used();
+`,
+            'used.ts': `
+export function used() {}
+`,
+            // lib file with no callers, no entry-file path.
+            'orphan.ts': `
+export function unused() { return 42; }
+`,
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(isReach(reach, index.symbols, 'used'),
+                'used is reachable from cli.ts');
+            assert.ok(!isReach(reach, index.symbols, 'unused'),
+                'unused must remain unreachable — over-broad fix would mark this true');
+        } finally { rm(dir); }
+    });
+
+    // Reachability cache is honored after the new seeding paths
+    it('reachability cache is preserved after the new seeding paths', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cli.ts': `
+function main() { run(); }
+function run() {}
+main();
+`,
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index._reachableSymbols, undefined,
+                'no cache before first call');
+            const a = computeReachability(index);
+            assert.ok(a instanceof Set);
+            const b = computeReachability(index);
+            assert.strictEqual(a, b, 'second call returns the same Set instance');
+        } finally { rm(dir); }
+    });
+});
