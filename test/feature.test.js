@@ -1547,7 +1547,11 @@ e();
         } finally { rm(dir); }
     });
 
-    it('execute(stats, top:0) returns empty hot list (no fallback to 10)', () => {
+    // BUG-2: --top=0 was previously accepted as "empty list", but rendered as
+    // misleading text ("top 0 of 718 called: (no inbound calls detected)") that
+    // implied no calls existed in the project. Reject 0 and negative values
+    // as invalid input — they're never sensible for "show top N functions".
+    it('execute(stats, top:0) rejects zero with helpful error', () => {
         const { execute } = require('../core/execute');
         const dir = tmp({
             'package.json': '{"name":"test"}',
@@ -1556,14 +1560,13 @@ e();
         try {
             const index = idx(dir);
             const r = execute(index, 'stats', { hot: true, top: 0 });
-            assert.strictEqual(r.ok, true);
-            assert.strictEqual(r.result.hot.items.length, 0,
-                'top=0 should produce empty list');
-            assert.strictEqual(r.result.hot.top, 0);
+            assert.strictEqual(r.ok, false, `expected error, got ok: ${JSON.stringify(r)}`);
+            assert.match(r.error, /--top/);
+            assert.match(r.error, /positive/i);
         } finally { rm(dir); }
     });
 
-    it('execute(stats, top:-1) rejects negative input (treated as 0 or error)', () => {
+    it('execute(stats, top:-1) rejects negative input with helpful error', () => {
         const { execute } = require('../core/execute');
         const dir = tmp({
             'package.json': '{"name":"test"}',
@@ -1572,9 +1575,9 @@ e();
         try {
             const index = idx(dir);
             const r = execute(index, 'stats', { hot: true, top: -1 });
-            // Treat negative as "show nothing" — empty list, not fallback to 10.
-            assert.strictEqual(r.ok, true);
-            assert.strictEqual(r.result.hot.items.length, 0);
+            assert.strictEqual(r.ok, false, `expected error, got ok: ${JSON.stringify(r)}`);
+            assert.match(r.error, /--top/);
+            assert.match(r.error, /positive/i);
         } finally { rm(dir); }
     });
 
@@ -3027,6 +3030,66 @@ func main() {
             const ep = result.find(r => r.name === 'healthCheck');
             assert.strictEqual(ep.framework, 'net/http');
             assert.strictEqual(ep.type, 'http');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-1: impact text output must surface structural pattern flags
+// (inLoop / inTry / inCallback / inTestCase) — they were already in the JSON
+// shape and in verify text but were dropped from the impact text formatter.
+// ============================================================================
+describe('BUG-1: impact text surfaces structural call-site patterns', () => {
+    const { execute } = require('../core/execute');
+
+    it('reports `in loop` when callsite is inside a for/while loop', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': `function helper(x) { return x + 1; }\nmodule.exports = { helper };\n`,
+            'app.js': `const { helper } = require('./lib');\nfunction run(items) {\n  for (const i of items) {\n    helper(i);\n  }\n}\nmodule.exports = { run };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'impact', { name: 'helper' });
+            assert.ok(r.ok, 'impact should succeed');
+            assert.ok(r.result.patterns.inLoop > 0, `JSON shape must already have inLoop>0; got ${r.result.patterns.inLoop}`);
+            const text = output.formatImpact(r.result);
+            assert.match(text, /in loop/i, `text output should surface "in loop": ${text}`);
+        } finally { rm(dir); }
+    });
+
+    it('reports `in try` when callsite is inside try block', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': `function helper(x) { return x; }\nmodule.exports = { helper };\n`,
+            'app.js': `const { helper } = require('./lib');\nfunction safe(x) {\n  try {\n    return helper(x);\n  } catch (e) { return null; }\n}\nmodule.exports = { safe };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'impact', { name: 'helper' });
+            assert.ok(r.ok, 'impact should succeed');
+            assert.ok(r.result.patterns.inTry > 0, `JSON shape must already have inTry>0; got ${r.result.patterns.inTry}`);
+            const text = output.formatImpact(r.result);
+            assert.match(text, /in try/i, `text output should surface "in try": ${text}`);
+        } finally { rm(dir); }
+    });
+
+    it('omits zero-count pattern flags from text (no false positives)', () => {
+        // helper called only at top-level — none of the structural flags should fire.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': `function helper(x) { return x; }\nmodule.exports = { helper };\n`,
+            'app.js': `const { helper } = require('./lib');\nfunction main() { return helper(1); }\nmodule.exports = { main };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'impact', { name: 'helper' });
+            assert.ok(r.ok, 'impact should succeed');
+            const text = output.formatImpact(r.result);
+            assert.ok(!/in loop/i.test(text), `text output should not say "in loop" when count is 0: ${text}`);
+            assert.ok(!/in try/i.test(text), `text output should not say "in try" when count is 0: ${text}`);
+            assert.ok(!/in callback/i.test(text), `text output should not say "in callback" when count is 0: ${text}`);
+            assert.ok(!/in test/i.test(text), `text output should not say "in test" when count is 0: ${text}`);
         } finally { rm(dir); }
     });
 });

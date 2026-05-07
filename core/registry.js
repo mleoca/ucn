@@ -48,6 +48,8 @@ const CLI_ALIASES = {
     'circular':        'circularDeps',
     'cycles':          'circularDeps',
     'audit-async':     'auditAsync',
+    // BUG-3: parity with other multi-word commands (circular-deps, reverse-trace, ...)
+    'entry-points':    'entrypoints',
 };
 
 // MCP uses snake_case for multi-word names.

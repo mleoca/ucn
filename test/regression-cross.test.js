@@ -5013,3 +5013,50 @@ func unused1() { helper() }
         }
     });
 });
+
+// ============================================================================
+// BUG-4: usages JSON output must report enclosing function as `callerName`
+// instead of falling back to `_topLevel` for every call site.
+// ============================================================================
+describe('BUG-4: usages reports enclosing function for call sites', () => {
+    it('call inside a named function reports callerName, not _topLevel', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': `function helper(x) { return x + 1; }\nmodule.exports = { helper };\n`,
+            'app.js': `const { helper } = require('./lib');\nfunction main() {\n  return helper(1);\n}\nmodule.exports = { main };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'usages', { name: 'helper' });
+            assert.ok(r.ok, 'usages should succeed');
+            const json = JSON.parse(output.formatUsagesJson(r.result, 'helper'));
+            assert.ok(json.data.calls.length > 0, 'should find at least one call');
+            const call = json.data.calls.find(c => c.expression && c.expression.includes('helper(1)'));
+            assert.ok(call, 'should find helper(1) call site');
+            assert.ok(!call.handle.endsWith(':_topLevel'),
+                `handle should not be _topLevel for call inside main(): ${call.handle}`);
+            assert.ok(call.handle.endsWith(':main'),
+                `handle should end with :main for call inside main(): ${call.handle}`);
+            assert.ok(call.enclosingHandle, 'enclosingHandle should be present for nested call');
+            assert.match(call.enclosingHandle, /:main$/, `enclosingHandle should reference main: ${call.enclosingHandle}`);
+        } finally { rm(dir); }
+    });
+
+    it('call at module scope still reports _topLevel', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': `function helper(x) { return x; }\nmodule.exports = { helper };\n`,
+            'app.js': `const { helper } = require('./lib');\nhelper(42);\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'usages', { name: 'helper' });
+            assert.ok(r.ok, 'usages should succeed');
+            const json = JSON.parse(output.formatUsagesJson(r.result, 'helper'));
+            const topCall = json.data.calls.find(c => c.expression && c.expression.includes('helper(42)'));
+            assert.ok(topCall, 'should find top-level helper(42) call');
+            assert.ok(topCall.handle.endsWith(':_topLevel'),
+                `top-level call should still report _topLevel: ${topCall.handle}`);
+        } finally { rm(dir); }
+    });
+});

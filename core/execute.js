@@ -774,6 +774,20 @@ const HANDLERS = {
     endpoints: (index, p) => {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        // Minor polish: validate --method against known HTTP verbs to catch
+        // typos that would otherwise silently filter out everything.
+        // 'ALL' / 'USE' are downstream route labels that can be queried explicitly.
+        const HTTP_METHODS = new Set(['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS', 'HEAD', 'ALL', 'USE']);
+        let normMethod = null;
+        if (p.method != null && String(p.method).trim() !== '') {
+            normMethod = String(p.method).trim().toUpperCase();
+            if (!HTTP_METHODS.has(normMethod)) {
+                return {
+                    ok: false,
+                    error: `Invalid --method value: "${p.method}". Expected one of ${[...HTTP_METHODS].join(', ')}.`,
+                };
+            }
+        }
         const { endpoints } = require('./bridge');
         // HIGH-2: --unmatched implies --bridge (we need bridges to know what's
         // unmatched). Without bridges computed, we can't separate matched from
@@ -785,7 +799,7 @@ const HANDLERS = {
             serverOnly: !!p.serverOnly,
             clientOnly: !!p.clientOnly,
             unmatched: wantUnmatched,
-            method: p.method ? String(p.method).toUpperCase() : null,
+            method: normMethod,
             prefix: p.prefix || null,
             showUncertain: !p.hideUncertain,
         });
@@ -1188,6 +1202,9 @@ const HANDLERS = {
         // MEDIUM-7: validate `--top`. Previously non-numeric, zero, and
         // negative values silently fell back to 10 — confusing when a typo
         // hides a request to show MORE entries.
+        // BUG-2: reject 0 and negative explicitly — the rendering ("top 0 of
+        // 718 called: (no inbound calls detected)") was misleading because
+        // it implied no calls exist when the user simply asked for nothing.
         let top;
         let note;
         if (p.top != null) {
@@ -1206,9 +1223,12 @@ const HANDLERS = {
                 };
             }
             if (n <= 0) {
-                // Treat 0/negative as "show nothing" — return an empty hot list.
-                top = 0;
-            } else if (n > 10000) {
+                return {
+                    ok: false,
+                    error: `Invalid --top value: must be a positive integer (got ${n})`,
+                };
+            }
+            if (n > 10000) {
                 top = 10000;
                 note = `--top capped at 10000 (requested ${n})`;
             } else {

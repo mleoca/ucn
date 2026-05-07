@@ -4400,3 +4400,70 @@ describe('endpoints command (JS/TS)', () => {
         assert.strictEqual(exact.confidence, 1);
     });
 });
+
+// ============================================================================
+// BUG-5: plan must preserve modifier prefixes (async / static / public / ...)
+// for class methods on rename / add-param / remove-param.
+// ============================================================================
+describe('BUG-5: plan preserves modifier prefixes for class methods', () => {
+    it('rename of async method preserves async', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': `class C {\n  async foo(data) {\n    return data;\n  }\n}\nmodule.exports = { C };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'foo', renameTo: 'bar', className: 'C' });
+            assert.ok(r.ok, 'plan should succeed');
+            assert.match(r.result.before.signature, /^async\s+foo\b/, `before should keep 'async ': ${r.result.before.signature}`);
+            assert.match(r.result.after.signature, /^async\s+bar\b/, `after should keep 'async ': ${r.result.after.signature}`);
+        } finally { rm(dir); }
+    });
+
+    it('rename of static method preserves static', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': `class C {\n  static make(config) {\n    return new C();\n  }\n}\nmodule.exports = { C };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'make', renameTo: 'create', className: 'C' });
+            assert.ok(r.ok, 'plan should succeed');
+            assert.match(r.result.before.signature, /^static\s+make\b/, `before should keep 'static ': ${r.result.before.signature}`);
+            assert.match(r.result.after.signature, /^static\s+create\b/, `after should keep 'static ': ${r.result.after.signature}`);
+        } finally { rm(dir); }
+    });
+
+    it('rename of static async method preserves both static and async', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': `class C {\n  static async load(url) {\n    return await fetch(url);\n  }\n}\nmodule.exports = { C };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'load', renameTo: 'fetchRemote', className: 'C' });
+            assert.ok(r.ok, 'plan should succeed');
+            // Both modifiers must appear, in any order, before the name.
+            assert.match(r.result.before.signature, /\bstatic\b/, `before should contain 'static': ${r.result.before.signature}`);
+            assert.match(r.result.before.signature, /\basync\b/, `before should contain 'async': ${r.result.before.signature}`);
+            assert.match(r.result.after.signature, /\bstatic\b/, `after should contain 'static': ${r.result.after.signature}`);
+            assert.match(r.result.after.signature, /\basync\b/, `after should contain 'async': ${r.result.after.signature}`);
+            assert.match(r.result.after.signature, /\bfetchRemote\b/, `after should contain renamed name: ${r.result.after.signature}`);
+        } finally { rm(dir); }
+    });
+
+    it('add-param on static method preserves static', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': `class C {\n  static make(config) {\n    return new C();\n  }\n}\nmodule.exports = { C };\n`
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'make', addParam: 'opts', className: 'C' });
+            assert.ok(r.ok, 'plan should succeed');
+            assert.match(r.result.before.signature, /^static\s+make\b/);
+            assert.match(r.result.after.signature, /^static\s+make\b/);
+            assert.ok(r.result.after.params.includes('opts'), `new param 'opts' should appear: ${JSON.stringify(r.result.after.params)}`);
+        } finally { rm(dir); }
+    });
+});

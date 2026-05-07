@@ -1267,6 +1267,17 @@ describe('endpoints command behavioral', () => {
         }
     });
 
+    it('--method rejects unknown HTTP verb with helpful error', () => {
+        const index = idx(JS_FIXTURE);
+        const r = execute(index, 'endpoints', { method: 'INVALID' });
+        assert.strictEqual(r.ok, false, `expected error, got ok=${r.ok}`);
+        assert.match(r.error, /--method/);
+        assert.match(r.error, /INVALID/);
+        // Should list the accepted verbs in the error message.
+        assert.match(r.error, /GET/);
+        assert.match(r.error, /POST/);
+    });
+
     it('--prefix=/api filters routes/requests by path prefix', () => {
         const index = idx(JS_FIXTURE);
         const { ok, result } = execute(index, 'endpoints', { prefix: '/api' });

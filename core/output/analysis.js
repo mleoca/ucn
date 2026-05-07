@@ -322,6 +322,9 @@ function formatImpact(impact, options = {}) {
     lines.push(`  Files affected: ${impact.byFile.length}`);
 
     // Patterns
+    // BUG-1: also surface structural classification counts (inLoop / inTry /
+    // inCallback / inTestCase) — they're already in the JSON shape and in
+    // verify text, but were dropped from impact text.
     const p = impact.patterns;
     if (p && !compact) {
         const patternParts = [];
@@ -330,6 +333,10 @@ function formatImpact(impact, options = {}) {
         if (p.awaitedCalls > 0) patternParts.push(`${p.awaitedCalls} awaited`);
         if (p.chainedCalls > 0) patternParts.push(`${p.chainedCalls} chained`);
         if (p.spreadCalls > 0) patternParts.push(`${p.spreadCalls} with spread`);
+        if (p.inLoop > 0) patternParts.push(`${p.inLoop} in loop`);
+        if (p.inTry > 0) patternParts.push(`${p.inTry} in try`);
+        if (p.inCallback > 0) patternParts.push(`${p.inCallback} in callback`);
+        if (p.inTestCase > 0) patternParts.push(`${p.inTestCase} in test`);
         if (patternParts.length > 0) {
             lines.push(`  Patterns: ${patternParts.join(', ')}`);
         }

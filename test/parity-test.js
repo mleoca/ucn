@@ -806,6 +806,9 @@ function testProcessData() {
             assert.strictEqual(resolveCommand('what-exports', 'cli'), 'fileExports');
             assert.strictEqual(resolveCommand('about'), 'about'); // canonical passthrough
             assert.strictEqual(resolveCommand('bogus'), null);
+            // BUG-3: parity with other multi-word commands.
+            assert.strictEqual(resolveCommand('entry-points', 'cli'), 'entrypoints');
+            assert.strictEqual(resolveCommand('entrypoints', 'cli'), 'entrypoints');
         });
 
         it('normalizeParams converts all known snake_case params', () => {

@@ -253,6 +253,15 @@ function usages(index, name, options = {}) {
 
                     const lineContent = lines[u.line - 1] || '';
 
+                    // BUG-4: enrich call usages with enclosing-function info so
+                    // the JSON `handle` shows the real caller, not `_topLevel`.
+                    // Only resolve for call usages — definitions, imports, and
+                    // bare references don't need a caller token.
+                    let callerSym = null;
+                    if (u.usageType === 'call') {
+                        callerSym = index.findEnclosingFunction(filePath, u.line, true);
+                    }
+
                     const usage = {
                         file: filePath,
                         relativePath: fileEntry.relativePath,
@@ -260,7 +269,11 @@ function usages(index, name, options = {}) {
                         content: lineContent,
                         usageType: u.usageType,
                         isDefinition: false,
-                        ...(u.receiver && { receiver: u.receiver })
+                        ...(u.receiver && { receiver: u.receiver }),
+                        ...(callerSym && {
+                            callerName: callerSym.name,
+                            callerStartLine: callerSym.startLine
+                        })
                     };
 
                     // Add context lines if requested
@@ -305,13 +318,23 @@ function usages(index, name, options = {}) {
                     // Classify usage type (AST-based, defaults to 'reference' for unsupported languages)
                     const usageType = index.classifyUsageAST(content, lineNum, name, filePath) ?? 'reference';
 
+                    // BUG-4: enrich call usages with enclosing-function info.
+                    let callerSym = null;
+                    if (usageType === 'call') {
+                        callerSym = index.findEnclosingFunction(filePath, lineNum, true);
+                    }
+
                     const usage = {
                         file: filePath,
                         relativePath: fileEntry.relativePath,
                         line: lineNum,
                         content: line,
                         usageType,
-                        isDefinition: false
+                        isDefinition: false,
+                        ...(callerSym && {
+                            callerName: callerSym.name,
+                            callerStartLine: callerSym.startLine
+                        })
                     };
 
                     // Add context lines if requested

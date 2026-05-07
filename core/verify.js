@@ -236,6 +236,45 @@ function formatPlanParamName(p) {
 }
 
 /**
+ * Compute the modifier-prefix tokens for a function/method definition.
+ * Returns an array of tokens (e.g. ['static', 'async']) drawn from:
+ *   - def.modifiers          (Java, Python async, Rust pub/async, ...)
+ *   - def.isAsync / def.async (JS/TS class methods)
+ *   - def.memberType         (JS/TS: 'static', 'static get', 'static override', ...)
+ *
+ * BUG-5: rename and add-param signature reconstruction must preserve modifier
+ * prefixes (async/static/public/...) — JS class methods don't populate
+ * def.modifiers, so we synthesise tokens from isAsync + memberType.
+ * @param {object} def
+ * @returns {string[]} ordered modifier tokens (no trailing space)
+ */
+function computeModifierTokens(def) {
+    if (!def) return [];
+    const tokens = [];
+    // Pull declared modifiers first (Java public/static/final, Python ['async'], Rust pub/async).
+    if (Array.isArray(def.modifiers) && def.modifiers.length) {
+        for (const m of def.modifiers) {
+            if (typeof m === 'string' && m.length && !tokens.includes(m)) tokens.push(m);
+        }
+    }
+    // JS/TS class methods: memberType encodes static/get/set/override/private.
+    // Examples: 'static', 'static get', 'static override', 'static override get',
+    //           'override', 'override get', 'get', 'set', 'private', 'method',
+    //           'abstract', 'constructor'. Only structural prefixes are added.
+    const memberType = def.memberType;
+    if (typeof memberType === 'string' && memberType.length) {
+        const STRUCTURAL_PREFIXES = new Set(['static', 'override', 'abstract', 'public', 'private', 'protected', 'readonly', 'get', 'set']);
+        for (const tok of memberType.split(/\s+/)) {
+            if (STRUCTURAL_PREFIXES.has(tok) && !tokens.includes(tok)) tokens.push(tok);
+        }
+    }
+    // Async (JS/TS isAsync, fallback for languages that set def.async).
+    const asyncFlag = def.isAsync || def.async || (Array.isArray(def.modifiers) && def.modifiers.includes('async'));
+    if (asyncFlag && !tokens.includes('async')) tokens.push('async');
+    return tokens;
+}
+
+/**
  * Build a function signature string from a definition, using
  * TS-correct param formatting (BUG-BV). Local to verify.js to avoid
  * the shared formatter's incorrect `?` placement.
@@ -245,8 +284,9 @@ function formatPlanParamName(p) {
  */
 function formatTypedSignature(def, overrides = {}) {
     const parts = [];
-    if (def.modifiers && def.modifiers.length) {
-        parts.push(def.modifiers.join(' '));
+    const modTokens = computeModifierTokens(def);
+    if (modTokens.length) {
+        parts.push(modTokens.join(' '));
     }
     const name = overrides.name || def.name;
     parts.push(name);
@@ -1375,9 +1415,11 @@ function plan(index, name, options = {}) {
 
         // Generate new signature with TS-correct optional marker (BUG-BV)
         // and arrow-fn enriched return type (BUG-BY).
+        // BUG-5: preserve all modifier tokens (async/static/public/...).
         const paramsList = newParams.map(formatTypedParam).filter(Boolean).join(', ');
-        const asyncPrefix = (def.async || def.isAsync || def.modifiers?.includes('async')) ? 'async ' : '';
-        newSignature = `${asyncPrefix}${name}(${paramsList})`;
+        const modTokens = computeModifierTokens(def);
+        const modPrefix = modTokens.length ? modTokens.join(' ') + ' ' : '';
+        newSignature = `${modPrefix}${name}(${paramsList})`;
         const newRet = arrowTypes?.returnType || def.returnType;
         if (newRet) newSignature += `: ${newRet}`;
 
@@ -1417,9 +1459,11 @@ function plan(index, name, options = {}) {
 
         // Generate new signature with TS-correct optional marker (BUG-BV)
         // and arrow-fn enriched return type (BUG-BY).
+        // BUG-5: preserve all modifier tokens (async/static/public/...).
         const paramsList = newParams.map(formatTypedParam).filter(Boolean).join(', ');
-        const asyncPrefix = (def.async || def.isAsync || def.modifiers?.includes('async')) ? 'async ' : '';
-        newSignature = `${asyncPrefix}${name}(${paramsList})`;
+        const modTokens = computeModifierTokens(def);
+        const modPrefix = modTokens.length ? modTokens.join(' ') + ' ' : '';
+        newSignature = `${modPrefix}${name}(${paramsList})`;
         const newRet = arrowTypes?.returnType || def.returnType;
         if (newRet) newSignature += `: ${newRet}`;
 
