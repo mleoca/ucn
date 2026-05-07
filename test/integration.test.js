@@ -1585,7 +1585,7 @@ describe('Confidence Scoring', () => {
             } finally { rm(dir); }
         });
 
-        it('--show-confidence + --include-methods works together', () => {
+        it('showConfidence + --include-methods works together', () => {
             const dir = tmp({
                 'package.json': '{"name":"test"}',
                 'lib.js': 'class S { process(d) { return d; } }\nfunction caller() { const s = new S(); s.process("x"); }\nmodule.exports = { S, caller };'

@@ -274,15 +274,21 @@ function getExportedSymbols(result) {
 /**
  * Strip <script> and </script> tags from extracted code lines for HTML files.
  * Only affects the first and last lines when they contain script tags alongside JS code.
+ * Handles inline cases like `<p>foo</p><script>code</script><p>bar</p>` by stripping
+ * the opening/closing tags wherever they appear on the line, not just at line edges.
  * @param {string[]} lines - Extracted lines
  * @param {string} language - Language name
  * @returns {string[]} Cleaned lines (same array mutated)
  */
 function cleanHtmlScriptTags(lines, language) {
     if (language === 'html' && lines.length > 0) {
-        lines[0] = lines[0].replace(/^(\s*)<script[^>]*>/i, '$1');
+        // Strip opening <script ...> tag wherever it appears on the first line
+        // (may be preceded by other HTML on the same line, e.g. <p>x</p><script>...).
+        lines[0] = lines[0].replace(/<script\b[^>]*>/i, '');
+        // Strip closing </script> tag wherever it appears on the last line
+        // (may be followed by other HTML on the same line, e.g. ...</script><p>x</p>).
         const last = lines.length - 1;
-        lines[last] = lines[last].replace(/<\/script>\s*$/i, '');
+        lines[last] = lines[last].replace(/<\/script\s*>/i, '');
     }
     return lines;
 }

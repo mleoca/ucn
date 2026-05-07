@@ -292,6 +292,120 @@ describe('Cross-language: isEntryPoint exported from language modules', () => {
     });
 });
 
+// BUG-CX/CY: every language must export getEntryPointKind() so tracing/search
+// can distinguish 'test' entries (test cases) from 'main'/'framework' entries
+// (runtime entry points). Collapsing these into a single boolean caused
+// fn main() to be mis-classified as a test-case in affectedTests.
+describe('Cross-language: getEntryPointKind exported and consistent with isEntryPoint', () => {
+    forEachLanguage((lang) => {
+        it(`${lang}: language module exports getEntryPointKind`, () => {
+            const { getLanguageModule } = require('../languages');
+            const langModule = getLanguageModule(lang);
+            assert.ok(typeof langModule.getEntryPointKind === 'function',
+                `${lang}: language module should export getEntryPointKind()`);
+        });
+
+        it(`${lang}: getEntryPointKind returns 'test' | 'main' | 'framework' | null`, () => {
+            const { getLanguageModule } = require('../languages');
+            const langModule = getLanguageModule(lang);
+            const ALLOWED = new Set(['test', 'main', 'framework', null]);
+            // Probe across realistic shapes — at least every return must be in ALLOWED.
+            const probes = [
+                { name: 'main', modifiers: ['public', 'static'] },
+                { name: 'main', modifiers: [] },
+                { name: 'init', modifiers: [] },
+                { name: 'test_thing', modifiers: ['test'] },
+                { name: 'TestSomething', modifiers: [] },
+                { name: 'Benchmark_x', modifiers: [] },
+                { name: '__init__', modifiers: [] },
+                { name: 'plain', modifiers: [] },
+                { name: 'helper', modifiers: ['cfg_test_module'] },
+                { name: 'override_method', modifiers: ['override'], isMethod: true, className: 'X' },
+                { name: 'componentDidMount', modifiers: [], isMethod: true, className: 'C' },
+            ];
+            for (const p of probes) {
+                const k = langModule.getEntryPointKind(p);
+                assert.ok(ALLOWED.has(k),
+                    `${lang}: getEntryPointKind returned '${k}' for ${JSON.stringify(p)}; expected one of ['test','main','framework',null]`);
+            }
+        });
+
+        it(`${lang}: isEntryPoint and getEntryPointKind agree`, () => {
+            const { getLanguageModule } = require('../languages');
+            const langModule = getLanguageModule(lang);
+            const probes = [
+                { name: 'main', modifiers: ['public', 'static'] },
+                { name: 'main', modifiers: [] },
+                { name: 'init', modifiers: [] },
+                { name: 'test_thing', modifiers: ['test'] },
+                { name: 'TestSomething', modifiers: [] },
+                { name: 'plain', modifiers: [] },
+                { name: 'helper', modifiers: ['cfg_test_module'] },
+                { name: 'componentDidMount', modifiers: [], isMethod: true, className: 'C' },
+            ];
+            for (const p of probes) {
+                const kind = langModule.getEntryPointKind(p);
+                const ep = !!langModule.isEntryPoint(p);
+                assert.strictEqual(ep, kind !== null,
+                    `${lang}: isEntryPoint(${JSON.stringify(p)})=${ep} should equal (kind!==null)=${kind !== null} (kind=${kind})`);
+            }
+        });
+    });
+});
+
+// Per-language smoke checks for the test-vs-main distinction. Covers at least
+// one test entry and one main/runtime entry per applicable language.
+describe('Cross-language: getEntryPointKind returns kind="test" for canonical test symbols', () => {
+    const cases = {
+        rust: [
+            // #[test] attribute is recorded as the 'test' modifier
+            { input: { name: 'check', modifiers: ['test'] }, kind: 'test' },
+            { input: { name: 'bench_x', modifiers: ['bench'] }, kind: 'test' },
+            { input: { name: 'helper', modifiers: ['cfg_test_module'] }, kind: 'test' },
+            { input: { name: 'main', modifiers: [] }, kind: 'main' },
+        ],
+        go: [
+            { input: { name: 'TestFoo', modifiers: [] }, kind: 'test' },
+            { input: { name: 'BenchmarkX', modifiers: [] }, kind: 'test' },
+            { input: { name: 'main', modifiers: [] }, kind: 'main' },
+            { input: { name: 'init', modifiers: [] }, kind: 'main' },
+        ],
+        python: [
+            { input: { name: 'test_foo', modifiers: [] }, kind: 'test' },
+            { input: { name: 'setUp', modifiers: [] }, kind: 'test' },
+            { input: { name: '__init__', modifiers: [] }, kind: 'framework' },
+        ],
+        java: [
+            { input: { name: 'foo', modifiers: ['test'] }, kind: 'test' },
+            { input: { name: 'main', modifiers: ['public', 'static'] }, kind: 'main' },
+        ],
+        javascript: [
+            // JS has no function-level test convention — handled via call detection
+            { input: { name: 'plain', modifiers: [] }, kind: null },
+            { input: { name: 'componentDidMount', modifiers: [], isMethod: true, className: 'C' }, kind: 'framework' },
+        ],
+        typescript: [
+            { input: { name: 'plain', modifiers: [] }, kind: null },
+            { input: { name: 'connectedCallback', modifiers: [], isMethod: true, className: 'C' }, kind: 'framework' },
+        ],
+    };
+
+    forEachLanguage((lang) => {
+        const langCases = cases[lang];
+        if (!langCases) return;
+        const { getLanguageModule } = require('../languages');
+        const langModule = getLanguageModule(lang);
+        for (const c of langCases) {
+            it(`${lang}: ${JSON.stringify(c.input)} -> kind=${c.kind}`, () => {
+                assert.strictEqual(
+                    langModule.getEntryPointKind(c.input), c.kind,
+                    `${lang}: expected kind=${c.kind} for ${JSON.stringify(c.input)}`
+                );
+            });
+        }
+    });
+});
+
 describe('Cross-language: fixtures exist', () => {
     forEachLanguage((lang) => {
         it(`${lang}: test fixtures directory exists`, () => {

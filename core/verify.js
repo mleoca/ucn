@@ -63,6 +63,426 @@ function clearTreeCache(index) {
 }
 
 /**
+ * Render a single parameter with TS-correct optional marker placement.
+ * BUG-BV fix: `?` follows the NAME, not the TYPE (e.g. `opt?: number`,
+ * not the invalid `opt: number?`). Used by verify/plan signature output.
+ * @param {object} p - Param object {name, type?, optional?, default?, rest?}
+ * @returns {string}
+ */
+function formatTypedParam(p) {
+    if (!p || !p.name) return '';
+    // Rest-param prefix:
+    //   Python `**kwargs` / `*args` keep their `*` prefix (name already starts with `*`).
+    //   JS/TS rest like `...rest` keeps `...` (avoid double-prefix if name already has `...`).
+    //   Bare names with rest=true get `...` prefix (JS rest with stripped pattern name).
+    let s;
+    if (p.rest) {
+        const n = String(p.name);
+        if (n.startsWith('*') || n.startsWith('...')) s = n;
+        else s = `...${n}`;
+    } else {
+        s = p.name;
+    }
+    // Optional marker — placed AFTER name, BEFORE type (TS syntax: `opt?: number`)
+    if (p.optional && !p.rest && p.default == null) s += '?';
+    if (p.type) s += `: ${p.type}`;
+    if (p.default != null) s += ` = ${p.default}`;
+    return s;
+}
+
+/**
+ * Render a param name for the plan `before.params` / `after.params` arrays.
+ * These arrays are name-keyed (callers do `.includes('retries')` exact match),
+ * so we keep TS optional `?` and type annotation for BUG-BV/#181 contracts,
+ * but omit the ` = default` suffix and rest `*`/`...` prefix that callers don't
+ * test against. Mirrors the pre-rewrite shape of plan output.
+ * @param {object} p
+ * @returns {string}
+ */
+function formatPlanParamName(p) {
+    if (!p || !p.name) return '';
+    let s = p.name;
+    if (p.optional && !p.default) s += '?';
+    if (p.type) s += `: ${p.type}`;
+    return s;
+}
+
+/**
+ * Build a function signature string from a definition, using
+ * TS-correct param formatting (BUG-BV). Local to verify.js to avoid
+ * the shared formatter's incorrect `?` placement.
+ * @param {object} def - Symbol definition
+ * @param {object} [overrides] - Optional { paramsStructured, returnType, name } overrides
+ * @returns {string}
+ */
+function formatTypedSignature(def, overrides = {}) {
+    const parts = [];
+    if (def.modifiers && def.modifiers.length) {
+        parts.push(def.modifiers.join(' '));
+    }
+    const name = overrides.name || def.name;
+    parts.push(name);
+    const ps = overrides.paramsStructured != null ? overrides.paramsStructured : def.paramsStructured;
+    if (Array.isArray(ps)) {
+        const paramTypes = def.paramTypes || {};
+        const parts2 = ps.map(p => {
+            // Apply paramTypes mapping when paramsStructured doesn't carry types
+            const merged = { ...p };
+            if (!merged.type && paramTypes[p.name]) merged.type = paramTypes[p.name];
+            return formatTypedParam(merged);
+        });
+        parts.push(`(${parts2.filter(Boolean).join(', ')})`);
+    } else if (def.params !== undefined) {
+        parts.push(`(${def.params})`);
+    }
+    const rt = overrides.returnType != null ? overrides.returnType : def.returnType;
+    if (rt) parts.push(`: ${rt}`);
+    return parts.join(' ');
+}
+
+/**
+ * BUG-BY: For an arrow function declared as `const x: (a: number) => number = (a) => ...`
+ * the inline arrow params/return type are missing types — they live on the
+ * variable_declarator's type_annotation. Walk up to the declarator and
+ * extract `function_type` parts (params + return type) when present.
+ *
+ * Returns null if no enrichment is available; otherwise an object with
+ * { paramsStructured, returnType } suitable for use as overrides.
+ *
+ * Only applies to TS-family files (typescript/tsx). JS doesn't have function_type
+ * annotations at the variable declarator level.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {object} def - Symbol definition (must have file + startLine)
+ * @returns {{ paramsStructured: Array, returnType: string|null }|null}
+ */
+function extractArrowTypesFromVarDecl(index, def) {
+    if (!def || !def.file || !def.startLine) return null;
+    const lang = detectLanguage(def.file);
+    if (lang !== 'typescript' && lang !== 'tsx') return null;
+    // Already have types — nothing to enrich.
+    const ps = def.paramsStructured;
+    const allHaveTypes = Array.isArray(ps) && ps.length > 0 && ps.every(p => p && p.type);
+    if (allHaveTypes && def.returnType) return null;
+    let parser;
+    try {
+        parser = getParser(lang);
+    } catch (e) {
+        return null;
+    }
+    if (!parser) return null;
+    let content;
+    try {
+        content = index._readFile(def.file);
+    } catch (e) {
+        return null;
+    }
+    const tree = safeParse(parser, content);
+    if (!tree) return null;
+
+    // Find the variable_declarator that wraps the arrow function at def.startLine
+    const targetRow = def.startLine - 1;
+    function findVarDecl(node) {
+        if (!node) return null;
+        if (node.startPosition.row > targetRow || node.endPosition.row < targetRow) return null;
+        if (node.type === 'variable_declarator') {
+            // Check if this declarator's value is an arrow_function (or function_expression)
+            const valueNode = node.childForFieldName('value');
+            if (valueNode && (valueNode.type === 'arrow_function' || valueNode.type === 'function_expression' || valueNode.type === 'function')) {
+                // Confirm name matches and starts at our target row
+                const nameNode = node.childForFieldName('name');
+                if (nameNode && nameNode.text === def.name) {
+                    return node;
+                }
+            }
+        }
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const result = findVarDecl(node.namedChild(i));
+            if (result) return result;
+        }
+        return null;
+    }
+    const declarator = findVarDecl(tree.rootNode);
+    if (!declarator) return null;
+
+    // Look for type_annotation child holding a function_type
+    let typeAnno = null;
+    for (let i = 0; i < declarator.namedChildCount; i++) {
+        const child = declarator.namedChild(i);
+        if (child.type === 'type_annotation') { typeAnno = child; break; }
+    }
+    if (!typeAnno) return null;
+    // type_annotation > function_type
+    let fnType = null;
+    for (let i = 0; i < typeAnno.namedChildCount; i++) {
+        const child = typeAnno.namedChild(i);
+        if (child.type === 'function_type') { fnType = child; break; }
+    }
+    if (!fnType) return null;
+    // function_type has formal_parameters + a return type sibling
+    const fp = fnType.childForFieldName('parameters') || (() => {
+        for (let i = 0; i < fnType.namedChildCount; i++) {
+            const c = fnType.namedChild(i);
+            if (c.type === 'formal_parameters') return c;
+        }
+        return null;
+    })();
+    let returnType = null;
+    // Return type is the last named child (predefined_type, type_identifier, etc.) that isn't formal_parameters
+    for (let i = fnType.namedChildCount - 1; i >= 0; i--) {
+        const c = fnType.namedChild(i);
+        if (c.type !== 'formal_parameters' && c.type !== 'type_parameters') {
+            returnType = c.text;
+            break;
+        }
+    }
+    // Build typed paramsStructured by reading param names + types out of fp.
+    // Pair against the existing inline params (from def.paramsStructured) so
+    // we preserve names declared at the arrow site if they differ.
+    let typedParams = [];
+    if (fp) {
+        for (let i = 0; i < fp.namedChildCount; i++) {
+            const param = fp.namedChild(i);
+            const info = {};
+            if (param.type === 'required_parameter' || param.type === 'optional_parameter') {
+                const patternNode = param.childForFieldName('pattern');
+                const tnode = param.childForFieldName('type');
+                if (patternNode) info.name = patternNode.text;
+                if (tnode) info.type = tnode.text.replace(/^:\s*/, '');
+                if (param.type === 'optional_parameter') info.optional = true;
+            } else if (param.type === 'identifier') {
+                info.name = param.text;
+            }
+            if (info.name) typedParams.push(info);
+        }
+    }
+    // If inline params have names (from arrow), prefer those names but keep types from fnType
+    if (Array.isArray(ps) && ps.length === typedParams.length) {
+        typedParams = typedParams.map((tp, i) => ({
+            ...ps[i],   // start from existing (preserves rest, default, etc.)
+            ...(tp.type ? { type: tp.type } : {}),
+            ...(tp.optional ? { optional: true } : {}),
+        }));
+    }
+    return {
+        paramsStructured: typedParams.length ? typedParams : ps,
+        returnType: returnType || def.returnType || null,
+    };
+}
+
+/**
+ * BUG-BX: A receiver like `Utils.helper()` may be a TS namespace member call
+ * for a regular (non-method) exported function. Returns true when the
+ * receiver matches a known namespace/class symbol that contains a function
+ * with the verified name.
+ * @param {object} index - ProjectIndex instance
+ * @param {string} receiver - Receiver text from the call site
+ * @param {string} funcName - Name being verified
+ * @param {string} defFile - The definition's file (to scope the match)
+ * @returns {boolean}
+ */
+function isNamespaceContainerFor(index, receiver, funcName, defFile) {
+    if (!receiver || !funcName) return false;
+    const candidates = index.symbols.get(receiver);
+    if (!candidates || candidates.length === 0) return false;
+    // Accept namespace, module, class, or interface containers
+    return candidates.some(c => {
+        const t = c.type;
+        if (t === 'namespace' || t === 'module' || t === 'class' || t === 'interface') {
+            // Same file as the def is the strongest signal; fall back to project-wide match.
+            if (!defFile || c.file === defFile) return true;
+            // Cross-file: only accept when receiver is a dedicated namespace/module
+            return t === 'namespace' || t === 'module';
+        }
+        return false;
+    });
+}
+
+/**
+ * BUG-BW: Build the list of call sites for `plan` using the SAME findCallers
+ * + className filter logic that verify uses. This guarantees plan and verify
+ * agree on which sites need updating — the previous implementation routed
+ * through `index.impact()` whose filter is stricter for unresolved receivers
+ * (e.g. `this.repo.save()`), causing plan to miss class-method call sites
+ * that verify finds.
+ *
+ * Returns an array of plan-shaped sites: { file, line, expression, args, argCount }.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {string} name - Function name being refactored
+ * @param {object} def - Resolved definition
+ * @param {object} options - { file, className, line }
+ * @returns {Array}
+ */
+function computePlanCallSites(index, name, def, options) {
+    let callerResults = index.findCallers(name, {
+        includeMethods: true,
+        includeUncertain: false,
+        targetDefinitions: [def],
+    });
+
+    // Mirror verify's className filter (kept inline rather than re-extracted to
+    // avoid changing verify's behavior).
+    if (options.className && def.className) {
+        const targetClassName = def.className;
+        callerResults = callerResults.filter(c => {
+            if (!c.isMethod) return true;
+            const r = c.receiver;
+            if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
+            if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
+            // Local var type inference from constructor assignments
+            if (c.callerFile) {
+                const callerDef = c.callerStartLine ? { file: c.callerFile, startLine: c.callerStartLine, endLine: c.callerEndLine } : null;
+                if (callerDef) {
+                    const callerCalls = index.getCachedCalls(c.callerFile);
+                    if (callerCalls && Array.isArray(callerCalls)) {
+                        const localTypes = new Map();
+                        for (const call of callerCalls) {
+                            if (call.line >= callerDef.startLine && call.line <= callerDef.endLine) {
+                                if (!call.isMethod && !call.receiver) {
+                                    const syms = index.symbols.get(call.name);
+                                    if (syms && syms.some(s => s.type === 'class')) {
+                                        const content = index._readFile(c.callerFile);
+                                        const clines = content.split('\n');
+                                        const cline = clines[call.line - 1] || '';
+                                        const m = cline.match(/^\s*(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/);
+                                        if (m && m[2] === call.name) {
+                                            localTypes.set(m[1], call.name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        const receiverType = localTypes.get(r);
+                        if (receiverType) return receiverType === targetClassName;
+                    }
+                }
+            }
+            // Param type annotations
+            if (c.callerFile && c.callerStartLine) {
+                const callerSymbol = index.findEnclosingFunction(c.callerFile, c.line, true);
+                if (callerSymbol && callerSymbol.paramsStructured) {
+                    for (const param of callerSymbol.paramsStructured) {
+                        if (param.name === r && param.type) {
+                            const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
+                            if (typeMatches && typeMatches.some(t => t === targetClassName)) {
+                                return true;
+                            }
+                            return false;
+                        }
+                    }
+                }
+            }
+            // Unique method heuristic
+            const methodDefs = index.symbols.get(name);
+            if (methodDefs) {
+                const classNames = new Set();
+                for (const d of methodDefs) {
+                    if (d.className) classNames.add(d.className);
+                }
+                if (classNames.size === 1 && classNames.has(targetClassName)) {
+                    return true;
+                }
+            }
+            return false;
+        });
+    }
+
+    // Apply the same isMethodCall / non-method filter verify uses.
+    const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
+    const targetBasename = path.basename(def.file, path.extname(def.file));
+    const defFileEntry = index.files.get(def.file);
+    const defLang = defFileEntry?.language;
+
+    const importNameCache = new Map();
+    function getImportedNames(filePath) {
+        if (importNameCache.has(filePath)) return importNameCache.get(filePath);
+        const names = new Set();
+        const fe = index.files.get(filePath);
+        if (!fe) { importNameCache.set(filePath, names); return names; }
+        try {
+            const content = index._readFile(filePath);
+            const { imports: rawImports, importAliases } = extractImports(content, fe.language);
+            for (const imp of rawImports) {
+                if (imp.names) for (const n of imp.names) names.add(n);
+            }
+            if (importAliases) for (const alias of importAliases) names.add(alias.local);
+        } catch (e) { /* skip */ }
+        importNameCache.set(filePath, names);
+        return names;
+    }
+
+    const sites = [];
+    for (const c of callerResults) {
+        const call = {
+            file: c.file,
+            relativePath: c.relativePath,
+            line: c.line,
+            content: c.content,
+            usageType: 'call',
+            receiver: c.receiver,
+        };
+        const analysis = analyzeCallSite(index, call, name);
+
+        if (analysis.isMethodCall && !defIsMethod) {
+            const callReceiver = call.receiver;
+            if (callReceiver && callReceiver === targetBasename) {
+                const importedNames = getImportedNames(call.file);
+                if (!importedNames.has(callReceiver)) continue;
+            } else if (callReceiver && langTraits(defLang)?.hasReceiverPackageCalls) {
+                const targetDir = path.basename(path.dirname(def.file));
+                if (callReceiver !== targetDir) continue;
+            } else if (callReceiver && isNamespaceContainerFor(index, callReceiver, name, def.file)) {
+                // BUG-BX: TS namespace-qualified call — accept.
+            } else {
+                continue;
+            }
+        }
+
+        sites.push({
+            file: call.relativePath,
+            line: call.line,
+            expression: (call.content || '').trim(),
+            args: analysis.args,
+            argCount: analysis.argCount,
+        });
+    }
+    clearTreeCache(index);
+    // Stable ordering (matches CLAUDE.md rule #11): files alphabetical, sites by line ascending.
+    sites.sort((a, b) => {
+        const fc = String(a.file).localeCompare(String(b.file));
+        if (fc !== 0) return fc;
+        return (a.line || 0) - (b.line || 0);
+    });
+    return sites;
+}
+
+/**
+ * Compute the same scopeWarning that impact() returns for plan output.
+ * @param {object} index - ProjectIndex instance
+ * @param {string} name - Function name
+ * @param {object} def - Resolved definition
+ * @param {object} options
+ * @returns {object|null}
+ */
+function computePlanScopeWarning(index, name, def, options) {
+    const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
+    if (!defIsMethod) return null;
+    const allDefs = index.symbols.get(name);
+    if (!allDefs || allDefs.length <= 1) return null;
+    const classNames = [...new Set(allDefs
+        .filter(d => d.className && d.className !== def.className)
+        .map(d => d.className))];
+    if (classNames.length === 0) return null;
+    if (options.className || options.file) return null;
+    return {
+        targetClass: def.className || '(unknown)',
+        otherClasses: classNames,
+        hint: `Results may include calls to ${classNames.join(', ')}.${name}(). Use file= or className= to narrow scope.`
+    };
+}
+
+/**
  * Analyze a call site to understand how it's being called (AST-based)
  * @param {object} index - ProjectIndex instance
  * @param {object} call - Usage object with file, line, content
@@ -194,7 +614,10 @@ function verify(index, name, options = {}) {
     // (callers don't pass self/cls explicitly: obj.method(a, b) not obj.method(obj, a, b))
     const fileEntry = index.files.get(def.file);
     const lang = fileEntry?.language;
-    let params = def.paramsStructured || [];
+    // BUG-BY: enrich types for arrow functions whose types live on the
+    // enclosing variable_declarator's type_annotation rather than inline.
+    const arrowTypes = extractArrowTypesFromVarDecl(index, def);
+    let params = (arrowTypes?.paramsStructured) || def.paramsStructured || [];
     const selfParams = langTraits(lang)?.selfParam;
     if (selfParams && params.length > 0 && selfParams.includes(params[0].name)) {
         params = params.slice(1);
@@ -353,6 +776,11 @@ function verify(index, name, options = {}) {
                     continue;
                 }
                 // Receiver matches package directory — keep it
+            } else if (callReceiver && isNamespaceContainerFor(index, callReceiver, name, def.file)) {
+                // BUG-BX: TS namespace-qualified call (e.g. `Utils.helper()` where
+                // `Utils` is a `namespace` symbol containing `helper`). Treat the
+                // call as a direct invocation of the namespace member function.
+                // Same handling for class static methods and module containers.
             } else {
                 continue;
             }
@@ -440,7 +868,12 @@ function verify(index, name, options = {}) {
         function: name,
         file: def.relativePath,
         startLine: def.startLine,
-        signature: index.formatSignature(def),
+        // BUG-BV: use local TS-correct param formatter (`opt?: number`, not `opt: number?`).
+        // BUG-BY: when the def is a typed arrow declaration, render with enriched types.
+        signature: formatTypedSignature(def, arrowTypes ? {
+            paramsStructured: arrowTypes.paramsStructured,
+            returnType: arrowTypes.returnType
+        } : {}),
         params: params.map(p => ({
             name: p.name,
             optional: p.optional || p.default !== undefined,
@@ -475,9 +908,22 @@ function plan(index, name, options = {}) {
 
     const resolved = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
     const def = resolved.def || definitions[0];
-    const impact = index.impact(name, { file: options.file, className: options.className });
-    const currentParams = def.paramsStructured || [];
-    const currentSignature = index.formatSignature(def);
+    // BUG-BY: enrich types for typed-arrow-fn declarations.
+    const arrowTypes = extractArrowTypesFromVarDecl(index, def);
+    const currentParams = (arrowTypes?.paramsStructured) || def.paramsStructured || [];
+    // BUG-BV: render with TS-correct param formatting (`opt?: number`).
+    const currentSignature = formatTypedSignature(def, arrowTypes ? {
+        paramsStructured: arrowTypes.paramsStructured,
+        returnType: arrowTypes.returnType
+    } : {});
+
+    // BUG-BW: plan must discover call sites the same way verify does for class
+    // methods. Previously plan relied on `index.impact()` whose filter rejected
+    // calls with unresolved receivers (e.g. `this.field.method()`), even when
+    // verify's filter accepts them. Compute call sites locally to keep plan
+    // and verify in lock-step.
+    const planCallSites = computePlanCallSites(index, name, def, options);
+    const impactScopeWarning = computePlanScopeWarning(index, name, def, options);
 
     // Reject ambiguous multi-op invocations rather than silently coalescing.
     // The previous behavior reported only the *last* operation in the
@@ -538,32 +984,26 @@ function plan(index, name, options = {}) {
             }
         }
 
-        // Generate new signature
-        const paramsList = newParams.map(p => {
-            let str = (p.rest && !p.name.startsWith('*')) ? `...${p.name}` : p.name;
-            if (p.optional && !p.default) str += '?';
-            if (p.type) str += `: ${p.type}`;
-            if (p.default) str += ` = ${p.default}`;
-            return str;
-        }).join(', ');
+        // Generate new signature with TS-correct optional marker (BUG-BV)
+        // and arrow-fn enriched return type (BUG-BY).
+        const paramsList = newParams.map(formatTypedParam).filter(Boolean).join(', ');
         const asyncPrefix = (def.async || def.isAsync || def.modifiers?.includes('async')) ? 'async ' : '';
         newSignature = `${asyncPrefix}${name}(${paramsList})`;
-        if (def.returnType) newSignature += `: ${def.returnType}`;
+        const newRet = arrowTypes?.returnType || def.returnType;
+        if (newRet) newSignature += `: ${newRet}`;
 
         // Describe changes needed at each call site
-        for (const fileGroup of impact.byFile) {
-            for (const site of fileGroup.sites) {
-                const suggestion = options.defaultValue
-                    ? `No change needed (has default value)`
-                    : `Add argument: ${options.addParam}`;
-                changes.push({
-                    file: site.file,
-                    line: site.line,
-                    expression: site.expression,
-                    suggestion,
-                    args: site.args
-                });
-            }
+        for (const site of planCallSites) {
+            const suggestion = options.defaultValue
+                ? `No change needed (has default value)`
+                : `Add argument: ${options.addParam}`;
+            changes.push({
+                file: site.file,
+                line: site.line,
+                expression: site.expression,
+                suggestion,
+                args: site.args
+            });
         }
     }
 
@@ -586,17 +1026,13 @@ function plan(index, name, options = {}) {
 
         newParams = currentParams.filter(p => p.name !== removeTarget);
 
-        // Generate new signature
-        const paramsList = newParams.map(p => {
-            let str = (p.rest && !p.name.startsWith('*')) ? `...${p.name}` : p.name;
-            if (p.optional && !p.default) str += '?';
-            if (p.type) str += `: ${p.type}`;
-            if (p.default) str += ` = ${p.default}`;
-            return str;
-        }).join(', ');
+        // Generate new signature with TS-correct optional marker (BUG-BV)
+        // and arrow-fn enriched return type (BUG-BY).
+        const paramsList = newParams.map(formatTypedParam).filter(Boolean).join(', ');
         const asyncPrefix = (def.async || def.isAsync || def.modifiers?.includes('async')) ? 'async ' : '';
         newSignature = `${asyncPrefix}${name}(${paramsList})`;
-        if (def.returnType) newSignature += `: ${def.returnType}`;
+        const newRet = arrowTypes?.returnType || def.returnType;
+        if (newRet) newSignature += `: ${newRet}`;
 
         // For Python/Rust methods, self/cls/&self/&mut self is in paramsStructured
         // but callers don't pass it. Adjust paramIndex to caller-side position.
@@ -610,17 +1046,15 @@ function plan(index, name, options = {}) {
         const callerArgIndex = paramIndex - selfOffset;
 
         // Describe changes at each call site
-        for (const fileGroup of impact.byFile) {
-            for (const site of fileGroup.sites) {
-                if (site.args && site.argCount > callerArgIndex) {
-                    changes.push({
-                        file: site.file,
-                        line: site.line,
-                        expression: site.expression,
-                        suggestion: `Remove argument ${callerArgIndex + 1}: ${site.args[callerArgIndex] || '?'}`,
-                        args: site.args
-                    });
-                }
+        for (const site of planCallSites) {
+            if (site.args && site.argCount > callerArgIndex) {
+                changes.push({
+                    file: site.file,
+                    line: site.line,
+                    expression: site.expression,
+                    suggestion: `Remove argument ${callerArgIndex + 1}: ${site.args[callerArgIndex] || '?'}`,
+                    args: site.args
+                });
             }
         }
     }
@@ -630,20 +1064,18 @@ function plan(index, name, options = {}) {
         newSignature = currentSignature.replace(new RegExp('\\b' + escapeRegExp(name) + '\\b'), options.renameTo);
 
         // All call sites need renaming
-        for (const fileGroup of impact.byFile) {
-            for (const site of fileGroup.sites) {
-                const newExpression = site.expression.replace(
-                    new RegExp('\\b' + escapeRegExp(name) + '\\b'),
-                    options.renameTo
-                );
-                changes.push({
-                    file: site.file,
-                    line: site.line,
-                    expression: site.expression,
-                    suggestion: `Rename to: ${newExpression}`,
-                    newExpression
-                });
-            }
+        for (const site of planCallSites) {
+            const newExpression = site.expression.replace(
+                new RegExp('\\b' + escapeRegExp(name) + '\\b'),
+                options.renameTo
+            );
+            changes.push({
+                file: site.file,
+                line: site.line,
+                expression: site.expression,
+                suggestion: `Rename to: ${newExpression}`,
+                newExpression
+            });
         }
 
         // Also include import statements that reference the renamed function
@@ -678,26 +1110,19 @@ function plan(index, name, options = {}) {
         operation,
         before: {
             signature: currentSignature,
-            params: currentParams.map(p => {
-                let n = p.name;
-                if (p.optional && !p.default) n += '?';
-                if (p.type) n += `: ${p.type}`;
-                return n;
-            })
+            // BUG-BV: TS-correct optional marker (`opt?: number`); test contract
+            // expects name-keyed array entries (no ` = default`, no rest prefix)
+            // so callers can `.includes('paramName')` for exact match.
+            params: currentParams.map(p => formatPlanParamName(p)).filter(Boolean)
         },
         after: {
             signature: newSignature,
-            params: newParams.map(p => {
-                let n = p.name;
-                if (p.optional && !p.default) n += '?';
-                if (p.type) n += `: ${p.type}`;
-                return n;
-            })
+            params: newParams.map(p => formatPlanParamName(p)).filter(Boolean)
         },
         totalChanges: changes.length,
         filesAffected: new Set(changes.map(c => c.file)).size,
         changes,
-        scopeWarning: impact?.scopeWarning || null
+        scopeWarning: impactScopeWarning
     };
     } finally { index._endOp(); }
 }

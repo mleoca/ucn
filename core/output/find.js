@@ -244,19 +244,29 @@ function formatUsagesJson(usages, name) {
     const imports = refs.filter(u => u.usageType === 'import');
     const references = refs.filter(u => u.usageType === 'reference');
 
-    // Each usage record points at a call site; the handle for the *enclosing
-    // function* (when known) is the most useful jump-back target.
-    const formatUsage = (u) => ({
-        file: u.relativePath || u.file,
-        line: u.line,
-        ...(u.callerStartLine && u.callerName && {
-            handle: `${u.relativePath || u.file}:${u.callerStartLine}:${u.callerName}`
-        }),
-        expression: u.content,  // FULL expression - key improvement
-        ...(u.args && { args: u.args }),  // Parsed arguments
-        ...(u.before && u.before.length > 0 && { before: u.before }),
-        ...(u.after && u.after.length > 0 && { after: u.after })
-    });
+    // Each usage record points at a call site. We emit a per-occurrence handle
+    // pointing at the SITE itself in the form "relativePath:line:callerName"
+    // (or "relativePath:line:_topLevel" when the call is at module scope and has
+    // no enclosing function). When the enclosing function position is known, we
+    // also emit `enclosingHandle` as a jump-back target to the function head.
+    const formatUsage = (u) => {
+        const file = u.relativePath || u.file;
+        const callerToken = u.callerName || '_topLevel';
+        const handle = `${file}:${u.line}:${callerToken}`;
+        const enclosingHandle = (u.callerStartLine && u.callerName)
+            ? `${file}:${u.callerStartLine}:${u.callerName}`
+            : undefined;
+        return {
+            file,
+            line: u.line,
+            handle,
+            ...(enclosingHandle && { enclosingHandle }),
+            expression: u.content,  // FULL expression - key improvement
+            ...(u.args && { args: u.args }),  // Parsed arguments
+            ...(u.before && u.before.length > 0 && { before: u.before }),
+            ...(u.after && u.after.length > 0 && { after: u.after })
+        };
+    };
 
     return JSON.stringify({
         meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },

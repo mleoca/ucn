@@ -229,28 +229,28 @@ function testProcessData() {
     });
 
     describe('confidence options parity', () => {
-        it('CLI: context --show-confidence shows confidence scores', () => {
-            const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--show-confidence']);
+        it('CLI: context shows confidence scores by default', () => {
+            const output = runCli(FIXTURES_PATH, 'context', ['processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
             assert.ok(output.includes('confidence:'), 'Should show confidence scores');
             assert.match(output, /confidence: \d+\.\d+/, 'Should show numeric confidence');
         });
 
-        it('interactive: context --show-confidence shows confidence scores', () => {
-            const output = runInteractive(FIXTURES_PATH, ['context processData --show-confidence']);
+        it('interactive: context shows confidence scores by default', () => {
+            const output = runInteractive(FIXTURES_PATH, ['context processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
             assert.ok(output.includes('confidence:'), 'Should show confidence scores');
         });
 
-        it('MCP: context show_confidence shows confidence scores', async () => {
-            const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData', show_confidence: true });
+        it('MCP: context shows confidence scores by default', async () => {
+            const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData' });
             assert.ok(!res.isError, 'Should not error');
             assert.ok(res.text.includes('processData'), 'Should find symbol');
             assert.ok(res.text.includes('confidence:'), 'MCP should show confidence scores');
         });
 
-        it('CLI: about --show-confidence shows confidence scores', () => {
-            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--show-confidence']);
+        it('CLI: about shows confidence scores by default', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
             assert.ok(output.includes('confidence:'), 'Should show confidence scores in about');
         });
@@ -290,7 +290,13 @@ function testProcessData() {
             assert.ok(output.includes('confidence:'), 'Should show confidence by default');
         });
 
-        it('CLI: context --no-confidence hides confidence lines', () => {
+        it('CLI: context --hide-confidence hides confidence lines', () => {
+            const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--hide-confidence']);
+            assert.ok(output.includes('processData'), 'Should find symbol');
+            assert.ok(!output.includes('confidence:'), 'Should NOT show confidence with --hide-confidence');
+        });
+
+        it('CLI: --no-confidence still works as backwards-compat alias', () => {
             const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--no-confidence']);
             assert.ok(output.includes('processData'), 'Should find symbol');
             assert.ok(!output.includes('confidence:'), 'Should NOT show confidence with --no-confidence');
@@ -1037,16 +1043,18 @@ describe('Architecture Guards', () => {
             'expand', 'not', 'no-follow-symlinks', 'no-regex', 'default',
             'max-files', 'max-chars', 'workers',
         ]);
+        // Known negation/inverse flags that map to a positive FLAG_APPLICABILITY entry.
+        // Includes both no-* and hide-* style negations.
+        const negationMap = {
+            'no-confidence': 'showConfidence',
+            'hide-confidence': 'showConfidence',
+            'no-regex': 'regex',
+            'no-follow-symlinks': 'followSymlinks',
+        };
         for (const flag of knownFlags) {
             if (exemptFlags.has(flag)) continue;
             // Negation flags (no-*): verify the underlying setting exists in FLAG_APPLICABILITY
-            if (flag.startsWith('no-')) {
-                // Known negation → positive mappings (where the names don't match by simple strip)
-                const negationMap = {
-                    'no-confidence': 'showConfidence',
-                    'no-regex': 'regex',
-                    'no-follow-symlinks': 'followSymlinks',
-                };
+            if (flag.startsWith('no-') || flag in negationMap) {
                 const mapped = negationMap[flag];
                 if (mapped) {
                     assert.ok(allApplicableFlags.has(mapped),

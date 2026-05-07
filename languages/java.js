@@ -1186,18 +1186,35 @@ function findUsagesInCode(code, name, parser) {
 }
 
 /**
+ * Classify a Java symbol as a runtime entry point of a specific kind.
+ * Returns 'test' | 'main' | 'framework' | null.
+ *
+ * - 'test': JUnit @Test family (Test, ParameterizedTest, RepeatedTest,
+ *           TestFactory, TestTemplate) and JUnit lifecycle hooks
+ *           (BeforeEach, AfterEach, BeforeAll, AfterAll).
+ * - 'main': public static void main() — invoked by the JVM.
+ * - 'framework': @Override methods (invoked by the type-system contract).
+ *
+ * Used by tracing/search so `affectedTests` only tags genuine test methods.
+ */
+function getEntryPointKind(symbol) {
+    const m = symbol.modifiers || [];
+    // JUnit @Test family — full lowercase set so deadcode/test detection treats
+    // ParameterizedTest, RepeatedTest, TestFactory, TestTemplate as test entry points.
+    const TEST_ANNOTATIONS = ['test', 'parameterizedtest', 'repeatedtest', 'testfactory', 'testtemplate',
+        'beforeeach', 'aftereach', 'beforeall', 'afterall', 'before', 'after'];
+    if (m.some(x => TEST_ANNOTATIONS.includes(x))) return 'test';
+    if (symbol.name === 'main' && m.includes('public') && m.includes('static')) return 'main';
+    if (m.includes('override')) return 'framework';
+    return null;
+}
+
+/**
  * Check if a symbol is a Java-convention entry point.
  * These are invoked by the JVM runtime, test runners, or required by type system.
  */
 function isEntryPoint(symbol) {
-    const m = symbol.modifiers || [];
-    if (symbol.name === 'main' && m.includes('public') && m.includes('static')) return true;
-    // JUnit @Test family — full lowercase set so deadcode/test detection treats
-    // ParameterizedTest, RepeatedTest, TestFactory, TestTemplate as test entry points.
-    const TEST_ANNOTATIONS = ['test', 'parameterizedtest', 'repeatedtest', 'testfactory', 'testtemplate'];
-    if (m.some(x => TEST_ANNOTATIONS.includes(x))) return true;
-    if (m.includes('override')) return true;
-    return false;
+    return getEntryPointKind(symbol) !== null;
 }
 
 module.exports = {
@@ -1209,5 +1226,6 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     isEntryPoint,
+    getEntryPointKind,
     parse
 };

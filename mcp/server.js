@@ -256,6 +256,7 @@ server.registerTool(
             include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches'),
             min_confidence: z.number().optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
             show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),
+            hide_confidence: z.boolean().optional().describe('Hide confidence scores per edge (alias of show_confidence=false).'),
             unreachable_only: z.boolean().optional().describe('Show only callers/callees that are unreachable from any detected entry point (about, context, impact).'),
             with_types: z.boolean().optional().describe('Include related type definitions in output'),
             detailed: z.boolean().optional().describe('Show full symbol listing per file'),
@@ -311,6 +312,12 @@ server.registerTool(
         // This eliminates per-case param selection and prevents CLI/MCP drift.
         const { command: _c, project_dir: _p, ...rawParams } = args;
         const ep = normalizeParams(rawParams);
+
+        // Translate hide_confidence → showConfidence:false (canonical inverse).
+        if (ep.hideConfidence === true && ep.showConfidence === undefined) {
+            ep.showConfidence = false;
+        }
+        delete ep.hideConfidence;
 
         // Strip params not applicable to this command (prevents silent no-ops).
         // Global/core params are always allowed — only optional flags are filtered.

@@ -1277,6 +1277,31 @@ function diffImpact(index, options = {}) {
         // Track which functions are affected by added/modified lines
         const affectedSymbols = new Map(); // symbolName -> { symbol, addedLines, deletedLines }
 
+        // Pre-compute old file's symbol identities (BUG-F): use the old AST as the
+        // authoritative source for "did this function exist before?". Avoids the
+        // line-arithmetic guess that was wrong for tightly-packed 1-line functions.
+        // The identity key is `name\0className` (matches deletion-detection below).
+        let oldSymbolIdentities = null; // null = unknown (file untracked or git failed)
+        if (change.deletedLines.length > 0 || change.addedLines.length > 0) {
+            const ref = staged ? 'HEAD' : base;
+            try {
+                const oldContent = execFileSync(
+                    'git', ['show', `${ref}:${change.gitRelativePath}`],
+                    { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
+                );
+                const fileLang = detectLanguage(change.filePath);
+                if (fileLang) {
+                    const oldParsed = parse(oldContent, fileLang);
+                    oldSymbolIdentities = new Set();
+                    for (const oldFn of extractCallableSymbols(oldParsed)) {
+                        oldSymbolIdentities.add(`${oldFn.name}\0${oldFn.className || ''}`);
+                    }
+                }
+            } catch (e) {
+                // File didn't exist in base, or git error — leave null (unknown).
+            }
+        }
+
         for (const line of change.addedLines) {
             const symbol = index.findEnclosingFunction(change.filePath, line, true);
             if (symbol) {
@@ -1306,18 +1331,47 @@ function diffImpact(index, options = {}) {
             // since those lines no longer exist. Track as module-level unless they map
             // to a function that still exists (the function was modified, not deleted).
             // We approximate: if a deleted line is within the range of a known symbol, it's a modification.
-            let matched = false;
+            // Pick the MOST-SPECIFIC match: prefer exact-contained over tolerance-contained,
+            // and among ties prefer the smallest range (innermost). This avoids an earlier
+            // symbol's expanded ±2 range claiming a line that actually belongs to a later
+            // 1-line function in tightly-packed files (BUG-F).
+            let bestSymbol = null;
+            let bestExact = false;
+            let bestRange = Infinity;
             for (const symbol of fileEntry.symbols) {
                 if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
-                // Use a generous range — deleted lines near a function likely belong to it
-                if (line >= symbol.startLine - 2 && line <= symbol.endLine + 2) {
-                    const key = `${symbol.name}:${symbol.startLine}`;
+                const exact = line >= symbol.startLine && line <= symbol.endLine;
+                const tolerant = line >= symbol.startLine - 2 && line <= symbol.endLine + 2;
+                if (!exact && !tolerant) continue;
+                const range = symbol.endLine - symbol.startLine;
+                // Prefer exact-contained over tolerance-contained; among same kind, smaller range wins.
+                const better = bestSymbol === null
+                    || (exact && !bestExact)
+                    || (exact === bestExact && range < bestRange);
+                if (better) {
+                    bestSymbol = symbol;
+                    bestExact = exact;
+                    bestRange = range;
+                }
+            }
+            let matched = false;
+            if (bestSymbol) {
+                // Only attribute to a symbol that ALSO existed in the old file. If we
+                // know the old identities and this symbol wasn't there, it's a brand-new
+                // function — its "deleted line" is really a neighboring line that gets
+                // pushed up by the diff hunk header. Treat as module-level so the new
+                // symbol stays cleanly in newFunctions[] (BUG-F).
+                const identityKey = `${bestSymbol.name}\0${bestSymbol.className || ''}`;
+                const existedBefore = oldSymbolIdentities === null
+                    ? true
+                    : oldSymbolIdentities.has(identityKey);
+                if (existedBefore) {
+                    const key = `${bestSymbol.name}:${bestSymbol.startLine}`;
                     if (!affectedSymbols.has(key)) {
-                        affectedSymbols.set(key, { symbol, addedLines: [], deletedLines: [] });
+                        affectedSymbols.set(key, { symbol: bestSymbol, addedLines: [], deletedLines: [] });
                     }
                     affectedSymbols.get(key).deletedLines.push(line);
                     matched = true;
-                    break;
                 }
             }
             if (!matched) {
@@ -1335,12 +1389,22 @@ function diffImpact(index, options = {}) {
             }
         }
 
-        // Detect new functions: all added lines are within a single function range
-        // and the function didn't exist before (approximation: all lines in the function are added)
+        // Detect new functions: a function is new if it didn't exist in the old file
+        // by identity (name + className). This is authoritative — no more line-count
+        // heuristics. Falls back to the old line-arithmetic approximation when the
+        // old file is unreachable (e.g. untracked or pre-base).
         for (const [key, data] of affectedSymbols) {
             const { symbol, addedLines } = data;
-            const fnLineCount = symbol.endLine - symbol.startLine + 1;
-            if (addedLines.length >= fnLineCount * 0.8 && data.deletedLines.length === 0) {
+            const identityKey = `${symbol.name}\0${symbol.className || ''}`;
+            let isNew;
+            if (oldSymbolIdentities !== null) {
+                isNew = !oldSymbolIdentities.has(identityKey);
+            } else {
+                // Fallback: 80% of body lines added and no deletions hit this symbol.
+                const fnLineCount = symbol.endLine - symbol.startLine + 1;
+                isNew = addedLines.length >= fnLineCount * 0.8 && data.deletedLines.length === 0;
+            }
+            if (isNew) {
                 newFunctions.push({
                     name: symbol.name,
                     filePath: change.filePath,

@@ -1421,6 +1421,157 @@ describe('fix #179: plan --remove-param self normalizes to match &self', () => {
 // Fix #182: Turbofish syntax in verify
 // ============================================================================
 
+describe('BUG-CX: Rust fn main() not mis-tagged as test-case in affectedTests', () => {
+    it('fn main() should NOT appear as a test-case match', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"',
+            // main.rs calls helper() from main(); test_helper() is the actual test.
+            'src/main.rs': `fn helper() -> i32 {
+    1
+}
+
+fn main() {
+    let _ = helper();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_helper() {
+        assert_eq!(helper(), 1);
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const result = index.affectedTests('helper');
+            assert.ok(result, 'affectedTests should return a result');
+
+            // Collect all test-case matches across files.
+            const testCaseMatches = [];
+            for (const r of result.testFiles || []) {
+                for (const m of r.matches || []) {
+                    if (m.matchType === 'test-case') {
+                        testCaseMatches.push({ file: r.file, line: m.line, content: m.content });
+                    }
+                }
+            }
+
+            // BUG-CX: main() must never be classified as a test-case.
+            assert.ok(
+                !testCaseMatches.some(m => m.content.includes('fn main')),
+                `main() must not be tagged as test-case. Got: ${JSON.stringify(testCaseMatches, null, 2)}`
+            );
+            // The actual test_helper() must be classified as a test-case.
+            assert.ok(
+                testCaseMatches.some(m => m.content.includes('fn test_helper')),
+                `test_helper() should be a test-case. Got: ${JSON.stringify(testCaseMatches, null, 2)}`
+            );
+        } finally { rm(dir); }
+    });
+});
+
+describe('BUG-CY: Rust tests inside #[cfg(test)] mod block are not in uncovered', () => {
+    it('helper called by an inline #[cfg(test)] mod test should be covered', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"',
+            // helper() lives in lib.rs; its only call site is inside a #[cfg(test)] mod tests block.
+            'src/lib.rs': `pub fn helper() -> i32 {
+    42
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn covers_helper() {
+        assert_eq!(helper(), 42);
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const result = index.affectedTests('helper');
+            assert.ok(result, 'affectedTests should return a result');
+
+            // BUG-CY: helper must be in coveredFunctions, not uncovered.
+            assert.ok(
+                !result.uncovered.includes('helper'),
+                `helper should be covered (called from inline #[cfg(test)] mod tests), but got uncovered: [${result.uncovered.join(', ')}]`
+            );
+            assert.strictEqual(
+                result.summary.uncoveredCount, 0,
+                'uncoveredCount should be 0 when the only target is covered by an inline test'
+            );
+            // The lib.rs file (containing the inline #[cfg(test)] mod) should appear in testFiles.
+            assert.ok(
+                result.testFiles.length > 0,
+                `inline test module should produce a test file in results. Got: ${JSON.stringify(result.testFiles)}`
+            );
+        } finally { rm(dir); }
+    });
+
+    it('test helper inside #[cfg(test)] mod (no #[test]) is treated as test code', () => {
+        // Functions inside #[cfg(test)] mod blocks that lack a direct #[test]
+        // attribute (shared test helpers) should still be classified as test
+        // entries — they only compile under cargo test.
+        const { getLanguageModule } = require('../languages');
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': `pub fn helper() -> i32 { 1 }
+
+#[cfg(test)]
+mod tests {
+    pub fn shared_setup() -> i32 {
+        helper()
+    }
+
+    #[test]
+    fn uses_setup() {
+        assert_eq!(shared_setup(), 1);
+    }
+}
+`
+        });
+        try {
+            const index = idx(dir);
+            const rust = getLanguageModule('rust');
+            assert.ok(typeof rust.getEntryPointKind === 'function',
+                'rust module must export getEntryPointKind');
+
+            // Find the shared_setup symbol to inspect its modifiers.
+            const sharedSyms = index.symbols.get('shared_setup') || [];
+            assert.ok(sharedSyms.length > 0, 'shared_setup should be indexed');
+            const sym = sharedSyms[0];
+            assert.ok(
+                (sym.modifiers || []).includes('cfg_test_module'),
+                `shared_setup should carry cfg_test_module modifier. Got: ${JSON.stringify(sym.modifiers)}`
+            );
+            assert.strictEqual(
+                rust.getEntryPointKind(sym), 'test',
+                'cfg(test) module function should classify as test kind'
+            );
+        } finally { rm(dir); }
+    });
+});
+
+describe('BUG-CX/CY: getEntryPointKind distinguishes test from main', () => {
+    it('rust: fn main() is kind=main, not kind=test', () => {
+        const { getLanguageModule } = require('../languages');
+        const rust = getLanguageModule('rust');
+        assert.strictEqual(rust.getEntryPointKind({ name: 'main', modifiers: [] }), 'main');
+        assert.strictEqual(rust.getEntryPointKind({ name: 'helper', modifiers: ['test'] }), 'test');
+        assert.strictEqual(rust.getEntryPointKind({ name: 'helper', modifiers: ['bench'] }), 'test');
+        assert.strictEqual(rust.getEntryPointKind({ name: 'helper', modifiers: ['cfg_test_module'] }), 'test');
+        assert.strictEqual(rust.getEntryPointKind({ name: 'plain', modifiers: [] }), null);
+    });
+});
+
 describe('fix #182: turbofish syntax handled by verify', () => {
     const { execute } = require('../core/execute');
 

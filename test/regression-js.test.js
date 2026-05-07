@@ -3558,3 +3558,216 @@ describe('type annotations — JSDoc', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// BUG-BV: TS optional param rendered as invalid syntax (`opt: number?`)
+// ============================================================================
+
+describe('BUG-BV: TS optional param renders as `opt?: number` (TS-correct)', () => {
+    const { execute } = require('../core/execute');
+
+    it('verify signature places `?` before the type, not after', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'function makeUser(name: string, opt?: number): string { return name + (opt||0); }\nmakeUser("a", 1);\nmakeUser("b");'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'makeUser' });
+            assert.ok(r.ok, 'verify should succeed');
+            assert.match(r.result.signature, /opt\?: number/, 'expected `opt?: number`, got: ' + r.result.signature);
+            assert.ok(!r.result.signature.includes('opt: number?'), 'must NOT contain invalid `opt: number?`');
+        } finally { rm(dir); }
+    });
+
+    it('plan before/after signatures use TS-correct optional marker', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'function greet(name: string, title?: string, age?: number): string { return name; }\ngreet("Alice");'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'greet', addParam: 'extra' });
+            assert.ok(r.ok);
+            assert.match(r.result.before.signature, /title\?: string/, 'before sig should have `title?: string`');
+            assert.match(r.result.before.signature, /age\?: number/, 'before sig should have `age?: number`');
+            assert.match(r.result.after.signature, /title\?: string/, 'after sig should preserve `title?: string`');
+            // No invalid placement (e.g. `title: string?` or `age: number?`)
+            assert.ok(!/title: string\?/.test(r.result.before.signature));
+            assert.ok(!/age: number\?/.test(r.result.before.signature));
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-BW: plan reports 0 changes for class methods even when verify finds calls
+// ============================================================================
+
+describe('BUG-BW: plan finds class-method call sites the same way verify does', () => {
+    const { execute } = require('../core/execute');
+
+    it('plan add-param on a class method finds the same call sites verify finds', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': [
+                'class Repository {',
+                '  async save(entity: string): Promise<void> {',
+                '    await this.persist(entity);',
+                '  }',
+                '  private async persist(e: string): Promise<void> {}',
+                '}',
+                'class Wrapper {',
+                '  constructor(private repo: Repository) {}',
+                '  async write(x: string) {',
+                '    await this.repo.save(x);',
+                '    await this.repo.save(x + "!");',
+                '  }',
+                '}'
+            ].join('\n')
+        });
+        try {
+            const i = idx(dir);
+            const v = execute(i, 'verify', { name: 'save', className: 'Repository' });
+            assert.ok(v.ok, 'verify should succeed');
+            const verifyTotal = v.result.totalCalls;
+            assert.ok(verifyTotal > 0, 'verify must find at least one call');
+            const p = execute(i, 'plan', { name: 'save', className: 'Repository', addParam: 'opt' });
+            assert.ok(p.ok, 'plan should succeed');
+            assert.strictEqual(p.result.totalChanges, verifyTotal,
+                `plan totalChanges (${p.result.totalChanges}) must equal verify totalCalls (${verifyTotal})`);
+            assert.strictEqual(p.result.filesAffected, 1, 'expected 1 file affected');
+            assert.ok(p.result.changes.every(c => c.suggestion.includes('Add argument: opt')));
+        } finally { rm(dir); }
+    });
+
+    it('plan rename on a class method updates each call site verify confirms', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': [
+                'class Service {',
+                '  process(x: number): number { return x * 2; }',
+                '  run(x: number): number { return this.process(x); }',
+                '}',
+                'class Caller {',
+                '  constructor(private svc: Service) {}',
+                '  go(x: number) { this.svc.process(x); this.svc.process(x+1); }',
+                '}'
+            ].join('\n')
+        });
+        try {
+            const i = idx(dir);
+            const v = execute(i, 'verify', { name: 'process', className: 'Service' });
+            assert.ok(v.ok);
+            const verifyTotal = v.result.totalCalls;
+            const p = execute(i, 'plan', { name: 'process', className: 'Service', renameTo: 'doProcess' });
+            assert.ok(p.ok);
+            // Plan rename adds call-site changes for each verified call site
+            // (and may add an import-statement change too — count the call-site
+            // ones via the suggestion prefix).
+            const renameChanges = p.result.changes.filter(c => c.suggestion.startsWith('Rename to:'));
+            assert.ok(renameChanges.length >= verifyTotal,
+                `plan should rename at least ${verifyTotal} call sites; got ${renameChanges.length}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-BX: TS namespace-qualified calls (`Utils.helper()`) yield totalCalls: 0
+// ============================================================================
+
+describe('BUG-BX: TS namespace-qualified calls counted in verify', () => {
+    const { execute } = require('../core/execute');
+
+    it('Utils.helper() calls are counted when verifying `helper`', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': [
+                'namespace Utils {',
+                '  export function helper(x: number): number { return x * 2; }',
+                '}',
+                'Utils.helper(3);',
+                'Utils.helper(4);'
+            ].join('\n')
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'helper' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.totalCalls, 2, 'expected 2 namespace-qualified calls');
+            assert.strictEqual(r.result.valid, 2);
+        } finally { rm(dir); }
+    });
+
+    it('does not falsely count obj.method() where obj is unrelated', () => {
+        // Sanity: standalone `helper` should not eat unrelated `dict.helper()` calls.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': [
+                'function helper(x: number): number { return x; }',
+                'const dict = { helper: (n: number) => n + 1 };',
+                'dict.helper(5);',  // should NOT match standalone `helper`
+                'helper(6);'         // should match
+            ].join('\n')
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'helper' });
+            assert.ok(r.ok);
+            // Only the `helper(6)` direct call should be counted; `dict.helper(5)`
+            // is filtered out (dict isn't a namespace/class symbol).
+            assert.strictEqual(r.result.totalCalls, 1);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// BUG-BY: TS arrow fn declared with type-annotated const loses param/return types
+// ============================================================================
+
+describe('BUG-BY: typed-arrow declaration preserves param and return types', () => {
+    const { execute } = require('../core/execute');
+
+    it('verify reads function-type from the variable_declarator', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'const add: (a: number, b: number) => number = (a, b) => a + b;\nadd(1, 2);'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'add' });
+            assert.ok(r.ok);
+            assert.match(r.result.signature, /a: number/, 'param `a` should have type `number`');
+            assert.match(r.result.signature, /b: number/, 'param `b` should have type `number`');
+            assert.match(r.result.signature, /\) : number/, 'return type `number` should be preserved');
+        } finally { rm(dir); }
+    });
+
+    it('plan before signature uses the enriched arrow-fn types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'const sub: (a: number, b: number) => number = (a, b) => a - b;\nsub(2, 1);'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'plan', { name: 'sub', addParam: 'c' });
+            assert.ok(r.ok);
+            assert.match(r.result.before.signature, /a: number/, 'plan before sig should retain types');
+            assert.match(r.result.before.signature, /\) : number/, 'plan before sig should retain return type');
+        } finally { rm(dir); }
+    });
+
+    it('does not break when the arrow already has inline types', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.ts': 'const mul = (a: number, b: number): number => a * b;\nmul(2, 3);'
+        });
+        try {
+            const i = idx(dir);
+            const r = execute(i, 'verify', { name: 'mul' });
+            assert.ok(r.ok);
+            assert.match(r.result.signature, /a: number/);
+            assert.match(r.result.signature, /b: number/);
+            assert.match(r.result.signature, /\) : number/);
+        } finally { rm(dir); }
+    });
+});

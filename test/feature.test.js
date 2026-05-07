@@ -703,6 +703,45 @@ line5`;
         assert.strictEqual(lines4[0], 'function foo() {}');
     });
 
+    it('cleanHtmlScriptTags strips inline script tags surrounded by other elements (BUG-CW)', () => {
+        const { cleanHtmlScriptTags } = require('../core/parser');
+
+        // Script tag inline with other elements on the same line.
+        // Old regex required whitespace prefix on opening and end-of-line on closing,
+        // so neither tag was stripped — leaving HTML noise that broke JS parsing.
+        const lines1 = ['<p>foo</p><script>const x = 1;</script><p>bar</p>'];
+        cleanHtmlScriptTags(lines1, 'html');
+        assert.ok(!lines1[0].includes('<script>'), '<script> tag must be stripped');
+        assert.ok(!lines1[0].includes('</script>'), '</script> tag must be stripped');
+        assert.ok(lines1[0].includes('const x = 1;'), 'script body must remain');
+
+        // Multi-line where opening tag has HTML before it on the first line
+        // and closing tag has HTML after it on the last line.
+        const lines2 = [
+            '<p>start</p><script>',
+            'function helper() { return 7; }',
+            '</script><p>end</p>'
+        ];
+        cleanHtmlScriptTags(lines2, 'html');
+        assert.ok(!lines2[0].includes('<script>'), 'multi-line: <script> tag must be stripped');
+        assert.ok(!lines2[2].includes('</script>'), 'multi-line: </script> tag must be stripped');
+        assert.strictEqual(lines2[1], 'function helper() { return 7; }', 'middle lines unchanged');
+
+        // Closing tag with surrounding text on the same line as the opening tag.
+        const lines3 = ['prefix<script type="text/javascript">code()</script>suffix'];
+        cleanHtmlScriptTags(lines3, 'html');
+        assert.ok(!lines3[0].includes('<script'), 'inline opening tag with attrs stripped');
+        assert.ok(!lines3[0].includes('</script>'), 'inline closing tag stripped');
+        assert.ok(lines3[0].includes('code()'), 'script body must remain');
+
+        // Sanity: existing behavior (whitespace-prefix + EOL closing) still works.
+        const lines4 = ['    <script>js();</script>    '];
+        cleanHtmlScriptTags(lines4, 'html');
+        assert.ok(!lines4[0].includes('<script>'));
+        assert.ok(!lines4[0].includes('</script>'));
+        assert.ok(lines4[0].includes('js();'));
+    });
+
     it('extractCode strips script tags for HTML files', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-html-extract-'));
         const htmlFile = path.join(tmpDir, 'test.html');

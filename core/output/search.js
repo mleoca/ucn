@@ -268,7 +268,7 @@ function formatTypedefJson(types, name) {
 function formatTests(tests, name) {
     const lines = [`Tests for "${name}":\n`];
 
-    if (tests.length === 0) {
+    if (!tests || !Array.isArray(tests) || tests.length === 0) {
         lines.push('  (no tests found)');
     } else {
         const totalMatches = tests.reduce((sum, t) => sum + t.matches.length, 0);
@@ -294,11 +294,12 @@ function formatTests(tests, name) {
  * Format tests as JSON
  */
 function formatTestsJson(tests, name) {
+    const safe = Array.isArray(tests) ? tests : [];
     return JSON.stringify({
         query: name,
-        testFileCount: tests.length,
-        totalMatches: tests.reduce((sum, t) => sum + t.matches.length, 0),
-        testFiles: tests
+        testFileCount: safe.length,
+        totalMatches: safe.reduce((sum, t) => sum + (t.matches?.length || 0), 0),
+        testFiles: safe
     }, null, 2);
 }
 

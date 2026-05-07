@@ -239,7 +239,7 @@ ucn [target] <command> [name] [--flags]
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
 | `--exact` | Exact name match only in `find`/`typedef` (no substring) |
 | `--include-uncertain` | Include ambiguous/uncertain matches in `context`/`smart`/`about` |
-| `--no-confidence` | Hide confidence scores (shown by default) in `context`/`about` |
+| `--hide-confidence` | Hide confidence scores (shown by default) in `context`/`about` |
 | `--min-confidence=N` | Filter edges below confidence threshold (e.g., `--min-confidence=0.7` keeps only high-confidence edges) |
 | `--calls-only` | Only show call/test-case matches in `tests` (skip file-level results) |
 | `--add-param=<name>` | Add a parameter (`plan` command). Combine with `--default=<value>` |

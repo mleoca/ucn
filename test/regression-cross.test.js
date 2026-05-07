@@ -4222,14 +4222,14 @@ describe('flag validation parity across surfaces', () => {
         assert.ok(combined.includes('no effect'), 'about --no-regex should warn (regex not applicable)');
     });
 
-    it('CLI warns about inapplicable negation flags (--no-confidence)', () => {
+    it('CLI warns about inapplicable negation flags (--hide-confidence)', () => {
         const { spawnSync } = require('child_process');
         const result = spawnSync('node', [
             require('path').join(__dirname, '..', 'cli', 'index.js'),
-            FIXTURES_PATH + '/javascript', 'tests', 'helper', '--no-confidence'
+            FIXTURES_PATH + '/javascript', 'tests', 'helper', '--hide-confidence'
         ], { timeout: 30000, encoding: 'utf-8' });
         const combined = (result.stdout || '') + (result.stderr || '');
-        assert.ok(combined.includes('no effect'), 'tests --no-confidence should warn (showConfidence not applicable)');
+        assert.ok(combined.includes('no effect'), 'tests --hide-confidence should warn (showConfidence not applicable)');
     });
 
     it('interactive mode warns about inapplicable negation flags', () => {
@@ -4317,22 +4317,22 @@ describe('CLI glob-mode parity', () => {
         assert.ok(!feOut.includes('undefined'), 'file-exports header should not show undefined');
     });
 
-    it('glob mode passes --show-confidence to about formatter', () => {
+    it('glob mode shows confidence in about by default (parity with project mode)', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        // --show-confidence adds confidence annotations to caller lines;
+        // confidence annotations on caller lines are shown by default;
         // verify glob output matches project mode
-        const globOut = runCli(pattern, 'about', ['helper'], ['--show-confidence']);
-        const projOut = runCli(FIXTURES_PATH + '/javascript', 'about', ['helper'], ['--show-confidence']);
+        const globOut = runCli(pattern, 'about', ['helper']);
+        const projOut = runCli(FIXTURES_PATH + '/javascript', 'about', ['helper']);
         const globConf = (globOut.match(/confidence/g) || []).length;
         const projConf = (projOut.match(/confidence/g) || []).length;
         assert.strictEqual(globConf, projConf,
             'glob and project mode should show same number of confidence annotations');
     });
 
-    it('glob mode passes --show-confidence to context formatter', () => {
+    it('glob mode shows confidence in context by default', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const withConf = runCli(pattern, 'context', ['helper'], ['--show-confidence']);
-        assert.ok(withConf.includes('confidence'), 'glob context --show-confidence should show confidence');
+        const withConf = runCli(pattern, 'context', ['helper']);
+        assert.ok(withConf.includes('confidence'), 'glob context should show confidence by default');
     });
 
     it('glob mode passes --top to related formatter', () => {

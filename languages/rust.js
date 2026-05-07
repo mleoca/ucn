@@ -99,6 +99,40 @@ const _STATE_PATTERN = /^([A-Z][A-Z0-9_]+|DEFAULT_[A-Z_]+)$/;
 // --- Single-pass helpers: extracted from find* callbacks ---
 
 /**
+ * Walk up AST ancestors to detect whether `node` is enclosed in a
+ * `#[cfg(test)]` (or `#[cfg(any(test, ...))]`) module. Used to flag
+ * functions inside a `mod tests` block as test entry points even when
+ * they don't carry a direct `#[test]` attribute (BUG-CY).
+ */
+function _isInsideCfgTestModule(node, lines) {
+    let parent = node.parent;
+    while (parent) {
+        if (parent.type === 'mod_item') {
+            const startRow = parent.startPosition.row;
+            // Look at preceding lines for #[cfg(test)] or #[cfg(any(test,...))] / #[cfg(all(...,test,...))]
+            for (let i = startRow - 1; i >= 0 && i >= startRow - 5; i--) {
+                const line = lines[i]?.trim();
+                if (!line) break;
+                if (line.startsWith('#[')) {
+                    // Match #[cfg(...)] forms that include a `test` predicate.
+                    // Conservatively look for the literal token `test` inside the cfg(...) args.
+                    const m = line.match(/#\[\s*cfg\s*\(([^\]]*)\)\s*\]/);
+                    if (m) {
+                        const args = m[1];
+                        // Word-boundary match for `test` to avoid matching e.g. `testing_module`.
+                        if (/\btest\b/.test(args)) return true;
+                    }
+                } else if (!line.startsWith('//')) {
+                    break;
+                }
+            }
+        }
+        parent = parent.parent;
+    }
+    return false;
+}
+
+/**
  * Process a node for function extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
  */
@@ -138,6 +172,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const docstring = extractRustDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const attributes = extractAttributes(node, lines);
+            const inCfgTest = _isInsideCfgTestModule(node, lines);
 
             const modifiers = [];
             if (visibility) modifiers.push(visibility);
@@ -149,6 +184,9 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             for (const attr of attributes) {
                 modifiers.push(attr);
             }
+            // Mark functions inside #[cfg(test)] modules — they are test-only code
+            // even if they lack a direct #[test] attribute (helpers used by tests).
+            if (inCfgTest) modifiers.push('cfg_test_module');
 
             functions.push({
                 name: nameNode.text,
@@ -695,9 +733,11 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
 
                 // Extract attributes (#[test], #[inline], etc.) for impl members
                 const attributes = extractAttributes(child, codeOrLines);
+                const inCfgTest = _isInsideCfgTestModule(child, Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n'));
                 const modifiers = [];
                 if (visibility) modifiers.push(visibility);
                 for (const attr of attributes) modifiers.push(attr);
+                if (inCfgTest) modifiers.push('cfg_test_module');
 
                 members.push({
                     name: nameNode.text,
@@ -1500,15 +1540,36 @@ function findUsagesInCode(code, name, parser) {
 }
 
 /**
+ * Classify a Rust symbol as a runtime entry point of a specific kind.
+ * Returns 'test' | 'main' | 'framework' | null.
+ *
+ * - 'test': harness-invoked — #[test], #[bench], or anything inside a
+ *           #[cfg(test)] module (which only compiles for `cargo test`).
+ * - 'main': program entry — fn main()
+ * - 'framework': trait-impl methods (invoked by the trait contract holder)
+ *
+ * Used by tracing/search to distinguish test-coverage producers from runtime
+ * entry points so `affectedTests` doesn't mis-tag fn main() as a test case.
+ */
+function getEntryPointKind(symbol) {
+    const m = symbol.modifiers || [];
+    // Test entries first — #[test]/#[bench] take precedence even over fn main().
+    if (m.includes('test') || m.includes('bench')) return 'test';
+    // Functions inside #[cfg(test)] mod blocks — test-only code, even if they
+    // lack a direct #[test] attribute (e.g. shared helpers in `mod tests`).
+    if (m.includes('cfg_test_module')) return 'test';
+    if (symbol.name === 'main') return 'main';
+    // Trait-impl methods are framework entry points (invoked by trait holder).
+    if (symbol.isMethod && symbol.className && symbol.traitImpl) return 'framework';
+    return null;
+}
+
+/**
  * Check if a symbol is a Rust-convention entry point.
  * These are invoked by the Rust runtime, test harness, or required by trait contracts.
  */
 function isEntryPoint(symbol) {
-    const m = symbol.modifiers || [];
-    if (symbol.name === 'main') return true;
-    if (m.includes('test') || m.includes('bench')) return true;
-    if (symbol.isMethod && symbol.className && symbol.traitImpl) return true;
-    return false;
+    return getEntryPointKind(symbol) !== null;
 }
 
 module.exports = {
@@ -1520,5 +1581,6 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     isEntryPoint,
+    getEntryPointKind,
     parse
 };

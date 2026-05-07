@@ -1248,11 +1248,17 @@ function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, 
         if (!fileEntry.symbols) return;
         try {
             const langModule = getLanguageModule(lang);
-            if (!langModule || !langModule.isEntryPoint) return;
+            if (!langModule) return;
+            // Prefer kinded predicate so fn main() and fn init() aren't classified
+            // as test cases (BUG-CX). Fall back to isEntryPoint for compat.
+            const classify = langModule.getEntryPointKind
+                ? (s) => langModule.getEntryPointKind(s) === 'test'
+                : langModule.isEntryPoint;
+            if (!classify) return;
 
             // Find test symbols
             for (const symbol of fileEntry.symbols) {
-                if (!langModule.isEntryPoint(symbol)) continue;
+                if (!classify(symbol)) continue;
                 // Check if any non-import usage of searchTerm falls within this test function
                 const usageInRange = matches.some(m =>
                     m.line >= symbol.startLine && m.line <= symbol.endLine &&

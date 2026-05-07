@@ -560,6 +560,92 @@ module.exports = { helper };
             }
         } finally { rm(dir); }
     });
+
+    // BUG-F regression: trailing modified 1-line functions in a tightly-packed file
+    // were classified as `newFunctions[]` instead of `functions[]` because the
+    // deletedLines loop used a ±2 line tolerance and broke on first match — an
+    // earlier 1-line symbol's expanded range claimed the deleted line that
+    // actually belonged to a later 1-line function.
+    describe('BUG-F: tightly-packed 1-line functions attributed correctly', () => {
+        function setupTightlyPackedRepo(suffix) {
+            const dir = tmp({
+                'package.json': '{"name":"test"}',
+                // Tightly-packed: 3 consecutive 1-line functions, no blank lines.
+                // function a is at line 1, b at line 2, c at line 3.
+                'pack.js': 'function a() { return 1; }\nfunction b() { return 2; }\nfunction c() { return 3; }\nmodule.exports = { a, b, c };\n',
+            });
+            execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+            execFileSync('git', ['add', '.'], { cwd: dir, stdio: 'pipe' });
+            execFileSync('git', ['-c', 'user.email=test@test.com', '-c', 'user.name=Test', 'commit', '-m', 'init'], { cwd: dir, stdio: 'pipe' });
+            return dir;
+        }
+
+        it('modifying trailing 1-line function classifies it as modified, not new', () => {
+            const dir = setupTightlyPackedRepo();
+            try {
+                // Modify only `c` (the trailing 1-line function)
+                const packPath = path.join(dir, 'pack.js');
+                fs.writeFileSync(packPath, 'function a() { return 1; }\nfunction b() { return 2; }\nfunction c() { return 99; }\nmodule.exports = { a, b, c };\n');
+
+                const index = idx(dir);
+                const { ok, result } = execute(index, 'diffImpact', { base: 'HEAD' });
+                assert.ok(ok);
+
+                const modifiedNames = (result.functions || []).map(f => f.name);
+                const newNames = (result.newFunctions || []).map(f => f.name);
+
+                assert.ok(modifiedNames.includes('c'),
+                    `c should be in functions[] (modified). Got modified=${JSON.stringify(modifiedNames)}, new=${JSON.stringify(newNames)}`);
+                assert.ok(!newNames.includes('c'),
+                    `c should NOT be in newFunctions[]. Got new=${JSON.stringify(newNames)}`);
+                // Sibling 1-line functions a and b were not touched — they should not appear at all.
+                assert.ok(!modifiedNames.includes('a'), 'a should not be modified');
+                assert.ok(!modifiedNames.includes('b'), 'b should not be modified');
+            } finally { rm(dir); }
+        });
+
+        it('modifying middle 1-line function classifies it as modified, not new', () => {
+            const dir = setupTightlyPackedRepo();
+            try {
+                // Modify only `b` (the middle 1-line function)
+                const packPath = path.join(dir, 'pack.js');
+                fs.writeFileSync(packPath, 'function a() { return 1; }\nfunction b() { return 88; }\nfunction c() { return 3; }\nmodule.exports = { a, b, c };\n');
+
+                const index = idx(dir);
+                const { ok, result } = execute(index, 'diffImpact', { base: 'HEAD' });
+                assert.ok(ok);
+
+                const modifiedNames = (result.functions || []).map(f => f.name);
+                const newNames = (result.newFunctions || []).map(f => f.name);
+
+                assert.ok(modifiedNames.includes('b'),
+                    `b should be in functions[] (modified). Got modified=${JSON.stringify(modifiedNames)}, new=${JSON.stringify(newNames)}`);
+                assert.ok(!newNames.includes('b'),
+                    `b should NOT be in newFunctions[]. Got new=${JSON.stringify(newNames)}`);
+            } finally { rm(dir); }
+        });
+
+        it('check command does not flag modified 1-line trailing function as [ADDED, ORPHAN]', () => {
+            const dir = setupTightlyPackedRepo();
+            try {
+                const packPath = path.join(dir, 'pack.js');
+                fs.writeFileSync(packPath, 'function a() { return 1; }\nfunction b() { return 2; }\nfunction c() { return 99; }\nmodule.exports = { a, b, c };\n');
+
+                const index = idx(dir);
+                const { ok, result } = execute(index, 'check', { base: 'HEAD' });
+                assert.ok(ok);
+
+                const items = result && Array.isArray(result.items) ? result.items : [];
+                const cItem = items.find(i => i.name === 'c');
+                if (cItem) {
+                    assert.notStrictEqual(cItem.kind, 'added',
+                        `c should be 'modified', not 'added'. Got kind=${cItem.kind}`);
+                    assert.ok(!cItem.orphan,
+                        `c should NOT be marked orphan. Got orphan=${cItem.orphan}`);
+                }
+            } finally { rm(dir); }
+        });
+    });
 });
 
 // ── brief ───────────────────────────────────────────────────────────────────

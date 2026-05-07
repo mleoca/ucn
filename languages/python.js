@@ -1208,16 +1208,38 @@ function extractConstructorName(node) {
 }
 
 /**
+ * Classify a Python symbol as a runtime entry point of a specific kind.
+ * Returns 'test' | 'framework' | null.
+ *
+ * - 'test': pytest discovery (`test_*` functions, methods on `Test*` classes,
+ *           `setUp`/`tearDown` lifecycle, pytest plugin hooks).
+ * - 'framework': dunder methods (`__init__`, `__repr__`, etc.) — invoked by
+ *                the Python runtime as part of the type protocol.
+ *
+ * Note: Python has no fn-level `main` entry point convention (the
+ * `if __name__ == '__main__':` guard wraps statements, not a function).
+ *
+ * Used by tracing/search so `affectedTests` only tags genuine test functions.
+ */
+function getEntryPointKind(symbol) {
+    const { name } = symbol;
+    // Test entries first — pytest naming + unittest lifecycle hooks
+    if (/^test_/.test(name)) return 'test';
+    if (/^(setUp|tearDown)(Class|Module)?$/.test(name)) return 'test';
+    if (/^pytest_/.test(name)) return 'test';
+    // Methods inside a class whose name starts with Test (unittest/pytest discovery)
+    if (symbol.isMethod && symbol.className && /^Test[A-Z_0-9]?/.test(symbol.className)) return 'test';
+    // Dunder methods are framework entries (Python protocol)
+    if (/^__\w+__$/.test(name)) return 'framework';
+    return null;
+}
+
+/**
  * Check if a symbol is a Python-convention entry point.
  * These are invoked by the Python runtime, test runners, or frameworks.
  */
 function isEntryPoint(symbol) {
-    const { name } = symbol;
-    if (/^__\w+__$/.test(name)) return true;
-    if (/^test_/.test(name)) return true;
-    if (/^(setUp|tearDown)(Class|Module)?$/.test(name)) return true;
-    if (/^pytest_/.test(name)) return true;
-    return false;
+    return getEntryPointKind(symbol) !== null;
 }
 
 module.exports = {
@@ -1230,5 +1252,6 @@ module.exports = {
     findUsagesInCode,
     findInstanceAttributeTypes,
     isEntryPoint,
+    getEntryPointKind,
     parse
 };

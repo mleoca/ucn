@@ -2222,11 +2222,31 @@ const _JS_LIFECYCLE_METHODS = new Set([
 ]);
 
 /**
+ * Classify a JS/TS symbol as a runtime entry point of a specific kind.
+ * Returns 'framework' | null.
+ *
+ * - 'framework': React lifecycle methods (componentDidMount, etc.) and Web
+ *                Components callbacks (connectedCallback, etc.) — invoked by
+ *                the framework, not user code.
+ *
+ * Note: in JS/TS, test cases are framework calls (`it`, `test`, `describe`)
+ * not function definitions, so they aren't classified as test entry points
+ * here — `_addAffectedTestCases` in core/tracing.js handles them via call
+ * detection rather than this predicate.
+ *
+ * Used by tracing/search so `affectedTests` only tags genuine test cases.
+ */
+function getEntryPointKind(symbol) {
+    if (symbol.isMethod && _JS_LIFECYCLE_METHODS.has(symbol.name)) return 'framework';
+    return null;
+}
+
+/**
  * Check if a symbol is a JS/TS-convention entry point.
  * These are framework lifecycle methods invoked by React or Web Components.
  */
 function isEntryPoint(symbol) {
-    return !!(symbol.isMethod && _JS_LIFECYCLE_METHODS.has(symbol.name));
+    return getEntryPointKind(symbol) !== null;
 }
 
 module.exports = {
@@ -2240,5 +2260,6 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     isEntryPoint,
+    getEntryPointKind,
     parse
 };

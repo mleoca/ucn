@@ -312,6 +312,15 @@ function findUsagesInCode(code, name, parser) {
 }
 
 /**
+ * Classify an HTML symbol as a runtime entry point.
+ * HTML has no entry points of its own — JS extracted from <script> blocks
+ * is classified by the JS predicate.
+ */
+function getEntryPointKind() {
+    return null;
+}
+
+/**
  * HTML has no entry points of its own.
  */
 function isEntryPoint() {
@@ -330,6 +339,7 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     isEntryPoint,
+    getEntryPointKind,
     // Exported for testing
     extractScriptBlocks,
     buildVirtualJSContent,

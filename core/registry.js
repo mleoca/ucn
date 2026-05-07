@@ -74,6 +74,7 @@ const PARAM_MAP = {
     include_decorated: 'includeDecorated',
     min_confidence:    'minConfidence',
     show_confidence:   'showConfidence',
+    hide_confidence:   'hideConfidence',
     calls_only:        'callsOnly',
     class_name:        'className',
     max_lines:         'maxLines',

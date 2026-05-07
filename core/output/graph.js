@@ -106,15 +106,32 @@ function formatExportersJson(exporters, filePath) {
 }
 
 /**
+ * Dedup exported/api symbols. TypeScript overloads emit one symbol per overload
+ * declaration with identical name/signature; collapse them to a single entry.
+ * Key is "name|signature" (falls back to name|startLine when no signature).
+ */
+function dedupExportSymbols(symbols) {
+    if (!Array.isArray(symbols)) return symbols;
+    const seen = new Map();
+    for (const s of symbols) {
+        const sig = s.signature || (s.params !== undefined ? `${s.name}(${s.params})` : '');
+        const key = sig ? `${s.name}|${sig}` : `${s.name}|${s.startLine}`;
+        if (!seen.has(key)) seen.set(key, s);
+    }
+    return Array.from(seen.values());
+}
+
+/**
  * Format file-exports command output
  */
 function formatFileExports(exports, filePath) {
     if (exports?.error) return formatFileError(exports, filePath);
     if (exports.length === 0) return `No exports found in ${filePath}`;
 
+    const deduped = dedupExportSymbols(exports);
     const lines = [];
     lines.push(`Exports from ${filePath}:\n`);
-    for (const exp of exports) {
+    for (const exp of deduped) {
         lines.push(`  ${lineRange(exp.startLine, exp.endLine)} ${exp.signature || exp.name}`);
     }
     return lines.join('\n');
@@ -123,11 +140,13 @@ function formatFileExports(exports, filePath) {
 function formatFileExportsJson(result, filePath) {
     if (!result) return JSON.stringify({ found: false });
     // result is an array of exported symbols from index.fileExports()
+    const rawExports = Array.isArray(result) ? result : (result.exports || []);
+    const exports = dedupExportSymbols(rawExports);
     return JSON.stringify({
         meta: { command: 'fileExports', file: filePath || (Array.isArray(result) ? result[0]?.file : result.file) },
         data: {
             file: filePath || (Array.isArray(result) ? result[0]?.file : result.file),
-            exports: Array.isArray(result) ? result : (result.exports || []),
+            exports,
         },
     }, null, 2);
 }
@@ -148,7 +167,7 @@ function formatApi(symbols, filePath) {
             lines.push('Note: Python requires __all__ for export detection. Use \'toc\' command to see all functions/classes.');
         }
     } else {
-        // Group by file
+        // Group by file, then dedup overloads within each file group.
         const byFile = new Map();
         for (const sym of symbols) {
             if (!byFile.has(sym.file)) {
@@ -159,7 +178,8 @@ function formatApi(symbols, filePath) {
 
         for (const [file, syms] of byFile) {
             lines.push(file);
-            for (const s of syms) {
+            const dedupedSyms = dedupExportSymbols(syms);
+            for (const s of dedupedSyms) {
                 const sig = s.signature || `${s.type} ${s.name}`;
                 lines.push(`  ${lineRange(s.startLine, s.endLine)} ${sig}`);
             }
@@ -175,12 +195,13 @@ function formatApi(symbols, filePath) {
  */
 function formatApiJson(symbols, filePath) {
     const { formatSymbolHandle } = require('../shared');
+    const deduped = dedupExportSymbols(symbols);
     return JSON.stringify({
-        meta: { command: 'api', count: symbols.length },
+        meta: { command: 'api', count: deduped.length },
         ...(filePath && { file: filePath }),
         data: {
-            exportCount: symbols.length,
-            exports: symbols.map(s => {
+            exportCount: deduped.length,
+            exports: deduped.map(s => {
                 const handleSym = { ...s, relativePath: s.relativePath || s.file };
                 const handle = formatSymbolHandle(handleSym);
                 return {

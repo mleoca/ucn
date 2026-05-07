@@ -1353,14 +1353,27 @@ function findUsagesInCode(code, name, parser) {
 }
 
 /**
+ * Classify a Go symbol as a runtime entry point of a specific kind.
+ * Returns 'test' | 'main' | null.
+ *
+ * - 'test': functions named Test*, Benchmark*, Example*, Fuzz* — invoked by `go test`.
+ * - 'main': fn main / fn init — invoked by the Go runtime.
+ *
+ * Used by tracing/search so `affectedTests` only tags genuine test functions.
+ */
+function getEntryPointKind(symbol) {
+    const { name } = symbol;
+    if (/^(Test|Benchmark|Example|Fuzz)[A-Z_]/.test(name)) return 'test';
+    if (name === 'main' || name === 'init') return 'main';
+    return null;
+}
+
+/**
  * Check if a symbol is a Go-convention entry point.
  * These are invoked by the Go runtime or test runner, not user code.
  */
 function isEntryPoint(symbol) {
-    const { name } = symbol;
-    if (name === 'main' || name === 'init') return true;
-    if (/^(Test|Benchmark|Example|Fuzz)[A-Z_]/.test(name)) return true;
-    return false;
+    return getEntryPointKind(symbol) !== null;
 }
 
 module.exports = {
@@ -1372,5 +1385,6 @@ module.exports = {
     findExportsInCode,
     findUsagesInCode,
     isEntryPoint,
+    getEntryPointKind,
     parse
 };

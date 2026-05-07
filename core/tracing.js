@@ -561,8 +561,11 @@ function affectedTests(index, name, options = {}) {
         for (const [filePath, fileEntry] of index.files) {
             let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
             // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
+            // or symbols inside a #[cfg(test)] mod block (BUG-CY).
             if (!isTest && fileEntry.language === 'rust') {
-                isTest = fileEntry.symbols?.some(s => s.modifiers?.includes('test'));
+                isTest = fileEntry.symbols?.some(s =>
+                    s.modifiers?.includes('test') || s.modifiers?.includes('cfg_test_module')
+                );
             }
             if (!isTest) continue;
             if (excludeArr.length > 0 && !index.matchesFilters(fileEntry.relativePath, { exclude: excludeArr })) continue;
@@ -744,9 +747,16 @@ function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches
         if (!fileEntry.symbols) return;
         try {
             const langModule = getLanguageModule(lang);
-            if (!langModule || !langModule.isEntryPoint) return;
+            if (!langModule) return;
+            // Prefer the kinded predicate so we don't mis-tag fn main() / fn init()
+            // (runtime entries) as test cases (BUG-CX). Fall back to isEntryPoint
+            // for backward compat with language modules that haven't been migrated.
+            const classify = langModule.getEntryPointKind
+                ? (s) => langModule.getEntryPointKind(s) === 'test'
+                : langModule.isEntryPoint;
+            if (!classify) return;
             for (const symbol of fileEntry.symbols) {
-                if (!langModule.isEntryPoint(symbol)) continue;
+                if (!classify(symbol)) continue;
                 // Only add test-case if a call match exists in the test body
                 const hasCallInRange = existingMatches.some(m =>
                     m.line >= symbol.startLine && m.line <= symbol.endLine &&

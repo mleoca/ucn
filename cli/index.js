@@ -146,7 +146,7 @@ function parseFlags(tokens) {
         decorator: getValueFlag('--decorator'),
         exported: tokens.includes('--exported') || undefined,
         unused: tokens.includes('--unused') || undefined,
-        showConfidence: tokens.includes('--no-confidence') ? false : undefined,
+        showConfidence: (tokens.includes('--hide-confidence') || tokens.includes('--no-confidence')) ? false : undefined,
         minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
         unreachableOnly: tokens.includes('--unreachable-only') || undefined,
         framework: getValueFlag('--framework'),
@@ -183,7 +183,7 @@ const knownFlags = new Set([
     '--regex', '--no-regex', '--functions',
     '--max-lines', '--class-name', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
-    '--show-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
+    '--hide-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
     '--framework', '--workers', '--deep', '--compact'
 ]);
 
@@ -1331,10 +1331,9 @@ Common Flags:
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
-  --no-confidence     Hide confidence scores (shown by default in about, context)
+  --hide-confidence   Hide confidence scores (shown by default in about, context)
   --min-confidence=N  Filter low-confidence edges (about, context, blast, trace,
                         reverse-trace, smart, affected-tests)
-  --show-confidence   Show confidence scores on caller/callee edges (about, context)
   --unreachable-only  Show only callers/callees that are unreachable from entry points (about, context, impact)
   --include-exported  Include exported symbols in deadcode
   --no-regex          Force plain text search (regex is default)

@@ -54,6 +54,38 @@ describe('Output Formatting', () => {
         assert.ok(result.includes('[test]'), 'Should show test-case label');
         assert.ok(result.includes('test.spec.js'), 'Should show file name');
     });
+
+    it('formatTests handles undefined result gracefully', () => {
+        // Defensive guard: caller passes undefined when no tests payload available.
+        // Must not throw and must produce a reasonable empty-message string.
+        let text;
+        assert.doesNotThrow(() => {
+            text = output.formatTests(undefined, 'parse');
+        });
+        assert.ok(typeof text === 'string', 'Should return a string');
+        assert.ok(text.includes('parse'), 'Should reference the query name');
+        assert.ok(text.includes('no tests found'), 'Should say no tests found');
+    });
+
+    it('formatTests handles null result gracefully', () => {
+        let text;
+        assert.doesNotThrow(() => {
+            text = output.formatTests(null, 'parse');
+        });
+        assert.ok(typeof text === 'string', 'Should return a string');
+        assert.ok(text.includes('no tests found'), 'Should say no tests found');
+    });
+
+    it('formatTestsJson handles undefined gracefully', () => {
+        let json;
+        assert.doesNotThrow(() => {
+            json = output.formatTestsJson(undefined, 'parse');
+        });
+        const parsed = JSON.parse(json);
+        assert.strictEqual(parsed.testFileCount, 0);
+        assert.strictEqual(parsed.totalMatches, 0);
+        assert.deepStrictEqual(parsed.testFiles, []);
+    });
 });
 
 // ============================================================================
@@ -1518,6 +1550,58 @@ describe('Additional Formatter Coverage', () => {
             const text = output.formatApi([]);
             assert.ok(text.includes('(none found)'), 'Should say none found');
         });
+
+        it('dedupes TS overload entries with identical name+signature', () => {
+            // TypeScript overloads emit one symbol per overload declaration with
+            // identical signatures. They should collapse to a single rendered line.
+            const symbols = [
+                { file: 'src/foo.ts', name: 'foo', type: 'function', startLine: 1, endLine: 1, signature: 'function foo(a: string): void' },
+                { file: 'src/foo.ts', name: 'foo', type: 'function', startLine: 2, endLine: 2, signature: 'function foo(a: string): void' },
+                { file: 'src/foo.ts', name: 'foo', type: 'function', startLine: 3, endLine: 7, signature: 'function foo(a: string): void' },
+                { file: 'src/foo.ts', name: 'bar', type: 'function', startLine: 10, endLine: 12, signature: 'function bar(): number' }
+            ];
+            const text = output.formatApi(symbols);
+            // Only one foo line and one bar line should render
+            const fooMatches = text.match(/function foo\(a: string\): void/g) || [];
+            assert.strictEqual(fooMatches.length, 1, 'Should collapse 3 identical foo overloads to 1');
+            assert.ok(text.includes('function bar(): number'), 'Should still show bar');
+        });
+
+        it('formatApiJson dedupes TS overload entries', () => {
+            const symbols = [
+                { file: 'src/foo.ts', relativePath: 'src/foo.ts', name: 'foo', type: 'function', startLine: 1, endLine: 1, signature: 'function foo(a: string): void' },
+                { file: 'src/foo.ts', relativePath: 'src/foo.ts', name: 'foo', type: 'function', startLine: 2, endLine: 2, signature: 'function foo(a: string): void' },
+                { file: 'src/foo.ts', relativePath: 'src/foo.ts', name: 'foo', type: 'function', startLine: 3, endLine: 7, signature: 'function foo(a: string): void' }
+            ];
+            const json = JSON.parse(output.formatApiJson(symbols));
+            assert.strictEqual(json.data.exportCount, 1, 'Should dedup count');
+            assert.strictEqual(json.data.exports.length, 1, 'Should dedup exports array');
+        });
+    });
+
+    // --- formatFileExports overload dedup ---
+    describe('formatFileExports overload dedup', () => {
+        it('dedupes TS overload entries with identical signatures', () => {
+            const exports = [
+                { name: 'parse', startLine: 1, endLine: 1, signature: 'function parse(input: string): Foo' },
+                { name: 'parse', startLine: 2, endLine: 2, signature: 'function parse(input: string): Foo' },
+                { name: 'parse', startLine: 3, endLine: 10, signature: 'function parse(input: string): Foo' },
+                { name: 'helper', startLine: 12, endLine: 14, signature: 'function helper(): void' }
+            ];
+            const text = output.formatFileExports(exports, 'lib.ts');
+            const parseMatches = text.match(/function parse\(input: string\): Foo/g) || [];
+            assert.strictEqual(parseMatches.length, 1, 'Should collapse 3 identical parse overloads to 1');
+            assert.ok(text.includes('function helper(): void'), 'Should still show helper');
+        });
+
+        it('formatFileExportsJson dedupes overloads', () => {
+            const exports = [
+                { name: 'parse', startLine: 1, endLine: 1, signature: 'function parse(s: string): Foo' },
+                { name: 'parse', startLine: 2, endLine: 2, signature: 'function parse(s: string): Foo' }
+            ];
+            const json = JSON.parse(output.formatFileExportsJson(exports, 'lib.ts'));
+            assert.strictEqual(json.data.exports.length, 1, 'Should dedup overload entries');
+        });
     });
 
     // --- formatTypedef ---
@@ -1783,6 +1867,55 @@ describe('Additional Formatter Coverage', () => {
             const json = JSON.parse(output.formatUsagesJson(usages, 'x'));
             assert.ok(json.data, 'Should have data');
             assert.strictEqual(json.data.symbol, 'x', 'Should include symbol name');
+        });
+
+        it('formatUsagesJson emits per-occurrence handle for call site', () => {
+            // FIX: each occurrence must have a `handle` pointing at the call SITE
+            // itself (relativePath:line:callerName) — not just enclosing function.
+            const usages = [
+                {
+                    isDefinition: false, usageType: 'call',
+                    relativePath: 'src/app.js', line: 42, content: 'helper()',
+                    callerName: 'main', callerStartLine: 30
+                },
+                {
+                    // call at module scope (no enclosing function)
+                    isDefinition: false, usageType: 'call',
+                    relativePath: 'src/init.js', line: 5, content: 'helper()'
+                }
+            ];
+            const json = JSON.parse(output.formatUsagesJson(usages, 'helper'));
+            const calls = json.data.calls;
+            assert.strictEqual(calls.length, 2, 'Should have 2 call entries');
+
+            // Per-site handle present on both
+            assert.strictEqual(calls[0].handle, 'src/app.js:42:main',
+                'Site handle should be relativePath:line:callerName');
+            assert.strictEqual(calls[1].handle, 'src/init.js:5:_topLevel',
+                'Top-level call should use _topLevel sentinel');
+
+            // Enclosing-function handle present only when known
+            assert.strictEqual(calls[0].enclosingHandle, 'src/app.js:30:main',
+                'Should expose enclosing function handle when known');
+            assert.strictEqual(calls[1].enclosingHandle, undefined,
+                'No enclosing handle when topLevel');
+        });
+
+        it('formatUsagesJson emits site handle for imports and references', () => {
+            const usages = [
+                {
+                    isDefinition: false, usageType: 'import',
+                    relativePath: 'src/x.js', line: 1, content: "import { y } from 'lib'"
+                },
+                {
+                    isDefinition: false, usageType: 'reference',
+                    relativePath: 'src/y.js', line: 8, content: 'const z = y',
+                    callerName: 'compute', callerStartLine: 5
+                }
+            ];
+            const json = JSON.parse(output.formatUsagesJson(usages, 'y'));
+            assert.strictEqual(json.data.imports[0].handle, 'src/x.js:1:_topLevel');
+            assert.strictEqual(json.data.references[0].handle, 'src/y.js:8:compute');
         });
 
         it('formatContextJson handles function context', () => {
