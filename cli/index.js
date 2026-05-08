@@ -34,6 +34,92 @@ const { ExpandCache } = require('../core/expand-cache');
 // Sentinel error for command failures that have already printed their message.
 // Thrown instead of process.exit(1) so finally blocks can run (cache save).
 class CommandError extends Error { constructor() { super(); } }
+
+// Thrown by validateNumericFlags when a numeric flag has a bad value.
+// The CLI top-level catches this, prints the message, and exits 1. Interactive
+// mode catches it inside its REPL try/catch and continues the session.
+class FlagValidationError extends Error {
+    constructor(msg) { super(msg); this.name = 'FlagValidationError'; }
+}
+
+/**
+ * Validate that a raw flag value is a positive integer. Returns the parsed
+ * number when valid, or throws FlagValidationError. Callers pass `null`/`undefined`
+ * raw values through unchanged (no flag → no validation).
+ *
+ * @param {string|null|undefined} raw - The raw string captured from the CLI/interactive token.
+ * @param {string} flagName - The CLI flag name including dashes (e.g. "--top") for error messages.
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowZero=false] - Whether 0 is a valid value (e.g. depth=0 may be meaningful).
+ * @param {number} [opts.cap=10000000] - Maximum accepted value (rejects 1e100 etc).
+ * @returns {number|undefined} The validated integer, or undefined when raw is null/undefined.
+ */
+function validatePositiveInt(raw, flagName, { allowZero = false, cap = 10000000 } = {}) {
+    if (raw == null) return undefined;
+    const label = allowZero ? 'non-negative integer' : 'positive integer';
+    const trimmed = String(raw).trim();
+    if (trimmed === '') {
+        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
+    }
+    const n = Number(trimmed);
+    if (!isFinite(n) || isNaN(n)) {
+        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got "${raw}")`);
+    }
+    if (!Number.isInteger(n)) {
+        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got ${n})`);
+    }
+    if (allowZero) {
+        if (n < 0) {
+            throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got ${n})`);
+        }
+    } else if (n <= 0) {
+        throw new FlagValidationError(`Invalid ${flagName} value: must be a ${label} (got ${n})`);
+    }
+    if (n > cap) {
+        throw new FlagValidationError(`Invalid ${flagName} value: ${n} exceeds maximum (${cap})`);
+    }
+    return n;
+}
+
+/**
+ * Validate all numeric flags on a parsed flags object. Looks at the *Raw
+ * companion strings preserved by parseFlags so we catch user-supplied bad
+ * values regardless of whether the parsed numeric form happened to be falsy.
+ * Mutates `flags` to hold the validated numeric values.
+ *
+ * Throws FlagValidationError on the first invalid flag.
+ */
+function validateNumericFlags(flags) {
+    // --top: positive integer, no zero. Used by stats/find/context/etc.
+    if (flags.topRaw != null) {
+        flags.top = validatePositiveInt(flags.topRaw, '--top');
+    }
+    // --limit: positive integer, no zero. Reject "0 = no limit" silent coercion.
+    if (flags.limitRaw != null) {
+        flags.limit = validatePositiveInt(flags.limitRaw, '--limit');
+    }
+    // --max-files: positive integer, no zero.
+    if (flags.maxFilesRaw != null) {
+        flags.maxFiles = validatePositiveInt(flags.maxFilesRaw, '--max-files');
+    }
+    // --max-lines: positive integer, no zero. Used by class command.
+    if (flags.maxLinesRaw != null) {
+        flags.maxLines = validatePositiveInt(flags.maxLinesRaw, '--max-lines');
+    }
+    // --depth: non-negative integer (0 is meaningful: "this symbol only").
+    if (flags.depthRaw != null) {
+        flags.depth = validatePositiveInt(flags.depthRaw, '--depth', { allowZero: true });
+    }
+    // --context: non-negative integer (0 = no surrounding lines).
+    if (flags.contextRaw != null) {
+        flags.context = validatePositiveInt(flags.contextRaw, '--context', { allowZero: true });
+    }
+    // --workers: non-negative integer (0 disables parallel build).
+    if (flags.workersRaw != null) {
+        flags.workers = validatePositiveInt(flags.workersRaw, '--workers', { allowZero: true });
+    }
+}
+
 /**
  * Print an error message and abort. When `--json` is in effect, write a JSON
  * error envelope to stdout (so JSON-consuming pipelines see structured output)
@@ -107,6 +193,7 @@ function parseFlags(tokens) {
         exclude: parseExclude(),
         in: getValueFlag('--in'),
         includeTests: tokens.includes('--include-tests') ? true : undefined,
+        excludeTests: tokens.includes('--exclude-tests') ? true : undefined,
         includeExported: tokens.includes('--include-exported') || undefined,
         includeDecorated: tokens.includes('--include-decorated') || undefined,
         includeUncertain: tokens.includes('--include-uncertain') || undefined,
@@ -121,12 +208,14 @@ function parseFlags(tokens) {
         withTypes: tokens.includes('--with-types') || undefined,
         expand: tokens.includes('--expand') || undefined,
         depth: getValueFlag('--depth'),
+        depthRaw: getValueFlag('--depth'),
         // `top` is the parsed numeric value (NaN/0 default → falsy). `topRaw`
         // preserves the original string so downstream validators can produce
         // helpful errors for "abc"/"-1"/"0" instead of silently defaulting.
         top: parseInt(getValueFlag('--top') || '0'),
         topRaw: getValueFlag('--top'),
         context: parseInt(getValueFlag('--context') || '0'),
+        contextRaw: getValueFlag('--context'),
         direction: getValueFlag('--direction'),
         addParam: getValueFlag('--add-param'),
         removeParam: getValueFlag('--remove-param'),
@@ -137,6 +226,7 @@ function parseFlags(tokens) {
         deep: tokens.includes('--deep') || undefined,
         compact: tokens.includes('--compact') || undefined,
         maxLines: getValueFlag('--max-lines') || null,
+        maxLinesRaw: getValueFlag('--max-lines'),
         regex: tokens.includes('--no-regex') ? false : undefined,
         functions: tokens.includes('--functions') || undefined,
         hot: tokens.includes('--hot') || undefined,
@@ -144,7 +234,9 @@ function parseFlags(tokens) {
         git: tokens.includes('--git') || undefined,
         className: getValueFlag('--class-name'),
         limit: parseInt(getValueFlag('--limit') || '0') || undefined,
+        limitRaw: getValueFlag('--limit'),
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
+        maxFilesRaw: getValueFlag('--max-files'),
         // Structural search flags
         type: getValueFlag('--type'),
         param: getValueFlag('--param'),
@@ -166,6 +258,7 @@ function parseFlags(tokens) {
         prefix: getValueFlag('--prefix'),
         hideUncertain: tokens.includes('--hide-uncertain') || tokens.includes('--no-uncertain') || undefined,
         stack: getValueFlag('--stack'),
+        workersRaw: getValueFlag('--workers'),
         workers: (() => {
             const v = getValueFlag('--workers');
             if (v === null) return undefined;
@@ -189,7 +282,7 @@ const knownFlags = new Set([
     '--help', '-h', '--mcp',
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
-    '--no-cache', '--clear-cache', '--include-tests',
+    '--no-cache', '--clear-cache', '--include-tests', '--exclude-tests',
     '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--no-include-methods', '--include-uncertain', '--detailed', '--calls-only',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
@@ -222,6 +315,23 @@ if (unknownFlags.length > 0) {
     console.error(`Unknown flag(s): ${unknownFlags.join(', ')}`);
     console.error('Use --help to see available flags');
     process.exit(1);
+}
+
+// Validate numeric flag values up front so bad input fails before we build
+// any indexes. Applies to --top, --limit, --max-files, --max-lines, --depth,
+// --context, --workers. Throws FlagValidationError with a helpful message.
+try {
+    validateNumericFlags(flags);
+} catch (e) {
+    if (e instanceof FlagValidationError) {
+        if (flags.json) {
+            const env = { meta: { ok: false }, error: e.message };
+            try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) {}
+        }
+        console.error(e.message);
+        process.exit(1);
+    }
+    throw e;
 }
 
 // Value flags that consume the next token (space form: --flag value)
@@ -532,7 +642,7 @@ function runProjectCommand(rootDir, command, arg) {
         // Map from camelCase flag name to CLI flag string
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
         // Flags that are global (not command-specific) — skip warning for these
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw', 'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw', 'workersRaw']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
             // Skip unset values (undefined, null, 0, empty array) — but NOT false (explicit negation)
@@ -932,7 +1042,7 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'entrypoints': {
-            const { ok, result, error, note } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file, exclude: flags.exclude, includeTests: flags.includeTests, limit: flags.limit });
+            const { ok, result, error, note } = execute(index, 'entrypoints', { type: flags.type, framework: flags.framework, file: flags.file, exclude: flags.exclude, includeTests: flags.includeTests, excludeTests: flags.excludeTests, limit: flags.limit });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result,
@@ -1018,8 +1128,10 @@ function runProjectCommand(rootDir, command, arg) {
     } finally {
         // Save cache after command execution so callsCache populated
         // by findCallers/findCallees gets persisted to disk.
-        // On cache-hit runs, only re-save if callsCache was mutated.
-        if (flags.cache && (needsCacheSave || index.callsCacheDirty)) {
+        // On cache-hit runs, only re-save if callsCache was mutated OR
+        // reachability was computed (MED-1: persists the BFS result so
+        // subsequent cold invocations don't repeat the 7-11s tax).
+        if (flags.cache && (needsCacheSave || index.callsCacheDirty || index.reachabilityDirty)) {
             try { index.saveCache(); } catch (e) { /* best-effort */ }
         }
     }
@@ -1126,7 +1238,7 @@ function runGlobCommand(pattern, command, arg) {
     const applicableFlags = FLAG_APPLICABILITY[canonical];
     if (applicableFlags) {
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw', 'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw', 'workersRaw']);
         for (const [key, value] of Object.entries(flags)) {
             if (globalFlags.has(key)) continue;
             if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;
@@ -1413,6 +1525,7 @@ Common Flags:
   --with-types        Include type definitions (about, smart)
   --detailed          Show all symbols in toc (not just counts)
   --include-tests     Include test files in usage counts (about) and results (find, usages, deadcode)
+  --exclude-tests     Exclude test files (entrypoints — tests are included by default)
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in caller/callee analysis
   --include-uncertain Include ambiguous/uncertain matches
@@ -1574,10 +1687,18 @@ Flags can be added per-command: context myFunc --include-methods
         const iflags = parseFlags(flagTokens);
 
         try {
+            // Validate numeric flags (--top, --limit, etc) — same rules as
+            // global CLI mode. MED-2/MED-3/MED-5: bad values are rejected with
+            // a helpful message instead of being silently coerced.
+            validateNumericFlags(iflags);
             const iCanonical = resolveCommand(command, 'cli') || command;
             executeInteractiveCommand(index, iCanonical, arg, iflags, iExpandCache);
         } catch (e) {
-            console.error(`Error: ${e.message}`);
+            if (e instanceof FlagValidationError) {
+                console.log(e.message);
+            } else {
+                console.error(`Error: ${e.message}`);
+            }
         }
 
         rl.prompt();
@@ -1632,14 +1753,18 @@ const INTERACTIVE_DISPATCH = {
     verify:       { params: 'name', format: (r) => output.formatVerify(r) },
     diffImpact:   { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit, all: f.all }), format: (r, _a, f) => output.formatDiffImpact(r, { all: f.all }) },
     check:        { params: (a, f) => ({ base: f.base, staged: f.staged, file: f.file, limit: f.limit }), format: (r) => output.formatCheck(r) },
-    entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude, includeTests: f.includeTests, limit: f.limit }), format: (r) => output.formatEntrypoints(r) },
+    entrypoints:  { params: (a, f) => ({ type: f.type, framework: f.framework, file: f.file, exclude: f.exclude, includeTests: f.includeTests, excludeTests: f.excludeTests, limit: f.limit }), format: (r) => output.formatEntrypoints(r) },
     endpoints:    { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit, framework: f.framework, bridge: f.bridge, serverOnly: f.serverOnly, clientOnly: f.clientOnly, unmatched: f.unmatched, method: f.method, prefix: f.prefix, hideUncertain: f.hideUncertain }), format: (r) => output.formatEndpoints(r, { bridge: r._bridge, unmatched: r._unmatched }) },
 
     // ── Other ────────────────────────────────────────────────────────
     api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
     stacktrace:   { params: (a, f) => ({ stack: f.stack || a }), format: (r) => output.formatStackTrace(r) },
     doctor:       { params: (a, f) => ({ file: f.file, in: f.in, limit: f.limit, deep: f.deep }), format: (r) => output.formatDoctor(r) },
-    stats:        { params: 'flags', format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
+    // MED-2: stats handler in execute.js rejects top<=0; without explicit
+    // coercion, parseFlags's `top: 0` default would surface as
+    // "Invalid --top value" on bare `stats`. Mirror the project-mode top
+    // coercion (topRaw when present, else undefined for default-10).
+    stats:        { params: (a, f) => ({ functions: f.functions, hot: f.hot, top: f.topRaw != null ? f.topRaw : (f.top || undefined) }), format: (r, _a, f) => output.formatStats(r, { top: f.top }) },
     auditAsync:   { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit }), format: (r) => output.formatAuditAsync(r) },
 };
 
@@ -1665,7 +1790,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
     const applicableFlags = FLAG_APPLICABILITY[command];
     if (applicableFlags) {
         const flagToCli = (f) => '--' + f.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
-        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw']);
+        const globalFlags = new Set(['json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles', 'verbose', 'expand', 'interactive', '_fileFromFileMode', 'topRaw', 'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw', 'workersRaw']);
         for (const [key, value] of Object.entries(iflags)) {
             if (globalFlags.has(key)) continue;
             if (value === undefined || value === null || value === 0 || (Array.isArray(value) && value.length === 0)) continue;

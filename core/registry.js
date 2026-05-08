@@ -69,6 +69,7 @@ const MCP_ALIASES = {
 const PARAM_MAP = {
     project_dir:       'projectDir',
     include_tests:     'includeTests',
+    exclude_tests:     'excludeTests',
     include_methods:   'includeMethods',
     include_uncertain: 'includeUncertain',
     with_types:        'withTypes',
@@ -123,7 +124,7 @@ const FLAG_APPLICABILITY = {
     tests:        ['name', 'file', 'exclude', 'className', 'callsOnly'],
     affectedTests:['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
-    entrypoints:  ['file', 'exclude', 'includeTests', 'limit', 'type', 'framework'],
+    entrypoints:  ['file', 'exclude', 'includeTests', 'excludeTests', 'limit', 'type', 'framework'],
     endpoints:    ['file', 'exclude', 'limit', 'framework', 'bridge', 'serverOnly', 'clientOnly', 'unmatched', 'method', 'prefix', 'hideUncertain'],
     // Extracting code
     fn:           ['name', 'file', 'className', 'all'],

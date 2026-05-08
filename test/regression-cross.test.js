@@ -2589,7 +2589,10 @@ describe('P3: className validation gaps', () => {
         });
     }
 
-    it('entrypoints excludes test files by default', () => {
+    it('entrypoints includes test files by default and respects --exclude-tests', () => {
+        // JAVA-2: tests ARE entry points (JUnit @Test, pytest fixtures,
+        // Rust #[test], etc.). Show them by default; let users opt out via
+        // --exclude-tests.
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'app.js': 'function main() {}\nmodule.exports = { main };',
@@ -2597,13 +2600,18 @@ describe('P3: className validation gaps', () => {
         });
         try {
             const index = idx(dir);
-            const { ok, result } = execute(index, 'entrypoints', {});
-            assert.strictEqual(ok, true);
-            // With test exclusion, test files should not appear in entrypoints
-            if (result && result.length > 0) {
-                const testEntries = result.filter(e => e.file && e.file.includes('test'));
-                assert.strictEqual(testEntries.length, 0, 'Test files should be excluded from entrypoints by default');
-            }
+            const { ok: okDefault, result: defaultResult } = execute(index, 'entrypoints', {});
+            assert.strictEqual(okDefault, true);
+            // Default: test files appear (the test/ dir entry under js-test-file).
+            const defaultTestEntries = (defaultResult || []).filter(e => e.file && e.file.includes('test'));
+            assert.ok(defaultTestEntries.length > 0,
+                'Default behavior: test entries should be visible');
+
+            const { ok: okExcl, result: exclResult } = execute(index, 'entrypoints', { excludeTests: true });
+            assert.strictEqual(okExcl, true);
+            const exclTestEntries = (exclResult || []).filter(e => e.file && e.file.includes('test'));
+            assert.strictEqual(exclTestEntries.length, 0,
+                '--exclude-tests should remove test files from entrypoints');
         } finally {
             rm(dir);
         }
@@ -5390,5 +5398,73 @@ describe('BUG-M4: about disambiguation note when other definitions exist', () =>
             assert.strictEqual(r.result.symbol.file, 'src/cmd.js',
                 `about should pick src/ over test/, got ${r.result.symbol.file}`);
         } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// JAVA-1: Polyglot file discovery does not gate languages by build manifests
+// ============================================================================
+
+describe('Regression JAVA-1: polyglot file discovery is manifest-independent', () => {
+    it('project with only package.json still discovers .py files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"poly"}',
+            'main.js': 'function main() {}',
+            'helper.py': 'def hello(): pass',
+        });
+        try {
+            const index = idx(dir);
+            const langs = new Set();
+            for (const [, fe] of index.files) {
+                if (fe.language) langs.add(fe.language);
+            }
+            assert.ok(langs.has('python'),
+                `Python files should be discovered alongside JS; got languages: ${[...langs].join(',')}`);
+            assert.ok(langs.has('javascript'),
+                `JS files should still be discovered; got languages: ${[...langs].join(',')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('project with only package.json still discovers .go and .rs files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"poly"}',
+            'main.js': 'function main() {}',
+            'service.go': 'package main\nfunc Main() {}',
+            'lib.rs': 'pub fn lib_main() {}',
+        });
+        try {
+            const index = idx(dir);
+            const langs = new Set();
+            for (const [, fe] of index.files) {
+                if (fe.language) langs.add(fe.language);
+            }
+            assert.ok(langs.has('go'),
+                `Go files should be discovered without go.mod; got: ${[...langs].join(',')}`);
+            assert.ok(langs.has('rust'),
+                `Rust files should be discovered without Cargo.toml; got: ${[...langs].join(',')}`);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('detectProjectPattern always returns ALL_SUPPORTED_EXTENSIONS', () => {
+        // Build manifests are HINTS not GATES. The pattern returned should
+        // include ALL supported language extensions regardless of which manifests
+        // exist in the project root.
+        const { detectProjectPattern, ALL_SUPPORTED_EXTENSIONS } = require('../core/discovery');
+
+        const emptyDir = tmp({ 'README.md': '# empty' });
+        try {
+            const pat = detectProjectPattern(emptyDir);
+            // All listed extensions should appear in the pattern
+            for (const ext of ALL_SUPPORTED_EXTENSIONS) {
+                assert.ok(pat.includes(ext),
+                    `Pattern should include ${ext}; got ${pat}`);
+            }
+        } finally {
+            rm(emptyDir);
+        }
     });
 });

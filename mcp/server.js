@@ -260,9 +260,10 @@ server.registerTool(
             file: z.string().optional().describe('File path (imports/exporters/graph/file_exports/lines/api/diff_impact) or filter pattern for disambiguation (e.g. "parser", "src/core")'),
             exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
+            exclude_tests: z.boolean().optional().describe('Exclude test files from results. Used by entrypoints (where tests are included by default).'),
             include_methods: z.boolean().optional().describe('Include obj.method() calls (default: true for about/trace)'),
             include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches'),
-            min_confidence: z.number().optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
+            min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
             show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),
             hide_confidence: z.boolean().optional().describe('Hide confidence scores per edge (alias of show_confidence=false).'),
             unreachable_only: z.boolean().optional().describe('Show only callers/callees that are unreachable from any detected entry point (about, context, impact).'),
@@ -270,14 +271,14 @@ server.registerTool(
             detailed: z.boolean().optional().describe('Show full symbol listing per file'),
             exact: z.boolean().optional().describe('Exact name match only (no substring matching)'),
             in: z.string().optional().describe('Only search in this directory path (e.g. "src/core")'),
-            top: z.number().optional().describe('Max results to show (default: 10)'),
-            depth: z.number().optional().describe('Max depth (default: 3 for trace, 2 for graph); expands all children'),
+            top: z.number().int().positive().max(10000).optional().describe('Max results to show (default: 10). Must be a positive integer.'),
+            depth: z.number().int().nonnegative().max(100).optional().describe('Max depth (default: 3 for trace, 2 for graph); expands all children. Non-negative integer.'),
             code_only: z.boolean().optional().describe('Exclude matches in comments and strings'),
-            context: z.number().optional().describe('Lines of context around each match'),
+            context: z.number().int().nonnegative().max(1000).optional().describe('Lines of context around each match. Non-negative integer.'),
             include_exported: z.boolean().optional().describe('Include exported symbols in deadcode results'),
             include_decorated: z.boolean().optional().describe('Include decorated/annotated symbols in deadcode results'),
             calls_only: z.boolean().optional().describe('Only direct calls and test-case matches (tests command)'),
-            max_lines: z.number().optional().describe('Max source lines for class (large classes show summary by default)'),
+            max_lines: z.number().int().positive().max(1000000).optional().describe('Max source lines for class (large classes show summary by default). Must be a positive integer.'),
             direction: z.enum(['imports', 'importers', 'both']).optional().describe('Graph direction: imports (what this file uses), importers (who uses this file), both (default: both)'),
             term: z.string().optional().describe('Search term (regex by default; set regex=false to force plain text)'),
             regex: z.boolean().optional().describe('Treat search term as a regex pattern (default: true). Set false to force plain text escaping.'),
@@ -290,7 +291,7 @@ server.registerTool(
             rename_to: z.string().optional().describe('New function name (plan command)'),
             default_value: z.string().optional().describe('Default value for added parameter (plan command)'),
             stack: z.string().optional().describe('The stack trace text to parse (stacktrace command)'),
-            item: z.number().optional().describe('Item number from context output to expand (e.g. 1, 2, 3)'),
+            item: z.number().int().positive().max(1000000).optional().describe('Item number from context output to expand (e.g. 1, 2, 3). Must be a positive integer.'),
             range: z.string().optional().describe('Line range to extract, e.g. "10-20" or "15" (lines command)'),
             base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
             staged: z.boolean().optional().describe('Analyze staged changes (diff_impact command)'),
@@ -300,9 +301,9 @@ server.registerTool(
             all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
             top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
             class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
-            limit: z.number().optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed.'),
-            max_files: z.number().optional().describe('Max files to index (default: 10000). Use for very large codebases.'),
-            max_chars: z.number().optional().describe('Max output chars before truncation. Targeted commands (about, context, smart, etc.): 10K default. Broad commands (toc, entrypoints, deadcode, etc.): 3K default. Max: 100K. Use all=true to bypass all caps.'),
+            limit: z.number().int().positive().max(1000000).optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed. Must be a positive integer.'),
+            max_files: z.number().int().positive().max(10000000).optional().describe('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.'),
+            max_chars: z.number().int().positive().max(10000000).optional().describe('Max output chars before truncation. Targeted commands (about, context, smart, etc.): 10K default. Broad commands (toc, entrypoints, deadcode, etc.): 3K default. Max: 100K. Use all=true to bypass all caps.'),
             // Structural search flags (search command)
             type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type. Triggers index-based search.'),
             param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
@@ -772,7 +773,9 @@ server.registerTool(
             // getIndex() only saves after build (when callsCache is empty).
             // Commands like context/about/impact populate callsCache lazily,
             // so we save here to avoid re-parsing all files on every MCP session.
-            if (index && index.callsCacheDirty) {
+            // MED-1: also persist when reachability was computed in-process so
+            // long-lived MCP servers carry the BFS result forward to disk.
+            if (index && (index.callsCacheDirty || index.reachabilityDirty)) {
                 try { index.saveCache(); } catch (_) { /* best-effort */ }
                 index.callsCacheDirty = false;
             }

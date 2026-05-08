@@ -697,31 +697,13 @@ function extractClassMembers(classNode, codeOrLines) {
             }
         }
 
-        // Constructor declarations
-        if (child.type === 'constructor_declaration') {
-            const nameNode = child.childForFieldName('name');
-            const paramsNode = child.childForFieldName('parameters');
-
-            if (nameNode) {
-                const { startLine, endLine } = nodeToLocation(child, code);
-                const modifiers = extractModifiers(child);
-                const docstring = extractJavaDocstring(code, startLine);
-                const nameLine = nameNode.startPosition.row + 1;
-
-                members.push({
-                    name: nameNode.text,
-                    params: extractJavaParams(paramsNode),
-                    paramsStructured: parseStructuredParams(paramsNode, 'java'),
-                    startLine,
-                    endLine,
-                    memberType: 'constructor',
-                    modifiers,
-                    isMethod: true,  // Mark as method for context() lookups
-                    ...(docstring && { docstring }),
-                    ...(nameLine !== startLine && { nameLine })
-                });
-            }
-        }
+        // Constructor declarations: intentionally NOT emitted as separate class
+        // members. The class itself is the symbol; `new Foo(...)` calls resolve
+        // to the class via `isConstructor: true` on the call. Emitting the
+        // constructor as a member would create duplicate `find Foo` results
+        // (one for class, one for constructor), forcing users to disambiguate.
+        // Constructor signature info (params, line) remains accessible by reading
+        // the class body when needed (e.g. via verify's AST walk).
     }
 
     return members;

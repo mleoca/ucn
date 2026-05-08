@@ -761,7 +761,17 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         const { detectEntrypoints } = require('./entrypoints');
-        const exclude = applyTestExclusions(p.exclude, p.includeTests);
+        // JAVA-2: tests ARE entry points (JUnit @Test, pytest fixtures,
+        // Rust #[test], etc.) — show them by default. Previously this command
+        // applied addTestExclusions() unconditionally, which stripped Java
+        // *Tests.java entries while letting Rust #[test] through (asymmetric).
+        // Now consistent: default = include test entries; user opts out via
+        // --exclude-tests (or --include-tests=false for back-compat).
+        const userExclude = Array.isArray(p.exclude)
+            ? p.exclude
+            : (p.exclude ? p.exclude.split(',').map(s => s.trim()).filter(Boolean) : []);
+        const wantsExcludeTests = p.excludeTests === true || p.includeTests === false;
+        const exclude = wantsExcludeTests ? addTestExclusions(userExclude) : userExclude;
         let result = detectEntrypoints(index, {
             type: p.type,
             framework: p.framework,

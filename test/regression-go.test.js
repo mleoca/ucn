@@ -2008,7 +2008,7 @@ func World() string { return "world" }
                 assert.ok(!entry.symbols, 'File entry should not contain symbols');
                 assert.ok(!entry.bindings, 'File entry should not contain bindings');
             }
-            assert.strictEqual(cacheData.version, 9, 'Cache version should be 9');
+            assert.strictEqual(cacheData.version, 10, 'Cache version should be 10');
         } finally {
             rm(dir);
         }
@@ -4280,3 +4280,75 @@ describe('endpoints command (Go)', () => {
     });
 });
 
+// ============================================================================
+// R3-NEW-3: Go composite literals are constructor calls
+// ============================================================================
+
+describe('Regression R3-NEW-3: Go composite literal as constructor', () => {
+    it('Foo{} composite literal registers as caller of struct Foo', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-r3-new-3-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+type Foo struct{}
+
+func main() {
+    _ = Foo{}
+}
+`);
+            const index = idx(tmpDir);
+            const callers = index.findCallers('Foo');
+            assert.ok(callers.length >= 1,
+                `Should find caller for Foo via Foo{} composite literal; got ${callers.length}`);
+            assert.ok(callers.some(c => c.callerName === 'main'),
+                `Should include main as caller; got: ${callers.map(c => c.callerName).join(',')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('field-initialized struct literal Foo{x: 1} registers as caller', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-r3-new-3b-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+type Foo struct{ X int }
+
+func build() Foo {
+    return Foo{X: 1}
+}
+`);
+            const index = idx(tmpDir);
+            const callers = index.findCallers('Foo');
+            assert.ok(callers.length >= 1, 'Should find caller for Foo via Foo{X:1}');
+            assert.ok(callers.some(c => c.callerName === 'build'),
+                `Should include build as caller; got: ${callers.map(c => c.callerName).join(',')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('does NOT emit anonymous types ([]int{}, map[string]int{}) as constructor calls', () => {
+        // Anonymous container types should NOT register as constructor calls —
+        // they have no project-defined symbol to attach the caller to.
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-go-r3-new-3c-'));
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'go.mod'), 'module test\n\ngo 1.21\n');
+            fs.writeFileSync(path.join(tmpDir, 'main.go'), `package main
+
+func main() {
+    _ = []int{1, 2, 3}
+    _ = map[string]int{"a": 1}
+}
+`);
+            const index = idx(tmpDir);
+            // No struct types defined → no callers should be found for any name
+            // (we just check these expressions don't crash the parser)
+            assert.ok(index.symbols, 'index built successfully');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});

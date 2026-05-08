@@ -150,7 +150,63 @@ const FRAMEWORK_PATTERNS = [
         type: 'di',
         framework: 'spring',
         detection: 'modifier',
-        pattern: /^(bean|component|service|controller|repository|configuration|restcontroller)$/,
+        // JAVA-4: Spring DI / IoC core annotations
+        pattern: /^(bean|component|service|controller|repository|configuration|restcontroller|restcontrolleradvice|controlleradvice|springbootapplication|springbootconfiguration|enableautoconfiguration|componentscan|conditional(on\w+)?|profile|primary|qualifier|autowired|inject|value|scope|lazy|order|dependson|import|importresource|propertysource)$/,
+    },
+
+    // JAVA-4: Spring MVC binding/validation annotations on handler-method
+    // parameters/methods. Treated as entry points because Spring's
+    // DispatcherServlet calls these methods reflectively.
+    {
+        id: 'spring-mvc-method',
+        languages: new Set(['java']),
+        type: 'http',
+        framework: 'spring-mvc',
+        detection: 'modifier',
+        pattern: /^(initbinder|modelattribute|exceptionhandler|sessionattributes|requestbody|responsebody|responsestatus|crossorigin|pathvariable|requestparam|requestheader|requestattribute|cookievalue|matrixvariable|validated|valid|validator)$/,
+    },
+
+    // JAVA-4: JPA / Hibernate persistence annotations. The persistence
+    // provider instantiates and reads these via reflection.
+    {
+        id: 'jpa-entity',
+        languages: new Set(['java']),
+        type: 'di',
+        framework: 'jpa',
+        detection: 'modifier',
+        pattern: /^(entity|mappedsuperclass|embeddable|embedded|table|secondarytable|column|id|generatedvalue|sequencegenerator|tablegenerator|version|enumerated|temporal|lob|basic|transient|access|onetomany|manytoone|onetoone|manytomany|joincolumn|joincolumns|jointable|orderby|orderColumn|inheritance|discriminatorcolumn|discriminatorvalue|namedquery|namedqueries|namednativequery|sqlresultsetmapping|fieldresultsetmapping|attributeoverride|attributeoverrides|associationoverride|cacheable|maptkey|mapkeyenumerated|mapkeycolumn|maptemporal|elementcollection|collectiontable|converter|convert|cascade)$/,
+    },
+
+    // JAVA-4: JPA / Spring Data query annotation.
+    {
+        id: 'spring-data-query',
+        languages: new Set(['java']),
+        type: 'di',
+        framework: 'spring-data',
+        detection: 'modifier',
+        pattern: /^(query|modifying|procedure|namedquery|param|lock|querytype|entitygraph|projection)$/,
+    },
+
+    // JAVA-4: Transactional / caching / async / scheduling cross-cutting
+    // annotations (Spring AOP / Spring tx).
+    {
+        id: 'spring-tx',
+        languages: new Set(['java']),
+        type: 'di',
+        framework: 'spring',
+        detection: 'modifier',
+        pattern: /^(transactional|cacheable|cacheevict|cacheput|caching|enabletransactionmanagement|enablecaching|enableasync|enablescheduling|enableaspectjautoproxy)$/,
+    },
+
+    // JAVA-4: JAX-RS / JAX-B / XML binding annotations. Frameworks
+    // (Jersey, JAXB, etc.) instantiate and serialize via reflection.
+    {
+        id: 'jax-binding',
+        languages: new Set(['java']),
+        type: 'http',
+        framework: 'jax-rs',
+        detection: 'modifier',
+        pattern: /^(path|produces|consumes|provider|webservice|webmethod|webparam|webresult|xmlrootelement|xmlelement|xmlattribute|xmlaccessortype|xmltype|xmltransient|xmlid|xmlidref|xmlschematype|xmlseealso|xmlanyelement|xmlanyattribute)$/,
     },
 
     // ── Job Schedulers ──────────────────────────────────────────────────
@@ -245,13 +301,25 @@ const FRAMEWORK_PATTERNS = [
 
     // JUnit @Test family — Java parser lowercases annotations into `modifiers`,
     // not `decorators`, so detection must run against modifiers.
+    // JAVA-4: also include lifecycle (BeforeEach/AfterEach/etc.), nested test
+    // classes, extension wiring, and SpringBoot/MVC/Data test slices.
     {
         id: 'java-junit-test',
         languages: new Set(['java']),
         type: 'test',
         framework: 'junit',
         detection: 'modifier',
-        pattern: /^(test|parameterizedtest|repeatedtest|testfactory|testtemplate)$/,
+        pattern: /^(test|parameterizedtest|repeatedtest|testfactory|testtemplate|beforeall|beforeeach|afterall|aftereach|nested|disabled|enabled|enabledon\w*|disabledon\w*|tag|displayname|extendwith|registerextension|testmethodorder|testinstance|timeout|csvsource|valuesource|methodsource|enumsource|argumentssource|csvfilesource)$/,
+    },
+
+    // JAVA-4: Spring Boot test slices and integration test annotations.
+    {
+        id: 'spring-boot-test',
+        languages: new Set(['java']),
+        type: 'test',
+        framework: 'spring-boot-test',
+        detection: 'modifier',
+        pattern: /^(springboottest|webmvctest|datajpatest|datamongotest|dataredistest|datacassandratest|jsontest|jdbctest|jooqtest|webfluxtest|restclienttest|graphqltest|autoconfiguremockmvc|autoconfiguredatajpa|autoconfigurewebmvc|mockbean|spybean|mockitobean|spymockitobean|sqlgroup|sql|testpropertysource|activeprofiles|dirtiescontext|recordapplicationevents|contextconfiguration|webappconfiguration|importautoconfiguration|bootstrapwith|testexecutionlisteners|transactionalconfiguration|repeatedtests)$/,
     },
 
     // Spring HTTP route annotations — same lowercase-modifier rule
@@ -884,7 +952,25 @@ function symbolKey(file, line) {
  * @returns {Set<string>} Set of symbol keys (file:startLine) reachable from entry points
  */
 function computeReachability(index) {
-    if (index._reachableSymbols) return index._reachableSymbols;
+    // PERF-1: when _reachableSymbols was loaded from the disk cache, verify
+    // the index hasn't drifted (e.g. because the cache was stale and a partial
+    // rebuild ran after load). If the fingerprint doesn't match, drop the
+    // cached set and recompute.
+    if (index._reachableSymbols) {
+        if (index._reachableFingerprint) {
+            const { _computeReachabilityFingerprint } = require('./cache');
+            const currentFingerprint = _computeReachabilityFingerprint(index);
+            if (currentFingerprint === index._reachableFingerprint) {
+                return index._reachableSymbols;
+            }
+            // Drift: drop stale set, recompute below.
+            index._reachableSymbols = null;
+            index._reachableFingerprint = null;
+        } else {
+            // Computed in-process this run (no fingerprint) — already trustworthy.
+            return index._reachableSymbols;
+        }
+    }
 
     const reachable = new Set();
     const entryPoints = detectEntrypoints(index);
@@ -1013,6 +1099,16 @@ function computeReachability(index) {
     }
 
     index._reachableSymbols = reachable;
+    // Clear any stale fingerprint — this set was computed in-process and is
+    // authoritative for the rest of the process lifetime. (saveCache will
+    // re-fingerprint when persisting.)
+    index._reachableFingerprint = null;
+    // MED-1 (Round 5): mark the set dirty so the surface knows to persist it.
+    // Without this flag, a cache-hit run that triggers reachability (about,
+    // context, deadcode, etc.) would compute the BFS in-memory but not save
+    // it, forcing every subsequent cold invocation to repeat the 7-11s tax.
+    // Cleared in saveCache after a successful write.
+    index.reachabilityDirty = true;
     return reachable;
 }
 

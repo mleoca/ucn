@@ -952,6 +952,82 @@ describe('fix R2: CLI --max-lines rejects non-integer values', () => {
 });
 
 // ============================================================================
+// Round 5 audit: MED-3 / MED-5 — uniform numeric flag validation across
+// all commands. Previously only `stats` validated --top; bad values to
+// other commands (context, find, deadcode, etc.) silently coerced.
+// MED-5 also reject --limit=0 / --max-files=0 instead of "no limit" coercion.
+// ============================================================================
+
+describe('Round 5 MED-3: --top validated on commands other than stats', () => {
+    it('context --top=abc errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'context', ['processData'],
+            ['--top=abc', '--no-cache']);
+        assert.ok(out.includes('Invalid --top'),
+            `context --top=abc should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('context --top=-1 errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'context', ['processData'],
+            ['--top=-1', '--no-cache']);
+        assert.ok(out.includes('Invalid --top'),
+            `context --top=-1 should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('find --top=abc errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', ['processData'],
+            ['--top=abc', '--no-cache']);
+        assert.ok(out.includes('Invalid --top'),
+            `find --top=abc should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('deadcode --top=NaN-equivalent errors out', () => {
+        // CLI receives "abc" as the raw string; parseFlags now preserves topRaw
+        // and validateNumericFlags catches it before the executor.
+        const out = runCli(FIXTURES_PATH + '/javascript', 'deadcode', [],
+            ['--top=abc', '--no-cache']);
+        assert.ok(out.includes('Invalid --top'),
+            `deadcode --top=abc should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('valid --top=10 still works', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'context', ['processData'],
+            ['--top=10', '--no-cache']);
+        assert.ok(!out.includes('Invalid --top'),
+            `valid --top=10 should not error, got: ${out.slice(0, 200)}`);
+    });
+});
+
+describe('Round 5 MED-5: --limit and --max-files reject 0', () => {
+    it('find --limit=0 errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', ['processData'],
+            ['--limit=0', '--no-cache']);
+        assert.ok(out.includes('Invalid --limit'),
+            `find --limit=0 should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('find --limit=-3 errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', ['processData'],
+            ['--limit=-3', '--no-cache']);
+        assert.ok(out.includes('Invalid --limit'),
+            `find --limit=-3 should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('--max-files=0 errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'toc', [],
+            ['--max-files=0', '--no-cache']);
+        assert.ok(out.includes('Invalid --max-files'),
+            `--max-files=0 should error, got: ${out.slice(0, 200)}`);
+    });
+
+    it('find --limit=10 still works', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', ['processData'],
+            ['--limit=10', '--no-cache']);
+        assert.ok(!out.includes('Invalid --limit'),
+            `valid --limit=10 should not error, got: ${out.slice(0, 200)}`);
+    });
+});
+
+// ============================================================================
 // Evaluation report fixes (2026-03-03)
 // ============================================================================
 

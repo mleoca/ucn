@@ -908,6 +908,47 @@ function findCallsInCode(code, parser, options = {}) {
             return true;
         }
 
+        // R3-NEW-3: Detect Go struct composite literals as constructor calls.
+        //   Foo{x: 1}        → call(name='Foo', isConstructor:true)
+        //   pkg.Foo{...}     → call(name='Foo', isConstructor:true) — strip package
+        //   &Foo{...}        → composite_literal nested inside unary_expression;
+        //                       handled because we visit the inner composite_literal node.
+        // Skipped: anonymous types (slices/maps/arrays/struct types):
+        //   []int{...}, map[string]int{...}, struct{...}{...}, [3]int{...}
+        // These have non-identifier type children — only type_identifier and
+        // qualified_type produce a real type name.
+        if (node.type === 'composite_literal') {
+            // Skip composite literals that are nested inside another composite_literal's
+            // value position — those are inner field initializers like
+            // `Outer{ field: Inner{...} }`. Both the outer and inner are real
+            // constructors, so we DO emit each, but we must not emit the same
+            // node twice. Tree-sitter visits each node once, so this is fine.
+            const typeNode = node.childForFieldName('type');
+            if (typeNode) {
+                let typeName = null;
+                if (typeNode.type === 'type_identifier') {
+                    // Foo{...}
+                    typeName = typeNode.text;
+                } else if (typeNode.type === 'qualified_type') {
+                    // pkg.Foo{...}
+                    const tn = typeNode.childForFieldName('name');
+                    if (tn) typeName = tn.text;
+                }
+                // Skip anonymous types (slice_type, map_type, array_type, struct_type, etc.)
+                if (typeName) {
+                    const enclosingFunction = getCurrentEnclosingFunction();
+                    calls.push({
+                        name: typeName,
+                        line: node.startPosition.row + 1,
+                        isMethod: false,
+                        isConstructor: true,
+                        enclosingFunction,
+                        uncertain: false
+                    });
+                }
+            }
+        }
+
         // Detect function references passed as arguments: dc.worker passed to UntilWithContext(ctx, dc.worker, ...)
         // selector_expression inside argument_list (not inside call_expression as the function)
         if (node.type === 'selector_expression' && node.parent?.type === 'argument_list') {

@@ -393,43 +393,68 @@ function findProjectRoot(startDir) {
     return path.resolve(startDir);
 }
 
+// All file extensions for languages UCN supports as code analysis (excludes .rb/.php/.c/.cpp etc.
+// which are extensions UCN scans but doesn't analyze). When build manifests can't tell us
+// what's in a project, we scan all of these — the file extension alone determines language.
+const ALL_SUPPORTED_EXTENSIONS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'py', 'go', 'java', 'rs', 'html', 'htm'];
+
+// Build-manifest hints: when present, we know the project has files of that language
+// regardless of whether sources are visible at the time of scan. Used as hints, not gates —
+// any source file extension is included whether or not its manifest is present.
+const MANIFEST_HINTS = {
+    'package.json':      ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'html', 'htm'],
+    'pyproject.toml':    ['py'],
+    'setup.py':          ['py'],
+    'requirements.txt':  ['py'],
+    'go.mod':            ['go'],
+    'Cargo.toml':        ['rs'],
+    'pom.xml':           ['java'],
+    'build.gradle':      ['java'],
+    'build.gradle.kts':  ['java'],
+};
+
 /**
- * Auto-detect the glob pattern for a project based on its type
- * Checks both project root and immediate subdirectories for config files
+ * Auto-detect the glob pattern for a project.
+ *
+ * Discovery rule: build manifests are HINTS, not gates. We always scan ALL supported
+ * language extensions (JS/TS/Python/Go/Rust/Java/HTML). Manifests only inform metadata
+ * (e.g., flagging a project as "has Go") and never exclude files.
+ *
+ * This means a polyglot project with only `package.json` still discovers .py/.go/.rs
+ * files — language is determined by extension, not by manifest presence.
+ *
+ * Manifests are still useful for:
+ *   - Project root detection (see findProjectRoot / PROJECT_MARKERS)
+ *   - Conditional ignores (vendor/target/Pods/etc. — see CONDITIONAL_IGNORES)
+ *   - Language hints in stats output
  */
 function detectProjectPattern(projectRoot) {
-    const extensions = [];
+    // Always scan all supported language extensions. Build manifests no longer gate
+    // language inclusion — file extension alone determines what gets analyzed.
+    return `**/*.{${ALL_SUPPORTED_EXTENSIONS.join(',')}}`;
+}
 
-    // Helper to check for config files in a directory
+/**
+ * Detect which manifest hints are present in a project root or immediate subdirectories.
+ * Returns array of detected language extension hints. Used purely informationally —
+ * not as a gate on which files get scanned.
+ *
+ * @param {string} projectRoot - Project root directory
+ * @returns {string[]} Array of language extension strings (e.g., ['js', 'py', 'go'])
+ */
+function detectManifestHints(projectRoot) {
+    const hints = new Set();
+
     const checkDir = (dir) => {
-        if (fs.existsSync(path.join(dir, 'package.json'))) {
-            extensions.push('js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'html', 'htm');
-        }
-
-        if (fs.existsSync(path.join(dir, 'pyproject.toml')) ||
-            fs.existsSync(path.join(dir, 'setup.py')) ||
-            fs.existsSync(path.join(dir, 'requirements.txt'))) {
-            extensions.push('py');
-        }
-
-        if (fs.existsSync(path.join(dir, 'go.mod'))) {
-            extensions.push('go');
-        }
-
-        if (fs.existsSync(path.join(dir, 'Cargo.toml'))) {
-            extensions.push('rs');
-        }
-
-        if (fs.existsSync(path.join(dir, 'pom.xml')) ||
-            fs.existsSync(path.join(dir, 'build.gradle'))) {
-            extensions.push('java');
+        for (const [marker, exts] of Object.entries(MANIFEST_HINTS)) {
+            if (fs.existsSync(path.join(dir, marker))) {
+                for (const ext of exts) hints.add(ext);
+            }
         }
     };
 
-    // Check project root
     checkDir(projectRoot);
 
-    // Also check immediate subdirectories for multi-language projects (e.g., web/, frontend/, server/)
     try {
         const entries = fs.readdirSync(projectRoot, { withFileTypes: true });
         for (const entry of entries) {
@@ -442,12 +467,7 @@ function detectProjectPattern(projectRoot) {
         // Ignore errors reading directory
     }
 
-    if (extensions.length > 0) {
-        const unique = [...new Set(extensions)];
-        return `**/*.{${unique.join(',')}}`;
-    }
-
-    return '**/*.{js,jsx,ts,tsx,py,go,java,rs,rb,php,c,cpp,h,hpp,html,htm}';
+    return [...hints];
 }
 
 /**
@@ -541,11 +561,14 @@ module.exports = {
     shouldIgnore,
     findProjectRoot,
     detectProjectPattern,
+    detectManifestHints,
     getFileStats,
     isTestFile,
     findTestFileFor,
     parseGitignore,
     DEFAULT_IGNORES,
     PROJECT_MARKERS,
-    TEST_PATTERNS
+    TEST_PATTERNS,
+    ALL_SUPPORTED_EXTENSIONS,
+    MANIFEST_HINTS
 };

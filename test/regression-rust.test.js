@@ -1705,3 +1705,93 @@ describe('endpoints command (Rust)', () => {
         assert.strictEqual(exact.confidence, 1);
     });
 });
+
+// ============================================================================
+// RUST-2: Multi-line method chain line offset
+// ============================================================================
+
+describe('Regression RUST-2: chained method call line offset', () => {
+    it('each method in chained call reports its own line, not outer expr start', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-2-'));
+        try {
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'),
+                '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.rs'), `
+fn parse_env(var: &str) -> Option<usize> {
+    Some(var.to_string())
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|x| x + 1)
+}
+`);
+            const index = idx(tmpDir);
+            const { getCachedCalls } = require('../core/callers');
+            const calls = getCachedCalls(index, path.join(tmpDir, 'src', 'main.rs'));
+            // Find the and_then call - should be on line 4
+            const andThen = calls.find(c => c.name === 'and_then');
+            assert.ok(andThen, 'should find and_then call');
+            assert.strictEqual(andThen.line, 4,
+                `and_then should report line 4, got ${andThen.line}`);
+            // Find the map call - should be on line 5
+            const mapCall = calls.find(c => c.name === 'map');
+            assert.ok(mapCall, 'should find map call');
+            assert.strictEqual(mapCall.line, 5,
+                `map should report line 5, got ${mapCall.line}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// R3-NEW-3: Rust struct expressions are constructor calls
+// ============================================================================
+
+describe('Regression R3-NEW-3: Rust struct expression as constructor', () => {
+    it('Foo { x: 1 } struct expression registers as caller of struct Foo', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-r3-new-3-'));
+        try {
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'),
+                '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.rs'), `struct Foo { x: u32 }
+
+fn main() {
+    let _ = Foo { x: 1 };
+}
+`);
+            const index = idx(tmpDir);
+            const callers = index.findCallers('Foo');
+            assert.ok(callers.length >= 1,
+                `Should find caller for Foo via Foo { x:1 }; got ${callers.length}`);
+            assert.ok(callers.some(c => c.callerName === 'main'),
+                `Should include main as caller; got: ${callers.map(c => c.callerName).join(',')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+
+    it('struct literal with path prefix module::Foo {...} registers as Foo caller', () => {
+        const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-r3-new-3b-'));
+        try {
+            fs.mkdirSync(path.join(tmpDir, 'src'), { recursive: true });
+            fs.writeFileSync(path.join(tmpDir, 'Cargo.toml'),
+                '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"\n');
+            fs.writeFileSync(path.join(tmpDir, 'src', 'main.rs'), `mod inner {
+    pub struct Bar { pub x: u32 }
+}
+
+fn build() -> inner::Bar {
+    inner::Bar { x: 1 }
+}
+`);
+            const index = idx(tmpDir);
+            const callers = index.findCallers('Bar');
+            assert.ok(callers.length >= 1, 'Should find caller for Bar via inner::Bar {x:1}');
+            assert.ok(callers.some(c => c.callerName === 'build'),
+                `Should include build as caller; got: ${callers.map(c => c.callerName).join(',')}`);
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});

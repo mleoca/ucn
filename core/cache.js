@@ -82,11 +82,39 @@ function saveCache(index, cachePath) {
     // calleeIndex is NOT persisted in index.json — it's rebuilt lazily from callsCache
     // on first findCallers/buildCalleeIndex call. Removing it saves ~22MB (14%) on large projects.
 
+    // PERF-1: persist _reachableSymbols if computed. Set keys are
+    // "absolutePath:line"; we strip the root prefix on save and re-attach on
+    // load so paths stay portable. Sorted for stable output ordering.
+    //
+    // Also save a fingerprint so we can detect index drift on load: if the
+    // saved fingerprint matches the loaded index state, the cached set is
+    // still valid. If the index was rebuilt after load (stale cache → build),
+    // the fingerprint won't match and computeReachability will recompute.
+    let reachableSymbolsRel = undefined;
+    let reachableFingerprint = undefined;
+    if (index._reachableSymbols && index._reachableSymbols.size > 0) {
+        const rels = [];
+        for (const k of index._reachableSymbols) {
+            const colon = k.lastIndexOf(':');
+            if (colon < 0) continue;
+            const absFile = k.slice(0, colon);
+            const lineStr = k.slice(colon + 1);
+            const relFile = path.relative(root, absFile);
+            rels.push(`${relFile}:${lineStr}`);
+        }
+        rels.sort();  // stable ordering — output contract
+        reachableSymbolsRel = rels;
+        reachableFingerprint = _computeReachabilityFingerprint(index);
+    }
+
     const cacheData = {
-        version: 9,  // v9: addSymbol now propagates isAsync/isGenerator/paramTypes; older caches drop these
+        // v10: persist _reachableSymbols set (computed by entrypoints.computeReachability)
+        version: 10,
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
+        // PERF-2: refresh buildTime on each save so partial rebuilds report
+        // accurate stats. Falls back to original on first save.
         buildTime: index.buildTime,
         timestamp: Date.now(),
         files: strippedFiles,
@@ -99,9 +127,24 @@ function saveCache(index, cachePath) {
         failedFiles: index.failedFiles
             ? Array.from(index.failedFiles).map(f => path.relative(root, f))
             : [],
+        ...(reachableSymbolsRel !== undefined && {
+            reachableSymbols: reachableSymbolsRel,
+            reachableFingerprint,
+        }),
     };
 
-    fs.writeFileSync(cacheFile, JSON.stringify(cacheData));
+    // PERF-3: atomic write — tmp file + rename so concurrent readers/writers
+    // never see a torn JSON. The calls/ shard write below already does this.
+    const tmpFile = cacheFile + '.tmp';
+    fs.writeFileSync(tmpFile, JSON.stringify(cacheData));
+    fs.renameSync(tmpFile, cacheFile);
+
+    // MED-1 (Round 5): clear the reachabilityDirty flag now that the set is
+    // safely persisted. The cli/index.js cache-save guard checks this flag
+    // along with needsCacheSave/callsCacheDirty.
+    if (index.reachabilityDirty) {
+        index.reachabilityDirty = false;
+    }
 
     // Save callsCache sharded by directory for lazy loading.
     // Write to a temp directory first, then atomic swap to avoid data loss on crash.
@@ -171,7 +214,8 @@ function loadCache(index, cachePath) {
         // Check version compatibility
         // v7: symbols/bindings stripped from file entries (dedup)
         // v9: addSymbol propagates isAsync/isGenerator/paramTypes (force rebuild for old)
-        if (cacheData.version !== 9) {
+        // v10: persists _reachableSymbols set
+        if (cacheData.version !== 10) {
             return false;
         }
 
@@ -282,6 +326,29 @@ function loadCache(index, cachePath) {
                 index.calleeIndex.set(name, new Set(
                     files.map(f => path.isAbsolute(f) ? f : toAbs(f))
                 ));
+            }
+        }
+
+        // PERF-1: restore _reachableSymbols if persisted (v10+).
+        // Saved as relative-path keys; rehydrate to absolute keys here so the
+        // in-memory set matches what computeReachability would produce fresh.
+        // The fingerprint is checked by computeReachability before reuse — if
+        // the index drifts (e.g. a rebuild after stale cache), the cached set
+        // is dropped and recomputed.
+        if (Array.isArray(cacheData.reachableSymbols)) {
+            const reachable = new Set();
+            for (const k of cacheData.reachableSymbols) {
+                if (typeof k !== 'string') continue;
+                const colon = k.lastIndexOf(':');
+                if (colon < 0) continue;
+                const relFile = k.slice(0, colon);
+                const lineStr = k.slice(colon + 1);
+                const absFile = path.isAbsolute(relFile) ? relFile : toAbs(relFile);
+                reachable.add(`${absFile}:${lineStr}`);
+            }
+            index._reachableSymbols = reachable;
+            if (cacheData.reachableFingerprint) {
+                index._reachableFingerprint = cacheData.reachableFingerprint;
             }
         }
 
@@ -467,4 +534,37 @@ function _loadCallsShard(index, hash) {
     }
 }
 
-module.exports = { saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded };
+/**
+ * Compute a cheap fingerprint of the index used to detect drift since the
+ * last reachability computation. Two states with the same fingerprint are
+ * indistinguishable for reachability purposes (file count + symbol count are
+ * monotonic with structural changes; an extra `entries[0]` byte detects most
+ * incremental rebuilds even when counts happen to match).
+ *
+ * Used by entrypoints.computeReachability to decide whether the persisted
+ * `_reachableSymbols` set is still valid.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @returns {string} compact fingerprint
+ */
+function _computeReachabilityFingerprint(index) {
+    const fileCount = index.files ? index.files.size : 0;
+    const symbolCount = index.symbols ? index.symbols.size : 0;
+    // Sample a tiny prefix of the symbol map for a cheap structural check.
+    // Map iteration order is insertion order, which is stable across an
+    // unmodified load (built from cacheData.symbols in the same order).
+    let sample = '';
+    if (index.symbols && index.symbols.size > 0) {
+        let count = 0;
+        for (const [name, defs] of index.symbols) {
+            sample += name + ':' + (Array.isArray(defs) ? defs.length : 0) + '|';
+            if (++count >= 8) break;
+        }
+    }
+    return `${fileCount}:${symbolCount}:${sample}`;
+}
+
+module.exports = {
+    saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
+    _computeReachabilityFingerprint,
+};

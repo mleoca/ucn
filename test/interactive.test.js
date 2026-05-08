@@ -99,4 +99,49 @@ describe('Interactive Mode', () => {
         assert.ok(!result.includes('Error'), 'Neither find should error');
         assert.ok(result.includes('formatToc'), 'First find should include formatToc');
     });
+
+    // MED-2 (Round 5): bare `stats` in interactive must not crash with
+    // "Invalid --top value: must be a positive integer (got 0)". Previously
+    // parseFlags defaulted top to 0 and the dispatch handler passed that
+    // straight through to the executor, which rejected it.
+    it('MED-2: bare stats command succeeds in interactive mode', () => {
+        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+            input: 'stats\nquit\n',
+            encoding: 'utf-8',
+            cwd: PROJECT_DIR,
+            timeout: 60000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        assert.ok(!result.includes('Invalid --top'),
+            `bare stats should not produce 'Invalid --top' error, got: ${result.slice(0, 500)}`);
+        assert.ok(result.includes('PROJECT STATISTICS'),
+            `stats should print the standard header, got: ${result.slice(0, 500)}`);
+    });
+
+    // MED-3 (Round 5): bad --top value should be rejected in interactive mode
+    // (matching CLI behaviour) instead of being silently coerced to falsy.
+    it('MED-3: interactive rejects --top=abc with helpful error', () => {
+        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+            input: 'context formatToc --top=abc\nquit\n',
+            encoding: 'utf-8',
+            cwd: PROJECT_DIR,
+            timeout: 60000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        assert.ok(result.includes('Invalid --top'),
+            `interactive should reject --top=abc, got: ${result.slice(0, 500)}`);
+    });
+
+    // MED-5 (Round 5): --limit=0 must be rejected, not treated as "no limit".
+    it('MED-5: interactive rejects --limit=0', () => {
+        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+            input: 'find formatToc --limit=0\nquit\n',
+            encoding: 'utf-8',
+            cwd: PROJECT_DIR,
+            timeout: 60000,
+            stdio: ['pipe', 'pipe', 'pipe']
+        });
+        assert.ok(result.includes('Invalid --limit'),
+            `interactive should reject --limit=0, got: ${result.slice(0, 500)}`);
+    });
 });

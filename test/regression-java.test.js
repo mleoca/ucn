@@ -51,10 +51,12 @@ describe('Regression: Java class methods in context', () => {
             // Should identify as class
             assert.strictEqual(ctx.type, 'class', 'User should be identified as class');
             assert.ok(ctx.methods, 'Should have methods array');
-            assert.strictEqual(ctx.methods.length, 3, 'User class should have 3 methods (constructor + 2 methods)');
+            // JAVA-3: constructors are no longer emitted as separate symbols.
+            // The class IS the symbol; the constructor is its initializer. So
+            // User class has 2 methods (greet, validate), not 3.
+            assert.strictEqual(ctx.methods.length, 2, 'User class should have 2 methods (greet + validate; constructor not emitted as separate symbol)');
 
             const methodNames = ctx.methods.map(m => m.name);
-            assert.ok(methodNames.includes('User'), 'Should include constructor User');
             assert.ok(methodNames.includes('greet'), 'Should include greet');
             assert.ok(methodNames.includes('validate'), 'Should include validate');
         } finally {
@@ -172,16 +174,57 @@ public class MyClass {
             index.build(null, { quiet: true });
 
             const symbols = index.symbols.get('MyClass') || [];
-            // Should have: 1 class + 2 constructors (as members) = 3 entries
-            // Should NOT have: extra duplicates from findFunctions
+            // JAVA-3: constructors are no longer emitted as separate symbols.
+            // The class IS the symbol; new MyClass() resolves to the class via
+            // isConstructor: true on the call. So we expect exactly 1 entry: the class.
             const types = symbols.map(s => s.type);
             assert.strictEqual(types.filter(t => t === 'class').length, 1, 'Should have exactly 1 class entry');
-            // Constructors should only come from extractClassMembers, not findFunctions
+            // Should NOT emit constructors as separate symbols
             const constructors = symbols.filter(s => s.type === 'constructor');
-            assert.strictEqual(constructors.length, 2, 'Should have exactly 2 constructor entries');
-            // Each constructor at a unique line
-            const lines = constructors.map(c => c.startLine);
-            assert.notStrictEqual(lines[0], lines[1], 'Constructors should be at different lines');
+            assert.strictEqual(constructors.length, 0, 'Should NOT emit constructors as separate symbols (class IS the symbol)');
+            // Total symbols for MyClass: just the class itself
+            assert.strictEqual(symbols.length, 1, 'Only the class symbol should exist for MyClass');
+        } finally {
+            fs.rmSync(tmpDir, { recursive: true, force: true });
+        }
+    });
+});
+
+// ============================================================================
+// R3-NEW-2: Java about Foo with `new Foo()` should populate CALLERS
+// ============================================================================
+
+describe('Regression R3-NEW-2: Java new ClassName() registers as caller of class', () => {
+    it('about Foo should show callers for `new Foo()` invocations', () => {
+        const tmpDir = path.join(os.tmpdir(), `ucn-test-java-new-callers-${Date.now()}`);
+        fs.mkdirSync(tmpDir, { recursive: true });
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'pom.xml'), '<project></project>');
+            fs.writeFileSync(path.join(tmpDir, 'Foo.java'), `
+public class Foo {
+}
+`);
+            fs.writeFileSync(path.join(tmpDir, 'Bar.java'), `
+public class Bar {
+    public void run() {
+        Foo f = new Foo();
+        System.out.println(f);
+    }
+}
+`);
+            const index = new ProjectIndex(tmpDir);
+            index.build(null, { quiet: true });
+
+            // findCallers should find run() as caller of Foo via `new Foo()`
+            const callers = index.findCallers('Foo');
+            assert.ok(callers.length >= 1, `Should find at least 1 caller for Foo, got ${callers.length}`);
+            assert.ok(callers.some(c => c.callerName === 'run'),
+                `Should include run() as caller; got: ${callers.map(c => c.callerName).join(',')}`);
+
+            // The class symbol IS the target — find should return only the class
+            const found = index.symbols.get('Foo') || [];
+            assert.strictEqual(found.length, 1, 'Foo should be a single symbol (class)');
+            assert.strictEqual(found[0].type, 'class', 'Symbol type should be class');
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }

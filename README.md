@@ -51,9 +51,7 @@ ucn deadcode --exclude=test    # unused code, AST-verified
 $ ucn trace build --depth=2
 
 build
-├── detectProjectPattern (core/discovery.js:400) 1x
-│   ├── checkDir (core/discovery.js:404) 2x
-│   └── shouldIgnore (core/discovery.js:348) 1x
+├── detectProjectPattern (core/discovery.js:431) 1x
 ├── parseGitignore (core/discovery.js:131) 1x
 ├── expandGlob (core/discovery.js:191) 1x
 │   ├── parseGlobPattern (core/discovery.js:227) 1x
@@ -64,7 +62,8 @@ build
 │   ├── addSymbol (core/project.js:398) 4x
 │   ├── detectLanguage (languages/index.js:209) 1x
 │   ├── parse (core/parser.js:69) 1x
-│   └── extractImports (core/imports.js:19) 1x
+│   ├── extractImports (core/imports.js:19) 1x
+│   └── extractExports (core/imports.js:44) 1x
 ├── buildImportGraph (core/project.js:631) 1x
 └── buildInheritanceGraph (core/project.js:636) 1x
 ```
@@ -86,13 +85,14 @@ core/discovery.js:191-222  →  core/discovery.js:191:expandGlob
 expandGlob (pattern: string, options: number = {}) : string[]
 
 CALLERS (7):
-  cli/index.js:1078 [runGlobCommand]
+  confidence: 0 high (>0.8), 7 medium (0.5-0.8), 0 low (<0.5)
+  cli/index.js:1190 [runGlobCommand]
     const files = expandGlob(pattern);
-  core/cache.js:350 [isCacheStale]
+    confidence: 0.65 (scope-match)
+  core/cache.js:417 [isCacheStale]
     const currentFiles = expandGlob(pattern, globOpts);
-  core/project.js:192 [build]
-    files = expandGlob(pattern, globOpts);
-  ... (4 more in test/integration.test.js)
+    confidence: 0.65 (scope-match)
+  ... (5 more)
 
 CALLEES (3):
   parseGlobPattern [utility] - core/discovery.js:227
@@ -102,7 +102,7 @@ CALLEES (3):
 TESTS: 5 matches in 1 file(s)
 ```
 
-Need to trace execution upward instead? `ucn reverse-trace fn` walks the caller chain back to entry points.
+Each caller comes with a confidence score (`exact-binding`, `same-class`, `receiver-hint`, `scope-match`, `name-only`) so you can tell direct calls from name-only matches. Add `--hide-confidence` to silence the scores, or `--min-confidence=0.7` to drop everything below `same-class`. Add `--git` to see who last touched the function. Need to trace execution upward instead? `ucn reverse-trace fn` walks the caller chain back to entry points.
 
 ## Change code without breaking things
 
@@ -123,7 +123,10 @@ STATUS: ✓ All calls valid
   Valid: 7
   Mismatches: 0
   Uncertain: 0
+  Patterns: 4 in try, 4 in callback
 ```
+
+The `Patterns:` line surfaces structural classification of each call site — `inLoop`, `inTry`, `inCallback`, `inTestCase`, `awaited` — so you can spot risky call sites (e.g., calls inside loops, missing `await`) at a glance. Same line appears on `impact` and inside `about`.
 
 Then preview the refactoring. UCN shows exactly what needs to change and where:
 
@@ -144,7 +147,7 @@ CHANGES NEEDED: 11
 BY FILE:
 
 cli/index.js (2 changes)
-  :1078
+  :1190
     const files = expandGlob(pattern);
     → Rename to: const files = expandGlobPattern(pattern);
   :15
@@ -155,6 +158,52 @@ cli/index.js (2 changes)
 ```
 
 Run `ucn diff-impact --staged` before committing to see what you changed and who calls it.
+
+Or wrap the same checks in a single command:
+
+```
+$ ucn check --staged
+
+Pre-commit Check vs HEAD
+════════════════════════════════════════════════════════════
+Changed: 3 functions
+  parseFlags (cli/index.js:165) [MODIFIED]  2 callers
+  ...
+```
+
+`ucn check` composes `diff-impact` + `verify` + `affected-tests` in one shot — flags ADDED functions with no callers, signature drift across call sites, and recommends which tests to run.
+
+## Get the lay of the land in a new repo
+
+```
+$ ucn brief fetch_user
+fetch_user(user_id: int): dict
+  svc.py:4-8  (5 lines)
+  "Fetch a user from the API."
+  async: no  |  side_effects: [fs, network, process]  |  complexity: branches=2, depth=2
+```
+
+`brief` is the lighter alternative to `about` — typed signature, first sentence of the docstring, side-effect classification, and complexity, all in one screen. Pair with `--git` to see who last touched it and how often.
+
+```
+$ ucn doctor
+
+UCN Trust Report — /path/to/project
+Index: 144 files, 1569 symbols
+Languages: javascript (74%), typescript (13%), java (4%), python (3%), rust (3%), go (3%)
+Cache: fresh, 221ms build
+...
+Trust level: HIGH
+```
+
+`doctor` reports how much UCN trusts the index — file/symbol counts, blind spots (dynamic imports, eval, reflection), parse failures, and a verdict. Use `--deep` to also sample resolution coverage.
+
+`entrypoints` lists detected framework handlers (HTTP routes, DI beans, jobs, tests):
+
+```
+ucn entrypoints --type=http --framework=spring   # narrow to one framework
+ucn entrypoints --exclude-tests                  # tests are included by default
+```
 
 ## Find what to clean up
 
@@ -190,11 +239,11 @@ Dead code: 3 unused symbol(s)
 
 core/bridge.js
   [  90-  92] endsWithWildcard (function)
-  [ 251- 258] parsePythonDecorator (function)
+  [ 258- 265] parsePythonDecorator (function)
 core/search.js
   [1409-1445] _testBodyReferencesClass (function)
 
-322 exported symbol(s) excluded (all have callers). Use --include-exported to audit them.
+325 exported symbol(s) excluded (all have callers). Use --include-exported to audit them.
 ```
 
 Find missing-await bugs:

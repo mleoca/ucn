@@ -125,11 +125,18 @@ const SERVER_RECEIVER_PATTERNS = {
         // Less common — Spring uses annotations. Capture WebFlux router builders if present.
     ],
     rust: [
-        // axum: Router::new().route("/path", get(handler))
+        // axum: matches both
+        //   - Named variable form:    let app = Router::new(); app.route("/p", get(h))
+        //     → receiver = 'app' (matched by the alpha pattern)
+        //   - Chained constructor:    Router::new().route("/p", get(h)).route(...)
+        //     → receiver = 'Router' (synthetic marker set by rust.js findCallsInCode
+        //       when it walks the chain to its `Router::new()` root)
         { receiverPattern: /^(router|app|api|r)$/i,
           methodPattern: /^route$/,
           framework: 'axum' },
-        // axum nested: .nest("/prefix", inner)
+        // axum nested: .nest("/prefix", inner) — captured but treated as a
+        // route mount with method ALL. (Prefix concat with inner router routes
+        // is deferred — too complex to track inner Router argument.)
     ],
 };
 

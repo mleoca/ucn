@@ -136,10 +136,11 @@ ucn check --staged         # only staged changes
 Lists functions registered as framework handlers (HTTP routes, DI beans, job schedulers, etc.). Detects patterns across Express, FastAPI, Flask, Spring, Gin, Actix, Celery, pytest, and more.
 
 ```bash
-ucn entrypoints                          # All detected entry points
+ucn entrypoints                          # All detected entry points (tests included by default)
 ucn entrypoints --type=http              # HTTP routes only
 ucn entrypoints --framework=express      # Specific framework
 ucn entrypoints --file=routes/           # Scoped to files
+ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pytest, Rust #[test], etc.)
 ```
 
 ## When to Use the Other Commands
@@ -186,6 +187,38 @@ ucn entrypoints --file=routes/           # Scoped to files
 | Pre-commit summary | `ucn check [--base=main]` | Changed funcs + signature drift + affected tests in one shot |
 | Find missing-await bugs | `ucn audit-async` | Lists async calls inside async functions that lack `await`. JS/TS/Python only. Filter with `--file`, `--exclude`, `--limit` |
 
+## Reading Call-Site Patterns
+
+`verify`, `impact`, and `about` annotate call sites with structural classification flags. Watch for these in summary lines (`Patterns: 4 in try, 4 in callback`) and per-call-site entries:
+
+| Flag | What it means | Why it matters |
+|------|--------------|---------------|
+| `inLoop` | Call is inside a `for`/`while`/comprehension | N+1 query risk, repeated work, performance hot path |
+| `inTry` | Call is wrapped in try/catch (or equivalent) | Errors are handled — different from "must fix" code paths |
+| `inCallback` | Call sits inside a callback/lambda/closure that's not the enclosing function | Async deferred work, may run on a different stack frame |
+| `inTestCase` | Call originates from inside a test function | Isolate production callers from test setup |
+| `awaited` | Call's parent is `await` / `Promise.then` (JS/TS/Python) | Confirms async coordination — its absence on async callees signals a missing-await bug |
+
+`audit-async` is the focused tool for the `awaited=false` case across an entire async function body.
+
+## Confidence Scores
+
+`about` and `context` show confidence per caller/callee edge by default (e.g. `confidence: 0.65 (scope-match)`). Resolution labels (high to low):
+
+| Label | Score | Meaning |
+|-------|-------|---------|
+| `exact-binding` | 0.98 | Import or binding evidence — direct call |
+| `same-class` | 0.92 | Method call resolved within the enclosing class |
+| `receiver-hint` | 0.80 | Receiver type inferred (Go/Java/Rust) — e.g. `f.run()` where `f: Filter` |
+| `scope-match` | 0.65 | Symbol resolved by name within a file/package scope |
+| `name-only` | 0.40 | Name match only, no binding/scope evidence — review before trusting |
+| `uncertain` | 0.25 | Ambiguous — multiple candidates, hidden unless `--include-uncertain` |
+
+Filter or hide:
+- `--min-confidence=0.7` — keep only high-confidence edges (≥ same-class)
+- `--hide-confidence` — silence the scores (legacy `--no-confidence` is a silent alias)
+- `--include-uncertain` — include otherwise-filtered low-confidence matches
+
 ## Symbol Handles (stable IDs)
 
 Every result that lists a symbol emits a **handle** in the form `relativePath:line:name` (e.g. `core/api.ts:42:handler`). Pass it back to any name-accepting command and resolution is pinned to that exact definition — no name disambiguation, no `--file` needed.
@@ -221,6 +254,7 @@ ucn [target] <command> [name] [--flags]
 | `--depth=N` | Control tree depth for `trace`, `graph`, and detail level for `find` (default 3). Also expands all children — no breadth limit |
 | `--all` | Expand truncated sections. Applies to `about`, `blast`, `trace`, `reverse-trace`, `related`, `find`, `toc`, `fn`, `class`, `graph`, `diff-impact` |
 | `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
+| `--exclude-tests` | Exclude test entries from `entrypoints` (tests are included by default since they ARE entry points). |
 | `--include-methods` | Include `obj.method()` calls in caller/callee analysis. `impact` defaults to true (show all callable sites); other commands default to false (use `--no-include-methods` to opt out). Applies to `about`, `context`, `impact`, `verify`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |

@@ -478,11 +478,12 @@ function testEdgeCases() {
       run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'lines', ['abc-def']),
       expect: (r) => !r.success && r.error?.includes('Invalid line range'),
     },
-    // Graph with negative depth
+    // Graph with negative depth — Round 5 MED-3: invalid numeric flag values
+    // are now rejected with a helpful error instead of being silently ignored.
     {
       name: 'Graph with negative depth',
       run: () => runUcn(languages.javascript.path, 'graph', ['main.js', '--depth=-5']),
-      expect: (r) => r.success && r.output.includes('main.js'),
+      expect: (r) => !r.success && (r.error?.includes('Invalid --depth') || r.output?.includes('Invalid --depth')),
     },
     // Double-dash separator
     {

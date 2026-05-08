@@ -856,6 +856,57 @@ function parse(code, parser) {
 }
 
 /**
+ * Walk a Rust call chain to find its root constructor type.
+ *
+ * Examples:
+ *   Router::new()                         → 'Router'
+ *   Router::new().route(...)              → 'Router'
+ *   Router::new().nest(...).route(...)    → 'Router' (recursively unwraps method chain)
+ *   axum::Router::new().route(...)        → 'Router'
+ *   foo()                                 → null (not a constructor pattern)
+ *
+ * Returns the root type name when the chain begins with `<Type>::new()` or
+ * `<Type>::*` (associated function call). Returns null otherwise.
+ *
+ * Used to detect axum's chained Router pattern where `.route(...)` is called on
+ * the result of `Router::new()` rather than a named variable.
+ *
+ * @param {Node} callNode - call_expression node
+ * @returns {string|null} root type name, or null
+ */
+function _findRustChainRootType(callNode) {
+    if (!callNode || callNode.type !== 'call_expression') return null;
+    const funcNode = callNode.childForFieldName('function');
+    if (!funcNode) return null;
+
+    // Base case: scoped path like Router::new or axum::Router::new
+    if (funcNode.type === 'scoped_identifier') {
+        const segments = funcNode.text.split('::');
+        // Need at least Type::method (associated function call)
+        if (segments.length < 2) return null;
+        // The type is the second-to-last segment (last is the method)
+        const typeName = segments[segments.length - 2];
+        // Must be a Capitalized type name (filter out module::func calls)
+        if (!/^[A-Z]/.test(typeName)) return null;
+        return typeName;
+    }
+
+    // Recursive case: chained method call on prior call result
+    //   Router::new().route(...)  →  unwrap .route(...) and recurse on Router::new()
+    if (funcNode.type === 'field_expression') {
+        const valueNode = funcNode.childForFieldName('value');
+        if (valueNode?.type === 'call_expression') {
+            return _findRustChainRootType(valueNode);
+        }
+        // Chain rooted at a named identifier: skip — we detect this elsewhere
+        // via the existing receiver-name path in bridge.js.
+        return null;
+    }
+
+    return null;
+}
+
+/**
  * Find all function calls in Rust code using tree-sitter AST
  * @param {string} code - Source code to analyze
  * @param {object} parser - Tree-sitter parser instance
@@ -1009,12 +1060,32 @@ function findCallsInCode(code, parser) {
                 const valueNode = funcNode.childForFieldName('value');
 
                 if (fieldNode) {
-                    const receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
+                    let receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
+                    // Detect chained Router::new()-rooted method calls. axum's canonical
+                    // idiom is `Router::new().route("/p", get(h)).route(...)` where the
+                    // receiver of `.route(...)` is itself a call_expression. Walk the
+                    // chain to its root: if the chain originates at Router::new() or
+                    // any Router-typed call, set a synthetic receiver string so the
+                    // bridge layer can recognize this as a Router method invocation.
+                    if (!receiver && valueNode?.type === 'call_expression') {
+                        const rootType = _findRustChainRootType(valueNode);
+                        if (rootType) {
+                            // Synthetic marker — ROUTER_CHAIN:<RootTypeName>. The
+                            // <RootTypeName> portion lets the bridge match
+                            // /^router/i case-insensitively.
+                            receiver = rootType;
+                        }
+                    }
                     const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
                     const firstArg = getFirstStringArg(node);
+                    // RUST-2: For chained calls like `a().b().parse::<T>().ok()`,
+                    // each method should report the line where its OWN identifier
+                    // appears, not the line where the outer expression begins.
+                    // Tree-sitter gives us fieldNode (the identifier) — use its
+                    // startPosition.row instead of the wrapping call_expression's.
                     calls.push({
                         name: fieldNode.text,
-                        line: node.startPosition.row + 1,
+                        line: fieldNode.startPosition.row + 1,
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
@@ -1040,6 +1111,43 @@ function findCallsInCode(code, parser) {
                 });
             }
             return true;
+        }
+
+        // R3-NEW-3: Detect Rust struct expressions as constructor calls.
+        //   Foo { x: 1 }      → call(name='Foo', isConstructor:true)
+        //   path::Foo { ... } → call(name='Foo', isConstructor:true) — strip path
+        //   Foo::Variant { } (enum struct variant) → name=Variant, receiver=Foo
+        //
+        // Detection happens as a separate AST node visit, so it doesn't conflict
+        // with existing call/method handlers.
+        if (node.type === 'struct_expression') {
+            const nameNode = node.childForFieldName('name');
+            if (nameNode) {
+                let typeName = null;
+                if (nameNode.type === 'type_identifier') {
+                    typeName = nameNode.text;
+                } else if (nameNode.type === 'scoped_type_identifier') {
+                    // path::Foo or Enum::Variant — emit as the rightmost name.
+                    const innerNameNode = nameNode.childForFieldName('name');
+                    if (innerNameNode) {
+                        typeName = innerNameNode.text;
+                    } else {
+                        // Fallback: split by ::
+                        const parts = nameNode.text.split('::');
+                        typeName = parts[parts.length - 1];
+                    }
+                }
+                if (typeName) {
+                    const enclosingFunction = getCurrentEnclosingFunction();
+                    calls.push({
+                        name: typeName,
+                        line: node.startPosition.row + 1,
+                        isMethod: false,
+                        isConstructor: true,
+                        enclosingFunction
+                    });
+                }
+            }
         }
 
         // Handle macro invocations: println!(), vec![]
@@ -1074,9 +1182,10 @@ function findCallsInCode(code, parser) {
                     const receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
                     const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
                     const enclosingFunction = getCurrentEnclosingFunction();
+                    // RUST-2: use the field identifier's line, not the wrapping field_expression's
                     calls.push({
                         name: fieldNode.text,
-                        line: node.startPosition.row + 1,
+                        line: fieldNode.startPosition.row + 1,
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),

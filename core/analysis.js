@@ -683,6 +683,14 @@ function impact(index, name, options = {}) {
         return null;
     }
     const defIsMethod = def.isMethod || def.type === 'method' || def.className || def.receiver;
+    // RUST-3: type definitions (class/struct/interface/etc.) are callable through
+    // constructor invocations (`new ClassName()`) — about() handles them via its
+    // CALLABLE_TYPES set since the M3 fix. Route them through the same findCallers
+    // path here so `impact ClassName` agrees with `about ClassName` rather than
+    // returning 0 because the legacy "function" branch doesn't recognize types.
+    const TYPE_DEF_KINDS = new Set(['class', 'struct', 'interface', 'type',
+        'enum', 'trait', 'impl', 'record', 'namespace']);
+    const defIsTypeDef = TYPE_DEF_KINDS.has(def.type);
 
     // BUG-H3: default includeMethods:true for impact ("what breaks if I change this"
     // should include every callable site — including obj.method() invocations).
@@ -693,7 +701,7 @@ function impact(index, name, options = {}) {
     // Use findCallers for className-scoped or method queries (sophisticated binding resolution)
     // Fall back to usages-based approach for simple function queries (backward compatible)
     let callSites;
-    if (options.className || defIsMethod) {
+    if (options.className || defIsMethod || defIsTypeDef) {
         // findCallers has proper method call resolution (self/this, binding IDs, receiver checks)
         let callerResults = index.findCallers(name, {
             includeMethods: impactIncludeMethods,
@@ -1061,10 +1069,45 @@ function about(index, name, options = {}) {
     // and the user supplied no --file/--class disambiguator. The resolveSymbol
     // warnings array already includes an "ambiguous" entry — surface it on the
     // result so formatters can render the note.
+    //
+    // R3-NEW-4: align the displayed count with `find`'s filtered count by
+    // dropping test-file definitions when --include-tests is not set.
+    // Without this, `find foo` could report 2 matches while `about foo` says
+    // "Found 7 definitions" — same query, divergent counts.
     const aboutWarnings = [];
     if (!options.file && !options.className && resolveWarnings && resolveWarnings.length > 0) {
+        const { isTestPath } = require('./shared');
+        const { isTestFile } = require('./discovery');
+        const filterTests = !options.includeTests;
         for (const w of resolveWarnings) {
-            if (w.type === 'ambiguous') aboutWarnings.push(w);
+            if (w.type !== 'ambiguous') continue;
+            if (!filterTests) {
+                aboutWarnings.push(w);
+                continue;
+            }
+            // Recompute the count using the same test exclusion that find applies.
+            // Always include `def` (the picked primary) so the message wording
+            // ("Using <def>...") stays consistent with the count.
+            const visible = definitions.filter(d => {
+                if (d === primary || (d.relativePath === primary.relativePath && d.startLine === primary.startLine)) return true;
+                const lang = detectLanguage(d.file);
+                if (isTestFile(d.relativePath, lang) || isTestPath(d.relativePath)) return false;
+                return true;
+            });
+            if (visible.length <= 1) {
+                // After test filtering, no real ambiguity remained — drop the warning.
+                continue;
+            }
+            const visibleOthers = visible.filter(d => d !== primary && (d.relativePath !== primary.relativePath || d.startLine !== primary.startLine));
+            const shown = visibleOthers.slice(0, 5);
+            const extra = visibleOthers.length - shown.length;
+            const alsoIn = shown.map(d => `${d.relativePath}:${d.startLine}`).join(', ');
+            const suffix = extra > 0 ? `, and ${extra} more` : '';
+            aboutWarnings.push({
+                type: 'ambiguous',
+                message: `Found ${visible.length} definitions for "${name}". Using ${primary.relativePath}:${primary.startLine}. Also in: ${alsoIn}${suffix}. Use file= to disambiguate.`,
+                alternatives: visibleOthers.map(d => ({ file: d.relativePath, line: d.startLine })),
+            });
         }
     }
 
@@ -1144,6 +1187,14 @@ function about(index, name, options = {}) {
         // Stash the post-filter total on allCallers so the result builder can use it.
         Object.defineProperty(allCallers, '__postFilterTotal', {
             value: allCallers.length + shadowSurvivors.length,
+            enumerable: false,
+            configurable: true,
+        });
+        // R3-NEW-1: stash shadow survivors so the histogram can include them.
+        // Without this the histogram only reflects the enriched (capped) callers,
+        // not the true total reported in `total`.
+        Object.defineProperty(allCallers, '__shadowSurvivors', {
+            value: shadowSurvivors,
             enumerable: false,
             configurable: true,
         });
@@ -1308,7 +1359,13 @@ function about(index, name, options = {}) {
             // (e.g., when primary is not a function and findCallers wasn't called).
             total: allCallers?.__postFilterTotal ?? allCallers?.length ?? 0,
             top: callers,
-            histogram: buildHistogram(allCallers),
+            // R3-NEW-1: include shadow callers (un-enriched candidates that passed the
+            // same filters) so the histogram counts sum to `total`, not maxResults*3.
+            histogram: buildHistogram(
+                allCallers && allCallers.__shadowSurvivors && allCallers.__shadowSurvivors.length > 0
+                    ? [...allCallers, ...allCallers.__shadowSurvivors]
+                    : allCallers
+            ),
         },
         callees: {
             total: allCallees?.length ?? 0,

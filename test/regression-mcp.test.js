@@ -4,7 +4,7 @@
  * MCP Demo Fixes, MCP Issues, stale cache, max_files, and two-tier output limits.
  */
 
-const { describe, it } = require('node:test');
+const { describe, it, before, after } = require('node:test');
 const assert = require('node:assert');
 const path = require('path');
 const fs = require('fs');
@@ -453,5 +453,123 @@ describe('MCP two-tier output limits', () => {
         for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
             assert.ok(serverCode.includes(`${cmd}:`), `Should have narrowing hint for ${cmd}`);
         }
+    });
+});
+
+// =============================================================================
+// MED-4: MCP numeric range validation (Round 5 audit)
+// =============================================================================
+describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
+    let client;
+    before(async () => {
+        client = new McpClient();
+        await client.start();
+        await client.initialize();
+    });
+    after(() => { if (client) client.stop(); });
+
+    // Helper: extract any user-visible error text from an MCP response.
+    // Zod validation errors come back as JSON-RPC error responses (res.error)
+    // OR as content with isError:true (depending on how MCP wraps the throw).
+    function errText(res) {
+        if (res.error) return res.error.message || JSON.stringify(res.error);
+        const content = res.result && res.result.content;
+        return (content && content[0] && content[0].text) || '';
+    }
+
+    it('top=1e100 is rejected by Zod (max cap)', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 1e100,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on top=1e100, got: ${JSON.stringify(res).slice(0, 300)}`);
+        assert.ok(/top|number|integer|max|less than/i.test(errText(res)),
+            `error should reference top/number, got: ${errText(res).slice(0, 200)}`);
+    });
+
+    it('top=-5 is rejected (must be positive)', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: -5,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on top=-5, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('top=NaN is rejected', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: NaN,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on top=NaN, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('top=0 is rejected (must be positive)', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 0,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on top=0, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('top=1.5 is rejected (must be integer)', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 1.5,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on top=1.5, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('limit=0 is rejected', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'find', project_dir: PROJECT_DIR, name: 'main', limit: 0,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on limit=0, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('max_files=0 is rejected', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'toc', project_dir: PROJECT_DIR, max_files: 0,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on max_files=0, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('depth=0 is allowed (meaningful: limit to this symbol only)', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'trace', project_dir: PROJECT_DIR, name: 'main', depth: 0,
+        });
+        // depth=0 should not be a Zod validation error. It may still produce
+        // an empty/short result, but no isError due to schema rejection.
+        const zodFailed = res.error || (res.result && res.result.isError === true &&
+            /must be|expected|number|integer|positive/i.test(errText(res)));
+        assert.ok(!zodFailed, `depth=0 should not fail Zod validation, got: ${errText(res).slice(0, 200)}`);
+    });
+
+    it('depth=-1 is rejected (must be non-negative)', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'trace', project_dir: PROJECT_DIR, name: 'main', depth: -1,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on depth=-1, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('valid top=10 is accepted', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 10,
+        });
+        // Should succeed (or at worst, fail for other reasons — not Zod).
+        // Just verify no Zod validation error.
+        const zodFailed = res.error || (res.result && res.result.isError === true &&
+            /must be|integer|less than|positive/i.test(errText(res)));
+        assert.ok(!zodFailed, `valid top=10 should not fail Zod, got: ${errText(res).slice(0, 200)}`);
+    });
+
+    it('min_confidence=2.0 is rejected (must be in [0,1])', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'context', project_dir: PROJECT_DIR, name: 'main', min_confidence: 2.0,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error on min_confidence=2.0, got: ${JSON.stringify(res).slice(0, 300)}`);
     });
 });
