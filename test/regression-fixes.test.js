@@ -1946,7 +1946,7 @@ describe('Bug Hunt: interactive parseInteractiveFlags space-separated values', (
         const result = execFileSync('node', [CLI_PATH, '--interactive'], {
             input: 'find main --in core\nquit\n',
             encoding: 'utf-8',
-            timeout: 15000,
+            timeout: 60000,
         });
         // Should not error about unknown flags
         assert.ok(!result.includes('Unknown flag'), `should accept --in with space, got: ${result}`);

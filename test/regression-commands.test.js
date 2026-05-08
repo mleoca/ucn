@@ -1115,7 +1115,7 @@ describe('affected-tests: transitive test detection', () => {
             'package.json': '{"name":"test"}',
             'tsconfig.json': '{}',
             'lib.ts': 'export function helper(): number { return 1; }\nexport function caller(): number { return helper(); }\n',
-            'test/lib.test.ts': 'import { helper, caller } from "../lib";\ndescribe("lib", () => {\n  it("helper", () => { helper(); });\n  it("caller", () => { caller(); });\n});\n',
+            'test/lib.test.ts': 'import { helper, caller } from "../lib";\nfunction runsHelper() { helper(); }\nfunction runsCaller() { caller(); }\ndescribe("lib", () => {\n  it("helper", runsHelper);\n  it("caller", runsCaller);\n});\n',
         });
         try {
             const index = idx(dir);
