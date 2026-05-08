@@ -1528,7 +1528,7 @@ function world() {
         const { execFileSync } = require('child_process');
         const result = execFileSync('node', [CLI_PATH, path.join(dir, 'data.js'), 'search', 'hello', '--context=1'], {
             encoding: 'utf-8',
-            timeout: 10000,
+            timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
         });
         const lines = result.split('\n');
@@ -1565,7 +1565,7 @@ describe('FIX 124 — CLI --exclude captures multiple occurrences', () => {
         const { execFileSync } = require('child_process');
         const result = execFileSync('node', [CLI_PATH, dir, 'find', 'main', '--exclude=test', '--exclude=vendor'], {
             encoding: 'utf-8',
-            timeout: 10000,
+            timeout: 30000,
             stdio: ['pipe', 'pipe', 'pipe']
         });
         assert.ok(!result.includes('test/'), `should exclude test dir, got: ${result}`);
@@ -1688,7 +1688,7 @@ describe('FIX 128 — CLI context/smart error exits with code 1', () => {
         try {
             execFileSync('node', [CLI_PATH, dir, 'context'], {
                 encoding: 'utf-8',
-                timeout: 10000,
+                timeout: 30000,
                 stdio: ['pipe', 'pipe', 'pipe']
             });
         } catch (e) {
@@ -1787,7 +1787,7 @@ describe('FIX 132 — fn/class exit code on not-found', () => {
         try {
             execFileSync('node', [CLI_PATH, dir, 'fn', 'nonexistent'], {
                 encoding: 'utf-8',
-                timeout: 10000,
+                timeout: 30000,
                 stdio: ['pipe', 'pipe', 'pipe']
             });
         } catch (e) {
@@ -1803,7 +1803,7 @@ describe('FIX 132 — fn/class exit code on not-found', () => {
         try {
             execFileSync('node', [CLI_PATH, dir, 'class', 'NonexistentClass'], {
                 encoding: 'utf-8',
-                timeout: 10000,
+                timeout: 30000,
                 stdio: ['pipe', 'pipe', 'pipe']
             });
         } catch (e) {

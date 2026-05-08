@@ -1133,7 +1133,7 @@ describe('affected-tests: transitive test detection', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "test"',
             'src/lib.rs': 'pub fn helper() -> i32 { 1 }\npub fn caller() -> i32 { helper() }\n',
-            'tests/integration_test.rs': 'use test::helper;\n#[test]\nfn test_helper() {\n    assert_eq!(helper(), 1);\n}\n',
+            'tests/integration_test.rs': 'use test::helper;\nfn invokes_helper() { helper(); }\n#[test]\nfn test_helper() {\n    invokes_helper();\n}\n',
         });
         try {
             const index = idx(dir);
