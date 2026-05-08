@@ -86,11 +86,6 @@ function joinRoutePath(prefix, sub) {
     return p + '/' + s;
 }
 
-/** True if `s` ends with the wildcard sentinel from a template literal. */
-function endsWithWildcard(s) {
-    return typeof s === 'string' && s.endsWith('*');
-}
-
 // ============================================================================
 // FRAMEWORK PATTERNS
 // ============================================================================
@@ -252,17 +247,6 @@ const PREFIX_ANNOTATIONS = new Set([
     'RequestMapping', // Spring class-level @RequestMapping("/api")
     'Path',           // JAX-RS class-level @Path("/api")
 ]);
-
-// Python decorator name patterns (e.g., 'app.route' or 'app.get')
-// Returns { method, isPrefix } when matched.
-function parsePythonDecorator(name) {
-    if (typeof name !== 'string') return null;
-    const m = name.match(/^[A-Za-z_][A-Za-z0-9_]*\.(route|get|post|put|delete|patch|options|head)/i);
-    if (!m) return null;
-    const verb = m[1].toLowerCase();
-    if (verb === 'route') return { method: 'ALL', isRoute: true };
-    return { method: verb.toUpperCase() };
-}
 
 // ============================================================================
 // EXTRACT SERVER ROUTES

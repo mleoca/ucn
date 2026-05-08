@@ -1403,48 +1403,6 @@ function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, 
 }
 
 /**
- * Check if a test body references the target class (directly or via instance variable).
- * Looks at AST usages of className within the test function's line range.
- */
-function _testBodyReferencesClass(index, filePath, fileEntry, testLine, className, instanceTypeMap) {
-    // Find the enclosing test function to get its line range
-    const enclosing = index.findEnclosingFunction(filePath, testLine, true);
-    let startLine, endLine;
-    if (enclosing) {
-        startLine = enclosing.startLine;
-        endLine = enclosing.endLine;
-    } else {
-        // No enclosing function found (common for JS/TS it/test callbacks which
-        // aren't in the symbol table). Estimate range from file content.
-        startLine = testLine;
-        endLine = _estimateTestBlockEnd(index, filePath, testLine);
-    }
-
-    // Check if className appears as AST usage in the range
-    const classUsages = index._getCachedUsages(filePath, className);
-    if (classUsages) {
-        for (const u of classUsages) {
-            if (u.line >= startLine && u.line <= endLine) return true;
-        }
-    }
-
-    // Check if any instance variable bound to className is used in the range
-    if (instanceTypeMap) {
-        for (const [varName, cls] of instanceTypeMap) {
-            if (cls !== className) continue;
-            const varUsages = index._getCachedUsages(filePath, varName);
-            if (varUsages) {
-                for (const u of varUsages) {
-                    if (u.line >= startLine && u.line <= endLine) return true;
-                }
-            }
-        }
-    }
-
-    return false;
-}
-
-/**
  * Estimate the end line of a test block (it/test/describe callback) by tracking
  * brace nesting from the start line.
  */

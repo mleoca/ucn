@@ -71,6 +71,8 @@ ucn trace generate_report --all      # all children at default depth
 
 Shows the entire pipeline — what `generate_report` calls, what those functions call, etc. — as an indented tree. No file reading needed. Invaluable for understanding orchestrator functions or entry points.
 
+**Prefer `trace` over chained `about` calls.** If you find yourself running `ucn about` 4–5 times in a row to follow a call chain (entry → leaves), one `ucn trace <fn> --depth=N` returns the same information in a single call. Use `--depth=N` to limit how deep the tree goes.
+
 ### 5. `fn` / `class` — Extract without reading the whole file
 
 Pull one or more functions out of a large file. Supports comma-separated names for bulk extraction.
@@ -161,7 +163,7 @@ ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pyte
 | Project complexity stats | `ucn stats` | File counts, symbol counts, lines by language. `--functions` for per-function line counts. `--hot --top=N` for the most-called functions (orientation primitive on a new repo) |
 | Find by glob pattern | `ucn find "handle*"` | Locate definitions matching a glob (supports * and ?) |
 | Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |
-| Regex search (default) | `ucn search '\d+'` | Search supports regex by default (alternation, character classes, etc.) |
+| Regex search (default) | `ucn search '\d+'` | JavaScript regex (V8 engine). See "Regex notes" below for syntax — alternation is `a|b`, not grep-style |
 | Text search filtered | `ucn search term --exclude=test` | Search only in matching files |
 | Structural search (index) | `ucn search --type=function --param=Request` | Query the symbol table, not text. Finds functions by param, return type, decorator, etc. |
 | Find all db.* calls | `ucn search --type=call --receiver=db` | Search call sites by receiver — something grep can't do |
@@ -186,6 +188,16 @@ ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pyte
 | Project trust report | `ucn doctor [--deep]` | Index coverage, blind spots, parse failures, verdict |
 | Pre-commit summary | `ucn check [--base=main]` | Changed funcs + signature drift + affected tests in one shot |
 | Find missing-await bugs | `ucn audit-async` | Lists async calls inside async functions that lack `await`. JS/TS/Python only. Filter with `--file`, `--exclude`, `--limit` |
+
+## Regex Notes (`search` command)
+
+`search` uses **JavaScript regex** (the V8 engine), not grep BRE/ERE. Common gotchas:
+
+- Alternation is `a|b`, **not** `a\|b`. `ucn search "flask|fastapi|django"` works; `ucn search "flask\|fastapi\|django"` matches the literal string.
+- `(`, `[`, `{` outside character classes do **not** need escaping for literal match in most cases — but normal JS regex semantics apply (you can still escape them for clarity).
+- Wrap the pattern in single quotes so the shell does not interpret special characters (`*`, `?`, `\`, `$`, etc.).
+- Default is case-insensitive; pass `--case-sensitive` to flip.
+- `--no-regex` forces literal-string search if you need to match regex metacharacters as text without escaping.
 
 ## Reading Call-Site Patterns
 
