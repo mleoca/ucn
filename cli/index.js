@@ -279,7 +279,7 @@ flags.followSymlinks = !args.includes('--no-follow-symlinks');
 
 // Known flags for validation
 const knownFlags = new Set([
-    '--help', '-h', '--mcp',
+    '--help', '-h', '--mcp', '--version', '-v',
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests', '--exclude-tests',
@@ -296,6 +296,13 @@ const knownFlags = new Set([
     '--bridge', '--server-only', '--client-only', '--unmatched',
     '--method', '--prefix', '--hide-uncertain', '--no-uncertain'
 ]);
+
+// Handle version flag
+if (args.includes('--version') || args.includes('-v')) {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    console.log(pkg.version);
+    process.exit(0);
+}
 
 // Handle help flag
 if (args.includes('--help') || args.includes('-h')) {
@@ -1557,6 +1564,7 @@ Common Flags:
   --workers=N         Parallel build workers (auto-detect; 0 to disable, env: UCN_WORKERS)
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
+  -v, --version       Print version information
   --base=<ref>        Git ref for diff-impact (default: HEAD)
   --staged            Analyze staged changes (diff-impact)
   --no-follow-symlinks  Don't follow symbolic links
