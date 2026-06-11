@@ -3,8 +3,9 @@ name: Eval
 # Reliability/accuracy evaluation on pinned real repos:
 #  - conservation: account invariant + engine-gap metrics (6 repos, 6 languages)
 #  - oracle: tiered caller answers vs compiler/LSP ground truth (ts-morph for
-#    TS repos, jedi for Python — jedi venv self-bootstraps under the eval temp
-#    dir); fails when missing-unexplained > 0 (the contract gate)
+#    TS repos; pyright-langserver over LSP for Python, jedi available as a
+#    second opinion via --oracle jedi with a self-bootstrapping venv);
+#    fails when missing-unexplained > 0 (the contract gate)
 # Separate from ci.yml: heavier, network-dependent, weekly + on demand.
 
 on:

@@ -21,6 +21,8 @@
  *   node eval/run-oracle-eval.js                  # all repos with a matching oracle
  *   node eval/run-oracle-eval.js --repo zod
  *   node eval/run-oracle-eval.js --sample 20      # symbols per repo (default 50)
+ *   node eval/run-oracle-eval.js --oracle jedi    # force an oracle (default: first match;
+ *                                                 # python = pyright, jedi second opinion)
  *
  * NOT part of npm test — run via `npm run eval:oracle` or eval.yml.
  */
@@ -36,14 +38,21 @@ const output = require('../core/output');
 const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
+const { pyrightOracle } = require('./oracles/pyright-oracle');
 const { jediOracle } = require('./oracles/jedi-oracle');
 
 const args = process.argv.slice(2);
 const repoFilter = readArgValue(args, '--repo');
 const sampleSize = Number(readArgValue(args, '--sample') || 50);
+const oracleFilter = readArgValue(args, '--oracle');
 const REPORTS_DIR = path.join(__dirname, 'reports');
 
-const ORACLES = [validateOracle(tsMorphOracle), validateOracle(jediOracle)];
+// Order matters: per repo the FIRST language match wins — pyright (stronger
+// inference) is the primary Python oracle, jedi stays as the second opinion
+// via --oracle jedi.
+const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle]
+    .map(validateOracle)
+    .filter(o => !oracleFilter || o.name === oracleFilter);
 
 const REF_BUCKETS = [
     { name: '0', test: (n) => n === 0 },
@@ -345,7 +354,7 @@ async function main() {
             const result = await evaluateRepo(repo, oracle);
             results.push(result);
             if (result.summary.missingUnexplained > 0) gateFailed = true;
-            const jsonPath = path.join(REPORTS_DIR, `oracle-eval-${repo.name}-${date}.json`);
+            const jsonPath = path.join(REPORTS_DIR, `oracle-eval-${repo.name}-${oracle.name}-${date}.json`);
             fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2));
             process.stdout.write(`  wrote ${path.relative(process.cwd(), jsonPath)}\n`);
         } catch (e) {

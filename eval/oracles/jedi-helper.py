@@ -40,15 +40,13 @@ import os
 import re
 import sys
 
+# Lazy: the ast-based ops (list_symbols / name_position / classify_ref) serve
+# the pyright oracle too, which must work without jedi installed. Only
+# find_references requires jedi.
 try:
     import jedi
-except ImportError as exc:
-    sys.stdout.write(json.dumps({
-        "ok": False,
-        "error": "cannot import jedi in %s: %s" % (sys.executable, exc),
-    }) + "\n")
-    sys.stdout.flush()
-    sys.exit(1)
+except ImportError:
+    jedi = None
 
 ROOT = os.path.abspath(sys.argv[1])
 
@@ -68,7 +66,7 @@ def detect_project_root(start):
 
 
 PROJECT_ROOT = detect_project_root(ROOT)
-PROJECT = jedi.Project(PROJECT_ROOT)
+PROJECT = jedi.Project(PROJECT_ROOT) if jedi else None
 
 DUNDER_RE = re.compile(r"^__\w+__$")
 
@@ -173,7 +171,59 @@ def classify(info, line, column, is_definition):
     return "reference"
 
 
+def char_to_utf16(text, char_col):
+    return len(text[:char_col].encode("utf-16-le")) // 2
+
+
+def utf16_to_char(text, units):
+    count = 0
+    for i, ch in enumerate(text):
+        if count >= units:
+            return i
+        count += len(ch.encode("utf-16-le")) // 2
+    return len(text)
+
+
+def resolve_name_position(rel_file, line, name):
+    """Shared (file, line, name) → (def_line, char_col) recovery."""
+    abs_path = os.path.join(ROOT, rel_file)
+    info = analyze_file(abs_path)
+    pos = info["name_pos"].get((line, name))
+    if pos is not None:
+        return abs_path, info, pos, None
+    if not info["lines"] or line < 1 or line > len(info["lines"]):
+        return abs_path, info, None, "no definition at %s:%d" % (rel_file, line)
+    m = re.search(r"\b%s\b" % re.escape(name), info["lines"][line - 1])
+    if not m:
+        return abs_path, info, None, "name %r not on line %s:%d" % (name, rel_file, line)
+    return abs_path, info, (line, m.start()), None
+
+
+def name_position(rel_file, line, name):
+    """LSP-ready position of the def name (0-based line, utf-16 column)."""
+    abs_path, info, pos, err = resolve_name_position(rel_file, line, name)
+    if err:
+        return {"ok": False, "error": err}
+    text = info["lines"][pos[0] - 1] if pos[0] <= len(info["lines"]) else ""
+    return {"ok": True, "line": pos[0], "utf16Col": char_to_utf16(text, pos[1])}
+
+
+def classify_ref(rel_file, line, utf16_col, name):
+    """Classify an LSP reference location with the same ast machinery jedi
+    references use, so the two oracles' kind taxonomies match exactly."""
+    abs_path = os.path.join(ROOT, rel_file)
+    info = analyze_file(abs_path)
+    text = info["lines"][line - 1] if (info["lines"] and 1 <= line <= len(info["lines"])) else ""
+    char_col = utf16_to_char(text, utf16_col)
+    is_definition = any(
+        key[1] == name and value == (line, char_col)
+        for key, value in info["name_pos"].items())
+    return {"ok": True, "kind": classify(info, line, char_col, is_definition)}
+
+
 def find_references(rel_file, line, name):
+    if jedi is None:
+        return {"ok": False, "error": "jedi not importable in %s" % sys.executable}
     abs_path = os.path.join(ROOT, rel_file)
     info = analyze_file(abs_path)
     pos = info["name_pos"].get((line, name))
@@ -212,7 +262,7 @@ def find_references(rel_file, line, name):
 def main():
     sys.stdout.write(json.dumps({
         "ok": True, "ready": True,
-        "jedi": jedi.__version__,
+        "jedi": jedi.__version__ if jedi else None,
         "python": sys.version.split()[0],
         "projectRoot": PROJECT_ROOT,
     }) + "\n")
@@ -228,6 +278,10 @@ def main():
                 resp = list_symbols()
             elif op == "find_references":
                 resp = find_references(req["file"], req["line"], req["name"])
+            elif op == "name_position":
+                resp = name_position(req["file"], req["line"], req["name"])
+            elif op == "classify_ref":
+                resp = classify_ref(req["file"], req["line"], req["utf16_col"], req["name"])
             elif op == "shutdown":
                 break
             else:
