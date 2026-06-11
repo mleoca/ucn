@@ -1,0 +1,41 @@
+name: PR Eval Gate
+
+# Fast contract gate on every PR/push: oracle eval on the two quickest
+# ground-truth repos (preact-signals via ts-morph, httpx via pyright —
+# no Go/Rust/Java toolchains needed, ~2 min total). Fails on:
+#  - missing-unexplained > 0 (an oracle call edge UCN neither showed nor
+#    accounted for — the silent lie the grep-reliability contract forbids)
+#  - tier-1 precision below the floor (locks the measured numbers in:
+#    preact 88.0 / httpx ~90 as of 2026-06-12 — the floor catches
+#    collapses, not single-point drift)
+# The full 6-repo battery stays in eval.yml (weekly + dispatch).
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  oracle-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Oracle eval gate (preact-signals + httpx)
+        run: node eval/run-oracle-eval.js --repo preact-signals,httpx --min-precision 0.85
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-eval-reports
+          path: eval/reports/
+          retention-days: 30

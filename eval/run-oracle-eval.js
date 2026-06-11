@@ -19,10 +19,13 @@
  *
  * Usage:
  *   node eval/run-oracle-eval.js                  # all repos with a matching oracle
- *   node eval/run-oracle-eval.js --repo zod
+ *   node eval/run-oracle-eval.js --repo zod       # one repo (or comma-separated list)
  *   node eval/run-oracle-eval.js --sample 20      # symbols per repo (default 50)
  *   node eval/run-oracle-eval.js --oracle jedi    # force an oracle (default: first match;
  *                                                 # python = pyright, jedi second opinion)
+ *   node eval/run-oracle-eval.js --min-precision 0.85   # ALSO gate on tier-1 precision
+ *                                                 # (PR gate: catch regressions, not just
+ *                                                 # contract violations)
  *
  * NOT part of npm test — run via `npm run eval:oracle` or eval.yml.
  */
@@ -45,9 +48,11 @@ const { rustAnalyzerOracle } = require('./oracles/rust-analyzer-oracle');
 const { jdtlsOracle } = require('./oracles/jdtls-oracle');
 
 const args = process.argv.slice(2);
-const repoFilter = readArgValue(args, '--repo');
+const repoFilter = readArgValue(args, '--repo'); // name, or comma-separated names
+const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim())) : null;
 const sampleSize = Number(readArgValue(args, '--sample') || 50);
 const oracleFilter = readArgValue(args, '--oracle');
+const minPrecision = readArgValue(args, '--min-precision') ? Number(readArgValue(args, '--min-precision')) : null;
 const REPORTS_DIR = path.join(__dirname, 'reports');
 
 // Order matters: per repo the FIRST language match wins — pyright (stronger
@@ -344,7 +349,7 @@ function pct(x) { return `${(x * 100).toFixed(1)}%`; }
 async function main() {
     const oracleRepos = REPOS.filter(r =>
         ORACLES.some(o => o.languages.includes(r.language)) &&
-        (!repoFilter || r.name === repoFilter));
+        (!repoFilterSet || repoFilterSet.has(r.name)));
     if (oracleRepos.length === 0) {
         console.error(`No matching repos for oracle languages${repoFilter ? ` and --repo ${repoFilter}` : ''}.`);
         process.exit(1);
@@ -361,6 +366,10 @@ async function main() {
             const result = await evaluateRepo(repo, oracle);
             results.push(result);
             if (result.summary.missingUnexplained > 0) gateFailed = true;
+            if (minPrecision != null && result.summary.tier1Precision < minPrecision) {
+                process.stdout.write(`  ⚠ PRECISION GATE FAILURE: tier1 ${pct(result.summary.tier1Precision)} < floor ${pct(minPrecision)}\n`);
+                gateFailed = true;
+            }
             const jsonPath = path.join(REPORTS_DIR, `oracle-eval-${repo.name}-${oracle.name}-${date}.json`);
             fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2));
             process.stdout.write(`  wrote ${path.relative(process.cwd(), jsonPath)}\n`);
