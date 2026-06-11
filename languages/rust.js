@@ -912,6 +912,91 @@ function _findRustChainRootType(callNode) {
  * @param {object} parser - Tree-sitter parser instance
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string, isMacro?: boolean}>}
  */
+/**
+ * Extract call-shaped token sequences from a macro body. Macro arguments are
+ * almost always ordinary expressions (assert_eq!, format!, vec!, write!), but
+ * tree-sitter parses them as a flat token_tree, so the regular call_expression
+ * handler never sees them. Recognized shapes (still AST token nodes, no text
+ * regex):  ident (…)  ·  recv . ident (…)  ·  Path :: ident (…)
+ * Emitted calls mirror the regular handlers' field contract and carry
+ * inMacro: true.
+ */
+function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverType) {
+    const children = [];
+    for (let i = 0; i < tree.childCount; i++) children.push(tree.child(i));
+    for (let i = 0; i < children.length; i++) {
+        const tok = children[i];
+        if (tok.type === 'token_tree') {
+            extractCallsFromTokenTree(tok, enclosingFunction, calls, getReceiverType);
+            continue;
+        }
+        if (tok.type !== 'identifier') continue;
+        const next = children[i + 1];
+        const prev = children[i - 1];
+        // $metavariable(...) — a macro fragment, not a named call
+        if (prev && prev.type === '$') continue;
+        // Nested macro invocation: name!(...)
+        if (next && next.type === '!' &&
+            children[i + 2] && children[i + 2].type === 'token_tree') {
+            calls.push({
+                name: tok.text,
+                line: tok.startPosition.row + 1,
+                isMethod: false,
+                isMacro: true,
+                inMacro: true,
+                enclosingFunction
+            });
+            continue;
+        }
+        if (!next || next.type !== 'token_tree' || !next.text.startsWith('(')) continue;
+        if (prev && prev.type === '::') {
+            // Path call: Type::func(...) / module::sub::func(...) — segments
+            // can be identifiers, primitives (char::from), or path keywords
+            const isSegment = (n) => n && ['identifier', 'primitive_type', 'self', 'super', 'crate'].includes(n.type);
+            const segments = [];
+            let j = i - 1;
+            while (j >= 1 && children[j].type === '::' && isSegment(children[j - 1])) {
+                segments.unshift(children[j - 1].text);
+                j -= 2;
+            }
+            calls.push({
+                name: tok.text,
+                line: tok.startPosition.row + 1,
+                isMethod: segments.length > 0,
+                isPathCall: true,
+                receiver: segments.length > 0 ? segments.join('::') : undefined,
+                inMacro: true,
+                enclosingFunction
+            });
+        } else if (prev && prev.type === '.') {
+            // Method call: recv.method(...)
+            const recvTok = children[i - 2];
+            const receiver = recvTok && (recvTok.type === 'identifier' || recvTok.type === 'self')
+                ? recvTok.text : undefined;
+            const receiverType = (receiver && receiver !== 'self' && getReceiverType)
+                ? getReceiverType(receiver) : undefined;
+            calls.push({
+                name: tok.text,
+                line: tok.startPosition.row + 1,
+                isMethod: true,
+                receiver,
+                ...(receiverType && { receiverType }),
+                inMacro: true,
+                enclosingFunction
+            });
+        } else {
+            // Plain call: func(...) — includes enum-variant constructors
+            calls.push({
+                name: tok.text,
+                line: tok.startPosition.row + 1,
+                isMethod: false,
+                inMacro: true,
+                enclosingFunction
+            });
+        }
+    }
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -1153,13 +1238,13 @@ function findCallsInCode(code, parser) {
         // Handle macro invocations: println!(), vec![]
         if (node.type === 'macro_invocation') {
             const macroNode = node.childForFieldName('macro');
+            const enclosingFunction = getCurrentEnclosingFunction();
             if (macroNode) {
                 let macroName = macroNode.text;
                 // Remove the trailing ! if present in the name
                 if (macroName.endsWith('!')) {
                     macroName = macroName.slice(0, -1);
                 }
-                const enclosingFunction = getCurrentEnclosingFunction();
                 calls.push({
                     name: macroName,
                     line: node.startPosition.row + 1,
@@ -1167,6 +1252,35 @@ function findCallsInCode(code, parser) {
                     isMacro: true,
                     enclosingFunction
                 });
+            }
+            // Calls INSIDE the macro body: tree-sitter parses macro arguments
+            // as an unstructured token_tree, which hid every call written
+            // inside assert_eq!/format!/vec!/write! (measured: 175 unclaimed
+            // call lines on ripgrep — test assertions live in macros).
+            for (let i = 0; i < node.childCount; i++) {
+                const child = node.child(i);
+                if (child.type === 'token_tree') {
+                    extractCallsFromTokenTree(child, enclosingFunction, calls, getReceiverType);
+                }
+            }
+            return true;
+        }
+
+        // macro_rules! definitions: the transcriber token_tree holds concrete
+        // call templates (write!(stderr, $($tt)*) in messages.rs) — real call
+        // sites in every expansion. The matcher (token_tree_pattern) holds
+        // fragment specifiers, never calls — skipped.
+        if (node.type === 'macro_definition') {
+            const enclosingFunction = getCurrentEnclosingFunction();
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const rule = node.namedChild(i);
+                if (rule.type !== 'macro_rule') continue;
+                for (let j = 0; j < rule.childCount; j++) {
+                    const part = rule.child(j);
+                    if (part.type === 'token_tree') {
+                        extractCallsFromTokenTree(part, enclosingFunction, calls, getReceiverType);
+                    }
+                }
             }
             return true;
         }
@@ -1633,11 +1747,14 @@ function findUsagesInCode(code, name, parser) {
                      parent.childForFieldName('function') === node) {
                 usageType = 'call';
             }
-            // Scoped call: Type::method() — identifier inside scoped_identifier inside call_expression
+            // Scoped call: Type::method() — only the LAST segment is the callee;
+            // the path qualifier (Type in Type::method()) is a type reference,
+            // not a call of Type
             else if (parent.type === 'scoped_identifier') {
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call_expression' &&
-                    grandparent.childForFieldName('function') === parent) {
+                    grandparent.childForFieldName('function') === parent &&
+                    parent.childForFieldName('name') === node) {
                     usageType = 'call';
                 }
             }

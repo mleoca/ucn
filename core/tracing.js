@@ -677,11 +677,19 @@ function affectedTests(index, name, options = {}) {
         // not production symbols that need test coverage.
         const productionNames = new Set();
         for (const n of affectedNames) {
-            // Check if this name is only found in test files
+            // Check if this name is only found in test files. Inline test
+            // functions (#[test] fns in Rust's #[cfg(test)] mods, Go Test*)
+            // live in production-path FILES but are tests themselves — the
+            // language's getEntryPointKind says so; they need no coverage.
             let foundInSource = false;
             for (const [fp, fe] of index.files) {
                 if (isTestFile(fe.relativePath, fe.language)) continue;
-                if (fe.symbols?.some(s => s.name === n)) { foundInSource = true; break; }
+                const langModule = getLanguageModule(fe.language);
+                const kindOf = langModule?.getEntryPointKind;
+                if (fe.symbols?.some(s => s.name === n && (!kindOf || kindOf(s) !== 'test'))) {
+                    foundInSource = true;
+                    break;
+                }
             }
             if (foundInSource) productionNames.add(n);
         }

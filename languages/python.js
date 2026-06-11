@@ -854,7 +854,10 @@ function findCallsInCode(code, parser) {
                     const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: attrNode.text,
-                        line: node.startPosition.row + 1,
+                        // Multi-line chains (obj.x()\n.y()) must report each
+                        // method's OWN name line, not the chain-start line —
+                        // the account's ground set is keyed by the name's line
+                        line: attrNode.startPosition.row + 1,
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),

@@ -923,7 +923,10 @@ function findCallsInCode(code, parser) {
                 const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: nameNode.text,
-                    line: node.startPosition.row + 1,
+                    // Multi-line chains (builder.x()\n.y()) must report each
+                    // method's OWN name line, not the chain-start line — the
+                    // account's ground set is keyed by the name's line
+                    line: nameNode.startPosition.row + 1,
                     isMethod: !!objNode,
                     receiver,
                     ...(receiverType && { receiverType }),
@@ -1243,10 +1246,12 @@ function findUsagesInCode(code, name, parser) {
                     usageType = 'call';
                 }
             }
-            // Static method call: ClassName.staticMethod() — ClassName is the object
+            // Object position of a method call: x.method() — x is a receiver
+            // (variable or ClassName), referenced, not called. The call belongs
+            // to the name field, handled above.
             else if (parent.type === 'method_invocation' &&
                      parent.childForFieldName('object') === node) {
-                usageType = 'call';
+                usageType = 'reference';
             }
             // Field access: obj.field
             else if (parent.type === 'field_access' &&

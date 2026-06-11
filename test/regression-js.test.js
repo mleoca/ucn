@@ -5180,3 +5180,39 @@ describe('fix #200 (js/ts): module receivers never confirm class methods', () =>
         } finally { rm(dir); }
     });
 });
+
+describe('fix #201 (js/ts): multi-line chained calls report the method name line', () => {
+    it('.pipe() on its own line is claimed at that line', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Chain {',
+                '    pipe(x: number) { return this; }',
+                '    done() { return 1; }',
+                '}',
+                'export function make() { return new Chain(); }',
+            ].join('\n'),
+            'app.ts': [
+                'import { make } from "./lib";',
+                '',
+                'export function run() {',
+                '    return make()',
+                '        .pipe(1)',
+                '        .done();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:2:pipe' });
+            assert.ok(r.ok);
+            const all = [...(r.result.callers || []), ...(r.result.unverifiedCallers || [])]
+                .map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(all.includes('app.ts:5'),
+                `.pipe must be reported at its own line 5 (not chain start 4): ${all}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+            assert.strictEqual((r.result.meta.account.callNotResolved || []).length, 0,
+                'chained-call line must be claimed');
+        } finally { rm(dir); }
+    });
+});

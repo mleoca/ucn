@@ -999,10 +999,20 @@ public class Handler {
         const parser = getParser('java');
         const usages = findUsagesInCode(code, 'ErrorUtil', parser);
 
-        // ErrorUtil in ErrorUtil.createErrorUid() should be a "call" (static method invocation)
+        // ErrorUtil in ErrorUtil.createErrorUid() is the OBJECT position — a
+        // type reference; the call belongs to createErrorUid. (Object position
+        // used to classify as 'call', which made the account tag receiver
+        // lines like iterator.hasNext() call-not-resolved for `iterator`.)
+        const usageLines = usages.map(u => u.usageType);
+        assert.ok(usageLines.includes('reference'),
+            `ErrorUtil.createErrorUid() should classify ErrorUtil as "reference": ${usageLines}`);
         const callUsages = usages.filter(u => u.usageType === 'call');
-        assert.ok(callUsages.length > 0,
-            'ErrorUtil.createErrorUid() should classify ErrorUtil as "call"');
+        assert.strictEqual(callUsages.length, 0,
+            'object position must not classify as call');
+        // ...and the method name owns the call classification
+        const methodUsages = findUsagesInCode(code, 'createErrorUid', parser);
+        assert.ok(methodUsages.some(u => u.usageType === 'call'),
+            'createErrorUid should classify as "call"');
     });
 
     it('BUG 8c — Java type_identifier in new expression detected', (t) => {

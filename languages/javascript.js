@@ -1633,7 +1633,11 @@ function findCallsInCode(code, parser) {
                         const assignedTo = jsAssignmentTargetOf(node);
                         calls.push({
                             name: propName,
-                            line: node.startPosition.row + 1,
+                            // Multi-line chains (builder.x()\n.y()) must report
+                            // each method's OWN name line, not the chain-start
+                            // line — the account's ground set is keyed by the
+                            // name's line
+                            line: propNode.startPosition.row + 1,
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),

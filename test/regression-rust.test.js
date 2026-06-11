@@ -483,11 +483,13 @@ fn main() {
 
     // Struct expression MyService{} should be "call"
     const calls = usages.filter(u => u.usageType === 'call');
-    assert.ok(calls.length >= 2, `Should find at least 2 calls (struct expr + scoped call), got ${calls.length}`);
+    assert.ok(calls.length >= 1, `Should find at least 1 call (struct expr), got ${calls.length}`);
 
-    // MyService::new() should be classified as "call" (the identifier inside scoped_identifier)
-    const scopedCall = usages.find(u => u.line === 17 && u.usageType === 'call');
-    assert.ok(scopedCall, 'MyService::new() should classify MyService as "call"');
+    // MyService in MyService::new() is the path QUALIFIER — a type reference;
+    // the call belongs to `new` (matches ts-morph/pyright classification and
+    // keeps the account from tagging qualifier lines call-not-resolved)
+    const scopedQualifier = usages.find(u => u.line === 17 && u.usageType === 'reference');
+    assert.ok(scopedQualifier, 'MyService::new() should classify MyService as "reference"');
 
     // Type references (return type, param type, let type) should be found
     const refs = usages.filter(u => u.usageType === 'reference');
@@ -513,7 +515,7 @@ fn use_cfg(cfg: Config) {}
     assert.strictEqual(paramTypeUsage.usageType, 'reference');
 });
 
-it('Rust scoped call — Type::method() classified as call', (t) => {
+it('Rust scoped call — Type::method() qualifier classified as reference', (t) => {
     const { getParser } = require('../languages');
     const { findUsagesInCode } = require('../languages/rust');
 
@@ -529,10 +531,13 @@ fn main() {
     const parser = getParser('rust');
     const usages = findUsagesInCode(code, 'Config', parser);
 
-    // Config::new() calls should be classified as "call"
-    const callLines = usages.filter(u => u.usageType === 'call').map(u => u.line);
-    assert.ok(callLines.includes(4), 'Config::new() on line 4 should be "call"');
-    assert.ok(callLines.includes(7), 'Config::new() on line 7 should be "call"');
+    // Config in Config::new() is the path qualifier: the CALL belongs to
+    // `new`; for the symbol Config these lines are type references. (The
+    // qualifier used to classify as 'call', which made the account tag
+    // File::open(...) lines call-not-resolved for the type File.)
+    const refLines = usages.filter(u => u.usageType === 'reference').map(u => u.line);
+    assert.ok(refLines.includes(4), 'Config::new() on line 4 should be "reference"');
+    assert.ok(refLines.includes(7), 'Config::new() on line 7 should be "reference"');
 });
 
 }); // end describe('Bug Report #3: Rust Regressions')
@@ -1813,5 +1818,56 @@ describe('export-rename aliases (rust): pub use renames captured in exports', ()
             `nested rename captured: ${JSON.stringify(exports)}`);
         assert.ok(!exports.some(e => e.name === 'c'),
             'plain (un-renamed) pub use entries are intentionally not emitted');
+    });
+});
+
+describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
+    it('assert_eq!/format! arguments produce call candidates', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub fn check(x: i32) -> i32 { x }',
+                '',
+                'pub fn caller() {',
+                '    assert_eq!(check(1), 1);',
+                '    let s = format!("{}", check(2));',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'check' });
+            assert.ok(r.ok);
+            const lines = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('src/lib.rs:4'), `check inside assert_eq! is a caller: ${lines}`);
+            assert.ok(lines.includes('src/lib.rs:5'), `check inside format! is a caller: ${lines}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+            assert.strictEqual((r.result.meta.account.callNotResolved || []).length, 0,
+                'no unclaimed call lines');
+        } finally { rm(dir); }
+    });
+
+    it('macro_rules! transcriber calls are extracted; matcher patterns are not', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub fn emit(s: &str) {}',
+                '',
+                'macro_rules! say {',
+                '    ($($tt:tt)*) => {',
+                '        emit(concat!($($tt)*));',
+                '    };',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'emit' });
+            assert.ok(r.ok);
+            const all = [...(r.result.callers || []), ...(r.result.unverifiedCallers || [])]
+                .map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(all.includes('src/lib.rs:5'),
+                `emit in the macro transcriber must be visible: ${all}`);
+        } finally { rm(dir); }
     });
 });
