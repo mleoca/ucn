@@ -1,0 +1,40 @@
+name: Eval
+
+# Reliability/accuracy evaluation on pinned real repos:
+#  - conservation: account invariant + engine-gap metrics (6 repos, 6 languages)
+#  - oracle: tiered caller answers vs ts-morph ground truth (TS repos);
+#    fails when missing-unexplained > 0 (the contract gate)
+# Separate from ci.yml: heavier, network-dependent, weekly + on demand.
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 6 * * 1'   # Mondays 06:00 UTC
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Conservation eval (pinned repos)
+        run: node eval/conservation-real.js
+
+      - name: Oracle eval (gate: missing-unexplained = 0)
+        run: node eval/run-oracle-eval.js
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-reports
+          path: eval/reports/
+          retention-days: 90
