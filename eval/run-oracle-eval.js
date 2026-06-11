@@ -58,6 +58,22 @@ function readArgValue(argv, flag) {
 
 function key(file, line) { return `${file}:${line}`; }
 
+const SYMBOL_KINDS = ['function', 'method', 'class'];
+
+function emptyPlacement() {
+    return { confirmed: 0, unverified: 0, reportedNonCall: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 };
+}
+
+function emptyKindTotals() {
+    return {
+        sampled: 0,
+        confirmedEdges: 0, confirmedHits: 0,
+        unverifiedEdges: 0, unverifiedHits: 0,
+        oracleCallEdges: 0,
+        placement: emptyPlacement(),
+    };
+}
+
 async function evaluateRepo(repo, oracle) {
     process.stdout.write(`\n=== ${repo.name} (${repo.language}) @ ${repo.commit.slice(0, 8)} — oracle: ${oracle.name} ===\n`);
     const repoPath = cloneAtCommit(repo);
@@ -115,10 +131,11 @@ async function evaluateRepo(repo, oracle) {
         confirmedEdges: 0, confirmedHits: 0,
         unverifiedEdges: 0, unverifiedHits: 0,
         oracleCallEdges: 0,
-        placement: { confirmed: 0, unverified: 0, reportedNonCall: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 },
+        placement: emptyPlacement(),
         zeroCases: 0, zeroAgreed: 0,
         conserved: 0, evaluated: 0,
     };
+    const byKind = new Map(SYMBOL_KINDS.map(k => [k, emptyKindTotals()]));
     const unexplainedSamples = [];
 
     for (const sym of sampled) {
@@ -133,7 +150,7 @@ async function evaluateRepo(repo, oracle) {
         const handleName = `${sym.file}:${sym.line}:${sym.name}`;
         const r = execute(index, 'context', { name: handleName });
         if (!r.ok) {
-            perSymbol.push({ name: sym.name, file: sym.file, line: sym.line, error: r.error });
+            perSymbol.push({ name: sym.name, file: sym.file, line: sym.line, kind: sym.kind, error: r.error });
             continue;
         }
         const json = JSON.parse(output.formatContextJson(r.result));
@@ -161,7 +178,7 @@ async function evaluateRepo(repo, oracle) {
         //                          contract violation.
         //   missingUnexplained   — in the ground set, indexed, yet unaccounted:
         //                          the silent lie the contract forbids. GATE: 0.
-        const placement = { confirmed: 0, unverified: 0, reportedNonCall: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 };
+        const placement = emptyPlacement();
         for (const oc of oracleCalls) {
             const k = key(oc.file, oc.line);
             if (confirmedKeys.has(k)) placement.confirmed++;
@@ -195,6 +212,16 @@ async function evaluateRepo(repo, oracle) {
         totals.evaluated++;
         if (account && account.conserved) totals.conserved++;
 
+        if (!byKind.has(sym.kind)) byKind.set(sym.kind, emptyKindTotals());
+        const kt = byKind.get(sym.kind);
+        kt.sampled++;
+        kt.confirmedEdges += confirmed.length;
+        kt.confirmedHits += confirmedHits;
+        kt.unverifiedEdges += unverified.length;
+        kt.unverifiedHits += unverifiedHits;
+        kt.oracleCallEdges += oracleCalls.length;
+        for (const k of Object.keys(placement)) kt.placement[k] += placement[k];
+
         perSymbol.push({
             name: sym.name, file: sym.file, line: sym.line, kind: sym.kind,
             oracleCalls: oracleCalls.length,
@@ -207,6 +234,25 @@ async function evaluateRepo(repo, oracle) {
 
     const tier1Precision = rate(totals.confirmedHits, totals.confirmedEdges);
     const unverifiedPrecision = rate(totals.unverifiedHits, totals.unverifiedEdges);
+    const byKindSummary = {};
+    for (const [kind, kt] of byKind) {
+        if (kt.sampled === 0) continue;
+        const p1 = rate(kt.confirmedHits, kt.confirmedEdges);
+        const pu = rate(kt.unverifiedHits, kt.unverifiedEdges);
+        byKindSummary[kind] = {
+            sampled: kt.sampled,
+            oracleCallEdges: kt.oracleCallEdges,
+            confirmedEdges: kt.confirmedEdges,
+            confirmedHits: kt.confirmedHits,
+            tier1Precision: p1,
+            unverifiedEdges: kt.unverifiedEdges,
+            unverifiedHits: kt.unverifiedHits,
+            unverifiedPrecision: pu,
+            tierSeparation: kt.confirmedEdges && kt.unverifiedEdges
+                ? Number((p1 - pu).toFixed(4)) : null,
+            oraclePlacement: kt.placement,
+        };
+    }
     const summary = {
         repo: repo.name,
         oracle: oracle.name,
@@ -221,6 +267,7 @@ async function evaluateRepo(repo, oracle) {
         tierSeparation: totals.confirmedEdges && totals.unverifiedEdges
             ? Number((tier1Precision - unverifiedPrecision).toFixed(4)) : null,
         oraclePlacement: totals.placement,
+        byKind: byKindSummary,
         // THE GATE:
         missingUnexplained: totals.placement.missingUnexplained,
         unexplainedSamples,
@@ -233,6 +280,11 @@ async function evaluateRepo(repo, oracle) {
         `tierSeparation ${summary.tierSeparation ?? 'n/a'} | placement ${JSON.stringify(summary.oraclePlacement)} | ` +
         `zeroTrust ${summary.zeroTrustworthiness != null ? pct(summary.zeroTrustworthiness) : 'n/a'} (${summary.zeroCases} cases) | ` +
         `conserved ${pct(summary.conservedRate)}\n`);
+    for (const [kind, k] of Object.entries(summary.byKind)) {
+        process.stdout.write(`    ${kind.padEnd(8)} n=${k.sampled} | tier1 ${pct(k.tier1Precision)} (${k.confirmedHits}/${k.confirmedEdges}) | ` +
+            `unverified ${pct(k.unverifiedPrecision)} (${k.unverifiedHits}/${k.unverifiedEdges}) | ` +
+            `placement ${JSON.stringify(k.oraclePlacement)}\n`);
+    }
     if (summary.missingUnexplained > 0) {
         process.stdout.write(`  ⚠ GATE FAILURE: ${summary.missingUnexplained} oracle call edge(s) unexplained: ${JSON.stringify(unexplainedSamples.slice(0, 3))}\n`);
     }
@@ -313,6 +365,21 @@ async function main() {
     for (const { summary: s } of results) {
         if (s.error) { lines.push(`| ${s.repo} | — | — | — | — | — | — | — | — | ERROR: ${s.error} |`); continue; }
         lines.push(`| ${s.repo} | ${s.oracle} | ${s.sampled} | ${s.oracleCallEdges} | ${pct(s.tier1Precision)} | ${pct(s.unverifiedPrecision)} | ${s.tierSeparation ?? 'n/a'} | **${s.missingUnexplained}** | ${s.zeroTrustworthiness != null ? pct(s.zeroTrustworthiness) : 'n/a'} (${s.zeroCases}) | ${pct(s.conservedRate)} |`);
+    }
+    lines.push('');
+    lines.push('## Per-kind breakdown');
+    lines.push('');
+    lines.push('Same metrics split by symbol kind (function / method / class), to');
+    lines.push('localize precision gaps — e.g. method-name conflation, where import');
+    lines.push('evidence confirms the file but not the receiver type.');
+    lines.push('');
+    lines.push('| repo | kind | sampled | oracle edges | tier1 precision | unverified precision | separation | placement |');
+    lines.push('|---|---|---|---|---|---|---|---|');
+    for (const { summary: s } of results) {
+        if (s.error || !s.byKind) continue;
+        for (const [kind, k] of Object.entries(s.byKind)) {
+            lines.push(`| ${s.repo} | ${kind} | ${k.sampled} | ${k.oracleCallEdges} | ${pct(k.tier1Precision)} (${k.confirmedHits}/${k.confirmedEdges}) | ${pct(k.unverifiedPrecision)} (${k.unverifiedHits}/${k.unverifiedEdges}) | ${k.tierSeparation ?? 'n/a'} | ${JSON.stringify(k.oraclePlacement)} |`);
+        }
     }
     lines.push('');
     const mdPath = path.join(REPORTS_DIR, `oracle-eval-rollup-${date}.md`);
