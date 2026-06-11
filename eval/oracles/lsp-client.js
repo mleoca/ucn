@@ -15,10 +15,12 @@ const { spawn } = require('child_process');
 const DEFAULT_TIMEOUT_MS = 300000;
 
 class LspClient {
-    constructor(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, settings = null } = {}) {
+    constructor(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, settings = null, capabilities = null, onNotification = null } = {}) {
         this.child = spawn(command, args, { stdio: ['pipe', 'pipe', 'inherit'] });
         this.timeoutMs = timeoutMs;
         this.settings = settings; // answers workspace/configuration by dotted section
+        this.extraCapabilities = capabilities; // merged into initialize capabilities (e.g. rust-analyzer serverStatus)
+        this.onNotification = onNotification; // (method, params) => void — server notifications
         this.nextId = 1;
         this.pending = new Map(); // id -> { resolve, reject, timer }
         this.dead = null;
@@ -77,7 +79,8 @@ class LspClient {
             if (msg.error) entry.reject(new Error(`LSP ${msg.error.code}: ${msg.error.message}`));
             else entry.resolve(msg.result);
         }
-        // else: notification (diagnostics, logs) — ignore
+        else if (msg.method && this.onNotification) this.onNotification(msg.method, msg.params);
+        // else: notification (diagnostics, logs) — ignored unless a hook is registered
     }
 
     _send(msg) {
@@ -124,9 +127,10 @@ class LspClient {
             processId: process.pid,
             rootUri: pathToUri(rootDir),
             workspaceFolders: [{ uri: pathToUri(rootDir), name: 'eval' }],
-            capabilities: this.settings
-                ? { workspace: { configuration: true, didChangeConfiguration: {} } }
-                : {},
+            capabilities: {
+                ...(this.settings ? { workspace: { configuration: true, didChangeConfiguration: {} } } : {}),
+                ...(this.extraCapabilities || {}),
+            },
             ...(initializationOptions && { initializationOptions }),
         });
         this.notify('initialized', {});

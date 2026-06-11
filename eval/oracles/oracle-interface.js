@@ -15,6 +15,7 @@
  *       // file: path RELATIVE to the prepared root; kind: 'function'|'method'|'class'
  *   async findReferences(handle, { name, file, line }) -> [{ file, line, kind }],
  *       // kind: 'call' | 'import' | 'reference' | 'definition'
+ *   async dispose?(handle),            // optional graceful teardown (LSP shutdown)
  * }
  */
 

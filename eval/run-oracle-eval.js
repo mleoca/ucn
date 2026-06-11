@@ -41,6 +41,7 @@ const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
 const { jediOracle } = require('./oracles/jedi-oracle');
 const { goplsOracle } = require('./oracles/gopls-oracle');
+const { rustAnalyzerOracle } = require('./oracles/rust-analyzer-oracle');
 
 const args = process.argv.slice(2);
 const repoFilter = readArgValue(args, '--repo');
@@ -51,7 +52,7 @@ const REPORTS_DIR = path.join(__dirname, 'reports');
 // Order matters: per repo the FIRST language match wins — pyright (stronger
 // inference) is the primary Python oracle, jedi stays as the second opinion
 // via --oracle jedi.
-const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle]
+const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle, rustAnalyzerOracle]
     .map(validateOracle)
     .filter(o => !oracleFilter || o.name === oracleFilter);
 
@@ -301,6 +302,10 @@ async function evaluateRepo(repo, oracle) {
     }
     if (summary.missingUnexplained > 0) {
         process.stdout.write(`  ⚠ GATE FAILURE: ${summary.missingUnexplained} oracle call edge(s) unexplained: ${JSON.stringify(unexplainedSamples.slice(0, 3))}\n`);
+    }
+
+    if (oracle.dispose) {
+        try { await oracle.dispose(handle); } catch (e) { /* teardown is best-effort */ }
     }
 
     return { summary, perSymbol };
