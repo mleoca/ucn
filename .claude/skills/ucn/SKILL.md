@@ -213,23 +213,22 @@ ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pyte
 
 `audit-async` is the focused tool for the `awaited=false` case across an entire async function body.
 
-## Confidence Scores
+## Reading Tiered Output (about / context / impact)
 
-`about` and `context` show confidence per caller/callee edge by default (e.g. `confidence: 0.65 (scope-match)`). Resolution labels (high to low):
+Caller answers are a **partition of every text occurrence** of the symbol — nothing is silently hidden. Sections:
 
-| Label | Score | Meaning |
-|-------|-------|---------|
-| `exact-binding` | 0.98 | Import or binding evidence — direct call |
-| `same-class` | 0.92 | Method call resolved within the enclosing class |
-| `receiver-hint` | 0.80 | Receiver type inferred (Go/Java/Rust) — e.g. `f.run()` where `f: Filter` |
-| `scope-match` | 0.65 | Symbol resolved by name within a file/package scope |
-| `name-only` | 0.40 | Name match only, no binding/scope evidence — review before trusting |
-| `uncertain` | 0.25 | Ambiguous — multiple candidates, hidden unless `--include-uncertain` |
+- `CALLERS — CONFIRMED (N, X prod + Y test):` — edges with binding/receiver/import evidence. Prod callers listed first, then a `test callers:` subheader. An `evidence:` line aggregates resolution labels for the section.
+- `CALLERS — UNVERIFIED (N) — call syntax, no binding/receiver evidence:` — name-matched call sites the engine could not verify, one line each with the reason (`method-no-evidence`, `ambiguous-binding`, `call-not-resolved`). Capped at 10; `--all` lifts the cap. **Treat these as possible callers when refactoring.**
+- `NON-CALL OCCURRENCES: N (...)` — imports/definitions/references/other-text, counts only (drill in with `ucn usages <name>`).
+- `ACCOUNT:` — the reconciliation line. Every ground line is in exactly one bucket; `0 unaccounted` means the partition is complete. `+N beyond-text callers` are alias-resolved call sites plain text search would miss.
+- `WARNING: N unparsed file(s) ...` — files containing the symbol that failed to parse. Their lines were NOT analyzed — fall back to text search for those files.
+- `FILTERED: N hidden by flags` — entries your display flags hid (they still count in ACCOUNT).
 
-Filter or hide:
-- `--min-confidence=0.7` — keep only high-confidence edges (≥ same-class)
-- `--hide-confidence` — silence the scores (legacy `--no-confidence` is a silent alias)
-- `--include-uncertain` — include otherwise-filtered low-confidence matches
+**Trust rules:** a CONFIRMED(0) + UNVERIFIED(0) answer with `0 unaccounted` and no WARNING means the symbol genuinely has no callers — safe to act on, same as a clean grep. Any UNVERIFIED entries or WARNINGs mean: verify those sites before a breaking change.
+
+Resolution labels in `evidence:` lines (high to low): `exact-binding` (0.98, import/binding evidence) · `same-class` (0.92) · `receiver-hint` (0.80, inferred receiver type) · `scope-match` (0.65, import/receiver-binding scope evidence) · `name-only` (0.40) · `uncertain` (0.25). Confirmed tier = scope-match and above. JSON output keeps per-edge decimals plus `tier`.
+
+Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain`/`--include-methods` are **implied no-ops** for about/context/impact (everything is shown, tiered); they keep their meaning for `trace`/`blast`/`smart`/`verify`/`reverse-trace`/`affected-tests`.
 
 ## Symbol Handles (stable IDs)
 
@@ -267,7 +266,7 @@ ucn [target] <command> [name] [--flags]
 | `--all` | Expand truncated sections. Applies to `about`, `blast`, `trace`, `reverse-trace`, `related`, `find`, `toc`, `fn`, `class`, `graph`, `diff-impact` |
 | `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
 | `--exclude-tests` | Exclude test entries from `entrypoints` (tests are included by default since they ARE entry points). |
-| `--include-methods` | Include `obj.method()` calls in caller/callee analysis. `impact` defaults to true (show all callable sites); other commands default to false (use `--no-include-methods` to opt out). Applies to `about`, `context`, `impact`, `verify`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
+| `--include-methods` | Include `obj.method()` calls in caller/callee analysis. Implied (no-op) for `about`/`context`/`impact` — method calls are always analyzed and tiered by receiver evidence. Applies to `verify`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |
@@ -289,7 +288,7 @@ ucn [target] <command> [name] [--flags]
 | `--max-lines=N` | Max source lines for `class` (large classes show summary by default) |
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
 | `--exact` | Exact name match only in `find`/`typedef` (no substring) |
-| `--include-uncertain` | Include ambiguous/uncertain matches. Applies to `about`, `context`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
+| `--include-uncertain` | Include ambiguous/uncertain matches. Implied (no-op) for `about`/`context`/`impact` — unverified callers are always shown in their own tier. Applies to `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
 | `--hide-confidence` | Hide confidence scores (shown by default) in `context`/`about` |
 | `--min-confidence=N` | Filter edges below confidence threshold (e.g., `--min-confidence=0.7` keeps only high-confidence edges) |
 | `--calls-only` | Only show call/test-case matches in `tests` (skip file-level results) |

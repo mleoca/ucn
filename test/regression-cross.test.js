@@ -1905,11 +1905,11 @@ it('about with includeMethods=false shows note in formatted output', () => {
         includeMethods: false,
         completeness: { warnings: [] }
     };
+    // Tiered contract: the methods-excluded hint is superseded by the
+    // always-visible UNVERIFIED tier — it must not appear in either mode.
     const text = formatAbout(aboutResult);
-    assert.ok(text.includes('obj.method() callers/callees excluded'), 'Should show note when includeMethods=false');
-    assert.ok(text.includes('--include-methods'), 'Should mention the flag');
+    assert.ok(!text.includes('obj.method() callers/callees excluded'), 'Hint superseded by UNVERIFIED tier');
 
-    // With includeMethods=true (default) — no note
     aboutResult.includeMethods = true;
     const text2 = formatAbout(aboutResult);
     assert.ok(!text2.includes('obj.method() callers/callees excluded'), 'Should NOT show note when includeMethods=true');
@@ -2464,10 +2464,9 @@ describe('fix TS-BUG-003: about command note uses correct --include-methods word
         const text = formatAbout(aboutResult);
         assert.ok(!text.includes('Remove flag'),
             'Note must not say "Remove flag" — there is no flag to remove when using default behavior');
-        assert.ok(text.includes('--include-methods'),
-            'Note must mention "--include-methods" flag to add');
-        assert.ok(text.includes('include'),
-            'Note must guide user toward adding the flag, not removing it');
+        // Tiered contract: no methods hint at all — the UNVERIFIED tier replaces it.
+        assert.ok(!text.includes('--include-methods'),
+            'Hint superseded by the UNVERIFIED tier (flag is an implied no-op)');
     });
 
     it('formatAbout note wording instructs user to USE --include-methods', () => {
@@ -2487,12 +2486,10 @@ describe('fix TS-BUG-003: about command note uses correct --include-methods word
             completeness: { warnings: [] }
         };
         const text = formatAbout(aboutResult);
-        // The note should say "use --include-methods to include them" (or similar)
-        // and must NOT instruct user to remove a flag that was never set
-        assert.ok(
-            text.includes('use --include-methods') || text.includes('Use --include-methods'),
-            `Note text should instruct to use --include-methods. Got: "${text.slice(-200)}"`
-        );
+        // Tiered contract: the hint is gone entirely — unverified method
+        // callers are always shown in their own section instead.
+        assert.ok(!text.includes('--include-methods'),
+            `No methods hint under the tiered contract. Got: "${text.slice(-200)}"`);
     });
 });
 
@@ -4337,10 +4334,10 @@ describe('CLI glob-mode parity', () => {
             'glob and project mode should show same number of confidence annotations');
     });
 
-    it('glob mode shows confidence in context by default', () => {
+    it('glob mode shows evidence aggregate in context by default', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
         const withConf = runCli(pattern, 'context', ['helper']);
-        assert.ok(withConf.includes('confidence'), 'glob context should show confidence by default');
+        assert.ok(withConf.includes('evidence: '), 'glob context should show evidence aggregate by default');
     });
 
     it('glob mode passes --top to related formatter', () => {
@@ -4905,15 +4902,17 @@ func unused2() { helper() }
         });
         try {
             const out = runCli(dir, 'context', ['helper']);
-            assert.ok(out.includes('CALLERS (3)'), 'should show 3 callers');
-            assert.match(out, /confidence: \d+ high \(>0\.8\), \d+ medium \(0\.5-0\.8\), \d+ low \(<0\.5\)/,
-                'histogram line should be present in caller section');
+            assert.ok(out.includes('CALLERS — CONFIRMED (3)'), 'should show 3 confirmed callers');
+            assert.match(out, /evidence: (\d+ )?[a-z-]+/,
+                'evidence aggregate line should be present in caller section');
+            assert.ok(!/confidence: \d+ high/.test(out),
+                'old histogram format replaced by evidence aggregate');
         } finally {
             rm(dir);
         }
     });
 
-    it('histogram is suppressed when there is only 1 caller', () => {
+    it('evidence aggregate present even for a single caller', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -4925,9 +4924,8 @@ func helper() {}
         });
         try {
             const out = runCli(dir, 'context', ['helper']);
-            assert.ok(out.includes('CALLERS (1)'), 'should show 1 caller');
-            assert.ok(!/^\s*confidence: \d+ high/m.test(out),
-                'histogram line should NOT be present when only 1 caller');
+            assert.ok(out.includes('CALLERS — CONFIRMED (1)'), 'should show 1 confirmed caller');
+            assert.ok(out.includes('evidence: '), 'evidence aggregate shown');
         } finally {
             rm(dir);
         }
@@ -5030,10 +5028,10 @@ func unused2() { helper() }
         });
         try {
             const fullOut = runCli(dir, 'context', ['helper']);
-            assert.ok(fullOut.includes('CALLERS (3)'), 'without filter: 3 callers');
+            assert.ok(fullOut.includes('CALLERS — CONFIRMED (3)'), 'without filter: 3 confirmed callers');
 
             const filteredOut = runCli(dir, 'context', ['helper'], ['--unreachable-only']);
-            assert.ok(filteredOut.includes('CALLERS (2)'), 'with --unreachable-only: 2 unreachable callers');
+            assert.ok(filteredOut.includes('CALLERS — CONFIRMED (2)'), 'with --unreachable-only: 2 unreachable callers');
             assert.ok(!filteredOut.includes('[doWork]'), 'reachable caller doWork should be filtered out');
             assert.ok(filteredOut.includes('[unused1]'), 'unreachable caller unused1 should remain');
         } finally {
@@ -5284,7 +5282,7 @@ describe('BUG-H3: impact and verify honor --include-methods flag', () => {
         } finally { rm(dir); }
     });
 
-    it('impact --no-include-methods drops obj.fn() calls', () => {
+    it('impact --no-include-methods is a deprecated no-op (tiered contract)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function process(x) { return x; }\nmodule.exports = { process };',
@@ -5295,9 +5293,11 @@ describe('BUG-H3: impact and verify honor --include-methods flag', () => {
             const index = idx(dir);
             const r = execute(index, 'impact', { name: 'process', includeMethods: false });
             assert.ok(r.ok);
-            // With --no-include-methods, only the direct call counts.
-            assert.strictEqual(r.result.totalCallSites, 1,
-                `impact --no-include-methods should give 1 site, got ${r.result.totalCallSites}`);
+            // Tiered contract: --no-include-methods is a deprecated no-op for
+            // impact. obj.process() has receiver binding evidence (obj =
+            // require) → confirmed; both sites count.
+            assert.strictEqual(r.result.totalCallSites, 2,
+                `impact ignores --no-include-methods (tiered), got ${r.result.totalCallSites}`);
         } finally { rm(dir); }
     });
 

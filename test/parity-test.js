@@ -229,30 +229,30 @@ function testProcessData() {
     });
 
     describe('confidence options parity', () => {
-        it('CLI: context shows confidence scores by default', () => {
+        it('CLI: context shows evidence aggregate by default', () => {
             const output = runCli(FIXTURES_PATH, 'context', ['processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(output.includes('confidence:'), 'Should show confidence scores');
-            assert.match(output, /confidence: \d+\.\d+/, 'Should show numeric confidence');
+            assert.ok(output.includes('evidence: '), 'Should show evidence aggregate line');
+            assert.ok(!/confidence: \d+\.\d+/.test(output), 'Per-edge decimals removed from text output');
         });
 
-        it('interactive: context shows confidence scores by default', () => {
+        it('interactive: context shows evidence aggregate by default', () => {
             const output = runInteractive(FIXTURES_PATH, ['context processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(output.includes('confidence:'), 'Should show confidence scores');
+            assert.ok(output.includes('evidence: '), 'Should show evidence aggregate line');
         });
 
-        it('MCP: context shows confidence scores by default', async () => {
+        it('MCP: context shows evidence aggregate by default', async () => {
             const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData' });
             assert.ok(!res.isError, 'Should not error');
             assert.ok(res.text.includes('processData'), 'Should find symbol');
-            assert.ok(res.text.includes('confidence:'), 'MCP should show confidence scores');
+            assert.ok(res.text.includes('evidence: '), 'MCP should show evidence aggregate line');
         });
 
-        it('CLI: about shows confidence scores by default', () => {
+        it('CLI: about shows evidence aggregate by default', () => {
             const output = runCli(FIXTURES_PATH, 'about', ['processData']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(output.includes('confidence:'), 'Should show confidence scores in about');
+            assert.ok(output.includes('evidence: '), 'Should show evidence aggregate in about');
         });
 
         it('CLI: about --min-confidence=0.9 filters low-confidence edges', () => {
@@ -284,22 +284,16 @@ function testProcessData() {
             assert.ok(res.text.includes('below confidence threshold hidden'), 'MCP context should filter and note');
         });
 
-        it('CLI: context shows confidence by default', () => {
-            const output = runCli(FIXTURES_PATH, 'context', ['processData']);
-            assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(output.includes('confidence:'), 'Should show confidence by default');
-        });
-
-        it('CLI: context --hide-confidence hides confidence lines', () => {
+        it('CLI: context --hide-confidence accepted (evidence aggregate is the only confidence display)', () => {
             const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--hide-confidence']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(!output.includes('confidence:'), 'Should NOT show confidence with --hide-confidence');
+            assert.ok(!/confidence: \d+\.\d+/.test(output), 'No per-edge decimals in any mode');
         });
 
-        it('CLI: --no-confidence still works as backwards-compat alias', () => {
+        it('CLI: --no-confidence still accepted as backwards-compat alias', () => {
             const output = runCli(FIXTURES_PATH, 'context', ['processData'], ['--no-confidence']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(!output.includes('confidence:'), 'Should NOT show confidence with --no-confidence');
+            assert.ok(!/confidence: \d+\.\d+/.test(output), 'No per-edge decimals in any mode');
         });
     });
 
@@ -1323,6 +1317,90 @@ describe('Output Ordering Contract', () => {
             const t1 = output.formatImpact(r1.result);
             const t2 = output.formatImpact(r2.result);
             assert.strictEqual(t1, t2, 'identical inputs must produce identical impact output');
+        } finally { rm(dir); }
+    });
+});
+
+describe('Tiered Output Contract (grep-reliability)', () => {
+    const { tmp, rm, idx } = require('./helpers');
+    const { execute } = require('../core/execute');
+    const output = require('../core/output');
+
+    // Fixture with BOTH confirmed and unverified callers plus prod/test split
+    function makeTieredFixture() {
+        return tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x) { return x + 1; }\nmodule.exports = { helper };',
+            'direct.js': 'const { helper } = require("./lib");\nfunction d1() { return helper(1); }\nmodule.exports = { d1 };',
+            'svc.js': 'function run(m) { return m.helper(9); }\nmodule.exports = { run };',  // no receiver evidence → unverified
+            'app.test.js': 'const { helper } = require("./lib");\ntest("t", () => helper(2));',
+        });
+    }
+
+    it('context output with unverified callers is byte-identical across runs', () => {
+        const dir = makeTieredFixture();
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'context', { name: 'helper' });
+            const r2 = execute(index, 'context', { name: 'helper' });
+            assert.ok(r1.ok && r2.ok);
+            const t1 = output.formatContext(r1.result).text;
+            const t2 = output.formatContext(r2.result).text;
+            assert.strictEqual(t1, t2, 'tiered context output must be deterministic');
+            assert.ok(t1.includes('CALLERS — UNVERIFIED ('), 'fixture must exercise the unverified tier');
+            assert.ok(t1.includes('test callers:'), 'fixture must exercise the prod/test split');
+            assert.ok(t1.includes('ACCOUNT: "helper"'), 'ACCOUNT line present');
+        } finally { rm(dir); }
+    });
+
+    it('ACCOUNT line and tier headers identical across CLI and interactive', () => {
+        const dir = makeTieredFixture();
+        try {
+            const cliOut = runCli(dir, 'context', ['helper']);
+            const interOut = runInteractive(dir, ['context helper']);
+            const accountOf = (s) => (s.match(/^ACCOUNT: .*$/m) || [''])[0];
+            const tierHeaderOf = (s) => (s.match(/^CALLERS — CONFIRMED \([^)]*\):$/m) || [''])[0];
+            assert.ok(accountOf(cliOut).length > 0, `CLI must print ACCOUNT line: ${cliOut}`);
+            assert.strictEqual(accountOf(interOut), accountOf(cliOut), 'ACCOUNT identical CLI vs interactive');
+            assert.strictEqual(tierHeaderOf(interOut), tierHeaderOf(cliOut), 'tier header identical CLI vs interactive');
+        } finally { rm(dir); }
+    });
+
+    it('ACCOUNT line identical across CLI and MCP', async () => {
+        const dir = makeTieredFixture();
+        try {
+            const cliOut = runCli(dir, 'context', ['helper']);
+            const client = new McpClient();
+            await client.start();
+            await client.initialize();
+            try {
+                const res = await client.callTool({ command: 'context', project_dir: dir, name: 'helper' });
+                assert.ok(!res.isError, 'MCP context should succeed');
+                const accountOf = (s) => (s.match(/^ACCOUNT: .*$/m) || [''])[0];
+                assert.strictEqual(accountOf(res.text), accountOf(cliOut), 'ACCOUNT identical CLI vs MCP');
+                assert.ok(res.text.includes('CALLERS — UNVERIFIED ('), 'MCP renders unverified tier');
+            } finally {
+                client.stop();
+            }
+        } finally { rm(dir); }
+    });
+
+    it('text ACCOUNT arithmetic matches JSON meta.account (can never diverge)', () => {
+        const dir = makeTieredFixture();
+        try {
+            const text = runCli(dir, 'context', ['helper']);
+            const jsonOut = JSON.parse(runCli(dir, 'context', ['helper'], ['--json']));
+            const account = jsonOut.meta.account;
+            const m = text.match(/^ACCOUNT: "helper" occurs on (\d+) lines? in (\d+) files?: (\d+) confirmed, (\d+) unverified, (\d+) non-call \((\d+) import, (\d+) definition, (\d+) reference, (\d+) other-text\), (\d+) other-target, (\d+) unaccounted/m);
+            assert.ok(m, `ACCOUNT line must parse: ${text}`);
+            assert.strictEqual(Number(m[1]), account.groundTotal, 'groundTotal matches');
+            assert.strictEqual(Number(m[2]), account.fileCount, 'fileCount matches');
+            assert.strictEqual(Number(m[3]), account.confirmed, 'confirmed matches');
+            assert.strictEqual(Number(m[4]), account.unverified, 'unverified matches');
+            assert.strictEqual(Number(m[5]), account.nonCall.total, 'nonCall total matches');
+            assert.strictEqual(Number(m[10]), account.excluded.total, 'excluded matches');
+            assert.strictEqual(Number(m[11]), account.unaccounted, 'unaccounted matches');
+            assert.strictEqual(account.conserved, true, 'account conserves');
         } finally { rm(dir); }
     });
 });

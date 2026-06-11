@@ -43,6 +43,108 @@ function shouldShowReachability(items) {
     return items.some(c => c.reachable === false);
 }
 
+/**
+ * Reachability display policy for a section: per-line [unreachable] markers
+ * ONLY when reachability is mixed (they distinguish which); when ALL items are
+ * unreachable a single aggregate note carries the information without
+ * repeating a marker on every line. Suppressed entirely when the project has
+ * no detected entry points (hasEntrypoints === false) — "unreachable" would
+ * be meaningless for library code.
+ *
+ * @returns {{ perLine: boolean, note: string|null }}
+ */
+function reachabilityDisplay(items, hasEntrypoints, label) {
+    if (hasEntrypoints === false || !items || items.length === 0) return { perLine: false, note: null };
+    const unreachable = items.filter(c => c.reachable === false).length;
+    if (unreachable === 0) return { perLine: false, note: null };
+    if (unreachable === items.length) {
+        return { perLine: false, note: `  Note: all ${unreachable} ${label}${unreachable === 1 ? '' : 's'} unreachable from any entry point` };
+    }
+    return { perLine: true, note: `  Note: ${unreachable} of ${items.length} ${label}s unreachable from any entry point` };
+}
+
+// Display order for resolution labels in evidence aggregates (most → least confident)
+const RESOLUTION_ORDER = ['exact-binding', 'same-class', 'receiver-hint', 'scope-match', 'name-only', 'uncertain'];
+
+/**
+ * One aggregate evidence line per tier section, replacing per-edge confidence
+ * decimals: uniform → "evidence: scope-match (all)"; mixed → counts in
+ * RESOLUTION_ORDER. Returns null when no items carry a resolution.
+ */
+function formatEvidenceLine(items) {
+    if (!items || items.length === 0) return null;
+    const counts = new Map();
+    for (const it of items) {
+        if (!it.resolution) continue;
+        counts.set(it.resolution, (counts.get(it.resolution) || 0) + 1);
+    }
+    if (counts.size === 0) return null;
+    if (counts.size === 1) {
+        return `  evidence: ${counts.keys().next().value} (all)`;
+    }
+    const parts = [];
+    for (const r of RESOLUTION_ORDER) {
+        if (counts.has(r)) parts.push(`${counts.get(r)} ${r}`);
+    }
+    for (const [r, n] of counts) {
+        if (!RESOLUTION_ORDER.includes(r)) parts.push(`${n} ${r}`);
+    }
+    return `  evidence: ${parts.join(', ')}`;
+}
+
+/** Classify a caller entry as test or prod by its path. */
+function isTestEntry(entry) {
+    const { isTestPath } = require('../shared');
+    return isTestPath(entry.relativePath || entry.file || '');
+}
+
+/**
+ * Render the conservation contract lines: ACCOUNT (always), WARNING (unparsed
+ * files containing the symbol), FILTERED (display-filter hides). Returns [].
+ * when no account is present (e.g. class-type context).
+ */
+function formatAccountLines(account) {
+    if (!account) return [];
+    const lines = [];
+    const nc = account.nonCall || { imports: 0, definitions: 0, references: 0, unclassifiedText: 0, total: 0 };
+    let line = `ACCOUNT: "${account.symbol}" occurs on ${account.groundTotal} line${account.groundTotal === 1 ? '' : 's'}` +
+        ` in ${account.fileCount} file${account.fileCount === 1 ? '' : 's'}: ` +
+        `${account.confirmed} confirmed, ${account.unverified} unverified, ` +
+        `${nc.total} non-call (${nc.imports} import, ${nc.definitions} definition, ${nc.references} reference, ${nc.unclassifiedText} other-text), ` +
+        `${account.excluded ? account.excluded.total : 0} other-target, ` +
+        `${account.unaccounted} unaccounted`;
+    if (account.beyondText && account.beyondText.count > 0) {
+        line += ` (+${account.beyondText.count} beyond-text caller${account.beyondText.count === 1 ? '' : 's'} grep would miss)`;
+    }
+    lines.push(line);
+    if (account.unparsed && account.unparsed.fileCount > 0) {
+        lines.push(`WARNING: ${account.unparsed.fileCount} unparsed file${account.unparsed.fileCount === 1 ? '' : 's'} ` +
+            `contain${account.unparsed.fileCount === 1 ? 's' : ''} "${account.symbol}" ` +
+            `(${account.unparsed.lines} line${account.unparsed.lines === 1 ? '' : 's'}, NOT analyzed): ` +
+            account.unparsed.files.join(', '));
+    }
+    if (account.unreadableFiles && account.unreadableFiles.length > 0) {
+        lines.push(`WARNING: ${account.unreadableFiles.length} indexed-but-unreadable file(s) skipped: ${account.unreadableFiles.join(', ')}`);
+    }
+    if (account.filtered && account.filtered.total > 0) {
+        const parts = [];
+        const f = account.filtered.byFlag || {};
+        if (f.exclude) parts.push(`${f.exclude} --exclude`);
+        if (f.minConfidence) parts.push(`${f.minConfidence} --min-confidence`);
+        if (f.unreachableOnly) parts.push(`${f.unreachableOnly} --unreachable-only`);
+        lines.push(`FILTERED: ${account.filtered.total} hidden by flags (${parts.join(', ')})`);
+    }
+    return lines;
+}
+
+/** "NON-CALL OCCURRENCES" summary line from the account. */
+function formatNonCallLine(account, hintName) {
+    if (!account || !account.nonCall || account.nonCall.total === 0) return null;
+    const nc = account.nonCall;
+    return `NON-CALL OCCURRENCES: ${nc.total} (${nc.imports} imports, ${nc.definitions} definitions, ` +
+        `${nc.references} references, ${nc.unclassifiedText} other-text) — counts only; see: ucn usages ${hintName}`;
+}
+
 /** Format context (callers + callees) as JSON */
 function formatContextJson(context) {
     const meta = context.meta || { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 };
@@ -74,6 +176,14 @@ function formatContextJson(context) {
                     expression: c.content,
                     callerName: c.callerName
                 })),
+                unverifiedCallers: (context.unverifiedCallers || []).map(c => ({
+                    file: c.relativePath || c.file,
+                    line: c.line,
+                    expression: c.content,
+                    callerName: c.callerName ?? null,
+                    tier: 'unverified',
+                    ...(c.reason && { reason: c.reason }),
+                })),
                 ...(context.warnings && { warnings: context.warnings })
             }
         });
@@ -81,6 +191,7 @@ function formatContextJson(context) {
 
     // Standard function/method context
     const callers = context.callers || [];
+    const unverifiedCallers = context.unverifiedCallers || [];
     const callees = context.callees || [];
     return JSON.stringify({
         meta,
@@ -88,6 +199,7 @@ function formatContextJson(context) {
             function: context.function,
             file: context.file,
             callerCount: callers.length,
+            unverifiedCount: unverifiedCallers.length,
             calleeCount: callees.length,
             callerHistogram: context.callerHistogram || null,
             calleeHistogram: context.calleeHistogram || null,
@@ -97,7 +209,17 @@ function formatContextJson(context) {
                 expression: c.content,  // FULL expression
                 callerName: c.callerName,
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.tier && { tier: c.tier }),
                 ...(c.reachable !== undefined && { reachable: c.reachable }),
+            })),
+            unverifiedCallers: unverifiedCallers.map(c => ({
+                file: c.relativePath || c.file,
+                line: c.line,
+                expression: c.content,  // FULL expression
+                callerName: c.callerName ?? null,
+                ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                tier: 'unverified',
+                ...(c.reason && { reason: c.reason }),
             })),
             callees: callees.map(c => ({
                 name: c.name,
@@ -122,7 +244,6 @@ function formatContext(ctx, options = {}) {
     if (!ctx) return { text: 'Symbol not found.', expandable: [] };
 
     const expandHint = options.expandHint != null ? options.expandHint : 'Use ucn_expand with item number to see code for any item.';
-    const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded. Use include_methods=true to include them.';
 
     const lines = [];
     const expandable = [];
@@ -159,7 +280,7 @@ function formatContext(ctx, options = {}) {
         }
 
         const callers = ctx.callers || [];
-        lines.push(`\nCALLERS (${callers.length}):`);
+        lines.push(`\nCALLERS — CONFIRMED (${callers.length}):`);
         for (const c of callers) {
             const callerName = c.callerName ? ` [${c.callerName}]` : '';
             lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
@@ -174,6 +295,40 @@ function formatContext(ctx, options = {}) {
                 startLine: c.callerStartLine || c.line,
                 endLine: c.callerEndLine || c.line
             });
+        }
+
+        const typeUnverified = ctx.unverifiedCallers || [];
+        if (typeUnverified.length > 0) {
+            lines.push(`\nCALLERS — UNVERIFIED (${typeUnverified.length}) — call syntax, no binding/receiver evidence:`);
+            const cap = 10;
+            let shown = 0;
+            for (const u of typeUnverified) {
+                if (shown >= cap) break;
+                const callerName = u.callerName ? ` [${u.callerName}]` : '';
+                const reason = u.reason ? ` (${u.reason})` : '';
+                const expr = u.content ? `: ${u.content.trim().replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`  [${itemNum}] ${u.relativePath}:${u.line}${callerName}${expr}${reason}`);
+                expandable.push({
+                    num: itemNum++,
+                    type: 'caller',
+                    name: u.callerName || '(module level)',
+                    file: u.callerFile || u.file,
+                    relativePath: u.relativePath,
+                    line: u.line,
+                    startLine: u.callerStartLine || u.line,
+                    endLine: u.callerEndLine || u.line
+                });
+                shown++;
+            }
+            if (typeUnverified.length > shown) {
+                lines.push(`  (+${typeUnverified.length - shown} more unverified — use --all)`);
+            }
+        }
+
+        const typeAccountLines = formatAccountLines(ctx.meta && ctx.meta.account);
+        if (typeAccountLines.length > 0) {
+            lines.push('');
+            lines.push(...typeAccountLines);
         }
 
         if (expandable.length > 0) {
@@ -195,16 +350,10 @@ function formatContext(ctx, options = {}) {
     if (ctx.meta) {
         const notes = [];
         if (ctx.meta.dynamicImports) { const dn = dynamicImportsNote(ctx.meta.dynamicImports, ctx.meta); if (dn) notes.push(dn); }
-        if (ctx.meta.uncertain) notes.push(`${ctx.meta.uncertain} uncertain call(s) skipped`);
         if (ctx.meta.confidenceFiltered) notes.push(`${ctx.meta.confidenceFiltered} edge(s) below confidence threshold hidden`);
         if (notes.length) {
-            const uncertainSuffix = ctx.meta.uncertain && options.uncertainHint ? ` — ${options.uncertainHint}` : '';
-            lines.push(`  Note: ${notes.join(', ')}${uncertainSuffix}`);
+            lines.push(`  Note: ${notes.join(', ')}`);
         }
-    }
-
-    if (ctx.meta && ctx.meta.includeMethods === false) {
-        lines.push(`  ${methodsHint}`);
     }
 
     if (ctx.warnings && ctx.warnings.length > 0) {
@@ -213,27 +362,30 @@ function formatContext(ctx, options = {}) {
         }
     }
 
-    const showConf = options.showConfidence || false;
+    // Reachability markers are suppressed when the project has no detected
+    // entry points (library code) — "unreachable" would be meaningless noise.
+    const hasEntrypoints = !ctx.meta || ctx.meta.hasEntrypoints !== false;
+
     const callers = ctx.callers || [];
-    lines.push(`${compact ? '' : '\n'}CALLERS (${callers.length}):`);
-    const callerHistLine = showConf ? formatHistogramLine(ctx.callerHistogram) : null;
-    if (callerHistLine) lines.push(callerHistLine);
-    const showCallerReach = shouldShowReachability(callers);
-    for (const c of callers) {
+    const prodCallers = callers.filter(c => !isTestEntry(c));
+    const testCallers = callers.filter(c => isTestEntry(c));
+    const tierHeader = testCallers.length > 0
+        ? `CALLERS — CONFIRMED (${callers.length}, ${prodCallers.length} prod + ${testCallers.length} test):`
+        : `CALLERS — CONFIRMED (${callers.length}):`;
+    lines.push(`${compact ? '' : '\n'}${tierHeader}`);
+    const callerEvidence = formatEvidenceLine(callers);
+    if (callerEvidence && !compact) lines.push(callerEvidence);
+    const callerReach = reachabilityDisplay(callers, hasEntrypoints, 'caller');
+    const renderCaller = (c) => {
         const callerName = c.callerName ? ` [${c.callerName}]` : '';
+        const unreachableMark = (callerReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
         if (compact) {
             // One line per caller: "[N] file:line [callerName]: expression"
             const expr = c.content ? c.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
-            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}: ${expr}`);
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}${unreachableMark}: ${expr}`);
         } else {
-            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}`);
+            lines.push(`  [${itemNum}] ${c.relativePath}:${c.line}${callerName}${unreachableMark}`);
             lines.push(`    ${c.content.trim()}`);
-        }
-        if (showConf && c.confidence != null && !compact) {
-            lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
-        }
-        if (showCallerReach && c.reachable === false && !compact) {
-            lines.push('    (unreachable from any entry point)');
         }
         expandable.push({
             num: itemNum++,
@@ -245,7 +397,13 @@ function formatContext(ctx, options = {}) {
             startLine: c.callerStartLine || c.line,
             endLine: c.callerEndLine || c.line
         });
+    };
+    for (const c of prodCallers) renderCaller(c);
+    if (testCallers.length > 0) {
+        if (!compact) lines.push('  test callers:');
+        for (const c of testCallers) renderCaller(c);
     }
+    if (callerReach.note && !compact) lines.push(callerReach.note);
 
     // Structural hint: class methods may have callers through constructed/injected instances
     // that static analysis can't track. Only show when caller count is low (≤3) to avoid noise.
@@ -253,31 +411,57 @@ function formatContext(ctx, options = {}) {
         lines.push(`  Note: ${ctx.function} is a class/struct method — additional callers through constructed or injected instances are not tracked by static analysis.`);
     }
 
+    // UNVERIFIED tier: call-syntax matches without binding/receiver evidence.
+    // Always visible (the contract: never silently hide an occurrence), capped
+    // at 10 one-liners unless --all.
+    const unverified = ctx.unverifiedCallers || [];
+    if (unverified.length > 0) {
+        lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${unverified.length}) — call syntax, no binding/receiver evidence:`);
+        const cap = (ctx.meta && ctx.meta.all) ? Infinity : 10;
+        let shown = 0;
+        for (const u of unverified) {
+            if (shown >= cap) break;
+            const callerName = u.callerName ? ` [${u.callerName}]` : '';
+            const reason = u.reason ? ` (${u.reason})` : '';
+            const expr = u.content ? `: ${u.content.trim().replace(/\s+/g, ' ').slice(0, 100)}` : '';
+            lines.push(`  [${itemNum}] ${u.relativePath}:${u.line}${callerName}${expr}${reason}`);
+            expandable.push({
+                num: itemNum++,
+                type: 'caller',
+                name: u.callerName || '(module level)',
+                file: u.callerFile || u.file,
+                relativePath: u.relativePath,
+                line: u.line,
+                startLine: u.callerStartLine || u.line,
+                endLine: u.callerEndLine || u.line
+            });
+            shown++;
+        }
+        if (unverified.length > shown) {
+            lines.push(`  (+${unverified.length - shown} more unverified — use --all)`);
+        }
+    }
+
     const callees = ctx.callees || [];
     lines.push(`${compact ? '' : '\n'}CALLEES (${callees.length}):`);
-    const calleeHistLine = showConf ? formatHistogramLine(ctx.calleeHistogram) : null;
-    if (calleeHistLine && !compact) lines.push(calleeHistLine);
-    const showCalleeReach = shouldShowReachability(callees);
+    const calleeEvidence = formatEvidenceLine(callees);
+    if (calleeEvidence && !compact) lines.push(calleeEvidence);
+    const calleeReach = reachabilityDisplay(callees, hasEntrypoints, 'callee');
     for (const c of callees) {
         const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
         const returnSuffix = c.returnType ? ` → ${c.returnType}` : '';
         const sideEffects = (c.sideEffects && c.sideEffects.length) ? ` {${c.sideEffects.join(',')}}` : '';
+        const unreachableMark = (calleeReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
         if (compact) {
             const snip = c.docstring ? calleeDocstringSnippet(c.docstring) : '';
             const docPart = snip ? `: ${snip}` : '';
-            lines.push(`  [${itemNum}] ${c.name}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${docPart}`);
+            lines.push(`  [${itemNum}] ${c.name}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${docPart}${unreachableMark}`);
         } else {
-            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}`);
+            lines.push(`  [${itemNum}] ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.relativePath}:${c.startLine}${unreachableMark}`);
             if (c.docstring) {
                 const snip = calleeDocstringSnippet(c.docstring);
                 if (snip) lines.push(`    "${snip}"`);
             }
-        }
-        if (showConf && c.confidence != null && !compact) {
-            lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
-        }
-        if (showCalleeReach && c.reachable === false && !compact) {
-            lines.push('    (unreachable from any entry point)');
         }
         expandable.push({
             num: itemNum++,
@@ -288,6 +472,19 @@ function formatContext(ctx, options = {}) {
             startLine: c.startLine,
             endLine: c.endLine
         });
+    }
+    if (calleeReach.note && !compact) lines.push(calleeReach.note);
+
+    // Conservation contract lines: non-call summary + ACCOUNT/WARNING/FILTERED
+    const account = ctx.meta && ctx.meta.account;
+    if (account) {
+        const nonCallLine = formatNonCallLine(account, ctx.function);
+        if (nonCallLine) lines.push(`${compact ? '' : '\n'}${nonCallLine}`);
+        const accountLines = formatAccountLines(account);
+        if (accountLines.length > 0) {
+            if (!compact && !nonCallLine) lines.push('');
+            lines.push(...accountLines);
+        }
     }
 
     if (expandable.length > 0) {
@@ -313,11 +510,13 @@ function formatImpact(impact, options = {}) {
     if (!compact) lines.push(impact.signature);
     if (!compact) lines.push('');
 
-    // Summary
+    // Summary (confirmed + unverified tiers reported separately)
+    const impactUnverified = impact.unverifiedSites || [];
+    const unverifiedSuffix = impactUnverified.length > 0 ? ` confirmed + ${impactUnverified.length} unverified` : '';
     if (impact.shownCallSites !== undefined && impact.shownCallSites < impact.totalCallSites) {
-        lines.push(`CALL SITES: ${impact.shownCallSites} shown of ${impact.totalCallSites} total`);
+        lines.push(`CALL SITES: ${impact.shownCallSites} shown of ${impact.totalCallSites}${unverifiedSuffix ? ` total${unverifiedSuffix}` : ' total'}`);
     } else {
-        lines.push(`CALL SITES: ${impact.totalCallSites}`);
+        lines.push(`CALL SITES: ${impact.totalCallSites}${unverifiedSuffix}`);
     }
     lines.push(`  Files affected: ${impact.byFile.length}`);
 
@@ -347,17 +546,18 @@ function formatImpact(impact, options = {}) {
         lines.push(`  Note: ${impact.scopeWarning.hint}`);
     }
 
-    // By file
+    // By file (confirmed tier)
     if (!compact) lines.push('');
     lines.push('BY FILE:');
 
-    // Histogram (over the trust signals collected before truncation)
-    const impactHistLine = formatHistogramLine(impact.callerHistogram);
-    if (impactHistLine) lines.push(impactHistLine);
-
-    // Compute reachability marker visibility across ALL sites (not per-file)
+    // Evidence aggregate over ALL sites (replaces per-edge confidence lines)
     const allSites = impact.byFile.flatMap(g => g.sites);
-    const showImpactReach = shouldShowReachability(allSites);
+    const impactEvidence = formatEvidenceLine(allSites);
+    if (impactEvidence && !compact) lines.push(impactEvidence);
+
+    // Reachability policy across ALL sites (not per-file); suppressed entirely
+    // when the project has no detected entry points.
+    const impactReach = reachabilityDisplay(allSites, impact.hasEntrypoints, 'call site');
 
     for (const fileGroup of impact.byFile) {
         if (compact) {
@@ -365,23 +565,44 @@ function formatImpact(impact, options = {}) {
             for (const site of fileGroup.sites) {
                 const caller = site.callerName ? ` [${site.callerName}]` : '';
                 const expr = site.expression ? site.expression.replace(/\s+/g, ' ').slice(0, 100) : '';
-                const reach = (showImpactReach && site.reachable === false) ? ' (unreachable)' : '';
+                const reach = (impactReach.perLine && site.reachable === false) ? ' [unreachable]' : '';
                 lines.push(`  ${fileGroup.file}:${site.line}${caller}${reach}: ${expr}`);
             }
         } else {
             lines.push(`\n${fileGroup.file} (${fileGroup.count} calls)`);
             for (const site of fileGroup.sites) {
                 const caller = site.callerName ? `[${site.callerName}]` : '';
-                lines.push(`  :${site.line} ${caller}`);
+                const reach = (impactReach.perLine && site.reachable === false) ? ' [unreachable]' : '';
+                lines.push(`  :${site.line} ${caller}${reach}`);
                 lines.push(`    ${site.expression}`);
                 if (site.args && site.args.length > 0) {
                     lines.push(`    args: ${site.args.join(', ')}`);
                 }
-                if (showImpactReach && site.reachable === false) {
-                    lines.push('    (unreachable from any entry point)');
-                }
             }
         }
+    }
+    if (impactReach.note && !compact) lines.push(impactReach.note);
+
+    // Unverified tier: visible, capped at 10 one-liners
+    if (impactUnverified.length > 0) {
+        lines.push(`${compact ? '' : '\n'}UNVERIFIED CALL SITES (${impactUnverified.length}) — call syntax, no binding/receiver evidence:`);
+        const cap = 10;
+        for (const site of impactUnverified.slice(0, cap)) {
+            const caller = site.callerName ? ` [${site.callerName}]` : '';
+            const reason = site.reason ? ` (${site.reason})` : '';
+            const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+            lines.push(`  ${site.file}:${site.line}${caller}${expr}${reason}`);
+        }
+        if (impactUnverified.length > cap) {
+            lines.push(`  (+${impactUnverified.length - cap} more unverified)`);
+        }
+    }
+
+    // Conservation contract lines
+    const impactAccountLines = formatAccountLines(impact.account);
+    if (impactAccountLines.length > 0) {
+        if (!compact) lines.push('');
+        lines.push(...impactAccountLines);
     }
 
     return lines.join('\n');
@@ -460,35 +681,57 @@ function formatAbout(about, options = {}) {
         lines.push(`  Note: ${about.confidenceFiltered} edge(s) below confidence threshold hidden`);
     }
 
-    // Usage summary
+    // Usage summary (fast-path approximation; ACCOUNT below is the exact
+    // text-ground truth — both are labeled to avoid confusion)
     lines.push('');
     lines.push(`USAGES: ${about.totalUsages} total`);
     lines.push(`  ${about.usages.calls} calls, ${about.usages.imports} imports, ${about.usages.references} references`);
 
-    // Callers
-    const showConf = options.showConfidence || false;
+    // Callers — CONFIRMED tier, prod before test
+    const hasEntrypoints = about.hasEntrypoints !== false;
     let aboutTruncated = false;
     if (about.callers.total > 0) {
         lines.push('');
-        if (about.callers.total > about.callers.top.length) {
-            lines.push(`CALLERS (showing ${about.callers.top.length} of ${about.callers.total}):`);
+        const top = about.callers.top;
+        const prodTop = top.filter(c => !isTestEntry(c));
+        const testTop = top.filter(c => isTestEntry(c));
+        const split = testTop.length > 0 ? `, ${prodTop.length} prod + ${testTop.length} test shown` : '';
+        if (about.callers.total > top.length) {
+            lines.push(`CALLERS — CONFIRMED (showing ${top.length} of ${about.callers.total}${split}):`);
             aboutTruncated = true;
         } else {
-            lines.push(`CALLERS (${about.callers.total}):`);
+            lines.push(`CALLERS — CONFIRMED (${about.callers.total}${testTop.length > 0 ? `, ${prodTop.length} prod + ${testTop.length} test` : ''}):`);
         }
-        const aboutCallerHist = showConf ? formatHistogramLine(about.callers.histogram) : null;
-        if (aboutCallerHist) lines.push(aboutCallerHist);
-        const showAboutCallerReach = shouldShowReachability(about.callers.top);
-        for (const c of about.callers.top) {
+        const callerEvidence = formatEvidenceLine(top);
+        if (callerEvidence) lines.push(callerEvidence);
+        const aboutCallerReach = reachabilityDisplay(top, hasEntrypoints, 'caller');
+        const renderAboutCaller = (c) => {
             const caller = c.callerName ? `[${c.callerName}]` : '';
-            lines.push(`  ${c.file}:${c.line} ${caller}`);
+            const unreachableMark = (aboutCallerReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
+            lines.push(`  ${c.file}:${c.line} ${caller}${unreachableMark}`);
             lines.push(`    ${c.expression}`);
-            if (showConf && c.confidence != null) {
-                lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
-            }
-            if (showAboutCallerReach && c.reachable === false) {
-                lines.push('    (unreachable from any entry point)');
-            }
+        };
+        for (const c of prodTop) renderAboutCaller(c);
+        if (testTop.length > 0) {
+            lines.push('  test callers:');
+            for (const c of testTop) renderAboutCaller(c);
+        }
+        if (aboutCallerReach.note) lines.push(aboutCallerReach.note);
+    }
+
+    // Callers — UNVERIFIED tier (always visible; the contract forbids hiding)
+    const aboutUnverified = about.callers.unverified;
+    if (aboutUnverified && aboutUnverified.total > 0) {
+        lines.push('');
+        lines.push(`CALLERS — UNVERIFIED (${aboutUnverified.total}) — call syntax, no binding/receiver evidence:`);
+        for (const u of aboutUnverified.top) {
+            const caller = u.callerName ? ` [${u.callerName}]` : '';
+            const reason = u.reason ? ` (${u.reason})` : '';
+            const expr = u.expression ? `: ${u.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+            lines.push(`  ${u.file}:${u.line}${caller}${expr}${reason}`);
+        }
+        if (aboutUnverified.total > aboutUnverified.top.length) {
+            lines.push(`  (+${aboutUnverified.total - aboutUnverified.top.length} more unverified — use --all)`);
         }
     }
 
@@ -501,23 +744,18 @@ function formatAbout(about, options = {}) {
         } else {
             lines.push(`CALLEES (${about.callees.total}):`);
         }
-        const aboutCalleeHist = showConf ? formatHistogramLine(about.callees.histogram) : null;
-        if (aboutCalleeHist) lines.push(aboutCalleeHist);
-        const showAboutCalleeReach = shouldShowReachability(about.callees.top);
+        const calleeEvidence = formatEvidenceLine(about.callees.top);
+        if (calleeEvidence) lines.push(calleeEvidence);
+        const aboutCalleeReach = reachabilityDisplay(about.callees.top, hasEntrypoints, 'callee');
         for (const c of about.callees.top) {
             const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
             const returnSuffix = c.returnType ? ` → ${c.returnType}` : '';
             const sideEffects = (c.sideEffects && c.sideEffects.length) ? ` {${c.sideEffects.join(',')}}` : '';
-            lines.push(`  ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.file}:${c.line} (${c.callCount}x)`);
+            const unreachableMark = (aboutCalleeReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
+            lines.push(`  ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.file}:${c.line} (${c.callCount}x)${unreachableMark}`);
             if (c.docstring) {
                 const snip = calleeDocstringSnippet(c.docstring);
                 if (snip) lines.push(`    "${snip}"`);
-            }
-            if (showConf && c.confidence != null) {
-                lines.push(`    confidence: ${c.confidence.toFixed(2)} (${c.resolution})`);
-            }
-            if (showAboutCalleeReach && c.reachable === false) {
-                lines.push('    (unreachable from any entry point)');
             }
 
             // Inline expansion: show first 3 lines of callee code
@@ -539,6 +777,17 @@ function formatAbout(about, options = {}) {
                     // Skip expansion on error
                 }
             }
+        }
+        if (aboutCalleeReach.note) lines.push(aboutCalleeReach.note);
+    }
+
+    // Conservation contract: exact text-ground reconciliation (ACCOUNT) plus
+    // unparsed-file warnings and display-filter notes.
+    if (about.account) {
+        const accountLines = formatAccountLines(about.account);
+        if (accountLines.length > 0) {
+            lines.push('');
+            lines.push(...accountLines);
         }
     }
 
@@ -595,11 +844,6 @@ function formatAbout(about, options = {}) {
     if (aboutTruncated) {
         const allHint = options.allHint || 'Use --all to show all.';
         lines.push(`\nSome sections truncated. ${allHint}`);
-    }
-
-    if (about.includeMethods === false) {
-        const methodsHint = options.methodsHint || 'Note: obj.method() callers/callees excluded — use --include-methods to include them';
-        lines.push(`\n${methodsHint}`);
     }
 
     return lines.join('\n');

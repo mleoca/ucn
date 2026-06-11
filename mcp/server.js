@@ -261,8 +261,8 @@ server.registerTool(
             exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
             exclude_tests: z.boolean().optional().describe('Exclude test files from results. Used by entrypoints (where tests are included by default).'),
-            include_methods: z.boolean().optional().describe('Include obj.method() calls (default: true for about/trace)'),
-            include_uncertain: z.boolean().optional().describe('Include uncertain/ambiguous matches'),
+            include_methods: z.boolean().optional().describe('Include obj.method() calls in trace/blast/smart/verify (implied for about/context/impact — method calls tiered by receiver evidence)'),
+            include_uncertain: z.boolean().optional().describe('Include uncertain matches in trace/blast/smart/verify (implied for about/context/impact — unverified callers always shown, tiered)'),
             min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
             show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),
             hide_confidence: z.boolean().optional().describe('Hide confidence scores per edge (alias of show_confidence=false).'),
@@ -392,7 +392,6 @@ server.registerTool(
                 if (!ok) return te(error);
                 let aboutText = output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
-                    methodsHint: 'Note: obj.method() callers/callees excluded. Use include_methods=true to include them.',
                     showConfidence: ep.showConfidence !== false,
                 });
                 if (note) aboutText += '\n\n' + note;

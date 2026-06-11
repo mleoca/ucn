@@ -859,8 +859,8 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('USAGES: 8 total'), 'Should show usage summary');
             assert.ok(text.includes('5 calls'), 'Should show call count');
 
-            // Callers
-            assert.ok(text.includes('CALLERS (2):'), 'Should show callers section');
+            // Callers (tiered contract header)
+            assert.ok(text.includes('CALLERS — CONFIRMED (2):'), 'Should show confirmed callers section');
             assert.ok(text.includes('src/main.js:15'), 'Should show caller location');
             assert.ok(text.includes('[main]'), 'Should show caller name');
 
@@ -915,7 +915,7 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('b.js:10'), 'Should show other definition location');
         });
 
-        it('includes-methods hint when includeMethods is false', () => {
+        it('no methods-excluded hint under the tiered contract (method calls always analyzed)', () => {
             const about = {
                 found: true,
                 symbol: { name: 'fn', type: 'function', file: 'a.js', startLine: 1, endLine: 3 },
@@ -929,7 +929,7 @@ describe('New Formatter Coverage', () => {
                 includeMethods: false
             };
             const text = output.formatAbout(about);
-            assert.ok(text.includes('obj.method()'), 'Should mention method calls excluded');
+            assert.ok(!text.includes('obj.method()'), 'Hint is superseded by the UNVERIFIED tier');
         });
 
         it('shows confidence note when confidenceFiltered is set', () => {
@@ -950,7 +950,7 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('3 edge(s) below confidence threshold hidden'), 'Should show filtered count');
         });
 
-        it('shows confidence per edge when showConfidence is true', () => {
+        it('shows aggregate evidence line instead of per-edge confidence', () => {
             const about = {
                 found: true,
                 symbol: { name: 'fn', type: 'function', file: 'lib.js', startLine: 1, endLine: 3 },
@@ -964,7 +964,8 @@ describe('New Formatter Coverage', () => {
                 includeMethods: false
             };
             const text = output.formatAbout(about, { showConfidence: true });
-            assert.ok(text.includes('confidence: 0.98 (exact-binding)'), 'Should show confidence per caller');
+            assert.ok(text.includes('evidence: exact-binding (all)'), 'Should show aggregate evidence line');
+            assert.ok(!text.includes('confidence: 0.98'), 'Per-edge decimals removed from text output');
         });
 
     });
@@ -998,7 +999,7 @@ describe('New Formatter Coverage', () => {
             const { text, expandable } = output.formatContext(ctx);
 
             assert.ok(text.includes('Context for handleRequest:'), 'Should show function name');
-            assert.ok(text.includes('CALLERS (1):'), 'Should show callers section');
+            assert.ok(text.includes('CALLERS — CONFIRMED (1):'), 'Should show confirmed callers section');
             assert.ok(text.includes('src/app.js:20'), 'Should show caller location');
             assert.ok(text.includes('[startServer]'), 'Should show caller name');
             assert.ok(text.includes('CALLEES (2):'), 'Should show callees section');
@@ -1031,7 +1032,7 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('METHODS (2):'), 'Should show methods section');
             assert.ok(text.includes('getUser(id)'), 'Should show method signature');
             assert.ok(text.includes('saveUser(user)'), 'Should show second method');
-            assert.ok(text.includes('CALLERS (1):'), 'Should show callers section');
+            assert.ok(text.includes('CALLERS — CONFIRMED (1):'), 'Should show confirmed callers section');
 
             // Expandable: 2 methods + 1 caller = 3
             assert.strictEqual(expandable.length, 3);
@@ -1039,7 +1040,7 @@ describe('New Formatter Coverage', () => {
             assert.strictEqual(expandable[2].type, 'caller');
         });
 
-        it('shows methods-excluded hint when includeMethods is false', () => {
+        it('no methods-excluded hint under the tiered contract', () => {
             const ctx = {
                 function: 'fn',
                 file: 'a.js',
@@ -1050,10 +1051,74 @@ describe('New Formatter Coverage', () => {
                 meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: false }
             };
             const { text } = output.formatContext(ctx);
-            assert.ok(text.includes('obj.method() calls excluded'), 'Should show methods-excluded hint');
+            assert.ok(!text.includes('obj.method() calls excluded'), 'Hint superseded by the UNVERIFIED tier');
         });
 
-        it('shows uncertain calls note in meta', () => {
+        it('renders unverified callers section with reasons and cap', () => {
+            const ctx = {
+                function: 'fn',
+                file: 'a.js',
+                startLine: 1,
+                endLine: 3,
+                callers: [],
+                unverifiedCallers: [
+                    { relativePath: 'svc.js', line: 4, content: 'm.fn()', callerName: 'run', reason: 'method-no-evidence' },
+                    { relativePath: 'svc.js', line: 9, content: 'x.fn()', callerName: null, reason: 'ambiguous-binding' },
+                ],
+                callees: [],
+                meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 2, includeMethods: false }
+            };
+            const { text, expandable } = output.formatContext(ctx);
+            assert.ok(text.includes('CALLERS — UNVERIFIED (2) — call syntax, no binding/receiver evidence:'),
+                'Should render unverified tier header');
+            assert.ok(text.includes('svc.js:4 [run]: m.fn() (method-no-evidence)'), 'Entry shows expression and reason');
+            assert.ok(text.includes('(ambiguous-binding)'), 'Second entry shows its reason');
+            assert.strictEqual(expandable.length, 2, 'Unverified entries are expandable');
+        });
+
+        it('caps unverified display at 10 with a +more hint, --all lifts it', () => {
+            const mk = (i) => ({ relativePath: 'a.js', line: i + 1, content: `m.fn(${i})`, reason: 'method-no-evidence' });
+            const ctx = {
+                function: 'fn', file: 'a.js', startLine: 1, endLine: 3,
+                callers: [], callees: [],
+                unverifiedCallers: Array.from({ length: 13 }, (_, i) => mk(i)),
+                meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 13 }
+            };
+            const { text } = output.formatContext(ctx);
+            assert.ok(text.includes('(+3 more unverified — use --all)'), 'Cap note shows remainder');
+            const all = output.formatContext({ ...ctx, meta: { ...ctx.meta, all: true } });
+            assert.ok(!all.text.includes('more unverified'), '--all lifts the cap');
+            assert.ok(all.text.includes('m.fn(12)'), 'All entries rendered under --all');
+        });
+
+        it('renders ACCOUNT line and unparsed WARNING from meta.account', () => {
+            const ctx = {
+                function: 'fn', file: 'a.js', startLine: 1, endLine: 3,
+                callers: [], callees: [],
+                meta: {
+                    complete: true, skipped: 0, dynamicImports: 0, uncertain: 0,
+                    account: {
+                        symbol: 'fn', groundTotal: 7, fileCount: 3,
+                        confirmed: 2, unverified: 1,
+                        nonCall: { imports: 1, definitions: 1, references: 0, unclassifiedText: 1, total: 3 },
+                        excluded: { total: 0, byReason: {} },
+                        unparsed: { fileCount: 1, lines: 1, files: ['legacy/old-parser.js'] },
+                        unreadableFiles: [],
+                        beyondText: { count: 1, sample: [] },
+                        unaccounted: 0, conserved: true,
+                    }
+                }
+            };
+            const { text } = output.formatContext(ctx);
+            assert.ok(text.includes('ACCOUNT: "fn" occurs on 7 lines in 3 files: 2 confirmed, 1 unverified, 3 non-call (1 import, 1 definition, 0 reference, 1 other-text), 0 other-target, 0 unaccounted (+1 beyond-text caller grep would miss)'),
+                `ACCOUNT line exact format: ${text}`);
+            assert.ok(text.includes('WARNING: 1 unparsed file contains "fn" (1 line, NOT analyzed): legacy/old-parser.js'),
+                'Unparsed warning rendered');
+            assert.ok(text.includes('NON-CALL OCCURRENCES: 3 (1 imports, 1 definitions, 0 references, 1 other-text)'),
+                'Non-call summary rendered');
+        });
+
+        it('dynamic imports note still renders; uncertain note superseded by tier section', () => {
             const ctx = {
                 function: 'fn',
                 file: 'a.js',
@@ -1065,7 +1130,7 @@ describe('New Formatter Coverage', () => {
             };
             const { text } = output.formatContext(ctx);
             assert.ok(text.includes('2 dynamic import(s)'), 'Should show dynamic import count');
-            assert.ok(text.includes('3 uncertain call(s) skipped'), 'Should show uncertain count');
+            assert.ok(!text.includes('uncertain call(s) skipped'), 'Uncertain note superseded by UNVERIFIED tier');
         });
 
     });
@@ -2285,7 +2350,7 @@ describe('Bug Hunt: formatExampleJson null best', () => {
 // ============================================================================
 
 describe('Confidence rendering in formatContext', () => {
-    it('shows confidence when showConfidence is true', () => {
+    it('shows aggregate evidence lines instead of per-edge confidence', () => {
         const ctx = {
             function: 'myFn',
             file: 'a.js',
@@ -2302,23 +2367,26 @@ describe('Confidence rendering in formatContext', () => {
             meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 0, includeMethods: false },
         };
         const { text } = output.formatContext(ctx, { showConfidence: true });
-        assert.ok(text.includes('confidence: 0.98 (exact-binding)'), 'should show caller confidence');
-        assert.ok(text.includes('confidence: 0.65 (scope-match)'), 'should show callee confidence');
+        assert.ok(text.includes('evidence: exact-binding (all)'), 'caller section shows evidence aggregate');
+        assert.ok(text.includes('evidence: scope-match (all)'), 'callee section shows evidence aggregate');
+        assert.ok(!text.includes('confidence: 0.98'), 'per-edge decimals removed from text output');
     });
 
-    it('hides confidence when showConfidence is false', () => {
+    it('mixed resolutions render as ordered counts', () => {
         const ctx = {
             function: 'myFn',
             file: 'a.js',
-            callers: [{
-                relativePath: 'b.js', line: 10, content: 'myFn()',
-                callerName: 'caller1', confidence: 0.98, resolution: 'exact-binding',
-            }],
+            callers: [
+                { relativePath: 'b.js', line: 10, content: 'myFn()', callerName: 'c1', confidence: 0.98, resolution: 'exact-binding' },
+                { relativePath: 'b.js', line: 20, content: 'myFn()', callerName: 'c2', confidence: 0.98, resolution: 'exact-binding' },
+                { relativePath: 'c.js', line: 5, content: 'myFn()', callerName: 'c3', confidence: 0.65, resolution: 'scope-match' },
+            ],
             callees: [],
             meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 0, includeMethods: false },
         };
-        const { text } = output.formatContext(ctx, { showConfidence: false });
-        assert.ok(!text.includes('confidence:'), 'should not show confidence');
+        const { text } = output.formatContext(ctx);
+        assert.ok(text.includes('evidence: 2 exact-binding, 1 scope-match'),
+            `mixed evidence aggregated in resolution order: ${text}`);
     });
 
     it('shows confidenceFiltered note when edges filtered', () => {

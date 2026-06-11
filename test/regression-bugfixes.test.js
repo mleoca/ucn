@@ -1005,7 +1005,7 @@ describe('fix #13: plan rejects duplicate parameter', () => {
 // ============================================================================
 
 describe('fix #14 (updated by H3): about excludes obj.method, impact defaults to including', () => {
-    it('about excludes obj.method() callers by default; impact now includes them (H3)', () => {
+    it('about and impact both tier method callers by receiver evidence (supersedes H3 split)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function parse(text) { return text; }\nmodule.exports = { parse };',
@@ -1019,22 +1019,25 @@ describe('fix #14 (updated by H3): about excludes obj.method, impact defaults to
             const impactNoMethods = execute(index, 'impact', { name: 'parse', includeMethods: false });
             assert.ok(aboutResult.ok);
             assert.ok(impactResult.ok);
-            // BUG-H3: impact now defaults to includeMethods:true ("what breaks if I change this"
-            // should reach all callable sites). about keeps the old default (false for
-            // standalone functions). With includeMethods=false they agree again.
+            // Tiered contract: about and impact BOTH analyze method calls and
+            // tier them by receiver evidence. obj.parse() has receiver binding
+            // evidence (obj = require) → confirmed; both confirmed totals
+            // include it, and --no-include-methods is a deprecated no-op.
             const aboutCallers = aboutResult.result.callers.total;
             const impactCallers = impactResult.result.totalCallSites;
             const impactNoMethodsCount = impactNoMethods.result.totalCallSites;
-            assert.strictEqual(aboutCallers, impactNoMethodsCount,
-                `about (${aboutCallers}) and impact --no-include-methods (${impactNoMethodsCount}) should agree`);
-            assert.ok(impactCallers >= impactNoMethodsCount,
-                `impact default (${impactCallers}) should include at least as many sites as --no-include-methods (${impactNoMethodsCount})`);
+            assert.strictEqual(aboutCallers, 2,
+                `about confirmed tier includes evidence-backed method callers, got ${aboutCallers}`);
+            assert.strictEqual(impactCallers, aboutCallers,
+                `impact (${impactCallers}) and about (${aboutCallers}) confirmed tiers should agree`);
+            assert.strictEqual(impactNoMethodsCount, impactCallers,
+                `--no-include-methods is a deprecated no-op for impact (${impactNoMethodsCount} vs ${impactCallers})`);
         } finally {
             rm(dir);
         }
     });
 
-    it('about with includeMethods=true shows more callers', () => {
+    it('about includeMethods flag is an implied no-op (tiered contract)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function parse(text) { return text; }\nmodule.exports = { parse };',
@@ -1047,9 +1050,8 @@ describe('fix #14 (updated by H3): about excludes obj.method, impact defaults to
             const withMethods = execute(index, 'about', { name: 'parse', includeMethods: true });
             assert.ok(defaultResult.ok);
             assert.ok(withMethods.ok);
-            // With includeMethods=true, should have >= default callers
-            assert.ok(withMethods.result.callers.total >= defaultResult.result.callers.total,
-                'includeMethods=true should show at least as many callers as default');
+            assert.strictEqual(withMethods.result.callers.total, defaultResult.result.callers.total,
+                'includeMethods=true must not change the confirmed tier (implied no-op)');
         } finally {
             rm(dir);
         }

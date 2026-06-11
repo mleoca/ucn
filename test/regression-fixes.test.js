@@ -2464,7 +2464,7 @@ describe('Bug Hunt: formatContext method exclusion hint', () => {
             'should not show method exclusion hint when includeMethods is not set');
     });
 
-    it('should show method exclusion hint when includeMethods is explicitly false', () => {
+    it('no method exclusion hint even when includeMethods is explicitly false (tiered contract)', () => {
         const ctx = {
             name: 'testFn',
             type: 'function',
@@ -2477,8 +2477,8 @@ describe('Bug Hunt: formatContext method exclusion hint', () => {
             warnings: []
         };
         const { text } = output.formatContext(ctx);
-        assert.ok(text.includes('obj.method()'),
-            'should show method exclusion hint when includeMethods is false');
+        assert.ok(!text.includes('obj.method()'),
+            'hint superseded by the always-visible UNVERIFIED tier');
     });
 });
 

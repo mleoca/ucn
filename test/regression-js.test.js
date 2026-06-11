@@ -2085,28 +2085,22 @@ function test() {
     assert.ok(!falseCb, 'status (string) in object literal value should NOT be potential callback');
 });
 
-it('FIX 76 — impact excludes method calls when --no-include-methods is set', () => {
-    // BUG-H3: impact now defaults to includeMethods:true ("what breaks if I change
-    // this" should reach all callable sites). Passing --no-include-methods restores
-    // the old behavior — drop obj.fn() calls when the target is a standalone function.
+it('FIX 76 (superseded by tiered contract) — impact ignores --no-include-methods; tiers carry the split', () => {
+    // Tiered contract: impact analyzes every callable site unconditionally.
+    // Method calls with receiver evidence land in the confirmed tier (byFile);
+    // evidence-less ones land in unverifiedSites. --no-include-methods is a
+    // deprecated no-op, so the flag must not change either set.
     const index = new ProjectIndex(PROJECT_DIR);
     index.build(null, { quiet: true });
 
-    const result = index.impact('parse', { file: 'core/parser.js', includeMethods: false });
-    assert.ok(result, 'Should find parse');
-
-    // With --no-include-methods, all call sites should be direct calls, not method calls
-    for (const group of result.byFile) {
-        for (const site of group.sites) {
-            assert.ok(!site.isMethodCall,
-                `${group.file}:${site.line} should not be a method call: ${site.expression}`);
-        }
-    }
-
-    // With matching include-methods=false, impact and verify should agree on call count
-    const verified = index.verify('parse', { file: 'core/parser.js' });
-    assert.strictEqual(result.totalCallSites, verified.totalCalls,
-        'impact and verify call counts must match (both filtering method calls)');
+    const withFlag = index.impact('parse', { file: 'core/parser.js', includeMethods: false });
+    const without = index.impact('parse', { file: 'core/parser.js' });
+    assert.ok(withFlag && without, 'Should find parse');
+    assert.strictEqual(withFlag.totalCallSites, without.totalCallSites,
+        '--no-include-methods is a no-op for impact');
+    assert.strictEqual((withFlag.unverifiedSites || []).length, (without.unverifiedSites || []).length,
+        'unverified tier unaffected by the deprecated flag');
+    assert.ok(withFlag.account && withFlag.account.conserved, 'impact account conserves');
 });
 
 it('FIX 77 — find counts match usages via transitive re-exports', () => {
@@ -4466,6 +4460,89 @@ describe('BUG-5: plan preserves modifier prefixes for class methods', () => {
             assert.match(r.result.before.signature, /^static\s+make\b/);
             assert.match(r.result.after.signature, /^static\s+make\b/);
             assert.ok(r.result.after.params.includes('opts'), `new param 'opts' should appear: ${JSON.stringify(r.result.after.params)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix: JSDoc nested-brace types truncated mid-brace', () => {
+    // `@returns {{ ok: boolean, error?: string }}` was captured with /[^}]+/,
+    // stopping at the FIRST closing brace — `about` then displayed a signature
+    // cut mid-type. Balanced-brace scan in parseJSDocTags fixes extraction;
+    // formatFunctionSignature/formatSignature collapse whitespace so multi-line
+    // annotations cannot break the one-line signature either.
+    it('@returns with nested object-literal type is captured completely', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                '/**',
+                ' * Score an edge.',
+                ' * @param {object} evidence - Evidence flags',
+                ' * @returns {{ confidence: number, resolution: string, evidence: string[] }}',
+                ' */',
+                'function scoreThing(evidence) { return { confidence: 1, resolution: "x", evidence: [] }; }',
+                'module.exports = { scoreThing };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'scoreThing' });
+            assert.ok(r.ok, 'about should succeed');
+            const rt = r.result.symbol.returnType;
+            assert.strictEqual(rt, '{ confidence: number, resolution: string, evidence: string[] }',
+                `returnType must keep nested braces intact, got: ${rt}`);
+            assert.ok(r.result.symbol.signature.includes('evidence: string[] }'),
+                `signature must not be cut mid-type: ${r.result.symbol.signature}`);
+        } finally { rm(dir); }
+    });
+
+    it('@param nested-brace and optional-bracket forms both survive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                '/**',
+                ' * @param {{ a: number, b: { c: string } }} shape - nested',
+                ' * @param {Object<string, {x: number}>} mapped - generic with nested braces',
+                ' * @param {number} [limit=10] - optional with default',
+                ' */',
+                'function takeShapes(shape, mapped, limit) { return shape; }',
+                'module.exports = { takeShapes };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'takeShapes' });
+            assert.ok(r.ok, 'about should succeed');
+            const pt = r.result.symbol.paramTypes || [];
+            const joined = JSON.stringify(r.result.symbol);
+            assert.ok(joined.includes('{ a: number, b: { c: string } }'),
+                `nested @param type must survive intact: ${joined.slice(0, 400)}`);
+            assert.ok(joined.includes('Object<string, {x: number}>'),
+                `generic nested @param type must survive: ${joined.slice(0, 400)}`);
+            assert.ok(joined.includes('"limit"') || joined.includes('limit: number') || pt.includes('number'),
+                `optional-bracket param keeps its type: ${joined.slice(0, 400)}`);
+        } finally { rm(dir); }
+    });
+
+    it('multi-line @returns type collapses to one line in signature', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                '/**',
+                ' * @returns {{ ok: boolean,',
+                ' *   result: object }}',
+                ' */',
+                'function build() { return { ok: true, result: {} }; }',
+                'module.exports = { build };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'build' });
+            assert.ok(r.ok, 'about should succeed');
+            const sig = r.result.symbol.signature;
+            assert.ok(!sig.includes('\n'), `signature must be single-line: ${JSON.stringify(sig)}`);
+            assert.ok(sig.includes('{ ok: boolean, result: object }'),
+                `multi-line type collapses with single spaces: ${sig}`);
         } finally { rm(dir); }
     });
 });

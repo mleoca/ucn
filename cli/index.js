@@ -653,6 +653,16 @@ function runProjectCommand(rootDir, command, arg) {
                 console.error(`Warning: ${flagToCli(key)} has no effect on '${toCliName(canonical)}'.`);
             }
         }
+        // Tiered-output contract: unverified callers are always shown for
+        // these commands, so the legacy reveal flags are implied no-ops.
+        if (['about', 'context', 'impact'].includes(canonical)) {
+            if (flags.includeUncertain) {
+                console.error(`Note: --include-uncertain is implied for '${toCliName(canonical)}' — unverified callers are always shown (tiered).`);
+            }
+            if (flags.includeMethods) {
+                console.error(`Note: --include-methods is implied for '${toCliName(canonical)}' — method calls are tiered by receiver evidence.`);
+            }
+        }
     }
 
     switch (canonical) {
@@ -1514,7 +1524,7 @@ Common Flags:
   --in=<path>         Only in path (e.g., --in=src/core)
   --depth=N           Max depth: blast=3, trace=3, reverse-trace=5, graph=2, affected-tests=3
   --direction=X       Graph direction: imports, importers, or both (default: both)
-  --all               Show full results: all callers/callees (about), full tree (trace/blast),
+  --all               Show full results: all callers/callees + unverified (about/context), full tree (trace/blast),
                         all names (related/find/fn/class/toc), all changed (diff-impact)
   --top=N             Limit callers/callees (about), similar functions (related), search results
   --limit=N           Limit result count (find, usages, search, deadcode, api, toc, entrypoints, diff-impact)
@@ -1527,8 +1537,10 @@ Common Flags:
   --include-tests     Include test files in usage counts (about) and results (find, usages, deadcode)
   --exclude-tests     Exclude test files (entrypoints — tests are included by default)
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
-  --include-methods   Include method calls (obj.fn) in caller/callee analysis
-  --include-uncertain Include ambiguous/uncertain matches
+  --include-methods   Include method calls (obj.fn) in trace/blast/smart/verify analysis
+                        (implied for about/context/impact — method calls are tiered by evidence)
+  --include-uncertain Include ambiguous/uncertain matches in trace/blast/smart/verify
+                        (implied for about/context/impact — unverified callers always shown, tiered)
   --hide-confidence   Hide confidence scores (shown by default in about, context)
   --min-confidence=N  Filter low-confidence edges (about, context, blast, trace,
                         reverse-trace, smart, affected-tests)
