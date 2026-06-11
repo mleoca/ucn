@@ -292,6 +292,7 @@ const HANDLERS = {
         const result = index.context(p.name, {
             ...buildCallerOptions(p),
             unreachableOnly: !!p.unreachableOnly,
+            all: !!p.all,
         });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
         const tNote = truncationNote(index);

@@ -11,7 +11,7 @@ const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES } = require('./shared');
-const { scoreEdge } = require('./confidence');
+const { scoreEdge, tierForResolution, TIER } = require('./confidence');
 
 /** Set.some() helper — like Array.some() but for Sets */
 function setSome(set, predicate) {
@@ -148,6 +148,22 @@ function findCallers(index, name, options = {}) {
     const callers = [];
     const stats = options.stats;
 
+    // Conservation accounting (grep-reliability contract): when collectAccount
+    // is set (context/about/impact only — trace/blast/verify paths must stay
+    // byte-identical), candidates that the legacy flags would silently drop are
+    // RETAINED as unverified-tier entries (rendered in their own output
+    // section), and candidates positively excluded (call targets a different
+    // symbol) are recorded with a reason for the account arithmetic.
+    const collectAccount = !!options.collectAccount;
+    const accountRaw = collectAccount ? { unverifiedLines: [], excludedEntries: [] } : null;
+    // Cap on how many unverified entries get full enrichment (content + caller
+    // lookup); the rest stay as shadow-style records. Display caps are handled
+    // by formatters — this only bounds file reads.
+    const unverifiedEnrichLimit = options.unverifiedEnrichLimit ?? 10;
+    const recordExcluded = (filePath, line, reason) => {
+        if (accountRaw) accountRaw.excludedEntries.push({ file: filePath, line, reason });
+    };
+
     // Get definition lines to exclude them
     const definitions = index.symbols.get(name) || [];
     const definitionLines = new Set();
@@ -159,6 +175,21 @@ function findCallers(index, name, options = {}) {
     // Collect pending callers keyed by file — content is read only in Phase 2.
     const pendingByFile = new Map(); // filePath -> [{ call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver }]
     let pendingCount = 0;
+    // Route a would-be-dropped candidate into the pending pipeline as an
+    // unverified-tier entry (grep-reliability contract: shown in its own
+    // section, never silently hidden). Does NOT count toward pendingCount —
+    // totals describe the confirmed answer.
+    const routeUnverified = (filePath, fileEntry, call, reason) => {
+        if (!collectAccount) return; // non-account paths (trace/blast/verify) keep the plain drop
+        if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
+        pendingByFile.get(filePath).push({
+            call, fileEntry, callerSymbol: null,
+            isMethod: call.isMethod || false, isFunctionReference: false,
+            receiver: call.receiver, receiverType: call.receiverType,
+            _tier: TIER.UNVERIFIED, _reason: reason,
+            _evidence: { isUncertain: true },
+        });
+    };
     const maxResults = options.maxResults;
     // BUG-H1: when consumers (like `about`) need an accurate truncation header
     // ("showing N of <total>"), they pass needsTotal:true so Phase 1 runs to
@@ -325,19 +356,28 @@ function findCallers(index, name, options = {}) {
                 // self/this.method() calls can be resolved by same-class matching
                 // even when binding is ambiguous (e.g. method exists in multiple classes)
                 let resolvedBySameClass = false;
+                // Receiver/path type known to mismatch the target: such an edge can
+                // never tier as confirmed even when legacy includeUncertain keeps it
+                // visible (scoreEdge checks hasReceiverType before isUncertain, so
+                // without this flag a known mismatch would score receiver-hint 0.80).
+                let typeMismatch = false;
                 if (call.isMethod) {
                     if (call.selfAttribute && fileEntry.language === 'python') {
                         // self.attr.method() — resolve via attribute type inference
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                         if (!callerSymbol?.className) {
                             // Can't resolve — include only if includeMethods requested
-                            if (!options.includeMethods) continue;
+                            if (!options.includeMethods) {
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
+                                continue;
+                            }
                         } else {
                             const attrTypes = getInstanceAttributeTypes(index, filePath, callerSymbol.className);
                             const targetClass = attrTypes?.get(call.selfAttribute);
                             if (targetClass && definitions.some(d => d.className === targetClass)) {
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
                                 continue;
                             }
                         }
@@ -345,7 +385,10 @@ function findCallers(index, name, options = {}) {
                         // self/this/super.method() — resolve to same-class or parent method
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                         if (!callerSymbol?.className) {
-                            if (!options.includeMethods) continue;
+                            if (!options.includeMethods) {
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
+                                continue;
+                            }
                         } else {
                             // For super(), skip same-class — only check parent chain
                             let matchesDef = call.receiver === 'super'
@@ -374,6 +417,7 @@ function findCallers(index, name, options = {}) {
                             if (matchesDef) {
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
                                 continue;
                             }
                         }
@@ -381,14 +425,22 @@ function findCallers(index, name, options = {}) {
                         // Go doesn't use this/self/cls - always include Go method calls
                         // Java method calls are always obj.method() - include by default
                         // Rust Type::method() calls - include by default (associated functions)
-                        // For other languages, skip method calls unless explicitly requested
-                        if (langTraits(fileEntry.language)?.methodCallInclusion === 'explicit' && !options.includeMethods) continue;
+                        // For other languages, skip method calls unless explicitly requested.
+                        // Under collectAccount the gate falls through instead: receiver
+                        // evidence computed at the push site decides the tier (a require'd
+                        // module receiver earns scope-match/confirmed; an unknown receiver
+                        // is marked uncertain in the binding block and routes below).
+                        if (langTraits(fileEntry.language)?.methodCallInclusion === 'explicit' && !options.includeMethods) {
+                            if (!collectAccount) continue;
+                        }
                     }
                 }
 
                 // Skip uncertain calls unless resolved by same-class matching or explicitly requested
                 if (isUncertain && !resolvedBySameClass && !options.includeUncertain) {
                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                    routeUnverified(filePath, fileEntry, call,
+                        call.isMethod ? 'method-no-evidence' : 'ambiguous-binding');
                     continue;
                 }
 
@@ -400,6 +452,7 @@ function findCallers(index, name, options = {}) {
                 const targetDefs = options.targetDefinitions || definitions;
                 const targetBindingIds = new Set(targetDefs.map(d => d.bindingId).filter(Boolean));
                 if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
+                    recordExcluded(filePath, call.line, 'other-definition');
                     continue;
                 }
 
@@ -424,7 +477,25 @@ function findCallers(index, name, options = {}) {
                                     break;
                                 }
                             }
-                            if (!foundViaReexport) continue;
+                            if (!foundViaReexport) {
+                                // Disposition depends on what the caller DOES import:
+                                //  - imports a DIFFERENT same-name def's file → positive
+                                //    mis-link evidence → excluded other-definition-import
+                                //  - imports neither def → pure ambiguity, no positive
+                                //    evidence → unverified tier (visible), per the contract
+                                const otherDefFiles = new Set((index.symbols.get(name) || [])
+                                    .map(d => d.file).filter(f => f && !targetFiles.has(f)));
+                                const importsOtherDef = imports && setSome(imports, imp => otherDefFiles.has(imp));
+                                if (importsOtherDef || otherDefFiles.has(filePath)) {
+                                    recordExcluded(filePath, call.line, 'other-definition-import');
+                                    continue;
+                                }
+                                if (collectAccount) {
+                                    routeUnverified(filePath, fileEntry, call, 'no-import-link');
+                                    continue;
+                                }
+                                continue;
+                            }
                         }
                     }
                 }
@@ -436,6 +507,7 @@ function findCallers(index, name, options = {}) {
                         targetDefs.filter(d => d.file).map(d => path.dirname(d.file))
                     );
                     if (targetPkgDirs.size > 0 && !targetPkgDirs.has(path.dirname(filePath))) {
+                        recordExcluded(filePath, call.line, 'out-of-scope-package');
                         continue;
                     }
                 }
@@ -450,10 +522,12 @@ function findCallers(index, name, options = {}) {
                     const targetHasClass = targetDefs.some(d => d.className);
                     if (call.isMethod && !targetHasClass) {
                         // Method call but target is a standalone function — skip
+                        recordExcluded(filePath, call.line, 'method-kind-mismatch');
                         continue;
                     }
                     if (!call.isMethod && targetHasClass) {
                         // Non-method call but target is a class method — skip
+                        recordExcluded(filePath, call.line, 'method-kind-mismatch');
                         continue;
                     }
                 }
@@ -474,6 +548,7 @@ function findCallers(index, name, options = {}) {
                     if (importModule) {
                         if (!importModule.includes('/')) {
                             // Single-segment import — Go stdlib, always external
+                            recordExcluded(filePath, call.line, 'external-package');
                             continue;
                         }
                         // Multi-segment import — verify via import graph
@@ -485,7 +560,10 @@ function findCallers(index, name, options = {}) {
                                 // No import edge — allow same-package (same directory) calls
                                 const callerDir = path.dirname(filePath);
                                 const samePackage = targetDefs.some(d => d.file && path.dirname(d.file) === callerDir);
-                                if (!samePackage) continue;
+                                if (!samePackage) {
+                                    recordExcluded(filePath, call.line, 'external-package');
+                                    continue;
+                                }
                             }
                         }
                     }
@@ -523,8 +601,15 @@ function findCallers(index, name, options = {}) {
                         if (knownType) {
                             const matchesTarget = targetTypes.has(knownType);
                             if (!matchesTarget) {
-                                // Known type doesn't match target — skip directly
+                                // Known type doesn't match target — positive evidence the
+                                // call targets a DIFFERENT symbol. Under the account contract
+                                // this is excluded-with-reason, not a revealable uncertain.
                                 isUncertain = true;
+                                typeMismatch = true;
+                                if (collectAccount) {
+                                    recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    continue;
+                                }
                                 if (!options.includeUncertain) {
                                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                                     continue;
@@ -561,6 +646,11 @@ function findCallers(index, name, options = {}) {
                             }
                             if (inferredMismatch) {
                                 isUncertain = true;
+                                typeMismatch = true;
+                                if (collectAccount) {
+                                    recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    continue;
+                                }
                                 if (!options.includeUncertain) {
                                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                                     continue;
@@ -575,6 +665,11 @@ function findCallers(index, name, options = {}) {
                                     // If it doesn't match target, it's definitely a different type — filter it
                                     if (call.isPathCall && /^[A-Z]/.test(call.receiver)) {
                                         isUncertain = true;
+                                        typeMismatch = true;
+                                        if (collectAccount) {
+                                            recordExcluded(filePath, call.line, 'path-type-mismatch');
+                                            continue;
+                                        }
                                         if (!options.includeUncertain) {
                                             if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                                             continue;
@@ -588,6 +683,11 @@ function findCallers(index, name, options = {}) {
                                     const matchesOther = [...nonTargetClasses].some(cn => cn.toLowerCase() === receiverLower);
                                     if (matchesOther) {
                                         isUncertain = true;
+                                        typeMismatch = true;
+                                        if (collectAccount) {
+                                            recordExcluded(filePath, call.line, 'receiver-other-class');
+                                            continue;
+                                        }
                                         if (!options.includeUncertain) {
                                             if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                                             continue;
@@ -618,6 +718,14 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Same-package evidence (nominal type systems): Java/Rust/Go
+                // resolve same-package/module names without import statements,
+                // so a target defined in the caller's directory is real scope
+                // evidence, not a bare name match.
+                const hasSamePackageEvidence = !hasImportLink &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                    targetDefs2.some(d => d.file && path.dirname(d.file) === path.dirname(filePath));
+
                 if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                 pendingByFile.get(filePath).push({
                     call, fileEntry, callerSymbol,
@@ -627,6 +735,7 @@ function findCallers(index, name, options = {}) {
                     _evidence: {
                         hasBindingId: !!bindingId,
                         resolvedBySameClass: !!resolvedBySameClass,
+                        hasSamePackageEvidence,
                         isUncertain: !!isUncertain || (
                             // Method calls where binding resolution was skipped (non-self receiver)
                             // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
@@ -638,6 +747,7 @@ function findCallers(index, name, options = {}) {
                         hasReceiverEvidence: !!(call.receiver &&
                             (fileEntry.bindings || []).some(b => b.name === call.receiver)),
                         hasImportEvidence: !!bindingId || hasImportLink,
+                        ...(typeMismatch && { typeMismatch: true }),
                     }
                 });
                 pendingCount++;
@@ -661,12 +771,58 @@ function findCallers(index, name, options = {}) {
     // a Phase-2 file read for every candidate. Each shadow has just enough
     // info to drive the filter predicates: relativePath + confidence.
     const shadowEntries = [];
+    // Unverified-tier entries (collectAccount only): retained drops, rendered
+    // in their own section. First `unverifiedEnrichLimit` get content + caller
+    // lookup; the rest stay shadow-style (file/line/reason only).
+    const unverifiedEntries = [];
+    let unverifiedEnriched = 0;
 
     // Phase 2: Read content only for files with matching calls (eliminates ~98% of file reads)
     outer: for (const [filePath, pending] of pendingByFile) {
         let content = null;
-        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, _evidence } of pending) {
+        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, _evidence, _tier, _reason } of pending) {
             const scored = scoreEdge(_evidence || {});
+            if (_tier) {
+                // Routed unverified entry — never competes with the main
+                // answer for maxResults/enrichLimit slots.
+                const base = {
+                    file: filePath,
+                    relativePath: fileEntry.relativePath,
+                    line: call.line,
+                    confidence: scored.confidence,
+                    resolution: scored.resolution,
+                    tier: _tier,
+                    reason: _reason,
+                    isMethod: call.isMethod || false,
+                    ...(receiver !== undefined && { receiver }),
+                    ...(receiverType && { receiverType }),
+                };
+                if (unverifiedEnriched < unverifiedEnrichLimit) {
+                    if (content === null) {
+                        try { content = fs.readFileSync(filePath, 'utf-8'); }
+                        catch (e) { content = ''; }
+                    }
+                    const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+                    unverifiedEntries.push({
+                        ...base,
+                        content: getLine(content, call.line),
+                        callerName: enclosing ? enclosing.name : null,
+                        callerFile: enclosing ? filePath : null,
+                        callerStartLine: enclosing ? enclosing.startLine : null,
+                        callerEndLine: enclosing ? enclosing.endLine : null,
+                    });
+                    unverifiedEnriched++;
+                } else {
+                    unverifiedEntries.push(base);
+                }
+                continue;
+            }
+            // Tier stamped ONLY under collectAccount so trace/blast/verify
+            // results stay byte-identical. A known type mismatch can never
+            // tier as confirmed, whatever its resolution score says.
+            const tier = collectAccount
+                ? (_evidence && _evidence.typeMismatch ? TIER.UNVERIFIED : tierForResolution(scored.resolution))
+                : undefined;
             if (enrichedCount >= enrichLimit) {
                 // Push shadow only — no file read needed.
                 shadowEntries.push({
@@ -675,6 +831,7 @@ function findCallers(index, name, options = {}) {
                     line: call.line,
                     confidence: scored.confidence,
                     resolution: scored.resolution,
+                    ...(tier && { tier }),
                     isMethod: call.isMethod || false,
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(receiver !== undefined && { receiver }),
@@ -702,6 +859,7 @@ function findCallers(index, name, options = {}) {
                 ...(receiverType && { receiverType }),
                 confidence: scored.confidence,
                 resolution: scored.resolution,
+                ...(tier && { tier }),
             });
             enrichedCount++;
         }
@@ -724,6 +882,29 @@ function findCallers(index, name, options = {}) {
         writable: true,
         configurable: true,
     });
+    // Conservation raw data (collectAccount only): dropped-candidate lines with
+    // reasons, consumed by composeAccount in analysis.js. Non-enumerable so
+    // JSON.stringify of results is unaffected.
+    if (accountRaw) {
+        Object.defineProperty(callers, 'accountRaw', {
+            value: accountRaw,
+            enumerable: false,
+            writable: true,
+            configurable: true,
+        });
+        // Retained unverified-tier entries, sorted (relativePath, line) per the
+        // output ordering contract.
+        unverifiedEntries.sort((a, b) => {
+            if (a.relativePath !== b.relativePath) return a.relativePath.localeCompare(b.relativePath);
+            return (a.line || 0) - (b.line || 0);
+        });
+        Object.defineProperty(callers, 'unverifiedEntries', {
+            value: unverifiedEntries,
+            enumerable: false,
+            writable: true,
+            configurable: true,
+        });
+    }
 
     return callers;
     } finally { index._endOp(); }

@@ -107,7 +107,12 @@ const PARAM_MAP = {
 const FLAG_APPLICABILITY = {
     // Understanding code
     about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git'],
-    context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact'],
+    // Note: includeMethods/includeUncertain are deprecated no-ops for
+    // about/context/impact since the tiered-output contract (unverified
+    // callers are always shown in their own section); kept in the matrix so
+    // legacy invocations don't warn as "inapplicable". `all` lifts the
+    // unverified display cap.
+    context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'all'],
     impact:       ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'top', 'unreachableOnly', 'compact'],
     blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],

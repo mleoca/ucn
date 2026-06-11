@@ -199,6 +199,46 @@ function tagCalleesSideEffects(index, callees) {
 
 
 /**
+ * Compose the conservation account for a caller query (grep-reliability
+ * contract). Claims come from the PRE-display-filter findCallers result —
+ * the account reconciles pre-display truth; display filters are reported
+ * separately in account.filtered.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {string} name - Symbol name
+ * @param {Array} rawCallers - findCallers result BEFORE display filters
+ *   (carries non-enumerable accountRaw/shadowEntries from collectAccount)
+ * @param {object} [filtered] - display-level hide counts { total, byFlag }
+ * @returns {object} account (see core/account.js)
+ */
+function composeAccount(index, name, rawCallers, filtered) {
+    const { computeGroundSet, buildAccount } = require('./account');
+    const groundSet = computeGroundSet(index, name);
+    const accountRaw = rawCallers.accountRaw || { unverifiedLines: [], excludedEntries: [] };
+
+    const confirmedEntries = [];
+    const unverifiedEntries = [...accountRaw.unverifiedLines];
+    const claimByTier = (entry) => {
+        if (entry.tier === 'unverified') unverifiedEntries.push({ file: entry.file, line: entry.line });
+        else confirmedEntries.push({ file: entry.file, line: entry.line });
+    };
+    for (const c of rawCallers) claimByTier(c);
+    for (const s of (rawCallers.shadowEntries || [])) claimByTier(s);
+    // Retained unverified-tier entries (routed drops — Phase 3 engine retention)
+    for (const u of (rawCallers.unverifiedEntries || [])) {
+        unverifiedEntries.push({ file: u.file, line: u.line });
+    }
+
+    return buildAccount(index, name, {
+        groundSet,
+        confirmedEntries,
+        unverifiedEntries,
+        excludedEntries: accountRaw.excludedEntries,
+        filtered,
+    });
+}
+
+/**
  * Context: quick caller/callee view for a symbol.
  *
  * @param {object} index - ProjectIndex instance
@@ -219,11 +259,34 @@ function context(index, name, options = {}) {
     if (['class', 'struct', 'interface', 'type'].includes(def.type)) {
         const methods = index.findMethodsForType(name);
 
-        let typeCallers = index.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain });
+        let typeCallers = index.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, collectAccount: true });
+        const rawTypeCallers = typeCallers;
+        const typeFilteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
+        // Tier partition — same contract as the function path: constructor/usage
+        // sites without evidence are visible as unverified, never hidden.
+        let typeUnverified = [
+            ...typeCallers.filter(c => c.tier === 'unverified'),
+            ...(rawTypeCallers.unverifiedEntries || []),
+        ];
+        typeCallers = typeCallers.filter(c => c.tier !== 'unverified');
         // Apply exclude filter
         if (options.exclude && options.exclude.length > 0) {
+            const before = typeCallers.length + typeUnverified.length;
             typeCallers = typeCallers.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            typeUnverified = typeUnverified.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            typeFilteredByFlag.exclude = before - typeCallers.length - typeUnverified.length;
         }
+        const byFileLine = (a, b) => {
+            const fa = a.relativePath || a.file || '';
+            const fb = b.relativePath || b.file || '';
+            if (fa !== fb) return fa.localeCompare(fb);
+            return (a.line || 0) - (b.line || 0);
+        };
+        typeCallers = [...typeCallers].sort(byFileLine);
+        typeUnverified = [...typeUnverified].sort(byFileLine);
+
+        const typeAccount = composeAccount(index, name, rawTypeCallers,
+            typeFilteredByFlag.exclude > 0 ? { total: typeFilteredByFlag.exclude, byFlag: typeFilteredByFlag } : undefined);
 
         const result = {
             type: def.type,
@@ -240,7 +303,9 @@ function context(index, name, options = {}) {
                 receiver: m.receiver
             })),
             // Also include places where the type is used in function parameters/returns
-            callers: typeCallers
+            callers: typeCallers,
+            unverifiedCallers: typeUnverified,
+            meta: { account: typeAccount }
         };
 
         if (warnings.length > 0) {
@@ -251,12 +316,38 @@ function context(index, name, options = {}) {
     }
 
     const stats = { uncertain: 0 };
-    let callers = index.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, targetDefinitions: [def] });
+    let callers = index.findCallers(name, {
+        includeMethods: options.includeMethods,
+        includeUncertain: options.includeUncertain,
+        stats,
+        targetDefinitions: [def],
+        collectAccount: true,
+        // --all lifts the unverified enrichment cap (content + caller lookup)
+        unverifiedEnrichLimit: options.all ? Infinity : undefined,
+    });
     let callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+    // Pre-display-filter result for the conservation account (filters below
+    // build new arrays and would lose the non-enumerable accountRaw).
+    const rawCallers = callers;
+    const filteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
+
+    // Tier partition (grep-reliability contract): `callers` = confirmed tier
+    // only; unverified-tier entries (name match without binding/receiver
+    // evidence) render in their own section — visible, never silently hidden.
+    let unverifiedCallers = [
+        ...callers.filter(c => c.tier === 'unverified'),
+        ...(rawCallers.unverifiedEntries || []),
+    ];
+    callers = callers.filter(c => c.tier !== 'unverified');
 
     // Apply exclude filter
     if (options.exclude && options.exclude.length > 0) {
+        const before = callers.length;
         callers = callers.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+        filteredByFlag.exclude = before - callers.length;
+        const beforeUnverified = unverifiedCallers.length;
+        unverifiedCallers = unverifiedCallers.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+        filteredByFlag.exclude += beforeUnverified - unverifiedCallers.length;
         callees = callees.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
     }
 
@@ -269,18 +360,21 @@ function context(index, name, options = {}) {
         callers = callerResult.kept;
         callees = calleeResult.kept;
         confidenceFiltered = callerResult.filtered + calleeResult.filtered;
+        filteredByFlag.minConfidence = callerResult.filtered;
     }
 
     // Stable output ordering: callers by (file, line). Callees retain their
     // call-count order from findCallees (most-called first) — that's a value
     // the user expects, not a stability concern, since the secondary sort
     // by line keeps ties deterministic.
-    callers = [...callers].sort((a, b) => {
+    const byFileLine = (a, b) => {
         const fa = a.relativePath || a.file || '';
         const fb = b.relativePath || b.file || '';
         if (fa !== fb) return fa.localeCompare(fb);
         return (a.line || 0) - (b.line || 0);
-    });
+    };
+    callers = [...callers].sort(byFileLine);
+    unverifiedCallers = [...unverifiedCallers].sort(byFileLine);
     callees = [...callees].sort((a, b) => {
         // Primary: callCount desc (preserves "most-called first" UX)
         const ca = a.callCount || 0, cb = b.callCount || 0;
@@ -303,9 +397,17 @@ function context(index, name, options = {}) {
 
     // Optional: filter to unreachable-only (helps surface dead-path callers/callees)
     if (options.unreachableOnly) {
+        const before = callers.length;
         callers = callers.filter(c => !c.reachable);
+        filteredByFlag.unreachableOnly = before - callers.length;
         callees = callees.filter(c => !c.reachable);
     }
+
+    // Conservation account: reconciles the caller answer against the text
+    // ground set (pre-display truth; display-filter hides reported separately).
+    const filteredTotal = filteredByFlag.exclude + filteredByFlag.minConfidence + filteredByFlag.unreachableOnly;
+    const account = composeAccount(index, name, rawCallers,
+        filteredTotal > 0 ? { total: filteredTotal, byFlag: filteredByFlag } : undefined);
 
     const callerHistogram = buildHistogram(callers);
     const calleeHistogram = buildHistogram(callees);
@@ -327,6 +429,7 @@ function context(index, name, options = {}) {
         params: def.params,
         returnType: def.returnType,
         callers,
+        unverifiedCallers,
         callees,
         callerHistogram,
         calleeHistogram,
@@ -338,6 +441,11 @@ function context(index, name, options = {}) {
             confidenceFiltered,
             includeMethods: !!options.includeMethods,
             projectLanguage: index._getPredominantLanguage(),
+            account,
+            // No detected entry points (e.g. library code) — reachability
+            // markers are meaningless and suppressed by formatters.
+            hasEntrypoints: reachableSet.size > 0,
+            ...(options.all && { all: true }),
             // Structural facts for reliability hints
             ...(def.isMethod && { isMethod: true }),
             ...(def.className && { className: def.className }),
@@ -692,22 +800,34 @@ function impact(index, name, options = {}) {
         'enum', 'trait', 'impl', 'record', 'namespace']);
     const defIsTypeDef = TYPE_DEF_KINDS.has(def.type);
 
-    // BUG-H3: default includeMethods:true for impact ("what breaks if I change this"
-    // should include every callable site — including obj.method() invocations).
-    // User can disable with --no-include-methods to scope down.
-    const impactIncludeMethods = options.includeMethods ?? true;
+    // BUG-H3 + tiered contract: impact always analyzes every callable site —
+    // method calls included unconditionally, tiered by receiver evidence.
+    // --no-include-methods is a deprecated no-op (evidence-less method sites
+    // land in the unverified tier instead of disappearing).
+    const impactIncludeMethods = true;
     const impactIncludeUncertain = options.includeUncertain ?? false;
 
     // Use findCallers for className-scoped or method queries (sophisticated binding resolution)
     // Fall back to usages-based approach for simple function queries (backward compatible)
     let callSites;
+    // Conservation accounting: engine-recorded drops + post-engine drops in
+    // this function (className filter, binding cross-check, method skips).
+    // Claims use ABSOLUTE paths (ground set is keyed by absolute file path).
+    let impactAccountRaw = null;
+    let impactRoutedUnverified = []; // engine-routed retained drops (unverifiedEntries)
+    const impactClaims = [];
+    const impactPostHocExcluded = [];
+    const impactPostHocUnverified = [];
     if (options.className || defIsMethod || defIsTypeDef) {
         // findCallers has proper method call resolution (self/this, binding IDs, receiver checks)
         let callerResults = index.findCallers(name, {
             includeMethods: impactIncludeMethods,
             includeUncertain: impactIncludeUncertain,
             targetDefinitions: [def],
+            collectAccount: true,
         });
+        impactAccountRaw = callerResults.accountRaw;
+        impactRoutedUnverified = callerResults.unverifiedEntries || [];
 
         // When the target definition has a className (including Go/Rust methods which
         // now get className from receiver), filter out method calls whose receiver
@@ -724,14 +844,14 @@ function impact(index, name, options = {}) {
                     else if (d.receiver) _impClassNames.add(d.receiver.replace(/^\*/, ''));
                 }
             }
-            callerResults = callerResults.filter(c => {
+            const keepForTargetClass = (c) => {
                 // Keep non-method calls and self/this/cls calls (already resolved by findCallers)
                 if (!c.isMethod) return true;
                 const r = c.receiver;
                 if (r && ['self', 'cls', 'this', 'super'].includes(r)) return true;
                 // Use receiverType from findCallers when available (Go/Java/Rust type inference)
                 if (c.receiverType) {
-                    return c.receiverType === targetClassName;
+                    return c.receiverType === targetClassName ? 'strong' : false;
                 }
                 // No receiver (chained/complex expression): only include if method is
                 // unique or rare across types — otherwise too many false positives
@@ -770,7 +890,7 @@ function impact(index, name, options = {}) {
                             }
                             const receiverType = localTypes.get(r);
                             if (receiverType) {
-                                return receiverType === targetClassName;
+                                return receiverType === targetClassName ? 'strong' : false;
                             }
                         }
                     }
@@ -792,7 +912,7 @@ function impact(index, name, options = {}) {
                                     const fieldMatch = line.match(new RegExp(`\\b(\\w+)(?:<[^>]*>)?\\s+${r.replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&')}\\s*[;=]`));
                                     if (fieldMatch) {
                                         const fieldType = fieldMatch[1];
-                                        if (fieldType === targetClassName) return true;
+                                        if (fieldType === targetClassName) return 'strong';
                                         break;
                                     }
                                 }
@@ -809,7 +929,7 @@ function impact(index, name, options = {}) {
                                 // Check if the type annotation contains the target class name
                                 const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
                                 if (typeMatches && typeMatches.some(t => t === targetClassName)) {
-                                    return true;
+                                    return 'strong';
                                 }
                                 // Type annotation exists but doesn't match target class — filter out
                                 return false;
@@ -825,6 +945,24 @@ function impact(index, name, options = {}) {
                 // Type-scoped query but receiver type unknown — filter it out.
                 // Unknown receivers are likely unrelated.
                 return false;
+            };
+            // Conservation: post-hoc rejects are positive type-mismatch evidence —
+            // they MOVE into the excluded bucket instead of vanishing. Survivors
+            // verified by STRONG evidence (receiverType / local constructor /
+            // field declaration / param annotation match) are upgraded to the
+            // confirmed tier — the filter just proved the receiver's type.
+            callerResults = callerResults.filter(c => {
+                const keep = keepForTargetClass(c);
+                if (!keep) {
+                    impactPostHocExcluded.push({ file: c.file, line: c.line, reason: 'receiver-type-mismatch' });
+                    return false;
+                }
+                if (keep === 'strong' && c.tier === 'unverified') {
+                    c.tier = 'confirmed';
+                    c.resolution = 'receiver-hint';
+                    c.confidence = 0.80;
+                }
+                return true;
             });
         }
 
@@ -834,6 +972,7 @@ function impact(index, name, options = {}) {
                 { file: c.file, relativePath: c.relativePath, line: c.line, content: c.content },
                 name
             );
+            impactClaims.push({ file: c.file, line: c.line, tier: c.tier });
             callSites.push({
                 file: c.relativePath,
                 line: c.line,
@@ -843,6 +982,7 @@ function impact(index, name, options = {}) {
                 callerStartLine: c.callerStartLine,
                 confidence: c.confidence,
                 resolution: c.resolution,
+                ...(c.tier && { tier: c.tier }),
                 ...analysis
             });
         }
@@ -856,7 +996,10 @@ function impact(index, name, options = {}) {
             includeMethods: impactIncludeMethods,
             includeUncertain: impactIncludeUncertain,
             targetDefinitions: [def],
+            collectAccount: true,
         });
+        impactAccountRaw = callerResults.accountRaw;
+        impactRoutedUnverified = callerResults.unverifiedEntries || [];
         const targetBindingId = def.bindingId;
         // Convert findCallers results to the format expected by analyzeCallSite
         const calls = callerResults.map(c => ({
@@ -870,6 +1013,7 @@ function impact(index, name, options = {}) {
             callerStartLine: c.callerStartLine,
             confidence: c.confidence,
             resolution: c.resolution,
+            tier: c.tier,
         }));
         // Keep the same binding filter for backward compat (findCallers already handles this,
         // but cross-check with usages-based binding filter for safety)
@@ -887,6 +1031,7 @@ function impact(index, name, options = {}) {
                     }
                 }
                 if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
+                    impactPostHocExcluded.push({ file: u.file, line: u.line, reason: 'other-definition' });
                     return false;
                 }
             }
@@ -915,12 +1060,15 @@ function impact(index, name, options = {}) {
                     if (matchedCall?.receiver === targetDir) {
                         // Receiver matches package directory — keep it
                     } else {
+                        impactPostHocUnverified.push({ file: call.file, line: call.line, reason: 'method-no-evidence' });
                         continue;
                     }
                 } else {
+                    impactPostHocUnverified.push({ file: call.file, line: call.line, reason: 'method-no-evidence' });
                     continue;
                 }
             }
+            impactClaims.push({ file: call.file, line: call.line, tier: call.tier });
             callSites.push({
                 file: call.relativePath,
                 line: call.line,
@@ -930,16 +1078,43 @@ function impact(index, name, options = {}) {
                 callerStartLine: call.callerStartLine,
                 confidence: call.confidence,
                 resolution: call.resolution,
+                ...(call.tier && { tier: call.tier }),
                 ...analysis
             });
         }
         index._clearTreeCache();
     }
 
+    // Tier partition: confirmed sites stay in callSites; unverified-tier sites
+    // (incl. engine-routed retained drops) render in their own section.
+    let unverifiedSites = callSites.filter(s => s.tier === 'unverified');
+    callSites = callSites.filter(s => s.tier !== 'unverified');
+    for (const u of impactRoutedUnverified) {
+        unverifiedSites.push({
+            file: u.relativePath,
+            line: u.line,
+            expression: (u.content || '').trim(),
+            callerName: u.callerName ?? null,
+            confidence: u.confidence,
+            resolution: u.resolution,
+            tier: 'unverified',
+            ...(u.reason && { reason: u.reason }),
+        });
+    }
+    unverifiedSites.sort((a, b) => {
+        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        return (a.line || 0) - (b.line || 0);
+    });
+
     // Apply exclude filter
+    const impactFilteredByFlag = { exclude: 0, unreachableOnly: 0 };
     let filteredSites = callSites;
     if (options.exclude && options.exclude.length > 0) {
         filteredSites = callSites.filter(s => index.matchesFilters(s.file, { exclude: options.exclude }));
+        impactFilteredByFlag.exclude = callSites.length - filteredSites.length;
+        const beforeUnverified = unverifiedSites.length;
+        unverifiedSites = unverifiedSites.filter(s => index.matchesFilters(s.file, { exclude: options.exclude }));
+        impactFilteredByFlag.exclude += beforeUnverified - unverifiedSites.length;
     }
 
     // Trust signals: tag each call site with reachability, build a confidence histogram.
@@ -953,9 +1128,34 @@ function impact(index, name, options = {}) {
         }
     }
     if (options.unreachableOnly) {
+        const before = filteredSites.length;
         filteredSites = filteredSites.filter(s => !s.reachable);
+        impactFilteredByFlag.unreachableOnly = before - filteredSites.length;
     }
     const callerHistogram = buildHistogram(filteredSites);
+
+    // Conservation account: claims from ALL call sites (pre-display filters,
+    // pre-top truncation) plus engine-recorded and post-hoc drops.
+    const impactAccount = (() => {
+        const { computeGroundSet, buildAccount } = require('./account');
+        const groundSet = computeGroundSet(index, name);
+        const confirmedEntries = [];
+        const unverifiedEntries = [...(impactAccountRaw?.unverifiedLines || []), ...impactPostHocUnverified];
+        for (const u of impactRoutedUnverified) unverifiedEntries.push({ file: u.file, line: u.line });
+        for (const cl of impactClaims) {
+            if (cl.tier === 'unverified') unverifiedEntries.push(cl);
+            else confirmedEntries.push(cl);
+        }
+        const excludedEntries = [...(impactAccountRaw?.excludedEntries || []), ...impactPostHocExcluded];
+        const filteredTotal = impactFilteredByFlag.exclude + impactFilteredByFlag.unreachableOnly;
+        return buildAccount(index, name, {
+            groundSet,
+            confirmedEntries,
+            unverifiedEntries,
+            excludedEntries,
+            filtered: filteredTotal > 0 ? { total: filteredTotal, byFlag: impactFilteredByFlag } : undefined,
+        });
+    })();
 
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
@@ -1007,6 +1207,9 @@ function impact(index, name, options = {}) {
         paramsStructured: def.paramsStructured,
         totalCallSites: totalBeforeLimit,
         shownCallSites: filteredSites.length,
+        unverifiedSites,
+        account: impactAccount,
+        hasEntrypoints: impactReachable.size > 0,
         callerHistogram,
         // Stable ordering: files alphabetical, sites by line ascending. Documented contract.
         byFile: Array.from(byFile.entries())
@@ -1130,6 +1333,8 @@ function about(index, name, options = {}) {
     let allCallers = null;
     let allCallees = null;
     let aboutConfFiltered = 0;
+    let aboutAccount = null;
+    let aboutUnverified = { total: 0, top: [] };
     // BUG-M3: include classes/structs/interfaces — `new Foo()` invocations are
     // tracked as calls in the parser (isConstructor:true) and findCallers resolves
     // them. Without this, `about ClassName` produced "USAGES: 5 calls" but no
@@ -1145,12 +1350,25 @@ function about(index, name, options = {}) {
         // BUG-H1: pass needsTotal:true so the returned array's `totalCount` reflects the
         // true pre-truncation candidate count. Without this, `about` would report the
         // capped count as the total (e.g. "showing 10 of 30" when there are actually 153).
-        const rawCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap, needsTotal: true });
+        const rawCallers = index.findCallers(symbolName, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [primary], maxResults: callerCap, needsTotal: true, collectAccount: true });
         const shadowCallers = rawCallers.shadowEntries || [];
         allCallers = rawCallers;
+        const aboutFilteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
+        // Tier partition: confirmed callers stay in allCallers; unverified-tier
+        // entries (incl. engine-routed retained drops) get their own section.
+        let unverifiedPool = [
+            ...allCallers.filter(c => c.tier === 'unverified'),
+            ...(rawCallers.unverifiedEntries || []),
+        ];
+        allCallers = allCallers.filter(c => c.tier !== 'unverified');
         // Apply exclude filter before slicing
         if (options.exclude && options.exclude.length > 0) {
+            const before = allCallers.length;
             allCallers = allCallers.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            aboutFilteredByFlag.exclude = before - allCallers.length;
+            const beforeUnverified = unverifiedPool.length;
+            unverifiedPool = unverifiedPool.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
+            aboutFilteredByFlag.exclude += beforeUnverified - unverifiedPool.length;
         }
         // Apply confidence filtering before slicing
         if (options.minConfidence > 0) {
@@ -1158,10 +1376,13 @@ function about(index, name, options = {}) {
             const callerResult = filterByConfidence(allCallers, options.minConfidence);
             allCallers = callerResult.kept;
             aboutConfFiltered += callerResult.filtered;
+            aboutFilteredByFlag.minConfidence = callerResult.filtered;
         }
         // BUG-H1: post-filter total — count the un-enriched shadow candidates that
         // also pass the same filters, so the displayed "showing N of <total>"
         // matches what `context` (which runs unbounded) would have shown.
+        // Per-tier: unverified-tier shadows count toward the unverified total,
+        // never toward the confirmed total.
         let shadowSurvivors = shadowCallers;
         if (options.exclude && options.exclude.length > 0) {
             shadowSurvivors = shadowSurvivors.filter(c => index.matchesFilters(c.relativePath, { exclude: options.exclude }));
@@ -1169,6 +1390,8 @@ function about(index, name, options = {}) {
         if (options.minConfidence > 0) {
             shadowSurvivors = shadowSurvivors.filter(c => (c.confidence || 0) >= options.minConfidence);
         }
+        const unverifiedShadowCount = shadowSurvivors.filter(s => s.tier === 'unverified').length;
+        shadowSurvivors = shadowSurvivors.filter(s => s.tier !== 'unverified');
         // Tag reachability on raw caller objects so we can preserve the field on the projection.
         // Reachability is computed once per index and cached.
         const aboutReachable = computeReachability(index);
@@ -1176,7 +1399,9 @@ function about(index, name, options = {}) {
 
         // Optional: filter to unreachable-only callers
         if (options.unreachableOnly) {
+            const before = allCallers.length;
             allCallers = allCallers.filter(c => !c.reachable);
+            aboutFilteredByFlag.unreachableOnly = before - allCallers.length;
             // Apply same filter to shadows using their callerStartLine/file when available.
             // Shadows lack callerStartLine, so they're treated as reachable=false (conservative,
             // matches the historical behavior where un-enriched callers had no reachability info).
@@ -1184,6 +1409,11 @@ function about(index, name, options = {}) {
             // building a perfect estimate isn't justified.
             shadowSurvivors = []; // conservative — drop shadows for unreachableOnly mode
         }
+        // Conservation account: claims from the PRE-filter rawCallers (+shadows);
+        // display-filter hides are explanatory metadata, outside the invariant.
+        const aboutFilteredTotal = aboutFilteredByFlag.exclude + aboutFilteredByFlag.minConfidence + aboutFilteredByFlag.unreachableOnly;
+        aboutAccount = composeAccount(index, symbolName, rawCallers,
+            aboutFilteredTotal > 0 ? { total: aboutFilteredTotal, byFlag: aboutFilteredByFlag } : undefined);
         // Stash the post-filter total on allCallers so the result builder can use it.
         Object.defineProperty(allCallers, '__postFilterTotal', {
             value: allCallers.length + shadowSurvivors.length,
@@ -1213,6 +1443,29 @@ function about(index, name, options = {}) {
             resolution: c.resolution,
             reachable: c.reachable,
         }));
+
+        // Unverified tier projection: visible, capped, with the drop reason.
+        unverifiedPool.sort((a, b) => {
+            const fa = a.relativePath || '';
+            const fb = b.relativePath || '';
+            if (fa !== fb) return fa.localeCompare(fb);
+            return (a.line || 0) - (b.line || 0);
+        });
+        aboutUnverified = {
+            total: unverifiedPool.length + unverifiedShadowCount,
+            top: unverifiedPool.slice(0, 10).map(c => ({
+                file: c.relativePath,
+                line: c.line,
+                ...(c.callerStartLine && c.callerName && {
+                    handle: `${c.relativePath}:${c.callerStartLine}:${c.callerName}`
+                }),
+                expression: (c.content || '').trim(),
+                callerName: c.callerName ?? null,
+                confidence: c.confidence,
+                resolution: c.resolution,
+                ...(c.reason && { reason: c.reason }),
+            })),
+        };
 
         // BUG-M3: classes/structs/interfaces don't have meaningful callees
         // (their body is methods, not a sequence of calls). Skip findCallees
@@ -1357,8 +1610,10 @@ function about(index, name, options = {}) {
             // BUG-H1: prefer post-filter total (computed from enriched + shadow candidates).
             // Falls back to allCallers.length when the post-filter total wasn't computed
             // (e.g., when primary is not a function and findCallers wasn't called).
+            // Since the tier partition, this total counts CONFIRMED callers only.
             total: allCallers?.__postFilterTotal ?? allCallers?.length ?? 0,
             top: callers,
+            unverified: aboutUnverified,
             // R3-NEW-1: include shadow callers (un-enriched candidates that passed the
             // same filters) so the histogram counts sum to `total`, not maxResults*3.
             histogram: buildHistogram(
@@ -1381,6 +1636,8 @@ function about(index, name, options = {}) {
         types,
         code,
         includeMethods,
+        ...(aboutAccount && { account: aboutAccount }),
+        ...(allCallers && { hasEntrypoints: computeReachability(index).size > 0 }),
         ...(aboutConfFiltered > 0 && { confidenceFiltered: aboutConfFiltered }),
         // BUG-M4: surface ambiguous-resolution warnings so formatters can render
         // a "auto-selected ... pass --file to choose" note.
