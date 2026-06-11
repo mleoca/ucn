@@ -21,11 +21,11 @@ test/public-repos-bugs.json
 test/public-repos-test.js
 test/agent-understanding-benchmark-report.json
 test/agent-understanding-benchmark-report.md
-test/agent-understanding-benchmark.js
 test/bug-hunting/
 
-# Agent benchmark fixtures
-test/fixtures/agent-benchmark/
 
 # Claude scheduled tasks
 .claude/scheduled_tasks.lock
+
+# Eval reports: JSON snapshots are large/regenerable; markdown roll-ups are committed
+eval/reports/*.json
