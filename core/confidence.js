@@ -27,6 +27,28 @@ const SCORES = {
     [RESOLUTION.UNCERTAIN]:      0.25,
 };
 
+// Trust tiers for the grep-reliability contract. CONFIRMED = the resolution
+// rests on binding/receiver/import evidence; UNVERIFIED = name match without
+// evidence. The mapping is resolution-based, never language-based — evidence
+// flags already come from langTraits dispatch in callers.js, so every
+// language gets correct tiers automatically.
+const TIER = { CONFIRMED: 'confirmed', UNVERIFIED: 'unverified' };
+const RESOLUTION_TIER = {
+    [RESOLUTION.EXACT_BINDING]: TIER.CONFIRMED,
+    [RESOLUTION.SAME_CLASS]:    TIER.CONFIRMED,
+    [RESOLUTION.RECEIVER_HINT]: TIER.CONFIRMED,
+    // scope-match is only assigned with import/receiver/callback evidence
+    // (see scoreEdge below) — that satisfies the contract's evidence clause.
+    [RESOLUTION.SCOPE_MATCH]:   TIER.CONFIRMED,
+    [RESOLUTION.NAME_ONLY]:     TIER.UNVERIFIED,
+    [RESOLUTION.UNCERTAIN]:     TIER.UNVERIFIED,
+};
+
+/** Map a RESOLUTION value to its trust tier (unknown values are unverified). */
+function tierForResolution(resolution) {
+    return RESOLUTION_TIER[resolution] || TIER.UNVERIFIED;
+}
+
 /**
  * Score a caller/callee edge based on resolution evidence.
  *
@@ -43,6 +65,14 @@ const SCORES = {
  */
 function scoreEdge(evidence) {
     const reasons = [];
+
+    // Known receiver/path type mismatch — checked FIRST: positive evidence the
+    // call targets a different symbol overrides any receiver-type signal
+    // (without this, a known mismatch would score receiver-hint 0.80).
+    if (evidence.typeMismatch) {
+        reasons.push('receiver type mismatch');
+        return { confidence: SCORES[RESOLUTION.UNCERTAIN], resolution: RESOLUTION.UNCERTAIN, evidence: reasons };
+    }
 
     // Exact binding match (highest confidence)
     if (evidence.hasBindingId) {
@@ -65,9 +95,10 @@ function scoreEdge(evidence) {
     }
 
     // Scope/import-supported match
-    if (evidence.hasImportEvidence || evidence.hasReceiverEvidence) {
+    if (evidence.hasImportEvidence || evidence.hasReceiverEvidence || evidence.hasSamePackageEvidence) {
         if (evidence.hasImportEvidence) reasons.push('import-supported');
         if (evidence.hasReceiverEvidence) reasons.push('receiver binding in scope');
+        if (evidence.hasSamePackageEvidence) reasons.push('same package/module');
         return { confidence: SCORES[RESOLUTION.SCOPE_MATCH], resolution: RESOLUTION.SCOPE_MATCH, evidence: reasons };
     }
 
@@ -111,6 +142,9 @@ function filterByConfidence(edges, minConfidence) {
 module.exports = {
     RESOLUTION,
     SCORES,
+    TIER,
+    RESOLUTION_TIER,
+    tierForResolution,
     scoreEdge,
     filterByConfidence,
 };
