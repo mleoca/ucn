@@ -1105,6 +1105,17 @@ function findCallsInCode(code, parser) {
         return undefined;
     };
 
+    // Walk up to the enclosing impl block's target type (impl<T> Foo<T> → Foo).
+    const findEnclosingImplType = (n) => {
+        for (let p = n.parent; p; p = p.parent) {
+            if (p.type === 'impl_item') {
+                const t = p.childForFieldName('type');
+                return (t && extractTypeName(t)) || undefined;
+            }
+        }
+        return undefined;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
@@ -1161,6 +1172,37 @@ function findCallsInCode(code, parser) {
                             receiver = rootType;
                         }
                     }
+                    // fix #202: one-hop declared-field receivers — self.dent.path(),
+                    // low.sep.into_bytes() — with .clone() transparency (clone()
+                    // returns Self by stdlib convention). receiverRoot/Field/RootType
+                    // let findCallers hop to the field's declared type cross-file.
+                    let receiverRoot, receiverField, receiverRootType;
+                    if (!receiver) {
+                        let obj = valueNode;
+                        while (obj?.type === 'call_expression') {
+                            const innerFn = obj.childForFieldName('function');
+                            if (innerFn?.type === 'field_expression' &&
+                                innerFn.childForFieldName('field')?.text === 'clone') {
+                                obj = innerFn.childForFieldName('value');
+                            } else break;
+                        }
+                        if (obj?.type === 'field_expression') {
+                            const rootNode = obj.childForFieldName('value');
+                            const fldNode = obj.childForFieldName('field');
+                            if (fldNode?.type === 'field_identifier' && rootNode &&
+                                (rootNode.type === 'identifier' || rootNode.type === 'self')) {
+                                receiverRoot = rootNode.text;
+                                receiverField = fldNode.text;
+                                receiverRootType = rootNode.type === 'self'
+                                    ? findEnclosingImplType(node)
+                                    : getReceiverType(rootNode.text);
+                            }
+                        } else if (obj && obj !== valueNode &&
+                            (obj.type === 'identifier' || obj.type === 'self')) {
+                            // x.clone().m() — the receiver is effectively x
+                            receiver = obj.text;
+                        }
+                    }
                     const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
                     const firstArg = getFirstStringArg(node);
                     // RUST-2: For chained calls like `a().b().parse::<T>().ok()`,
@@ -1174,6 +1216,8 @@ function findCallsInCode(code, parser) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverField && { receiverRoot, receiverField }),
+                        ...(receiverField && receiverRootType && { receiverRootType }),
                         enclosingFunction,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });

@@ -1683,3 +1683,101 @@ describe('endpoints command (Java)', () => {
         assert.strictEqual(exact.confidence, 1);
     });
 });
+
+describe('fix #202: declared-field receivers (Java)', () => {
+    const FILES = {
+        'Service.java': `public class Service {
+    public void execute() {}
+}
+`,
+        'Other.java': `public class Other {
+    public void execute() {}
+}
+`,
+        'Main.java': `public class Main {
+    private Service service;
+
+    public void run() {
+        this.service.execute();
+    }
+
+    public void bare() {
+        service.execute();
+    }
+
+    public void shadowed() {
+        Other service = new Other();
+        service.execute();
+    }
+}
+`,
+        'Base.java': `public class Base {
+    public void parse() {}
+}
+`,
+        'Child.java': `public class Child extends Base {
+    public void parse() {}
+}
+`,
+        'Holder.java': `public class Holder {
+    private Base b;
+
+    public void go() {
+        this.b.parse();
+    }
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('this.field and bare-field receivers type from field declarations', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const service = callersOf(index, 'Service.java:2:execute');
+            assert.ok(service.confirmed.includes('Main.java:5'),
+                `this.service.execute() must confirm Service.execute: ${service.confirmed}`);
+            assert.ok(service.confirmed.includes('Main.java:9'),
+                `bare service.execute() (implicit this) must confirm Service.execute: ${service.confirmed}`);
+            assert.ok(!service.confirmed.includes('Main.java:14'),
+                `shadowed local typed Other must not confirm Service.execute: ${service.confirmed}`);
+            assert.strictEqual(service.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('field-typed receivers exclude unrelated same-name targets with reason', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const other = callersOf(index, 'Other.java:2:execute');
+            assert.ok(other.confirmed.includes('Main.java:14'),
+                `local new Other() receiver must confirm Other.execute: ${other.confirmed}`);
+            assert.ok(!other.confirmed.includes('Main.java:5') && !other.confirmed.includes('Main.java:9'),
+                `Service-typed field sites must not confirm Other.execute: ${other.confirmed}`);
+            assert.ok(other.excluded.byReason['receiver-type-mismatch'],
+                'mismatched field receivers excluded with reason');
+            assert.strictEqual(other.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('supertype-typed fields never exclude overriding subclasses (virtual dispatch)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const child = callersOf(index, 'Child.java:2:parse');
+            assert.ok(child.confirmed.includes('Holder.java:5'),
+                `this.b.parse() with b typed Base may dispatch to Child.parse — never excluded: ${child.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

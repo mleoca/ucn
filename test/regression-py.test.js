@@ -2432,3 +2432,45 @@ describe('fix #200 (python): module receivers and self-call return flow', () => 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #202b: self.attr resolution respects the pinned target class (Python)', () => {
+    const FILES = {
+        'helper.py': `class Helper:
+    def run(self):
+        pass
+`,
+        'other.py': `class Other:
+    def run(self):
+        pass
+`,
+        'user.py': `from helper import Helper
+
+class User:
+    def __init__(self):
+        self.helper = Helper()
+
+    def go(self):
+        self.helper.run()
+`,
+    };
+
+    it('self.attr.run() typed to Helper is not a caller of pinned Other.run', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const rOther = execute(index, 'context', { name: 'other.py:2:run' });
+            const jsonOther = JSON.parse(output.formatContextJson(rOther.result));
+            const confOther = (jsonOther.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confOther.includes('user.py:8'),
+                `self.helper.run() (Helper-typed) must not confirm Other.run: ${confOther}`);
+            assert.strictEqual(jsonOther.meta.account.conserved, true);
+
+            const rHelper = execute(index, 'context', { name: 'helper.py:2:run' });
+            const jsonHelper = JSON.parse(output.formatContextJson(rHelper.result));
+            const confHelper = (jsonHelper.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confHelper.includes('user.py:8'),
+                `self.helper.run() must still confirm Helper.run: ${confHelper}`);
+        } finally { rm(dir); }
+    });
+});

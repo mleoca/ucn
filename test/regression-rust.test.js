@@ -1871,3 +1871,158 @@ describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #202: declared-field receivers (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'hay.rs': `
+pub struct Haystack { dent: DirEntry }
+impl Haystack {
+    pub fn path(&self) -> u8 {
+        if self.strip_dot_prefix && self.dent.path().starts_with("./") {
+            return self.dent.path().strip_prefix("./").unwrap();
+        }
+        self.dent.path()
+    }
+    pub fn is_dir(&self) -> bool {
+        self.dent.path().is_dir()
+    }
+}
+`,
+        'dent.rs': `
+pub struct DirEntry { x: u8 }
+impl DirEntry {
+    pub fn path(&self) -> u8 { self.x }
+}
+`,
+        'user.rs': `
+pub struct Low { sep: Separator }
+pub struct Separator { b: u8 }
+impl Separator {
+    pub fn into_bytes(&self) -> u8 { self.b }
+}
+pub struct OtherSep { b: u8 }
+impl OtherSep {
+    pub fn into_bytes(&self) -> u8 { self.b }
+}
+impl Low {
+    pub fn run(&self) -> u8 {
+        self.sep.clone().into_bytes()
+    }
+}
+pub struct Holder { flag: Box<dyn Flag> }
+pub struct Concrete { y: u8 }
+impl Concrete {
+    pub fn is_switch(&self) -> bool { true }
+}
+impl Holder {
+    pub fn check(&self) -> bool {
+        self.flag.is_switch()
+    }
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('excludes self.field.method() against an unrelated same-name target', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const hay = callersOf(index, 'hay.rs:3:path');
+            assert.ok(!hay.confirmed.some(c => c.startsWith('hay.rs:')),
+                `self.dent.path() sites must not confirm Haystack::path: ${hay.confirmed}`);
+            assert.ok(hay.excluded.byReason['receiver-type-mismatch'],
+                'field-typed receivers excluded with reason');
+            assert.strictEqual(hay.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('confirms self.field.method() for the field-typed target', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const dent = callersOf(index, 'dent.rs:3:path');
+            for (const line of ['hay.rs:4', 'hay.rs:5', 'hay.rs:7', 'hay.rs:10']) {
+                assert.ok(dent.confirmed.includes(line),
+                    `${line} (self.dent.path()) must confirm DirEntry::path: ${dent.confirmed}`);
+            }
+            assert.strictEqual(dent.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('types receivers through .clone() chains (clone returns Self)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const sep = callersOf(index, 'user.rs:4:into_bytes');
+            assert.ok(sep.confirmed.includes('user.rs:12'),
+                `self.sep.clone().into_bytes() must confirm Separator::into_bytes: ${sep.confirmed}`);
+            const other = callersOf(index, 'user.rs:8:into_bytes');
+            assert.ok(!other.confirmed.includes('user.rs:12'),
+                `clone-chain site must not confirm OtherSep::into_bytes: ${other.confirmed}`);
+            assert.strictEqual(other.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('never excludes through Box<dyn Trait> fields (dynamic dispatch)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const concrete = callersOf(index, 'user.rs:18:is_switch');
+            assert.ok(concrete.confirmed.includes('user.rs:22'),
+                `self.flag.is_switch() through Box<dyn Flag> stays a possible edge: ${concrete.confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #202b: same-class resolution respects the pinned target class (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'a.rs': `pub struct Haystack { x: u8 }
+impl Haystack {
+    pub fn path(&self) -> u8 { self.x }
+}
+`,
+        'b.rs': `pub struct StandardImpl { y: u8 }
+impl StandardImpl {
+    fn path(&self) -> u8 { self.y }
+    fn write_path_line(&self) -> u8 {
+        self.path()
+    }
+}
+`,
+    };
+
+    it('self.path() in an unrelated impl is not a caller of the pinned target', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const rA = execute(index, 'context', { name: 'a.rs:3:path' });
+            const jsonA = JSON.parse(output.formatContextJson(rA.result));
+            const confA = (jsonA.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confA.includes('b.rs:5'),
+                `StandardImpl-internal self.path() must not confirm Haystack::path: ${confA}`);
+            assert.ok(jsonA.meta.account.excluded.byReason['other-definition'],
+                'cross-impl self-call excluded with reason');
+            assert.strictEqual(jsonA.meta.account.conserved, true);
+
+            const rB = execute(index, 'context', { name: 'b.rs:3:path' });
+            const jsonB = JSON.parse(output.formatContextJson(rB.result));
+            const confB = (jsonB.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confB.includes('b.rs:5'),
+                `self.path() must still confirm its own impl's path: ${confB}`);
+        } finally { rm(dir); }
+    });
+});

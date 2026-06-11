@@ -109,7 +109,10 @@ function saveCache(index, cachePath) {
 
     const cacheData = {
         // v10: persist _reachableSymbols set (computed by entrypoints.computeReachability)
-        version: 10,
+        // v11: fix #202 — calls carry receiverRoot/receiverField/receiverRootType,
+        //      Java classes emit field members with fieldType (stale shapes would
+        //      silently disable declared-field receiver typing)
+        version: 11,
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
@@ -215,7 +218,7 @@ function loadCache(index, cachePath) {
         // v7: symbols/bindings stripped from file entries (dedup)
         // v9: addSymbol propagates isAsync/isGenerator/paramTypes (force rebuild for old)
         // v10: persists _reachableSymbols set
-        if (cacheData.version !== 10) {
+        if (cacheData.version !== 11) {
             return false;
         }
 

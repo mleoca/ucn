@@ -2008,7 +2008,7 @@ func World() string { return "world" }
                 assert.ok(!entry.symbols, 'File entry should not contain symbols');
                 assert.ok(!entry.bindings, 'File entry should not contain bindings');
             }
-            assert.strictEqual(cacheData.version, 10, 'Cache version should be 10');
+            assert.strictEqual(cacheData.version, 11, 'Cache version should be 11');
         } finally {
             rm(dir);
         }
@@ -4350,5 +4350,80 @@ func main() {
         } finally {
             fs.rmSync(tmpDir, { recursive: true, force: true });
         }
+    });
+});
+
+describe('fix #202: declared-field receivers (Go)', () => {
+    const FILES = {
+        'go.mod': 'module test\n\ngo 1.21\n',
+        'main.go': `package main
+
+type Inner struct{ b int }
+
+func (i *Inner) Run() int { return i.b }
+
+type OtherInner struct{ b int }
+
+func (o *OtherInner) Run() int { return o.b }
+
+type Holder struct {
+	inner Inner
+	iface Formatter
+}
+
+type Formatter interface {
+	Format() string
+}
+
+type Impl struct{}
+
+func (im Impl) Format() string { return "x" }
+
+func (h *Holder) Go() int {
+	return h.inner.Run()
+}
+
+func (h *Holder) Fmt() string {
+	return h.iface.Format()
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('h.inner.Run() confirms the field-typed target, excludes the other', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const inner = callersOf(index, 'main.go:5:Run');
+            assert.ok(inner.confirmed.includes('main.go:25'),
+                `h.inner.Run() must confirm Inner.Run: ${inner.confirmed}`);
+            const other = callersOf(index, 'main.go:9:Run');
+            assert.ok(!other.confirmed.includes('main.go:25'),
+                `h.inner.Run() must not confirm OtherInner.Run: ${other.confirmed}`);
+            assert.ok(other.excluded.byReason['receiver-type-mismatch'],
+                'mismatched field receiver excluded with reason');
+            assert.strictEqual(other.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('interface-typed fields never exclude implementors (dynamic dispatch)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const impl = callersOf(index, 'main.go:22:Format');
+            assert.ok(impl.confirmed.includes('main.go:29'),
+                `h.iface.Format() through an interface field stays a possible edge: ${impl.confirmed}`);
+        } finally { rm(dir); }
     });
 });

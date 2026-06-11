@@ -565,6 +565,17 @@ function findCallers(index, name, options = {}) {
                             const attrTypes = getInstanceAttributeTypes(index, filePath, callerSymbol.className);
                             const targetClass = attrTypes?.get(call.selfAttribute);
                             if (targetClass && definitions.some(d => d.className === targetClass)) {
+                                // fix #202b: the resolved class must be the
+                                // TARGET's class (or an ancestor — dynamic
+                                // dispatch). self.attr.m() resolving to class X
+                                // is not a caller of a pinned target Y.m.
+                                const tDefs = options.targetDefinitions || definitions;
+                                const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
+                                if (!targetClasses.has(targetClass) &&
+                                    !_isAncestorOfTargetClass(index, targetClass, tDefs)) {
+                                    recordExcluded(filePath, call.line, 'other-definition');
+                                    continue;
+                                }
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
@@ -581,21 +592,21 @@ function findCallers(index, name, options = {}) {
                             }
                         } else {
                             // For super(), skip same-class — only check parent chain
-                            let matchesDef = call.receiver === 'super'
-                                ? false
-                                : definitions.some(d => d.className === callerSymbol.className);
+                            let matchedClass = call.receiver !== 'super' &&
+                                definitions.some(d => d.className === callerSymbol.className)
+                                ? callerSymbol.className : null;
                             // Walk inheritance chain using BFS if not found in same class
-                            if (!matchesDef) {
+                            if (!matchedClass) {
                                 const visited = new Set([callerSymbol.className]);
                                 const callerFile = callerSymbol.file || filePath;
                                 const startParents = index._getInheritanceParents(callerSymbol.className, callerFile) || [];
                                 const queue = startParents.map(p => ({ name: p, contextFile: callerFile }));
-                                while (queue.length > 0 && !matchesDef) {
+                                while (queue.length > 0 && !matchedClass) {
                                     const { name: current, contextFile } = queue.shift();
                                     if (visited.has(current)) continue;
                                     visited.add(current);
-                                    matchesDef = definitions.some(d => d.className === current);
-                                    if (!matchesDef) {
+                                    if (definitions.some(d => d.className === current)) matchedClass = current;
+                                    if (!matchedClass) {
                                         const resolvedFile = index._resolveClassFile(current, contextFile);
                                         const grandparents = index._getInheritanceParents(current, resolvedFile) || [];
                                         for (const gp of grandparents) {
@@ -604,7 +615,26 @@ function findCallers(index, name, options = {}) {
                                     }
                                 }
                             }
-                            if (matchesDef) {
+                            if (matchedClass) {
+                                // fix #202b: same-class resolution must land on the
+                                // TARGET's class (or an ancestor — dynamic dispatch
+                                // may run the target override). self.path() inside
+                                // StandardImpl resolves to StandardImpl::path — not
+                                // a caller of a pinned target Haystack::path.
+                                // NOMINAL languages only: the exclusion is sound only
+                                // when the inheritance graph is complete; structural
+                                // TS hierarchies hide edges UCN can't see (zod's
+                                // `declare class` merging — measured: the structural
+                                // guard excluded true callers).
+                                if (langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                                    const tDefs = options.targetDefinitions || definitions;
+                                    const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
+                                    if (!targetClasses.has(matchedClass) &&
+                                        !_isAncestorOfTargetClass(index, matchedClass, tDefs)) {
+                                        recordExcluded(filePath, call.line, 'other-definition');
+                                        continue;
+                                    }
+                                }
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
@@ -626,6 +656,19 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Declared-field receiver typing (fix #202): one-hop field
+                // receivers (self.dent.path() / h.inner.Run() /
+                // this.service.execute()) resolve through the field's DECLARED
+                // type. Computed before binding checks — name-bindings don't
+                // model receivers, so a same-file `path` binding must not
+                // claim a call whose receiver field is typed elsewhere.
+                let fieldHopType = null;
+                if (call.isMethod && !call.receiverType && call.receiverField && call.receiverRootType &&
+                    !resolvedBySameClass &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                    fieldHopType = _declaredFieldType(index, call.receiverRootType, call.receiverField, fileEntry.language);
+                }
+
                 // Skip uncertain calls unless resolved by same-class matching or explicitly requested
                 if (isUncertain && !resolvedBySameClass && !options.includeUncertain) {
                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
@@ -642,8 +685,18 @@ function findCallers(index, name, options = {}) {
                 const targetDefs = options.targetDefinitions || definitions;
                 const targetBindingIds = new Set(targetDefs.map(d => d.bindingId).filter(Boolean));
                 if (targetBindingIds.size > 0 && bindingId && !targetBindingIds.has(bindingId)) {
-                    recordExcluded(filePath, call.line, 'other-definition');
-                    continue;
+                    // fix #202: a declared-field receiver type that VALIDATES
+                    // against the target overrides name-binding evidence —
+                    // self.dent.path() name-binds to a same-file `path` def,
+                    // but the field's declared type says the call is the
+                    // target's (receiver-typed edges fall through to the
+                    // receiver-class disambiguation below).
+                    const fieldHopMatchesTarget = fieldHopType && targetDefs.some(d =>
+                        (d.className || (d.receiver || '').replace(/^\*/, '')) === fieldHopType);
+                    if (!fieldHopMatchesTarget) {
+                        recordExcluded(filePath, call.line, 'other-definition');
+                        continue;
+                    }
                 }
 
                 // Import-graph disambiguation for JS/TS/Python: when multiple definitions of
@@ -829,8 +882,11 @@ function findCallers(index, name, options = {}) {
                 // whose receiverType is known to be a different type.
                 // All languages use receiverType when available (constructor/annotation inference).
                 // Go/Java/Rust additionally fall back to variable name matching.
-                if (call.isMethod && (call.receiver || call.receiverType) && !resolvedBySameClass && !bindingId &&
-                    (call.receiverType || langTraits(fileEntry.language)?.typeSystem === 'nominal')) {
+                // A declared-field receiver type (fix #202) enters even when a
+                // name-binding matched — bindings don't model receivers.
+                if (call.isMethod && (call.receiver || call.receiverType || fieldHopType) && !resolvedBySameClass &&
+                    (!bindingId || fieldHopType) &&
+                    (call.receiverType || fieldHopType || langTraits(fileEntry.language)?.typeSystem === 'nominal')) {
                     // Build target type set from both className (Java) and receiver (Go/Rust)
                     const targetTypes = new Set();
                     for (const td of targetDefs) {
@@ -859,23 +915,31 @@ function findCallers(index, name, options = {}) {
                     }
                     if (targetTypes.size > 0) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
-                        const knownType = call.receiverType;
+                        const knownType = call.receiverType || fieldHopType;
                         if (knownType) {
+                            const viaFieldHop = !call.receiverType; // declared-field hop (fix #202)
                             // Exclusion requires an UNRELATED type. A receiver typed
                             // as an ANCESTOR of the target's class may dynamically
                             // dispatch to the target override (x: Base; x.parse()
                             // can run Child.parse) — structural languages only;
-                            // Go embedding has no virtual dispatch.
+                            // Go embedding has no virtual dispatch. Field-hop types
+                            // get the ancestor guard too (Java virtual dispatch).
                             const structural = langTraits(fileEntry.language)?.typeSystem === 'structural';
                             if (targetTypes.has(knownType)) receiverTypeValidated = true;
                             const matchesTarget = receiverTypeValidated ||
-                                (structural && _isAncestorOfTargetClass(index, knownType, targetDefs));
+                                ((structural || viaFieldHop) && _isAncestorOfTargetClass(index, knownType, targetDefs));
                             // Structural trust gate: a name that is neither a
                             // builtin nor a project class (type alias, interface,
                             // external type) tracks no hierarchy UCN can check —
                             // not positive evidence against the target.
-                            const exclusionTrusted = !structural ||
-                                _receiverTypeTrustedForExclusion(index, knownType);
+                            // Field-hop exclusion additionally demands the field's
+                            // type DEFINE the method itself — otherwise Go
+                            // promotion, Rust Deref, or Java inheritance could
+                            // still route the call to the target.
+                            const fieldHopDefinesMethod = !viaFieldHop || definitions.some(d =>
+                                (d.className || (d.receiver || '').replace(/^\*/, '')) === knownType);
+                            const exclusionTrusted = (!structural ||
+                                _receiverTypeTrustedForExclusion(index, knownType)) && fieldHopDefinesMethod;
                             if (!matchesTarget && exclusionTrusted) {
                                 // Known type doesn't match target — positive evidence the
                                 // call targets a DIFFERENT symbol. Under the account contract
@@ -2112,6 +2176,77 @@ function _isAncestorOfTargetClass(index, typeName, targetDefs) {
         }
     }
     return false;
+}
+
+/**
+ * Resolve a one-hop field receiver to the field's DECLARED type (fix #202):
+ * rootType.fieldName → the field's declared type from the struct/class body
+ * (Rust/Go/Java parsers emit field members with fieldType). Returns null —
+ * never a wrong type — when: no such field, the declared type doesn't
+ * normalize to a plain nominal name (slices, fn types, wrappers), same-named
+ * classes disagree, or the type is a trait/interface (dynamic dispatch —
+ * a trait-typed field is not evidence against any implementor).
+ */
+function _declaredFieldType(index, rootType, fieldName, language) {
+    const defs = index.symbols.get(fieldName);
+    if (!defs) return null;
+    const fields = defs.filter(d =>
+        (d.type === 'field' || d.memberType === 'field') &&
+        d.className === rootType && d.fieldType);
+    if (fields.length === 0) return null;
+    const normalized = new Set();
+    for (const f of fields) {
+        const t = _normalizeFieldTypeName(f.fieldType, language);
+        if (t) normalized.add(t);
+        else return null; // any un-normalizable declaration → no evidence
+    }
+    if (normalized.size !== 1) return null; // same-named classes disagree
+    const typeName = [...normalized][0];
+    const typeDefs = index.symbols.get(typeName);
+    if (typeDefs && typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
+    return typeName;
+}
+
+/** Rust deref-transparent wrappers: Box<X>/Rc<X>/Arc<X> auto-deref to X for method calls. */
+const _RUST_DEREF_WRAPPERS = new Set(['Box', 'Rc', 'Arc']);
+
+/**
+ * Normalize a declared field type to a bare nominal type name, or null when
+ * the declaration carries no usable single-type evidence.
+ *   rust: `&'a mut ignore::DirEntry` → DirEntry; `Box<DirEntry>` → DirEntry;
+ *         `Box<dyn Flag>`/`dyn Flag`/`impl Trait` → null; tuples/fns → null
+ *   go:   `*ignore.Ig` → Ig; slices/maps/chans/funcs → null
+ *   java: `java.util.List<Foo>` → List; arrays → null
+ */
+function _normalizeFieldTypeName(raw, language) {
+    let t = String(raw).trim();
+    if (language === 'rust') {
+        let prev;
+        do {
+            prev = t;
+            t = t.replace(/^&+\s*/, '').replace(/^'[A-Za-z_][A-Za-z0-9_]*\s*/, '').replace(/^mut\s+/, '');
+        } while (t !== prev);
+        if (/^(dyn|impl)\b/.test(t)) return null;
+        const m = t.match(/^([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)\s*(?:<(.*)>)?$/s);
+        if (!m) return null;
+        const base = m[1].split('::').pop().trim();
+        if (m[2] !== undefined && _RUST_DEREF_WRAPPERS.has(base)) {
+            return _normalizeFieldTypeName(m[2], 'rust');
+        }
+        return base;
+    }
+    if (language === 'go') {
+        t = t.replace(/^\*+/, '');
+        const m = t.match(/^([A-Za-z_][A-Za-z0-9_]*)(?:\.([A-Za-z_][A-Za-z0-9_]*))?$/);
+        if (!m) return null;
+        return m[2] || m[1];
+    }
+    if (language === 'java') {
+        const m = t.match(/^([A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*)\s*(?:<.*>)?$/s);
+        if (!m) return null;
+        return m[1].split('.').pop();
+    }
+    return null;
 }
 
 function _buildTypedLocalTypeMap(index, def, calls) {

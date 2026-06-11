@@ -704,6 +704,29 @@ function extractClassMembers(classNode, codeOrLines) {
         // (one for class, one for constructor), forcing users to disambiguate.
         // Constructor signature info (params, line) remains accessible by reading
         // the class body when needed (e.g. via verify's AST walk).
+
+        // Field declarations: declared types drive receiver disambiguation
+        // (fix #202) — Rust/Go already emit field members with fieldType.
+        if (child.type === 'field_declaration') {
+            const typeNode = child.childForFieldName('type');
+            const fieldTypeText = typeNode ? typeNode.text : null;
+            for (let j = 0; j < child.namedChildCount; j++) {
+                const decl = child.namedChild(j);
+                if (decl.type === 'variable_declarator') {
+                    const nameNode = decl.childForFieldName('name');
+                    if (nameNode && fieldTypeText) {
+                        const { startLine, endLine } = nodeToLocation(child, code);
+                        members.push({
+                            name: nameNode.text,
+                            startLine,
+                            endLine,
+                            memberType: 'field',
+                            fieldType: fieldTypeText
+                        });
+                    }
+                }
+            }
+        }
     }
 
     return members;
@@ -899,6 +922,60 @@ function findCallsInCode(code, parser) {
         return undefined;
     };
 
+    // All names declared anywhere in a function body (locals, for/catch/lambda
+    // params). Guard for fix #202: a bare identifier receiver is only treated
+    // as an implicit-this field when NO local of that name is declared —
+    // mistyping a shadowed local could wrongly exclude a true caller.
+    const scopeDeclared = new Map();
+    const collectDeclaredNames = (fnNode) => {
+        const declared = new Set();
+        const walk = (n) => {
+            for (let i = 0; i < n.namedChildCount; i++) {
+                const c = n.namedChild(i);
+                if (c.type === 'variable_declarator' ||
+                    c.type === 'enhanced_for_statement' ||
+                    c.type === 'catch_formal_parameter') {
+                    const nn = c.childForFieldName('name');
+                    if (nn) declared.add(nn.text);
+                } else if (c.type === 'lambda_expression') {
+                    const params = c.childForFieldName('parameters');
+                    if (params?.type === 'identifier') declared.add(params.text);
+                    else if (params) {
+                        for (let j = 0; j < params.namedChildCount; j++) {
+                            const pc = params.namedChild(j);
+                            if (pc.type === 'identifier') declared.add(pc.text);
+                            else {
+                                const pn = pc.childForFieldName('name');
+                                if (pn) declared.add(pn.text);
+                            }
+                        }
+                    }
+                }
+                walk(c);
+            }
+        };
+        walk(fnNode);
+        return declared;
+    };
+    const isDeclaredLocal = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const declared = scopeDeclared.get(functionStack[i].startLine);
+            if (declared?.has(varName)) return true;
+        }
+        return false;
+    };
+
+    // Nearest enclosing class/interface/enum/record name (for implicit-this fields)
+    const findEnclosingClassName = (n) => {
+        for (let p = n.parent; p; p = p.parent) {
+            if (p.type === 'class_declaration' || p.type === 'interface_declaration' ||
+                p.type === 'enum_declaration' || p.type === 'record_declaration') {
+                return p.childForFieldName('name')?.text;
+            }
+        }
+        return undefined;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
@@ -909,6 +986,7 @@ function findCallsInCode(code, parser) {
             };
             functionStack.push(entry);
             scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
+            scopeDeclared.set(entry.startLine, collectDeclaredNames(node));
         }
 
         // Handle method invocations: foo(), obj.foo(), this.foo()
@@ -920,6 +998,38 @@ function findCallsInCode(code, parser) {
                 const enclosingFunction = getCurrentEnclosingFunction();
                 const receiver = (objNode?.type === 'identifier' || objNode?.type === 'this') ? objNode.text : undefined;
                 const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
+                // fix #202: one-hop declared-field receivers —
+                // this.service.execute(), svc.client.run(), and bare
+                // service.execute() where service is a class field (only when
+                // no same-named local is declared anywhere in the method).
+                let receiverRoot, receiverFieldName, receiverRootType;
+                if (objNode && !receiverType) {
+                    if (objNode.type === 'field_access') {
+                        const rootNode = objNode.childForFieldName('object');
+                        const fldNode = objNode.childForFieldName('field');
+                        if (fldNode?.type === 'identifier' && rootNode) {
+                            if (rootNode.type === 'this') {
+                                receiverRoot = 'this';
+                                receiverFieldName = fldNode.text;
+                                receiverRootType = findEnclosingClassName(node);
+                            } else if (rootNode.type === 'identifier') {
+                                const rootType = getReceiverType(rootNode.text);
+                                if (rootType) {
+                                    receiverRoot = rootNode.text;
+                                    receiverFieldName = fldNode.text;
+                                    receiverRootType = rootType;
+                                }
+                            }
+                        }
+                    } else if (objNode.type === 'identifier' && receiver &&
+                        !isDeclaredLocal(receiver)) {
+                        // Implicit-this field (or a class name — the field-type
+                        // hop in findCallers simply finds no field and no-ops).
+                        receiverRoot = 'this';
+                        receiverFieldName = receiver;
+                        receiverRootType = findEnclosingClassName(node);
+                    }
+                }
                 const firstArg = getFirstStringArg(node);
                 calls.push({
                     name: nameNode.text,
@@ -930,6 +1040,8 @@ function findCallsInCode(code, parser) {
                     isMethod: !!objNode,
                     receiver,
                     ...(receiverType && { receiverType }),
+                    ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
+                    ...(receiverFieldName && receiverRootType && { receiverRootType }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });

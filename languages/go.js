@@ -892,6 +892,20 @@ function findCallsInCode(code, parser, options = {}) {
                     // If receiver is a known import alias, this is a package call, not a method call
                     const isPkgCall = receiver && importAliases.has(receiver);
                     const receiverType = (!isPkgCall && receiver) ? getReceiverType(receiver) : undefined;
+                    // fix #202: one-hop declared-field receivers — h.inner.Run().
+                    // receiverRoot/Field/RootType let findCallers hop to the
+                    // field's declared struct-field type cross-file.
+                    let receiverRoot, receiverFieldName, receiverRootType;
+                    if (!receiver && operandNode?.type === 'selector_expression') {
+                        const rootNode = operandNode.childForFieldName('operand');
+                        const fldNode = operandNode.childForFieldName('field');
+                        if (rootNode?.type === 'identifier' && fldNode &&
+                            !importAliases.has(rootNode.text)) {
+                            receiverRoot = rootNode.text;
+                            receiverFieldName = fldNode.text;
+                            receiverRootType = getReceiverType(rootNode.text);
+                        }
+                    }
                     const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: fieldNode.text,
@@ -899,6 +913,8 @@ function findCallsInCode(code, parser, options = {}) {
                         isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
+                        ...(receiverFieldName && receiverRootType && { receiverRootType }),
                         enclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
