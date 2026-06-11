@@ -348,7 +348,7 @@ describe('perf: cache v8', () => {
             index.saveCache();
             const cachePath = path.join(dir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 11, 'should save as current version');
+            assert.strictEqual(cacheData.version, 12, 'should save as current version');
             assert.ok(!cacheData.calleeIndex, 'should not include calleeIndex');
         } finally {
             rm(dir);
@@ -733,7 +733,7 @@ describe('perf: PERF-3 atomic index.json write', () => {
                 index.saveCache();
                 const cachePath = path.join(dir, '.ucn-cache', 'index.json');
                 const data = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-                assert.strictEqual(data.version, 11, 'cache version should be intact');
+                assert.strictEqual(data.version, 12, 'cache version should be intact');
             }
 
             const tmpFile = path.join(dir, '.ucn-cache', 'index.json.tmp');

@@ -2474,3 +2474,41 @@ class User:
         } finally { rm(dir); }
     });
 });
+
+describe('fix #203: assigned locals shadow callback references (Python)', () => {
+    const FILES = {
+        'lib.py': `def effect(fn):
+    return fn
+
+def needs_recompute(t):
+    return bool(t)
+
+def end_batch(batched):
+    effect = batched
+    while effect is not None:
+        needs_recompute(effect)
+
+def real_user():
+    schedule(effect)
+
+def schedule(fn):
+    pass
+`,
+    };
+
+    it('function-wide assignment makes the name local for all references', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'lib.py:1:effect' });
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confirmed.includes('lib.py:10'),
+                `needs_recompute(effect) with assigned local must not confirm the effect function: ${confirmed}`);
+            assert.ok(confirmed.includes('lib.py:13'),
+                `schedule(effect) without shadowing must stay confirmed: ${confirmed}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});

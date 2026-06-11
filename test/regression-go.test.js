@@ -2008,7 +2008,7 @@ func World() string { return "world" }
                 assert.ok(!entry.symbols, 'File entry should not contain symbols');
                 assert.ok(!entry.bindings, 'File entry should not contain bindings');
             }
-            assert.strictEqual(cacheData.version, 11, 'Cache version should be 11');
+            assert.strictEqual(cacheData.version, 12, 'Cache version should be 12');
         } finally {
             rm(dir);
         }

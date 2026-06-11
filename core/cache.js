@@ -112,7 +112,9 @@ function saveCache(index, cachePath) {
         // v11: fix #202 — calls carry receiverRoot/receiverField/receiverRootType,
         //      Java classes emit field members with fieldType (stale shapes would
         //      silently disable declared-field receiver typing)
-        version: 11,
+        // v12: fix #203 — callback references carry localShadow (lexical-scope
+        //      shadowing computed parser-side)
+        version: 12,
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
@@ -218,7 +220,7 @@ function loadCache(index, cachePath) {
         // v7: symbols/bindings stripped from file entries (dedup)
         // v9: addSymbol propagates isAsync/isGenerator/paramTypes (force rebuild for old)
         // v10: persists _reachableSymbols set
-        if (cacheData.version !== 11) {
+        if (cacheData.version !== 12) {
             return false;
         }
 

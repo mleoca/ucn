@@ -415,9 +415,13 @@ function findCallers(index, name, options = {}) {
                     // A parameter of the enclosing function with the same name
                     // shadows the target: `disposeEffect(effect)` inside
                     // `function disposeEffect(effect)` references the parameter,
-                    // not a same-name module-scope symbol.
-                    if (callerSymbol && Array.isArray(callerSymbol.paramsStructured) &&
-                        callerSymbol.paramsStructured.some(p => p && p.name === call.name)) {
+                    // not a same-name module-scope symbol. Same for let/const
+                    // locals and inner-arrow params (fix #203 — parser-side
+                    // lexical scope walk sets call.localShadow; JS block-accurate,
+                    // Python function-wide assignment semantics).
+                    if (call.localShadow ||
+                        (callerSymbol && Array.isArray(callerSymbol.paramsStructured) &&
+                            callerSymbol.paramsStructured.some(p => p && p.name === call.name))) {
                         recordExcluded(filePath, call.line, 'local-shadow');
                         continue;
                     }

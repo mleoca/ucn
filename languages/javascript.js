@@ -1429,6 +1429,74 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    // fix #203: does a declaration node declare `name` (incl. shallow destructuring)?
+    const _declaresName = (declNode, name) => {
+        for (let i = 0; i < declNode.namedChildCount; i++) {
+            const d = declNode.namedChild(i);
+            if (d.type !== 'variable_declarator') continue;
+            const nameNode = d.childForFieldName('name');
+            if (nameNode?.type === 'identifier' && nameNode.text === name) return true;
+            if (nameNode && (nameNode.type === 'object_pattern' || nameNode.type === 'array_pattern')) {
+                for (let j = 0; j < nameNode.namedChildCount; j++) {
+                    const el = nameNode.namedChild(j);
+                    if ((el.type === 'identifier' || el.type === 'shorthand_property_identifier_pattern') &&
+                        el.text === name) return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    // fix #203: is a bare-identifier function REFERENCE shadowed by a
+    // let/const/var local, for/catch binding, or inner-arrow param in an
+    // enclosing lexical scope? Block-accurate, declaration-before-use.
+    // The enclosing SYMBOL's params are checked at query time in
+    // findCallers — let locals and non-symbol arrow params are only
+    // visible here. Module-level (program) declarations are NOT shadows:
+    // that's the module binding itself, owned by binding resolution.
+    const isShadowedByLocal = (refNode, name) => {
+        for (let p = refNode.parent; p; p = p.parent) {
+            if (p.type === 'statement_block') {
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    const stmt = p.namedChild(i);
+                    if (stmt.startIndex >= refNode.startIndex) break; // declaration-before-use
+                    if ((stmt.type === 'lexical_declaration' || stmt.type === 'variable_declaration') &&
+                        _declaresName(stmt, name)) return true;
+                }
+            } else if (p.type === 'for_statement') {
+                const init = p.childForFieldName('initializer');
+                if (init && (init.type === 'lexical_declaration' || init.type === 'variable_declaration') &&
+                    _declaresName(init, name)) return true;
+            } else if (p.type === 'for_in_statement') {
+                const left = p.childForFieldName('left');
+                if (left?.type === 'identifier' && left.text === name) return true;
+                if (left && (left.type === 'lexical_declaration' || left.type === 'variable_declaration') &&
+                    _declaresName(left, name)) return true;
+            } else if (p.type === 'catch_clause') {
+                const param = p.childForFieldName('parameter');
+                if (param?.type === 'identifier' && param.text === name) return true;
+            } else if (p.type === 'arrow_function' || p.type === 'function_expression' ||
+                p.type === 'function_declaration' || p.type === 'function' ||
+                p.type === 'method_definition' || p.type === 'generator_function' ||
+                p.type === 'generator_function_declaration') {
+                const params = p.childForFieldName('parameters') || p.childForFieldName('parameter');
+                if (params) {
+                    if (params.type === 'identifier' && params.text === name) return true; // x => ...
+                    for (let i = 0; i < params.namedChildCount; i++) {
+                        const prm = params.namedChild(i);
+                        if (prm.type === 'identifier' && prm.text === name) return true;
+                        if (prm.type === 'assignment_pattern' || prm.type === 'required_parameter' ||
+                            prm.type === 'optional_parameter') {
+                            const l = prm.childForFieldName('left') || prm.childForFieldName('pattern');
+                            if (l?.type === 'identifier' && l.text === name) return true;
+                        }
+                    }
+                }
+            }
+        }
+        return false;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track module-alias bindings: `import * as ns from "./m"` binds ns to a
         // MODULE — method calls through it dispatch to module exports, never to
@@ -1683,6 +1751,7 @@ function findCallsInCode(code, parser) {
                                     line: arg.startPosition.row + 1,
                                     isMethod: false,
                                     isFunctionReference: true,
+                                    ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
                                     enclosingFunction
                                 });
                             } else if (arg.type === 'member_expression') {
@@ -1721,6 +1790,7 @@ function findCallsInCode(code, parser) {
                                 isMethod: false,
                                 isFunctionReference: true,
                                 isPotentialCallback: true,
+                                ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
                                 enclosingFunction
                             });
                         }
@@ -1738,6 +1808,7 @@ function findCallsInCode(code, parser) {
                                             isMethod: false,
                                             isFunctionReference: true,
                                             isPotentialCallback: true,
+                                            ...(isShadowedByLocal(val, val.text) && { localShadow: true }),
                                             enclosingFunction
                                         });
                                     }
@@ -1840,6 +1911,7 @@ function findCallsInCode(code, parser) {
                         isMethod: false,
                         isFunctionReference: true,
                         isPotentialCallback: true,
+                        ...(isShadowedByLocal(child, child.text) && { localShadow: true }),
                         enclosingFunction
                     });
                 } else if (child.type === 'member_expression') {

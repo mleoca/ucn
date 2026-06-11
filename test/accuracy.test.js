@@ -1117,7 +1117,7 @@ export { getArea, getCircleArea, getSquareArea };
 
 describe('11. Fix C Edge Cases', () => {
 
-    it('LIMITATION: variable sharing name with function causes false caller', () => {
+    it('fixed #203: variable sharing name with function no longer a false caller', () => {
         const d = tmp({
             'package.json': '{"name":"t"}',
             'lib.js': `
@@ -1132,11 +1132,12 @@ module.exports = { count, process, doSomething };
         try {
             const index = idx(d);
             const callers = index.findCallers('count');
-            // doSomething(count) — 'count' is a variable, not the function, but name matches symbol table
+            // doSomething(count) — 'count' is the const local, not the function.
+            // Was a documented Fix C LIMITATION; fix #203's lexical-scope shadow
+            // detection excludes it (local-shadow) like param shadowing.
             const hasProcess = callers.some(c => c.callerName === 'process');
-            // This is a known false positive from Fix C
-            assert.ok(hasProcess,
-                'False positive: variable count passed to doSomething() triggers isPotentialCallback');
+            assert.ok(!hasProcess,
+                'const-local count passed to doSomething() must not confirm the count function');
         } finally { rm(d); }
     });
 

@@ -656,6 +656,54 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    // fix #203: is a bare-identifier function REFERENCE shadowed by a local of
+    // the enclosing function? Python locals are FUNCTION-scoped and an
+    // assignment ANYWHERE in the function makes the name local for ALL its
+    // references (UnboundLocalError semantics) — so scan the whole enclosing
+    // function subtree (excluding nested function bodies, which are separate
+    // scopes) for assignment/for/with-as/walrus bindings of the name.
+    // Enclosing-function PARAMS are checked at query time in findCallers.
+    const _bindsNameInScope = (scopeNode, name) => {
+        for (let i = 0; i < scopeNode.namedChildCount; i++) {
+            const c = scopeNode.namedChild(i);
+            if (c.type === 'function_definition' || c.type === 'async_function_definition' ||
+                c.type === 'class_definition' || c.type === 'lambda') continue; // separate scope
+            if (c.type === 'assignment' || c.type === 'augmented_assignment' || c.type === 'named_expression') {
+                const left = c.childForFieldName('left') || c.childForFieldName('name');
+                if (left?.type === 'identifier' && left.text === name) return true;
+                if (left?.type === 'pattern_list' || left?.type === 'tuple_pattern') {
+                    for (let j = 0; j < left.namedChildCount; j++) {
+                        if (left.namedChild(j).type === 'identifier' && left.namedChild(j).text === name) return true;
+                    }
+                }
+            } else if (c.type === 'for_statement') {
+                const left = c.childForFieldName('left');
+                if (left?.type === 'identifier' && left.text === name) return true;
+                if (left?.type === 'pattern_list' || left?.type === 'tuple_pattern') {
+                    for (let j = 0; j < left.namedChildCount; j++) {
+                        if (left.namedChild(j).type === 'identifier' && left.namedChild(j).text === name) return true;
+                    }
+                }
+            } else if (c.type === 'with_statement') {
+                // with open(f) as fh: — as-target is inside with_clause/with_item
+                const text = c.namedChild(0)?.text || '';
+                const m = text.match(/\bas\s+([A-Za-z_][A-Za-z0-9_]*)/);
+                if (m && m[1] === name) return true;
+            }
+            if (_bindsNameInScope(c, name)) return true;
+        }
+        return false;
+    };
+    const isShadowedByLocal = (refNode, name) => {
+        for (let p = refNode.parent; p; p = p.parent) {
+            if (p.type === 'function_definition' || p.type === 'async_function_definition') {
+                const body = p.childForFieldName('body');
+                return body ? _bindsNameInScope(body, name) : false;
+            }
+        }
+        return false; // module level — that's a module binding, not a shadow
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track module-alias bindings: `import httpx` binds 'httpx' (a module),
         // `import numpy as np` binds 'np'. Method calls through these receivers
@@ -891,6 +939,7 @@ function findCallsInCode(code, parser) {
                             isMethod: false,
                             isFunctionReference: true,
                             isPotentialCallback: true,
+                            ...(isShadowedByLocal(arg, arg.text) && { localShadow: true }),
                             enclosingFunction
                         });
                     }
@@ -908,6 +957,7 @@ function findCallsInCode(code, parser) {
                                         isMethod: false,
                                         isFunctionReference: true,
                                         isPotentialCallback: true,
+                                        ...(isShadowedByLocal(val, val.text) && { localShadow: true }),
                                         enclosingFunction
                                     });
                                 }

@@ -5216,3 +5216,44 @@ describe('fix #201 (js/ts): multi-line chained calls report the method name line
         } finally { rm(dir); }
     });
 });
+
+describe('fix #203: let/const locals shadow callback references (JS/TS)', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'lib.js': `function effect(fn) { return fn; }
+function needsToRecompute(t) { return !!t; }
+function endBatch() {
+    let effect = getBatched();
+    while (effect !== undefined) {
+        if (needsToRecompute(effect)) {
+            effect = effect._next;
+        }
+    }
+}
+function realUser() {
+    schedule(effect);
+}
+function schedule(fn) {}
+function getBatched() {}
+module.exports = { effect, endBatch, realUser };
+`,
+    };
+
+    it('arg-position refs shadowed by a let local are excluded with reason', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'lib.js:1:effect' });
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confirmed.includes('lib.js:6'),
+                `needsToRecompute(effect) with let-local effect must not confirm the effect function: ${confirmed}`);
+            assert.ok(confirmed.includes('lib.js:12'),
+                `schedule(effect) without shadowing must stay confirmed: ${confirmed}`);
+            assert.ok(json.meta.account.excluded.byReason['local-shadow'],
+                'shadowed ref excluded with local-shadow reason');
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
