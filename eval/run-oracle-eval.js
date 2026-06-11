@@ -2,7 +2,7 @@
 
 /**
  * eval/run-oracle-eval.js - Score UCN's tiered caller answers against an
- * external compiler/LSP oracle (ts-morph for TypeScript).
+ * external compiler/LSP oracle (ts-morph for TypeScript, jedi for Python).
  *
  * Metrics (per repo):
  *   tier1Precision      — |confirmed ∩ oracle-calls| / |confirmed|
@@ -18,7 +18,7 @@
  *   conservedRate       — account invariant holds on real-repo symbols
  *
  * Usage:
- *   node eval/run-oracle-eval.js                  # all TS repos
+ *   node eval/run-oracle-eval.js                  # all repos with a matching oracle
  *   node eval/run-oracle-eval.js --repo zod
  *   node eval/run-oracle-eval.js --sample 20      # symbols per repo (default 50)
  *
@@ -36,13 +36,14 @@ const output = require('../core/output');
 const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
+const { jediOracle } = require('./oracles/jedi-oracle');
 
 const args = process.argv.slice(2);
 const repoFilter = readArgValue(args, '--repo');
 const sampleSize = Number(readArgValue(args, '--sample') || 50);
 const REPORTS_DIR = path.join(__dirname, 'reports');
 
-const ORACLES = [validateOracle(tsMorphOracle)];
+const ORACLES = [validateOracle(tsMorphOracle), validateOracle(jediOracle)];
 
 const REF_BUCKETS = [
     { name: '0', test: (n) => n === 0 },
@@ -325,10 +326,10 @@ function rate(n, d) { return d ? Number((n / d).toFixed(4)) : 0; }
 function pct(x) { return `${(x * 100).toFixed(1)}%`; }
 
 async function main() {
-    const tsRepos = REPOS.filter(r =>
+    const oracleRepos = REPOS.filter(r =>
         ORACLES.some(o => o.languages.includes(r.language)) &&
         (!repoFilter || r.name === repoFilter));
-    if (tsRepos.length === 0) {
+    if (oracleRepos.length === 0) {
         console.error(`No matching repos for oracle languages${repoFilter ? ` and --repo ${repoFilter}` : ''}.`);
         process.exit(1);
     }
@@ -338,7 +339,7 @@ async function main() {
     const results = [];
     let gateFailed = false;
 
-    for (const repo of tsRepos) {
+    for (const repo of oracleRepos) {
         const oracle = ORACLES.find(o => o.languages.includes(repo.language));
         try {
             const result = await evaluateRepo(repo, oracle);
