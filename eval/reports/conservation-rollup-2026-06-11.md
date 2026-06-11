@@ -7,9 +7,9 @@ grep-reliability contract eliminates).
 
 | repo | lang | files | sampled | conserved | gap symbols | gap lines | beyond-text | avg ms/account |
 |---|---|---|---|---|---|---|---|---|
-| zod | typescript | 287 | 24 | 100.0% | 0 | 0 | 30 | 175.3 |
-| preact-signals | typescript | 2 | 23 | 100.0% | 0 | 0 | 1 | 32.6 |
-| httpx | python | 61 | 24 | 100.0% | 0 | 0 | 0 | 31 |
-| cobra | go | 36 | 24 | 100.0% | 0 | 0 | 1 | 29.5 |
-| ripgrep | rust | 100 | 24 | 100.0% | 0 | 0 | 0 | 83.6 |
-| gson | java | 210 | 24 | 100.0% | 0 | 0 | 0 | 36.3 |
+| zod | typescript | 287 | 24 | 100.0% | 0 | 0 | 30 | 178.8 |
+| preact-signals | typescript | 2 | 23 | 100.0% | 0 | 0 | 1 | 33.6 |
+| httpx | python | 61 | 24 | 100.0% | 0 | 0 | 0 | 33.3 |
+| cobra | go | 36 | 24 | 100.0% | 0 | 0 | 1 | 29 |
+| ripgrep | rust | 100 | 24 | 100.0% | 0 | 0 | 0 | 84.3 |
+| gson | java | 210 | 24 | 100.0% | 0 | 0 | 0 | 32.2 |
