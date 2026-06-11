@@ -2371,3 +2371,64 @@ describe('fix #199 (python): return-type flow types assigned variables', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #200 (python): module receivers and self-call return flow', () => {
+    const FIXTURE = {
+        'package.json': '{"name":"t"}',
+        'pkg/__init__.py': 'from ._api import get\nfrom ._client import Client\n',
+        'pkg/_api.py': 'def get(url):\n    return url\n',
+        'pkg/_client.py': [
+            'class Response:',
+            '    def aclose(self):',
+            '        return 1',
+            '',
+            'class AsyncClient:',
+            '    def aclose(self):',
+            '        return 2',
+            '',
+            'class Client:',
+            '    def get(self, url):',
+            '        return url',
+            '',
+            '    def _send(self, request) -> Response:',
+            '        return Response()',
+            '',
+            '    def run(self, request):',
+            '        response = self._send(request)',
+            '        return response.aclose()',
+        ].join('\n'),
+        'app.py': 'import pkg\n\ndef fetch():\n    return pkg.get("http://x")\n',
+    };
+
+    it('module-receiver call never confirms a class method, still confirms the module fn', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const rMethod = execute(index, 'context', { name: 'pkg/_client.py:10:get', className: 'Client' });
+            assert.ok(rMethod.ok);
+            const methodLines = (rMethod.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!methodLines.includes('app.py:4'),
+                `pkg.get() is the module function, not Client.get: ${methodLines}`);
+            const rFn = execute(index, 'context', { name: 'pkg/_api.py:1:get' });
+            const fnLines = (rFn.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(fnLines.includes('app.py:4'),
+                `pkg.get() must stay confirmed for the module function: ${fnLines}`);
+            assert.strictEqual(rMethod.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('self-call return flow types the assigned variable', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const rResp = execute(index, 'context', { name: 'pkg/_client.py:2:aclose', className: 'Response' });
+            const respLines = (rResp.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(respLines.includes('pkg/_client.py:18'),
+                `response = self._send() -> Response must confirm Response.aclose: ${respLines}`);
+            const rAsync = execute(index, 'context', { name: 'pkg/_client.py:6:aclose', className: 'AsyncClient' });
+            const asyncLines = (rAsync.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!asyncLines.includes('pkg/_client.py:18'),
+                `flow-typed Response receiver excluded from AsyncClient.aclose: ${asyncLines}`);
+        } finally { rm(dir); }
+    });
+});

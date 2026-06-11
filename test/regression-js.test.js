@@ -5139,3 +5139,44 @@ describe('fix #199 (js/ts): return-type flow types assigned variables', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #200 (js/ts): module receivers never confirm class methods', () => {
+    it('namespace-import receiver excluded from class method, kept for module fn', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Client {',
+                '    send(m: string) { return m; }',
+                '}',
+                'export function send(m: string) { return m; }',
+            ].join('\n'),
+            'app.ts': 'import * as lib from "./lib";\n\nexport function run() {\n    return lib.send("x");\n}',
+        });
+        try {
+            const index = idx(dir);
+            const rMethod = execute(index, 'context', { name: 'lib.ts:2:send', className: 'Client' });
+            const methodLines = (rMethod.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!methodLines.includes('app.ts:4'),
+                `lib.send() is the module function, not Client.send: ${methodLines}`);
+            const rFn = execute(index, 'context', { name: 'lib.ts:4:send' });
+            const fnLines = (rFn.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(fnLines.includes('app.ts:4'),
+                `lib.send() must stay confirmed for the module function: ${fnLines}`);
+        } finally { rm(dir); }
+    });
+
+    it('require-bound receiver excluded from class method', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'class Worker {\n    start() { return 1; }\n}\nfunction start() { return 2; }\nmodule.exports = { Worker, start };',
+            'app.js': 'const lib = require("./lib");\n\nfunction go() {\n    return lib.start();\n}',
+        });
+        try {
+            const index = idx(dir);
+            const rMethod = execute(index, 'context', { name: 'lib.js:2:start', className: 'Worker' });
+            const methodLines = (rMethod.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!methodLines.includes('app.js:4'),
+                `lib.start() is the module export, not Worker.start: ${methodLines}`);
+        } finally { rm(dir); }
+    });
+});

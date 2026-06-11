@@ -333,7 +333,7 @@ function findCallers(index, name, options = {}) {
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     let flowMap = returnFlowCache.get(filePath);
                     if (flowMap === undefined) {
-                        flowMap = _buildReturnTypeFlowMap(index, calls);
+                        flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
                         returnFlowCache.set(filePath, flowMap);
                     }
                     const flowType = flowMap && _lookupReturnTypeFlow(flowMap, call);
@@ -718,6 +718,25 @@ function findCallers(index, name, options = {}) {
                     if (!call.isMethod && targetHasClass) {
                         // Non-method call but target is a class method — skip
                         recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                        continue;
+                    }
+                }
+
+                // Module receiver: httpx.get() / ns.helper() dispatches to a
+                // module export — it can never be a CLASS METHOD call. Applies
+                // only when every target is a class method; standalone-function
+                // and class (constructor) targets keep flowing on import evidence.
+                if (!bindingId && !resolvedBySameClass && call.isMethod && call.receiverIsModule &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    targetDefs.length > 0 && targetDefs.every(d => d.className)) {
+                    isUncertain = true;
+                    typeMismatch = true;
+                    if (collectAccount) {
+                        recordExcluded(filePath, call.line, 'module-receiver');
+                        continue;
+                    }
+                    if (!options.includeUncertain) {
+                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                         continue;
                     }
                 }
@@ -1978,13 +1997,16 @@ function _typeNameFromReturnAnnotation(text) {
  * Per-file return-type-flow map: variables typed by what the assigned call
  * returns. Key `${enclosingFnStartLine||''}:${varName}` → [{ line, type }]
  * (all assignments, so lookups can pick the nearest preceding one).
- * Only two resolvable shapes, both conservative:
+ * Only three resolvable shapes, all conservative:
  *  - typed-receiver method call: receiverType class (or an ancestor walk is
  *    NOT attempted — exact className match only) defines the method with a
  *    return annotation
+ *  - self/this/cls method call: the enclosing class (walking up its
+ *    inheritance chain for inherited methods) defines the method with a
+ *    return annotation
  *  - plain call with exactly ONE project definition carrying a return annotation
  */
-function _buildReturnTypeFlowMap(index, calls) {
+function _buildReturnTypeFlowMap(index, filePath, calls) {
     let map = null;
     for (const call of calls) {
         if (!call.assignedTo) continue;
@@ -1993,6 +2015,23 @@ function _buildReturnTypeFlowMap(index, calls) {
             const defs = index.symbols.get(call.name) || [];
             const def = defs.find(d => d.className === call.receiverType && d.returnType);
             returnType = def && def.returnType;
+        } else if (call.isMethod && ['self', 'this', 'cls'].includes(call.receiver)) {
+            const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+            let cls = enclosing && enclosing.className;
+            let ctxFile = filePath;
+            const visited = new Set();
+            while (cls && !visited.has(cls)) {
+                visited.add(cls);
+                const def = (index.symbols.get(call.name) || [])
+                    .find(d => d.className === cls && d.returnType);
+                if (def) { returnType = def.returnType; break; }
+                const parents = index._getInheritanceParents(cls, ctxFile) || [];
+                const next = parents[0]; // single chain; diamond bases stay untyped
+                if (next && index._resolveClassFile) {
+                    ctxFile = index._resolveClassFile(next, ctxFile) || ctxFile;
+                }
+                cls = next;
+            }
         } else if (!call.isMethod) {
             const defs = (index.symbols.get(call.name) || [])
                 .filter(d => !NON_CALLABLE_TYPES.has(d.type));

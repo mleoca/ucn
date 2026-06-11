@@ -1247,6 +1247,7 @@ function findCallsInCode(code, parser) {
     const aliases = new Map();  // Track local aliases: aliasName -> originalName (string or string[])
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const moduleAliases = new Set();  // Names bound to MODULES (import * as ns / const pkg = require(...))
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
     // Helper: extract first string-arg literal from a call_expression node.
@@ -1429,6 +1430,14 @@ function findCallsInCode(code, parser) {
     };
 
     traverseTree(tree.rootNode, (node) => {
+        // Track module-alias bindings: `import * as ns from "./m"` binds ns to a
+        // MODULE — method calls through it dispatch to module exports, never to
+        // class methods.
+        if (node.type === 'namespace_import') {
+            const id = node.namedChild(0);
+            if (id?.type === 'identifier') moduleAliases.add(id.text);
+        }
+
         // Track function entry
         if (isFunctionNode(node)) {
             functionStack.push({
@@ -1444,6 +1453,13 @@ function findCallsInCode(code, parser) {
         if (node.type === 'variable_declarator') {
             const nameNode = node.childForFieldName('name');
             const initNode = node.childForFieldName('value');
+            // const pkg = require("./lib") — pkg is a module namespace
+            if (nameNode?.type === 'identifier' && initNode?.type === 'call_expression') {
+                const fn = initNode.childForFieldName('function');
+                if (fn?.type === 'identifier' && fn.text === 'require') {
+                    moduleAliases.add(nameNode.text);
+                }
+            }
             if (nameNode?.type === 'identifier' && initNode?.type === 'identifier') {
                 // Simple alias: const p = parse
                 aliases.set(nameNode.text, initNode.text);
@@ -1608,6 +1624,10 @@ function findCallsInCode(code, parser) {
                         const receiverType = receiver
                             ? localVarTypes.get(receiver)
                             : (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined);
+                        // Module receiver (ns.helper()) — unless locally shadowed
+                        // by a typed instance binding
+                        const receiverIsModule = !!receiver && moduleAliases.has(receiver) &&
+                            !localVarTypes.has(receiver);
                         const firstArg = getFirstStringArg(node);
                         const argCount = getArgCount(node);
                         const assignedTo = jsAssignmentTargetOf(node);
@@ -1617,6 +1637,7 @@ function findCallsInCode(code, parser) {
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),
+                            ...(receiverIsModule && { receiverIsModule: true }),
                             ...(assignedTo && { assignedTo }),
                             enclosingFunction,
                             uncertain,

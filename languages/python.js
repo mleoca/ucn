@@ -571,6 +571,7 @@ function findCallsInCode(code, parser) {
     const aliases = new Map();  // Track local aliases: aliasName -> originalName
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
     // Helper: extract first string-arg literal from a call node.
@@ -656,6 +657,23 @@ function findCallsInCode(code, parser) {
     };
 
     traverseTree(tree.rootNode, (node) => {
+        // Track module-alias bindings: `import httpx` binds 'httpx' (a module),
+        // `import numpy as np` binds 'np'. Method calls through these receivers
+        // dispatch to module functions, never to class methods. `from x import y`
+        // is skipped — y may be a symbol, not a module.
+        if (node.type === 'import_statement') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const child = node.namedChild(i);
+                if (child.type === 'dotted_name') {
+                    const first = child.namedChild(0);
+                    if (first?.type === 'identifier') moduleAliases.add(first.text);
+                } else if (child.type === 'aliased_import') {
+                    const alias = child.childForFieldName('alias');
+                    if (alias?.type === 'identifier') moduleAliases.add(alias.text);
+                }
+            }
+        }
+
         // Track function entry
         if (isFunctionNode(node)) {
             // Use decorated_definition start line if present, to match symbol index
@@ -829,6 +847,10 @@ function findCallsInCode(code, parser) {
                     const receiverType = receiver
                         ? localVarTypes.get(receiver)
                         : (objNode ? PY_LITERAL_RECEIVER_TYPES[objNode.type] : undefined);
+                    // Module receiver (httpx.get()) — unless locally shadowed
+                    // by a typed instance binding
+                    const receiverIsModule = !!receiver && moduleAliases.has(receiver) &&
+                        !localVarTypes.has(receiver);
                     const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: attrNode.text,
@@ -836,6 +858,7 @@ function findCallsInCode(code, parser) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverIsModule && { receiverIsModule: true }),
                         ...(selfAttribute && { selfAttribute }),
                         ...(assignedTo && { assignedTo }),
                         enclosingFunction,
