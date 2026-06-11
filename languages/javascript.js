@@ -1206,6 +1206,28 @@ function tsTypeName(node) {
 }
 
 /**
+ * Variable receiving this call's result: `const x = foo()` / `x = await foo()`
+ * → 'x'. Identifier targets only. Compared by node id — tree-sitter wrapper
+ * objects are not identity-stable.
+ */
+function jsAssignmentTargetOf(callNode) {
+    let n = callNode;
+    let p = n.parent;
+    if (p && p.type === 'await_expression') { n = p; p = n.parent; }
+    if (p && p.type === 'variable_declarator') {
+        const value = p.childForFieldName('value');
+        const nameNode = p.childForFieldName('name');
+        if (value && value.id === n.id && nameNode?.type === 'identifier') return nameNode.text;
+    }
+    if (p && p.type === 'assignment_expression') {
+        const right = p.childForFieldName('right');
+        const left = p.childForFieldName('left');
+        if (right && right.id === n.id && left?.type === 'identifier') return left.text;
+    }
+    return undefined;
+}
+
+/**
  * Type name from a new-expression constructor node: new Foo() or new pkg.Foo().
  */
 function jsConstructorTypeName(ctorNode) {
@@ -1522,6 +1544,7 @@ function findCallsInCode(code, parser) {
                 const resolvedName = typeof alias === 'string' ? alias : undefined;
                 const resolvedNames = Array.isArray(alias) ? alias : undefined;
                 const firstArg = getFirstStringArg(node);
+                const assignedTo = jsAssignmentTargetOf(node);
                 // MEDIUM-5: capture explicit method for fetch(url, { method }).
                 const optionsMethod = funcNode.text === 'fetch'
                     ? getOptionsMethod(node, 1)
@@ -1532,6 +1555,7 @@ function findCallsInCode(code, parser) {
                     ...(resolvedNames && { resolvedNames }),
                     line: node.startPosition.row + 1,
                     isMethod: false,
+                    ...(assignedTo && { assignedTo }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
@@ -1586,12 +1610,14 @@ function findCallsInCode(code, parser) {
                             : (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined);
                         const firstArg = getFirstStringArg(node);
                         const argCount = getArgCount(node);
+                        const assignedTo = jsAssignmentTargetOf(node);
                         calls.push({
                             name: propName,
                             line: node.startPosition.row + 1,
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),
+                            ...(assignedTo && { assignedTo }),
                             enclosingFunction,
                             uncertain,
                             ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),

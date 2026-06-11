@@ -5066,3 +5066,76 @@ describe('fix #198c (js/ts): alias/interface receiver types never exclude', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #199 (js/ts): return-type flow types assigned variables', () => {
+    it('const x = store.fetchItem() types x via the TS return annotation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'store.ts': [
+                'export class Item {',
+                '    save() { return 1; }',
+                '}',
+                'export class Draft {',
+                '    save() { return 2; }',
+                '}',
+                'export class Store {',
+                '    fetchItem(id: string): Item { return new Item(); }',
+                '}',
+            ].join('\n'),
+            'app.ts': [
+                'import { Store } from "./store";',
+                '',
+                'export function run(store: Store) {',
+                '    const item = store.fetchItem("a");',
+                '    item.save();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const rItem = execute(index, 'context', { name: 'store.ts:2:save', className: 'Item' });
+            const itemLines = (rItem.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(itemLines.includes('app.ts:5'),
+                `item: Item via fetchItem return type — must confirm: ${itemLines}`);
+            const rDraft = execute(index, 'context', { name: 'store.ts:5:save', className: 'Draft' });
+            const draftLines = (rDraft.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!draftLines.includes('app.ts:5'),
+                `flow-typed Item receiver must be excluded from Draft.save: ${draftLines}`);
+            assert.strictEqual(rItem.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('Promise<X> return annotations unwrap for awaited assignments', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': [
+                'export class User {',
+                '    greet() { return "hi"; }',
+                '}',
+                'export class Bot {',
+                '    greet() { return "beep"; }',
+                '}',
+                'export async function loadUser(): Promise<User> { return new User(); }',
+            ].join('\n'),
+            'app.ts': [
+                'import { loadUser } from "./api";',
+                '',
+                'export async function run() {',
+                '    const u = await loadUser();',
+                '    u.greet();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const rUser = execute(index, 'context', { name: 'api.ts:2:greet', className: 'User' });
+            const userLines = (rUser.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(userLines.includes('app.ts:5'),
+                `u: User via Promise<User> unwrap — must confirm: ${userLines}`);
+            const rBot = execute(index, 'context', { name: 'api.ts:5:greet', className: 'Bot' });
+            const botLines = (rBot.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!botLines.includes('app.ts:5'),
+                `flow-typed User receiver must be excluded from Bot.greet: ${botLines}`);
+        } finally { rm(dir); }
+    });
+});

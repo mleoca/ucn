@@ -283,6 +283,7 @@ function findCallers(index, name, options = {}) {
     // file reads stay bounded, but the candidate count reflects the true total.
     const needsTotal = !!options.needsTotal;
     const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
+    const returnFlowCache = new Map(); // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
 
     // Use inverted callee index to skip files that don't contain calls to this name
     let calleeFiles = index.getCalleeFiles(name);
@@ -306,7 +307,7 @@ function findCallers(index, name, options = {}) {
             const calls = getCachedCalls(index, filePath);
             if (!calls) continue;
 
-            for (const call of calls) {
+            for (let call of calls) {
                 // Skip if not matching our target name (also check alias resolution)
                 let calledAs = null; // surface name when matched via an import/export rename
                 if (call.name !== name && call.resolvedName !== name &&
@@ -320,6 +321,23 @@ function findCallers(index, name, options = {}) {
                         if (reach && reach.has(filePath)) calledAs = call.name;
                     }
                     if (!calledAs) continue;
+                }
+
+                // Return-type flow (structural): an untyped method receiver may be a
+                // variable assigned from a call with a known return annotation
+                // (response = client.get(...) with Client.get() -> Response).
+                // Copy-on-enrich: cached call objects stay parser-pure — the flow
+                // type derives from OTHER files' annotations, so it must never be
+                // persisted with this file's calls.
+                if (call.isMethod && call.receiver && !call.receiverType &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    let flowMap = returnFlowCache.get(filePath);
+                    if (flowMap === undefined) {
+                        flowMap = _buildReturnTypeFlowMap(index, calls);
+                        returnFlowCache.set(filePath, flowMap);
+                    }
+                    const flowType = flowMap && _lookupReturnTypeFlow(flowMap, call);
+                    if (flowType) call = { ...call, receiverType: flowType };
                 }
 
                 // For potential callbacks (function passed as arg), validate against symbol table
@@ -1927,6 +1945,85 @@ function _buildLocalTypeMap(index, def, calls) {
  * variable types for method resolution. Not used by JS/TS/Python -- structural
  * languages use import evidence via _buildLocalTypeMap instead.
  */
+/**
+ * Single concrete type name from a return-annotation STRING (symbols store
+ * returnType as text). Conservative: ambiguous shapes return undefined.
+ * Handles: Foo · pkg.Foo · "Foo" · Foo | None · Optional[Foo] · Promise<Foo> ·
+ * list[Item] (→ list — the value IS a list) · Foo<T> / Foo[T] (→ Foo).
+ */
+function _typeNameFromReturnAnnotation(text) {
+    if (!text || typeof text !== 'string') return undefined;
+    let t = text.trim().replace(/^["']|["']$/g, '').trim();
+    // X | None / X | null / X | undefined → X (single real member only)
+    if (t.includes('|')) {
+        const parts = t.split('|').map(s => s.trim())
+            .filter(s => !['None', 'null', 'undefined'].includes(s));
+        if (parts.length !== 1) return undefined;
+        t = parts[0];
+    }
+    // unwrap value-transparent wrappers: Optional[X], Promise<X>, Awaitable[X]
+    let m;
+    while ((m = t.match(/^(?:typing\.)?(Optional|Annotated|Final|Promise|Awaitable)\s*[[<]\s*([^,]+?)\s*[\]>]$/))) {
+        t = m[2].trim();
+    }
+    // generic base: Foo[...] / Foo<...> → Foo (the value is a Foo)
+    m = t.match(/^([\w.]+)\s*[[<]/);
+    if (m) t = m[1];
+    // dotted → last segment; validate a bare identifier remains
+    const last = t.split('.').pop();
+    return /^[A-Za-z_]\w*$/.test(last) ? last : undefined;
+}
+
+/**
+ * Per-file return-type-flow map: variables typed by what the assigned call
+ * returns. Key `${enclosingFnStartLine||''}:${varName}` → [{ line, type }]
+ * (all assignments, so lookups can pick the nearest preceding one).
+ * Only two resolvable shapes, both conservative:
+ *  - typed-receiver method call: receiverType class (or an ancestor walk is
+ *    NOT attempted — exact className match only) defines the method with a
+ *    return annotation
+ *  - plain call with exactly ONE project definition carrying a return annotation
+ */
+function _buildReturnTypeFlowMap(index, calls) {
+    let map = null;
+    for (const call of calls) {
+        if (!call.assignedTo) continue;
+        let returnType;
+        if (call.isMethod && call.receiverType) {
+            const defs = index.symbols.get(call.name) || [];
+            const def = defs.find(d => d.className === call.receiverType && d.returnType);
+            returnType = def && def.returnType;
+        } else if (!call.isMethod) {
+            const defs = (index.symbols.get(call.name) || [])
+                .filter(d => !NON_CALLABLE_TYPES.has(d.type));
+            if (defs.length === 1) returnType = defs[0].returnType;
+        }
+        const typeName = returnType && _typeNameFromReturnAnnotation(returnType);
+        if (!typeName) continue;
+        const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+        const key = `${scope}:${call.assignedTo}`;
+        if (!map) map = new Map();
+        if (!map.has(key)) map.set(key, []);
+        map.get(key).push({ line: call.line, type: typeName });
+    }
+    return map;
+}
+
+/** Nearest preceding flow assignment for this call's receiver (fn scope, then module). */
+function _lookupReturnTypeFlow(map, call) {
+    const fnScope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+    for (const scope of fnScope === '' ? [''] : [fnScope, '']) {
+        const entries = map.get(`${scope}:${call.receiver}`);
+        if (!entries) continue;
+        let best = null;
+        for (const e of entries) {
+            if (e.line < call.line && (!best || e.line > best.line)) best = e;
+        }
+        if (best) return best.type;
+    }
+    return undefined;
+}
+
 // Builtin receiver types from literal/annotation inference (Python builtins,
 // JS globals, TS predefined types). Definitionally not project classes, so a
 // mismatch against a project class target is always positive evidence.

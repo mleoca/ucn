@@ -532,6 +532,23 @@ function typeNameFromExpr(node) {
 }
 
 /**
+ * Variable receiving this call's result: `x = foo(...)` / `x = await foo(...)`
+ * → 'x'. Identifier targets only (no tuples/attributes). Compared by node id —
+ * tree-sitter wrapper objects are not identity-stable.
+ */
+function assignmentTargetOf(callNode) {
+    let n = callNode;
+    let p = n.parent;
+    if (p && p.type === 'await') { n = p; p = n.parent; }
+    if (p && p.type === 'assignment') {
+        const right = p.childForFieldName('right');
+        const left = p.childForFieldName('left');
+        if (right && right.id === n.id && left?.type === 'identifier') return left.text;
+    }
+    return undefined;
+}
+
+/**
  * Type name from a constructor-call callee: ClassName(...) or pkg.ClassName(...).
  * Uppercase-first heuristic (Python class naming convention).
  */
@@ -762,6 +779,7 @@ function findCallsInCode(code, parser) {
 
             const enclosingFunction = getCurrentEnclosingFunction();
             let uncertain = false;
+            const assignedTo = assignmentTargetOf(node);
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
@@ -772,6 +790,7 @@ function findCallsInCode(code, parser) {
                     ...(resolvedName && { resolvedName }),
                     line: node.startPosition.row + 1,
                     isMethod: false,
+                    ...(assignedTo && { assignedTo }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -818,6 +837,7 @@ function findCallsInCode(code, parser) {
                         receiver,
                         ...(receiverType && { receiverType }),
                         ...(selfAttribute && { selfAttribute }),
+                        ...(assignedTo && { assignedTo }),
                         enclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })

@@ -2285,3 +2285,89 @@ describe('fix #198b (python): supertype receiver is not a mismatch', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #199 (python): return-type flow types assigned variables', () => {
+    const FIXTURE = {
+        'package.json': '{"name":"t"}',
+        'lib.py': [
+            'class Request:',
+            '    async def aread(self):',
+            '        return b""',
+            '',
+            'class Response:',
+            '    async def aread(self):',
+            '        return b""',
+            '',
+            'class AsyncClient:',
+            '    async def get(self, url) -> Response:',
+            '        return Response()',
+        ].join('\n'),
+        'app.py': [
+            'import lib',
+            '',
+            'async def fetch():',
+            '    async with lib.AsyncClient() as client:',
+            '        response = await client.get("u")',
+            '        return await response.aread()',
+        ].join('\n'),
+    };
+
+    it('x = await client.get() types x via the return annotation (two-hop)', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const rResp = execute(index, 'context', { name: 'lib.py:6:aread', className: 'Response' });
+            assert.ok(rResp.ok);
+            const confirmed = (rResp.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app.py:6'),
+                `response: Response via flow — must confirm Response.aread: ${confirmed}`);
+            const rReq = execute(index, 'context', { name: 'lib.py:2:aread', className: 'Request' });
+            const reqConfirmed = (rReq.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!reqConfirmed.includes('app.py:6'),
+                `flow-typed Response receiver must be excluded from Request.aread: ${reqConfirmed}`);
+            assert.strictEqual(rResp.result.meta.account.conserved, true);
+            assert.strictEqual(rReq.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('reassignment uses the nearest preceding flow type', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.py': [
+                'class A:',
+                '    def ping(self):',
+                '        return 1',
+                '',
+                'class B:',
+                '    def ping(self):',
+                '        return 2',
+                '',
+                'def make_a() -> A:',
+                '    return A()',
+                '',
+                'def make_b() -> B:',
+                '    return B()',
+            ].join('\n'),
+            'app.py': [
+                'from lib import make_a, make_b',
+                '',
+                'def run():',
+                '    x = make_a()',
+                '    x.ping()',
+                '    x = make_b()',
+                '    x.ping()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const rA = execute(index, 'context', { name: 'lib.py:2:ping', className: 'A' });
+            const aLines = (rA.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(aLines.includes('app.py:5'), `first ping is A.ping: ${aLines}`);
+            assert.ok(!aLines.includes('app.py:7'), `second ping reassigned to B: ${aLines}`);
+            const rB = execute(index, 'context', { name: 'lib.py:6:ping', className: 'B' });
+            const bLines = (rB.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(bLines.includes('app.py:7'), `second ping is B.ping: ${bLines}`);
+            assert.ok(!bLines.includes('app.py:5'), `first ping was A: ${bLines}`);
+        } finally { rm(dir); }
+    });
+});
