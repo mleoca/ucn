@@ -2106,3 +2106,21 @@ describe('fix #192 (python): argument-position function references need import e
         } finally { rm(dir); }
     });
 });
+
+describe('export-rename aliases (python): from-import-as callers attribute to the original', () => {
+    it('import { transform as t } style rename attributes t() calls', () => {
+        const dir = tmp({
+            'lib.py': 'def transform(x):\n    return x * 2\n',
+            'app.py': 'from lib import transform as t\n\ndef run(items):\n    return [t(i) for i in items]\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'transform' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'app.py' && c.calledAs === 't'),
+                `t() caller must attribute to transform: ${JSON.stringify(confirmed)}`);
+            assert.strictEqual(r.result.meta.account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+});

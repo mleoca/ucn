@@ -2118,10 +2118,18 @@ function findExportsInCode(code, parser) {
                     for (let j = 0; j < child.namedChildCount; j++) {
                         const specifier = child.namedChild(j);
                         if (specifier.type === 'export_specifier') {
-                            const nameNode = specifier.namedChild(0);
+                            const nameNode = specifier.childForFieldName('name') || specifier.namedChild(0);
+                            // Export rename: `export { _gt as gt }` — name keeps the
+                            // local/source symbol (deadcode and re-export resolution
+                            // key on it); alias carries the external name callers use.
+                            const aliasNode = specifier.childForFieldName('alias');
                             if (nameNode) {
                                 const exportType = source ? 're-export' : 'named';
-                                exports.push({ name: nameNode.text, type: exportType, line, ...(source && { source }) });
+                                exports.push({
+                                    name: nameNode.text, type: exportType, line,
+                                    ...(source && { source }),
+                                    ...(aliasNode && aliasNode.text !== nameNode.text && { alias: aliasNode.text }),
+                                });
                             }
                         }
                     }

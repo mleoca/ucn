@@ -4758,3 +4758,167 @@ describe('fix #195: class context pins callers to the resolved definition', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #196: TS-ESM .js specifiers resolve to .ts sources', () => {
+    it('import "./b.js" links b.ts in the import graph and confers caller evidence', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'b.ts': 'export function helper(x: number): number { return x * 2; }',
+            'a.ts': 'import { helper } from "./b.js";\nexport function run(): number { return helper(21); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'helper' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'a.ts' && c.line === 2),
+                `caller via .js specifier must be confirmed: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('export-rename aliases: callers via renamed surface (roadmap #2)', () => {
+    it('re-export rename (export { _gt as gt } from) attributes gt() callers to _gt', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': 'export function _gt(v: number): boolean { return v > 0; }',
+            'checks.ts': 'export { _gt as gt } from "./api.js";',
+            'app.ts': 'import { gt } from "./checks.js";\nexport function use(): boolean { return gt(1); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: '_gt' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            const edge = confirmed.find(c => c.relativePath === 'app.ts' && c.line === 2);
+            assert.ok(edge, `gt() caller must attribute to _gt: ${JSON.stringify(confirmed)}`);
+            assert.strictEqual(edge.calledAs, 'gt', 'edge must carry the surface name');
+            const account = r.result.meta.account;
+            assert.ok(account.beyondText.count >= 1,
+                `alias caller is a beyond-text claim: ${JSON.stringify(account.beyondText)}`);
+            assert.strictEqual(account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+
+    it('export rename in the defining file (export { _enum as en }) attributes en() callers', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schemas.ts': 'function _enum(values: string[]): string[] { return values; }\nexport { _enum as en };',
+            'app.ts': 'import { en } from "./schemas.js";\nexport function use(): string[] { return en(["a"]); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: '_enum' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'app.ts' && c.calledAs === 'en'),
+                `en() caller must attribute to _enum: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('import-side rename (import { _gt as gt }) attributes local gt() calls', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': 'export function _gt(v: number): boolean { return v > 0; }',
+            'app.ts': 'import { _gt as gt } from "./api.js";\nexport function use(): boolean { return gt(1); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: '_gt' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'app.ts' && c.line === 2 && c.calledAs === 'gt'),
+                `renamed-import caller must attribute to _gt: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('typed-receiver method call is NOT attributed to a renamed standalone function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': 'export function _gt(v: number): boolean { return v > 0; }',
+            'checks.ts': 'export { _gt as gt } from "./api.js";',
+            'num.ts': [
+                'import { gt } from "./checks.js";',
+                'export class Num {',
+                '  gt(v: number): boolean { return v > 1; }',
+                '}',
+                'export function fluent(): boolean {',
+                '  const n = new Num();',
+                '  return n.gt(2);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: '_gt' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.relativePath === 'num.ts' && c.line === 7),
+                `n.gt() dispatches on Num, must not attribute to _gt: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('unrelated gt() in a file without an import path to the target is not attributed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': 'export function _gt(v: number): boolean { return v > 0; }',
+            'checks.ts': 'export { _gt as gt } from "./api.js";',
+            'other.ts': 'function gt(v: number): boolean { return v > 9; }\nexport function use(): boolean { return gt(1); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: '_gt' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.relativePath === 'other.ts'),
+                `local gt() with no import path must not attribute: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #197: package self-reference imports resolve via exports map', () => {
+    it('importing own package by name links the source file (monorepo test pattern)', () => {
+        const dir = tmp({
+            'package.json': JSON.stringify({
+                name: 'mypkg',
+                exports: { '.': { import: './src/index.js' }, './sub': { import: './src/sub/index.js' } },
+            }),
+            'src/index.ts': 'export function rootFn(): number { return 1; }',
+            'src/sub/index.ts': 'export function subFn(): number { return 2; }',
+            'src/app.test.ts': [
+                'import { rootFn } from "mypkg";',
+                'import { subFn } from "mypkg/sub";',
+                'export function uses(): number { return rootFn() + subFn(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'subFn', includeTests: true });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => (c.relativePath || '').endsWith('app.test.ts')),
+                `self-referencing import must confer caller evidence: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('deep re-export chains keep renamed-surface callers visible (never silently missing)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schemas.ts': 'function _enum(v: string[]): string[] { return v; }\nexport { _enum as en };\nexport function other(): number { return 1; }',
+            'barrel1.ts': 'export * from "./schemas.js";',
+            'barrel2.ts': 'export * from "./barrel1.js";',
+            'app.ts': 'import * as z from "./barrel2.js";\nexport function use(): string[] { return z.en(["a"]); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: '_enum' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            const unverified = r.result.unverifiedCallers || [];
+            const visible = [...confirmed, ...unverified];
+            assert.ok(visible.some(c => (c.relativePath || c.file || '').includes('app.ts')),
+                `z.en() through 2 barrels must be visible (confirmed or unverified): ${JSON.stringify({ confirmed, unverified })}`);
+            assert.strictEqual(r.result.meta.account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+});

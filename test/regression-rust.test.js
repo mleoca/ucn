@@ -1795,3 +1795,23 @@ fn build() -> inner::Bar {
         }
     });
 });
+
+describe('export-rename aliases (rust): pub use renames captured in exports', () => {
+    const { extractExports } = require('../core/imports');
+
+    it('pub use foo::bar as baz emits a re-export with alias', () => {
+        const { exports } = extractExports('pub use foo::bar as baz;\npub fn real() {}', 'rust');
+        const rename = exports.find(e => e.alias === 'baz');
+        assert.ok(rename, `rename must be captured: ${JSON.stringify(exports)}`);
+        assert.strictEqual(rename.name, 'bar');
+        assert.strictEqual(rename.type, 're-export');
+    });
+
+    it('nested use-list renames are captured; plain re-exports are not emitted', () => {
+        const { exports } = extractExports('pub use m::{a as b, c};', 'rust');
+        assert.ok(exports.some(e => e.name === 'a' && e.alias === 'b'),
+            `nested rename captured: ${JSON.stringify(exports)}`);
+        assert.ok(!exports.some(e => e.name === 'c'),
+            'plain (un-renamed) pub use entries are intentionally not emitted');
+    });
+});

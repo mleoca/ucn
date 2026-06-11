@@ -1435,6 +1435,41 @@ function findExportsInCode(code, parser) {
     }
 
     traverseTreeCached(tree.rootNode, (node) => {
+        // Public renamed re-exports: `pub use foo::bar as baz;` (also nested in
+        // use lists: `pub use m::{a as b}`). name keeps the source symbol; alias
+        // carries the external name callers use. Plain (un-renamed) `pub use`
+        // re-exports are intentionally not emitted here — only renames feed the
+        // export-alias caller resolution.
+        if (node.type === 'use_declaration' && hasVisibility(node)) {
+            const line = node.startPosition.row + 1;
+            const collectAsClauses = (n) => {
+                if (n.type === 'use_as_clause') {
+                    const srcNode = n.namedChild(0);
+                    const aliasNode = n.namedChild(1);
+                    // Last path segment is the source symbol name (foo::bar -> bar)
+                    let local = null;
+                    if (srcNode) {
+                        if (srcNode.type === 'identifier' || srcNode.type === 'type_identifier') {
+                            local = srcNode.text;
+                        } else if (srcNode.type === 'scoped_identifier') {
+                            const nameField = srcNode.childForFieldName('name');
+                            local = nameField ? nameField.text : null;
+                        }
+                    }
+                    if (local && aliasNode && aliasNode.text !== local) {
+                        exports.push({
+                            name: local, type: 're-export', line,
+                            source: srcNode.text, alias: aliasNode.text,
+                        });
+                    }
+                    return;
+                }
+                for (let i = 0; i < n.namedChildCount; i++) collectAsClauses(n.namedChild(i));
+            };
+            collectAsClauses(node);
+            return true;
+        }
+
         // Public functions
         if (node.type === 'function_item' && hasVisibility(node)) {
             const nameNode = node.childForFieldName('name');

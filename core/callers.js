@@ -171,6 +171,91 @@ function findCallers(index, name, options = {}) {
         definitionLines.add(`${def.file}:${def.startLine}`);
     }
 
+    // ---- Rename-alias surfaces (import/export renames) ----
+    // Other surface names that can denote this symbol:
+    //   import-side: `import { _gt as gt }` — fileEntry.importAliases, valid
+    //   only inside the renaming file;
+    //   export-side: `export { _enum as enum }` / Rust `pub use a as b` —
+    //   exportDetails entries carrying an alias, valid in files importing the
+    //   renaming module (or in that module itself).
+    // A renaming file must sit on an import path to the target (or define it)
+    // — otherwise it renames an unrelated same-name symbol. Matched call
+    // sites are beyond-text claims: the line does not contain the target name
+    // (account.js classifies them in the beyondText bucket).
+    const aliasTargetFiles = new Set((options.targetDefinitions || definitions)
+        .map(d => d.file).filter(Boolean));
+    const importAliasLocals = new Map(); // filePath -> Set<localName>
+    const exportAliasRenamers = new Map(); // aliasName -> Set<renamingFilePath>
+    for (const [fp, fe] of index.files) {
+        const hasImportRenames = fe.importAliases &&
+            fe.importAliases.some(a => a && a.original === name && a.local && a.local !== name);
+        const exportRenames = fe.exportDetails
+            ? fe.exportDetails.filter(e => e && e.alias && e.name === name && e.alias !== name)
+            : [];
+        if (!hasImportRenames && exportRenames.length === 0) continue;
+        const fpImports = index.importGraph.get(fp);
+        let linksTarget = aliasTargetFiles.has(fp) ||
+            (fpImports && setSome(fpImports, imp => aliasTargetFiles.has(imp)));
+        // One barrel hop: `export { _gt as gt } from './core/index.js'` where
+        // the barrel re-exports the defining file.
+        if (!linksTarget && fpImports) {
+            for (const imp of fpImports) {
+                const trans = index.importGraph.get(imp);
+                if (trans && setSome(trans, ti => aliasTargetFiles.has(ti))) {
+                    linksTarget = true;
+                    break;
+                }
+            }
+        }
+        if (!linksTarget) continue;
+        if (hasImportRenames) {
+            for (const a of fe.importAliases) {
+                if (a && a.original === name && a.local && a.local !== name) {
+                    if (!importAliasLocals.has(fp)) importAliasLocals.set(fp, new Set());
+                    importAliasLocals.get(fp).add(a.local);
+                }
+            }
+        }
+        for (const e of exportRenames) {
+            // If the renaming file defines the name itself, the rename refers
+            // to that local definition (classic/schemas.ts's `export { _enum
+            // as enum }` renames ITS _enum wrapper, not core's _enum) — only
+            // credit it when the pinned target IS that local definition.
+            if (!aliasTargetFiles.has(fp) && definitions.some(d => d.file === fp)) continue;
+            if (!exportAliasRenamers.has(e.alias)) exportAliasRenamers.set(e.alias, new Set());
+            exportAliasRenamers.get(e.alias).add(fp);
+        }
+    }
+    // Files that can reach each renaming module through imports — re-export
+    // chains run deep (test → mini/index → external → schemas), so a fixed
+    // hop count misses real surfaces. Bounded reverse-import BFS; matching
+    // stays name+path specific, and tiering still demands its own evidence.
+    const aliasReachers = new Map(); // aliasName -> Set<filePath> (renamers + transitive importers)
+    for (const [aliasName, renamers] of exportAliasRenamers) {
+        const reach = new Set(renamers);
+        let frontier = [...renamers];
+        for (let depth = 0; depth < 4 && frontier.length && reach.size <= 5000; depth++) {
+            const next = [];
+            for (const f of frontier) {
+                const importers = index.exportGraph.get(f);
+                if (!importers) continue;
+                for (const importer of importers) {
+                    if (!reach.has(importer)) {
+                        reach.add(importer);
+                        next.push(importer);
+                    }
+                }
+            }
+            frontier = next;
+        }
+        aliasReachers.set(aliasName, reach);
+    }
+    const aliasNames = new Set(exportAliasRenamers.keys());
+    for (const locals of importAliasLocals.values()) {
+        for (const local of locals) aliasNames.add(local);
+    }
+    const hasAliasSurfaces = aliasNames.size > 0;
+
     // Phase 1: Find matching calls without reading file content.
     // Collect pending callers keyed by file — content is read only in Phase 2.
     const pendingByFile = new Map(); // filePath -> [{ call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver }]
@@ -179,13 +264,14 @@ function findCallers(index, name, options = {}) {
     // unverified-tier entry (grep-reliability contract: shown in its own
     // section, never silently hidden). Does NOT count toward pendingCount —
     // totals describe the confirmed answer.
-    const routeUnverified = (filePath, fileEntry, call, reason) => {
+    const routeUnverified = (filePath, fileEntry, call, reason, calledAs) => {
         if (!collectAccount) return; // non-account paths (trace/blast/verify) keep the plain drop
         if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
         pendingByFile.get(filePath).push({
             call, fileEntry, callerSymbol: null,
             isMethod: call.isMethod || false, isFunctionReference: false,
             receiver: call.receiver, receiverType: call.receiverType,
+            calledAs,
             _tier: TIER.UNVERIFIED, _reason: reason,
             _evidence: { isUncertain: true },
         });
@@ -199,7 +285,16 @@ function findCallers(index, name, options = {}) {
     const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
 
     // Use inverted callee index to skip files that don't contain calls to this name
-    const calleeFiles = index.getCalleeFiles(name);
+    let calleeFiles = index.getCalleeFiles(name);
+    if (hasAliasSurfaces) {
+        // Alias surfaces are indexed under their own names — union their files in.
+        const union = new Set(calleeFiles || []);
+        for (const aliasName of aliasNames) {
+            const aliasFiles = index.getCalleeFiles(aliasName);
+            if (aliasFiles) for (const f of aliasFiles) union.add(f);
+        }
+        if (union.size > 0) calleeFiles = union;
+    }
     const fileIterator = calleeFiles
         ? [...calleeFiles].map(fp => [fp, index.files.get(fp)]).filter(([, fe]) => fe)
         : index.files;
@@ -213,8 +308,19 @@ function findCallers(index, name, options = {}) {
 
             for (const call of calls) {
                 // Skip if not matching our target name (also check alias resolution)
+                let calledAs = null; // surface name when matched via an import/export rename
                 if (call.name !== name && call.resolvedName !== name &&
-                    !(call.resolvedNames && call.resolvedNames.includes(name))) continue;
+                    !(call.resolvedNames && call.resolvedNames.includes(name))) {
+                    if (!hasAliasSurfaces) continue;
+                    const locals = importAliasLocals.get(filePath);
+                    if (locals && locals.has(call.name)) {
+                        calledAs = call.name;
+                    } else {
+                        const reach = aliasReachers.get(call.name);
+                        if (reach && reach.has(filePath)) calledAs = call.name;
+                    }
+                    if (!calledAs) continue;
+                }
 
                 // For potential callbacks (function passed as arg), validate against symbol table
                 // and skip complex binding resolution — just check the name exists
@@ -301,6 +407,7 @@ function findCallers(index, name, options = {}) {
                     pendingByFile.get(filePath).push({
                         call, fileEntry, callerSymbol,
                         isMethod: false, isFunctionReference: true, receiver: undefined,
+                        calledAs,
                         _evidence: {
                             isFunctionReference: true,
                             hasImportEvidence: cbSameFile || cbImportLink,
@@ -428,7 +535,7 @@ function findCallers(index, name, options = {}) {
                         if (!callerSymbol?.className) {
                             // Can't resolve — include only if includeMethods requested
                             if (!options.includeMethods) {
-                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
                         } else {
@@ -437,7 +544,7 @@ function findCallers(index, name, options = {}) {
                             if (targetClass && definitions.some(d => d.className === targetClass)) {
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
-                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
                         }
@@ -446,7 +553,7 @@ function findCallers(index, name, options = {}) {
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                         if (!callerSymbol?.className) {
                             if (!options.includeMethods) {
-                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
                         } else {
@@ -477,7 +584,7 @@ function findCallers(index, name, options = {}) {
                             if (matchesDef) {
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
-                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence');
+                                routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
                         }
@@ -500,7 +607,7 @@ function findCallers(index, name, options = {}) {
                 if (isUncertain && !resolvedBySameClass && !options.includeUncertain) {
                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                     routeUnverified(filePath, fileEntry, call,
-                        call.isMethod ? 'method-no-evidence' : 'ambiguous-binding');
+                        call.isMethod ? 'method-no-evidence' : 'ambiguous-binding', calledAs);
                     continue;
                 }
 
@@ -551,7 +658,7 @@ function findCallers(index, name, options = {}) {
                                     continue;
                                 }
                                 if (collectAccount) {
-                                    routeUnverified(filePath, fileEntry, call, 'no-import-link');
+                                    routeUnverified(filePath, fileEntry, call, 'no-import-link', calledAs);
                                     continue;
                                 }
                                 continue;
@@ -626,6 +733,26 @@ function findCallers(index, name, options = {}) {
                                 }
                             }
                         }
+                    }
+                }
+
+                // Alias-matched method call on a TYPED receiver: the receiver's
+                // class owns the method dispatch — it cannot be a renamed
+                // standalone function (`numberSchema.gt()` is ZodNumber.gt, not
+                // `export { _gt as gt }`). Namespace receivers (`import * as
+                // checks; checks.gt()`) carry no receiverType and keep flowing
+                // on import evidence.
+                if (calledAs && call.isMethod && call.receiverType &&
+                    !targetDefs.some(td => td.className || td.receiver)) {
+                    isUncertain = true;
+                    typeMismatch = true;
+                    if (collectAccount) {
+                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                        continue;
+                    }
+                    if (!options.includeUncertain) {
+                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                        continue;
                     }
                 }
 
@@ -806,6 +933,7 @@ function findCallers(index, name, options = {}) {
                     isMethod: call.isMethod || false, isFunctionReference: false,
                     receiver: call.receiver,
                     receiverType: call.receiverType,
+                    calledAs,
                     _evidence: {
                         hasBindingId: !!bindingId,
                         resolvedBySameClass: !!resolvedBySameClass,
@@ -850,7 +978,7 @@ function findCallers(index, name, options = {}) {
     // Phase 2: Read content only for files with matching calls (eliminates ~98% of file reads)
     outer: for (const [filePath, pending] of pendingByFile) {
         let content = null;
-        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, _evidence, _tier, _reason } of pending) {
+        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, calledAs, _evidence, _tier, _reason } of pending) {
             const scored = scoreEdge(_evidence || {});
             if (_tier) {
                 // Routed unverified entry — never competes with the main
@@ -866,6 +994,7 @@ function findCallers(index, name, options = {}) {
                     isMethod: call.isMethod || false,
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
+                    ...(calledAs && { calledAs }),
                 };
                 if (unverifiedEnriched < unverifiedEnrichLimit) {
                     if (content === null) {
@@ -906,6 +1035,7 @@ function findCallers(index, name, options = {}) {
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
+                    ...(calledAs && { calledAs }),
                 });
                 continue;
             }
@@ -927,6 +1057,7 @@ function findCallers(index, name, options = {}) {
                 ...(isFunctionReference && { isFunctionReference: true }),
                 ...(receiver !== undefined && { receiver }),
                 ...(receiverType && { receiverType }),
+                ...(calledAs && { calledAs }),
                 confidence: scored.confidence,
                 resolution: scored.resolution,
                 ...(tier && { tier }),

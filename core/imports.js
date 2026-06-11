@@ -120,6 +120,10 @@ function resolveImport(importPath, fromFile, config = {}) {
                     if (result) return result;
                 }
             }
+
+            // Package self-reference (import own package by name)
+            const selfResolved = resolveSelfReference(importPath, fromDir, config);
+            if (selfResolved) return selfResolved;
         }
 
         // Check Go module imports
@@ -412,10 +416,122 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
 /**
  * Try to resolve a path with various extensions
  */
+// package.json lookup cache for self-reference resolution (dir -> info|null).
+// Process-lifetime cache: package.json name/exports churn is rare enough that
+// long-lived servers (MCP) tolerate it.
+const _pkgCache = new Map();
+
+function _findPackageJson(fromDir, stopDir) {
+    let current = fromDir;
+    for (let i = 0; i < 8; i++) {
+        let info;
+        if (_pkgCache.has(current)) {
+            info = _pkgCache.get(current);
+        } else {
+            info = null;
+            const candidate = path.join(current, 'package.json');
+            try {
+                if (fs.existsSync(candidate)) {
+                    const pkg = JSON.parse(fs.readFileSync(candidate, 'utf-8'));
+                    info = { dir: current, name: pkg.name, exports: pkg.exports, main: pkg.main };
+                }
+            } catch { /* unreadable or invalid JSON */ }
+            _pkgCache.set(current, info);
+        }
+        if (info) return info;
+        if (stopDir && current === stopDir) break;
+        const parent = path.dirname(current);
+        if (parent === current) break;
+        current = parent;
+    }
+    return null;
+}
+
+/** Flatten an exports-map entry to candidate targets (condition objects in
+ *  insertion order, arrays in order). 'types' conditions are skipped — they
+ *  name declaration files, not runtime sources. */
+function _collectExportTargets(entry, out = []) {
+    if (typeof entry === 'string') {
+        out.push(entry);
+    } else if (Array.isArray(entry)) {
+        for (const e of entry) _collectExportTargets(e, out);
+    } else if (entry && typeof entry === 'object') {
+        for (const [cond, v] of Object.entries(entry)) {
+            if (cond === 'types') continue;
+            _collectExportTargets(v, out);
+        }
+    }
+    return out;
+}
+
+/**
+ * Package self-reference: a file importing its own package by name
+ * (`import * as z from "zod/v3"` inside the zod repo) — standard in monorepo
+ * tests and benchmarks. Resolves through package.json "exports" (conditional
+ * objects, arrays, '*' wildcards), accepting the first condition target that
+ * lands on a real file.
+ */
+function resolveSelfReference(importPath, fromDir, config) {
+    const pkg = _findPackageJson(fromDir, config.root ? path.dirname(config.root) : null);
+    if (!pkg || !pkg.name) return null;
+    if (importPath !== pkg.name && !importPath.startsWith(pkg.name + '/')) return null;
+    const subpath = importPath === pkg.name ? '.' : './' + importPath.slice(pkg.name.length + 1);
+    const extensions = config.extensions || getExtensions(config.language);
+    const tryTargets = (entry, wildcard) => {
+        for (const target of _collectExportTargets(entry)) {
+            const concrete = wildcard != null ? target.replace(/\*/g, wildcard) : target;
+            const resolved = resolveFilePath(path.resolve(pkg.dir, concrete), extensions);
+            if (resolved) return resolved;
+        }
+        return null;
+    };
+    const exp = pkg.exports;
+    if (typeof exp === 'string') {
+        return subpath === '.' ? tryTargets(exp, null) : null;
+    }
+    if (exp && typeof exp === 'object') {
+        if (exp[subpath] !== undefined) {
+            const hit = tryTargets(exp[subpath], null);
+            if (hit) return hit;
+        }
+        for (const [key, val] of Object.entries(exp)) {
+            const star = key.indexOf('*');
+            if (star === -1) continue;
+            const pre = key.slice(0, star);
+            const post = key.slice(star + 1);
+            if (subpath.length > pre.length + post.length &&
+                subpath.startsWith(pre) && subpath.endsWith(post)) {
+                const wild = subpath.slice(pre.length, subpath.length - post.length);
+                const hit = tryTargets(val, wild);
+                if (hit) return hit;
+            }
+        }
+        return null;
+    }
+    // No exports map: bare name -> main/index; subpath -> direct file
+    if (subpath === '.') {
+        return (pkg.main && resolveFilePath(path.resolve(pkg.dir, pkg.main), extensions)) ||
+            resolveFilePath(path.resolve(pkg.dir, 'index'), extensions);
+    }
+    return resolveFilePath(path.resolve(pkg.dir, subpath), extensions);
+}
+
 function resolveFilePath(basePath, extensions) {
     // Check exact path
     if (fs.existsSync(basePath) && fs.statSync(basePath).isFile()) {
         return basePath;
+    }
+
+    // TS-ESM: explicit '.js'/'.mjs' specifiers refer to '.ts'/'.mts' sources
+    // (import specifiers name the compiled output). Remap before probing.
+    const esmRemap = { '.js': ['.ts', '.tsx'], '.jsx': ['.tsx'], '.mjs': ['.mts'], '.cjs': ['.cts'] };
+    const explicitExt = path.extname(basePath);
+    if (esmRemap[explicitExt]) {
+        const stem = basePath.slice(0, -explicitExt.length);
+        for (const tsExt of esmRemap[explicitExt]) {
+            const candidate = stem + tsExt;
+            try { if (fs.existsSync(candidate) && fs.statSync(candidate).isFile()) return candidate; } catch { /* skip */ }
+        }
     }
 
     // Try adding extensions
