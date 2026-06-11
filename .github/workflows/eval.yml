@@ -5,7 +5,7 @@ name: Eval
 #  - oracle: tiered caller answers vs compiler/LSP ground truth (ts-morph for
 #    TS repos; pyright-langserver over LSP for Python, jedi available as a
 #    second opinion via --oracle jedi with a self-bootstrapping venv; gopls
-#    for Go; rust-analyzer for Rust);
+#    for Go; rust-analyzer for Rust; jdtls for Java);
 #    fails when missing-unexplained > 0 (the contract gate)
 # Separate from ci.yml: heavier, network-dependent, weekly + on demand.
 
@@ -17,7 +17,7 @@ on:
 jobs:
   eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -40,6 +40,18 @@ jobs:
         run: |
           rustup component add rust-analyzer rust-src
           rust-analyzer --version
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install jdtls (Java oracle)
+        run: |
+          curl -fsSL -o /tmp/jdtls.tar.gz "https://download.eclipse.org/jdtls/milestones/1.58.0/jdt-language-server-1.58.0-202604151538.tar.gz"
+          echo "2a5bbe55ec91b4325392050dc422cead3220a2459b3766be35e1fff45b4a50d9  /tmp/jdtls.tar.gz" | sha256sum -c
+          mkdir -p "$HOME/jdtls" && tar -xzf /tmp/jdtls.tar.gz -C "$HOME/jdtls"
+          echo "UCN_EVAL_JDTLS=$HOME/jdtls/bin/jdtls" >> "$GITHUB_ENV"
 
       - run: npm ci
 

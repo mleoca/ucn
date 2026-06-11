@@ -935,9 +935,27 @@ function findCallers(index, name, options = {}) {
                             // Field-hop exclusion additionally demands the field's
                             // type DEFINE the method itself — otherwise Go
                             // promotion, Rust Deref, or Java inheritance could
-                            // still route the call to the target.
+                            // still route the call to the target. Exception: an
+                            // EXTERNAL field type (no project class/struct def,
+                            // e.g. Map/StringBuilder) excludes without that —
+                            // external code cannot Deref/promote/inherit INTO
+                            // project types, so the only dispatch path back is a
+                            // project subtype of the external type, which the
+                            // ancestor guard above already keeps.
+                            // (1-2 char ALL-CAPS names are generic type params by
+                            // convention — T, K, V, T1 — never external evidence:
+                            // T may be instantiated WITH the target class. And the
+                            // external rule needs the target's ancestor chain to be
+                            // FULLY project-resolvable: a chain that dead-ends at an
+                            // external ancestor (LinkedTreeMap extends AbstractMap)
+                            // may reach knownType through ancestry UCN can't see —
+                            // measured on gson: 6 true edges lost without this.)
                             const fieldHopDefinesMethod = !viaFieldHop || definitions.some(d =>
-                                (d.className || (d.receiver || '').replace(/^\*/, '')) === knownType);
+                                (d.className || (d.receiver || '').replace(/^\*/, '')) === knownType) ||
+                                (!/^[A-Z][A-Z0-9]?$/.test(knownType) &&
+                                    !(index.symbols.get(knownType) || []).some(d =>
+                                        d.type === 'class' || d.type === 'struct' || d.type === 'interface' || d.type === 'trait') &&
+                                    _targetAncestryFullyResolved(index, targetDefs));
                             const exclusionTrusted = (!structural ||
                                 _receiverTypeTrustedForExclusion(index, knownType)) && fieldHopDefinesMethod;
                             if (!matchesTarget && exclusionTrusted) {
@@ -2205,6 +2223,38 @@ function _declaredFieldType(index, rootType, fieldName, language) {
     const typeDefs = index.symbols.get(typeName);
     if (typeDefs && typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
     return typeName;
+}
+
+/**
+ * Is every ancestor in the targets' inheritance closure a project-resolvable
+ * class? A chain that dead-ends at an EXTERNAL ancestor may continue into
+ * supertypes UCN can't see, so absence-of-knownType in the visible chain is
+ * not evidence (fix #202: external-type exclusion gate).
+ */
+function _targetAncestryFullyResolved(index, targetDefs) {
+    const visited = new Set();
+    const queue = [];
+    for (const td of targetDefs) {
+        const cls = td.className || (td.receiver && td.receiver.replace(/^\*/, ''));
+        if (cls) queue.push({ name: cls, file: td.file });
+    }
+    while (queue.length > 0) {
+        const { name, file } = queue.shift();
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const parents = index._getInheritanceParents(name, file) || [];
+        for (const parent of parents) {
+            const defs = index.symbols.get(parent);
+            const isProject = !!defs && defs.some(d =>
+                d.type === 'class' || d.type === 'struct' || d.type === 'interface' || d.type === 'trait');
+            if (!isProject) return false; // external ancestor — chain invisible beyond here
+            if (!visited.has(parent)) {
+                const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
+                queue.push({ name: parent, file: parentFile });
+            }
+        }
+    }
+    return true;
 }
 
 /** Rust deref-transparent wrappers: Box<X>/Rc<X>/Arc<X> auto-deref to X for method calls. */

@@ -15,8 +15,8 @@ const { spawn } = require('child_process');
 const DEFAULT_TIMEOUT_MS = 300000;
 
 class LspClient {
-    constructor(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, settings = null, capabilities = null, onNotification = null } = {}) {
-        this.child = spawn(command, args, { stdio: ['pipe', 'pipe', 'inherit'] });
+    constructor(command, args, { timeoutMs = DEFAULT_TIMEOUT_MS, settings = null, capabilities = null, onNotification = null, env = null } = {}) {
+        this.child = spawn(command, args, { stdio: ['pipe', 'pipe', 'inherit'], ...(env && { env }) });
         this.timeoutMs = timeoutMs;
         this.settings = settings; // answers workspace/configuration by dotted section
         this.extraCapabilities = capabilities; // merged into initialize capabilities (e.g. rust-analyzer serverStatus)

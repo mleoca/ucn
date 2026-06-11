@@ -1781,3 +1781,62 @@ describe('fix #202: declared-field receivers (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #202: external-typed field receivers (Java)', () => {
+    const FILES = {
+        'Registry.java': `import java.util.Map;
+
+public class Registry {
+    private final Map<String, String> creators = null;
+
+    public String lookup(String type) {
+        return creators.get(type);
+    }
+}
+`,
+        'Store.java': `public class Store {
+    public String get(String key) { return key; }
+}
+`,
+        'TreeMapLike.java': `import java.util.AbstractMap;
+
+public class TreeMapLike extends AbstractMap<String, String> {
+    public String get(Object key) { return null; }
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('Map-typed field excludes unrelated project targets with resolved ancestry', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const store = callersOf(index, 'Store.java:2:get');
+            assert.ok(!store.confirmed.includes('Registry.java:7'),
+                `creators.get() on a java.util.Map field must not confirm Store.get: ${store.confirmed}`);
+            assert.strictEqual(store.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('never excludes targets whose ancestry dead-ends at an external class', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            // TreeMapLike extends AbstractMap (external) — the chain to Map is
+            // invisible, so a Map-typed receiver may reach TreeMapLike.get.
+            const tree = callersOf(index, 'TreeMapLike.java:4:get');
+            assert.ok(tree.confirmed.includes('Registry.java:7'),
+                `Map-typed receiver stays a possible caller of TreeMapLike.get (external ancestor): ${tree.confirmed}`);
+        } finally { rm(dir); }
+    });
+});
