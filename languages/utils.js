@@ -460,34 +460,54 @@ function parseJSDocTags(codeOrLines, startLine) {
     }
     const block = blockLines.join('\n');
 
-    // @param {Type} name  — capture balanced braces (no nested braces in JSDoc types in practice)
+    // @param {Type} name — balanced-brace scan so nested types survive
+    // (e.g. `{{ ok: boolean, error?: string }}` or `{Object<string, {x: number}>}`)
     const paramTypes = {};
     let any = false;
-    const paramRegex = /@param\s+\{([^}]+)\}\s+([A-Za-z_$][\w$]*)/g;
+    const paramTagRegex = /@param\s+/g;
     let m;
-    while ((m = paramRegex.exec(block)) !== null) {
-        const type = m[1].trim();
-        const name = m[2];
-        // Strip optional brackets if author wrote @param {Type} [name]; here we already excluded that
-        // but also handle @param {Type} [name=default] form by scanning a separate regex
-        paramTypes[name] = type;
-        any = true;
-    }
-    // Optional-bracket form: @param {Type} [name] or [name=default]
-    const paramOptRegex = /@param\s+\{([^}]+)\}\s+\[([A-Za-z_$][\w$]*)(?:\s*=[^\]]*)?\]/g;
-    while ((m = paramOptRegex.exec(block)) !== null) {
-        const type = m[1].trim();
-        const name = m[2];
-        if (!paramTypes[name]) paramTypes[name] = type;
+    while ((m = paramTagRegex.exec(block)) !== null) {
+        const braced = extractBracedType(block, m.index + m[0].length);
+        if (!braced) continue;
+        // Name follows the closing brace: plain `name` or optional `[name]` / `[name=default]`
+        const rest = block.slice(braced.endIdx);
+        const nameMatch = rest.match(/^\s+(?:\[([A-Za-z_$][\w$]*)(?:\s*=[^\]]*)?\]|([A-Za-z_$][\w$]*))/);
+        if (!nameMatch) continue;
+        const name = nameMatch[1] || nameMatch[2];
+        paramTypes[name] = braced.type.trim().replace(/\s+/g, ' ');
         any = true;
     }
 
     // @returns {Type} or @return {Type}
-    const retMatch = block.match(/@returns?\s+\{([^}]+)\}/);
+    const retTag = block.match(/@returns?\s+/);
+    const retBraced = retTag ? extractBracedType(block, retTag.index + retTag[0].length) : null;
     const result = {};
     if (any) result.paramTypes = paramTypes;
-    if (retMatch) result.returnType = retMatch[1].trim();
+    if (retBraced) result.returnType = retBraced.type.trim().replace(/\s+/g, ' ');
     return result;
+}
+
+/**
+ * Extract a balanced-brace type expression starting at an opening `{`.
+ * Returns the inner text (without the outer braces) and the index just past
+ * the matching closing brace, or null when text[openIdx] is not `{` or the
+ * braces never balance.
+ * @param {string} text
+ * @param {number} openIdx - index expected to hold the opening `{`
+ * @returns {{ type: string, endIdx: number }|null}
+ */
+function extractBracedType(text, openIdx) {
+    if (text[openIdx] !== '{') return null;
+    let depth = 0;
+    for (let k = openIdx; k < text.length; k++) {
+        const ch = text[k];
+        if (ch === '{') depth++;
+        else if (ch === '}') {
+            depth--;
+            if (depth === 0) return { type: text.slice(openIdx + 1, k), endIdx: k + 1 };
+        }
+    }
+    return null;
 }
 
 /**

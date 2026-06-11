@@ -103,8 +103,8 @@ function formatFunctionSignature(fn) {
     else paramText = '...';
     sig += `(${paramText})`;
 
-    // Return type
-    if (fn.returnType) sig += `: ${fn.returnType}`;
+    // Return type (collapse whitespace — multi-line annotations must not break the one-line signature)
+    if (fn.returnType) sig += `: ${String(fn.returnType).replace(/\s+/g, ' ').trim()}`;
 
     // Arrow indicator
     if (fn.isArrow) sig += ' =>';

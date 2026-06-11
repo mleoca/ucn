@@ -1397,7 +1397,7 @@ class ProjectIndex {
             parts.push(`(${typed != null ? typed : def.params})`);
         }
         if (def.returnType) {
-            parts.push(`: ${def.returnType}`);
+            parts.push(`: ${String(def.returnType).replace(/\s+/g, ' ').trim()}`);
         }
         return parts.join(' ');
     }
