@@ -288,6 +288,15 @@ function findCallers(index, name, options = {}) {
 
                     // Find the enclosing function
                     const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
+                    // A parameter of the enclosing function with the same name
+                    // shadows the target: `disposeEffect(effect)` inside
+                    // `function disposeEffect(effect)` references the parameter,
+                    // not a same-name module-scope symbol.
+                    if (callerSymbol && Array.isArray(callerSymbol.paramsStructured) &&
+                        callerSymbol.paramsStructured.some(p => p && p.name === call.name)) {
+                        recordExcluded(filePath, call.line, 'local-shadow');
+                        continue;
+                    }
                     if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                     pendingByFile.get(filePath).push({
                         call, fileEntry, callerSymbol,
@@ -329,6 +338,15 @@ function findCallers(index, name, options = {}) {
                     }
                     if (bindings.length === 1) {
                         bindingId = bindings[0].id;
+                    } else if (bindings.length > 1 && !call.isMethod &&
+                        call.isConstructor &&
+                        bindings.filter(b => b.type === 'class' || b.type === 'function').length === 1) {
+                        // Constructor calls bind to constructable symbols: `new ZodArray()`
+                        // must resolve to the class binding, not a same-name field/const
+                        // elsewhere in the file (TS declaration merging, bottom-of-file
+                        // namespace aliases). All `new`-style languages mark these
+                        // (JS/TS `new`, Java `new`, Go/Rust composite/struct literals).
+                        bindingId = bindings.find(b => b.type === 'class' || b.type === 'function').id;
                     } else if (bindings.length > 1 && !call.isMethod) {
                         // For implicit same-class calls (Java: execute() means this.execute()),
                         // try to resolve via caller's className before marking uncertain

@@ -174,7 +174,12 @@ function formatContextJson(context) {
                     file: c.relativePath || c.file,
                     line: c.line,
                     expression: c.content,
-                    callerName: c.callerName
+                    callerName: c.callerName,
+                    // Tier parity with the function-path callers list: class
+                    // usages are the confirmed-tier answer for type symbols.
+                    ...(c.confidence !== undefined && { confidence: c.confidence }),
+                    ...(c.resolution && { resolution: c.resolution }),
+                    ...(c.tier && { tier: c.tier })
                 })),
                 unverifiedCallers: (context.unverifiedCallers || []).map(c => ({
                     file: c.relativePath || c.file,

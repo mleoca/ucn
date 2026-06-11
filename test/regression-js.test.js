@@ -4674,3 +4674,87 @@ describe('fix #192: argument-position references and same-file method calls need
         } finally { rm(dir); }
     });
 });
+
+describe('fix #193: constructor calls resolve to the class binding among same-name bindings', () => {
+    it('new Widget() confirms despite a same-name field binding (TS declaration noise)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Widget {',
+                '  size: number = 1;',
+                '  static make(): Widget { return new Widget(); }',
+                '}',
+                'export class Registry {',
+                '  Widget: Widget | null = null;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:1:Widget' });
+            assert.ok(r.ok, 'context should succeed');
+            const usages = r.result.usages || r.result.callers || [];
+            const ctor = usages.find(u => u.line === 3);
+            assert.ok(ctor, `new Widget() must be a confirmed usage: ${JSON.stringify(usages)}`);
+            assert.strictEqual(ctor.tier, 'confirmed');
+            assert.strictEqual(ctor.resolution, 'exact-binding',
+                'constructor must bind to the class, not stay ambiguous');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #194: enclosing-function parameter shadows argument-position references', () => {
+    it('dispose(effect) inside function(effect) is not a confirmed caller of module effect()', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'function effect(fn) { return fn(); }',
+                'function handle(x) { return x; }',
+                'function run(effect) { return handle(effect); }',
+                'module.exports = { effect, run };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'effect', file: 'lib.js' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.line === 3),
+                `param-shadowed reference must not confirm: ${JSON.stringify(confirmed)}`);
+            const account = r.result.meta.account;
+            assert.ok((account.excluded.byReason['local-shadow']?.count || 0) > 0,
+                `shadow exclusion must be accounted: ${JSON.stringify(account.excluded)}`);
+            assert.strictEqual(account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #195: class context pins callers to the resolved definition', () => {
+    it('same-name class in another file does not attribute its usages to the pinned class', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'v1.ts': [
+                'export class Parser {',
+                '  static make(): Parser { return new Parser(); }',
+                '}',
+            ].join('\n'),
+            'v2.ts': [
+                'export class Parser {',
+                '  run(): number { return 2; }',
+                '}',
+                'export function build(): Parser { return new Parser(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'v1.ts:1:Parser' });
+            assert.ok(r.ok, 'context should succeed');
+            const usages = r.result.usages || r.result.callers || [];
+            assert.ok(usages.some(u => (u.relativePath || u.file) === 'v1.ts'),
+                `own-file constructor stays confirmed: ${JSON.stringify(usages)}`);
+            assert.ok(!usages.some(u => (u.relativePath || u.file) === 'v2.ts'),
+                `other definition's usages must not attribute to pinned class: ${JSON.stringify(usages)}`);
+            assert.strictEqual(r.result.meta.account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+});

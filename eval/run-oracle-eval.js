@@ -154,7 +154,10 @@ async function evaluateRepo(repo, oracle) {
             continue;
         }
         const json = JSON.parse(output.formatContextJson(r.result));
-        const confirmed = dedupe((json.data.callers || []).map(c => ({ file: c.file, line: c.line })));
+        // Function/method symbols expose confirmed callers as `callers`; class
+        // symbols expose them as `usages` (constructor/type-usage sites, same
+        // confirmed tier). Both carry tier labels.
+        const confirmed = dedupe((json.data.callers || json.data.usages || []).map(c => ({ file: c.file, line: c.line })));
         const unverified = dedupe((json.data.unverifiedCallers || []).map(c => ({ file: c.file, line: c.line })));
         const account = json.meta.account;
 

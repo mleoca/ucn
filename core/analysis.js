@@ -259,7 +259,10 @@ function context(index, name, options = {}) {
     if (['class', 'struct', 'interface', 'type'].includes(def.type)) {
         const methods = index.findMethodsForType(name);
 
-        let typeCallers = index.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, collectAccount: true });
+        // Pin caller resolution to the resolved class definition — same as the
+        // function path below. Without this, same-name classes in other files
+        // conflate (their usages attribute to whichever def displays).
+        let typeCallers = index.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, collectAccount: true, targetDefinitions: [def] });
         const rawTypeCallers = typeCallers;
         const typeFilteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
         // Tier partition — same contract as the function path: constructor/usage
