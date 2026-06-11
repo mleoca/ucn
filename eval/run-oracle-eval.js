@@ -40,6 +40,7 @@ const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
 const { jediOracle } = require('./oracles/jedi-oracle');
+const { goplsOracle } = require('./oracles/gopls-oracle');
 
 const args = process.argv.slice(2);
 const repoFilter = readArgValue(args, '--repo');
@@ -50,7 +51,7 @@ const REPORTS_DIR = path.join(__dirname, 'reports');
 // Order matters: per repo the FIRST language match wins — pyright (stronger
 // inference) is the primary Python oracle, jedi stays as the second opinion
 // via --oracle jedi.
-const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle]
+const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle]
     .map(validateOracle)
     .filter(o => !oracleFilter || o.name === oracleFilter);
 

@@ -20,11 +20,10 @@
 const fs = require('fs');
 const path = require('path');
 const { spawn } = require('child_process');
-const readline = require('readline');
 const { LspClient, pathToUri, uriToPath } = require('./lsp-client');
+const { makeHelperHandle } = require('./jsonl-helper');
 
 const HELPER_PATH = path.join(__dirname, 'jedi-helper.py');
-const HELPER_TIMEOUT_MS = 120000;
 
 const pyrightOracle = {
     name: 'pyright',
@@ -46,7 +45,7 @@ const pyrightOracle = {
         const helperChild = spawn(python, [HELPER_PATH, repoDir], {
             stdio: ['pipe', 'pipe', 'inherit'],
         });
-        const helper = makeHelperHandle(helperChild);
+        const helper = makeHelperHandle(helperChild, { label: 'ast helper' });
         const banner = JSON.parse(await helper.expectLine());
         if (!banner.ok) throw new Error(`ast helper failed to start: ${banner.error}`);
         const projectRoot = banner.projectRoot;
@@ -146,53 +145,6 @@ function walkPyFiles(root) {
         }
     }
     return out.sort();
-}
-
-/** Same serialized line-paired protocol the jedi oracle uses for its helper. */
-function makeHelperHandle(child) {
-    const rl = readline.createInterface({ input: child.stdout });
-    const queue = [];
-    let dead = null;
-
-    rl.on('line', (line) => {
-        const entry = queue.shift();
-        if (entry) {
-            clearTimeout(entry.timer);
-            entry.resolve(line);
-        }
-    });
-    const fail = (err) => {
-        dead = err;
-        while (queue.length) {
-            const entry = queue.shift();
-            clearTimeout(entry.timer);
-            entry.reject(err);
-        }
-    };
-    child.on('error', (e) => fail(new Error(`ast helper spawn failed: ${e.message}`)));
-    child.on('exit', (code) => fail(new Error(`ast helper exited (code ${code})`)));
-
-    const expectLine = () => new Promise((resolve, reject) => {
-        if (dead) return reject(dead);
-        const entry = { resolve, reject };
-        entry.timer = setTimeout(() => {
-            fail(new Error(`ast helper timed out after ${HELPER_TIMEOUT_MS}ms`));
-            child.kill();
-            reject(new Error(`ast helper timed out after ${HELPER_TIMEOUT_MS}ms`));
-        }, HELPER_TIMEOUT_MS);
-        queue.push(entry);
-    });
-
-    const request = async (payload) => {
-        if (dead) throw dead;
-        child.stdin.write(JSON.stringify(payload) + '\n');
-        const line = await expectLine();
-        const resp = JSON.parse(line);
-        if (!resp.ok) throw new Error(`ast helper: ${resp.error}`);
-        return resp;
-    };
-
-    return { child, expectLine, request };
 }
 
 module.exports = { pyrightOracle };
