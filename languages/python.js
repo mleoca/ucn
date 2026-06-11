@@ -450,6 +450,103 @@ function parse(code, parser) {
  * @param {object} parser - Tree-sitter parser instance
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string}>}
  */
+// Builtin types for literal method receivers: {'a': 1}.get('a') is dict.get,
+// never a project class method. Keys are tree-sitter node types.
+const PY_LITERAL_RECEIVER_TYPES = {
+    dictionary: 'dict',
+    dictionary_comprehension: 'dict',
+    list: 'list',
+    list_comprehension: 'list',
+    set: 'set',
+    set_comprehension: 'set',
+    string: 'str',
+    concatenated_string: 'str',
+    tuple: 'tuple',
+};
+
+// typing wrappers whose first argument is the actual value type
+const PY_TYPE_WRAPPERS = new Set(['Optional', 'Annotated', 'Final', 'ClassVar']);
+
+/**
+ * Extract a single concrete type name from an annotation's `type` node.
+ * Conservative by design: a wrong type would exclude true callers downstream
+ * (receiver-type-mismatch), so anything ambiguous returns undefined.
+ * Handles: Foo · pkg.Foo · Foo | None · Optional[Foo] · "Foo" · dict[str, int]
+ */
+function typeNameFromAnnotation(typeNode) {
+    if (!typeNode) return undefined;
+    const inner = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
+    return typeNameFromExpr(inner);
+}
+
+function typeNameFromExpr(node) {
+    if (!node) return undefined;
+    switch (node.type) {
+        case 'identifier':
+            return node.text;
+        case 'attribute': {
+            // dotted name: classes match by name in the symbol table → last segment
+            const attr = node.childForFieldName('attribute');
+            return attr?.text;
+        }
+        case 'binary_operator': {
+            // PEP 604 union: X | None → X; unions of two real types are ambiguous
+            const left = node.namedChild(0);
+            const right = node.namedChild(1);
+            if (left?.type === 'none' && right?.type !== 'none') return typeNameFromExpr(right);
+            if (right?.type === 'none' && left?.type !== 'none') return typeNameFromExpr(left);
+            return undefined;
+        }
+        case 'subscript': {
+            // typing.Optional[Foo] parses as subscript when base is dotted
+            const base = typeNameFromExpr(node.childForFieldName('value'));
+            if (PY_TYPE_WRAPPERS.has(base)) {
+                return typeNameFromExpr(node.childForFieldName('subscript'));
+            }
+            return base; // dict[str, int] → the receiver IS a dict
+        }
+        case 'generic_type': {
+            // Optional[Foo] / Mapping[str, int] in annotation position
+            const base = typeNameFromExpr(node.namedChild(0));
+            if (PY_TYPE_WRAPPERS.has(base)) {
+                const params = node.namedChild(1); // type_parameter → type wrappers
+                const firstType = params && params.namedChildCount > 0 ? params.namedChild(0) : null;
+                return typeNameFromAnnotation(firstType);
+            }
+            return base;
+        }
+        case 'string': {
+            // forward reference: "Foo" — only accept a bare dotted name
+            for (let i = 0; i < node.childCount; i++) {
+                const c = node.child(i);
+                if (c.type === 'string_content') {
+                    const txt = c.text.trim();
+                    if (/^[A-Za-z_][\w.]*$/.test(txt)) return txt.split('.').pop();
+                }
+            }
+            return undefined;
+        }
+        default:
+            return undefined;
+    }
+}
+
+/**
+ * Type name from a constructor-call callee: ClassName(...) or pkg.ClassName(...).
+ * Uppercase-first heuristic (Python class naming convention).
+ */
+function constructorTypeName(funcNode) {
+    if (!funcNode) return undefined;
+    if (funcNode.type === 'identifier') {
+        return /^[A-Z]/.test(funcNode.text) ? funcNode.text : undefined;
+    }
+    if (funcNode.type === 'attribute') {
+        const attr = funcNode.childForFieldName('attribute');
+        return attr && /^[A-Z]/.test(attr.text) ? attr.text : undefined;
+    }
+    return undefined;
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -564,9 +661,24 @@ function findCallsInCode(code, parser) {
             const nameNode = node.childForFieldName('name') || node.namedChild(0);
             const typeNode = node.childForFieldName('type');
             if (nameNode?.type === 'identifier' && typeNode) {
-                const typeId = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
-                if (typeId?.type === 'identifier' && !['self', 'cls'].includes(nameNode.text)) {
-                    localVarTypes.set(nameNode.text, typeId.text);
+                const typeName = typeNameFromAnnotation(typeNode);
+                if (typeName && !['self', 'cls'].includes(nameNode.text)) {
+                    localVarTypes.set(nameNode.text, typeName);
+                }
+            }
+        }
+
+        // Track with-statement bindings: with Client() as c → c is Client
+        // (covers async with too — same with_item/as_pattern node shape)
+        if (node.type === 'with_item') {
+            const value = node.childForFieldName('value') || node.namedChild(0);
+            if (value?.type === 'as_pattern') {
+                const ctx = value.namedChild(0);
+                const target = value.namedChildCount > 1 ? value.namedChild(value.namedChildCount - 1) : null;
+                const targetId = target?.type === 'as_pattern_target' ? target.namedChild(0) : null;
+                if (ctx?.type === 'call' && targetId?.type === 'identifier') {
+                    const ctorName = constructorTypeName(ctx.childForFieldName('function'));
+                    if (ctorName) localVarTypes.set(targetId.text, ctorName);
                 }
             }
         }
@@ -579,10 +691,9 @@ function findCallsInCode(code, parser) {
                 // Track type annotation: x: Foo = ... → x is Foo
                 const typeNode = node.childForFieldName('type');
                 if (typeNode) {
-                    // type node wraps the actual type identifier
-                    const typeId = typeNode.namedChildCount > 0 ? typeNode.namedChild(0) : null;
-                    if (typeId?.type === 'identifier') {
-                        localVarTypes.set(left.text, typeId.text);
+                    const typeName = typeNameFromAnnotation(typeNode);
+                    if (typeName) {
+                        localVarTypes.set(left.text, typeName);
                     }
                 }
                 if (right?.type === 'identifier') {
@@ -626,11 +737,11 @@ function findCallsInCode(code, parser) {
                 // Exception: partial() already handled above via alias tracking.
                 else if (right?.type === 'call' && !aliases.has(left.text)) {
                     nonCallableNames.add(left.text);
-                    // Infer type from constructor call: x = ClassName(...)
-                    // Python convention: classes start with uppercase
-                    const callFunc = right.childForFieldName('function');
-                    if (callFunc?.type === 'identifier' && /^[A-Z]/.test(callFunc.text)) {
-                        localVarTypes.set(left.text, callFunc.text);
+                    // Infer type from constructor call: x = ClassName(...) or
+                    // x = pkg.ClassName(...). Python convention: classes start uppercase
+                    const ctorName = constructorTypeName(right.childForFieldName('function'));
+                    if (ctorName) {
+                        localVarTypes.set(left.text, ctorName);
                     }
                 }
                 // Third: subscript/attribute access results are non-callable data
@@ -694,7 +805,11 @@ function findCallsInCode(code, parser) {
                         }
                     }
 
-                    const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
+                    // Literal receivers carry their builtin type: {}.get() can
+                    // never be a project class method
+                    const receiverType = receiver
+                        ? localVarTypes.get(receiver)
+                        : (objNode ? PY_LITERAL_RECEIVER_TYPES[objNode.type] : undefined);
                     const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: attrNode.text,

@@ -2124,3 +2124,164 @@ describe('export-rename aliases (python): from-import-as callers attribute to th
         } finally { rm(dir); }
     });
 });
+
+describe('fix #198 (python): structural receiver type inference', () => {
+    const FIXTURE = {
+        'package.json': '{"name":"t"}',
+        'lib.py': [
+            'class Client:',
+            '    def get(self, url):',
+            '        return url',
+            '',
+            'class AsyncClient:',
+            '    def get(self, url):',
+            '        return url',
+            '',
+            'def fetch_all(items):',
+            '    return items',
+        ].join('\n'),
+        'app.py': [
+            'from lib import Client, AsyncClient, fetch_all',
+            '',
+            'def use_sync(client: Client):',
+            '    return client.get("a")',
+            '',
+            'def use_async(client: AsyncClient):',
+            '    return client.get("b")',
+            '',
+            'def use_optional(client: Client | None):',
+            '    return client.get("d")',
+            '',
+            'def use_with():',
+            '    with Client() as c:',
+            '        return c.get("c")',
+            '',
+            'def use_dict():',
+            '    return {"http": 80}.get("http")',
+            '',
+            'def typed_vs_function():',
+            '    x = Client()',
+            '    return x.fetch_all([1])',
+        ].join('\n'),
+    };
+
+    it('annotated and with-as receivers confirm only the matching class', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.py:2:get' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            const lines = confirmed.map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('app.py:4'), `client: Client caller confirmed: ${lines}`);
+            assert.ok(lines.includes('app.py:10'), `client: Client | None union caller confirmed: ${lines}`);
+            assert.ok(lines.includes('app.py:14'), `with Client() as c caller confirmed: ${lines}`);
+            assert.ok(!lines.includes('app.py:7'), `client: AsyncClient must be excluded: ${lines}`);
+            assert.ok(confirmed.every(c => c.resolution === 'receiver-hint'),
+                `typed receivers score receiver-hint: ${JSON.stringify(confirmed.map(c => c.resolution))}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('dict-literal receiver never confirms a class method', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.py:2:get' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.line === 17),
+                `literal {}.get must not be a confirmed caller: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('typed receiver method call never confirms a standalone function', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'fetch_all' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            assert.strictEqual(confirmed.length, 0,
+                `x.fetch_all() with x: Client must be excluded: ${JSON.stringify(confirmed)}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('dotted annotations and dotted constructors type the receiver', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'pkg/__init__.py': 'from .lib import Client\n',
+            'pkg/lib.py': 'class Client:\n    def send(self, m):\n        return m\n\nclass Other:\n    def send(self, m):\n        return m\n',
+            'app.py': [
+                'import pkg',
+                '',
+                'def f(c: pkg.Client):',
+                '    return c.send(1)',
+                '',
+                'def g():',
+                '    o = pkg.Other()',
+                '    return o.send(2)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'pkg/lib.py:2:send' });
+            assert.ok(r.ok);
+            const lines = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('app.py:4'), `pkg.Client annotation confirms: ${lines}`);
+            assert.ok(!lines.includes('app.py:8'), `pkg.Other() constructor excludes: ${lines}`);
+        } finally { rm(dir); }
+    });
+
+    it('subclass receiver stays confirmed on inherited parent method', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.py': 'class Base:\n    def start(self):\n        return 1\n\nclass Child(Base):\n    pass\n',
+            'app.py': 'from lib import Child\n\ndef run(c: Child):\n    return c.start()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.py:2:start' });
+            assert.ok(r.ok);
+            const lines = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('app.py:4'),
+                `Child receiver calls inherited Base.start — must stay confirmed: ${lines}`);
+        } finally { rm(dir); }
+    });
+
+    it('subclass override redirects: Child receiver not confirmed on Base method', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.py': 'class Base:\n    def start(self):\n        return 1\n\nclass Child(Base):\n    def start(self):\n        return 2\n',
+            'app.py': 'from lib import Child\n\ndef run(c: Child):\n    return c.start()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.py:2:start', file: 'lib.py', className: 'Base' });
+            assert.ok(r.ok);
+            const lines = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!lines.includes('app.py:4'),
+                `Child overrides start — its calls dispatch to the override: ${lines}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #198b (python): supertype receiver is not a mismatch', () => {
+    it('Base-typed receiver stays confirmed on Child override (dynamic dispatch)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.py': 'class Base:\n    def start(self):\n        return 1\n\nclass Child(Base):\n    def start(self):\n        return 2\n',
+            'app.py': 'from lib import Base\n\ndef run(b: Base):\n    return b.start()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.py:6:start', className: 'Child' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app.py:4'),
+                `b: Base may dispatch to Child.start — must stay confirmed: ${confirmed}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});

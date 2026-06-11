@@ -528,6 +528,11 @@ function findCallers(index, name, options = {}) {
                 // visible (scoreEdge checks hasReceiverType before isUncertain, so
                 // without this flag a known mismatch would score receiver-hint 0.80).
                 let typeMismatch = false;
+                // Structural languages: receiver-hint requires a VALIDATED match
+                // (receiverType ∈ target class + subtypes). Ancestor-kept and
+                // trust-gate-passed types fall back to import/scope evidence —
+                // an unvalidated annotation must not upgrade the tier.
+                let receiverTypeValidated = false;
                 if (call.isMethod) {
                     if (call.selfAttribute && fileEntry.language === 'python') {
                         // self.attr.method() — resolve via attribute type inference
@@ -699,6 +704,32 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Structural typed-receiver kind filter: a method call on a
+                // receiver with a known class type can only target that class's
+                // methods — never a standalone function. Module receivers are
+                // never typed (localVarTypes only types constructor results,
+                // annotations, and literals), so module-qualified calls to
+                // standalone functions keep flowing on import evidence. Class
+                // targets are exempt: their own type matching runs below.
+                // Trust gate: only builtin/project-class types are positive
+                // evidence — an alias/interface annotation can wrap the target
+                // (`const x: Fetcher = { fetch }`), so it must not exclude.
+                if (!bindingId && !resolvedBySameClass && call.isMethod && call.receiverType &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    _receiverTypeTrustedForExclusion(index, call.receiverType) &&
+                    !targetDefs.some(d => d.className || d.receiver || NON_CALLABLE_TYPES.has(d.type))) {
+                    isUncertain = true;
+                    typeMismatch = true;
+                    if (collectAccount) {
+                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                        continue;
+                    }
+                    if (!options.includeUncertain) {
+                        if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                        continue;
+                    }
+                }
+
                 // Go package-qualified call filter: when a non-method call has a receiver
                 // that is an import alias (e.g., fmt.Errorf()), verify the caller imports
                 // a project file containing the target. Catches stdlib (single-segment imports
@@ -761,7 +792,7 @@ function findCallers(index, name, options = {}) {
                 // whose receiverType is known to be a different type.
                 // All languages use receiverType when available (constructor/annotation inference).
                 // Go/Java/Rust additionally fall back to variable name matching.
-                if (call.isMethod && call.receiver && !resolvedBySameClass && !bindingId &&
+                if (call.isMethod && (call.receiver || call.receiverType) && !resolvedBySameClass && !bindingId &&
                     (call.receiverType || langTraits(fileEntry.language)?.typeSystem === 'nominal')) {
                     // Build target type set from both className (Java) and receiver (Go/Rust)
                     const targetTypes = new Set();
@@ -769,16 +800,23 @@ function findCallers(index, name, options = {}) {
                         if (td.className) targetTypes.add(td.className);
                         if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
                     }
-                    // Expand targetTypes with types that embed the target (Go/Java/Rust)
-                    // e.g., if target is Base.Start() and Child embeds Base, accept Child.Start() callers
-                    if (targetTypes.size > 0 && langTraits(fileEntry.language)?.typeSystem === 'nominal') {
-                        for (const tt of [...targetTypes]) {
-                            const children = index.extendedByGraph?.get(tt);
-                            if (children) {
-                                for (const child of children) {
-                                    const cName = typeof child === 'string' ? child : child.name;
-                                    if (cName) targetTypes.add(cName);
-                                }
+                    // Expand targetTypes with subtypes of the target's class
+                    // (transitively): a Child receiver calling an inherited
+                    // Base method IS a caller of Base.method. Skip children
+                    // that define the method themselves — their calls dispatch
+                    // to the override, not the target.
+                    if (targetTypes.size > 0) {
+                        const queue = [...targetTypes];
+                        while (queue.length > 0) {
+                            const children = index.extendedByGraph?.get(queue.pop());
+                            if (!children) continue;
+                            for (const child of children) {
+                                const cName = typeof child === 'string' ? child : child.name;
+                                if (!cName || targetTypes.has(cName)) continue;
+                                const overrides = definitions.some(d => d.className === cName);
+                                if (overrides) continue;
+                                targetTypes.add(cName);
+                                queue.push(cName);
                             }
                         }
                     }
@@ -786,8 +824,22 @@ function findCallers(index, name, options = {}) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
                         const knownType = call.receiverType;
                         if (knownType) {
-                            const matchesTarget = targetTypes.has(knownType);
-                            if (!matchesTarget) {
+                            // Exclusion requires an UNRELATED type. A receiver typed
+                            // as an ANCESTOR of the target's class may dynamically
+                            // dispatch to the target override (x: Base; x.parse()
+                            // can run Child.parse) — structural languages only;
+                            // Go embedding has no virtual dispatch.
+                            const structural = langTraits(fileEntry.language)?.typeSystem === 'structural';
+                            if (targetTypes.has(knownType)) receiverTypeValidated = true;
+                            const matchesTarget = receiverTypeValidated ||
+                                (structural && _isAncestorOfTargetClass(index, knownType, targetDefs));
+                            // Structural trust gate: a name that is neither a
+                            // builtin nor a project class (type alias, interface,
+                            // external type) tracks no hierarchy UCN can check —
+                            // not positive evidence against the target.
+                            const exclusionTrusted = !structural ||
+                                _receiverTypeTrustedForExclusion(index, knownType);
+                            if (!matchesTarget && exclusionTrusted) {
                                 // Known type doesn't match target — positive evidence the
                                 // call targets a DIFFERENT symbol. Under the account contract
                                 // this is excluded-with-reason, not a revealable uncertain.
@@ -941,7 +993,9 @@ function findCallers(index, name, options = {}) {
                         // Method calls where binding resolution was skipped (non-self receiver)
                         // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
                         isUncertain: !!isUncertain || uncertainMethodReceiver,
-                        hasReceiverType: !!call.receiverType,
+                        hasReceiverType: langTraits(fileEntry.language)?.typeSystem === 'structural'
+                            ? receiverTypeValidated
+                            : !!call.receiverType,
                         hasReceiverEvidence: !!(call.receiver &&
                             (fileEntry.bindings || []).some(b => b.name === call.receiver)),
                         hasImportEvidence: !!bindingId || hasImportLink,
@@ -1873,6 +1927,57 @@ function _buildLocalTypeMap(index, def, calls) {
  * variable types for method resolution. Not used by JS/TS/Python -- structural
  * languages use import evidence via _buildLocalTypeMap instead.
  */
+// Builtin receiver types from literal/annotation inference (Python builtins,
+// JS globals, TS predefined types). Definitionally not project classes, so a
+// mismatch against a project class target is always positive evidence.
+const BUILTIN_RECEIVER_TYPES = new Set([
+    'dict', 'list', 'set', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset',
+    'Array', 'String', 'Object', 'RegExp', 'Number', 'Boolean', 'Map', 'Set', 'Promise',
+    'string', 'number', 'boolean', 'bigint', 'symbol',
+]);
+
+/**
+ * Can this receiverType justify EXCLUDING a caller (structural languages)?
+ * True for builtins and names that resolve to a project class/struct — types
+ * whose identity and hierarchy UCN tracks. False for type aliases, interfaces,
+ * and external types: those can wrap or alias the target, so a name mismatch
+ * is not evidence against it.
+ */
+function _receiverTypeTrustedForExclusion(index, typeName) {
+    if (BUILTIN_RECEIVER_TYPES.has(typeName)) return true;
+    const defs = index.symbols.get(typeName);
+    return !!defs && defs.some(d => d.type === 'class' || d.type === 'struct');
+}
+
+/**
+ * Is typeName an ancestor (transitively) of any target definition's class?
+ * Used by receiver-class disambiguation: a receiver typed as a SUPERTYPE of
+ * the target's class is not evidence against the target — dynamic dispatch
+ * may run the target override at that site.
+ */
+function _isAncestorOfTargetClass(index, typeName, targetDefs) {
+    const visited = new Set();
+    const queue = [];
+    for (const td of targetDefs) {
+        const cls = td.className || (td.receiver && td.receiver.replace(/^\*/, ''));
+        if (cls) queue.push({ name: cls, file: td.file });
+    }
+    while (queue.length > 0) {
+        const { name, file } = queue.shift();
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const parents = index._getInheritanceParents(name, file) || [];
+        for (const parent of parents) {
+            if (parent === typeName) return true;
+            if (!visited.has(parent)) {
+                const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
+                queue.push({ name: parent, file: parentFile });
+            }
+        }
+    }
+    return false;
+}
+
 function _buildTypedLocalTypeMap(index, def, calls) {
     const localTypes = new Map();
     let _cachedLines = null;

@@ -1149,6 +1149,75 @@ function parse(code, parser) {
  * @param {object} parser - Tree-sitter parser instance
  * @returns {Array<{name: string, line: number, isMethod: boolean, receiver?: string, isConstructor?: boolean}>}
  */
+// Builtin types for literal method receivers: [].map() is Array.map, never a
+// project class method. Keys are tree-sitter node types.
+const JS_LITERAL_RECEIVER_TYPES = {
+    array: 'Array',
+    string: 'String',
+    template_string: 'String',
+    object: 'Object',
+    regex: 'RegExp',
+    number: 'Number',
+};
+
+// Predefined TS types that pin a receiver; any/unknown/object say nothing.
+const TS_PREDEFINED_RECEIVER_TYPES = new Set(['string', 'number', 'boolean', 'bigint', 'symbol']);
+
+/**
+ * Extract a single concrete type name from a TS type node. Conservative by
+ * design: a wrong type would exclude true callers downstream
+ * (receiver-type-mismatch), so anything ambiguous returns undefined.
+ * Handles: Foo · ns.Foo · Foo | null · Store<string> · (Foo) · string
+ */
+function tsTypeName(node) {
+    if (!node) return undefined;
+    switch (node.type) {
+        case 'type_identifier':
+        case 'identifier':
+            return node.text;
+        case 'nested_type_identifier': {
+            // ns.Foo → classes match by name in the symbol table → last segment
+            const last = node.namedChild(node.namedChildCount - 1);
+            return last?.text;
+        }
+        case 'generic_type':
+            // Store<string> → Store
+            return tsTypeName(node.namedChild(0));
+        case 'union_type': {
+            // Foo | null / Foo | undefined → Foo; unions of two real types are ambiguous
+            const real = [];
+            for (let i = 0; i < node.namedChildCount; i++) {
+                const c = node.namedChild(i);
+                if (c.type === 'literal_type' ||
+                    (c.type === 'predefined_type' && !TS_PREDEFINED_RECEIVER_TYPES.has(c.text))) {
+                    continue;
+                }
+                real.push(c);
+            }
+            return real.length === 1 ? tsTypeName(real[0]) : undefined;
+        }
+        case 'parenthesized_type':
+            return tsTypeName(node.namedChild(0));
+        case 'predefined_type':
+            return TS_PREDEFINED_RECEIVER_TYPES.has(node.text) ? node.text : undefined;
+        default:
+            return undefined;
+    }
+}
+
+/**
+ * Type name from a new-expression constructor node: new Foo() or new pkg.Foo().
+ */
+function jsConstructorTypeName(ctorNode) {
+    if (!ctorNode) return undefined;
+    if (ctorNode.type === 'identifier') return ctorNode.text;
+    if (ctorNode.type === 'member_expression') {
+        const prop = ctorNode.childForFieldName('property');
+        return prop?.text;
+    }
+    return undefined;
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -1388,10 +1457,10 @@ function findCallsInCode(code, parser) {
             // Constructor results are object instances, not callable functions
             if (nameNode?.type === 'identifier' && initNode?.type === 'new_expression') {
                 nonCallableNames.add(nameNode.text);
-                // Infer type: const x = new Foo() → x is Foo
-                const ctorNode = initNode.childForFieldName('constructor');
-                if (ctorNode?.type === 'identifier') {
-                    localVarTypes.set(nameNode.text, ctorNode.text);
+                // Infer type: const x = new Foo() / new pkg.Foo() → x is Foo
+                const ctorName = jsConstructorTypeName(initNode.childForFieldName('constructor'));
+                if (ctorName) {
+                    localVarTypes.set(nameNode.text, ctorName);
                 }
             }
             // Track TypeScript type annotations: const x: Foo = ...
@@ -1401,15 +1470,23 @@ function findCallsInCode(code, parser) {
                     // type_annotation → first named child is the type identifier
                     const typeId = typeNode.type === 'type_annotation'
                         ? typeNode.namedChild(0) : typeNode;
-                    if (typeId?.type === 'type_identifier' || typeId?.type === 'identifier') {
-                        localVarTypes.set(nameNode.text, typeId.text);
-                    } else if (typeId?.type === 'generic_type') {
-                        // Store<string> → generic_type has type_identifier as first child
-                        const baseType = typeId.namedChild(0);
-                        if (baseType?.type === 'type_identifier' || baseType?.type === 'identifier') {
-                            localVarTypes.set(nameNode.text, baseType.text);
-                        }
+                    const typeName = tsTypeName(typeId);
+                    if (typeName) {
+                        localVarTypes.set(nameNode.text, typeName);
                     }
+                }
+            }
+        }
+
+        // Track TS parameter type annotations: function f(client: Client) → client is Client
+        if (node.type === 'required_parameter' || node.type === 'optional_parameter') {
+            const pat = node.childForFieldName('pattern') || node.namedChild(0);
+            const typeNode = node.childForFieldName('type');
+            if (pat?.type === 'identifier' && typeNode) {
+                const inner = typeNode.type === 'type_annotation' ? typeNode.namedChild(0) : typeNode;
+                const typeName = tsTypeName(inner);
+                if (typeName) {
+                    localVarTypes.set(pat.text, typeName);
                 }
             }
         }
@@ -1420,9 +1497,9 @@ function findCallsInCode(code, parser) {
             const right = node.childForFieldName('right');
             if (left?.type === 'identifier' && right?.type === 'new_expression') {
                 nonCallableNames.add(left.text);
-                const ctorNode = right.childForFieldName('constructor');
-                if (ctorNode?.type === 'identifier') {
-                    localVarTypes.set(left.text, ctorNode.text);
+                const ctorName = jsConstructorTypeName(right.childForFieldName('constructor'));
+                if (ctorName) {
+                    localVarTypes.set(left.text, ctorName);
                 }
             }
         }
@@ -1502,7 +1579,11 @@ function findCallsInCode(code, parser) {
                                 receiver = objNode.text;
                             }
                         }
-                        const receiverType = receiver ? localVarTypes.get(receiver) : undefined;
+                        // Literal receivers carry their builtin type: [].map() can
+                        // never be a project class method
+                        const receiverType = receiver
+                            ? localVarTypes.get(receiver)
+                            : (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined);
                         const firstArg = getFirstStringArg(node);
                         const argCount = getArgCount(node);
                         calls.push({

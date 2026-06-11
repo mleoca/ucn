@@ -9,7 +9,7 @@ lie the grep-reliability contract forbids. Target: 0.
 |---|---|---|---|---|---|---|---|---|---|
 | zod | ts-morph | 50 | 1861 | 97.1% | 28.0% | 0.6908 | **0** | 100.0% (8) | 100.0% |
 | preact-signals | ts-morph | 24 | 24 | 88.0% | 0.0% | 0.88 | **0** | n/a (0) | 100.0% |
-| httpx | jedi | 50 | 851 | 73.2% | 35.2% | 0.3799 | **0** | 100.0% (5) | 100.0% |
+| httpx | jedi | 50 | 851 | 80.3% | 35.3% | 0.4507 | **0** | 100.0% (5) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -25,6 +25,6 @@ evidence confirms the file but not the receiver type.
 | preact-signals | function | 13 | 17 | 85.0% (17/20) | 0.0% (0/437) | 0.85 | {"confirmed":17,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | method | 10 | 5 | 100.0% (5/5) | 0.0% (0/57) | 1 | {"confirmed":5,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | class | 1 | 2 | 0.0% (0/0) | 0.0% (0/2) | n/a | {"confirmed":0,"unverified":0,"reportedNonCall":2,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| httpx | function | 8 | 38 | 84.4% (38/45) | 0.0% (0/1) | 0.8444 | {"confirmed":38,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| httpx | method | 29 | 248 | 49.5% (247/499) | 0.5% (1/212) | 0.4903 | {"confirmed":247,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| httpx | function | 8 | 38 | 88.4% (38/43) | 0.0% (0/0) | n/a | {"confirmed":38,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| httpx | method | 29 | 248 | 60.1% (247/411) | 0.5% (1/212) | 0.5963 | {"confirmed":247,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | httpx | class | 13 | 565 | 97.6% (451/462) | 100.0% (114/114) | -0.0238 | {"confirmed":451,"unverified":114,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

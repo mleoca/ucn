@@ -4922,3 +4922,147 @@ describe('fix #197: package self-reference imports resolve via exports map', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #198 (js/ts): structural receiver type inference', () => {
+    const FIXTURE = {
+        'package.json': '{"name":"t"}',
+        'store.ts': [
+            'export class Store {',
+            '    commit(k: string) { return k; }',
+            '}',
+            'export class AsyncStore {',
+            '    commit(k: string) { return k; }',
+            '}',
+            'export function map(fn: (v: number) => number) { return fn; }',
+        ].join('\n'),
+        'app.ts': [
+            'import { Store, AsyncStore, map } from "./store";',
+            '',
+            'export function useStore(store: Store, other: AsyncStore, opt: Store | null) {',
+            '    store.commit("a");',
+            '    other.commit("b");',
+            '    opt.commit("c");',
+            '    [1, 2].map(v => v);',
+            '    const s = new Store();',
+            '    s.commit("d");',
+            '    s.map(v => v);',
+            '}',
+        ].join('\n'),
+    };
+
+    it('TS param annotations and new-expressions confirm only the matching class', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'store.ts:2:commit' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            const lines = confirmed.map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('app.ts:4'), `store: Store param confirms: ${lines}`);
+            assert.ok(lines.includes('app.ts:6'), `Store | null union confirms: ${lines}`);
+            assert.ok(lines.includes('app.ts:9'), `new Store() confirms: ${lines}`);
+            assert.ok(!lines.includes('app.ts:5'), `other: AsyncStore must be excluded: ${lines}`);
+            assert.ok(confirmed.every(c => c.resolution === 'receiver-hint'),
+                `typed receivers score receiver-hint: ${JSON.stringify(confirmed.map(c => c.resolution))}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('array-literal receiver and typed receiver never confirm a standalone function', () => {
+        const dir = tmp(FIXTURE);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'store.ts:7:map' });
+            assert.ok(r.ok);
+            const confirmed = r.result.callers || [];
+            assert.strictEqual(confirmed.length, 0,
+                `[].map and s.map (s: Store) must not confirm standalone map: ${JSON.stringify(confirmed)}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('member-expression constructor types the receiver: new pkg.Foo()', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'class Engine {\n    run(x) { return x; }\n}\nclass Pump {\n    run(x) { return x; }\n}\nmodule.exports = { Engine, Pump };',
+            'app.js': [
+                'const pkg = require("./lib");',
+                '',
+                'function go() {',
+                '    const e = new pkg.Engine();',
+                '    return e.run(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.js:2:run', className: 'Engine' });
+            assert.ok(r.ok);
+            const lines = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(lines.includes('app.js:5'), `new pkg.Engine() receiver confirms Engine.run: ${lines}`);
+            const rPump = execute(index, 'context', { name: 'lib.js:5:run', className: 'Pump' });
+            const pumpLines = (rPump.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!pumpLines.includes('app.js:5'), `Engine receiver excluded from Pump.run: ${pumpLines}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #198b (js/ts): supertype receiver is not a mismatch', () => {
+    it('Base-typed receiver stays confirmed on Child override (dynamic dispatch)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': 'export class Base {\n    start() { return 1; }\n}\nexport class Child extends Base {\n    start() { return 2; }\n}',
+            'app.ts': 'import { Base } from "./lib";\n\nexport function run(b: Base) {\n    return b.start();\n}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:5:start', className: 'Child' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app.ts:4'),
+                `b: Base may dispatch to Child.start — must stay confirmed: ${confirmed}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #198c (js/ts): alias/interface receiver types never exclude', () => {
+    it('type-alias annotated receiver stays confirmed (alias name != class name)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class ZType<T> {',
+                '    parse(v: T) { return v; }',
+                '}',
+                'export type ZTypeAny = ZType<any>;',
+            ].join('\n'),
+            'app.ts': 'import { ZTypeAny } from "./lib";\n\nexport function run(schema: ZTypeAny) {\n    return schema.parse(1);\n}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:2:parse' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app.ts:4'),
+                `ZTypeAny aliases ZType — schema.parse() must stay confirmed: ${confirmed}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('interface-typed receiver does not exclude a standalone function target', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': 'export function fetchData(u: string) { return u; }\nexport interface Fetcher { fetchData(u: string): string; }',
+            'app.ts': 'import { fetchData, Fetcher } from "./lib";\n\nexport function run(f: Fetcher) {\n    return f.fetchData("u");\n}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:1:fetchData' });
+            assert.ok(r.ok);
+            const visible = [...(r.result.callers || []), ...(r.result.unverifiedCallers || [])]
+                .map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(visible.includes('app.ts:4'),
+                `Fetcher may wrap fetchData — site must stay visible (confirmed or unverified): ${visible}`);
+        } finally { rm(dir); }
+    });
+});
