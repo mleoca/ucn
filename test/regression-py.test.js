@@ -2082,3 +2082,27 @@ describe('endpoints command (Python)', () => {
         assert.ok(partial.confidence < 1 && partial.confidence > 0);
     });
 });
+
+describe('fix #192 (python): argument-position function references need import evidence', () => {
+    it('imported callback confirms; bare name without import goes unverified', () => {
+        const dir = tmp({
+            'lib.py': 'def transform(x):\n    return x * 2\n',
+            'app.py': 'from lib import transform\n\ndef run(items):\n    return list(map(transform, items))\n',
+            'stray.py': 'def noimport(items):\n    return list(map(transform, items))\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'transform' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            const unverified = r.result.unverifiedCallers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'app.py'),
+                `imported callback must stay confirmed: ${JSON.stringify(confirmed)}`);
+            assert.ok(!confirmed.some(c => c.relativePath === 'stray.py'),
+                'no-import callback must not be confirmed');
+            assert.ok(unverified.some(c => (c.relativePath || c.file || '').includes('stray.py')),
+                'no-import callback must be visible in the unverified tier');
+            assert.strictEqual(r.result.meta.account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+});

@@ -221,13 +221,13 @@ function findCallers(index, name, options = {}) {
                 if (call.isPotentialCallback) {
                     const syms = definitions;
                     if (!syms || syms.length === 0) continue;
+                    const cbTargetDefs = options.targetDefinitions || definitions;
 
                     // Go unexported visibility: lowercase functions are package-private.
                     // Only allow callers from the same package directory.
                     if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[a-z]/.test(name)) {
-                        const targetDefs = options.targetDefinitions || definitions;
                         const targetPkgDirs = new Set(
-                            targetDefs.filter(d => d.file).map(d => path.dirname(d.file))
+                            cbTargetDefs.filter(d => d.file).map(d => path.dirname(d.file))
                         );
                         if (targetPkgDirs.size > 0 && !targetPkgDirs.has(path.dirname(filePath))) {
                             continue;
@@ -237,14 +237,52 @@ function findCallers(index, name, options = {}) {
                     // Nominal type receiver disambiguation for callbacks (e.g. dc.worker)
                     if (call.isMethod && call.receiver &&
                         langTraits(fileEntry.language)?.typeSystem === 'nominal') {
-                        const targetDefs = options.targetDefinitions || definitions;
                         const targetTypes = new Set();
-                        for (const td of targetDefs) {
+                        for (const td of cbTargetDefs) {
                             if (td.className) targetTypes.add(td.className);
                             if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
                         }
                         if (targetTypes.size > 0 && call.receiverType) {
                             if (!targetTypes.has(call.receiverType)) continue;
+                        }
+                    }
+
+                    // Resolution evidence for a bare-identifier function reference:
+                    // the name reaches the target via module scope (same file),
+                    // same-package scope (nominal languages), or an import edge
+                    // (direct or one barrel hop). Argument position alone is a name
+                    // match, not evidence — a local variable or an unrelated
+                    // same-name symbol shadows it invisibly.
+                    const cbTargetFiles = new Set(cbTargetDefs.map(d => d.file).filter(Boolean));
+                    const cbSameFile = cbTargetFiles.has(filePath);
+                    const cbSamePackage = !cbSameFile &&
+                        langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                        cbTargetDefs.some(d => d.file && path.dirname(d.file) === path.dirname(filePath));
+                    let cbImportLink = false;
+                    if (!cbSameFile && !cbSamePackage) {
+                        const cbImports = index.importGraph.get(filePath);
+                        cbImportLink = !!(cbImports && setSome(cbImports, imp => cbTargetFiles.has(imp)));
+                        if (!cbImportLink && cbImports) {
+                            for (const imp of cbImports) {
+                                const trans = index.importGraph.get(imp);
+                                if (trans && setSome(trans, ti => cbTargetFiles.has(ti))) {
+                                    cbImportLink = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!cbImportLink) {
+                            // Positive mis-link evidence: the name resolves to a
+                            // same-name definition in this file (or one this file
+                            // imports) that is NOT the target — same disposition
+                            // as the import-graph disambiguation for plain calls.
+                            const cbOtherDefFiles = new Set(definitions
+                                .map(d => d.file).filter(f => f && !cbTargetFiles.has(f)));
+                            if (cbOtherDefFiles.has(filePath) ||
+                                (cbImports && setSome(cbImports, imp => cbOtherDefFiles.has(imp)))) {
+                                recordExcluded(filePath, call.line, 'other-definition-import');
+                                continue;
+                            }
                         }
                     }
 
@@ -254,7 +292,11 @@ function findCallers(index, name, options = {}) {
                     pendingByFile.get(filePath).push({
                         call, fileEntry, callerSymbol,
                         isMethod: false, isFunctionReference: true, receiver: undefined,
-                        _evidence: { isFunctionReference: true }
+                        _evidence: {
+                            isFunctionReference: true,
+                            hasImportEvidence: cbSameFile || cbImportLink,
+                            hasSamePackageEvidence: cbSamePackage,
+                        }
                     });
                     pendingCount++;
                     continue;
@@ -702,21 +744,35 @@ function findCallers(index, name, options = {}) {
                 // Find the enclosing function (get full symbol info)
                 const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
 
+                // Method call whose receiver has no binding evidence in this file's
+                // scope (structural languages only) — receiver-evidence-free.
+                // Hoisted because it also limits what counts as import evidence.
+                const uncertainMethodReceiver = skipLocalBinding && call.isMethod && !resolvedBySameClass &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    !(call.receiver && (fileEntry.bindings || []).some(b => b.name === call.receiver));
+
                 // Check import graph evidence: does this file import from the target definition's file?
                 const targetDefs2 = options.targetDefinitions || definitions;
                 const targetFiles2 = new Set(targetDefs2.map(d => d.file).filter(Boolean));
                 const callerImports = index.importGraph.get(filePath);
-                let hasImportLink = targetFiles2.has(filePath) || (callerImports && setSome(callerImports, imp => targetFiles2.has(imp)));
+                let importEdgeLink = !!(callerImports && setSome(callerImports, imp => targetFiles2.has(imp)));
                 // Check one level of re-exports (barrel files) for import evidence
-                if (!hasImportLink && callerImports) {
+                if (!importEdgeLink && callerImports) {
                     for (const imp of callerImports) {
                         const transImports = index.importGraph.get(imp);
                         if (transImports && setSome(transImports, ti => targetFiles2.has(ti))) {
-                            hasImportLink = true;
+                            importEdgeLink = true;
                             break;
                         }
                     }
                 }
+                // Same-file membership is module-scope evidence for plain calls,
+                // but says nothing about a method receiver: `foo.map()` sharing a
+                // file with `function map()` must not confirm while foo's type is
+                // unknown. Real import edges keep counting — importing the
+                // defining module is evidence the file uses its API.
+                const hasImportLink = importEdgeLink ||
+                    (targetFiles2.has(filePath) && !uncertainMethodReceiver);
 
                 // Same-package evidence (nominal type systems): Java/Rust/Go
                 // resolve same-package/module names without import statements,
@@ -736,13 +792,9 @@ function findCallers(index, name, options = {}) {
                         hasBindingId: !!bindingId,
                         resolvedBySameClass: !!resolvedBySameClass,
                         hasSamePackageEvidence,
-                        isUncertain: !!isUncertain || (
-                            // Method calls where binding resolution was skipped (non-self receiver)
-                            // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
-                            skipLocalBinding && call.isMethod && !resolvedBySameClass &&
-                            langTraits(fileEntry.language)?.typeSystem === 'structural' &&
-                            !(call.receiver && (fileEntry.bindings || []).some(b => b.name === call.receiver))
-                        ),
+                        // Method calls where binding resolution was skipped (non-self receiver)
+                        // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
+                        isUncertain: !!isUncertain || uncertainMethodReceiver,
                         hasReceiverType: !!call.receiverType,
                         hasReceiverEvidence: !!(call.receiver &&
                             (fileEntry.bindings || []).some(b => b.name === call.receiver)),

@@ -4546,3 +4546,131 @@ describe('fix: JSDoc nested-brace types truncated mid-brace', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #192: argument-position references and same-file method calls need evidence', () => {
+    // zod `codec` case: a bare identifier in argument position confirmed as a
+    // caller purely because SOME symbol with that name exists in the project —
+    // blind to import evidence and local shadowing. Function references now
+    // confirm only with same-file / same-package / import-edge evidence;
+    // otherwise they tier as unverified (visible, never silently dropped).
+
+    it('callback with import evidence stays confirmed; without it goes unverified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function transform(x) { return x * 2; }\nmodule.exports = { transform };',
+            'app.js': 'const { transform } = require("./lib");\nfunction run(items) { return items.map(transform); }\nmodule.exports = { run };',
+            'stray.js': 'function noimport(items) { return items.map(transform); }\nmodule.exports = { noimport };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'transform' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            const unverified = r.result.unverifiedCallers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'app.js'),
+                'imported callback must stay confirmed');
+            assert.ok(!confirmed.some(c => c.relativePath === 'stray.js'),
+                'no-import callback must not be confirmed');
+            assert.ok(unverified.some(c => (c.relativePath || c.file).includes('stray.js')),
+                'no-import callback must be visible in the unverified tier');
+        } finally { rm(dir); }
+    });
+
+    it('local variable shadowing the name in argument position is not confirmed (zod codec case)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schemas.js': 'function codec(a, b) { return [a, b]; }\nmodule.exports = { codec };',
+            'helper.test.js': [
+                'function stringToNumber() { return { decode: (x) => Number(x) }; }',
+                'function decode(c, v) { return c.decode(v); }',
+                'function testIt() {',
+                '  const codec = stringToNumber();',
+                '  return decode(codec, "42");',
+                '}',
+                'module.exports = { testIt };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'codec', includeTests: true });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.relativePath === 'helper.test.js'),
+                `shadowed argument-position reference must not confirm: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('same-file function reference stays confirmed', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function double(x) { return x * 2; }\nfunction all(items) { return items.map(double); }\nmodule.exports = { all };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'double' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(confirmed.some(c => c.relativePath === 'lib.js' && c.line === 2),
+                `same-file callback must stay confirmed: ${JSON.stringify(confirmed)}`);
+        } finally { rm(dir); }
+    });
+
+    it('reference importing a different same-name definition is excluded with reason', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function serialize(x) { return x; }\nmodule.exports = { serialize };',
+            'b.js': 'function serialize(x) { return x + 1; }\nmodule.exports = { serialize };',
+            'user_b.js': 'const { serialize } = require("./b");\nfunction useB(items) { return items.map(serialize); }\nmodule.exports = { useB };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.js:1:serialize' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            const unverified = r.result.unverifiedCallers || [];
+            assert.ok(!confirmed.some(c => c.relativePath === 'user_b.js'),
+                'b-importing reference must not confirm against a.js:serialize');
+            assert.ok(!unverified.some(c => (c.relativePath || c.file || '').includes('user_b')),
+                'positive mis-link evidence excludes (with reason), not unverified');
+            const account = r.result.meta.account;
+            assert.ok((account.excluded.byReason['other-definition-import']?.count || 0) > 0,
+                `exclusion must be accounted: ${JSON.stringify(account)}`);
+            assert.strictEqual(account.conserved, true, 'conservation must hold');
+        } finally { rm(dir); }
+    });
+
+    it('method call on unknown receiver does not confirm against a same-file function', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function map(fn) { return fn; }\nfunction useIt(checks) { return checks.map((c) => c(1)); }\nmodule.exports = { map, useIt };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'map', file: 'lib.js' });
+            assert.ok(r.ok, 'context should succeed');
+            const confirmed = r.result.callers || [];
+            assert.ok(!confirmed.some(c => c.line === 2),
+                `checks.map() must not be a confirmed caller of function map: ${JSON.stringify(confirmed)}`);
+            const unverified = r.result.unverifiedCallers || [];
+            assert.ok(unverified.some(c => c.line === 2),
+                'receiver-unknown same-file method call lands in the unverified tier');
+        } finally { rm(dir); }
+    });
+
+    it('account stays conserved when callback edges demote', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schemas.js': 'function codec(a, b) { return [a, b]; }\nmodule.exports = { codec };',
+            'usage.js': 'function wrap() { const codec = () => 1;\n  return [codec].map((f) => f); }\nfunction passes(reg) { reg.add(codec); }\nmodule.exports = { wrap, passes };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'codec', file: 'schemas.js' });
+            assert.ok(r.ok, 'context should succeed');
+            const account = r.result.meta.account;
+            assert.ok(account, 'account must be present');
+            assert.strictEqual(account.conserved, true,
+                `conservation must hold: ${JSON.stringify(account)}`);
+        } finally { rm(dir); }
+    });
+});

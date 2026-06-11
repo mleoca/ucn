@@ -7,8 +7,8 @@ lie the grep-reliability contract forbids. Target: 0.
 
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|
-| zod | ts-morph | 50 | 1861 | 63.6% | 29.0% | 0.3453 | **0** | 64.3% (14) | 100.0% |
-| preact-signals | ts-morph | 24 | 24 | 75.9% | 0.0% | 0.7586 | **0** | 0.0% (1) | 100.0% |
+| zod | ts-morph | 50 | 1861 | 98.7% | 28.7% | 0.7006 | **0** | 64.3% (14) | 100.0% |
+| preact-signals | ts-morph | 24 | 24 | 81.5% | 0.0% | 0.8148 | **0** | n/a (0) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -18,9 +18,9 @@ evidence confirms the file but not the receiver type.
 
 | repo | kind | sampled | oracle edges | tier1 precision | unverified precision | separation | placement |
 |---|---|---|---|---|---|---|---|
-| zod | function | 36 | 1655 | 49.7% (91/183) | 28.5% (1444/5059) | 0.2119 | {"confirmed":91,"unverified":1444,"reportedNonCall":102,"missingExplained":0,"missingBeyondText":18,"missingUnexplained":0} |
-| zod | method | 10 | 199 | 97.3% (73/75) | 36.1% (119/330) | 0.6127 | {"confirmed":73,"unverified":119,"reportedNonCall":7,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| zod | function | 36 | 1655 | 100.0% (91/91) | 28.0% (1444/5149) | 0.7196 | {"confirmed":91,"unverified":1444,"reportedNonCall":102,"missingExplained":0,"missingBeyondText":18,"missingUnexplained":0} |
+| zod | method | 10 | 199 | 97.0% (65/67) | 37.6% (127/338) | 0.5944 | {"confirmed":65,"unverified":127,"reportedNonCall":7,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | class | 4 | 7 | 0.0% (0/0) | 100.0% (3/3) | n/a | {"confirmed":0,"unverified":3,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| preact-signals | function | 13 | 17 | 70.8% (17/24) | 0.0% (0/435) | 0.7083 | {"confirmed":17,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| preact-signals | function | 13 | 17 | 77.3% (17/22) | 0.0% (0/437) | 0.7727 | {"confirmed":17,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | method | 10 | 5 | 100.0% (5/5) | 0.0% (0/57) | 1 | {"confirmed":5,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| preact-signals | class | 1 | 2 | 0.0% (0/0) | 0.0% (0/0) | n/a | {"confirmed":0,"unverified":0,"reportedNonCall":2,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| preact-signals | class | 1 | 2 | 0.0% (0/0) | 0.0% (0/2) | n/a | {"confirmed":0,"unverified":0,"reportedNonCall":2,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

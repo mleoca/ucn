@@ -94,17 +94,25 @@ function scoreEdge(evidence) {
         return { confidence: SCORES[RESOLUTION.RECEIVER_HINT], resolution: RESOLUTION.RECEIVER_HINT, evidence: reasons };
     }
 
+    // Function reference (callback / passed-as-argument). Argument position is
+    // only confirming when the name demonstrably reaches the target (same file,
+    // same package, or an import edge) — otherwise it's a bare name match: a
+    // local variable or an unrelated same-name symbol shadows it invisibly.
+    if (evidence.isFunctionReference) {
+        reasons.push('function reference');
+        if (evidence.hasImportEvidence || evidence.hasSamePackageEvidence) {
+            reasons.push(evidence.hasImportEvidence ? 'import-supported' : 'same package/module');
+            return { confidence: SCORES[RESOLUTION.SCOPE_MATCH], resolution: RESOLUTION.SCOPE_MATCH, evidence: reasons };
+        }
+        reasons.push('no import evidence');
+        return { confidence: SCORES[RESOLUTION.NAME_ONLY], resolution: RESOLUTION.NAME_ONLY, evidence: reasons };
+    }
+
     // Scope/import-supported match
     if (evidence.hasImportEvidence || evidence.hasReceiverEvidence || evidence.hasSamePackageEvidence) {
         if (evidence.hasImportEvidence) reasons.push('import-supported');
         if (evidence.hasReceiverEvidence) reasons.push('receiver binding in scope');
         if (evidence.hasSamePackageEvidence) reasons.push('same package/module');
-        return { confidence: SCORES[RESOLUTION.SCOPE_MATCH], resolution: RESOLUTION.SCOPE_MATCH, evidence: reasons };
-    }
-
-    // Function reference (callback)
-    if (evidence.isFunctionReference) {
-        reasons.push('function reference');
         return { confidence: SCORES[RESOLUTION.SCOPE_MATCH], resolution: RESOLUTION.SCOPE_MATCH, evidence: reasons };
     }
 
