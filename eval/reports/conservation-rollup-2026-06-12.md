@@ -7,13 +7,13 @@ grep-reliability contract eliminates).
 
 | repo | lang | files | sampled | conserved | gap symbols | gap lines | beyond-text | avg ms/account |
 |---|---|---|---|---|---|---|---|---|
-| zod | typescript | 287 | 24 | 100.0% | 0 | 0 | 30 | 46.3 |
-| preact-signals | typescript | 2 | 23 | 100.0% | 0 | 0 | 1 | 7.8 |
-| express | javascript | 150 | 24 | 100.0% | 0 | 0 | 0 | 19.5 |
-| httpx | python | 61 | 24 | 100.0% | 0 | 0 | 0 | 15.6 |
-| rich | python | 213 | 24 | 100.0% | 0 | 0 | 0 | 29.3 |
-| cobra | go | 36 | 24 | 100.0% | 0 | 0 | 0 | 11.6 |
-| grpc-go | go | 1037 | 24 | 100.0% | 0 | 0 | 0 | 311.6 |
-| ripgrep | rust | 100 | 24 | 100.0% | 0 | 0 | 0 | 34.5 |
-| cursive | rust | 187 | 24 | 100.0% | 1 | 1 | 0 | 21.5 |
-| gson | java | 210 | 24 | 100.0% | 0 | 0 | 0 | 20.9 |
+| zod | typescript | 287 | 24 | 100.0% | 0 | 0 | 30 | 45.8 |
+| preact-signals | typescript | 2 | 23 | 100.0% | 0 | 0 | 1 | 8.3 |
+| express | javascript | 150 | 24 | 100.0% | 0 | 0 | 0 | 19.3 |
+| httpx | python | 61 | 24 | 100.0% | 0 | 0 | 0 | 16.3 |
+| rich | python | 213 | 24 | 100.0% | 0 | 0 | 0 | 27.5 |
+| cobra | go | 36 | 24 | 100.0% | 0 | 0 | 0 | 12.8 |
+| grpc-go | go | 1037 | 24 | 100.0% | 0 | 0 | 0 | 283.7 |
+| ripgrep | rust | 100 | 24 | 100.0% | 0 | 0 | 0 | 30.5 |
+| cursive | rust | 187 | 24 | 100.0% | 1 | 1 | 0 | 21.3 |
+| gson | java | 210 | 24 | 100.0% | 0 | 0 | 0 | 16.5 |

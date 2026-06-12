@@ -34,6 +34,14 @@ function addSymbol(fileEntry, item, type) {
         docstring: item.docstring,
         bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,
     };
+    // Field set MUST mirror project.js addSymbol exactly — a worker-side drop
+    // silently strips the field from every parallel-built index (>500 files).
+    // The cache.test.js / perf-optimizations.test.js indexSnapshot guards
+    // compare full symbol shapes, but only for shapes present in their
+    // fixtures — keep this list in sync by hand when addSymbol grows.
+    if (item.paramTypes) symbol.paramTypes = item.paramTypes;
+    if (item.isAsync) symbol.isAsync = true;
+    if (item.isGenerator) symbol.isGenerator = true;
     if (item.generics) symbol.generics = item.generics;
     if (item.extends) symbol.extends = item.extends;
     if (item.implements) symbol.implements = item.implements;
@@ -44,9 +52,14 @@ function addSymbol(fileEntry, item, type) {
     if (item.className) symbol.className = item.className;
     if (item.memberType) symbol.memberType = item.memberType;
     if (item.fieldType) symbol.fieldType = item.fieldType;
+    if (item.aliasOf) symbol.aliasOf = item.aliasOf;
     if (item.decorators && item.decorators.length > 0) symbol.decorators = item.decorators;
+    if (item.decoratorsWithArgs && item.decoratorsWithArgs.length > 0) symbol.decoratorsWithArgs = item.decoratorsWithArgs;
+    if (item.annotationsWithArgs && item.annotationsWithArgs.length > 0) symbol.annotationsWithArgs = item.annotationsWithArgs;
+    if (item.attributesWithArgs && item.attributesWithArgs.length > 0) symbol.attributesWithArgs = item.attributesWithArgs;
     if (item.nameLine) symbol.nameLine = item.nameLine;
     if (item.traitImpl) symbol.traitImpl = true;
+    if (item.traitName) symbol.traitName = item.traitName;
     if (item.isSignature) symbol.isSignature = true;
 
     fileEntry.symbols.push(symbol);
@@ -159,7 +172,7 @@ function processFile(filePath) {
         addSymbol(fileEntry, cls, cls.type || 'class');
         if (cls.members) {
             for (const m of cls.members) {
-                addSymbol(fileEntry, { ...m, className: cls.name, ...(cls.traitName && { traitImpl: true }) }, m.memberType || 'method');
+                addSymbol(fileEntry, { ...m, className: cls.name, ...(cls.traitName && { traitImpl: true, traitName: cls.traitName }) }, m.memberType || 'method');
             }
         }
     }

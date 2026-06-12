@@ -32,7 +32,13 @@ const UCN_VERSION = require('../package.json').version;
 // commas and strip type-argument suffixes (fix #214 — `extends Base<string,
 // object>` produced parents ["Base<string", "object>"], so every generically
 // extended class had no usable ancestor edges).
-const CACHE_FORMAT_VERSION = 21; // v21: fileEntry.moduleAssignedNames (fix #217)
+// v21: fileEntry.moduleAssignedNames (fix #217)
+// v22 (fix #219): JS/TS member fieldType; receiverRoot/receiverField/
+// receiverRootType + receiverCall/receiverCallIsMethod/receiverCallAwaited on
+// JS/TS/Python calls; build-worker symbol-field parity (paramTypes, isAsync,
+// isGenerator, aliasOf, traitName, *WithArgs were silently dropped from
+// parallel-built indexes).
+const CACHE_FORMAT_VERSION = 22;
 
 /**
  * Save index to cache file

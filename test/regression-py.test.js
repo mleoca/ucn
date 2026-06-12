@@ -3266,3 +3266,74 @@ describe('fix #218: strict-ancestor same-class match routes possible-dispatch (P
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #219: chained-receiver return-type flow (Python side of the structural
+// family — the producer's declared return annotation types the receiver of
+// `fetch_data().json()`; async producers type only AWAITED chains)
+// ============================================================================
+
+describe('fix #219: chained-receiver return-type flow (Python)', () => {
+    const output = require('../core/output');
+    const FILES = {
+        'app.py': [
+            'class Response:',
+            '    def json(self):',
+            '        return {}',
+            '',
+            'class Codec:',
+            '    def json(self):',
+            '        return []',
+            '',
+            'def fetch_data() -> Response:',
+            '    return Response()',
+            '',
+            'def use():',
+            '    fetch_data().json()',
+            '',
+            'async def fetch_async() -> Response:',
+            '    return Response()',
+            '',
+            'def use_async():',
+            '    fetch_async().json()',
+        ].join('\n'),
+    };
+
+    function contextOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+            excluded: ((json.meta.account || {}).excluded || {}).byReason || {},
+        };
+    }
+
+    it('annotated producer confirms the returned class and excludes the sibling', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const resp = contextOf(index, 'app.py:2:json');
+            assert.ok(resp.confirmed.includes('app.py:13'),
+                `fetch_data() -> Response types the receiver: ${resp.confirmed}`);
+            const codec = contextOf(index, 'app.py:6:json');
+            assert.ok(!codec.confirmed.includes('app.py:13'),
+                `Response-typed chain is not a Codec.json caller: ${codec.confirmed}`);
+            assert.ok(codec.excluded['receiver-type-mismatch'],
+                `expected receiver-type-mismatch: ${JSON.stringify(codec.excluded)}`);
+        } finally { rm(dir); }
+    });
+
+    it('un-awaited async producer does NOT type (the value is a coroutine)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const resp = contextOf(index, 'app.py:2:json');
+            assert.ok(!resp.confirmed.includes('app.py:19'),
+                `fetch_async() un-awaited is a coroutine, not a Response: ${resp.confirmed}`);
+            assert.ok(resp.unverified.includes('app.py:19'),
+                `the async-chain edge stays VISIBLE: ${resp.unverified}`);
+        } finally { rm(dir); }
+    });
+});

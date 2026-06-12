@@ -1015,6 +1015,13 @@ function findCallsInCode(code, parser) {
                 if (attrNode) {
                     let receiver = objNode?.type === 'identifier' ? objNode.text : undefined;
                     let selfAttribute = undefined;
+                    // Chained receiver (fix #219): the receiver IS a call —
+                    // fetch_data().json() — record the producer so findCallers
+                    // can type the receiver from its declared return
+                    // annotation. `(await f()).m()` unwraps to the call and
+                    // marks awaited (an un-awaited async producer's value is a
+                    // coroutine, not the annotation's type).
+                    let receiverCall, receiverCallIsMethod, receiverCallAwaited;
 
                     // Detect super().method() pattern
                     if (objNode?.type === 'call') {
@@ -1022,6 +1029,27 @@ function findCallsInCode(code, parser) {
                         if (superFunc?.type === 'identifier' && superFunc.text === 'super') {
                             receiver = 'super';
                         }
+                    }
+                    {
+                        let recvNode = objNode;
+                        if (recvNode?.type === 'parenthesized_expression' &&
+                            recvNode.namedChild(0)?.type === 'await') {
+                            receiverCallAwaited = true;
+                            recvNode = recvNode.namedChild(0).namedChild(0);
+                        }
+                        if (recvNode?.type === 'call' && receiver !== 'super') {
+                            const prodFunc = recvNode.childForFieldName('function');
+                            if (prodFunc?.type === 'identifier') {
+                                receiverCall = prodFunc.text;
+                            } else if (prodFunc?.type === 'attribute') {
+                                const prodAttr = prodFunc.childForFieldName('attribute');
+                                if (prodAttr) {
+                                    receiverCall = prodAttr.text;
+                                    receiverCallIsMethod = true;
+                                }
+                            }
+                        }
+                        if (!receiverCall) receiverCallAwaited = undefined;
                     }
 
                     // Detect self.X.method() pattern: objNode is attribute access on self/cls
@@ -1057,6 +1085,9 @@ function findCallsInCode(code, parser) {
                         ...(receiverType && { receiverType }),
                         ...(receiverIsModule && { receiverIsModule: true }),
                         ...(selfAttribute && { selfAttribute }),
+                        ...(receiverCall && { receiverCall }),
+                        ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+                        ...(receiverCallAwaited && { receiverCallAwaited: true }),
                         ...(assignedTo && { assignedTo }),
                         argCount,
                         ...(argSpread && { argSpread: true }),

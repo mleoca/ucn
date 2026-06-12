@@ -846,11 +846,18 @@ function extractInterfaceMembers(interfaceNode, code) {
             const nameNode = child.childForFieldName('name');
             if (nameNode) {
                 const { startLine, endLine } = nodeToLocation(child, code);
+                // Declared property type (fix #219): raw annotation text —
+                // findCallers hops field receivers to it (this._map.has()),
+                // and function-typed properties ((arg) => T) count as
+                // callable owners in the dispatch tiering.
+                const typeNode = child.childForFieldName('type');
+                const fieldType = typeNode ? typeNode.text.replace(/^:\s*/, '').trim() : undefined;
                 members.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
-                    memberType: 'field'
+                    memberType: 'field',
+                    ...(fieldType && { fieldType })
                 });
             }
         }
@@ -1058,11 +1065,18 @@ function extractClassMembers(classNode, codeOrLines) {
                         ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                     });
                 } else {
+                    // Declared field type (fix #219): `_map: WeakMap<K,V> =
+                    // new WeakMap()` — the annotation is the compiler-true
+                    // contract for every receiver hop through this field.
+                    const fieldTypeNode = child.childForFieldName('type');
+                    const fieldType = fieldTypeNode
+                        ? fieldTypeNode.text.replace(/^:\s*/, '').trim() : undefined;
                     members.push({
                         name,
                         startLine,
                         endLine,
                         memberType: name.startsWith('#') ? 'private field' : 'field',
+                        ...(fieldType && { fieldType }),
                         ...(fieldDecorators.length > 0 && { decorators: fieldDecorators })
                         // Not a method - regular field
                     });
@@ -1722,6 +1736,53 @@ function findCallsInCode(code, parser) {
                                 receiver = objNode.text;
                             }
                         }
+                        // One-hop field receiver (fix #219 — #202's shape for
+                        // structural): this._map.has(x) / def.cache.get(k) —
+                        // receiverRoot/Field let findCallers hop to the
+                        // field's DECLARED type annotation. `this`-rooted hops
+                        // resolve their root type query-side (the enclosing
+                        // class); identifier roots type from local annotations.
+                        let receiverRoot, receiverFieldName, receiverRootType;
+                        if (!receiver && objNode && objNode.type === 'member_expression') {
+                            const rootNode = objNode.childForFieldName('object');
+                            const fldNode = objNode.childForFieldName('property');
+                            if (fldNode && rootNode &&
+                                (rootNode.type === 'identifier' || rootNode.type === 'this')) {
+                                receiverRoot = rootNode.text;
+                                receiverFieldName = fldNode.text;
+                                if (rootNode.type === 'identifier') {
+                                    receiverRootType = localVarTypes.get(rootNode.text);
+                                }
+                            }
+                        }
+                        // Chained receiver (fix #219): the receiver IS a call —
+                        // parseAsync(args).catch(...) — record the producer so
+                        // findCallers can type the receiver from its declared
+                        // return annotation (Promise<...> → Promise).
+                        let receiverCall, receiverCallIsMethod, receiverCallAwaited;
+                        {
+                            let recvNode = objNode;
+                            if (recvNode && recvNode.type === 'parenthesized_expression') {
+                                recvNode = recvNode.namedChild(0);
+                            }
+                            if (recvNode && recvNode.type === 'await_expression') {
+                                receiverCallAwaited = true;
+                                recvNode = recvNode.namedChild(0);
+                            }
+                            if (recvNode && recvNode.type === 'call_expression') {
+                                const prodFunc = recvNode.childForFieldName('function');
+                                if (prodFunc?.type === 'identifier') {
+                                    receiverCall = prodFunc.text;
+                                } else if (prodFunc?.type === 'member_expression') {
+                                    const prodProp = prodFunc.childForFieldName('property');
+                                    if (prodProp) {
+                                        receiverCall = prodProp.text;
+                                        receiverCallIsMethod = true;
+                                    }
+                                }
+                            }
+                            if (!receiverCall) receiverCallAwaited = undefined;
+                        }
                         // Literal receivers carry their builtin type: [].map() can
                         // never be a project class method
                         const receiverType = receiver
@@ -1745,6 +1806,11 @@ function findCallsInCode(code, parser) {
                             receiver,
                             ...(receiverType && { receiverType }),
                             ...(receiverIsModule && { receiverIsModule: true }),
+                            ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
+                            ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                            ...(receiverCall && { receiverCall }),
+                            ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+                            ...(receiverCallAwaited && { receiverCallAwaited: true }),
                             ...(assignedTo && { assignedTo }),
                             enclosingFunction,
                             uncertain,

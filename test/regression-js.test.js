@@ -5971,3 +5971,267 @@ describe('fix #218: export * as ns does not flatten into the parent surface', ()
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #219: structural declared-field receiver hop + chained-receiver flow +
+// function-typed field ownership (zod-seed-B-measured family C)
+// ============================================================================
+
+describe('fix #219: structural declared-field receiver hop (TS)', () => {
+    function contextOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+            excluded: ((json.meta.account || {}).excluded || {}).byReason || {},
+        };
+    }
+
+    it('this-rooted builtin field hop excludes (this._map.has vs single-owner has)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'registry.ts': [
+                'export class Registry {',
+                '  _map: WeakMap<object, string> = new WeakMap();',
+                '  has(schema: object): boolean {',
+                '    return this._map.has(schema);', // WeakMap.has, NOT Registry.has
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'registry.ts:3:has');
+            assert.ok(!ctx.confirmed.includes('registry.ts:4'),
+                `WeakMap-typed field receiver must not confirm: ${ctx.confirmed}`);
+            assert.ok(ctx.excluded['receiver-type-mismatch'],
+                `expected receiver-type-mismatch exclusion: ${JSON.stringify(ctx.excluded)}`);
+        } finally { rm(dir); }
+    });
+
+    it('identifier-rooted field hop excludes through a param-typed root', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'defs.ts': [
+                'export class Bag {',
+                '  cache: Map<string, number> = new Map();',
+                '}',
+            ].join('\n'),
+            'svc.ts': [
+                "import { Bag } from './defs';",
+                'export class Store {',
+                '  get(k: string): number { return 1; }',
+                '}',
+                'export function lookup(bag: Bag) {',
+                "  return bag.cache.get('k');", // Map.get, NOT Store.get
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'svc.ts:3:get');
+            assert.ok(!ctx.confirmed.includes('svc.ts:6'),
+                `Map-typed field receiver must not confirm: ${ctx.confirmed}`);
+            assert.ok(ctx.excluded['receiver-type-mismatch'],
+                `expected receiver-type-mismatch exclusion: ${JSON.stringify(ctx.excluded)}`);
+        } finally { rm(dir); }
+    });
+
+    it('field typed as the TARGET class confirms (this.svc.run)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': [
+                'export class Service {',
+                '  run(): void {}',
+                '}',
+                'export class Holder {',
+                '  svc: Service = new Service();',
+                '  go() { this.svc.run(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'svc.ts:2:run');
+            assert.ok(ctx.confirmed.includes('svc.ts:6'),
+                `Service-typed field receiver is a TRUE caller: ${ctx.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('interface-typed field attributes dispatch, never excludes', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': [
+                'export interface Runner {',
+                '  run(): void;',
+                '}',
+                'export class FastRunner {',
+                '  run(): void {}',
+                '}',
+                'export class SlowRunner {',
+                '  run(): void {}',
+                '}',
+                'export class Holder {',
+                '  r: Runner;',
+                '  go() { this.r.run(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'svc.ts:5:run');
+            assert.ok(!ctx.confirmed.includes('svc.ts:12'),
+                `interface-typed field is not identity evidence: ${ctx.confirmed}`);
+            assert.ok(ctx.unverified.includes('svc.ts:12'),
+                `dispatch through Runner stays VISIBLE: ${ctx.unverified}`);
+            assert.ok(!ctx.excluded['receiver-type-mismatch'],
+                `interface fields never exclude: ${JSON.stringify(ctx.excluded)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #219: chained-receiver return-type flow (TS)', () => {
+    function contextOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+            excluded: ((json.meta.account || {}).excluded || {}).byReason || {},
+        };
+    }
+
+    it('Promise-returning producer excludes a project method (.parseAsync().catch)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'types.ts': [
+                'export class Schema {',
+                '  parseAsync(data: unknown): Promise<string> { return Promise.resolve(""); }',
+                '  catch(def: string): Schema { return this; }',
+                '}',
+                'export function guard(s: Schema) {',
+                '  s.parseAsync(1).catch((e) => { throw e; });', // Promise.catch
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'types.ts:3:catch');
+            assert.ok(!ctx.confirmed.includes('types.ts:6'),
+                `Promise.catch must not confirm against Schema.catch: ${ctx.confirmed}`);
+            assert.ok(ctx.excluded['receiver-type-mismatch'],
+                `expected receiver-type-mismatch exclusion: ${JSON.stringify(ctx.excluded)}`);
+        } finally { rm(dir); }
+    });
+
+    it('unique plain producer types and confirms (makeService().run())', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': [
+                'export class Service {',
+                '  run(): void {}',
+                '}',
+                'export function makeService(): Service { return new Service(); }',
+                'export function boot() { makeService().run(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'svc.ts:2:run');
+            assert.ok(ctx.confirmed.includes('svc.ts:5'),
+                `Service-returning chain is a TRUE caller: ${ctx.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('disagreeing method producers do not type the receiver', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'mix.ts': [
+                'export class A {',
+                '  load(): Promise<string> { return Promise.resolve(""); }',
+                '}',
+                'export class B {',
+                '  load(): string { return ""; }',
+                '}',
+                'export class C {',
+                '  catch(d: string): C { return this; }',
+                '}',
+                'export function use(x: any) {',
+                '  x.load().catch(noop);', // producers disagree → untyped → visible
+                '}',
+                'function noop() {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'mix.ts:8:catch');
+            assert.ok(!ctx.excluded['receiver-type-mismatch'],
+                `disagreeing producers carry no exclusion evidence: ${JSON.stringify(ctx.excluded)}`);
+            assert.ok(ctx.unverified.includes('mix.ts:11') || ctx.confirmed.includes('mix.ts:11'),
+                'the edge must stay accounted (visible)');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #219: function-typed fields are callable owners (TS)', () => {
+    // The measured zod shape: the receiver variable's NAME matches a field
+    // symbol in the file (`effect: Effect<any>` in ZodEffectsDef), so the
+    // receiver counts as binding-evidenced and the single-owner rule decides
+    // the tier — exactly where the function-typed property must add owner #2.
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'types.ts': [
+            'export class Schema {',
+            '  transform(fn: (a: string) => string): Schema { return this; }',
+            '  describe(text: string): Schema { return this; }',
+            '}',
+            'export interface EffectDef {',
+            '  effect: TransformDef;',
+            '}',
+            'export interface TransformDef {',
+            '  transform: (arg: string) => string;', // callable property — owner #2
+            '  describe: string;',                   // plain property — NOT an owner
+            '}',
+            'export function apply(input: any) {',
+            '  const effect = input.def.effect || null;',
+            "  effect.transform('x');",
+            "  effect.describe('y');",
+            '}',
+        ].join('\n'),
+    };
+
+    function contextOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    it('effect.transform routes visible when an interface declares transform as a callable property', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'types.ts:2:transform');
+            assert.ok(!ctx.confirmed.includes('types.ts:14'),
+                `untyped receiver vs two owners must not confirm: ${ctx.confirmed}`);
+            assert.ok(ctx.unverified.includes('types.ts:14'),
+                `the edge stays VISIBLE method-ambiguous: ${ctx.unverified}`);
+        } finally { rm(dir); }
+    });
+
+    it('plain-typed interface properties do NOT add owners (single method owner still confirms)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'types.ts:3:describe');
+            assert.ok(ctx.confirmed.includes('types.ts:15'),
+                `single-owner rule unchanged for non-callable properties: ${ctx.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

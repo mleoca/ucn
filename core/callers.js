@@ -185,7 +185,20 @@ function findCallers(index, name, options = {}) {
         if (!_methodOwnerKeys) {
             _methodOwnerKeys = new Set();
             for (const d of definitions) {
-                if (NON_CALLABLE_TYPES.has(d.type)) continue;
+                if (NON_CALLABLE_TYPES.has(d.type)) {
+                    // Function-typed FIELDS are callable owners (fix #219):
+                    // `effect.transform(...)` may be ZodType.transform OR the
+                    // $ZodTransformDef.transform property — single-method-owner
+                    // confirmation is a lie when an interface declares the same
+                    // name as a callable property. Structural only: Java/Rust
+                    // cannot call a field by name (obj.f() is always a method
+                    // there); Go CAN (func fields) but no measured Go board
+                    // carries the family — deferred until measured.
+                    if (d.type === 'field' && d.className && _callableFieldDef(index, d)) {
+                        _methodOwnerKeys.add(d.className);
+                    }
+                    continue;
+                }
                 const o = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
                 if (o) _methodOwnerKeys.add(o);
             }
@@ -408,6 +421,23 @@ function findCallers(index, name, options = {}) {
                         call = { ...call, receiverType: flowEntry.type,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
                     }
+                }
+
+                // Chained-receiver typing (fix #219): the receiver IS a call —
+                // `me._def.args.parseAsync(args, params).catch(...)` — so the
+                // producer's DECLARED return annotation types it (Promise →
+                // builtin → exclusion-grade under the trust gate; the target's
+                // own class validates; anything else attributes dispatch).
+                // Method producers must AGREE project-wide (the #207
+                // discipline); plain producers follow #199's unique-def rule.
+                // Structural only: nominal parsers don't capture receiverCall —
+                // their chained calls stay under the #204 dispatch tiering
+                // (visible, honest) until a measured family justifies the
+                // #207 origin-pinning rails there.
+                if (call.isMethod && !call.receiver && !call.receiverType && call.receiverCall &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    const chainedType = _chainedReceiverType(index, call, fileEntry.language);
+                    if (chainedType) call = { ...call, receiverType: chainedType };
                 }
 
                 // For potential callbacks (function passed as arg), validate against symbol table
@@ -886,17 +916,28 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
-                // Declared-field receiver typing (fix #202): one-hop field
-                // receivers (self.dent.path() / h.inner.Run() /
-                // this.service.execute()) resolve through the field's DECLARED
-                // type. Computed before binding checks — name-bindings don't
-                // model receivers, so a same-file `path` binding must not
-                // claim a call whose receiver field is typed elsewhere.
+                // Declared-field receiver typing (fix #202, extended to
+                // structural by fix #219): one-hop field receivers
+                // (self.dent.path() / h.inner.Run() / this._map.has()) resolve
+                // through the field's DECLARED type. Computed before binding
+                // checks — name-bindings don't model receivers, so a same-file
+                // `path` binding must not claim a call whose receiver field is
+                // typed elsewhere. JS/TS `this`-rooted hops resolve their root
+                // type here (the enclosing class — the parser's walk does not
+                // track class context; arrows keep lexical `this`, and nested
+                // function declarations are their own symbols WITHOUT
+                // className, so dynamic-this shapes resolve to nothing).
                 let fieldHopType = null;
-                if (call.isMethod && !call.receiverType && call.receiverField && call.receiverRootType &&
+                let fieldHopRootType = call.receiverRootType;
+                if (!fieldHopRootType && call.receiverField && call.receiverRoot === 'this' &&
                     !resolvedBySameClass &&
-                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
-                    fieldHopType = _declaredFieldType(index, call.receiverRootType, call.receiverField, fileEntry.language);
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    const hopEnclosing = index.findEnclosingFunction(filePath, call.line, true);
+                    if (hopEnclosing?.className) fieldHopRootType = hopEnclosing.className;
+                }
+                if (call.isMethod && !call.receiverType && call.receiverField && fieldHopRootType &&
+                    !resolvedBySameClass) {
+                    fieldHopType = _declaredFieldType(index, fieldHopRootType, call.receiverField, fileEntry.language);
                 }
                 // Dispatch attribution (contract surface only): a field DECLARED
                 // as a project interface/trait carries no exclusion evidence
@@ -906,10 +947,9 @@ function findCallers(index, name, options = {}) {
                 // edge: "possible-dispatch via <Interface> — 1 of N impls".
                 let fieldDispatchType = null;
                 if (collectAccount && fieldHopType === null &&
-                    call.isMethod && !call.receiverType && call.receiverField && call.receiverRootType &&
-                    !resolvedBySameClass &&
-                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
-                    fieldDispatchType = _declaredFieldInterfaceType(index, call.receiverRootType, call.receiverField, fileEntry.language);
+                    call.isMethod && !call.receiverType && call.receiverField && fieldHopRootType &&
+                    !resolvedBySameClass) {
+                    fieldDispatchType = _declaredFieldInterfaceType(index, fieldHopRootType, call.receiverField, fileEntry.language);
                 }
 
                 // Skip uncertain calls unless resolved by same-class matching or explicitly requested
@@ -1767,15 +1807,17 @@ function findCallers(index, name, options = {}) {
                             continue;
                         }
                         if (!typeQualifiedReceiver && methodOwnerKeys().size > 1) {
-                            if (call.receiverType) {
+                            const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
+                            if (knownDispatchType) {
                                 // Known-but-unvalidated type (supertype of the
                                 // target — dynamic dispatch — or an alias/
-                                // interface name UCN can't validate): a
+                                // interface name UCN can't validate, or a
+                                // declared-field hop type, fix #219): a
                                 // possible dispatch edge, attributed via the
                                 // receiver's declared type (#204 physics).
                                 routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
-                                    dispatchVia: call.receiverType,
-                                    dispatchCandidates: countDispatchCandidates(call.receiverType),
+                                    dispatchVia: knownDispatchType,
+                                    dispatchCandidates: countDispatchCandidates(knownDispatchType),
                                 });
                             } else {
                                 routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
@@ -3133,6 +3175,7 @@ function _qualifiedProducerDefs(index, fileEntry, receiver, defs) {
 const BUILTIN_RECEIVER_TYPES = new Set([
     'dict', 'list', 'set', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset',
     'Array', 'String', 'Object', 'RegExp', 'Number', 'Boolean', 'Map', 'Set', 'Promise',
+    'WeakMap', 'WeakSet',
     'string', 'number', 'boolean', 'bigint', 'symbol',
 ]);
 
@@ -3462,8 +3505,10 @@ function _shareProjectDescendant(index, className, targetClasses) {
 function _declaredFieldType(index, rootType, fieldName, language) {
     const defs = index.symbols.get(fieldName);
     if (!defs) return null;
+    // 'private field' (JS #-fields, fix #219): equally compiler-true, and
+    // safer — nothing outside the class can rebind them.
     const fields = defs.filter(d =>
-        (d.type === 'field' || d.memberType === 'field') &&
+        (d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') &&
         d.className === rootType && d.fieldType);
     if (fields.length === 0) return null;
     const normalized = new Set();
@@ -3962,7 +4007,125 @@ function _normalizeFieldTypeName(raw, language) {
         if (!m) return null;
         return m[1].split('.').pop();
     }
+    if (langTraits(language)?.typeSystem === 'structural') {
+        // JS/TS/Python (fix #219): compiler-true annotation heads, value-
+        // position semantics — a field declared Promise<X> HOLDS a Promise.
+        return _structuralTypeHead(t);
+    }
     return null;
+}
+
+// typing-module aliases for builtin containers — normalized to the runtime
+// type so BUILTIN_RECEIVER_TYPES and the trust gate see one name.
+const _PY_TYPING_BUILTINS = {
+    Dict: 'dict', List: 'list', Set: 'set', Tuple: 'tuple',
+    FrozenSet: 'frozenset', Text: 'str',
+};
+
+/**
+ * Single concrete type name from a STRUCTURAL annotation in value position
+ * (fix #219): field declarations and chained-receiver producer returns.
+ * Unlike _typeNameFromReturnAnnotation, Promise/Awaitable are NOT unwrapped
+ * by default — the value IS the promise (`parseAsync(...).catch` dispatches
+ * on Promise). opts.unwrapAsync handles `(await f()).m()`: TS annotations
+ * unwrap their Promise/Awaitable head; a Python async producer's annotation
+ * already names the awaited value, so it passes through unchanged.
+ * Conservative: unions of two real types, function types, object literals,
+ * and tuples return null — a wrong head would exclude true callers.
+ */
+function _structuralTypeHead(text, opts = {}) {
+    if (!text || typeof text !== 'string') return null;
+    let t = text.trim().replace(/^readonly\s+/, '').replace(/^["']|["']$/g, '').trim();
+    if (t.includes('|')) {
+        const parts = t.split('|').map(s => s.trim())
+            .filter(s => s && !['None', 'null', 'undefined'].includes(s));
+        if (parts.length !== 1) return null;
+        t = parts[0];
+    }
+    let m;
+    // type-transparent wrappers (the value's runtime type is the argument)
+    while ((m = t.match(/^(?:typing\.)?(Optional|Annotated|Final)\s*[[<]\s*(.+)\s*[\]>]$/s))) {
+        t = (_splitTopLevelGenericArgs(m[2])[0] || '').trim(); // Annotated[X, meta] → X
+    }
+    if (opts.unwrapAsync) {
+        m = t.match(/^(?:typing\.)?(Promise|Awaitable|Coroutine)\s*[[<]\s*(.*)\s*[\]>]$/s);
+        if (m) {
+            const args = _splitTopLevelGenericArgs(m[2]).map(s => s.trim());
+            // Coroutine[Y, S, R] resolves to its RETURN (last) argument
+            t = (m[1] === 'Coroutine' ? args[args.length - 1] : args[0]) || '';
+        }
+    }
+    if (/\[\]$/.test(t)) return 'Array'; // TS Foo[] — the value is an array
+    m = t.match(/^([\w$.]+)\s*[[<]/s);   // generic head: Foo<...> / dict[...]
+    if (m) t = m[1];
+    const last = t.split('.').pop();
+    if (!/^[A-Za-z_$][\w$]*$/.test(last)) return null; // fn types, object literals, tuples
+    return _PY_TYPING_BUILTINS[last] || last;
+}
+
+// Structural annotation heads that carry no receiver identity: TS escape
+// hatches, the receiver-polymorphic `this`/`Self`, and Python's object root.
+const _STRUCTURAL_FLOW_REJECT = new Set([
+    'any', 'unknown', 'object', 'void', 'never', 'undefined', 'null',
+    'this', 'Self', 'Object', 'None',
+]);
+
+/**
+ * Type a chained receiver from its producer's declared return annotation
+ * (fix #219): `parseAsync(args).catch(...)` — the receiver of .catch IS the
+ * parseAsync(...) call, so its return annotation is compiler-true receiver
+ * evidence. Method producers follow the #207 agreement discipline: EVERY
+ * same-name method def project-wide must carry a return annotation and all
+ * heads must agree (whichever class the producer dispatches to, the type is
+ * the same). Plain producers follow #199's unique-project-def rule. Python
+ * async producers type only AWAITED chains — the bare value is a coroutine,
+ * not the annotation's type (TS annotations already SAY Promise, so they
+ * type either way).
+ */
+function _chainedReceiverType(index, call, language) {
+    const defs = (index.symbols.get(call.receiverCall) || [])
+        .filter(d => !NON_CALLABLE_TYPES.has(d.type));
+    let producers;
+    if (call.receiverCallIsMethod) {
+        producers = defs.filter(d => d.className);
+        if (producers.length === 0) return null;
+        if (!producers.every(d => d.returnType)) return null;
+    } else {
+        if (defs.length !== 1 || !defs[0].returnType) return null;
+        producers = defs;
+    }
+    if (language === 'python' && !call.receiverCallAwaited &&
+        producers.some(d => d.isAsync)) return null;
+    const heads = new Set();
+    for (const d of producers) {
+        const h = _structuralTypeHead(d.returnType, { unwrapAsync: call.receiverCallAwaited });
+        if (!h) return null;
+        heads.add(h);
+        if (heads.size > 1) return null;
+    }
+    const head = [...heads][0];
+    if (/^[A-Z][A-Z0-9]?$/.test(head)) return null; // generic type param (T, K, V1)
+    if (_STRUCTURAL_FLOW_REJECT.has(head)) return null;
+    return head;
+}
+
+/**
+ * Is this field symbol callable by its own name (obj.f(...) reaches the
+ * field's function value)? Arrow-function class fields are callable by
+ * construction; annotation-typed fields qualify via a function-type shape.
+ * Structural languages only — Java needs .apply()/.run() on a functional
+ * field and Rust needs (s.f)(…) parens, so their fields never own a
+ * method-call name; Go func fields DO but stay under the existing owner
+ * rules until a measured family justifies the churn.
+ */
+function _callableFieldDef(index, d) {
+    const lang = index.files.get(d.file)?.language;
+    if (langTraits(lang)?.typeSystem !== 'structural') return false;
+    if (d.isMethod) return true; // arrow-function class fields
+    if (!d.fieldType) return false;
+    return /=>/.test(d.fieldType) ||
+        /^(?:typing\.)?Callable\b/.test(d.fieldType.trim()) ||
+        /^Function\b/.test(d.fieldType.trim());
 }
 
 function _buildTypedLocalTypeMap(index, def, calls) {

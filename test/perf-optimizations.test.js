@@ -1059,6 +1059,36 @@ describe('index reliability: parallel build equals sequential build', () => {
                 `module.exports = { fn${i}, C${i} };`,
             ].join('\n');
         }
+        // Shapes whose symbol fields the worker once silently dropped (fix
+        // #219 found aliasOf/isAsync/isGenerator/paramTypes/traitName/
+        // *WithArgs missing from build-worker's addSymbol): the snapshot
+        // guard only catches a drop when the fixture PRODUCES the field.
+        spec['rich0.ts'] = [
+            'export type AliasT = BaseT;',
+            'export class BaseT {',
+            '  cache: Map<string, number> = new Map();',
+            '  handler: (x: number) => string;',
+            '  async load(p: string): Promise<number> { return 1; }',
+            '  *gen(): Iterable<number> { yield 1; }',
+            '}',
+            'export function typedFn(a: string, b: number): boolean { return !!a && b > 0; }',
+        ].join('\n');
+        spec['rich1.py'] = [
+            'from flask import Flask',
+            'app = Flask(__name__)',
+            '@app.route("/things")',
+            'def list_things():',
+            '    return []',
+            'async def fetch_thing(name: str) -> dict:',
+            '    return {}',
+        ].join('\n');
+        spec['rich2.rs'] = [
+            'pub trait Greet { fn hello(&self) -> String; }',
+            'pub struct Greeter;',
+            'impl Greet for Greeter {',
+            '    fn hello(&self) -> String { String::from("hi") }',
+            '}',
+        ].join('\n');
         const dir = tmp(spec);
         try {
             const seq = new ProjectIndex(dir);
