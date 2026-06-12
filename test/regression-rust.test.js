@@ -2026,3 +2026,99 @@ impl StandardImpl {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #204: possible-dispatch tiering (Rust)
+// ============================================================================
+
+describe('fix #204: possible-dispatch tiering (Rust)', () => {
+    const FILES = {
+        'lib.rs': `pub trait Haystack {
+    fn path(&self) -> String;
+}
+
+pub struct FileHaystack {
+    name: String,
+}
+
+impl Haystack for FileHaystack {
+    fn path(&self) -> String {
+        self.name.clone()
+    }
+}
+
+pub struct MemHaystack {}
+
+impl Haystack for MemHaystack {
+    fn path(&self) -> String {
+        String::from("mem")
+    }
+}
+
+pub struct Searcher {
+    target: Box<dyn Haystack>,
+    direct: FileHaystack,
+}
+
+impl Searcher {
+    pub fn search(&self) -> String {
+        self.target.path()
+    }
+    pub fn search_direct(&self) -> String {
+        self.direct.path()
+    }
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason,
+                dispatchVia: c.dispatchVia, dispatchCandidates: c.dispatchCandidates,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('Box<dyn Trait> field routes to possible-dispatch against a pinned impl', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.rs:10:path');
+            assert.ok(!res.confirmed.includes('lib.rs:30'),
+                `self.target.path() through dyn Haystack is not evidence for FileHaystack's impl: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'lib.rs:30');
+            assert.ok(entry, `dyn-trait dispatch stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Haystack');
+            assert.strictEqual(entry.dispatchCandidates, 2);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('concrete field typed as the pinned impl stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.rs:10:path');
+            assert.ok(res.confirmed.includes('lib.rs:33'),
+                `self.direct.path() with direct: FileHaystack confirms the impl: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('dyn-trait field confirms when the trait declaration itself is pinned', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.rs:2:path');
+            assert.ok(res.confirmed.includes('lib.rs:30'),
+                `self.target.path() with target: Box<dyn Haystack> references Haystack::path: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

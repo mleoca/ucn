@@ -1102,6 +1102,8 @@ function impact(index, name, options = {}) {
             resolution: u.resolution,
             tier: 'unverified',
             ...(u.reason && { reason: u.reason }),
+            ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
+            ...(u.dispatchCandidates != null && { dispatchCandidates: u.dispatchCandidates }),
         });
     }
     unverifiedSites.sort((a, b) => {
@@ -1467,6 +1469,8 @@ function about(index, name, options = {}) {
                 confidence: c.confidence,
                 resolution: c.resolution,
                 ...(c.reason && { reason: c.reason }),
+                ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
+                ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
             })),
         };
 

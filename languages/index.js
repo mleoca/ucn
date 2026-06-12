@@ -21,6 +21,7 @@ const STRUCTURAL_TRAITS = {
     exportVisibility: 'keyword',
     hasDynamicImports: true,
     testDirs: [],
+    allMethodsVirtual: false,
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
@@ -30,6 +31,11 @@ const NOMINAL_TRAITS = {
     exportVisibility: 'keyword',
     hasDynamicImports: true,
     testDirs: [],
+    // Whether ANY instance method call can dynamically dispatch to a subtype
+    // override (Java: all instance methods are virtual). Go struct method
+    // sets and Rust inherent methods bind statically — only interface/trait
+    // receivers dispatch there, which is detected per-type, not per-language.
+    allMethodsVirtual: false,
 };
 
 // Language configurations
@@ -125,6 +131,7 @@ const LANGUAGES = {
         traits: {
             ...NOMINAL_TRAITS,
             selfParam: ['this'],
+            allMethodsVirtual: true,
             testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],
         },
     },

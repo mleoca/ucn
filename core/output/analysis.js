@@ -4,7 +4,7 @@
 const fs = require('fs');
 const path = require('path');
 const { langTraits } = require('../../languages');
-const { dynamicImportsNote, formatGitLine } = require('./shared');
+const { dynamicImportsNote, formatGitLine, unverifiedReasonLabel } = require('./shared');
 
 /**
  * One short sentence (~80 chars) of a docstring, suitable for inline display
@@ -188,6 +188,8 @@ function formatContextJson(context) {
                     callerName: c.callerName ?? null,
                     tier: 'unverified',
                     ...(c.reason && { reason: c.reason }),
+                    ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
+                    ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                 })),
                 ...(context.warnings && { warnings: context.warnings })
             }
@@ -227,6 +229,8 @@ function formatContextJson(context) {
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
                 tier: 'unverified',
                 ...(c.reason && { reason: c.reason }),
+                ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
+                ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
             })),
             callees: callees.map(c => ({
                 name: c.name,
@@ -429,7 +433,7 @@ function formatContext(ctx, options = {}) {
         for (const u of unverified) {
             if (shown >= cap) break;
             const callerName = u.callerName ? ` [${u.callerName}]` : '';
-            const reason = u.reason ? ` (${u.reason})` : '';
+            const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
             const expr = u.content ? `: ${u.content.trim().replace(/\s+/g, ' ').slice(0, 100)}` : '';
             lines.push(`  [${itemNum}] ${u.relativePath}:${u.line}${callerName}${expr}${reason}`);
             expandable.push({
@@ -596,7 +600,7 @@ function formatImpact(impact, options = {}) {
         const cap = 10;
         for (const site of impactUnverified.slice(0, cap)) {
             const caller = site.callerName ? ` [${site.callerName}]` : '';
-            const reason = site.reason ? ` (${site.reason})` : '';
+            const reason = site.reason ? ` (${unverifiedReasonLabel(site)})` : '';
             const expr = site.expression ? `: ${site.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
             lines.push(`  ${site.file}:${site.line}${caller}${expr}${reason}`);
         }
@@ -733,7 +737,7 @@ function formatAbout(about, options = {}) {
         lines.push(`CALLERS — UNVERIFIED (${aboutUnverified.total}) — call syntax, no binding/receiver evidence:`);
         for (const u of aboutUnverified.top) {
             const caller = u.callerName ? ` [${u.callerName}]` : '';
-            const reason = u.reason ? ` (${u.reason})` : '';
+            const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
             const expr = u.expression ? `: ${u.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
             lines.push(`  ${u.file}:${u.line}${caller}${expr}${reason}`);
         }

@@ -306,9 +306,30 @@ function formatGitLine(git) {
     return line;
 }
 
+/**
+ * Display label for an unverified-tier entry's reason. Dispatch-tiered
+ * entries (nominal languages) carry attribution metadata: the declared
+ * supertype the call dispatches through (dispatchVia) and how many
+ * same-name definitions the dispatch could land on (dispatchCandidates).
+ */
+function unverifiedReasonLabel(entry) {
+    if (!entry || !entry.reason) return '';
+    if (entry.reason === 'possible-dispatch' && entry.dispatchVia) {
+        const n = entry.dispatchCandidates;
+        return n > 1
+            ? `possible-dispatch via ${entry.dispatchVia} — 1 of ${n} implementations`
+            : `possible-dispatch via ${entry.dispatchVia}`;
+    }
+    if (entry.reason === 'method-ambiguous' && entry.dispatchCandidates > 1) {
+        return `method-ambiguous — ${entry.dispatchCandidates} same-name definitions`;
+    }
+    return entry.reason;
+}
+
 module.exports = {
     dynamicImportsNote,
     formatFileError,
+    unverifiedReasonLabel,
     normalizeParams,
     lineNum,
     lineRange,

@@ -9,22 +9,26 @@
 
 // Resolution types ordered from most to least confident
 const RESOLUTION = {
-    EXACT_BINDING:  'exact-binding',
-    SAME_CLASS:     'same-class',
-    RECEIVER_HINT:  'receiver-hint',
-    SCOPE_MATCH:    'scope-match',
-    NAME_ONLY:      'name-only',
-    UNCERTAIN:      'uncertain',
+    EXACT_BINDING:    'exact-binding',
+    SAME_CLASS:       'same-class',
+    RECEIVER_HINT:    'receiver-hint',
+    SCOPE_MATCH:      'scope-match',
+    POSSIBLE_DISPATCH: 'possible-dispatch',
+    NAME_ONLY:        'name-only',
+    METHOD_AMBIGUOUS: 'method-ambiguous',
+    UNCERTAIN:        'uncertain',
 };
 
 // Seed scores per resolution type (tunable)
 const SCORES = {
-    [RESOLUTION.EXACT_BINDING]:  0.98,
-    [RESOLUTION.SAME_CLASS]:     0.92,
-    [RESOLUTION.RECEIVER_HINT]:  0.80,
-    [RESOLUTION.SCOPE_MATCH]:    0.65,
-    [RESOLUTION.NAME_ONLY]:      0.40,
-    [RESOLUTION.UNCERTAIN]:      0.25,
+    [RESOLUTION.EXACT_BINDING]:    0.98,
+    [RESOLUTION.SAME_CLASS]:       0.92,
+    [RESOLUTION.RECEIVER_HINT]:    0.80,
+    [RESOLUTION.SCOPE_MATCH]:      0.65,
+    [RESOLUTION.POSSIBLE_DISPATCH]: 0.50,
+    [RESOLUTION.NAME_ONLY]:        0.40,
+    [RESOLUTION.METHOD_AMBIGUOUS]: 0.35,
+    [RESOLUTION.UNCERTAIN]:        0.25,
 };
 
 // Trust tiers for the grep-reliability contract. CONFIRMED = the resolution
@@ -40,7 +44,13 @@ const RESOLUTION_TIER = {
     // scope-match is only assigned with import/receiver/callback evidence
     // (see scoreEdge below) — that satisfies the contract's evidence clause.
     [RESOLUTION.SCOPE_MATCH]:   TIER.CONFIRMED,
+    // Nominal dispatch tiering: a call that CAN reach the target through
+    // virtual dispatch (interface/supertype-typed receiver) or whose untyped
+    // receiver faces multiple same-name owners is evidence a call happens —
+    // not evidence it reaches THIS definition. Unverified by construction.
+    [RESOLUTION.POSSIBLE_DISPATCH]: TIER.UNVERIFIED,
     [RESOLUTION.NAME_ONLY]:     TIER.UNVERIFIED,
+    [RESOLUTION.METHOD_AMBIGUOUS]: TIER.UNVERIFIED,
     [RESOLUTION.UNCERTAIN]:     TIER.UNVERIFIED,
 };
 
@@ -72,6 +82,17 @@ function scoreEdge(evidence) {
     if (evidence.typeMismatch) {
         reasons.push('receiver type mismatch');
         return { confidence: SCORES[RESOLUTION.UNCERTAIN], resolution: RESOLUTION.UNCERTAIN, evidence: reasons };
+    }
+
+    // Nominal dispatch tiering (contract surface only — callers.js sets these
+    // flags exclusively under collectAccount, so legacy paths never see them).
+    if (evidence.possibleDispatch) {
+        reasons.push('interface/supertype dispatch');
+        return { confidence: SCORES[RESOLUTION.POSSIBLE_DISPATCH], resolution: RESOLUTION.POSSIBLE_DISPATCH, evidence: reasons };
+    }
+    if (evidence.methodAmbiguous) {
+        reasons.push('untyped receiver, multiple same-name definitions');
+        return { confidence: SCORES[RESOLUTION.METHOD_AMBIGUOUS], resolution: RESOLUTION.METHOD_AMBIGUOUS, evidence: reasons };
     }
 
     // Exact binding match (highest confidence)

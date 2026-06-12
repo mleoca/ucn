@@ -4396,6 +4396,9 @@ func (h *Holder) Fmt() string {
         const json = JSON.parse(output.formatContextJson(r.result));
         return {
             confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason, dispatchVia: c.dispatchVia,
+            })),
             excluded: json.meta.account?.excluded,
             conserved: json.meta.account?.conserved,
         };
@@ -4421,9 +4424,130 @@ func (h *Holder) Fmt() string {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
+            // Dispatch tiering: an interface-typed field MAY dispatch to the
+            // implementor — visible as possible-dispatch (unverified), never
+            // confirmed (Go interface satisfaction is implicit), never excluded.
             const impl = callersOf(index, 'main.go:22:Format');
-            assert.ok(impl.confirmed.includes('main.go:29'),
-                `h.iface.Format() through an interface field stays a possible edge: ${impl.confirmed}`);
+            assert.ok(!impl.confirmed.includes('main.go:29'),
+                `interface-typed field is not receiver evidence for the impl: ${impl.confirmed}`);
+            const entry = impl.unverified.find(u => u.key === 'main.go:29');
+            assert.ok(entry, `h.iface.Format() stays a visible possible edge: ${JSON.stringify(impl.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Formatter');
+            assert.strictEqual(impl.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #204: possible-dispatch tiering (Go)
+// ============================================================================
+
+describe('fix #204: possible-dispatch tiering (Go)', () => {
+    const FILES = {
+        'go.mod': 'module test\n\ngo 1.21\n',
+        'types.go': `package main
+
+type Filter struct{ name string }
+
+func (f *Filter) Run() string { return f.name }
+
+func (f *Filter) Unique() string { return "u" }
+
+type Runner struct{ id int }
+
+func (r *Runner) Run() string { return "r" }
+
+type Doer interface {
+	Do() string
+}
+
+type RealDoer struct{}
+
+func (d RealDoer) Do() string { return "done" }
+`,
+        'caller.go': `package main
+
+func useTyped(thing *Filter) {
+	thing.Run()
+}
+
+func useUntyped() {
+	x := getThing()
+	x.Run()
+	x.Unique()
+}
+
+func useIface(d Doer) {
+	d.Do()
+}
+
+func getThing() *Filter { return nil }
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason,
+                dispatchVia: c.dispatchVia, dispatchCandidates: c.dispatchCandidates,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('untyped receiver with multiple same-name owners routes to method-ambiguous', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'types.go:5:Run');
+            assert.ok(!res.confirmed.includes('caller.go:9'),
+                `x.Run() with x untyped and 2 Run owners is not confirmed: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'caller.go:9');
+            assert.ok(entry, `untyped multi-owner call stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'method-ambiguous');
+            assert.strictEqual(entry.dispatchCandidates, 2);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('untyped receiver with a UNIQUE project-wide owner stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'types.go:7:Unique');
+            assert.ok(res.confirmed.includes('caller.go:10'),
+                `x.Unique() — only Filter defines Unique — stays confirmed: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('typed receiver matching the target stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'types.go:5:Run');
+            assert.ok(res.confirmed.includes('caller.go:4'),
+                `thing.Run() with thing *Filter confirms Filter.Run: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('interface-typed param routes to possible-dispatch (implicit satisfaction)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'types.go:19:Do');
+            assert.ok(!res.confirmed.includes('caller.go:14'),
+                `d.Do() through interface Doer is not receiver evidence for RealDoer.Do: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'caller.go:14');
+            assert.ok(entry, `interface dispatch stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Doer');
+            assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
 });

@@ -1736,6 +1736,9 @@ describe('fix #202: declared-field receivers (Java)', () => {
         const json = JSON.parse(output.formatContextJson(r.result));
         return {
             confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason, dispatchVia: c.dispatchVia,
+            })),
             excluded: json.meta.account?.excluded,
             conserved: json.meta.account?.conserved,
         };
@@ -1771,13 +1774,21 @@ describe('fix #202: declared-field receivers (Java)', () => {
         } finally { rm(dir); }
     });
 
-    it('supertype-typed fields never exclude overriding subclasses (virtual dispatch)', () => {
+    it('supertype-typed fields route to possible-dispatch, never excluded (virtual dispatch)', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const child = callersOf(index, 'Child.java:2:parse');
-            assert.ok(child.confirmed.includes('Holder.java:5'),
-                `this.b.parse() with b typed Base may dispatch to Child.parse — never excluded: ${child.confirmed}`);
+            // Dispatch tiering: a Base-typed field MAY dispatch to Child.parse —
+            // visible as possible-dispatch (unverified), never confirmed (no
+            // evidence it reaches THIS override), never excluded.
+            assert.ok(!child.confirmed.includes('Holder.java:5'),
+                `supertype-typed field is not receiver evidence for the override: ${child.confirmed}`);
+            const entry = child.unverified.find(u => u.key === 'Holder.java:5');
+            assert.ok(entry, `this.b.parse() with b typed Base stays visible: ${JSON.stringify(child.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Base');
+            assert.strictEqual(child.conserved, true);
         } finally { rm(dir); }
     });
 });
@@ -1813,6 +1824,9 @@ public class TreeMapLike extends AbstractMap<String, String> {
         const json = JSON.parse(output.formatContextJson(r.result));
         return {
             confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason, dispatchVia: c.dispatchVia,
+            })),
             conserved: json.meta.account?.conserved,
         };
     }
@@ -1834,9 +1848,123 @@ public class TreeMapLike extends AbstractMap<String, String> {
             const index = idx(dir);
             // TreeMapLike extends AbstractMap (external) — the chain to Map is
             // invisible, so a Map-typed receiver may reach TreeMapLike.get.
+            // Dispatch tiering: visible as possible-dispatch (the Map-typed
+            // receiver is not evidence it reaches THIS def), never excluded.
             const tree = callersOf(index, 'TreeMapLike.java:4:get');
-            assert.ok(tree.confirmed.includes('Registry.java:7'),
-                `Map-typed receiver stays a possible caller of TreeMapLike.get (external ancestor): ${tree.confirmed}`);
+            assert.ok(!tree.confirmed.includes('Registry.java:7'),
+                `external supertype field is not receiver evidence: ${tree.confirmed}`);
+            const entry = tree.unverified.find(u => u.key === 'Registry.java:7');
+            assert.ok(entry, `Map-typed receiver stays a possible caller of TreeMapLike.get: ${JSON.stringify(tree.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Map');
+            assert.strictEqual(tree.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #204: possible-dispatch tiering (Java)
+// ============================================================================
+
+describe('fix #204: possible-dispatch tiering (Java)', () => {
+    const FILES = {
+        'Storage.java': `public interface Storage {
+    void save(String data);
+}
+`,
+        'DiskStorage.java': `public class DiskStorage implements Storage {
+    public void save(String data) { System.out.println(data); }
+}
+`,
+        'MemStorage.java': `public class MemStorage implements Storage {
+    public void save(String data) { System.out.println(data); }
+}
+`,
+        'App.java': `public class App {
+    private Storage storage;
+    private DiskStorage disk;
+
+    public void run(String data) {
+        storage.save(data);
+    }
+
+    public void runTyped(Storage s, String data) {
+        s.save(data);
+    }
+
+    public void runDisk(String data) {
+        disk.save(data);
+    }
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason,
+                dispatchVia: c.dispatchVia, dispatchCandidates: c.dispatchCandidates,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('interface-typed param receiver routes to possible-dispatch (was excluded)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'DiskStorage.java:2:save');
+            assert.ok(!res.confirmed.includes('App.java:10'),
+                `s.save() on a Storage param is not evidence for DiskStorage.save: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'App.java:10');
+            assert.ok(entry, `interface-typed receiver stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Storage');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('interface-typed field receiver routes to possible-dispatch with implementation count', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'DiskStorage.java:2:save');
+            const entry = res.unverified.find(u => u.key === 'App.java:6');
+            assert.ok(entry, `storage.save() on a Storage field stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Storage');
+            // Implementations only — the interface's abstract declaration is
+            // not a landing site.
+            assert.strictEqual(entry.dispatchCandidates, 2);
+        } finally { rm(dir); }
+    });
+
+    it('exact-class field receiver stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'DiskStorage.java:2:save');
+            assert.ok(res.confirmed.includes('App.java:14'),
+                `disk.save() on a DiskStorage field confirms DiskStorage.save: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('legacy commands unaffected: trace finds no tier routing', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            // trace runs findCallers WITHOUT collectAccount — dispatch tiering
+            // must not change its results (byte-identical legacy contract).
+            const r = execute(index, 'trace', { name: 'save' });
+            assert.ok(r.ok, `trace failed: ${r.error}`);
+            const text = require('../core/output').formatTrace(r.result);
+            assert.ok(!text.includes('possible-dispatch'),
+                'legacy trace output must not carry dispatch-tier markers');
         } finally { rm(dir); }
     });
 });

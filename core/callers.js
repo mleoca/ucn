@@ -171,6 +171,35 @@ function findCallers(index, name, options = {}) {
         definitionLines.add(`${def.file}:${def.startLine}`);
     }
 
+    // Possible-dispatch tiering inputs (nominal contract surface) — all fixed
+    // per query, computed lazily once. targetTypes mirrors the receiver-class
+    // disambiguation set (target classes + non-overriding subtypes); owner
+    // keys are the distinct types defining a same-name method project-wide.
+    let _dispatchTargetTypes = null;
+    const dispatchTargetTypes = (targetDefs) => {
+        if (!_dispatchTargetTypes) _dispatchTargetTypes = _buildTargetTypeSet(index, targetDefs, definitions);
+        return _dispatchTargetTypes;
+    };
+    let _methodOwnerKeys = null;
+    const methodOwnerKeys = () => {
+        if (!_methodOwnerKeys) {
+            _methodOwnerKeys = new Set();
+            for (const d of definitions) {
+                if (NON_CALLABLE_TYPES.has(d.type)) continue;
+                const o = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
+                if (o) _methodOwnerKeys.add(o);
+            }
+        }
+        return _methodOwnerKeys;
+    };
+    const _dispatchCountCache = new Map(); // via type -> candidate count
+    const countDispatchCandidates = (via) => {
+        if (!_dispatchCountCache.has(via)) {
+            _dispatchCountCache.set(via, _countDispatchCandidates(index, via, definitions));
+        }
+        return _dispatchCountCache.get(via);
+    };
+
     // ---- Rename-alias surfaces (import/export renames) ----
     // Other surface names that can denote this symbol:
     //   import-side: `import { _gt as gt }` — fileEntry.importAliases, valid
@@ -264,7 +293,7 @@ function findCallers(index, name, options = {}) {
     // unverified-tier entry (grep-reliability contract: shown in its own
     // section, never silently hidden). Does NOT count toward pendingCount —
     // totals describe the confirmed answer.
-    const routeUnverified = (filePath, fileEntry, call, reason, calledAs) => {
+    const routeUnverified = (filePath, fileEntry, call, reason, calledAs, meta) => {
         if (!collectAccount) return; // non-account paths (trace/blast/verify) keep the plain drop
         if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
         pendingByFile.get(filePath).push({
@@ -272,8 +301,12 @@ function findCallers(index, name, options = {}) {
             isMethod: call.isMethod || false, isFunctionReference: false,
             receiver: call.receiver, receiverType: call.receiverType,
             calledAs,
-            _tier: TIER.UNVERIFIED, _reason: reason,
-            _evidence: { isUncertain: true },
+            _tier: TIER.UNVERIFIED, _reason: reason, _meta: meta,
+            // Dispatch-tiered routes carry their own resolution so JSON output
+            // distinguishes "possible virtual dispatch" from a bare uncertain.
+            _evidence: reason === 'possible-dispatch' ? { possibleDispatch: true }
+                : reason === 'method-ambiguous' ? { methodAmbiguous: true }
+                : { isUncertain: true },
         });
     };
     const maxResults = options.maxResults;
@@ -555,6 +588,10 @@ function findCallers(index, name, options = {}) {
                 // trust-gate-passed types fall back to import/scope evidence —
                 // an unvalidated annotation must not upgrade the tier.
                 let receiverTypeValidated = false;
+                // Nominal local-inference match (receiver typed via
+                // _buildTypedLocalTypeMap ∈ target types) — receiver evidence
+                // for the dispatch tiering below.
+                let nominalInferredMatch = false;
                 if (call.isMethod) {
                     if (call.selfAttribute && fileEntry.language === 'python') {
                         // self.attr.method() — resolve via attribute type inference
@@ -671,6 +708,19 @@ function findCallers(index, name, options = {}) {
                     !resolvedBySameClass &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     fieldHopType = _declaredFieldType(index, call.receiverRootType, call.receiverField, fileEntry.language);
+                }
+                // Dispatch attribution (contract surface only): a field DECLARED
+                // as a project interface/trait carries no exclusion evidence
+                // (_declaredFieldType returns null — any implementor may receive
+                // the call), but it IS positive evidence of possible dispatch.
+                // Resolved separately so the unverified tier can attribute the
+                // edge: "possible-dispatch via <Interface> — 1 of N impls".
+                let fieldDispatchType = null;
+                if (collectAccount && fieldHopType === null &&
+                    call.isMethod && !call.receiverType && call.receiverField && call.receiverRootType &&
+                    !resolvedBySameClass &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                    fieldDispatchType = _declaredFieldInterfaceType(index, call.receiverRootType, call.receiverField, fileEntry.language);
                 }
 
                 // Skip uncertain calls unless resolved by same-class matching or explicitly requested
@@ -891,32 +941,10 @@ function findCallers(index, name, options = {}) {
                 if (call.isMethod && (call.receiver || call.receiverType || fieldHopType) && !resolvedBySameClass &&
                     (!bindingId || fieldHopType) &&
                     (call.receiverType || fieldHopType || langTraits(fileEntry.language)?.typeSystem === 'nominal')) {
-                    // Build target type set from both className (Java) and receiver (Go/Rust)
-                    const targetTypes = new Set();
-                    for (const td of targetDefs) {
-                        if (td.className) targetTypes.add(td.className);
-                        if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
-                    }
-                    // Expand targetTypes with subtypes of the target's class
-                    // (transitively): a Child receiver calling an inherited
-                    // Base method IS a caller of Base.method. Skip children
-                    // that define the method themselves — their calls dispatch
-                    // to the override, not the target.
-                    if (targetTypes.size > 0) {
-                        const queue = [...targetTypes];
-                        while (queue.length > 0) {
-                            const children = index.extendedByGraph?.get(queue.pop());
-                            if (!children) continue;
-                            for (const child of children) {
-                                const cName = typeof child === 'string' ? child : child.name;
-                                if (!cName || targetTypes.has(cName)) continue;
-                                const overrides = definitions.some(d => d.className === cName);
-                                if (overrides) continue;
-                                targetTypes.add(cName);
-                                queue.push(cName);
-                            }
-                        }
-                    }
+                    // Target type set: target classes + non-overriding subtypes
+                    // (a Child receiver calling an inherited Base method IS a
+                    // caller of Base.method). Memoized — fixed per query.
+                    const targetTypes = dispatchTargetTypes(targetDefs);
                     if (targetTypes.size > 0) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
                         const knownType = call.receiverType || fieldHopType;
@@ -969,6 +997,20 @@ function findCallers(index, name, options = {}) {
                                 isUncertain = true;
                                 typeMismatch = true;
                                 if (collectAccount) {
+                                    // ...unless the type can VIRTUALLY dispatch into
+                                    // the target: an interface/trait receiver that
+                                    // declares the method, or (Java — all instance
+                                    // methods virtual) a superclass of the target.
+                                    // Not evidence against — visible possible-dispatch.
+                                    // Go struct embedding binds statically and stays
+                                    // excluded.
+                                    if (_dispatchCapableSupertype(index, fileEntry.language, knownType, targetDefs, definitions)) {
+                                        routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                            dispatchVia: knownType,
+                                            dispatchCandidates: countDispatchCandidates(knownType),
+                                        });
+                                        continue;
+                                    }
                                     recordExcluded(filePath, call.line, 'receiver-type-mismatch');
                                     continue;
                                 }
@@ -999,6 +1041,7 @@ function findCallers(index, name, options = {}) {
                                         if (inferredType) {
                                             if (targetTypes.has(inferredType)) {
                                                 inferredMatch = true;
+                                                nominalInferredMatch = true;
                                             } else {
                                                 inferredMismatch = true;
                                             }
@@ -1018,8 +1061,13 @@ function findCallers(index, name, options = {}) {
                                     continue;
                                 }
                             }
-                            // Still no type — fall back to receiver name matching when multiple defs exist
-                            if (!inferredMatch && !inferredMismatch && definitions.length > 1) {
+                            // Still no type — fall back to receiver name matching when
+                            // multiple defs exist. A field-declared interface/trait type
+                            // (fieldDispatchType, contract surface only) outranks the name
+                            // heuristic: `storage.save()` on a field declared `Storage`
+                            // is a dispatch edge, not a case-insensitive name accident —
+                            // skip the fallback and let the dispatch tiering route it.
+                            if (!inferredMatch && !inferredMismatch && definitions.length > 1 && !fieldDispatchType) {
                                 const receiverLower = call.receiver.toLowerCase();
                                 const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
                                 if (!matchesTarget) {
@@ -1047,6 +1095,21 @@ function findCallers(index, name, options = {}) {
                                         isUncertain = true;
                                         typeMismatch = true;
                                         if (collectAccount) {
+                                            // The matched class may be a dispatch-capable
+                                            // supertype of the target (a receiver named
+                                            // after the interface it is typed as) — that
+                                            // is a possible dispatch edge, not evidence
+                                            // against the target.
+                                            const dispatchSuper = [...nonTargetClasses]
+                                                .filter(cn => cn.toLowerCase() === receiverLower)
+                                                .find(cn => _dispatchCapableSupertype(index, fileEntry.language, cn, targetDefs, definitions));
+                                            if (dispatchSuper) {
+                                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                                    dispatchVia: dispatchSuper,
+                                                    dispatchCandidates: countDispatchCandidates(dispatchSuper),
+                                                });
+                                                continue;
+                                            }
                                             recordExcluded(filePath, call.line, 'receiver-other-class');
                                             continue;
                                         }
@@ -1102,6 +1165,42 @@ function findCallers(index, name, options = {}) {
                     langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                     targetDefs2.some(d => d.file && path.dirname(d.file) === path.dirname(filePath));
 
+                // Possible-dispatch tiering (nominal languages, contract surface
+                // only): methodCallInclusion='auto' confirms method calls with
+                // ZERO receiver evidence — right when the name is unique
+                // project-wide (cobra), a lie when dozens of types implement it
+                // (gson TypeAdapter.read). The confirmed tier keeps only
+                // evidence-backed edges: validated/inferred receiver type,
+                // same-class resolution, binding, a type-qualified receiver
+                // (Type::method / Type.method), or a name with a single
+                // project-wide owner. The rest stay VISIBLE as unverified — a
+                // known-but-unvalidated receiver type is 'possible-dispatch'
+                // (attributed via the declared supertype), an untyped receiver
+                // against multiple owners is 'method-ambiguous'. Nothing is
+                // dropped: conservation holds, the entries move tiers.
+                if (collectAccount && call.isMethod && !bindingId && !resolvedBySameClass &&
+                    !receiverTypeValidated && !nominalInferredMatch &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                    const tTypes = dispatchTargetTypes(targetDefs2);
+                    const typeQualifiedReceiver = call.receiver && tTypes.has(call.receiver);
+                    if (!typeQualifiedReceiver) {
+                        const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
+                        if (knownDispatchType && !tTypes.has(knownDispatchType)) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: knownDispatchType,
+                                dispatchCandidates: countDispatchCandidates(knownDispatchType),
+                            });
+                            continue;
+                        }
+                        if (!knownDispatchType && methodOwnerKeys().size > 1) {
+                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                dispatchCandidates: methodOwnerKeys().size,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
                 if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                 pendingByFile.get(filePath).push({
                     call, fileEntry, callerSymbol,
@@ -1155,7 +1254,7 @@ function findCallers(index, name, options = {}) {
     // Phase 2: Read content only for files with matching calls (eliminates ~98% of file reads)
     outer: for (const [filePath, pending] of pendingByFile) {
         let content = null;
-        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, calledAs, _evidence, _tier, _reason } of pending) {
+        for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, calledAs, _evidence, _tier, _reason, _meta } of pending) {
             const scored = scoreEdge(_evidence || {});
             if (_tier) {
                 // Routed unverified entry — never competes with the main
@@ -1168,6 +1267,7 @@ function findCallers(index, name, options = {}) {
                     resolution: scored.resolution,
                     tier: _tier,
                     reason: _reason,
+                    ...(_meta || {}),
                     isMethod: call.isMethod || false,
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
@@ -2227,6 +2327,184 @@ function _declaredFieldType(index, rootType, fieldName, language) {
     const typeDefs = index.symbols.get(typeName);
     if (typeDefs && typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
     return typeName;
+}
+
+/**
+ * Build the target type set for receiver-class disambiguation: target
+ * classes/receivers + their non-overriding subtypes (transitively). A Child
+ * receiver calling an inherited Base method IS a caller of Base.method;
+ * children that define the method themselves dispatch to the override.
+ */
+function _buildTargetTypeSet(index, targetDefs, definitions) {
+    const targetTypes = new Set();
+    for (const td of targetDefs) {
+        if (td.className) targetTypes.add(td.className);
+        if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
+    }
+    if (targetTypes.size > 0) {
+        const queue = [...targetTypes];
+        while (queue.length > 0) {
+            const children = index.extendedByGraph?.get(queue.pop());
+            if (!children) continue;
+            for (const child of children) {
+                const cName = typeof child === 'string' ? child : child.name;
+                if (!cName || targetTypes.has(cName)) continue;
+                const overrides = definitions.some(d => d.className === cName);
+                if (overrides) continue;
+                targetTypes.add(cName);
+                queue.push(cName);
+            }
+        }
+    }
+    return targetTypes;
+}
+
+/**
+ * Can a receiver typed as `typeName` VIRTUALLY dispatch into the target
+ * definition? True when typeName is a project interface/trait that declares
+ * the method or sits above the target's class, or — in languages where every
+ * instance method is virtual (Java) — any supertype of the target. Go struct
+ * embedding binds statically and never qualifies; Go interfaces qualify via
+ * the declares-the-method check (satisfaction is implicit — there is no
+ * recorded edge to walk). Used only to decide possible-dispatch ROUTING
+ * (visible unverified), never to exclude.
+ */
+function _dispatchCapableSupertype(index, language, typeName, targetDefs, definitions) {
+    if (langTraits(language)?.typeSystem !== 'nominal') return false;
+    const typeDefs = index.symbols.get(typeName) || [];
+    const isIface = typeDefs.some(d => d.type === 'interface' || d.type === 'trait');
+    if (isIface) {
+        // The interface/trait declares this method → any implementor
+        // (recorded or implicit) may receive the call.
+        if (definitions.some(d => d.className === typeName)) return true;
+        return _isDispatchAncestor(index, typeName, targetDefs);
+    }
+    if (langTraits(language)?.allMethodsVirtual) {
+        return _isDispatchAncestor(index, typeName, targetDefs);
+    }
+    return false;
+}
+
+/**
+ * Like _isAncestorOfTargetClass, but walks `implements` records (Java
+ * implements clauses, Rust `impl Trait for Type` surfaced as implements)
+ * in addition to extends edges — the inheritance graph only stores extends,
+ * yet virtual dispatch flows through interface/trait edges too. Routing
+ * decision only (possible-dispatch vs excluded), never exclusion evidence.
+ */
+function _isDispatchAncestor(index, typeName, targetDefs) {
+    const visited = new Set();
+    const queue = [];
+    for (const td of targetDefs) {
+        const cls = td.className || (td.receiver && td.receiver.replace(/^\*/, ''));
+        if (cls) queue.push({ name: cls, file: td.file });
+    }
+    while (queue.length > 0) {
+        const { name, file } = queue.shift();
+        if (visited.has(name)) continue;
+        visited.add(name);
+        const parents = [
+            ...(index._getInheritanceParents(name, file) || []),
+            ..._implementsParents(index, name),
+        ];
+        for (const parent of parents) {
+            if (parent === typeName) return true;
+            if (!visited.has(parent)) {
+                const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
+                queue.push({ name: parent, file: parentFile });
+            }
+        }
+    }
+    return false;
+}
+
+/** Interface/trait names a class declares it implements (generics stripped). */
+function _implementsParents(index, className) {
+    const defs = index.symbols.get(className);
+    if (!defs) return [];
+    const out = [];
+    for (const d of defs) {
+        if (!Array.isArray(d.implements)) continue;
+        for (const p of d.implements) {
+            const bare = String(p).replace(/<.*$/s, '').trim().split(/[.:]+/).pop();
+            if (bare) out.push(bare);
+        }
+    }
+    return out;
+}
+
+/**
+ * How many same-name method definitions could a call through `via` dispatch
+ * to? Counts distinct owner types among the definitions that sit at or below
+ * `via` (extends edges + implements records). Languages with implicit
+ * interface satisfaction (Go) record no edges at all — fall back to the full
+ * owner count. Display/routing enrichment only ("1 of N implementations").
+ */
+function _countDispatchCandidates(index, via, definitions) {
+    const ownerFiles = new Map(); // owner type -> defining file
+    for (const d of definitions) {
+        if (NON_CALLABLE_TYPES.has(d.type)) continue;
+        const o = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
+        if (o && !ownerFiles.has(o)) ownerFiles.set(o, d.file);
+    }
+    if (ownerFiles.size === 0) return 0;
+    // Interface/trait owners hold the abstract declaration, not a landing
+    // site — "implementations" counts the concrete methods dispatch can run.
+    const isIface = (o) => (index.symbols.get(o) || [])
+        .some(d => d.type === 'interface' || d.type === 'trait');
+    let count = 0;
+    let concrete = 0;
+    for (const [owner, file] of ownerFiles) {
+        if (isIface(owner)) continue;
+        concrete++;
+        if (owner === via || _isDispatchAncestor(index, via, [{ className: owner, file }])) count++;
+    }
+    // No recorded edges below `via` (Go interfaces are satisfied implicitly)
+    // → any concrete owner is a candidate.
+    return count > 0 ? count : (concrete > 0 ? concrete : ownerFiles.size);
+}
+
+/**
+ * Resolve a one-hop field receiver to a declared project INTERFACE/TRAIT
+ * type — exactly the case _declaredFieldType refuses (a trait-typed field is
+ * not exclusion evidence against any implementor). Dispatch attribution
+ * only: lets the unverified tier say "possible-dispatch via <Interface>".
+ * Rust `dyn Trait` / `Box<dyn Trait>` / `&dyn Trait` resolve to Trait here.
+ */
+function _declaredFieldInterfaceType(index, rootType, fieldName, language) {
+    const defs = index.symbols.get(fieldName);
+    if (!defs) return null;
+    const fields = defs.filter(d =>
+        (d.type === 'field' || d.memberType === 'field') &&
+        d.className === rootType && d.fieldType);
+    if (fields.length === 0) return null;
+    const normalized = new Set();
+    for (const f of fields) {
+        const t = _normalizeFieldTypeName(f.fieldType, language) ||
+            (language === 'rust' ? _normalizeRustDynTypeName(f.fieldType) : null);
+        if (t) normalized.add(t);
+        else return null; // un-normalizable declaration → no attribution
+    }
+    if (normalized.size !== 1) return null; // same-named classes disagree
+    const typeName = [...normalized][0];
+    const typeDefs = index.symbols.get(typeName);
+    if (!typeDefs || !typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
+    return typeName;
+}
+
+/** Rust dyn-trait declarations: `dyn Flag`, `&dyn Flag`, `Box<dyn Flag>` → Flag. */
+function _normalizeRustDynTypeName(raw) {
+    let t = String(raw).trim();
+    let prev;
+    do {
+        prev = t;
+        t = t.replace(/^&+\s*/, '').replace(/^'[A-Za-z_][A-Za-z0-9_]*\s*/, '').replace(/^mut\s+/, '');
+        const wrap = t.match(/^([A-Za-z_][A-Za-z0-9_]*)\s*<(.*)>$/s);
+        if (wrap && _RUST_DEREF_WRAPPERS.has(wrap[1])) t = wrap[2].trim();
+    } while (t !== prev);
+    const m = t.match(/^dyn\s+([A-Za-z_][A-Za-z0-9_]*(?:\s*::\s*[A-Za-z_][A-Za-z0-9_]*)*)$/s);
+    if (!m) return null;
+    return m[1].split('::').pop().trim();
 }
 
 /**
