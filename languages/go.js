@@ -806,6 +806,104 @@ function findCallsInCode(code, parser, options = {}) {
         return undefined;
     };
 
+    // fix #203 (Go): is a bare-identifier function REFERENCE shadowed by an
+    // enclosing func-literal/function parameter, method receiver, range/init
+    // binding, or a := / var local declared before use? grpc-go-measured:
+    // `&clusterInfo{unsubscribe: unsubscribe}` inside `func(ref int32,
+    // unsubscribe func())` references the parameter, never a same-name
+    // package symbol. The enclosing INDEXED symbol's params are checked at
+    // query time in findCallers — func-literal params and block locals are
+    // only visible here. (Rust/Java need no equivalent: their parsers emit
+    // no bare-identifier callback references — Rust only obj.method field
+    // expressions, Java only :: method references.)
+    const _paramListDeclares = (paramsNode, name) => {
+        if (!paramsNode) return false;
+        for (let i = 0; i < paramsNode.namedChildCount; i++) {
+            const pd = paramsNode.namedChild(i);
+            if (pd.type !== 'parameter_declaration' && pd.type !== 'variadic_parameter_declaration') continue;
+            // Go allows several names per declaration: `a, b int`
+            for (let j = 0; j < pd.namedChildCount; j++) {
+                const c = pd.namedChild(j);
+                if (c.type === 'identifier' && c.text === name) return true;
+            }
+        }
+        return false;
+    };
+    const _declaresLocal = (stmt, name, refNode) => {
+        if (!stmt) return false;
+        // The declaration CONTAINING the reference is not a shadow: in
+        // `unsubscribe := unsubscribe` the RHS names the OUTER binding —
+        // Go's := declares the LHS only after the statement.
+        if (stmt.startIndex <= refNode.startIndex && stmt.endIndex >= refNode.endIndex) return false;
+        if (stmt.type === 'short_var_declaration') {
+            const left = stmt.childForFieldName('left');
+            if (left) {
+                for (let i = 0; i < left.namedChildCount; i++) {
+                    const id = left.namedChild(i);
+                    if (id.type === 'identifier' && id.text === name) return true;
+                }
+            }
+        } else if (stmt.type === 'var_declaration') {
+            for (let i = 0; i < stmt.namedChildCount; i++) {
+                const spec = stmt.namedChild(i);
+                if (spec.type !== 'var_spec') continue;
+                for (let j = 0; j < spec.namedChildCount; j++) {
+                    const id = spec.namedChild(j);
+                    if (id.type === 'identifier' && id.text === name) return true;
+                }
+            }
+        }
+        return false;
+    };
+    const isShadowedByLocal = (refNode, name) => {
+        for (let p = refNode.parent; p; p = p.parent) {
+            if (p.type === 'block') {
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    const stmt = p.namedChild(i);
+                    if (stmt.startIndex >= refNode.startIndex) break; // declaration-before-use
+                    if (_declaresLocal(stmt, name, refNode)) return true;
+                }
+            } else if (p.type === 'for_statement') {
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    const c = p.namedChild(i);
+                    if (c.type === 'range_clause') {
+                        const left = c.childForFieldName('left');
+                        if (left) {
+                            for (let j = 0; j < left.namedChildCount; j++) {
+                                const id = left.namedChild(j);
+                                if (id.type === 'identifier' && id.text === name) return true;
+                            }
+                        }
+                    } else if (c.type === 'for_clause') {
+                        if (_declaresLocal(c.childForFieldName('initializer'), name, refNode)) return true;
+                    }
+                }
+            } else if (p.type === 'if_statement' || p.type === 'expression_switch_statement' ||
+                p.type === 'type_switch_statement') {
+                if (_declaresLocal(p.childForFieldName('initializer'), name, refNode)) return true;
+                // if/switch initializers are plain named children in some
+                // grammar versions; type switches bind `v := x.(type)`
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    const c = p.namedChild(i);
+                    if (c.type === 'short_var_declaration' && _declaresLocal(c, name, refNode)) return true;
+                    if (p.type === 'type_switch_statement' && c.type === 'expression_list' &&
+                        c.nextSibling?.type === ':=') {
+                        for (let j = 0; j < c.namedChildCount; j++) {
+                            const id = c.namedChild(j);
+                            if (id.type === 'identifier' && id.text === name) return true;
+                        }
+                    }
+                }
+            } else if (p.type === 'func_literal' || p.type === 'function_declaration' ||
+                p.type === 'method_declaration') {
+                if (_paramListDeclares(p.childForFieldName('parameters'), name)) return true;
+                if (p.type === 'method_declaration' &&
+                    _paramListDeclares(p.childForFieldName('receiver'), name)) return true;
+            }
+        }
+        return false;
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
@@ -1108,7 +1206,8 @@ function findCallsInCode(code, parser, options = {}) {
                     isFunctionReference: true,
                     isPotentialCallback: true,
                     enclosingFunction,
-                    uncertain: false
+                    uncertain: false,
+                    ...(isShadowedByLocal(node, name) && { localShadow: true }),
                 });
             }
         }
@@ -1159,7 +1258,8 @@ function findCallsInCode(code, parser, options = {}) {
                                 isFunctionReference: true,
                                 isPotentialCallback: true,
                                 enclosingFunction,
-                                uncertain: false
+                                uncertain: false,
+                                ...(isShadowedByLocal(rhs, name) && { localShadow: true }),
                             });
                         }
                     }
@@ -1217,6 +1317,7 @@ function findCallsInCode(code, parser, options = {}) {
                             uncertain: false,
                             ...(compositeType && { compositeType }),
                             ...(fieldName && { fieldName }),
+                            ...(isShadowedByLocal(valueNode, name) && { localShadow: true }),
                         });
                     }
                 }

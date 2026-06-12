@@ -4089,14 +4089,16 @@ describe('RUST-3: impact on class types shows callers like about does', () => {
 
 
 // ============================================================================
-// call-not-resolved lines render as visible unverified entries (roadmap #4):
-// the account COUNTED unclaimed ground call-lines in its unverified total but
-// listed them nowhere — an edge at such a line was conserved yet invisible
-// (grpc-go-measured: strAddr(r.RemoteAddr) method-reference silently dropped
-// by the typed-receiver callback gate).
+// Typed-receiver method references at the callback gate (engine-gap closure):
+// `take(r.RemoteAddr)` where r's type is neither the target type nor below it
+// was a SILENT drop — the ground line surfaced as call-not-resolved
+// (grpc-go/cursive-measured). Now disposed like the main method-call path:
+// unrelated concrete type → excluded receiver-type-mismatch; interface
+// receiver → visible possible-dispatch; alias/embedding (closed target set)
+// → kept as a true edge.
 // ============================================================================
 
-describe('call-not-resolved entries are listed in the unverified tier', () => {
+describe('typed-receiver method references are disposed, never dropped', () => {
     const FILES = {
         'go.mod': 'module example.com/m\ngo 1.21\n',
         'lib/lib.go': `package lib
@@ -4119,43 +4121,125 @@ func use(r *Request) {
 `,
     };
 
-    it('context lists the unclaimed call line with reason call-not-resolved', () => {
+    it('unrelated concrete receiver type → excluded receiver-type-mismatch, conserved', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const r = execute(index, 'context', { name: 'lib/lib.go:5:RemoteAddr' });
             assert.ok(r.ok, `context failed: ${r.error}`);
             const json = JSON.parse(output.formatContextJson(r.result));
-            const entry = (json.data.unverifiedCallers || [])
-                .find(u => u.reason === 'call-not-resolved');
-            assert.ok(entry,
-                `unclaimed ground call line is listed: ${JSON.stringify(json.data.unverifiedCallers)}`);
-            assert.strictEqual(entry.file, 'app/app.go');
-            assert.ok(entry.expression.includes('take(r.RemoteAddr)'),
-                `bare entry carries the source text: ${JSON.stringify(entry)}`);
+            assert.ok(!(json.data.callers || []).some(c => c.file === 'app/app.go'),
+                'Request.RemoteAddr reference is not a Conn.RemoteAddr caller');
+            assert.ok(!(json.data.unverifiedCallers || []).some(u => u.file === 'app/app.go'),
+                `claimed as excluded, not left unverified: ${JSON.stringify(json.data.unverifiedCallers)}`);
+            const byReason = json.meta.account.excluded?.byReason || {};
+            assert.ok((byReason['receiver-type-mismatch']?.count || 0) >= 1,
+                `excluded with reason: ${JSON.stringify(byReason)}`);
             assert.strictEqual(json.meta.account.conserved, true);
-            // The account already counted it — listing must not double-count
-            assert.ok(json.meta.account.unverified >= 1);
         } finally { rm(dir); }
     });
 
-    it('about and impact list the same entry', () => {
-        const dir = tmp(FILES);
+    it('interface-typed receiver reference → visible possible-dispatch', () => {
+        const dir = tmp({
+            ...FILES,
+            'app/iface.go': `package app
+
+type Addresser interface {
+	RemoteAddr() string
+}
+
+func useIface(a Addresser) {
+	take(a.RemoteAddr)
+}
+`,
+        });
         try {
             const index = idx(dir);
-            const a = execute(index, 'about', { name: 'lib/lib.go:5:RemoteAddr' });
-            assert.ok(a.ok, `about failed: ${a.error}`);
-            const aJson = JSON.parse(output.formatAboutJson(a.result));
-            const aTop = aJson.callers?.unverified?.top || [];
-            assert.ok(aTop.some(u => u.reason === 'call-not-resolved'),
-                `about lists the entry: ${JSON.stringify(aTop)}`);
+            const r = execute(index, 'context', { name: 'lib/lib.go:5:RemoteAddr' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const entry = (json.data.unverifiedCallers || [])
+                .find(u => u.file === 'app/iface.go' && u.reason === 'possible-dispatch');
+            assert.ok(entry,
+                `interface method value can hold any implementation: ${JSON.stringify(json.data.unverifiedCallers)}`);
+            assert.strictEqual(entry.dispatchVia, 'Addresser');
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
 
-            const i = execute(index, 'impact', { name: 'lib/lib.go:5:RemoteAddr' });
-            assert.ok(i.ok, `impact failed: ${i.error}`);
-            const iJson = JSON.parse(output.formatImpactJson(i.result));
-            const iSites = iJson.unverifiedSites || iJson.data?.unverifiedSites || [];
-            const iEntry = iSites.find(u => u.reason === 'call-not-resolved');
-            assert.ok(iEntry, `impact lists the entry: ${JSON.stringify(iSites)}`);
+    it('embedding (promoting) receiver type → kept as a true caller edge', () => {
+        const dir = tmp({
+            ...FILES,
+            'app/embed.go': `package app
+
+import "example.com/m/lib"
+
+type Wrapped struct {
+	lib.Conn
+}
+
+func useWrapped(w *Wrapped) {
+	take(w.RemoteAddr)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib/lib.go:5:RemoteAddr' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app/embed.go:10'),
+                `w.RemoteAddr IS the promoted Conn.RemoteAddr: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// call-not-resolved listing contract (roadmap #4): a ground call-line the
+// engine claims nowhere must be LISTED as a bare unverified entry, not just
+// counted. Every natural producer is now closed (the callback gate above was
+// the last), so the glue is pinned directly with a stubbed account.
+// ============================================================================
+
+describe('call-not-resolved entries render as bare unverified one-liners', () => {
+    it('entries carry file:line, source text, and the reason', () => {
+        const dir = tmp({
+            'package.json': '{"name":"cnr-glue"}',
+            'app.js': 'function helper() { return 1; }\nhelper();\n',
+        });
+        try {
+            const index = idx(dir);
+            const { callNotResolvedEntries } = require('../core/analysis');
+            const file = [...index.files.keys()].find(f => f.endsWith('app.js'));
+            const account = {
+                callNotResolved: [{ file, relativePath: 'app.js', line: 2 }],
+            };
+            const entries = callNotResolvedEntries(index, account);
+            assert.strictEqual(entries.length, 1);
+            assert.strictEqual(entries[0].relativePath, 'app.js');
+            assert.strictEqual(entries[0].line, 2);
+            assert.strictEqual(entries[0].content, 'helper();');
+            assert.strictEqual(entries[0].tier, 'unverified');
+            assert.strictEqual(entries[0].reason, 'call-not-resolved');
+            assert.strictEqual(entries[0].callerName, null);
+        } finally { rm(dir); }
+    });
+
+    it('exclude filters apply; missing account yields no entries', () => {
+        const dir = tmp({
+            'package.json': '{"name":"cnr-glue2"}',
+            'test/app.test.js': 'function helper() { return 1; }\nhelper();\n',
+        });
+        try {
+            const index = idx(dir);
+            const { callNotResolvedEntries } = require('../core/analysis');
+            const file = [...index.files.keys()].find(f => f.endsWith('app.test.js'));
+            const account = {
+                callNotResolved: [{ file, relativePath: 'test/app.test.js', line: 2 }],
+            };
+            const filtered = callNotResolvedEntries(index, account, { exclude: ['test'] });
+            assert.strictEqual(filtered.length, 0, 'exclude pattern filters entries');
+            assert.deepStrictEqual(callNotResolvedEntries(index, null), []);
         } finally { rm(dir); }
     });
 });

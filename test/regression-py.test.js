@@ -2644,3 +2644,134 @@ describe('fix #209: structural dispatch tiering (Python)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #202b (Python re-scope): plain self/cls/super same-class resolution
+// must land on the pinned target's class — a sibling class's self.method()
+// is not a caller of the target (httpx-measured: ~5 sibling self-call FP
+// edges, Client/AsyncClient in one file; same-file siblings bypass the
+// binding and import gates, so the same-class branch decides). Python MRO
+// guard: exclusion requires that the matched class and the target share NO
+// project descendant — class C(Target, Mixin) makes self.method() inside
+// Mixin reach Target.method through C's MRO.
+// ============================================================================
+
+describe('fix #202b: Python self-call sibling-class pinning', () => {
+    const output = require('../core/output');
+
+    it('same-file sibling self.process() is excluded other-definition (httpx family)', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "t"\n',
+            'a.py': [
+                'class Target:',
+                '    def process(self):',
+                '        return 1',
+                '',
+                'class Sibling:',
+                '    def process(self):',
+                '        return 2',
+                '    def run(self):',
+                '        return self.process()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.py:2:process' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            assert.ok(!(json.data.callers || []).some(c => c.line === 9),
+                `Sibling.process self-call is not a Target.process caller: ${JSON.stringify(json.data.callers)}`);
+            const byReason = json.meta.account.excluded?.byReason || {};
+            assert.ok((byReason['other-definition']?.count || 0) >= 1,
+                `excluded with reason: ${JSON.stringify(byReason)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('subclass-without-override self.process() stays a confirmed caller', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "t"\n',
+            'a.py': [
+                'class Target:',
+                '    def process(self):',
+                '        return 1',
+            ].join('\n'),
+            'c.py': [
+                'from a import Target',
+                '',
+                'class Child(Target):',
+                '    def run(self):',
+                '        return self.process()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.py:2:process' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('c.py:5'),
+                `inherited method resolves to Target.process: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('overriding subclass self.process() is excluded (target unreachable below the override)', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "t"\n',
+            'a.py': [
+                'class Target:',
+                '    def process(self):',
+                '        return 1',
+                '',
+                'class Override(Target):',
+                '    def process(self):',
+                '        return 4',
+                '    def run(self):',
+                '        return self.process()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.py:2:process' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            assert.ok(!(json.data.callers || []).some(c => c.line === 9),
+                `self.process() under Override binds the override, never Target.process: ${JSON.stringify(json.data.callers)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('co-parent mixin (MRO trap) is NOT excluded — class C(Target, Mixin) reaches Target.process', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "t"\n',
+            'a.py': [
+                'class Target:',
+                '    def process(self):',
+                '        return 1',
+                '',
+                'class Mixin:',
+                '    def process(self):',
+                '        return 3',
+                '    def run(self):',
+                '        return self.process()',
+            ].join('\n'),
+            'combo.py': [
+                'from a import Target, Mixin',
+                '',
+                'class Combo(Target, Mixin):',
+                '    pass',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.py:2:process' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const byReason = json.meta.account.excluded?.byReason || {};
+            const trapExcluded = (byReason['other-definition']?.sample || [])
+                .some(s => s.line === 9);
+            assert.ok(!trapExcluded,
+                `Mixin self-call can dispatch to Target.process via Combo's MRO: ${JSON.stringify(byReason)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});

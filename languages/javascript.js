@@ -39,6 +39,27 @@ function extractReturnType(node) {
 }
 
 /**
+ * Base type name from a type-alias target (fix #208, TS): ZodType<any, any>
+ * → ZodType, ns.Type → Type, (T) → T. Unions, intersections, object/function
+ * types, mapped/conditional types, and predefined types return null — they
+ * are not single-type identities a method receiver can be resolved through.
+ */
+function aliasBaseTypeName(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'type_identifier') return typeNode.text;
+    if (typeNode.type === 'nested_type_identifier') {
+        return typeNode.childForFieldName('name')?.text || null;
+    }
+    if (typeNode.type === 'generic_type') {
+        return aliasBaseTypeName(typeNode.childForFieldName('name') || typeNode.namedChild(0));
+    }
+    if (typeNode.type === 'parenthesized_type') {
+        return aliasBaseTypeName(typeNode.namedChild(0));
+    }
+    return null;
+}
+
+/**
  * Check if function is a generator
  * @param {object} node - Function node
  * @returns {boolean}
@@ -622,6 +643,11 @@ function _processClass(node, classes, processedRanges, lines) {
         if (nameNode) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
+            // `type ZodTypeAny = ZodType<any, any, any>;` — the alias IS the
+            // aliased type. Record the base name so receivers annotated with
+            // the alias validate against the base type's methods (fix #208,
+            // TS parity with Rust/Go).
+            const aliasOf = aliasBaseTypeName(node.childForFieldName('value'));
 
             classes.push({
                 name: nameNode.text,
@@ -629,6 +655,7 @@ function _processClass(node, classes, processedRanges, lines) {
                 endLine,
                 type: 'type',
                 members: [],
+                ...(aliasOf && { aliasOf }),
                 ...(docstring && { docstring })
             });
         }

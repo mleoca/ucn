@@ -5083,3 +5083,106 @@ func Use(s *lib.Styled) {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #203 (Go parity): bare-identifier function references shadowed by
+// func-literal params or block locals are excluded 'local-shadow'
+// (grpc-go-measured: `&clusterInfo{unsubscribe: unsubscribe}` inside
+// `func(ref int32, unsubscribe func())` references the parameter — was
+// CONFIRMED against the package function via scope evidence).
+// ============================================================================
+
+describe('fix #203 (Go): local shadowing of function references', () => {
+    const output = require('../core/output');
+
+    it('func-literal param shadows a composite-field reference', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'app/app.go': `package app
+
+type clusterInfo struct {
+	unsubscribe func()
+}
+
+func build() {
+	newClusterInfo := func(ref int32, unsubscribe func()) *clusterInfo {
+		ci := &clusterInfo{unsubscribe: unsubscribe}
+		_ = ref
+		return ci
+	}
+	_ = newClusterInfo
+}
+
+func unsubscribe() {}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'app/app.go:16:unsubscribe' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            assert.ok(!(json.data.callers || []).some(c => c.line === 9),
+                `param-shadowed reference is not a caller: ${JSON.stringify(json.data.callers)}`);
+            const byReason = json.meta.account.excluded?.byReason || {};
+            assert.ok((byReason['local-shadow']?.count || 0) >= 1,
+                `excluded local-shadow: ${JSON.stringify(byReason)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('block := local shadows an argument-position reference; unshadowed stays confirmed', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'app/app.go': `package app
+
+func take(f func()) {}
+
+func handler() {}
+
+func shadowed() {
+	handler := func() {}
+	take(handler)
+}
+
+func clean() {
+	take(handler)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'app/app.go:5:handler' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!confirmed.includes('app/app.go:9'),
+                `:= local shadows the reference: ${confirmed}`);
+            assert.ok(confirmed.includes('app/app.go:13'),
+                `unshadowed reference stays a caller: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('x := x rebinding does not shadow its own RHS', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'app/app.go': `package app
+
+func take(f func()) {}
+
+func handler() {}
+
+func use() {
+	handler := handler
+	take(handler)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'app/app.go:5:handler' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app/app.go:8'),
+                `the RHS of x := x names the OUTER (package) binding: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});

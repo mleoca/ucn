@@ -5334,3 +5334,160 @@ describe('fix #209: structural dispatch tiering (JS/TS)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #208 (TS parity): type-alias receivers — `type SchemaAny = Schema<any>`
+// is the SAME type. Receivers annotated with the alias validate against the
+// base type's methods instead of routing visible (zod-measured: ZodTypeAny-
+// annotated receivers were demoted by #209's structural tiering).
+// ============================================================================
+
+describe('fix #208: type-alias receivers (TS)', () => {
+    const FILES = {
+        'package.json': '{"name":"alias-ts"}',
+        'types.ts': [
+            'export class Schema<T = any> {',
+            '    parse(data: T): T { return data; }',
+            '}',
+            'export type SchemaAny = Schema<any>;',
+        ].join('\n'),
+        'consumer.ts': [
+            'import { Schema, SchemaAny } from "./types";',
+            'export function check(s: SchemaAny) {',
+            '    return s.parse(1);',
+            '}',
+        ].join('\n'),
+    };
+
+    it('parser records aliasOf on TS type-alias symbols', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('SchemaAny') || [];
+            assert.strictEqual(defs.length, 1);
+            assert.strictEqual(defs[0].type, 'type');
+            assert.strictEqual(defs[0].aliasOf, 'Schema');
+        } finally { rm(dir); }
+    });
+
+    it('alias-annotated receiver confirms against the aliased class method', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'types.ts:2:parse' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('consumer.ts:3'),
+                `SchemaAny IS Schema — receiver must confirm: ${confirmed}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('union alias is not a single-type identity — never confirms', () => {
+        const dir = tmp({
+            'package.json': '{"name":"alias-union"}',
+            'types.ts': [
+                'export class Schema {',
+                '    parse(data: any): any { return data; }',
+                '}',
+                'export class Other {',
+                '    parse(data: any): any { return null; }',
+                '}',
+                'export type Mixed = Schema | Other;',
+            ].join('\n'),
+            'consumer.ts': [
+                'import { Mixed } from "./types";',
+                'export function check(s: Mixed) {',
+                '    return s.parse(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const mixedDefs = index.symbols.get('Mixed') || [];
+            assert.strictEqual(mixedDefs[0]?.aliasOf, undefined,
+                'union alias must not record aliasOf');
+            const r = execute(index, 'context', { name: 'types.ts:2:parse' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!confirmed.includes('consumer.ts:3'),
+                `union-typed receiver must not confirm one arm: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('same-name aliases to different bases must not close (purity rule)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"alias-impure"}',
+            'a.ts': [
+                'export class Schema {',
+                '    parse(data: any): any { return data; }',
+                '}',
+                'export type Common = Schema;',
+            ].join('\n'),
+            'b.ts': [
+                'export class Unrelated {',
+                '    runs(): void {}',
+                '}',
+                'export type Common = Unrelated;',
+            ].join('\n'),
+            'consumer.ts': [
+                'import type { Common } from "./b";',
+                'export function check(s: Common) {',
+                '    return s.parse(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.ts:2:parse' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!confirmed.includes('consumer.ts:3'),
+                `disagreeing Common aliases must not confirm: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Receiver-blind bindings, structural variant (the cursive Rust family):
+// a same-file class method def binds the NAME, but `getThing().process()`
+// resolves through its chained receiver — multi-owner routes visible.
+// ============================================================================
+
+describe('receiver-blind bindings: chained method calls never confirm via name binding (TS)', () => {
+    it('chained-receiver call demotes; multi-owner routes method-ambiguous', () => {
+        const dir = tmp({
+            'package.json': '{"name":"rbb-ts"}',
+            'a.ts': [
+                'export class Pipeline {',
+                '    process(): number { return 1; }',
+                '    run(): number { return this.process(); }',
+                '}',
+                'declare function getThing(): any;',
+                'export function use(): number {',
+                '    return getThing().process();',
+                '}',
+            ].join('\n'),
+            'b.ts': [
+                'export class Worker {',
+                '    process(): number { return 2; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'a.ts:2:process' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('a.ts:3'),
+                `this.process() stays confirmed: ${confirmed}`);
+            assert.ok(!confirmed.includes('a.ts:7'),
+                `getThing().process() resolves through its receiver, not file scope: ${confirmed}`);
+            const entry = (json.data.unverifiedCallers || []).find(u => u.line === 7);
+            assert.ok(entry, `chained call routes VISIBLE: ${JSON.stringify(json.data.unverifiedCallers)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});

@@ -2410,3 +2410,63 @@ pub fn build_label() {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Receiver-blind bindings (cursive-measured: 9 of 11 method FPs): a method
+// call resolves through its RECEIVER, never file scope — a same-file def of
+// `map` is not evidence that `parse_hex(v).map(...)` (chained receiver) or
+// `self.inner.next()` (generic field) dispatches to it. Such calls route
+// through dispatch tiering; self-receiver calls keep confirming.
+// ============================================================================
+
+describe('receiver-blind bindings: chained method calls never confirm via name binding (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/lib.rs': 'pub mod color;\npub mod other;\n',
+        'src/color.rs': `pub struct Rgb { pub r: u8 }
+
+fn parse_hex(v: &str) -> Option<u8> { v.parse().ok() }
+
+impl Rgb {
+    pub fn map(self, f: impl Fn(u8) -> u8) -> Rgb {
+        Rgb { r: f(self.r) }
+    }
+    pub fn brighten(self) -> Rgb {
+        self.map(|x| x + 1)
+    }
+}
+
+pub fn from_hex(v: &str) -> Option<u8> {
+    parse_hex(v).map(|x| x * 2)
+}
+`,
+        'src/other.rs': `pub struct Pal { pub v: u8 }
+
+impl Pal {
+    pub fn map(self, f: impl Fn(u8) -> u8) -> Pal {
+        Pal { v: f(self.v) }
+    }
+}
+`,
+    };
+
+    it('chained-receiver call demotes to visible; self call stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/color.rs:6:map' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('src/color.rs:10'),
+                `self.map(...) stays confirmed: ${confirmed}`);
+            assert.ok(!confirmed.includes('src/color.rs:15'),
+                `parse_hex(v).map(...) is Option::map, not Rgb::map: ${confirmed}`);
+            const entry = (json.data.unverifiedCallers || [])
+                .find(u => u.line === 15);
+            assert.ok(entry, `chained call routes VISIBLE, not dropped: ${JSON.stringify(json.data.unverifiedCallers)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});

@@ -22,7 +22,11 @@ const UCN_VERSION = require('../package.json').version;
 // (fix #207).
 // v16: Rust/Go type-alias symbols record aliasOf (fix #208 — alias-qualified
 // receivers are the aliased type); Go `type A = B` aliases now indexed.
-const CACHE_FORMAT_VERSION = 16;
+// v17: TS type-alias symbols record aliasOf (fix #208 TS parity — alias-
+// annotated receivers validate against the aliased type).
+// v18: Go callback references carry localShadow (fix #203 Go parity —
+// func-literal params and block locals shadow bare-identifier references).
+const CACHE_FORMAT_VERSION = 18;
 
 /**
  * Save index to cache file

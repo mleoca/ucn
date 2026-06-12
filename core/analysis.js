@@ -2637,4 +2637,8 @@ module.exports = {
     unquoteDiffPath,
     auditAsync,
     tagInTestCase,
+    // Exported for tests: with the callback-gate fix every natural producer
+    // of call-not-resolved is closed — the listing contract (counted ⇒
+    // listed) is pinned directly since no fixture can reach it end-to-end.
+    callNotResolvedEntries,
 };

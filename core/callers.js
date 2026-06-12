@@ -401,12 +401,15 @@ function findCallers(index, name, options = {}) {
                     const cbTargetDefs = options.targetDefinitions || definitions;
 
                     // Go unexported visibility: lowercase functions are package-private.
-                    // Only allow callers from the same package directory.
+                    // Only allow callers from the same package directory. Recorded
+                    // with reason (not a silent drop) — same disposition as the
+                    // plain-call visibility gate below.
                     if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[a-z]/.test(name)) {
                         const targetPkgDirs = new Set(
                             cbTargetDefs.filter(d => d.file).map(d => path.dirname(d.file))
                         );
                         if (targetPkgDirs.size > 0 && !targetPkgDirs.has(path.dirname(filePath))) {
+                            recordExcluded(filePath, call.line, 'out-of-scope-package');
                             continue;
                         }
                     }
@@ -442,8 +445,34 @@ function findCallers(index, name, options = {}) {
                             if (td.className) targetTypes.add(td.className);
                             if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
                         }
-                        if (targetTypes.size > 0 && call.receiver && call.receiverType) {
-                            if (!targetTypes.has(call.receiverType)) continue;
+                        if (targetTypes.size > 0 && call.receiver && call.receiverType &&
+                            !targetTypes.has(call.receiverType)) {
+                            // Raw-set mismatch — check the CLOSED set (aliases +
+                            // non-overriding subtypes incl. Go embedding) before
+                            // disposing: a reference through a promoting outer
+                            // type or a type alias IS the target's method.
+                            if (!dispatchTargetTypes(cbTargetDefs).has(call.receiverType)) {
+                                // A method VALUE binds at the receiver's static
+                                // type: a typed receiver that is neither the
+                                // target type nor below it denotes ANOTHER
+                                // type's method — excluded with reason, unless
+                                // the type can virtually dispatch into the
+                                // target (interface receiver), which routes
+                                // visible possible-dispatch. Was a silent drop:
+                                // the ground line surfaced as call-not-resolved
+                                // (grpc-go/cursive-measured).
+                                if (collectAccount) {
+                                    if (_dispatchCapableSupertype(index, fileEntry.language, call.receiverType, cbTargetDefs, definitions)) {
+                                        routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                            dispatchVia: call.receiverType,
+                                            dispatchCandidates: countDispatchCandidates(call.receiverType),
+                                        });
+                                    } else {
+                                        recordExcluded(filePath, call.line, 'receiver-type-mismatch');
+                                    }
+                                }
+                                continue;
+                            }
                         }
                         // Under the account contract, a qualified reference
                         // whose receiver is neither an imported package
@@ -741,16 +770,27 @@ function findCallers(index, name, options = {}) {
                                 // may run the target override). self.path() inside
                                 // StandardImpl resolves to StandardImpl::path — not
                                 // a caller of a pinned target Haystack::path.
-                                // NOMINAL languages only: the exclusion is sound only
-                                // when the inheritance graph is complete; structural
-                                // TS hierarchies hide edges UCN can't see (zod's
+                                // NOMINAL languages + Python: the exclusion is sound
+                                // only when the inheritance graph is complete; TS
+                                // hierarchies hide edges UCN can't see (zod's
                                 // `declare class` merging — measured: the structural
-                                // guard excluded true callers).
-                                if (langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                                // guard excluded true callers). Python's recorded
+                                // bases are reliable, but MRO adds a trap nominal
+                                // languages lack: `self.method()` inside Mixin can
+                                // dispatch to a CO-PARENT's method through a common
+                                // subclass (class C(Target, Mixin) — C's MRO finds
+                                // Target.method before Mixin's). Exclusion therefore
+                                // also requires that the matched class and the
+                                // target's class share no project descendant.
+                                const sameClassTraits = langTraits(fileEntry.language);
+                                if (sameClassTraits?.typeSystem === 'nominal' ||
+                                    fileEntry.language === 'python') {
                                     const tDefs = options.targetDefinitions || definitions;
                                     const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
                                     if (!targetClasses.has(matchedClass) &&
-                                        !_isAncestorOfTargetClass(index, matchedClass, tDefs)) {
+                                        !_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
+                                        !(fileEntry.language === 'python' &&
+                                            _shareProjectDescendant(index, matchedClass, targetClasses))) {
                                         recordExcluded(filePath, call.line, 'other-definition');
                                         continue;
                                     }
@@ -1470,7 +1510,19 @@ function findCallers(index, name, options = {}) {
                 // (attributed via the declared supertype), an untyped receiver
                 // against multiple owners is 'method-ambiguous'. Nothing is
                 // dropped: conservation holds, the entries move tiers.
-                if (collectAccount && call.isMethod && !bindingId && !resolvedBySameClass &&
+                // A binding matched from a bare-name lookup is receiver-blind:
+                // method calls resolve through their RECEIVER in every supported
+                // language, never through file scope — a same-file def or import
+                // of the name says nothing about what `parse_hex(v).map(...)` or
+                // `self.inner.next()` dispatches to (cursive-measured: 9 of 11
+                // method FPs were chained/field-rooted calls confirmed
+                // exact-binding against Rgb::map / Iterator-impl next / V::draw).
+                // Such calls must earn the confirmed tier through receiver
+                // evidence — route them through the dispatch tiering below.
+                // Self-receiver calls are not affected (same-class resolution
+                // owns them); captured-receiver calls never bound (skipLocalBinding).
+                const receiverBlindBinding = !!bindingId && call.isMethod && !call.receiver;
+                if (collectAccount && call.isMethod && (!bindingId || receiverBlindBinding) && !resolvedBySameClass &&
                     !receiverTypeValidated && !nominalInferredMatch &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     const tTypes = dispatchTargetTypes(targetDefs2);
@@ -1529,7 +1581,7 @@ function findCallers(index, name, options = {}) {
                 // bare call against pure method targets (a bare name cannot
                 // denote a method in JS/TS/Python — only a rebound alias can,
                 // which has no evidence here either).
-                if (collectAccount && !bindingId && !resolvedBySameClass &&
+                if (collectAccount && (!bindingId || receiverBlindBinding) && !resolvedBySameClass &&
                     !receiverTypeValidated &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     // Module-qualified calls (z.string(), ns.helper()) are
@@ -3083,6 +3135,47 @@ function _isAncestorOfTargetClass(index, typeName, targetDefs) {
                 const parentFile = index._resolveClassFile ? index._resolveClassFile(parent, file) : file;
                 queue.push({ name: parent, file: parentFile });
             }
+        }
+    }
+    return false;
+}
+
+/**
+ * Do two classes share a project descendant (Python #202b guard)? With
+ * multiple inheritance, `self.method()` inside Mixin dispatches through
+ * type(self).__mro__ — a class C(Target, Mixin) looks the method up on
+ * Target BEFORE Mixin, so a sibling-class exclusion is only sound when no
+ * project class inherits from both sides. Conservative: any common
+ * descendant keeps the edge regardless of MRO order.
+ */
+function _collectDescendants(index, className, cap = 256) {
+    const out = new Set([className]);
+    const queue = [className];
+    while (queue.length > 0 && out.size < cap) {
+        const children = index.extendedByGraph?.get(queue.pop());
+        if (!children) continue;
+        for (const child of children) {
+            const cName = typeof child === 'string' ? child : child.name;
+            if (!cName || out.has(cName)) continue;
+            out.add(cName);
+            queue.push(cName);
+        }
+    }
+    return out;
+}
+
+function _shareProjectDescendant(index, className, targetClasses) {
+    if (!targetClasses || targetClasses.size === 0) return false;
+    const mine = _collectDescendants(index, className);
+    for (const t of targetClasses) {
+        const theirs = _collectDescendants(index, t);
+        // matchedClass BELOW the target: every descendant's MRO finds the
+        // matched override before the target (subclass precedes superclass
+        // in C3) — the target def is unreachable from this site, exclusion
+        // stands. Not an MRO trap.
+        if (theirs.has(className)) continue;
+        for (const d of theirs) {
+            if (mine.has(d)) return true;
         }
     }
     return false;
