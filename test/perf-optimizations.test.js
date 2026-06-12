@@ -1088,6 +1088,25 @@ describe('index reliability: parallel build equals sequential build', () => {
             'impl Greet for Greeter {',
             '    fn hello(&self) -> String { String::from("hi") }',
             '}',
+            'pub fn lit() -> usize { "abc".parse().unwrap() }',
+            'pub fn chain(g: Greeter) -> usize { g.hello().len() }',
+        ].join('\n');
+        // fix #220 call-field shapes: Go chained receivers
+        // (receiverCall/receiverCallIsMethod/receiverCallReceiver),
+        // var-decl/new(T) receiver types, tuple-rest names.
+        spec['rich3.go'] = [
+            'package rich3',
+            'import "bytes"',
+            'type Cmd struct{}',
+            'func (c *Cmd) Flags() *bytes.Buffer { return nil }',
+            'func use(c *Cmd) string {',
+            '\tvar sb bytes.Buffer',
+            '\tbuf := new(bytes.Buffer)',
+            '\tv, err := pair()',
+            '\t_, _ = v, err',
+            '\treturn c.Flags().String() + sb.String() + buf.String()',
+            '}',
+            'func pair() (int, error) { return 0, nil }',
         ].join('\n');
         const dir = tmp(spec);
         try {

@@ -2609,3 +2609,262 @@ describe('fix #211: deadcode — Rust trait declarations and pub control', () =>
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #220 (Rust): literal receivers, sibling-impl overload ambiguity,
+// generic-param identity, paren-less member access, dot-call kind discipline,
+// path-call type identity (ripgrep/cursive seed-B-measured)
+// ============================================================================
+describe('fix #220 (Rust): receiver physics and sibling impls', () => {
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}:${u.reason}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('string-literal receivers are str — never a project method', () => {
+        // ripgrep: "match:fg:magenta".parse().unwrap() confirmed against the
+        // project's parse method via scope evidence.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': `pub struct Spec;
+
+impl Spec {
+    pub fn parse(&self, s: &str) -> usize { s.len() }
+}
+
+pub fn check() -> usize {
+    let n: usize = "match:fg".parse().unwrap();
+    n
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const m = contractCallers(index, 'src/lib.rs:4:parse');
+            assert.ok(!m.confirmed.includes('src/lib.rs:8'),
+                `"...".parse() is str::parse: ${m.confirmed}`);
+            assert.strictEqual(m.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('same-type sibling impls route overload-ambiguous (class-level evidence only)', () => {
+        // cursive: impl From<Color> for ColorStyle ×4 — ColorStyle::from(x)
+        // proves SOME from, never the pinned impl block's.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/style.rs': `pub struct ColorStyle;
+pub struct Color;
+pub struct Palette;
+
+impl From<Color> for ColorStyle {
+    fn from(c: Color) -> Self { ColorStyle }
+}
+
+impl From<Palette> for ColorStyle {
+    fn from(p: Palette) -> Self { ColorStyle }
+}
+`,
+            'src/use_site.rs': `use crate::style::{Color, ColorStyle};
+
+pub fn apply(color: Color) -> ColorStyle {
+    ColorStyle::from(color)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const m = contractCallers(index, 'src/style.rs:6:from');
+            assert.ok(!m.confirmed.includes('src/use_site.rs:4'),
+                `sibling impls make the pin ambiguous: ${m.confirmed}`);
+            assert.ok(m.unverified.some(u => u === 'src/use_site.rs:4:overload-ambiguous'),
+                `routed visible overload-ambiguous: ${JSON.stringify(m.unverified)}`);
+            assert.strictEqual(m.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('generic-param field types and blanket-impl class names are not identity', () => {
+        // cursive: impl<T: ViewWrapper> View for T records className 'T';
+        // LastSizeView's field `view: T` must not "validate" T==T.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/view.rs': `pub trait Wrapper {
+    fn unwrap_it(&self) -> usize;
+}
+
+pub trait View {
+    fn layout(&mut self, n: usize) {}
+}
+
+impl<T: Wrapper> View for T {
+    fn layout(&mut self, n: usize) { let _ = n; }
+}
+
+pub struct Sized2 {
+    pub size: usize,
+}
+
+impl View for Sized2 {
+    fn layout(&mut self, n: usize) { self.size = n; }
+}
+`,
+            'src/wrap.rs': `pub struct Holder<T> {
+    pub view: T,
+}
+
+impl<T> Holder<T> {
+    pub fn wrap_layout(&mut self, n: usize) {
+        self.view.layout(n);
+    }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const m = contractCallers(index, 'src/view.rs:10:layout');
+            assert.ok(!m.confirmed.includes('src/wrap.rs:7'),
+                `generic field hop must not confirm the blanket impl: ${m.confirmed}`);
+            assert.ok(m.unverified.some(u => u.startsWith('src/wrap.rs:7:')),
+                `routed visible: ${JSON.stringify(m.unverified)}`);
+            assert.strictEqual(m.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('paren-less member access is a field, never a method', () => {
+        // ripgrep: builder.strip(self.paths.has_implicit_path) — Rust method
+        // values are path-only; x.name without parens is always the field.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': `pub struct Paths {
+    pub has_implicit: bool,
+}
+
+pub struct Args {
+    pub paths: Paths,
+}
+
+impl Args {
+    pub fn has_implicit(&self) -> bool { self.paths.has_implicit }
+
+    pub fn builder(&self) -> bool {
+        strip(self.paths.has_implicit)
+    }
+}
+
+pub fn strip(b: bool) -> bool { !b }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const m = contractCallers(index, 'src/lib.rs:10:has_implicit');
+            assert.ok(!m.confirmed.includes('src/lib.rs:13'),
+                `paren-less access denotes the field: ${m.confirmed}`);
+            assert.strictEqual(m.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a dot-call never binds a standalone function, even with a name binding', () => {
+        // ripgrep: .preprocessor_globs(...) confirmed exact-binding against
+        // the same-file FUNCTION — Rust needs (s.f)() parens for that.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': `pub struct Builder;
+
+impl Builder {
+    pub fn build(&self) -> usize {
+        self.glob_set(3)
+    }
+
+    fn glob_set(&self, n: usize) -> usize { n }
+}
+
+pub fn glob_other() {
+    let b = Builder;
+    b.build();
+}
+
+pub fn globs(n: usize) -> usize { globs_inner(n) }
+
+fn globs_inner(n: usize) -> usize { n }
+`,
+            'src/hi.rs': `pub struct HiArgs {
+    pub n: usize,
+}
+
+impl HiArgs {
+    pub fn assemble(&self) -> usize {
+        self.globs2(self.n)
+    }
+
+    fn globs2(&self, n: usize) -> usize { n }
+}
+
+pub fn globs2(n: usize) -> usize { n }
+`,
+        });
+        try {
+            const index = idx(dir);
+            // pinned FUNCTION globs2 — the dot-call self.globs2(...) can
+            // never reach it (method exists; even if it didn't, dot-calls
+            // don't bind free functions)
+            const fn2 = contractCallers(index, 'src/hi.rs:13:globs2');
+            assert.ok(!fn2.confirmed.includes('src/hi.rs:7'),
+                `dot-call cannot bind the free function: ${fn2.confirmed}`);
+            assert.strictEqual(fn2.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('path-call receivers resolve type identity to the target package', () => {
+        // ripgrep: each crate defines its own Config — printer's
+        // Config::default() never confirms core's Config.default.
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/core/search.rs': `pub struct Config {
+    pub n: usize,
+}
+
+impl Config {
+    pub fn fresh() -> Config { Config { n: 0 } }
+}
+
+pub fn local_use() -> Config {
+    Config::fresh()
+}
+`,
+            'src/printer/json.rs': `pub struct Config {
+    pub pretty: bool,
+}
+
+impl Config {
+    pub fn fresh() -> Config { Config { pretty: false } }
+}
+
+pub struct JSONBuilder {
+    config: Config,
+}
+
+impl JSONBuilder {
+    pub fn new() -> JSONBuilder {
+        JSONBuilder { config: Config::fresh() }
+    }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const core = contractCallers(index, 'src/core/search.rs:6:fresh');
+            assert.ok(!core.confirmed.includes('src/printer/json.rs:15'),
+                `printer's Config is a different type: ${core.confirmed}`);
+            assert.ok(core.confirmed.includes('src/core/search.rs:10'),
+                `same-file Config::fresh() keeps confirming: ${core.confirmed}`);
+            assert.strictEqual(core.conserved, true);
+        } finally { rm(dir); }
+    });
+});

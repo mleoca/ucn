@@ -2301,7 +2301,10 @@ describe('fix #182: Go package-qualified calls marked isMethod: false', () => {
     it('pkg.Func() should not be isMethod when receiver is import alias', () => {
         const dir = tmp({
             'go.mod': 'module example.com/test\ngo 1.21',
-            'util.go': `package util
+            // util must live in util/ — a `package util` file in the module
+            // root is invalid Go, and the #220 go.mod identity check now
+            // correctly refuses root-package targets for subpackage imports.
+            'util/util.go': `package util
 func Get() string { return "ok" }
 `,
             'main.go': `package main
@@ -5230,6 +5233,248 @@ describe('fix #211: deadcode — Go interface markers and capitalization control
             // Struct methods are executable code — no declaredOn label
             const helper = index.deadcode({}).find(d => d.name === 'deadHelper');
             assert.strictEqual(helper.declaredOn, undefined);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #220: nominal chained receivers, external producers, Go typing sources,
+// bare-name/method kind discipline, go.mod root-package identity
+// (cobra/grpc-go seed-B-measured)
+// ============================================================================
+describe('fix #220 (Go): chained receivers + external producers + kind discipline', () => {
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || json.data.usages || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason, dispatchVia: u.dispatchVia,
+            })),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('chained receiver typed from the producer return annotation (external → excluded, project → confirmed)', () => {
+        // cobra: rootCmd.Flags().String(...) — Flags() returns *pflag.FlagSet
+        // (external) — never customMultiString.String. A project-returning
+        // producer keeps confirming.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'value.go': `package m
+
+type customValue struct{}
+
+func (customValue) String() string { return "v" }
+
+type Builder struct{}
+
+func (Builder) String() string { return "b" }
+`,
+            'cmd.go': `package m
+
+import "github.com/external/pflag"
+
+type Command struct{}
+
+func (c *Command) Flags() *pflag.FlagSet { return nil }
+
+func (c *Command) Mine() Builder { return Builder{} }
+
+func register(c *Command) {
+	c.Flags().String("name")
+}
+
+func project(c *Command) {
+	c.Mine().String()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cv = contractCallers(index, 'value.go:5:String');
+            assert.ok(!cv.confirmed.includes('cmd.go:12'),
+                `Flags() returns external *pflag.FlagSet: ${cv.confirmed}`);
+            assert.strictEqual(cv.conserved, true);
+            const b = contractCallers(index, 'value.go:9:String');
+            assert.ok(b.confirmed.includes('cmd.go:16'),
+                `Mine() returns project Builder — chained call confirms: ${b.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('var-declared and new(T) receivers carry their compile-time type', () => {
+        // cobra: var sb strings.Builder / buf := new(bytes.Buffer) —
+        // sb.String()/buf.String() are never a project String.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'value.go': `package m
+
+type customValue struct{}
+
+func (customValue) String() string { return "v" }
+`,
+            'use.go': `package m
+
+import (
+	"bytes"
+	"strings"
+)
+
+func render() string {
+	var sb strings.Builder
+	buf := new(bytes.Buffer)
+	return sb.String() + buf.String()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cv = contractCallers(index, 'value.go:5:String');
+            assert.ok(!cv.confirmed.includes('use.go:11'),
+                `typed receivers must not confirm: ${cv.confirmed}`);
+            assert.strictEqual(cv.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('external-producer receivers route possible-dispatch, never confirm via single owner', () => {
+        // cobra: av := reflect.ValueOf(a); av.String() — the type was decided
+        // outside the project. Tuple elements beyond the first too:
+        // f, err := os.CreateTemp(...); err.Error().
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'value.go': `package m
+
+type customValue struct{}
+
+func (customValue) String() string { return "v" }
+
+func (customValue) Error() string { return "e" }
+`,
+            'use.go': `package m
+
+import (
+	"os"
+	"reflect"
+)
+
+func compare(a interface{}) string {
+	av := reflect.ValueOf(a)
+	return av.String()
+}
+
+func tempfile() string {
+	f, err := os.CreateTemp("", "x")
+	_ = f
+	return err.Error()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cv = contractCallers(index, 'value.go:5:String');
+            assert.ok(!cv.confirmed.includes('use.go:10'),
+                `reflect.ValueOf receiver must not confirm: ${cv.confirmed}`);
+            assert.ok(cv.unverified.some(u => u.key === 'use.go:10' && u.reason === 'possible-dispatch'),
+                `routed visible: ${JSON.stringify(cv.unverified)}`);
+            const ce = contractCallers(index, 'value.go:7:Error');
+            assert.ok(!ce.confirmed.includes('use.go:16'),
+                `tuple-second err from os.CreateTemp must not confirm: ${ce.confirmed}`);
+            assert.strictEqual(ce.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a bare call cannot invoke a method — binds the package function', () => {
+        // cobra: func (c *Command) MarkFlagDirname calls the package FUNCTION
+        // MarkFlagDirname — the method pin gets other-definition, the
+        // function pin keeps the caller.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'flags.go': `package m
+
+type Command struct{}
+
+func (c *Command) MarkDir(name string) error {
+	return MarkDir(nil, name)
+}
+
+func MarkDir(flags interface{}, name string) error { return nil }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const method = contractCallers(index, 'flags.go:5:MarkDir');
+            assert.ok(!method.confirmed.includes('flags.go:6'),
+                `bare call cannot reach the method: ${method.confirmed}`);
+            assert.strictEqual(method.conserved, true);
+            const fn = contractCallers(index, 'flags.go:9:MarkDir');
+            assert.ok(fn.confirmed.includes('flags.go:6'),
+                `the bare call denotes the function: ${fn.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('a bare identifier reference cannot denote a method (argument position)', () => {
+        // grpc-go: balancer.Get(Name) references the package const Name,
+        // never the pinned method Name().
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'balancer.go': `package m
+
+const Name = "experimental"
+
+type bb struct{}
+
+func (bb) Name() string { return Name }
+
+func Get(n string) int { return len(n) }
+
+func register() int {
+	return Get(Name)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const m = contractCallers(index, 'balancer.go:7:Name');
+            assert.ok(!m.confirmed.includes('balancer.go:12'),
+                `bare Name in argument position is the const: ${m.confirmed}`);
+            assert.strictEqual(m.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('go.mod module identity: external package-qualified calls never confirm root-package types', () => {
+        // cobra: exec.Command("shellcheck", ...) on import "os/exec" is not a
+        // usage of the root package's Command type; the module self-import
+        // keeps confirming.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'command.go': 'package m\n\ntype Command struct{ Use string }\n',
+            'tool/tool.go': `package tool
+
+import (
+	"os/exec"
+
+	root "example.com/m"
+)
+
+func run() {
+	cmd := exec.Command("ls", "-la")
+	_ = cmd
+	c := root.Command{Use: "x"}
+	_ = c
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cls = contractCallers(index, 'command.go:3:Command');
+            assert.ok(!cls.confirmed.includes('tool/tool.go:10'),
+                `os/exec's Command is external: ${cls.confirmed}`);
+            assert.ok(cls.confirmed.includes('tool/tool.go:12'),
+                `the module self-import keeps confirming root defs: ${cls.confirmed}`);
+            assert.strictEqual(cls.conserved, true);
         } finally { rm(dir); }
     });
 });

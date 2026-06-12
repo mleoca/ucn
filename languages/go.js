@@ -621,9 +621,18 @@ function goAssignmentTargetOf(callNode) {
     }
     const target = names[0];
     if (target?.type !== 'identifier' || target.text === '_') return undefined;
-    return names.length > 1
-        ? { assignedTo: target.text, assignedTuple: true }
-        : { assignedTo: target.text };
+    if (names.length > 1) {
+        // All LHS names (fix #220): an EXTERNAL producer decides every tuple
+        // element's type, not just the first — `tmpFile, err := os.CreateTemp`
+        // marks err external-flow too. The TYPED flow keeps pairing only
+        // element 0 with the producer's return tuple (#207).
+        const rest = names.slice(1)
+            .filter(t => t.type === 'identifier' && t.text !== '_')
+            .map(t => t.text);
+        return { assignedTo: target.text, assignedTuple: true,
+            ...(rest.length > 0 && { assignedTupleRest: rest }) };
+    }
+    return { assignedTo: target.text };
 }
 
 function findCallsInCode(code, parser, options = {}) {
@@ -964,10 +973,55 @@ function findCallsInCode(code, parser, options = {}) {
                                 if (callName && /^New[A-Z]/.test(callName)) {
                                     typeName = callName.slice(3);
                                     if (!typeName || !/^[A-Z]/.test(typeName)) typeName = null;
+                                } else if (callFuncNode.type === 'identifier' &&
+                                    callFuncNode.text === 'new') {
+                                    // buf := new(bytes.Buffer) — the builtin
+                                    // allocator returns *T (fix #220,
+                                    // cobra-measured: buf.String() is
+                                    // bytes.Buffer's, never a project method).
+                                    // The argument parses as an expression:
+                                    // identifier or selector_expression.
+                                    const args = val.childForFieldName('arguments');
+                                    const argNode = args && args.namedChild(0);
+                                    if (argNode) {
+                                        typeName = argNode.type === 'identifier'
+                                            ? argNode.text
+                                            : argNode.type === 'selector_expression'
+                                                ? argNode.childForFieldName('field')?.text || null
+                                                : extractTypeName(argNode);
+                                    }
                                 }
                             }
                         }
                         if (typeName) typeMap.set(names[vi], typeName);
+                    }
+                }
+            }
+        }
+
+        // Explicitly typed var declarations: `var buf bytes.Buffer`,
+        // `var sb strings.Builder` (fix #220, cobra-measured — sb.String()
+        // on an untyped receiver fell to single-owner confirmation). Same
+        // semantics as parameter annotations: the declared type is the
+        // receiver's compile-time type.
+        if (node.type === 'var_declaration' && functionStack.length > 0) {
+            const scopeKey = functionStack[functionStack.length - 1].startLine;
+            const varTypeMap = scopeTypes.get(scopeKey);
+            if (varTypeMap) {
+                const recordSpec = (spec) => {
+                    if (spec.type !== 'var_spec') return;
+                    const typeName = extractTypeName(spec.childForFieldName('type'));
+                    if (!typeName) return;
+                    for (let j = 0; j < spec.namedChildCount; j++) {
+                        const id = spec.namedChild(j);
+                        if (id.type === 'identifier') varTypeMap.set(id.text, typeName);
+                    }
+                };
+                for (let i = 0; i < node.namedChildCount; i++) {
+                    const c = node.namedChild(i);
+                    if (c.type === 'var_spec') recordSpec(c);
+                    else if (c.type === 'var_spec_list') {
+                        for (let j = 0; j < c.namedChildCount; j++) recordSpec(c.namedChild(j));
                     }
                 }
             }
@@ -1070,6 +1124,7 @@ function findCallsInCode(code, parser, options = {}) {
                     ...(argSpread && { argSpread: true }),
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.assignedTuple && { assignedTuple: true }),
+                        ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -1099,6 +1154,30 @@ function findCallsInCode(code, parser, options = {}) {
                             receiverRootType = getReceiverType(rootNode.text);
                         }
                     }
+                    // Chained receiver (fix #220, cobra-measured): the receiver
+                    // IS a call — rootCmd.Flags().String(...) — record the
+                    // producer so findCallers can type the receiver from its
+                    // declared return (*pflag.FlagSet → external → routed).
+                    // Package-qualified producers (os.CreateTemp().Name())
+                    // carry the qualifier for strict import-package resolution.
+                    let receiverCall, receiverCallIsMethod, receiverCallReceiver;
+                    if (!receiver && !receiverFieldName && operandNode?.type === 'call_expression') {
+                        const prodFunc = operandNode.childForFieldName('function');
+                        if (prodFunc?.type === 'identifier') {
+                            receiverCall = prodFunc.text;
+                        } else if (prodFunc?.type === 'selector_expression') {
+                            const pf = prodFunc.childForFieldName('field');
+                            const po = prodFunc.childForFieldName('operand');
+                            if (pf) {
+                                receiverCall = pf.text;
+                                if (po?.type === 'identifier' && importAliases.has(po.text)) {
+                                    receiverCallReceiver = po.text;
+                                } else {
+                                    receiverCallIsMethod = true;
+                                }
+                            }
+                        }
+                    }
                     const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: fieldNode.text,
@@ -1108,10 +1187,14 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverType && { receiverType }),
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                        ...(receiverCall && { receiverCall }),
+                        ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+                        ...(receiverCallReceiver && { receiverCallReceiver }),
                         argCount,
                         ...(argSpread && { argSpread: true }),
                         ...(assigned && { assignedTo: assigned.assignedTo }),
                         ...(assigned?.assignedTuple && { assignedTuple: true }),
+                        ...(assigned?.assignedTupleRest && { assignedTupleRest: assigned.assignedTupleRest }),
                         enclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })

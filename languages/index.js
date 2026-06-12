@@ -30,6 +30,16 @@ const STRUCTURAL_TRAITS = {
     // captured as modifiers) or capitalization rules (Go) set false: there
     // the member's own marker decides.
     implicitlyPublicMembers: true,
+    // A bare (receiver-less) name can never denote a METHOD here — JS/Python
+    // methods are reached through their receiver; only a rebound alias could,
+    // which is separate name-level evidence. Java sets true: `execute()`
+    // inside a class means this.execute(), and static imports bind foreign
+    // class methods to bare names (fix #220).
+    bareCallReachesMethods: false,
+    // A method-shaped call CAN reach a standalone function here: attribute
+    // assignment rebinds functions onto objects (obj.print = print), so the
+    // #218b gate routes such calls visible instead of excluding (fix #220).
+    methodCallReachesFunctions: true,
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
@@ -69,6 +79,28 @@ const NOMINAL_TRAITS = {
     // supertype. Structural languages: null — any/object/unknown receivers
     // are already refused as exclusion evidence by the trust gate.
     universalSupertype: null,
+    // A bare (receiver-less) call or reference can never denote a METHOD:
+    // Go method values/expressions require an explicit receiver or type
+    // qualifier (m.Helper(), T.Helper); Rust requires self./Type:: and `use`
+    // cannot import associated functions. A bare MarkFlagDirname(...) inside
+    // Command.MarkFlagDirname denotes the package FUNCTION (fix #220,
+    // cobra/grpc-go-measured). Java overrides true (implicit this-calls,
+    // static imports).
+    bareCallReachesMethods: false,
+    // Whether a method-shaped call (x.f()) can reach a standalone FUNCTION:
+    // Go func-typed fields are name-callable (s.Run() may invoke a stored
+    // function), so exclusion needs !bindingId there; Rust requires (s.f)()
+    // parens and Java requires .apply() — a dot-call provably never binds a
+    // free function (fix #220, ripgrep-measured).
+    methodCallReachesFunctions: false,
+    // Whether a paren-less member access (x.name) can denote a METHOD. Rust
+    // sets true for the inverse — `x.name` is ALWAYS a field there (method
+    // values are path-only: Type::method), so a member-access reference
+    // against a method target is excluded (fix #220, ripgrep-measured:
+    // `self.paths.has_implicit_path` is the bool FIELD, not the method).
+    // Go method values (obj.Method) and Java `::` references DO denote
+    // methods — false. Per-language override, not preset-wide.
+    memberAccessNeverMethod: false,
 };
 
 // Language configurations
@@ -139,6 +171,7 @@ const LANGUAGES = {
             exportVisibility: 'capitalization',
             hasDynamicImports: false,
             typeQualifiedCallStyle: 'method-expr',
+            methodCallReachesFunctions: true,
             testFileCandidates: (base, ext) => [`${base}_test.go`],
         },
     },
@@ -153,6 +186,7 @@ const LANGUAGES = {
             selfParam: ['self', '&self', '&mut self', 'mut self'],
             hasDynamicImports: false,
             typeQualifiedCallStyle: 'path',
+            memberAccessNeverMethod: true,
             testFileCandidates: (base, ext) => [`${base}_test.rs`],
             testDirs: ['tests'],
         },
@@ -169,6 +203,7 @@ const LANGUAGES = {
             allMethodsVirtual: true,
             hasArityOverloads: true,
             universalSupertype: 'Object',
+            bareCallReachesMethods: true,
             testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],
         },
     },

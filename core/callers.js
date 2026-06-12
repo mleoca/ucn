@@ -12,6 +12,7 @@ const { detectLanguage, getParser, getLanguageModule, langTraits } = require('..
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES } = require('./shared');
 const { scoreEdge, tierForResolution, TIER } = require('./confidence');
+const { findGoModule } = require('./imports');
 
 /** Set.some() helper — like Array.some() but for Sets */
 function setSome(set, predicate) {
@@ -417,7 +418,12 @@ function findCallers(index, name, options = {}) {
                         returnFlowCache.set(filePath, flowMap);
                     }
                     const flowEntry = flowMap && _lookupReturnTypeFlow(flowMap, call);
-                    if (flowEntry) {
+                    if (flowEntry && flowEntry.externalVia) {
+                        // External producer (fix #220) — typed outside the
+                        // project; blocks single-owner confirmation, routes
+                        // possible-dispatch in the gate. Nominal-only entries.
+                        call = { ...call, receiverExternalFlow: flowEntry.externalVia };
+                    } else if (flowEntry) {
                         call = { ...call, receiverType: flowEntry.type,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
                     }
@@ -438,6 +444,19 @@ function findCallers(index, name, options = {}) {
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
                     const chainedType = _chainedReceiverType(index, call, fileEntry.language);
                     if (chainedType) call = { ...call, receiverType: chainedType };
+                } else if (call.isMethod && !call.receiver && !call.receiverType && call.receiverCall &&
+                    collectAccount && !call.isPotentialCallback &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal') {
+                    // Nominal chained receivers (fix #220, cobra-measured):
+                    // account-gated like the #207 nominal flow — mismatch
+                    // reroutes are account-only; legacy would silently drop.
+                    const flowEntry = _nominalChainedReceiverType(index, call, fileEntry, filePath);
+                    if (flowEntry && flowEntry.externalVia) {
+                        call = { ...call, receiverExternalFlow: flowEntry.externalVia };
+                    } else if (flowEntry) {
+                        call = { ...call, receiverType: flowEntry.type,
+                            ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
+                    }
                 }
 
                 // For potential callbacks (function passed as arg), validate against symbol table
@@ -489,6 +508,38 @@ function findCallers(index, name, options = {}) {
                                 recordExcluded(filePath, call.line, 'other-definition');
                                 continue;
                             }
+                        }
+                    }
+
+                    // A bare identifier can never denote a METHOD where bare
+                    // names don't reach methods (fix #220, grpc-go-measured:
+                    // `balancer.Get(Name)` references each package's const
+                    // Name, never the pinned method Name() — Go method values
+                    // require receivers, Rust `use` cannot import associated
+                    // functions). Java exempt (static imports). Compiler-grade
+                    // kind evidence — excluded with reason, all surfaces.
+                    if (!call.isMethod && !call.receiver &&
+                        langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                        !langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                        const allMethodTargets = cbTargetDefs.length > 0 && cbTargetDefs.every(d =>
+                            !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver));
+                        if (allMethodTargets) {
+                            recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                            continue;
+                        }
+                    }
+
+                    // A paren-less member access is ALWAYS a field in Rust —
+                    // method values are path-only (Type::method), so
+                    // `self.paths.has_implicit_path` provably denotes the bool
+                    // FIELD, never the method (fix #220, ripgrep-measured).
+                    if (call.isMethod && call.isFunctionReference &&
+                        langTraits(fileEntry.language)?.memberAccessNeverMethod) {
+                        const allMethodTargets = cbTargetDefs.length > 0 && cbTargetDefs.every(d =>
+                            !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver));
+                        if (allMethodTargets) {
+                            recordExcluded(filePath, call.line, 'method-kind-mismatch');
+                            continue;
                         }
                     }
 
@@ -641,6 +692,21 @@ function findCallers(index, name, options = {}) {
                 const skipLocalBinding = call.receiver && !selfReceivers.has(call.receiver);
                 if (!bindingId && !skipLocalBinding) {
                     let bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
+                    // A bare call cannot bind to a METHOD def where bare names
+                    // never reach methods (fix #220, cobra-measured): Go's
+                    // func (c *Command) MarkFlagDirname and func MarkFlagDirname
+                    // coexist in one package — the bare call denotes the
+                    // FUNCTION. Java keeps both (implicit this-calls); the
+                    // structural gates own their kind discipline (#218b).
+                    if (!call.isMethod && bindings.length > 0 &&
+                        langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                        !langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                        const defsOfName = index.symbols.get(call.name) || [];
+                        bindings = bindings.filter(b => {
+                            const sym = defsOfName.find(s => s.file === filePath && s.startLine === b.startLine);
+                            return !(sym && (sym.className || sym.receiver));
+                        });
+                    }
                     // For Go, also check sibling files in same directory (same package scope)
                     if (bindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(filePath);
@@ -1129,7 +1195,18 @@ function findCallers(index, name, options = {}) {
                 // and cli.Run() (package call, isMethod:false) from matching DeploymentController.Run.
                 // Rust path calls (module::func(), Type::new()) bypass this filter — they're
                 // scoped_identifier calls that can target both standalone functions and impl methods.
-                if (!bindingId && !resolvedBySameClass && !call.isPathCall &&
+                // The binding guard is per-direction (fix #220): a name binding
+                // is receiver-blind, so it cannot make x.f() reach a standalone
+                // function in languages whose dot-calls provably never do (Rust
+                // needs (s.f)() parens — ripgrep's `.preprocessor_globs(...)`
+                // bound the same-file FUNCTION def). Go keeps !bindingId there:
+                // func-typed fields ARE name-callable. The bare-call direction
+                // keeps !bindingId — the upstream binding filter already
+                // re-resolves those to function defs where methods are
+                // unreachable.
+                if ((!bindingId || (call.isMethod &&
+                        !langTraits(fileEntry.language)?.methodCallReachesFunctions)) &&
+                    !resolvedBySameClass && !call.isPathCall &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     const targetHasClass = targetDefs.some(d => d.className);
                     if (call.isMethod && !targetHasClass) {
@@ -1346,7 +1423,15 @@ function findCallers(index, name, options = {}) {
                     const targetTypes = dispatchTargetTypes(targetDefs);
                     if (targetTypes.size > 0) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
-                        const knownType = call.receiverType || fieldHopType;
+                        // Generic type parameters by convention are not type
+                        // identity in EITHER direction (fix #220): a receiver
+                        // typed 'T' neither validates against a blanket-impl
+                        // target named 'T' nor excludes a concrete target —
+                        // T may be instantiated with anything. A short-caps
+                        // name with a real project type def is a class.
+                        let knownType = call.receiverType || fieldHopType;
+                        if (knownType && /^[A-Z][A-Z0-9]?$/.test(knownType) &&
+                            !(index.symbols.get(knownType) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) knownType = null;
                         if (knownType) {
                             const viaFieldHop = !call.receiverType; // declared-field hop (fix #202)
                             // Exclusion requires an UNRELATED type. A receiver typed
@@ -1509,9 +1594,46 @@ function findCallers(index, name, options = {}) {
                             // heuristic: `storage.save()` on a field declared `Storage`
                             // is a dispatch edge, not a case-insensitive name accident —
                             // skip the fallback and let the dispatch tiering route it.
-                            if (!inferredMatch && !inferredMismatch && definitions.length > 1 && !fieldDispatchType) {
+                            // call.receiver guard: a generic-param knownType
+                            // (fix #220) reaches here receiver-less — there is
+                            // no receiver NAME to match against.
+                            if (call.receiver && !inferredMatch && !inferredMismatch && definitions.length > 1 && !fieldDispatchType) {
                                 const receiverLower = call.receiver.toLowerCase();
                                 const matchesTarget = [...targetTypes].some(cn => cn.toLowerCase() === receiverLower);
+                                // Type-qualified identity discipline (fix #220,
+                                // ripgrep-measured): a path-call receiver that
+                                // matches the target type's NAME must also
+                                // resolve (same file → same dir → import edge)
+                                // to the target's package — every ripgrep crate
+                                // defines its own `Config`, and printer's
+                                // Config::default() name-matches core's Config
+                                // while provably denoting the same-file struct.
+                                // Path style only: a Go/Java receiver named
+                                // like the type may be a VARIABLE (#206b) —
+                                // its type is unknown, identity proves nothing.
+                                if (matchesTarget && call.isPathCall &&
+                                    langTraits(fileEntry.language)?.typeQualifiedCallStyle === 'path') {
+                                    const identity = _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs);
+                                    if (identity === 'other') {
+                                        isUncertain = true;
+                                        typeMismatch = true;
+                                        if (collectAccount) {
+                                            recordExcluded(filePath, call.line, 'path-type-mismatch');
+                                            continue;
+                                        }
+                                        if (!options.includeUncertain) {
+                                            if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                            continue;
+                                        }
+                                    } else if (identity === 'unknown' && collectAccount) {
+                                        // Unresolvable identity never confirms,
+                                        // never excludes (#206).
+                                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                            dispatchCandidates: methodOwnerKeys().size,
+                                        });
+                                        continue;
+                                    }
+                                }
                                 if (!matchesTarget) {
                                     // Rust/Go path calls (Type::method() / pkg.Method()): receiver IS the type name
                                     // If it doesn't match target, it's definitely a different type — filter it
@@ -1711,7 +1833,42 @@ function findCallers(index, name, options = {}) {
                         if (qualStyle === 'path') typeQualifiedReceiver = !!call.isPathCall;
                         else if (qualStyle === 'method-expr') typeQualifiedReceiver = call.argCount == null || call.argCount >= 1;
                     }
+                    // Identity discipline on the qualified shape itself (fix
+                    // #220): a genuinely type-qualified call still only NAMES
+                    // the type — the name must resolve to the target's package
+                    // (every ripgrep crate defines a `Config`). 'other' is
+                    // compiler-grade evidence for a different type; 'unknown'
+                    // never confirms and never excludes (#206). The receiver-
+                    // name fallback above handles multi-definition names; this
+                    // covers single-definition targets that skip it.
+                    if (typeQualifiedReceiver) {
+                        const identity = _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs2);
+                        if (identity === 'other') {
+                            recordExcluded(filePath, call.line, 'path-type-mismatch');
+                            continue;
+                        }
+                        if (identity === 'unknown') {
+                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                dispatchCandidates: methodOwnerKeys().size,
+                            });
+                            continue;
+                        }
+                    }
                     if (!typeQualifiedReceiver) {
+                        // External-producer receiver (fix #220): the variable
+                        // was assigned from a call into an external package
+                        // (av := reflect.ValueOf(a)) — its type was decided
+                        // outside the project, so unique project ownership is
+                        // not identity evidence. Visible, never excluded
+                        // (external generic identity functions can return
+                        // project values).
+                        if (call.receiverExternalFlow) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: call.receiverExternalFlow,
+                                externalContract: true,
+                            });
+                            continue;
+                        }
                         // Unresolvable type-name identity (fix #206): the
                         // receiver is typed with a name several distinct types
                         // share, and none resolves from this file's scope —
@@ -1747,6 +1904,55 @@ function findCallers(index, name, options = {}) {
                             routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                 ...(extContract.via && { dispatchVia: extContract.via }),
                                 externalContract: true,
+                            });
+                            continue;
+                        }
+                    }
+                }
+
+                // Sibling-impl overload ambiguity (fix #220, cursive-measured —
+                // the #205 jdtls insight for languages WITHOUT arity-overload
+                // discipline): Rust defines same-name methods on the SAME type
+                // across impl blocks (`impl From<Color> for ColorStyle` ×4;
+                // `impl Rgb<f32>` vs `impl Rgb<u8>` both with as_color).
+                // Class-level receiver evidence — type-qualified path calls,
+                // name-validated receiver types — proves "some ColorStyle::from",
+                // never the pinned one; with an arity-indistinguishable
+                // same-class sibling the call routes visible. Alias-qualified
+                // receivers are exempt: `StyledString::plain` names ONE
+                // instantiation by construction (#208 — the alias carries the
+                // type argument even though UCN's closure is name-level).
+                // Go cannot compile same-class same-name siblings; Java runs
+                // its own #205 argKinds discipline (hasArityOverloads).
+                if (collectAccount && call.isMethod && !resolvedBySameClass &&
+                    (!bindingId || receiverBlindBinding) &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                    !langTraits(fileEntry.language)?.hasArityOverloads &&
+                    options.targetDefinitions && options.targetDefinitions.length > 0 &&
+                    !(call.receiver && (index.symbols.get(call.receiver) || []).some(d => d.aliasOf))) {
+                    const pinnedCallable = options.targetDefinitions.filter(d => !NON_CALLABLE_TYPES.has(d.type));
+                    const pinnedClasses = new Set(pinnedCallable
+                        .map(d => d.className || (d.receiver || '').replace(/^\*/, ''))
+                        .filter(Boolean));
+                    if (pinnedClasses.size > 0) {
+                        const pinnedKeys = new Set(pinnedCallable.map(d => `${d.file}:${d.startLine}`));
+                        // Same-FILE constraint: a same-name class in another
+                        // package is a DIFFERENT type, not a sibling impl
+                        // (Go's per-package `bb` structs). The measured Rust
+                        // families (From impls, generic instantiations) live
+                        // in the type's own file.
+                        const pinnedFiles = new Set(pinnedCallable.map(d => d.file).filter(Boolean));
+                        const sibling = definitions.find(d =>
+                            !NON_CALLABLE_TYPES.has(d.type) &&
+                            pinnedClasses.has(d.className || (d.receiver || '').replace(/^\*/, '')) &&
+                            pinnedFiles.has(d.file) &&
+                            !pinnedKeys.has(`${d.file}:${d.startLine}`) &&
+                            _callArityCompatible(call, [d], fileEntry.language));
+                        if (sibling) {
+                            routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs, {
+                                dispatchCandidates: definitions.filter(d =>
+                                    !NON_CALLABLE_TYPES.has(d.type) &&
+                                    pinnedClasses.has(d.className || (d.receiver || '').replace(/^\*/, ''))).length,
                             });
                             continue;
                         }
@@ -2915,6 +3121,23 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             if (inPkg && inPkg.length > 0 && new Set(inPkg.map(d => d.returnType)).size === 1) {
                 returnType = inPkg[0].returnType;
                 fromFile = inPkg[0].file;
+            } else {
+                // External producer (fix #220, cobra-measured): the parser
+                // marked this call package-qualified (receiver ∈ imports),
+                // and the package resolves to no project def — the variable's
+                // type was decided OUTSIDE the project (av := reflect.ValueOf).
+                // Not positive evidence for any type, but compiler-grade
+                // evidence AGAINST single-owner confirmation: route visible.
+                // EVERY tuple element is external-decided (tmpFile, err := …),
+                // unlike typed flow which pairs only element 0 (#207).
+                const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                if (!map) map = new Map();
+                for (const lhs of [call.assignedTo, ...(call.assignedTupleRest || [])]) {
+                    const key = `${scope}:${lhs}`;
+                    if (!map.has(key)) map.set(key, []);
+                    map.get(key).push({ line: call.line, externalVia: `${call.receiver}.${call.name}` });
+                }
+                continue;
             }
         } else if (!nominal && call.isMethod && call.receiver && call.receiverIsModule) {
             // Structural module-qualified producer (fix #209): schema =
@@ -3249,11 +3472,27 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
         const dir = path.dirname(d.file);
         const relDir = index.root ? path.relative(index.root, dir) : '';
         // Root-package target: its directory is the clone dir — package
-        // identity is unverifiable from paths, and exclusion requires
-        // POSITIVE evidence. Never exclude (a root-module import like
-        // `cobra "github.com/spf13/cobra"` must keep confirming root defs
-        // regardless of what the checkout directory is named).
-        if (!relDir || relDir === '.') return true;
+        // identity is unverifiable from PATHS, and exclusion requires
+        // POSITIVE evidence. go.mod's module line IS that identity (fix
+        // #220, cobra-measured): `exec.Command(...)` on import "os/exec"
+        // can never denote the root package's Command, while the root
+        // self-import `cobra "github.com/spf13/cobra"` matches exactly.
+        // Without a go.mod, never exclude (checkout-dir-name luck).
+        if (!relDir || relDir === '.') {
+            const goMod = findGoModule(index.root);
+            if (goMod && goMod.modulePath) {
+                // index.root may be a subtree of the go.mod root (grpc-go's
+                // internal/xds target): the root package's import path is
+                // modulePath + the subtree's relative path.
+                let effective = goMod.modulePath;
+                const sub = goMod.root && path.relative(goMod.root, index.root);
+                if (sub && sub !== '.' && !sub.startsWith('..')) {
+                    effective = effective + '/' + sub.split(path.sep).join('/');
+                }
+                return importModule === effective;
+            }
+            return true;
+        }
         if (!relDir.startsWith('..') &&
             (importModule === relDir || importModule.endsWith('/' + relDir))) return true;
         const base = path.basename(dir);
@@ -3519,6 +3758,15 @@ function _declaredFieldType(index, rootType, fieldName, language) {
     }
     if (normalized.size !== 1) return null; // same-named classes disagree
     const typeName = [...normalized][0];
+    // Generic type parameters by convention (T, K, V1 — fix #220,
+    // cursive-measured): `view: T` declares the field as WHATEVER the
+    // instantiation chose — not a type identity. Without this, the hop
+    // "validated" against Rust blanket impls (`impl<T: ViewWrapper> View
+    // for T` records className 'T'), confirming self.view.layout() for
+    // every wrapper view. A short-caps name with a real project type def
+    // (class A in a fixture) is a class, not a generic param.
+    if (/^[A-Z][A-Z0-9]?$/.test(typeName) &&
+        !(index.symbols.get(typeName) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) return null;
     const typeDefs = index.symbols.get(typeName);
     if (typeDefs && typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
     return typeName;
@@ -4082,6 +4330,90 @@ const _STRUCTURAL_FLOW_REJECT = new Set([
  * not the annotation's type (TS annotations already SAY Promise, so they
  * type either way).
  */
+/**
+ * Nominal chained-receiver typing (fix #220, cobra-measured — #219's part 2
+ * extended past the structural gate now that a family is measured):
+ * `rootCmd.Flags().String(...)` — the producer's compiler-checked return
+ * annotation types the receiver. Reuses the #207 rails verbatim: method
+ * producers must AGREE project-wide, plain producers are same-package-only
+ * for Go (an unqualified call cannot cross packages), package-qualified
+ * producers resolve strictly through the file's imports
+ * (_qualifiedProducerDefs), and the type NAME pins to its defining file from
+ * the PRODUCER's scope (_resolveFlowTypeOrigin). External producer packages
+ * and reject-set returns stay untyped — no evidence either way.
+ */
+function _nominalChainedReceiverType(index, call, fileEntry, filePath) {
+    const language = fileEntry.language;
+    const defs = (index.symbols.get(call.receiverCall) || [])
+        .filter(d => !NON_CALLABLE_TYPES.has(d.type));
+    let producer = null;
+    let selfClass;
+    if (call.receiverCallReceiver) {
+        // Package-qualified producer: os.CreateTemp().Name(). A package that
+        // resolves to no project def decided the type OUTSIDE the project —
+        // external-flow marker (blocks single-owner confirmation, routes
+        // possible-dispatch; never excludes).
+        const cands = defs.filter(d => d.returnType);
+        const inPkg = _qualifiedProducerDefs(index, fileEntry, call.receiverCallReceiver, cands);
+        if (!inPkg || inPkg.length === 0 ||
+            new Set(inPkg.map(d => d.returnType)).size !== 1) {
+            return { externalVia: `${call.receiverCallReceiver}.${call.receiverCall}` };
+        }
+        producer = inPkg[0];
+    } else if (call.receiverCallIsMethod) {
+        // Method producer: every same-name method def project-wide must carry
+        // an annotation and agree (#219 discipline — whichever class
+        // dispatches, the type is the same).
+        const methodDefs = defs.filter(d => d.className || d.receiver);
+        if (methodDefs.length === 0) return null;
+        if (!methodDefs.every(d => d.returnType)) return null;
+        if (new Set(methodDefs.map(d => d.returnType)).size !== 1) return null;
+        producer = methodDefs[0];
+        const classes = new Set(methodDefs.map(d =>
+            d.className || (d.receiver || '').replace(/^\*/, '')));
+        selfClass = classes.size === 1 ? [...classes][0] : undefined;
+    } else {
+        // Plain producer: Go resolves within the package; others same-file
+        // narrowing, then global-unique (#199/#207 rules). Where bare calls
+        // reach methods (Java), a bare producer is this.getConfig() — the
+        // enclosing class's own method wins.
+        if (langTraits(language)?.bareCallReachesMethods) {
+            const enclosing = index.findEnclosingFunction(filePath, call.line, true);
+            if (enclosing?.className) {
+                const sameClass = defs.find(d => d.className === enclosing.className && d.returnType);
+                if (sameClass) {
+                    const parsedSC = _returnTypeNameNominal(sameClass.returnType, language, {
+                        selfClass: enclosing.className,
+                    });
+                    if (!parsedSC) return null;
+                    const originSC = _resolveFlowTypeOrigin(index, sameClass.file || filePath, parsedSC.name, parsedSC.qualifier);
+                    if (!originSC) return null;
+                    return { type: parsedSC.name, ...(originSC.fromFile && { fromFile: originSC.fromFile }) };
+                }
+            }
+        }
+        const cands = defs.filter(d => !(d.className || d.receiver));
+        let chosen = null;
+        if (langTraits(language)?.packageScope === 'directory') {
+            const dir = path.dirname(filePath);
+            const samePkg = cands.filter(d => d.file && path.dirname(d.file) === dir);
+            if (samePkg.length === 1) chosen = samePkg[0];
+        } else if (cands.length === 1) {
+            chosen = cands[0];
+        } else {
+            const sameFile = cands.filter(d => d.file === filePath);
+            if (sameFile.length === 1) chosen = sameFile[0];
+        }
+        if (!chosen || !chosen.returnType) return null;
+        producer = chosen;
+    }
+    const parsed = _returnTypeNameNominal(producer.returnType, language, { selfClass });
+    if (!parsed) return null;
+    const origin = _resolveFlowTypeOrigin(index, producer.file || filePath, parsed.name, parsed.qualifier);
+    if (!origin) return null;
+    return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+}
+
 function _chainedReceiverType(index, call, language) {
     const defs = (index.symbols.get(call.receiverCall) || [])
         .filter(d => !NON_CALLABLE_TYPES.has(d.type));

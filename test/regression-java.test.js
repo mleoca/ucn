@@ -2507,3 +2507,79 @@ describe('fix #218: strict-ancestor same-class match routes possible-dispatch (J
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #220 (Java): chained receivers from declared returns; bare same-class
+// calls keep binding (bareCallReachesMethods control)
+// ============================================================================
+describe('fix #220 (Java): chained receivers + bare-call control', () => {
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}:${u.reason}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('chained receiver typed from the producer return annotation', () => {
+        // getConfig().validate() — Config.validate confirms; the same-name
+        // method on an unrelated class is excluded.
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/Config.java': `public class Config {
+    public boolean validate() { return true; }
+}
+`,
+            'src/Other.java': `public class Other {
+    public boolean validate() { return false; }
+}
+`,
+            'src/App.java': `public class App {
+    private Config config;
+
+    public Config getConfig() { return config; }
+
+    public boolean check() {
+        return getConfig().validate();
+    }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cfg = contractCallers(index, 'src/Config.java:2:validate');
+            assert.ok(cfg.confirmed.includes('src/App.java:7'),
+                `producer returns Config — confirms: ${cfg.confirmed}`);
+            const other = contractCallers(index, 'src/Other.java:2:validate');
+            assert.ok(!other.confirmed.includes('src/App.java:7'),
+                `Other.validate is excluded by the flow type: ${other.confirmed}`);
+            assert.strictEqual(other.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('bare same-class calls keep confirming (bareCallReachesMethods)', () => {
+        // Java control for the Go/Rust bare-call discipline: execute() inside
+        // a class means this.execute().
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/Runner.java': `public class Runner {
+    public void run() {
+        execute();
+    }
+
+    public void execute() { }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const m = contractCallers(index, 'src/Runner.java:6:execute');
+            assert.ok(m.confirmed.includes('src/Runner.java:3'),
+                `Java bare calls reach same-class methods: ${m.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

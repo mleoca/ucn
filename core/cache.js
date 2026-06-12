@@ -38,7 +38,11 @@ const UCN_VERSION = require('../package.json').version;
 // JS/TS/Python calls; build-worker symbol-field parity (paramTypes, isAsync,
 // isGenerator, aliasOf, traitName, *WithArgs were silently dropped from
 // parallel-built indexes).
-const CACHE_FORMAT_VERSION = 22;
+// v23 (fix #220): receiverCall/receiverCallIsMethod on Go/Rust/Java calls
+// (+receiverCallReceiver for Go package-qualified producers); Go receiverType
+// from `var x T` declarations and new(T) allocations; Rust literal-receiver
+// types ("...".parse() → str).
+const CACHE_FORMAT_VERSION = 23;
 
 /**
  * Save index to cache file

@@ -1004,8 +1004,14 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             const recvTok = children[i - 2];
             const receiver = recvTok && (recvTok.type === 'identifier' || recvTok.type === 'self')
                 ? recvTok.text : undefined;
+            // Literal receivers type as builtins inside macros too (fix #220,
+            // ripgrep-measured: assert_eq!(.., vec!["match:fg".parse()...]))
+            const litType = recvTok
+                ? ({ string_literal: 'str', raw_string_literal: 'str',
+                    char_literal: 'char', boolean_literal: 'bool' })[recvTok.type]
+                : undefined;
             const receiverType = (receiver && receiver !== 'self' && getReceiverType)
-                ? getReceiverType(receiver) : undefined;
+                ? getReceiverType(receiver) : litType;
             calls.push({
                 name: tok.text,
                 line: tok.startPosition.row + 1,
@@ -1300,7 +1306,32 @@ function findCallsInCode(code, parser) {
                             receiver = obj.text;
                         }
                     }
-                    const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
+                    // Chained receiver (fix #220): the receiver IS a call —
+                    // self.as_u8().as_color() — record the producer so
+                    // findCallers can type it from the declared return.
+                    // Path producers (Config::load().x()) stay uncaptured
+                    // until a measured family justifies the path branch.
+                    let receiverCall, receiverCallIsMethod;
+                    if (!receiver && !receiverField && valueNode?.type === 'call_expression') {
+                        const prodFunc = valueNode.childForFieldName('function');
+                        if (prodFunc?.type === 'identifier') {
+                            receiverCall = prodFunc.text;
+                        } else if (prodFunc?.type === 'field_expression') {
+                            const pf = prodFunc.childForFieldName('field');
+                            if (pf) { receiverCall = pf.text; receiverCallIsMethod = true; }
+                        }
+                    }
+                    // Literal receivers carry their builtin type (fix #220,
+                    // ripgrep-measured): "match:fg:magenta".parse() is
+                    // str::parse, never a project method. Numeric literals
+                    // stay untyped (i32/u64/f64 ambiguity).
+                    const literalReceiverType = (!receiver && valueNode)
+                        ? ({ string_literal: 'str', raw_string_literal: 'str',
+                            char_literal: 'char', boolean_literal: 'bool' })[valueNode.type]
+                        : undefined;
+                    const receiverType = (receiver && receiver !== 'self')
+                        ? getReceiverType(receiver)
+                        : literalReceiverType;
                     const firstArg = getFirstStringArg(node);
                     // RUST-2: For chained calls like `a().b().parse::<T>().ok()`,
                     // each method should report the line where its OWN identifier
@@ -1315,6 +1346,8 @@ function findCallsInCode(code, parser) {
                         ...(receiverType && { receiverType }),
                         ...(receiverField && { receiverRoot, receiverField }),
                         ...(receiverField && receiverRootType && { receiverRootType }),
+                        ...(receiverCall && { receiverCall }),
+                        ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                         argCount,
                         ...(assigned && { assignedTo: assigned.assignedTo }),
                         ...(assigned?.unwrapped && { assignedUnwrap: true }),

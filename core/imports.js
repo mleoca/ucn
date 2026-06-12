@@ -749,5 +749,6 @@ module.exports = {
     extractImports,
     extractExports,
     resolveImport,
-    resolveFilePath
+    resolveFilePath,
+    findGoModule
 };
