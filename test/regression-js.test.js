@@ -6235,3 +6235,120 @@ describe('fix #219: function-typed fields are callable owners (TS)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #221: family B bound-call contract field (calledAs:'bound')
+// `this.parse = this.parse.bind(this)` establishes the call relationship
+// through Function.prototype indirection — the edge stays CONFIRMED but is
+// labeled calledAs:'bound' so consumers (and the oracle eval's hit rule) know
+// reference oracles classify the site as a non-call reference.
+// ============================================================================
+
+describe('fix #221: bind/call/apply edges carry calledAs:bound', () => {
+    function contextEdges(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            callers: json.data.callers || [],
+            unverified: json.data.unverifiedCallers || [],
+        };
+    }
+
+    it('constructor this.parse.bind(this) confirms with calledAs:bound', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Parser {',
+                '  constructor() { this.parse = this.parse.bind(this); }',
+                '  parse(x: number) { return x; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextEdges(index, 'lib.ts:3:parse');
+            const edge = ctx.callers.find(c => c.file === 'lib.ts' && c.line === 2);
+            assert.ok(edge, `bind site stays a confirmed caller: ${JSON.stringify(ctx.callers)}`);
+            assert.strictEqual(edge.calledAs, 'bound');
+            assert.strictEqual(edge.tier, 'confirmed');
+        } finally { rm(dir); }
+    });
+
+    it('fn.call() on a plain function carries calledAs:bound; direct calls do not', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'function helper(x) { return x; }',
+                'function indirect() { return helper.call(null, 1); }',
+                'function direct() { return helper(2); }',
+                'module.exports = { helper, indirect, direct };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextEdges(index, 'lib.js:1:helper');
+            const bound = ctx.callers.find(c => c.line === 2);
+            assert.ok(bound, `helper.call site is a confirmed caller: ${JSON.stringify(ctx.callers)}`);
+            assert.strictEqual(bound.calledAs, 'bound');
+            const plain = ctx.callers.find(c => c.line === 3);
+            assert.ok(plain, 'direct call confirmed');
+            assert.strictEqual(plain.calledAs, undefined,
+                'direct call syntax must not be labeled bound');
+        } finally { rm(dir); }
+    });
+
+    it('callback argument edges expose functionReference in context JSON', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'function helper(x) { return x; }',
+                'const out = [1, 2].map(helper);',
+                'module.exports = { helper, out };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextEdges(index, 'lib.js:1:helper');
+            const ref = ctx.callers.find(c => c.line === 2);
+            assert.ok(ref, `callback reference is a confirmed caller: ${JSON.stringify(ctx.callers)}`);
+            assert.strictEqual(ref.functionReference, true);
+            assert.strictEqual(ref.calledAs, undefined,
+                'argument-position references are functionReference, not bound');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #222: parser-detected shadow excludes on every record shape', () => {
+    it('argument ref to an outer-function local never confirms a property-assigned fn', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'application.js': [
+                'var app = module.exports = {};',
+                '',
+                'app.use = function use(fn) {',
+                '  var path = "/";',
+                '  var router = this.router;',
+                '  [fn].forEach(function (f) {',
+                '    return router.use(path, f);',
+                '  });',
+                '  return this;',
+                '};',
+                '',
+                'app.path = function path() {',
+                '  return this.mountpath;',
+                '};',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'application.js:12:path' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => c.line);
+            assert.ok(!confirmed.includes(7),
+                `router.use(path, f) references use()'s local var: ${confirmed}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});

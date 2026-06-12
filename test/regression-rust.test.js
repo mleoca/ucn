@@ -2868,3 +2868,131 @@ impl JSONBuilder {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #222 (seed-C): turbofish path receivers + generic-param path calls
+// ============================================================================
+
+describe('fix #222: turbofish path receivers carry the type (Rust)', () => {
+    function contract(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({ key: `${u.file}:${u.line}`, reason: u.reason })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('Vec::<T>::new() inside assert_eq! never confirms a project new', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lowargs.rs': [
+                'pub struct LowArgs { n: usize }',
+                'impl LowArgs {',
+                '    pub fn new() -> LowArgs { LowArgs { n: 0 } }',
+                '}',
+            ].join('\n'),
+            'src/defs.rs': [
+                'pub fn check(args: &[String]) {',
+                '    assert_eq!(Vec::<String>::new(), args);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/lowargs.rs:3:new');
+            assert.ok(!res.confirmed.includes('src/defs.rs:2'),
+                `Vec::<String>::new() is std's new, not LowArgs::new: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('AST-branch turbofish receiver is the plain type name', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Maker { n: usize }',
+                'impl Maker {',
+                '    pub fn make() -> Maker { Maker { n: 0 } }',
+                '}',
+                'pub fn go() -> Maker {',
+                '    Maker::make()',
+                '}',
+                'pub fn other() {',
+                '    let v = Vec::<u8>::new();',
+                '    let _ = v;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // type-qualified receiver on the true target still confirms
+            const res = contract(index, 'src/lib.rs:3:make');
+            assert.ok(res.confirmed.includes('src/lib.rs:6'),
+                `Maker::make() stays confirmed: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('T::method() on a generic param routes visible, never scope-confirms', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/vec2.rs': [
+                'pub struct XY<T> { pub x: T, pub y: T }',
+                'impl<T: Default> XY<T> {',
+                '    pub fn zero() -> XY<T> { XY { x: T::default(), y: T::default() } }',
+                '    pub fn keep_x(&self) -> XY<T> where T: Clone {',
+                '        XY { x: self.x.clone(), y: T::zero_val() }',
+                '    }',
+                '    pub fn zero_val() -> T { T::default() }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/vec2.rs:7:zero_val');
+            assert.ok(!res.confirmed.includes('src/vec2.rs:5'),
+                `T::zero_val() is the generic param's, not provably XY's: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'src/vec2.rs:5');
+            assert.ok(entry, `the edge stays VISIBLE: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #222b: use-as import renames keep type-qualified calls confirmable', () => {
+    it('Separator::disabled() under `use ContextSeparator as Separator` stays visible-or-confirmed', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lowargs.rs': [
+                'pub struct ContextSeparator(Option<u8>);',
+                'impl ContextSeparator {',
+                '    pub fn disabled() -> ContextSeparator { ContextSeparator(None) }',
+                '}',
+            ].join('\n'),
+            'src/defs.rs': [
+                'pub fn update() {',
+                '    use crate::lowargs::ContextSeparator as Separator;',
+                '    let _a = Separator::disabled();',
+                '}',
+            ].join('\n'),
+            'src/lib.rs': 'pub mod lowargs;\npub mod defs;\n',
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'src/lowargs.rs:3:disabled' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            const unverified = (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}`);
+            assert.ok(confirmed.includes('src/defs.rs:3') || unverified.includes('src/defs.rs:3'),
+                `the renamed type-qualified call is a true edge — never excluded: ` +
+                `confirmed=${confirmed} unverified=${unverified}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});

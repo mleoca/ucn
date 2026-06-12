@@ -42,7 +42,12 @@ const UCN_VERSION = require('../package.json').version;
 // (+receiverCallReceiver for Go package-qualified producers); Go receiverType
 // from `var x T` declarations and new(T) allocations; Rust literal-receiver
 // types ("...".parse() → str).
-const CACHE_FORMAT_VERSION = 23;
+// v24 (fix #221): boundCall on JS/TS bind/call/apply call records (family B
+// contract field — edges surface as calledAs:'bound').
+// v25 (fix #222): turbofish path receivers — `Vec::<T>::new()` records
+// receiver 'Vec' in BOTH the macro token-tree branch (was receiver-less) and
+// the AST branch (was 'Vec::<T>').
+const CACHE_FORMAT_VERSION = 25;
 
 /**
  * Save index to cache file

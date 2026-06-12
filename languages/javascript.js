@@ -1702,7 +1702,12 @@ function findCallsInCode(code, parser) {
                 if (propNode) {
                     const propName = propNode.text;
 
-                    // Handle .call(), .apply(), .bind() - these are calls TO the object
+                    // Handle .call(), .apply(), .bind() - these are calls TO the object.
+                    // boundCall marks the indirection (fix #221, family B): the line
+                    // establishes the call relationship through Function.prototype
+                    // rather than direct call syntax — the edge surfaces as
+                    // calledAs:'bound' so consumers know reference oracles see a
+                    // non-call reference here.
                     if (['call', 'apply', 'bind'].includes(propName) && objNode) {
                         if (objNode.type === 'identifier') {
                             // foo.call() -> call to foo
@@ -1710,6 +1715,7 @@ function findCallsInCode(code, parser) {
                                 name: objNode.text,
                                 line: node.startPosition.row + 1,
                                 isMethod: false,
+                                boundCall: true,
                                 enclosingFunction
                             });
                         } else if (objNode.type === 'member_expression') {
@@ -1721,6 +1727,7 @@ function findCallsInCode(code, parser) {
                                     name: innerProp.text,
                                     line: node.startPosition.row + 1,
                                     isMethod: true,
+                                    boundCall: true,
                                     receiver: innerObj?.text,
                                     enclosingFunction,
                                     uncertain

@@ -182,8 +182,19 @@ async function evaluateRepo(repo, oracle) {
         // Function/method symbols expose confirmed callers as `callers`; class
         // symbols expose them as `usages` (constructor/type-usage sites, same
         // confirmed tier). Both carry tier labels.
-        const confirmed = dedupe((json.data.callers || json.data.usages || []).map(c => ({ file: c.file, line: c.line })));
-        const unverified = dedupe((json.data.unverifiedCallers || []).map(c => ({ file: c.file, line: c.line })));
+        // usageStyle: bound (bind/call/apply indirection) and function-reference
+        // (callback/method-value) edges establish the call relationship without
+        // direct call syntax — reference oracles classify those sites as
+        // reference-kind, so they verify against ANY oracle ref (family B
+        // decision 2026-06-12; the #218f class-kind precedent).
+        const confirmed = dedupe((json.data.callers || json.data.usages || []).map(c => ({
+            file: c.file, line: c.line,
+            usageStyle: c.calledAs === 'bound' || !!c.functionReference,
+        })));
+        const unverified = dedupe((json.data.unverifiedCallers || []).map(c => ({
+            file: c.file, line: c.line,
+            usageStyle: c.calledAs === 'bound' || !!c.functionReference,
+        })));
         const account = json.meta.account;
 
         const confirmedKeys = new Set(confirmed.map(c => key(c.file, c.line)));
@@ -197,13 +208,16 @@ async function evaluateRepo(repo, oracle) {
         // real usages, rich-measured 11 of 12 class-kind "FPs"), so any oracle
         // ref at the line verifies a class usage. Placement/recall stays over
         // call edges for all kinds.
-        const hitKeys = sym.kind === 'class'
-            ? new Set(oracleRefs
-                .filter(r => !(r.file === sym.file && r.line === sym.line))
-                .map(r => key(r.file, r.line)))
-            : oracleKeys;
-        const confirmedHits = confirmed.filter(c => hitKeys.has(key(c.file, c.line))).length;
-        const unverifiedHits = unverified.filter(c => hitKeys.has(key(c.file, c.line))).length;
+        const anyRefKeys = new Set(oracleRefs
+            .filter(r => !(r.file === sym.file && r.line === sym.line))
+            .map(r => key(r.file, r.line)));
+        const hitKeys = sym.kind === 'class' ? anyRefKeys : oracleKeys;
+        // usage-style edges (calledAs:'bound', functionReference) verify against
+        // any oracle ref at the line — see the mapping comment above.
+        const edgeHit = c => hitKeys.has(key(c.file, c.line)) ||
+            (c.usageStyle && anyRefKeys.has(key(c.file, c.line)));
+        const confirmedHits = confirmed.filter(edgeHit).length;
+        const unverifiedHits = unverified.filter(edgeHit).length;
 
         // Oracle-edge placement.
         //   reportedNonCall      — line is in the text ground set; by the

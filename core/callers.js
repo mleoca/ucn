@@ -337,7 +337,8 @@ function findCallers(index, name, options = {}) {
         if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
         pendingByFile.get(filePath).push({
             call, fileEntry, callerSymbol: null,
-            isMethod: call.isMethod || false, isFunctionReference: false,
+            isMethod: call.isMethod || false,
+            isFunctionReference: !!call.isFunctionReference,
             receiver: call.receiver, receiverType: call.receiverType,
             calledAs,
             _tier: TIER.UNVERIFIED, _reason: reason, _meta: meta,
@@ -684,6 +685,18 @@ function findCallers(index, name, options = {}) {
                 // Resolve binding within this file (without mutating cached call objects)
                 let bindingId = call.bindingId;
                 let isUncertain = call.uncertain;
+                // Parser-detected lexical shadow (fix #203, hoisted by #222 —
+                // express-measured): a local let/var/param of the same name
+                // shadows the target at this reference, whatever record shape
+                // carried it. The callback fast path already excluded its own;
+                // an isFunctionReference-only argument ref (`router.use(path,
+                // f)` inside `use(fn)`'s forEach closure) used to slip past to
+                // binding resolution and exact-confirm on the shadowed name.
+                if (call.localShadow && !call.isPotentialCallback) {
+                    recordExcluded(filePath, call.line, 'local-shadow');
+                    continue;
+                }
+
                 // Skip binding resolution for calls with non-self/this/cls receivers:
                 // e.g., analyzer.analyze_instrument() should NOT resolve to a local
                 // standalone function def `analyze_instrument` — they're different symbols.
@@ -696,10 +709,16 @@ function findCallers(index, name, options = {}) {
                     // never reach methods (fix #220, cobra-measured): Go's
                     // func (c *Command) MarkFlagDirname and func MarkFlagDirname
                     // coexist in one package — the bare call denotes the
-                    // FUNCTION. Java keeps both (implicit this-calls); the
-                    // structural gates own their kind discipline (#218b).
+                    // FUNCTION. Java keeps both (implicit this-calls). Fix
+                    // #222 (rich-measured) extends this to structural: the
+                    // bindings table lists class members, but Python bare-name
+                    // lookup never enters class scope (`cell_len(self.plain)`
+                    // inside Text binds the module-level import of
+                    // cells.cell_len, not Text.cell_len) and a JS class
+                    // member is not a file binding either — the structural
+                    // dispatch gates can't own this case because a matched
+                    // bindingId bypasses them.
                     if (!call.isMethod && bindings.length > 0 &&
-                        langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                         !langTraits(fileEntry.language)?.bareCallReachesMethods) {
                         const defsOfName = index.symbols.get(call.name) || [];
                         bindings = bindings.filter(b => {
@@ -1088,7 +1107,13 @@ function findCallers(index, name, options = {}) {
                         recordExcluded(filePath, call.line, 'name-not-in-scope');
                         continue;
                     }
-                    if (nameBindings.length > 0 && !tFiles.has(filePath)) {
+                    // A same-file pin does not put a bare name in scope when
+                    // every pinned def is class-scoped (fix #222, rich-measured):
+                    // the class member is outside the bare-name lookup chain,
+                    // so the file's import bindings own the name.
+                    const samefilePinsOutOfScope = targetDefs.length > 0 &&
+                        targetDefs.every(d => d.className);
+                    if (nameBindings.length > 0 && (!tFiles.has(filePath) || samefilePinsOutOfScope)) {
                         // Name-level export-chain ownership (fix #217): each
                         // binding is chased by NAME, not by file — `from
                         // .render import render` pins to tests/render.py's own
@@ -1819,6 +1844,23 @@ function findCallers(index, name, options = {}) {
                     !receiverTypeValidated && !nominalInferredMatch &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     const tTypes = dispatchTargetTypes(targetDefs2);
+                    // `use X as Y` import rename (fix #222b, ripgrep-measured:
+                    // `use ContextSeparator as Separator; Separator::disabled()`
+                    // — the alias names the TARGET type locally): judge path
+                    // receivers by the ORIGINAL name. Only fires when the
+                    // import's last path segment IS a target type — package
+                    // aliases and unrelated imports stay untouched.
+                    let receiverName = call.receiver;
+                    if (receiverName && !tTypes.has(receiverName)) {
+                        for (const im of (fileEntry.importBindings || [])) {
+                            if (im.name !== receiverName) continue;
+                            const orig = String(im.module || '').split('::').pop();
+                            if (orig && orig !== receiverName && tTypes.has(orig)) {
+                                receiverName = orig;
+                                break;
+                            }
+                        }
+                    }
                     // A receiver that shares the target type's NAME is only
                     // type-qualified when the call matches the language's
                     // qualified-call syntax (typeQualifiedCallStyle trait):
@@ -1827,7 +1869,7 @@ function findCallers(index, name, options = {}) {
                     // T.M(recv, ...) pass the receiver as the first argument,
                     // so a zero-arg call on a type-named receiver is a
                     // variable, not the type (grpc-go's `bb` collision).
-                    let typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                    let typeQualifiedReceiver = !!(receiverName && tTypes.has(receiverName));
                     if (typeQualifiedReceiver) {
                         const qualStyle = langTraits(fileEntry.language)?.typeQualifiedCallStyle;
                         if (qualStyle === 'path') typeQualifiedReceiver = !!call.isPathCall;
@@ -1842,7 +1884,7 @@ function findCallers(index, name, options = {}) {
                     // name fallback above handles multi-definition names; this
                     // covers single-definition targets that skip it.
                     if (typeQualifiedReceiver) {
-                        const identity = _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs2);
+                        const identity = _resolveReceiverTypeIdentity(index, filePath, receiverName, targetDefs2);
                         if (identity === 'other') {
                             recordExcluded(filePath, call.line, 'path-type-mismatch');
                             continue;
@@ -1877,6 +1919,32 @@ function findCallers(index, name, options = {}) {
                             routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
                                 dispatchCandidates: methodOwnerKeys().size,
                             });
+                            continue;
+                        }
+                        // Type-qualified path calls naming a NON-target type
+                        // (fix #222, seed-C-measured — the #220(2) fallback
+                        // only ran with multiple same-name definitions, so
+                        // single-owner names bypassed the whole discipline):
+                        // `Vec::<String>::new()` inside assert_eq! names std's
+                        // Vec — same-package scope cannot make it the project
+                        // `new`. Generic-param receivers (`T::zero()` — T is
+                        // instantiable with ANY type satisfying its bound)
+                        // route VISIBLE, never excluded; concrete non-target
+                        // type names are compiler-grade evidence for a
+                        // different type. `Self` keeps its current scope
+                        // resolution (a true same-impl call). Alias-qualified
+                        // receivers are in the #208-closed tTypes and never
+                        // reach here.
+                        if (call.isPathCall && call.receiver &&
+                            /^[A-Z]/.test(call.receiver) && call.receiver !== 'Self') {
+                            if (/^[A-Z][A-Z0-9]?$/.test(call.receiver) &&
+                                !(index.symbols.get(call.receiver) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) {
+                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                    dispatchCandidates: methodOwnerKeys().size,
+                                });
+                                continue;
+                            }
+                            recordExcluded(filePath, call.line, 'path-type-mismatch');
                             continue;
                         }
                         const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
@@ -1982,6 +2050,20 @@ function findCallers(index, name, options = {}) {
                     if (call.isMethod && !call.receiverIsModule) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        // External-producer receiver (fix #222, httpx-measured
+                        // — the #220 Go rule for structural languages): the
+                        // variable was assigned from a call into an external
+                        // module (logger = logging.getLogger(...)), so its
+                        // type was decided outside the project and unique
+                        // project ownership is not identity evidence.
+                        // Visible, never excluded.
+                        if (!typeQualifiedReceiver && call.receiverExternalFlow) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: call.receiverExternalFlow,
+                                externalContract: true,
+                            });
+                            continue;
+                        }
                         // A method call cannot denote a standalone function
                         // (fix #218, rich-measured: `console.print(...)`
                         // confirmed scope-match against module-level print):
@@ -2044,7 +2126,11 @@ function findCallers(index, name, options = {}) {
                 if (!pendingByFile.has(filePath)) pendingByFile.set(filePath, []);
                 pendingByFile.get(filePath).push({
                     call, fileEntry, callerSymbol,
-                    isMethod: call.isMethod || false, isFunctionReference: false,
+                    isMethod: call.isMethod || false,
+                    // Function references can resolve through the plain binding
+                    // path too (e.g. JS `arr.map(helper)` with a local binding) —
+                    // surface the parser's marker on the edge (fix #221).
+                    isFunctionReference: !!call.isFunctionReference,
                     receiver: call.receiver,
                     receiverType: call.receiverType,
                     calledAs,
@@ -2096,6 +2182,12 @@ function findCallers(index, name, options = {}) {
         let content = null;
         for (const { call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver, receiverType, calledAs, _evidence, _tier, _reason, _meta } of pending) {
             const scored = scoreEdge(_evidence || {});
+            // Family B contract field (fix #221): a bind/call/apply site reaches
+            // the target through Function.prototype indirection, not direct call
+            // syntax — label the edge calledAs:'bound'. Rename aliases keep their
+            // surface name (they describe the same slot and are rarer). Label
+            // only, computed at edge construction: routing logic never sees it.
+            const edgeCalledAs = calledAs || (call.boundCall ? 'bound' : undefined);
             if (_tier) {
                 // Routed unverified entry — never competes with the main
                 // answer for maxResults/enrichLimit slots.
@@ -2109,9 +2201,10 @@ function findCallers(index, name, options = {}) {
                     reason: _reason,
                     ...(_meta || {}),
                     isMethod: call.isMethod || false,
+                    ...(isFunctionReference && { isFunctionReference: true }),
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
-                    ...(calledAs && { calledAs }),
+                    ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                 };
                 if (unverifiedEnriched < unverifiedEnrichLimit) {
                     if (content === null) {
@@ -2152,7 +2245,7 @@ function findCallers(index, name, options = {}) {
                     ...(isFunctionReference && { isFunctionReference: true }),
                     ...(receiver !== undefined && { receiver }),
                     ...(receiverType && { receiverType }),
-                    ...(calledAs && { calledAs }),
+                    ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                 });
                 continue;
             }
@@ -2174,7 +2267,7 @@ function findCallers(index, name, options = {}) {
                 ...(isFunctionReference && { isFunctionReference: true }),
                 ...(receiver !== undefined && { receiver }),
                 ...(receiverType && { receiverType }),
-                ...(calledAs && { calledAs }),
+                ...(edgeCalledAs && { calledAs: edgeCalledAs }),
                 confidence: scored.confidence,
                 resolution: scored.resolution,
                 ...(tier && { tier }),
@@ -3148,6 +3241,27 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
             // never a class method.
             const binding = (fileEntry?.importBindings || []).find(b => b.name === call.receiver);
             const rel = binding && fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
+            if (binding && !rel) {
+                // External module producer (fix #222, httpx-measured — the
+                // #220 Go external-producer rule for structural languages):
+                // logger = logging.getLogger(...) / thread = threading.Thread()
+                // types the variable OUTSIDE the project, so unique project
+                // ownership of a later method name (logger.info vs the only
+                // project `info`) is not identity evidence. Same externality
+                // test as #209 module ownership: relative or project-ish
+                // modules are resolver gaps, never externality evidence.
+                const mod = String(binding.module);
+                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+                if (!mod.startsWith('.') &&
+                    !(firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                    const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+                    if (!map) map = new Map();
+                    const key = `${scope}:${call.assignedTo}`;
+                    if (!map.has(key)) map.set(key, []);
+                    map.get(key).push({ line: call.line, externalVia: `${call.receiver}.${call.name}` });
+                }
+                continue;
+            }
             if (rel) {
                 const modFile = path.join(index.root, rel);
                 const cands = (index.symbols.get(call.name) || [])

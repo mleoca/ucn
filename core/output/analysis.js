@@ -217,6 +217,7 @@ function formatContextJson(context) {
                 expression: c.content,  // FULL expression
                 callerName: c.callerName,
                 ...(c.calledAs && { calledAs: c.calledAs }),
+                ...(c.isFunctionReference && { functionReference: true }),
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
                 ...(c.tier && { tier: c.tier }),
                 ...(c.reachable !== undefined && { reachable: c.reachable }),
@@ -227,6 +228,7 @@ function formatContextJson(context) {
                 expression: c.content,  // FULL expression
                 callerName: c.callerName ?? null,
                 ...(c.calledAs && { calledAs: c.calledAs }),
+                ...(c.isFunctionReference && { functionReference: true }),
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
                 tier: 'unverified',
                 ...(c.reason && { reason: c.reason }),

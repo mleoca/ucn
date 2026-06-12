@@ -5478,3 +5478,36 @@ func run() {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #221: function-reference edges expose functionReference in context JSON
+// (the cobra FuncMap / method-value analog of the JS bound-call family — the
+// eval's hit rule verifies these usage-style edges against any oracle ref).
+// ============================================================================
+
+describe('fix #221: Go function references carry functionReference in JSON', () => {
+    it('composite-literal func field reference is a confirmed functionReference edge', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'main.go': [
+                'package main',
+                '',
+                'func trimRight(s string) string { return s }',
+                '',
+                'var funcs = map[string]func(string) string{"trim": trimRight}',
+                '',
+                'func main() { _ = funcs }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'main.go:3:trimRight' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const edge = (json.data.callers || []).find(c => c.line === 5);
+            assert.ok(edge, `FuncMap-style reference is a confirmed caller: ${JSON.stringify(json.data.callers)}`);
+            assert.strictEqual(edge.functionReference, true);
+        } finally { rm(dir); }
+    });
+});

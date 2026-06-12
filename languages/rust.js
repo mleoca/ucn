@@ -986,9 +986,30 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             const isSegment = (n) => n && ['identifier', 'primitive_type', 'self', 'super', 'crate'].includes(n.type);
             const segments = [];
             let j = i - 1;
-            while (j >= 1 && children[j].type === '::' && isSegment(children[j - 1])) {
-                segments.unshift(children[j - 1].text);
-                j -= 2;
+            while (j >= 1 && children[j].type === '::') {
+                let k = j - 1;
+                if (children[k] && children[k].type === '>') {
+                    // Turbofish: `Vec::<PatternSource>::new(...)` — angle
+                    // brackets do NOT group into token_trees, so skip the
+                    // <...> token run (nesting-aware) back to the matching
+                    // `<`, which the turbofish form introduces with `::`.
+                    // Without this the walk stopped at `>`, emitted a
+                    // receiver-less path call, and `Vec::<T>::new()` inside
+                    // assert_eq! scope-confirmed against every project `new`
+                    // (fix #222, ripgrep-seed-C-measured).
+                    let depth = 1;
+                    k--;
+                    while (k >= 0 && depth > 0) {
+                        if (children[k].type === '>') depth++;
+                        else if (children[k].type === '<') depth--;
+                        if (depth > 0) k--;
+                    }
+                    if (k < 1 || children[k - 1].type !== '::') break;
+                    k -= 2;
+                }
+                if (!isSegment(children[k])) break;
+                segments.unshift(children[k].text);
+                j = k - 1;
             }
             calls.push({
                 name: tok.text,
@@ -1362,12 +1383,17 @@ function findCallsInCode(code, parser) {
                 const segments = pathText.split('::');
                 const name = segments[segments.length - 1];
                 const firstArg = getFirstStringArg(node);
+                // Turbofish receivers (`Vec::<String>::new`) carry the type
+                // arguments as their own `::`-split segments — drop them so
+                // the receiver is the plain type/module path (fix #222).
+                const recvSegments = segments.slice(0, -1)
+                    .filter(s => !s.startsWith('<') && !s.endsWith('>'));
                 calls.push({
                     name: name,
                     line: node.startPosition.row + 1,
                     isMethod: segments.length > 1,
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
-                    receiver: segments.length > 1 ? segments.slice(0, -1).join('::') : undefined,
+                    receiver: recvSegments.length > 0 ? recvSegments.join('::') : undefined,
                     argCount,
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.unwrapped && { assignedUnwrap: true }),

@@ -37,6 +37,16 @@ const REPOS = [
         // augmentation, property-assigned functions. TS numbers do not
         // transfer to annotation-free receiver physics — this is the
         // measurement for it. Pinned @ v5.2.1.
+        //
+        // KNOWN ORACLE-BLIND FAMILY (F1, decision 2026-06-12: documented, not
+        // sampled out): ts-morph with checkJs:false cannot resolve references
+        // to property-assigned CJS methods (`proto.use = function use() {}` —
+        // `app.use(...)` call sites return no refs), so true UCN edges on
+        // those symbols count as misses and express's tier-1 UNDERSTATES real
+        // precision. Same family: the zeroTrust n=2 artifact is the CJS
+        // default-export rename (`module.exports = createApplication` →
+        // `express()` calls are beyond-text). Precedents: gson's jdtls
+        // var-lambda blindness, cursive's cfg(feature) macro blindness.
         name: 'express',
         url: 'https://github.com/expressjs/express',
         commit: 'dbac741a49a5a64336b70c06e85c2e2706e36336',

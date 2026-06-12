@@ -3337,3 +3337,102 @@ describe('fix #219: chained-receiver return-type flow (Python)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #222 (seed-C): bare-call class-member bindings + external producers
+// ============================================================================
+
+describe('fix #222: a bare Python call never binds a class-scoped member', () => {
+    const { execute } = require('../core/execute');
+    const output = require('../core/output');
+    const FILES = {
+        'cells.py': 'def cell_len(text):\n    return len(text)\n',
+        'text.py': [
+            'from cells import cell_len',
+            '',
+            '',
+            'class Text:',
+            '    @property',
+            '    def cell_len(self):',
+            '        return cell_len(self.plain)',
+            '',
+            '    def fit(self, width):',
+            '        length = cell_len(self.plain)',
+            '        return length',
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('the method pin gets no bare-call callers (import binding owns the name)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'text.py:6:cell_len');
+            assert.strictEqual(res.confirmed.length, 0,
+                `bare cell_len(...) binds the import, never Text.cell_len: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('the imported function gains the callers the member binding used to steal', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'cells.py:1:cell_len');
+            assert.ok(res.confirmed.includes('text.py:7') && res.confirmed.includes('text.py:10'),
+                `bare calls belong to cells.cell_len: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #222: external-module producers block single-owner confirmation (structural)', () => {
+    const { execute } = require('../core/execute');
+    const output = require('../core/output');
+
+    it('logger = logging.getLogger() receiver routes possible-dispatch, real receiver confirms', () => {
+        const dir = tmp({
+            'models.py': [
+                'import logging',
+                '',
+                'logger = logging.getLogger("app")',
+                '',
+                '',
+                'class Cookies:',
+                '    def info(self, msg):',
+                '        return msg',
+                '',
+                '',
+                'def run():',
+                '    logger.info("starting")',
+                '    c = Cookies()',
+                '    c.info("real")',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'models.py:7:info' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => c.line);
+            const unverified = json.data.unverifiedCallers || [];
+            assert.ok(!confirmed.includes(12),
+                `logger.info is logging's, not Cookies.info: ${confirmed}`);
+            const entry = unverified.find(u => u.line === 12);
+            assert.ok(entry, `the edge stays VISIBLE: ${JSON.stringify(unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'logging.getLogger');
+            assert.ok(confirmed.includes(14), `typed receiver keeps confirming: ${confirmed}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
