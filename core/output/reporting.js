@@ -227,7 +227,12 @@ function formatDeadcode(results, options = {}) {
             hints.push(...item.annotations.map(a => `@${a}`));
         }
         const hintStr = hints.length > 0 ? ` [has ${hints.join(', ')}]` : '';
-        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}`);
+        // Interface/trait member declarations: unreferenced is true, but
+        // deleting one changes the contract, not dead logic — say so.
+        const declStr = item.declaredOn
+            ? ` [declared on ${item.declaredOn.kind} ${item.declaredOn.name} — contract surface, not executable code]`
+            : '';
+        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}${declStr}`);
     }
 
     if (hidden > 0) {
@@ -277,7 +282,8 @@ function formatDeadcodeJson(results) {
                     ...(handle && { handle }),
                     ...(item.isExported && { isExported: true }),
                     ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
-                    ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations })
+                    ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations }),
+                    ...(item.declaredOn && { declaredOn: item.declaredOn })
                 };
             }),
         },

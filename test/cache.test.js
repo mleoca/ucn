@@ -2172,3 +2172,79 @@ describe('perf: skip graph rebuild on zero-change incremental', () => {
         }
     });
 });
+
+// ============================================================================
+// Index reliability guards: the symbol table and calls cache must be
+// IDENTICAL no matter how the index was produced. Catches the silent-drop
+// bug class (fix #208's addSymbol passthrough: a parser field that save/load
+// or incremental rebuild loses corrupts every downstream answer invisibly).
+// ============================================================================
+
+describe('index reliability: cache round-trip and incremental rebuild identity', () => {
+    const { indexSnapshot } = require('./helpers');
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'a.ts': [
+            'export type AliasName = TargetType;',
+            'export interface TargetType { run(): number; }',
+            'export class Alpha {',
+            '  override compute(x: number) { return beta(x) + 1; }',
+            '  "~quoted"() { return 1; }',
+            '}',
+            'export function beta(y: number): number { return y * 2; }',
+        ].join('\n'),
+        'b.ts': [
+            'import { Alpha, beta } from "./a";',
+            'export function gamma() { const a = new Alpha(); return a.compute(beta(3)); }',
+        ].join('\n'),
+        'c.ts': 'export function gone() { return 1; }',
+    };
+
+    it('loadCache reproduces the exact symbol table, file entries, and calls', () => {
+        const dir = tmp(FILES);
+        try {
+            const fresh = new ProjectIndex(dir);
+            fresh.build(null, { quiet: true });
+            const expected = indexSnapshot(fresh);
+            fresh.saveCache();
+
+            const reloaded = new ProjectIndex(dir);
+            assert.ok(reloaded.loadCache(), 'cache should load');
+            assert.strictEqual(indexSnapshot(reloaded), expected,
+                'cache round-trip must not lose or alter any symbol/call field');
+        } finally { rm(dir); }
+    });
+
+    it('incremental rebuild (modify+delete+add) equals a fresh build', () => {
+        const dir = tmp(FILES);
+        try {
+            const initial = new ProjectIndex(dir);
+            initial.build(null, { quiet: true });
+            initial.saveCache();
+
+            fs.unlinkSync(path.join(dir, 'c.ts'));
+            fs.writeFileSync(path.join(dir, 'd.ts'),
+                'import { beta } from "./a";\nexport function delta() { return beta(9); }');
+            fs.writeFileSync(path.join(dir, 'b.ts'), [
+                'import { Alpha } from "./a";',
+                'export function gamma() { const a = new Alpha(); return a.compute(5); }',
+            ].join('\n'));
+
+            // The production incremental path (cli/index.js, mcp/server.js):
+            // loadCache → stale → build with forceRebuild so deleted files are
+            // swept. Plain build() after loadCache is pattern-safe by design
+            // and must NOT be used for full rebuilds.
+            const incremental = new ProjectIndex(dir);
+            incremental.loadCache();
+            incremental.build(null, { quiet: true, forceRebuild: true });
+
+            const fresh = new ProjectIndex(dir);
+            fresh.build(null, { quiet: true });
+
+            assert.strictEqual(indexSnapshot(incremental), indexSnapshot(fresh),
+                'incremental rebuild must converge to the fresh-build index');
+            assert.ok(!incremental.symbols.has('gone'),
+                'deleted file symbols must be swept');
+        } finally { rm(dir); }
+    });
+});

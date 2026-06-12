@@ -819,6 +819,25 @@ function findCallers(index, name, options = {}) {
                                         recordExcluded(filePath, call.line, 'other-definition');
                                         continue;
                                     }
+                                } else if (collectAccount) {
+                                    // fix #213 (JS/TS, zod seed-B-measured): the same
+                                    // pinning check, but ROUTED visible instead of
+                                    // excluded — `this.min()` inside ZodString lexically
+                                    // binds ZodString.min or a subclass override, never
+                                    // a pinned sibling ZodNumber.min (cross-sibling
+                                    // spray was ~23 of 38 FP edges). Exclusion stays
+                                    // off: TS `declare class` merging hides extends
+                                    // edges, so an unrelated-looking class may still be
+                                    // an ancestor (the original #202b structural revert).
+                                    // Legacy keeps confirming (drop-vs-route asymmetry).
+                                    const tDefs = options.targetDefinitions || definitions;
+                                    const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
+                                    if (!targetClasses.has(matchedClass) &&
+                                        !_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
+                                        !_shareProjectDescendant(index, matchedClass, targetClasses)) {
+                                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs);
+                                        continue;
+                                    }
                                 }
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
@@ -915,6 +934,28 @@ function findCallers(index, name, options = {}) {
                     (fileEntry.importBindings || []).length > 0) {
                     const nameBindings = fileEntry.importBindings.filter(b => b.name === call.name);
                     const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                    // fix #215 (rich-measured: 225 builtin `print(...)` calls
+                    // confirmed against rich's def via file-level import edges):
+                    // a bare name in a module file resolves to a local binding,
+                    // an import binding of THAT name, or a builtin/global — it
+                    // can never reach an unimported project def. No local
+                    // binding (bindingId), no import binding of the name, no
+                    // star import that could inject it → the call provably
+                    // does not denote the target. Same correctness family as
+                    // the all-external shadow exclusion below; the
+                    // importBindings.length precondition keeps script files
+                    // (no module discipline) out.
+                    // `resolvedName` means the parser already resolved a local
+                    // alias to the original through a real import binding
+                    // (`const { parse: csvParse } = require(...)`) — name-level
+                    // evidence by construction; importBindings store the
+                    // ORIGINAL name, so the local alias must not look unbound.
+                    if (nameBindings.length === 0 && !call.resolvedName &&
+                        tFiles.size > 0 && !tFiles.has(filePath) &&
+                        !(fileEntry.importNames || []).includes('*')) {
+                        recordExcluded(filePath, call.line, 'name-not-in-scope');
+                        continue;
+                    }
                     if (nameBindings.length > 0 && !tFiles.has(filePath)) {
                         let reaches = false;
                         let projectish = false;
@@ -3467,7 +3508,19 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
  * (visible unverified), never to exclude.
  */
 function _dispatchCapableSupertype(index, language, typeName, targetDefs, definitions) {
-    if (langTraits(language)?.typeSystem !== 'nominal') return false;
+    const traits = langTraits(language);
+    if (traits?.typeSystem !== 'nominal') return false;
+    // The implicit root supertype (Java `Object`) sits above EVERY class
+    // without a declared extends edge — `void show(Object o) { o.size() }`
+    // can dispatch into any project override, but the ancestry walk below
+    // cannot see the implicit edge (fix #212). Bare-name compare on the last
+    // segment covers `java.lang.Object` annotations; a project class that
+    // shadows the root name only ever gains routing (demote-only), never
+    // loses an exclusion it was entitled to.
+    if (traits.universalSupertype &&
+        String(typeName).split('.').pop() === traits.universalSupertype) {
+        return true;
+    }
     const typeDefs = index.symbols.get(typeName) || [];
     const isIface = typeDefs.some(d => d.type === 'interface' || d.type === 'trait');
     if (isIface) {
@@ -3476,7 +3529,7 @@ function _dispatchCapableSupertype(index, language, typeName, targetDefs, defini
         if (definitions.some(d => d.className === typeName)) return true;
         return _isDispatchAncestor(index, typeName, targetDefs);
     }
-    if (langTraits(language)?.allMethodsVirtual) {
+    if (traits.allMethodsVirtual) {
         return _isDispatchAncestor(index, typeName, targetDefs);
     }
     return false;

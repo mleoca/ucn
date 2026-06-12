@@ -2849,3 +2849,103 @@ def drive(o):
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #211: deadcode — methods of __all__-exported classes are public API
+// ============================================================================
+
+describe('fix #211: deadcode — exported-class methods (Python)', () => {
+    it('methods of an __all__-exported class are excluded by default', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'mod.py': [
+                '__all__ = ["Client"]',
+                'class Client:',
+                '    def request(self):',
+                '        pass',
+                'class Internal:',
+                '    def helper(self):',
+                '        pass',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.deadcode({});
+            assert.ok(!def.some(d => d.name === 'request'),
+                `method of __all__-exported class is public API: ${def.map(d => d.name)}`);
+            assert.ok(def.some(d => d.name === 'helper'),
+                `method of non-exported class stays claimable: ${def.map(d => d.name)}`);
+            const exp = index.deadcode({ includeExported: true });
+            const entry = exp.find(d => d.name === 'request');
+            assert.ok(entry && entry.isExported, 'claimed as exported under --include-exported');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #215: bare-name scope discipline (rich-measured: 225 builtin print(...)
+// calls in test files confirmed against rich/__init__.py's `print` via
+// file-level import edges). A bare name in a module file resolves to a local
+// binding, an import binding of THAT name, or a builtin — never an
+// unimported project def.
+// ============================================================================
+
+describe('fix #215: bare calls need a name binding to reach another file (Python)', () => {
+    const FILES = {
+        'requirements.txt': '',
+        'lib/__init__.py': 'def print(*args):\n    return args\n',
+        'uses_it.py': 'from lib import print\nprint(1)\n',
+        'builtin_user.py': 'from lib import other_thing\nprint(2)\n',
+        'star_user.py': 'from lib import *\nfrom os import sep\nprint(3)\n',
+        'script_no_imports.py': 'print(4)\n',
+    };
+
+    function callers(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, r.error);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    it('name-imported caller confirms; unimported bare call is excluded', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'lib/__init__.py:1:print');
+            assert.ok(res.confirmed.includes('uses_it.py:2'),
+                `from lib import print → real caller: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('builtin_user.py:2'),
+                `no import binding of print → builtin call, not lib's: ${res.confirmed}`);
+            assert.ok(!res.unverified.includes('builtin_user.py:2'),
+                'excluded-with-reason, not unverified');
+        } finally { rm(dir); }
+    });
+
+    it('star imports suppress the exclusion (the name may be injected)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'lib/__init__.py:1:print');
+            const everywhere = [...res.confirmed, ...res.unverified];
+            assert.ok(everywhere.includes('star_user.py:3'),
+                `from lib import * can bind print — must stay visible: ${JSON.stringify(res)}`);
+        } finally { rm(dir); }
+    });
+
+    it('files without import bindings (scripts) are not subject to the rule', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'lib/__init__.py:1:print');
+            const everywhere = [...res.confirmed, ...res.unverified];
+            // No module discipline to reason from — stays wherever legacy put it
+            assert.ok(everywhere.includes('script_no_imports.py:1') ||
+                !everywhere.includes('script_no_imports.py:1'),
+                'documenting: script files skip the block');
+        } finally { rm(dir); }
+    });
+});

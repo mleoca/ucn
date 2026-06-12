@@ -1036,3 +1036,37 @@ module.exports = { run };
         }
     });
 });
+
+// ============================================================================
+// Index reliability guard: parallel build determinism — worker-pool builds
+// must produce the EXACT index a sequential build does (symbol fields, file
+// entries, calls). >500 files triggers the parallel path; workers:0 forces
+// sequential.
+// ============================================================================
+
+describe('index reliability: parallel build equals sequential build', () => {
+    it('worker-pool index is byte-identical to sequential', () => {
+        const { tmp, rm, indexSnapshot } = require('./helpers');
+        const { ProjectIndex } = require('../core/project');
+        const spec = { 'package.json': '{"name":"big"}' };
+        const N = 520; // > 500-file parallel threshold
+        for (let i = 0; i < N; i++) {
+            const next = (i + 1) % N;
+            spec[`m${i}.js`] = [
+                `const { fn${next} } = require("./m${next}");`,
+                `function fn${i}(x) { return fn${next} ? fn${next}(x) + ${i} : ${i}; }`,
+                `class C${i} { run() { return fn${i}(1); } }`,
+                `module.exports = { fn${i}, C${i} };`,
+            ].join('\n');
+        }
+        const dir = tmp(spec);
+        try {
+            const seq = new ProjectIndex(dir);
+            seq.build(null, { quiet: true, workers: 0 });
+            const par = new ProjectIndex(dir);
+            par.build(null, { quiet: true, workers: 2 });
+            assert.strictEqual(indexSnapshot(par), indexSnapshot(seq),
+                'parallel and sequential builds must produce identical indexes');
+        } finally { rm(dir); }
+    });
+});

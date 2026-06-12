@@ -7,6 +7,8 @@ name: Eval
 #    second opinion via --oracle jedi with a self-bootstrapping venv; gopls
 #    for Go; rust-analyzer for Rust; jdtls for Java);
 #    fails when missing-unexplained > 0 (the contract gate)
+#  - deadcode: every deadcode claim checked for oracle references — fails
+#    when a default-arm claim has a reference UCN missed (false-dead gate)
 # Separate from ci.yml: heavier, network-dependent, weekly + on demand.
 
 on:
@@ -60,6 +62,9 @@ jobs:
 
       - name: Oracle eval (gate: missing-unexplained = 0)
         run: node eval/run-oracle-eval.js
+
+      - name: Deadcode eval (gate: default-arm false-dead = 0)
+        run: node eval/run-deadcode-eval.js --sample 300
 
       - name: Upload reports
         if: always()

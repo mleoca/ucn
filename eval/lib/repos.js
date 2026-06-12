@@ -33,11 +33,34 @@ const REPOS = [
         targetCandidates: ['packages/core/src'],
     },
     {
+        // Plain JavaScript (no annotations, no tsconfig): CJS, prototype
+        // augmentation, property-assigned functions. TS numbers do not
+        // transfer to annotation-free receiver physics — this is the
+        // measurement for it. Pinned @ v5.2.1.
+        name: 'express',
+        url: 'https://github.com/expressjs/express',
+        commit: 'dbac741a49a5a64336b70c06e85c2e2706e36336',
+        language: 'javascript',
+        targetCandidates: ['.'],
+    },
+    {
         name: 'httpx',
         url: 'https://github.com/encode/httpx',
         commit: 'b5addb64f0161ff6bfe94c124ef76f6a1fba5254',
         language: 'python',
         targetCandidates: ['httpx'],
+    },
+    {
+        // Dispatch-heavy second Python repo (the grpc-go/cursive analog):
+        // console-protocol rendering — dozens of types share render/measure
+        // method names, called through protocol-typed receivers. Style-
+        // different from httpx (deep class hierarchies vs flat clients).
+        // Pinned @ v15.0.0.
+        name: 'rich',
+        url: 'https://github.com/Textualize/rich',
+        commit: '6ac483cbea39cab124dfd3483bba70ffafb71050',
+        language: 'python',
+        targetCandidates: ['rich'],
     },
     {
         name: 'cobra',

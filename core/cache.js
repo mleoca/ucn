@@ -28,7 +28,11 @@ const UCN_VERSION = require('../package.json').version;
 // func-literal params and block locals shadow bare-identifier references).
 // v19: Rust trait-impl member symbols carry traitName (fix #210 — external-
 // contract attribution: `impl Iterator for X` members name their contract).
-const CACHE_FORMAT_VERSION = 19;
+// v20: persisted extends/extendedBy graphs split parent lists on TOP-LEVEL
+// commas and strip type-argument suffixes (fix #214 — `extends Base<string,
+// object>` produced parents ["Base<string", "object>"], so every generically
+// extended class had no usable ancestor edges).
+const CACHE_FORMAT_VERSION = 20;
 
 /**
  * Save index to cache file

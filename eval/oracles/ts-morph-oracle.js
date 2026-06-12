@@ -40,13 +40,25 @@ const tsMorphOracle = {
         }
         // Add exactly the files UCN would index under the target dir, so the
         // file universes align (normalization happens again at scoring time).
-        project.addSourceFilesAtPaths([
+        // No tsconfig = plain-JavaScript project (express): add the JS
+        // extensions UCN indexes. Gated on the tsconfig check so TS repos'
+        // symbol universes (and therefore their historical samples) stay
+        // byte-stable.
+        const globs = [
             path.join(repoDir, '**/*.ts'),
             path.join(repoDir, '**/*.tsx'),
             '!' + path.join(repoDir, '**/node_modules/**'),
             '!' + path.join(repoDir, '**/*.d.ts'),
-        ]);
-        return { project, root: repoDir, ts };
+        ];
+        if (!tsConfigPath) {
+            globs.push(
+                path.join(repoDir, '**/*.js'),
+                path.join(repoDir, '**/*.mjs'),
+                path.join(repoDir, '**/*.cjs'),
+                path.join(repoDir, '**/*.jsx'));
+        }
+        project.addSourceFilesAtPaths(globs);
+        return { project, root: repoDir, ts, isJsProject: !tsConfigPath };
     },
 
     /**
@@ -71,6 +83,17 @@ const tsMorphOracle = {
                     for (const m of cls.getMethods()) {
                         out.push({ name: m.getName(), file: rel, line: m.getStartLineNumber(), kind: 'method' });
                     }
+                }
+            }
+            // Plain-JS projects define most callables in CJS shapes invisible
+            // to getFunctions(): `const f = () => {}`, `proto.use = function
+            // use() {}`, `exports.query = function () {}`. Enumerate them with
+            // UCN's naming rules (named fn expression wins, else the assigned
+            // property/variable name) so the symbol universes align. Gated to
+            // JS projects so TS repos' historical samples stay byte-stable.
+            if (handle.isJsProject && wanted.has('function')) {
+                for (const { name, line } of jsAssignedFunctions(sf)) {
+                    out.push({ name, file: rel, line, kind: 'function' });
                 }
             }
             if (limit && out.length >= limit) return out.slice(0, limit);
@@ -126,6 +149,40 @@ function findTsConfig(dir) {
     return null;
 }
 
+/**
+ * CJS/assigned function shapes with UCN's naming rules: a named function
+ * expression keeps its own name, an anonymous one takes the assigned
+ * property/variable name (`proto.listen = function () {}` → `listen`).
+ * `anchor` is a node findReferences() accepts (Identifier or named fn).
+ */
+function jsAssignedFunctions(sf) {
+    const { SyntaxKind } = require('ts-morph');
+    const out = [];
+    for (const v of sf.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+        const init = v.getInitializer();
+        if (!init) continue;
+        const k = init.getKind();
+        if ((k === SyntaxKind.ArrowFunction || k === SyntaxKind.FunctionExpression) &&
+            v.getNameNode().getKind() === SyntaxKind.Identifier) {
+            out.push({ name: v.getName(), line: v.getStartLineNumber(), anchor: v });
+        }
+    }
+    for (const bin of sf.getDescendantsOfKind(SyntaxKind.BinaryExpression)) {
+        if (bin.getOperatorToken().getKind() !== SyntaxKind.EqualsToken) continue;
+        const lhs = bin.getLeft();
+        const rhs = bin.getRight();
+        if (lhs.getKind() !== SyntaxKind.PropertyAccessExpression) continue;
+        const rk = rhs.getKind();
+        if (rk !== SyntaxKind.FunctionExpression && rk !== SyntaxKind.ArrowFunction) continue;
+        const fnName = rk === SyntaxKind.FunctionExpression ? (rhs.getName ? rhs.getName() : null) : null;
+        const name = fnName || lhs.getNameNode().getText();
+        if (!name) continue;
+        const anchor = fnName ? rhs : lhs.getNameNode();
+        out.push({ name, line: bin.getStartLineNumber(), anchor });
+    }
+    return out;
+}
+
 function findDeclarationAt(sf, name, line) {
     for (const fn of sf.getFunctions()) {
         if (fn.getName() === name && fn.getStartLineNumber() === line) return fn;
@@ -135,6 +192,18 @@ function findDeclarationAt(sf, name, line) {
         for (const m of cls.getMethods()) {
             if (m.getName() === name && m.getStartLineNumber() === line) return m;
         }
+    }
+    // Arrow-function consts (`export const f = () => ...`) and anything nested
+    // in a namespace — getFunctions()/getClasses() are top-level only, so walk
+    // descendants. Needed by the deadcode eval, whose claims come from UCN's
+    // symbol table rather than this oracle's listSymbols.
+    const { SyntaxKind } = require('ts-morph');
+    for (const v of sf.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+        if (v.getName() === name && v.getStartLineNumber() === line) return v;
+    }
+    // CJS property-assigned functions (`proto.use = function use() {}`)
+    for (const af of jsAssignedFunctions(sf)) {
+        if (af.name === name && af.line === line) return af.anchor;
     }
     // Fallback: match by name only (line drift)
     for (const fn of sf.getFunctions()) if (fn.getName() === name) return fn;

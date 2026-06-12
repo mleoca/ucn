@@ -2329,3 +2329,118 @@ describe('fix #210: external-contract methods (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #211: deadcode — abstract interface members labeled; default methods not
+// ============================================================================
+
+describe('fix #211: deadcode — Java interface declarations', () => {
+    it('abstract interface members carry declaredOn; default methods do not', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/Api.java': [
+                'interface Api {',
+                '    void call();',
+                '    default void assist() { }',
+                '}',
+                'public class App {',
+                '    void deadPkgPrivate() {}',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // Java interface members are implicitly public — exported arm
+            const claims = index.deadcode({ includeExported: true });
+            const call = claims.find(d => d.name === 'call');
+            assert.ok(call, `abstract interface member is reported: ${claims.map(d => d.name)}`);
+            assert.deepStrictEqual(call.declaredOn, { kind: 'interface', name: 'Api' });
+            const assist = claims.find(d => d.name === 'assist');
+            assert.ok(assist, `default method is reported: ${claims.map(d => d.name)}`);
+            assert.strictEqual(assist.declaredOn, undefined,
+                'default methods have bodies — executable code');
+            // Explicit visibility languages: package-private member of a public
+            // class stays claimable by default (implicitlyPublicMembers=false)
+            const def = index.deadcode({});
+            assert.ok(def.some(d => d.name === 'deadPkgPrivate'),
+                `package-private method stays claimable: ${def.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #212: universal-supertype receivers — `void show(Object o) { o.size() }`
+// was excluded receiver-type-mismatch, but an Object-typed receiver can hold
+// ANY project instance and dispatch into any override. The implicit
+// `extends Object` edge is invisible to declared-ancestry walks, so the
+// universalSupertype trait short-circuits _dispatchCapableSupertype.
+// Demote-only: reroutes excluded → visible possible-dispatch, never confirms.
+// ============================================================================
+
+describe('fix #212: Object-typed receivers route possible-dispatch, never excluded', () => {
+    const FILES = {
+        'pom.xml': '<project/>',
+        'src/Num.java': [
+            'public class Num {',
+            '    public int size() { return 1; }',
+            '}',
+        ].join('\n'),
+        'src/Other.java': [
+            'public class Other {',
+            '    public int area() { return 2; }',
+            '}',
+        ].join('\n'),
+        'src/Show.java': [
+            'public class Show {',
+            '    void show(Object o, java.lang.Object q, Other x) {',
+            '        int a = o.size();',
+            '        int b = q.size();',
+            '        int c = x.size();',
+            '    }',
+            '}',
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason, dispatchVia: u.dispatchVia,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('Object and java.lang.Object receivers are dispatch-capable toward any override', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/Num.java:2:size');
+            assert.strictEqual(res.confirmed.length, 0,
+                `an Object receiver is not evidence FOR Num.size: ${res.confirmed}`);
+            for (const line of ['src/Show.java:3', 'src/Show.java:4']) {
+                const entry = res.unverified.find(u => u.key === line);
+                assert.ok(entry, `${line} must be visible, not excluded: ${JSON.stringify(res.unverified)}`);
+                assert.strictEqual(entry.reason, 'possible-dispatch');
+                assert.strictEqual(entry.dispatchVia, 'Object');
+            }
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('unrelated concrete project receivers still exclude (control)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/Num.java:2:size');
+            assert.ok(!res.confirmed.includes('src/Show.java:5'),
+                'x is typed Other — not a Num caller');
+            assert.ok(!res.unverified.some(u => u.key === 'src/Show.java:5'),
+                `Other defines no size and is unrelated to Num — stays excluded: ${JSON.stringify(res.unverified)}`);
+        } finally { rm(dir); }
+    });
+});

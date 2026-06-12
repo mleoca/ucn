@@ -85,12 +85,13 @@ ucn class MarketDataFetcher
 
 ### 6. `deadcode` — Find unused code
 
-Lists all functions and classes with zero callers across the project. Framework entry points (Express routes, Spring controllers, Celery tasks, etc.) are automatically excluded.
+Lists all functions and classes with zero callers across the project. Framework entry points (Express routes, Spring controllers, Celery tasks, etc.) and exported/public API symbols — including methods of exported classes in JS/TS/Python — are automatically excluded (`--include-exported` audits them). Interface/trait method declarations are labeled `[declared on interface X — contract surface, not executable code]`: unreferenced is true, but deleting one changes the API contract, not dead logic.
 
 ```bash
 ucn deadcode                        # Everything
 ucn deadcode --exclude=test         # Skip test files (most useful)
 ucn deadcode --include-decorated    # Include framework-registered functions
+ucn deadcode --include-exported     # Audit exported/public API symbols too
 ```
 
 ### 7. `brief` — One-screen "before-I-touch-this" summary

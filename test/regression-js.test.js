@@ -5561,3 +5561,261 @@ export function drive(o) {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #211: deadcode reliability — measured against compiler/LSP oracles
+// (eval/run-deadcode-eval.js). zod's `"~validate"` was the one false-dead
+// claim across 8 repos: quoted member names are invisible to the identifier-
+// regex usage scan, and methods of exported classes were claimed as dead
+// public API.
+// ============================================================================
+
+describe('fix #211: deadcode — quoted member names and exported-class methods', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'lib.ts': [
+            'export class Schema {',
+            '  "~validate"(data: unknown) { return data; }',
+            '  "~unusedQuoted"() { return 1; }',
+            '  helper() { return this["~validate"](1); }',
+            '  publicApi() { return 2; }',
+            '  _convPrivate() { return 3; }',
+            '}',
+            'class Hidden {',
+            '  "~quotedDead"() { return 4; }',
+            '  plainDead() { return 5; }',
+            '}',
+            'export function $dollarDead() { return 6; }',
+        ].join('\n'),
+    };
+
+    it('bracket-notation usage of a quoted method name counts as usage', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const claimed = index.deadcode({ includeExported: true }).map(d => d.name);
+            // this["~validate"](1) is a real usage — deleting breaks the build
+            assert.ok(!claimed.includes('"~validate"'),
+                `quoted name used via bracket notation must not be dead: ${claimed}`);
+        } finally { rm(dir); }
+    });
+
+    it('unused quoted method names are still claimable (control)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const claimed = index.deadcode({}).map(d => d.name);
+            assert.ok(claimed.includes('"~quotedDead"'),
+                `unused quoted method on non-exported class stays claimable: ${claimed}`);
+            assert.ok(claimed.includes('plainDead'), `control: ${claimed}`);
+        } finally { rm(dir); }
+    });
+
+    it('$-containing names survive the identifier pre-filter', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function $stream() { return 1; }\nmodule.exports = { run: () => [$stream] };',
+        });
+        try {
+            const index = idx(dir);
+            const claimed = index.deadcode({}).map(d => d.name);
+            // [$stream] is a reference (not a call, so no calleeIndex fast path);
+            // the old /\b[a-zA-Z_]\w*\b/ pre-filter never produced "$stream"
+            assert.ok(!claimed.includes('$stream'),
+                `$-name referenced as value must not be dead: ${claimed}`);
+        } finally { rm(dir); }
+    });
+
+    it('methods of an exported class are public API — excluded by default, claimed as exported', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.deadcode({});
+            assert.ok(!def.some(d => d.name === 'publicApi'),
+                `method of exported class is reachable externally: ${def.map(d => d.name)}`);
+            const exp = index.deadcode({ includeExported: true });
+            const entry = exp.find(d => d.name === 'publicApi');
+            assert.ok(entry && entry.isExported, 'claimed as exported under --include-exported');
+            // Private-by-convention members stay claimable by default
+            assert.ok(def.some(d => d.name === '_convPrivate'),
+                `_name members are not public API: ${def.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+
+    it('members of an exported interface are excluded by default; non-exported interface members carry declaredOn', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.ts': [
+                'export interface Pub {',
+                '  pubArea(): number;',
+                '}',
+                'interface Priv {',
+                '  privArea(): number;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.deadcode({});
+            assert.ok(!def.some(d => d.name === 'pubArea'),
+                `exported interface member is public API: ${def.map(d => d.name)}`);
+            const priv = def.find(d => d.name === 'privArea');
+            assert.ok(priv, `non-exported interface member stays claimable: ${def.map(d => d.name)}`);
+            assert.deepStrictEqual(priv.declaredOn, { kind: 'interface', name: 'Priv' },
+                'declaration-only member is labeled contract surface');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #213: structural same-class pinning with ROUTING (zod seed-B-measured).
+// `this.min()` inside ZodString lexically binds ZodString.min (or a subclass
+// override) — it is not confirmation evidence for a pinned sibling
+// ZodNumber.min. The #202b exclusion was measured unsound for TS (declare-
+// class merging hides extends edges), so mismatches route VISIBLE
+// method-ambiguous under the account contract; legacy keeps confirming.
+// ============================================================================
+
+describe('fix #213: this-calls pin to the enclosing class for JS/TS (routed, not excluded)', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'lib.ts': [
+            'export class Str {',
+            '  min(n: number) { return n; }',
+            '  nonempty() { return this.min(1); }',
+            '}',
+            'export class Num {',
+            '  min(n: number) { return n; }',
+            '  positive() { return this.min(0); }',
+            '}',
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({ key: `${u.file}:${u.line}`, reason: u.reason })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('own-class this-call confirms; sibling this-call routes visible', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'lib.ts:2:min'); // Str.min
+            assert.ok(res.confirmed.includes('lib.ts:3'),
+                `Str.nonempty's this.min(1) is Str.min's caller: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('lib.ts:7'),
+                `Num.positive's this.min(0) binds Num.min, not Str.min: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'lib.ts:7');
+            assert.ok(entry, `sibling this-call stays VISIBLE (declare-merging may hide edges): ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'method-ambiguous');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('subclass override pinning: this-call in an ancestor stays confirmed (dynamic dispatch)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Base {',
+                '  parse(x: number) { return x; }',
+                '  run() { return this.parse(1); }',
+                '}',
+                'export class Child extends Base {',
+                '  parse(x: number) { return x + 1; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // this.parse(1) inside Base can dispatch to Child.parse at runtime
+            const res = contract(index, 'lib.ts:6:parse'); // Child.parse
+            assert.ok(res.confirmed.includes('lib.ts:3'),
+                `Base.run's this.parse may dispatch to the Child override: ${res.confirmed} / ${JSON.stringify(res.unverified)}`);
+        } finally { rm(dir); }
+    });
+
+    it('legacy callers keep the sibling edge (drop-vs-route asymmetry)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const legacy = index.findCallers('min', { file: 'lib.ts' });
+            const lines = (legacy.callers || legacy).map(c => c.line);
+            assert.ok(lines.includes(3) && lines.includes(7),
+                `legacy (trace/blast path) keeps both this-call edges: ${lines}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #215 (JS): bare calls need a name binding to reach another module
+// ============================================================================
+
+describe('fix #215: bare calls need a name binding to reach another file (JS)', () => {
+    it('unimported bare name does not confirm against another module', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'export function structuredThing() { return 1; }',
+            'user.js': 'import { structuredThing } from "./lib.js";\nexport const a = () => structuredThing();',
+            'bystander.js': 'import { unrelated } from "./other.js";\nexport const b = () => structuredThing();',
+            'other.js': 'export const unrelated = 1;',
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'lib.js:1:structuredThing' });
+            assert.ok(r.ok, r.error);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('user.js:2'), `imported caller confirms: ${confirmed}`);
+            assert.ok(!confirmed.includes('bystander.js:2'),
+                `bystander never imports structuredThing — a bare call cannot reach lib.js: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #216: dotted accesses count as deadcode usage (express-measured
+// false-dead: `app.all(route, user.load)` — a member-access callback
+// reference — looked like a skippable property access, so exports.load was
+// claimed dead while deleting it breaks the route).
+// ============================================================================
+
+describe('fix #216: member-access callback references keep symbols alive', () => {
+    it('mod.fn passed as a callback is a usage', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'user.js': 'exports.load = function(req, res, next) { next(); };',
+            'index.js': [
+                'var user = require("./user");',
+                'var app = { all: function(r, fn) {} };',
+                'app.all("/user/:id", user.load);',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const claimed = index.deadcode({ includeExported: true }).map(d => d.name);
+            assert.ok(!claimed.includes('load'),
+                `user.load is a callback reference — deleting load breaks the route: ${claimed}`);
+        } finally { rm(dir); }
+    });
+
+    it('fully unreferenced exports are still claimed (control)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'user.js': 'exports.deadThing = function() { return 1; };',
+            'index.js': 'var user = require("./user");\nconsole.log("nothing else");',
+        });
+        try {
+            const index = idx(dir);
+            const claimed = index.deadcode({ includeExported: true }).map(d => d.name);
+            assert.ok(claimed.includes('deadThing'), `no reference anywhere: ${claimed}`);
+        } finally { rm(dir); }
+    });
+});

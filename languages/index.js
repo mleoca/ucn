@@ -23,6 +23,13 @@ const STRUCTURAL_TRAITS = {
     testDirs: [],
     allMethodsVirtual: false,
     hasArityOverloads: false,
+    // Class members are public unless marked otherwise (#name, _name,
+    // `private`). An exported class therefore exposes its non-private methods
+    // as public API — deadcode treats them as exported (fix #211). Languages
+    // with explicit member visibility (Rust `pub`, Java `public` — already
+    // captured as modifiers) or capitalization rules (Go) set false: there
+    // the member's own marker decides.
+    implicitlyPublicMembers: true,
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
@@ -52,6 +59,16 @@ const NOMINAL_TRAITS = {
     //   'path'        — Rust Type::method (isPathCall); a DOT-call receiver
     //                   matching a type name is a variable, never the type.
     typeQualifiedCallStyle: 'static',
+    implicitlyPublicMembers: false,
+    // The implicit root supertype every class extends without declaring it
+    // (Java `Object`). A receiver declared with this type can hold ANY project
+    // instance, so it is dispatch-capable toward every override — but the
+    // edge is invisible to declared-ancestry walks (fix #212). Routing only,
+    // never exclusion evidence. Go/Rust: null — Go's interface{}/any cannot
+    // receive method calls without an assertion, Rust has no universal
+    // supertype. Structural languages: null — any/object/unknown receivers
+    // are already refused as exclusion evidence by the trust gate.
+    universalSupertype: null,
 };
 
 // Language configurations
@@ -151,6 +168,7 @@ const LANGUAGES = {
             selfParam: ['this'],
             allMethodsVirtual: true,
             hasArityOverloads: true,
+            universalSupertype: 'Object',
             testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],
         },
     },

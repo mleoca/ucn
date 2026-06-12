@@ -190,8 +190,15 @@ function buildInheritanceGraph(index) {
             }
 
             if (symbol.extends) {
-                // Parse comma-separated parents (Python MRO: "Flyable, Swimmable")
-                const parents = symbol.extends.split(',').map(s => s.trim()).filter(Boolean);
+                // Parse comma-separated parents (Python MRO: "Flyable, Swimmable").
+                // Commas inside type arguments do NOT separate parents:
+                // `extends Base<string, object>` is ONE parent `Base`, and
+                // `class C(Mapping[str, int], Base)` is `Mapping` + `Base`.
+                // The naive split made every generically-extended class
+                // parentless (fix #214 — zod's whole ZodType hierarchy had no
+                // ancestor edges, measured: 12 true base-class dispatch edges
+                // demoted because `Base<string` never equals `Base`).
+                const parents = splitParentList(symbol.extends);
 
                 // Resolve aliased parent names via import aliases
                 // e.g., const { BaseHandler: Handler } = require('./base')
@@ -228,6 +235,32 @@ function buildInheritanceGraph(index) {
             }
         }
     }
+}
+
+/**
+ * Split an extends/bases clause on TOP-LEVEL commas only and strip each
+ * parent's trailing type-argument suffix: `Base<string, object>` → `Base`,
+ * `Mapping[str, int], Flyable` → `Mapping`, `Flyable`. Depth-tracks <>, [],
+ * and () so argument commas never split (fix #214).
+ */
+function splitParentList(clause) {
+    const parts = [];
+    let depth = 0;
+    let current = '';
+    for (const ch of String(clause)) {
+        if (ch === '<' || ch === '[' || ch === '(') depth++;
+        else if (ch === '>' || ch === ']' || ch === ')') depth = Math.max(0, depth - 1);
+        if (ch === ',' && depth === 0) {
+            parts.push(current);
+            current = '';
+        } else {
+            current += ch;
+        }
+    }
+    parts.push(current);
+    return parts
+        .map(s => s.trim().replace(/[<[(].*$/s, '').trim())
+        .filter(Boolean);
 }
 
 module.exports = { buildDirIndex, buildImportGraph, buildInheritanceGraph, _resolveJavaPackageImport };

@@ -13,6 +13,7 @@
     "benchmark:agent": "node test/agent-understanding-benchmark.js",
     "eval:conservation": "node eval/conservation-real.js",
     "eval:oracle": "node eval/run-oracle-eval.js",
+    "eval:deadcode": "node eval/run-deadcode-eval.js",
     "lint": "eslint core/ cli/ mcp/ languages/"
   },
   "keywords": [

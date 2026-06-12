@@ -53,6 +53,13 @@ const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim
 const sampleSize = Number(readArgValue(args, '--sample') || 50);
 const oracleFilter = readArgValue(args, '--oracle');
 const minPrecision = readArgValue(args, '--min-precision') ? Number(readArgValue(args, '--min-precision')) : null;
+// Statistical-hardening runs: a different seed draws a different stratified
+// sample, confirming the board numbers aren't sample artifacts. Non-default
+// seeds get their own report filenames so they never clobber the canonical
+// dated rollup.
+const DEFAULT_SEED = 0xACE0FBA5E;
+const sampleSeed = readArgValue(args, '--seed') ? Number(readArgValue(args, '--seed')) : DEFAULT_SEED;
+const seedSuffix = sampleSeed === DEFAULT_SEED ? '' : `-seed${sampleSeed.toString(16)}`;
 const REPORTS_DIR = path.join(__dirname, 'reports');
 
 // Order matters: per repo the FIRST language match wins — pyright (stronger
@@ -118,7 +125,7 @@ async function evaluateRepo(repo, oracle) {
         s.name && s.name.length >= 3 && indexedFiles.has(s.file));
 
     // Seeded shuffle, then stratify by oracle reference count.
-    const rand = seededRandom(0xACE0FBA5E);
+    const rand = seededRandom(sampleSeed);
     for (let i = candidates.length - 1; i > 0; i--) {
         const j = Math.floor(rand() * (i + 1));
         [candidates[i], candidates[j]] = [candidates[j], candidates[i]];
@@ -370,7 +377,7 @@ async function main() {
                 process.stdout.write(`  ⚠ PRECISION GATE FAILURE: tier1 ${pct(result.summary.tier1Precision)} < floor ${pct(minPrecision)}\n`);
                 gateFailed = true;
             }
-            const jsonPath = path.join(REPORTS_DIR, `oracle-eval-${repo.name}-${oracle.name}-${date}.json`);
+            const jsonPath = path.join(REPORTS_DIR, `oracle-eval-${repo.name}-${oracle.name}-${date}${seedSuffix}.json`);
             fs.writeFileSync(jsonPath, JSON.stringify(result, null, 2));
             process.stdout.write(`  wrote ${path.relative(process.cwd(), jsonPath)}\n`);
         } catch (e) {
@@ -411,7 +418,7 @@ async function main() {
         }
     }
     lines.push('');
-    const mdPath = path.join(REPORTS_DIR, `oracle-eval-rollup-${date}.md`);
+    const mdPath = path.join(REPORTS_DIR, `oracle-eval-rollup-${date}${seedSuffix}.md`);
     fs.writeFileSync(mdPath, lines.join('\n'));
     process.stdout.write(`\nwrote ${path.relative(process.cwd(), mdPath)}\n`);
 

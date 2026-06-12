@@ -2560,3 +2560,52 @@ pub fn drive() -> u32 {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #211: deadcode — trait declarations labeled; explicit member visibility
+// ============================================================================
+
+describe('fix #211: deadcode — Rust trait declarations and pub control', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname="t"\nversion="0.1.0"',
+        'src/lib.rs': [
+            'pub struct Widget {}',
+            'impl Widget {',
+            '    pub fn shown(&self) {}',
+            '    fn hidden_dead(&self) {}',
+            '}',
+            'trait Render {',
+            '    fn draw(&self);',
+            '    fn assist(&self) { }',
+            '}',
+        ].join('\n'),
+    };
+
+    it('non-pub method of a pub struct stays claimable (implicitlyPublicMembers=false)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const names = index.deadcode({}).map(d => d.name);
+            assert.ok(names.includes('hidden_dead'),
+                `Rust member visibility is the member's own pub marker: ${names}`);
+            assert.ok(!names.includes('shown'), `pub method is exported: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('required trait methods carry declaredOn; default-bodied ones do not', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            // Trait methods are parsed with the `public` modifier (implicitly
+            // public within the trait), so they live in the exported arm.
+            const claims = index.deadcode({ includeExported: true });
+            const draw = claims.find(d => d.name === 'draw');
+            assert.ok(draw, `body-less trait method is reported: ${claims.map(d => d.name)}`);
+            assert.deepStrictEqual(draw.declaredOn, { kind: 'trait', name: 'Render' });
+            const assist = claims.find(d => d.name === 'assist');
+            assert.ok(assist, `default-bodied trait method is reported: ${claims.map(d => d.name)}`);
+            assert.strictEqual(assist.declaredOn, undefined,
+                'a default body is executable code, not pure contract');
+        } finally { rm(dir); }
+    });
+});

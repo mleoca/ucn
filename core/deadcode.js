@@ -178,6 +178,45 @@ function buildUsageIndex(index, filterNames) {
 }
 
 /**
+ * Is a symbol part of the public/exported API surface?
+ *
+ * Beyond direct evidence (export list, export/public modifiers, Go
+ * capitalization), methods of an exported class count as exported in
+ * languages where class members are public by default (implicitlyPublicMembers
+ * trait — JS/TS/Python): they are reachable through the class from outside
+ * the project, so claiming them dead invites deleting public API (fix #211 —
+ * zod's `strictImplement` is called by zero project files but is documented
+ * public API). Private-by-shape members (#name, _name, `private` modifier)
+ * stay claimable.
+ */
+function symbolIsExported(index, symbol, fileEntry) {
+    if (!fileEntry) return false;
+    const name = symbol.name;
+    const mods = symbol.modifiers || [];
+    if (fileEntry.exports.includes(name) || mods.includes('export') || mods.includes('public')) {
+        return true;
+    }
+    const traits = langTraits(fileEntry.language);
+    if (traits?.exportVisibility === 'capitalization') {
+        return /^[A-Z]/.test(name);
+    }
+    if (traits?.implicitlyPublicMembers && symbol.className &&
+        !mods.includes('private') && !name.startsWith('#') && !name.startsWith('_')) {
+        const classSyms = index.symbols.get(symbol.className) || [];
+        const cls = classSyms.find(c => c.file === symbol.file &&
+            (c.type === 'class' || c.type === 'interface'));
+        if (cls) {
+            const cmods = cls.modifiers || [];
+            if (fileEntry.exports.includes(symbol.className) ||
+                cmods.includes('export') || cmods.includes('public')) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
  * Find dead code (unused functions/classes)
  * @param {object} index - ProjectIndex instance
  * @param {object} options - { includeExported, includeTests }
@@ -220,15 +259,7 @@ function deadcode(index, options = {}) {
         for (const name of potentiallyDeadNames) {
             const syms = index.symbols.get(name) || [];
             // Keep the name only if at least one definition is NOT exported
-            const allExported = syms.every(s => {
-                const fe = index.files.get(s.file);
-                const lang = fe?.language;
-                if (!fe) return false;
-                return fe.exports.includes(name) ||
-                    (s.modifiers || []).includes('export') ||
-                    (s.modifiers || []).includes('public') ||
-                    (langTraits(lang)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(name));
-            });
+            const allExported = syms.every(s => symbolIsExported(index, s, index.files.get(s.file)));
             if (!allExported) narrowed.add(name);
         }
         potentiallyDeadNames = narrowed;
@@ -260,10 +291,18 @@ function deadcode(index, options = {}) {
                 const content = index._readFile(filePath);
                 // Fast pre-filter: extract identifiers from file, intersect with target names.
                 // One regex pass over content (O(content)) vs O(names × content) substring searches.
+                // Names the identifier regex can never produce — quoted member names
+                // (zod's `"~validate"`), $-containing JS names — fall back to a substring
+                // check, or they would scan as zero-usage and be falsely claimed dead
+                // (fix #211: `this["~validate"](data)` is a real usage; the quotes in
+                // the symbol name make the substring search self-delimiting).
                 const fileIdentifiers = new Set(content.match(/\b[a-zA-Z_]\w*\b/g));
                 const namesInFile = [];
                 for (const name of potentiallyDeadNames) {
-                    if (fileIdentifiers.has(name)) namesInFile.push(name);
+                    const present = /^[a-zA-Z_]\w*$/.test(name)
+                        ? fileIdentifiers.has(name)
+                        : content.includes(name);
+                    if (present) namesInFile.push(name);
                 }
                 if (namesInFile.length === 0) continue;
                 const lines = content.split('\n');
@@ -291,9 +330,37 @@ function deadcode(index, options = {}) {
                                 (hashIdx === 0 || /\s/.test(line[hashIdx - 1]))) continue;
                             // Skip if inside a string literal
                             if (isInsideString(line, pos)) continue;
-                            // Skip property/field access: preceded by '.' unless followed by '(' (method call)
+                            // Property/field access (preceded by '.'), not a
+                            // call: resolve the RECEIVER (fix #216, express-
+                            // measured false-dead — `app.all(route, user.load)`
+                            // is a callback reference to user.js's load, and
+                            // deleting it breaks the route).
+                            //   - import-bound module receiver → usage scoped
+                            //     to the module's resolved file
+                            //   - this/self/cls receiver → usage scoped to the
+                            //     same file (same-class member reference)
+                            //   - any other receiver (local object literal,
+                            //     instance) → NOT a usage of a standalone
+                            //     symbol (fix #123: `Primitives.Separator` has
+                            //     its own key; must not keep the export alive)
+                            let dottedScope;
                             if (pos > 0 && line[pos - 1] === '.' &&
-                                (pos + nameLen >= line.length || line[pos + nameLen] !== '(')) continue;
+                                (pos + nameLen >= line.length || line[pos + nameLen] !== '(')) {
+                                let r = pos - 2;
+                                while (r >= 0 && /[\w$]/.test(line[r])) r--;
+                                const receiver = line.slice(r + 1, pos - 1);
+                                if (!receiver) continue;
+                                if (['this', 'self', 'cls'].includes(receiver)) {
+                                    dottedScope = 'same-file';
+                                } else {
+                                    const binding = (fileEntry.importBindings || [])
+                                        .find(b => b.name === receiver);
+                                    const resolved = binding && fileEntry.moduleResolved &&
+                                        fileEntry.moduleResolved[binding.module];
+                                    if (!resolved) continue;
+                                    dottedScope = resolved;
+                                }
+                            }
                             // Skip object literal key: name followed by ':' (not '::' for Rust paths)
                             const afterChar = pos + nameLen < line.length ? line[pos + nameLen] : '';
                             const afterChar2 = pos + nameLen + 1 < line.length ? line[pos + nameLen + 1] : '';
@@ -303,7 +370,8 @@ function deadcode(index, options = {}) {
                             usageIndex.get(name).push({
                                 file: filePath,
                                 line: i + 1,
-                                relativePath: fileEntry.relativePath
+                                relativePath: fileEntry.relativePath,
+                                ...(dottedScope && { dottedScope })
                             });
                             break; // one match per line is enough for deadcode
                         }
@@ -365,12 +433,7 @@ function deadcode(index, options = {}) {
                 continue;
             }
 
-            const isExported = fileEntry && (
-                fileEntry.exports.includes(name) ||
-                mods.includes('export') ||
-                mods.includes('public') ||
-                (langTraits(lang)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(name))
-            );
+            const isExported = symbolIsExported(index, symbol, fileEntry);
 
             // Skip exported unless requested
             if (isExported && !options.includeExported) {
@@ -389,8 +452,15 @@ function deadcode(index, options = {}) {
             // Filter out usages that are at the definition location
             // nameLine: when decorators/annotations are present, startLine is the decorator line
             // but the name identifier is on a different line (nameLine). Check both.
+            // Dotted usages (fix #216) are scoped to the file their receiver
+            // resolves to — `user.load` keeps user.js's load alive, never an
+            // unrelated module's same-name symbol.
             let nonDefUsages = allUsages.filter(u =>
-                !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine))
+                !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine)) &&
+                (!u.dottedScope ||
+                    (u.dottedScope === 'same-file'
+                        ? u.file === symbol.file
+                        : u.dottedScope === symbol.relativePath))
             );
 
             // For exported symbols in --include-exported mode, also filter out export-site
@@ -428,6 +498,28 @@ function deadcode(index, options = {}) {
                     ? mods.filter(m => !javaKw.has(m))
                     : [];
 
+                // Interface/trait member declarations are contract surface, not
+                // executable code: "unreferenced" is true, but deleting one
+                // changes the API contract rather than removing dead logic (Go
+                // marker interfaces exist SOLELY as uncallable declarations —
+                // grpc-go-measured: its entire default deadcode output was this
+                // family). Label so the claim self-explains (fix #211). Only
+                // body-less declarations qualify — Java `default` and Rust
+                // default-bodied trait methods are executable code, detected
+                // generically by a brace in the member's source range.
+                const declaredOn = (() => {
+                    if (!symbol.className) return null;
+                    const enclosing = (index.symbols.get(symbol.className) || []).find(c =>
+                        c.file === symbol.file && (c.type === 'interface' || c.type === 'trait'));
+                    if (!enclosing) return null;
+                    try {
+                        const content = index._readFile(symbol.file);
+                        const range = content.split('\n').slice(symbol.startLine - 1, symbol.endLine).join('\n');
+                        if (range.includes('{')) return null;
+                    } catch { return null; }
+                    return { kind: enclosing.type, name: symbol.className };
+                })();
+
                 results.push({
                     name: symbol.name,
                     type: symbol.type,
@@ -437,7 +529,8 @@ function deadcode(index, options = {}) {
                     isExported,
                     usageCount: 0,
                     ...(decorators.length > 0 && { decorators }),
-                    ...(annotations.length > 0 && { annotations })
+                    ...(annotations.length > 0 && { annotations }),
+                    ...(declaredOn && { declaredOn })
                 });
             }
         }

@@ -236,6 +236,39 @@ function extensionFor(lang) {
     return ext ? ext.slice(1) : null;
 }
 
+/**
+ * Deterministic semantic snapshot of an index: every symbol field, file
+ * entry semantics, and per-file calls — sorted so Map insertion order never
+ * leaks in. Two indexes over the same tree must snapshot byte-identical
+ * regardless of HOW they were built (fresh / cache round-trip / incremental
+ * rebuild / parallel workers). Used by the index-reliability guards.
+ */
+function indexSnapshot(index) {
+    const { getCachedCalls } = require('../../core/callers');
+    const symbols = [...index.symbols.entries()]
+        .map(([name, syms]) => [name, syms.map(s => {
+            const o = {};
+            for (const k of Object.keys(s).sort()) o[k] = s[k];
+            return o;
+        }).sort((a, b) => `${a.relativePath}:${a.startLine}:${a.type}`
+            .localeCompare(`${b.relativePath}:${b.startLine}:${b.type}`))])
+        .filter(([, syms]) => syms.length > 0)
+        .sort((a, b) => a[0].localeCompare(b[0]));
+    const files = [...index.files.values()]
+        .map(fe => ({
+            relativePath: fe.relativePath,
+            language: fe.language,
+            exports: [...(fe.exports || [])].sort(),
+            importCount: (fe.imports || []).length,
+        }))
+        .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    const calls = [...index.files.keys()].sort().map(f => [
+        path.relative(index.root, f),
+        (getCachedCalls(index, f) || []).map(c => JSON.stringify(c)).sort(),
+    ]);
+    return JSON.stringify({ symbols, files, calls });
+}
+
 module.exports = {
     PROJECT_DIR,
     FIXTURES_PATH,
@@ -254,4 +287,5 @@ module.exports = {
     langTraits,
     forEachLanguage,
     extensionFor,
+    indexSnapshot,
 };

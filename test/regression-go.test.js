@@ -5186,3 +5186,50 @@ func use() {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #211: deadcode — interface method declarations are contract surface
+// (grpc-go-measured: marker interfaces like UnsafeXServer/ChannelzSecurityValue
+// made up its ENTIRE default deadcode output)
+// ============================================================================
+
+describe('fix #211: deadcode — Go interface markers and capitalization control', () => {
+    const FILES = {
+        'go.mod': 'module t',
+        'app.go': [
+            'package main',
+            'type Marker interface {',
+            '\tmustEmbedUnimplemented()',
+            '}',
+            'type Server struct{}',
+            'func (s Server) Public() {}',
+            'func (s Server) deadHelper() {}',
+            'func main() {}',
+        ].join('\n'),
+    };
+
+    it('interface method declarations carry declaredOn', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const claim = index.deadcode({}).find(d => d.name === 'mustEmbedUnimplemented');
+            assert.ok(claim, 'marker method is still reported (it IS unreferenced)');
+            assert.deepStrictEqual(claim.declaredOn, { kind: 'interface', name: 'Marker' },
+                'labeled as contract surface');
+        } finally { rm(dir); }
+    });
+
+    it('capitalization still decides method exported-ness (implicitlyPublicMembers=false)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const names = index.deadcode({}).map(d => d.name);
+            assert.ok(names.includes('deadHelper'),
+                `lowercase method of exported struct stays claimable: ${names}`);
+            assert.ok(!names.includes('Public'), `capitalized method is exported: ${names}`);
+            // Struct methods are executable code — no declaredOn label
+            const helper = index.deadcode({}).find(d => d.name === 'deadHelper');
+            assert.strictEqual(helper.declaredOn, undefined);
+        } finally { rm(dir); }
+    });
+});

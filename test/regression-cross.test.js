@@ -5468,3 +5468,94 @@ describe('Regression JAVA-1: polyglot file discovery is manifest-independent', (
         }
     });
 });
+
+// ============================================================================
+// Fix #214: type arguments in extends/bases clauses broke the inheritance
+// graph — `extends Base<string, object>` split on the argument comma into
+// parents ["Base<string", "object>"], so every generically extended class
+// had no usable ancestor edges (zod-measured: 12 true base-class dispatch
+// edges demoted; Java AbstractMap<K,V> and Python Mapping[str, int] bases
+// had the same silent breakage).
+// ============================================================================
+
+describe('fix #214: generic extends clauses split on top-level commas only', () => {
+    it('TS: extends Base<string, object> yields parent Base', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.ts': [
+                'export abstract class Base<O = any, D = unknown> {',
+                '  abstract run(x: O): O;',
+                '}',
+                'export class Str extends Base<string, object> {',
+                '  run(x: string) { return x; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const f = [...index.files.keys()][0];
+            assert.deepStrictEqual(index._getInheritanceParents('Str', f), ['Base']);
+        } finally { rm(dir); }
+    });
+
+    it('Java: extends AbstractBox<K, V> yields parent AbstractBox', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/Impl.java': [
+                'abstract class AbstractBox<K, V> {',
+                '    abstract V get(K k);',
+                '}',
+                'public class Impl extends AbstractBox<String, Integer> {',
+                '    Integer get(String k) { return 1; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const f = [...index.files.keys()][0];
+            assert.deepStrictEqual(index._getInheritanceParents('Impl', f), ['AbstractBox']);
+        } finally { rm(dir); }
+    });
+
+    it('Python: class C(Mapping[str, int], Flyable) yields both parents', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'mod.py': [
+                'class Flyable:',
+                '    pass',
+                'class C(dict[str, int], Flyable):',
+                '    pass',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const f = [...index.files.keys()].find(k => k.endsWith('mod.py'));
+            assert.deepStrictEqual(index._getInheritanceParents('C', f), ['dict', 'Flyable']);
+        } finally { rm(dir); }
+    });
+
+    it('base-class this-call dispatch edges stay confirmed through generic extends', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.ts': [
+                'export abstract class Base<O> {',
+                '  abstract _parse(x: O): O;',
+                '  run() { return this._parse(null as any); }',
+                '}',
+                'export class Str extends Base<string> {',
+                '  _parse(x: string) { return x; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'a.ts:6:_parse' });
+            assert.ok(r.ok, r.error);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('a.ts:3'),
+                `Base.run's this._parse() can dispatch to the Str override: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
