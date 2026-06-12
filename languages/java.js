@@ -976,6 +976,62 @@ function findCallsInCode(code, parser) {
         return undefined;
     };
 
+    // Call-site argument shape: count + per-arg static kind. Kinds feed the
+    // overload discipline in findCallers (Java is the only supported language
+    // with arity/type overloading): literal kinds can prove a call binds a
+    // DIFFERENT same-class overload than the pinned one. Unknown args are
+    // 'expr' — never evidence.
+    const bareTypeName = (text) => {
+        let t = text;
+        const g = t.indexOf('<');
+        if (g > 0) t = t.substring(0, g);
+        const d = t.lastIndexOf('.');
+        if (d >= 0) t = t.substring(d + 1);
+        return t.trim();
+    };
+    const argKindOf = (arg) => {
+        switch (arg.type) {
+            case 'string_literal': return 'string';
+            case 'character_literal': return 'char';
+            case 'decimal_integer_literal':
+            case 'hex_integer_literal':
+            case 'octal_integer_literal':
+            case 'binary_integer_literal':
+                return /[lL]$/.test(arg.text) ? 'long' : 'int';
+            case 'decimal_floating_point_literal':
+            case 'hex_floating_point_literal':
+                return /[fF]$/.test(arg.text) ? 'float' : 'double';
+            case 'true':
+            case 'false': return 'boolean';
+            case 'null_literal': return 'null';
+            case 'object_creation_expression': {
+                const tn = arg.childForFieldName('type');
+                return tn ? `new:${bareTypeName(tn.text)}` : 'expr';
+            }
+            case 'cast_expression': {
+                const tn = arg.childForFieldName('type');
+                return tn ? `cast:${bareTypeName(tn.text)}` : 'expr';
+            }
+            case 'lambda_expression':
+            case 'method_reference': return 'lambda';
+            case 'unary_expression':
+                // -1, -2.5 — numeric literal kinds survive negation
+                return arg.namedChildCount === 1 ? argKindOf(arg.namedChild(0)) : 'expr';
+            default: return 'expr';
+        }
+    };
+    const getCallArgs = (callNode) => {
+        const argsNode = callNode.childForFieldName('arguments');
+        if (!argsNode) return { argCount: 0, argKinds: null };
+        const kinds = [];
+        for (let i = 0; i < argsNode.namedChildCount; i++) {
+            const arg = argsNode.namedChild(i);
+            if (arg.type === 'comment') continue;
+            kinds.push(argKindOf(arg));
+        }
+        return { argCount: kinds.length, argKinds: kinds.some(k => k !== 'expr') ? kinds : null };
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
@@ -1031,6 +1087,7 @@ function findCallsInCode(code, parser) {
                     }
                 }
                 const firstArg = getFirstStringArg(node);
+                const callArgs = getCallArgs(node);
                 calls.push({
                     name: nameNode.text,
                     // Multi-line chains (builder.x()\n.y()) must report each
@@ -1042,6 +1099,8 @@ function findCallsInCode(code, parser) {
                     ...(receiverType && { receiverType }),
                     ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                    argCount: callArgs.argCount,
+                    ...(callArgs.argKinds && { argKinds: callArgs.argKinds }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
@@ -1066,11 +1125,14 @@ function findCallsInCode(code, parser) {
                 }
 
                 const enclosingFunction = getCurrentEnclosingFunction();
+                const ctorArgs = getCallArgs(node);
                 calls.push({
                     name: typeName,
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     isConstructor: true,
+                    argCount: ctorArgs.argCount,
+                    ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
                     enclosingFunction
                 });
             }

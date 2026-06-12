@@ -1968,3 +1968,99 @@ describe('fix #204: possible-dispatch tiering (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #205: arity pruning + overload discipline (Java)
+// ============================================================================
+
+describe('fix #205: overload discipline and arity pruning (Java)', () => {
+    const FILES = {
+        'Element.java': 'public class Element {}\n',
+        'Sub.java': 'public class Sub extends Element {}\n',
+        'Sink.java': `public class Sink {
+    public void add(Number n) {}
+    public void add(String s) {}
+    public void add(Element e) {}
+    public String[] asList() { return null; }
+}
+`,
+        'Use.java': `public class Use {
+    public void go(Sink sink, Element el) {
+        sink.add(1);
+        sink.add("x");
+        sink.add(new Sub());
+        sink.add(el);
+        Arrays.asList(1, 2, 3);
+        sink.asList();
+    }
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => ({
+                key: `${c.file}:${c.line}`, reason: c.reason, dispatchCandidates: c.dispatchCandidates,
+            })),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('literal kinds narrow to the pinned overload (int → add(Number) confirmed)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'Sink.java:2:add');
+            assert.ok(res.confirmed.includes('Use.java:3'),
+                `sink.add(1) uniquely binds add(Number): ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('literal kinds proving a sibling overload exclude with overload-mismatch', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'Sink.java:2:add');
+            // add("x") binds add(String); add(new Sub()) binds add(Element)
+            // via project ancestry Sub -> Element.
+            assert.ok(!res.confirmed.includes('Use.java:4') && !res.confirmed.includes('Use.java:5'),
+                `string/constructor args must not confirm add(Number): ${res.confirmed}`);
+            assert.strictEqual(res.excluded.byReason['overload-mismatch']?.count, 2,
+                `sibling-overload calls excluded with reason: ${JSON.stringify(res.excluded.byReason)}`);
+        } finally { rm(dir); }
+    });
+
+    it('variable args against several applicable overloads stay visible as overload-ambiguous', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'Sink.java:2:add');
+            const entry = res.unverified.find(u => u.key === 'Use.java:6');
+            assert.ok(entry, `sink.add(el) stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'overload-ambiguous');
+            assert.strictEqual(entry.dispatchCandidates, 3);
+        } finally { rm(dir); }
+    });
+
+    it('argument count that fits no pinned signature excludes with arity-mismatch', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'Sink.java:5:asList');
+            assert.ok(res.confirmed.includes('Use.java:8'),
+                `sink.asList() confirms: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('Use.java:7'),
+                `Arrays.asList(1,2,3) cannot bind a 0-param method: ${res.confirmed}`);
+            assert.strictEqual(res.excluded.byReason['arity-mismatch']?.count, 1,
+                `arity mismatch excluded with reason: ${JSON.stringify(res.excluded.byReason)}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});

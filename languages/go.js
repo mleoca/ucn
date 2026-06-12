@@ -861,6 +861,21 @@ function findCallsInCode(code, parser, options = {}) {
             const enclosingFunction = getCurrentEnclosingFunction();
             let uncertain = false;
 
+            // Call-site arg count for arity pruning. Slice-spread (`xs...`)
+            // makes the count open-ended — flag it so pruning skips the site.
+            const argsNode = node.childForFieldName('arguments');
+            let argCount = 0;
+            let argSpread = false;
+            if (argsNode) {
+                for (let i = 0; i < argsNode.namedChildCount; i++) {
+                    if (argsNode.namedChild(i).type === 'comment') continue;
+                    argCount++;
+                }
+                for (let i = 0; i < argsNode.childCount; i++) {
+                    if (argsNode.child(i).type === '...') { argSpread = true; break; }
+                }
+            }
+
             if (funcNode.type === 'identifier') {
                 const callName = funcNode.text;
                 // Skip Go built-in function calls
@@ -877,6 +892,8 @@ function findCallsInCode(code, parser, options = {}) {
                     name: callName,
                     line: node.startPosition.row + 1,
                     isMethod: false,
+                    argCount,
+                    ...(argSpread && { argSpread: true }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -915,6 +932,8 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverType && { receiverType }),
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                        argCount,
+                        ...(argSpread && { argSpread: true }),
                         enclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })

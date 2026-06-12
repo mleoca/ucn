@@ -1124,6 +1124,51 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Arity pruning (nominal contract surface, fix #205): a call
+                // whose argument count cannot fit ANY pinned definition's
+                // parameter range is positive evidence the call binds a
+                // different symbol — excluded-with-reason. Static-arity
+                // languages only: their compilers enforce arity, so a mismatch
+                // IS evidence. JS pads/ignores extra args legally and Python
+                // decorators reshape signatures invisibly — never prune there.
+                // Go tuple expansion (f(g()) filling two params) means too-FEW
+                // syntactic args is not evidence in Go — only too-many prunes.
+                // Binding/same-class evidence outranks the count (then a
+                // mismatch more likely means our param parse is wrong).
+                if (collectAccount && !bindingId && !resolvedBySameClass &&
+                    call.argCount != null && !call.argSpread &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                    !_callArityCompatible(call, targetDefs, fileEntry.language)) {
+                    recordExcluded(filePath, call.line, 'arity-mismatch');
+                    continue;
+                }
+
+                // Overload discipline (fix #205, languages with arity/type
+                // overloading — Java): when the pinned target shares its name
+                // with sibling overloads in the same class, a call site only
+                // CONFIRMS the pinned overload if its static argument shape
+                // (count + literal kinds) binds it:
+                //   - kinds prove a DIFFERENT overload → excluded 'overload-mismatch'
+                //   - kinds prove the pinned one uniquely → flows on (confirmable)
+                //   - undecidable (variable args) → visible 'overload-ambiguous'
+                // jdtls-measured: class-level receiver evidence said "some add()
+                // overload", which is not evidence for THIS add(Number).
+                if (collectAccount && options.targetDefinitions &&
+                    langTraits(fileEntry.language)?.hasArityOverloads &&
+                    call.argCount != null && !call.argSpread && !call.isConstructor) {
+                    const overloadVerdict = _overloadDiscipline(index, call, targetDefs, definitions);
+                    if (overloadVerdict === 'other-overload') {
+                        recordExcluded(filePath, call.line, 'overload-mismatch');
+                        continue;
+                    }
+                    if (overloadVerdict && overloadVerdict.ambiguous) {
+                        routeUnverified(filePath, fileEntry, call, 'overload-ambiguous', calledAs, {
+                            dispatchCandidates: overloadVerdict.candidates,
+                        });
+                        continue;
+                    }
+                }
+
                 // Find the enclosing function (get full symbol info)
                 const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
 
@@ -2327,6 +2372,135 @@ function _declaredFieldType(index, rootType, fieldName, language) {
     const typeDefs = index.symbols.get(typeName);
     if (typeDefs && typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
     return typeName;
+}
+
+/**
+ * Can this call's argument count fit any target definition's parameter
+ * range? (Nominal languages only — their compilers enforce arity, so a
+ * mismatch is positive evidence the call binds a different symbol.)
+ * Accepts both the bound form (obj.m(a)) and the unbound/UFCS form
+ * (Type::m(&obj, a) / Class.m(obj, a)) for method targets. Returns true
+ * whenever the signature is unknown, variadic, or the target is not a
+ * plain callable — unknown never excludes.
+ */
+function _callArityCompatible(call, targetDefs, language) {
+    const traits = langTraits(language);
+    const selfNames = new Set((traits?.selfParam || [])
+        .map(s => String(s).replace(/&|mut\s*/g, '').trim()));
+    let sawComparable = false;
+    for (const def of targetDefs) {
+        if (NON_CALLABLE_TYPES.has(def.type)) return true;
+        const ps = def.paramsStructured;
+        if (!Array.isArray(ps)) return true;
+        if (ps.some(p => p && p.rest)) return true;
+        const params = ps.filter((p, i) => !(i === 0 && p &&
+            selfNames.has(String(p.name || '').replace(/&|mut\s*/g, '').trim())));
+        const isMethodDef = !!(def.className || def.receiver);
+        // The receiver-as-first-arg shift applies only to call shapes that
+        // can actually be unbound: Rust UFCS (Type::method(&x)) and Go
+        // method expressions (Type.Method(recv)) — the receiver text IS the
+        // type. Java has no unbound instance-call form.
+        const defType = def.className || (def.receiver || '').replace(/^\*/, '');
+        const unboundForm = call.isPathCall || (!!call.receiver && call.receiver === defType);
+        const max = params.length + (isMethodDef && unboundForm ? 1 : 0);
+        const min = params.filter(p => p && !p.optional && p.default === undefined).length;
+        sawComparable = true;
+        if (langTraits(language)?.packageScope === 'directory') {
+            // Go: f(g()) tuple expansion can fill several params with one
+            // syntactic arg — too-few never excludes, only too-many.
+            if (call.argCount <= max) return true;
+        } else if (call.argCount >= min && call.argCount <= max) {
+            return true;
+        }
+    }
+    return sawComparable ? false : true;
+}
+
+const JAVA_PRIMITIVES = new Set(['int', 'long', 'short', 'byte', 'char', 'float', 'double', 'boolean']);
+
+// Which parameter types a call-site literal kind can bind (Java overload
+// resolution: identity, widening, boxing — plus the boxed types' interfaces).
+// Anything not provably incompatible MATCHES: only certainty excludes.
+const JAVA_KIND_TYPES = {
+    string: ['String', 'CharSequence', 'Comparable', 'Serializable'],
+    char: ['char', 'Character', 'int', 'long', 'float', 'double', 'Comparable', 'Serializable'],
+    int: ['int', 'long', 'float', 'double', 'Integer', 'Number', 'Comparable', 'Serializable'],
+    long: ['long', 'float', 'double', 'Long', 'Number', 'Comparable', 'Serializable'],
+    float: ['float', 'double', 'Float', 'Number', 'Comparable', 'Serializable'],
+    double: ['double', 'Double', 'Number', 'Comparable', 'Serializable'],
+    boolean: ['boolean', 'Boolean', 'Comparable', 'Serializable'],
+};
+
+/**
+ * Can an argument of static kind `kind` (from the Java parser's argKinds)
+ * bind a parameter declared as `paramType`? Unknown kinds ('expr',
+ * 'lambda'), unknown/generic param types, and unresolvable hierarchies all
+ * match — a mismatch must be provable to count.
+ */
+function _javaArgKindMatches(index, kind, paramType) {
+    if (!kind || kind === 'expr' || kind === 'lambda') return true;
+    if (!paramType) return true;
+    const bare = String(paramType).replace(/<.*$/s, '').trim()
+        .replace(/\.\.\.$/, '').replace(/\[\]$/, '').split('.').pop();
+    if (!bare || bare === 'Object') return true;
+    if (/^[A-Z][0-9]?$/.test(bare)) return true; // generic type variable (T, E, K1...)
+    if (kind === 'null') return !JAVA_PRIMITIVES.has(bare);
+    if (kind.startsWith('new:') || kind.startsWith('cast:')) {
+        const t = kind.slice(kind.indexOf(':') + 1);
+        if (t === bare) return true;
+        const tDefs = (index.symbols.get(t) || [])
+            .filter(d => d.type === 'class' || d.type === 'interface');
+        if (tDefs.length === 0) return true; // external arg type — unknowable
+        const asTarget = [{ className: t, file: tDefs[0].file }];
+        if (_isDispatchAncestor(index, bare, asTarget)) return true;
+        // Deny only when t's ancestry is fully project-visible — a chain
+        // that dead-ends external may still reach paramType.
+        return !_targetAncestryFullyResolved(index, asTarget);
+    }
+    const allowed = JAVA_KIND_TYPES[kind];
+    if (!allowed) return true;
+    return allowed.includes(bare);
+}
+
+/** Is overload `def` applicable to this call's static argument shape? */
+function _overloadApplicable(index, call, def) {
+    const ps = def.paramsStructured;
+    if (!Array.isArray(ps)) return true;
+    const hasRest = ps.some(p => p && p.rest);
+    const min = ps.filter(p => p && !p.optional && p.default === undefined && !p.rest).length;
+    if (call.argCount < min) return false;
+    if (!hasRest && call.argCount > ps.length) return false;
+    const kinds = call.argKinds;
+    if (!Array.isArray(kinds)) return true;
+    for (let i = 0; i < kinds.length && i < ps.length; i++) {
+        const p = ps[i];
+        if (!p || p.rest) break;
+        if (!_javaArgKindMatches(index, kinds[i], p.type)) return false;
+    }
+    return true;
+}
+
+/**
+ * Overload discipline (Java): when the pinned target has same-class sibling
+ * overloads, decide what the call site's static argument shape proves.
+ * Returns 'other-overload' (binds a sibling — exclusion evidence),
+ * {ambiguous, candidates} (cannot tell — visible unverified), or null
+ * (no siblings / uniquely the pinned one / model has no opinion).
+ */
+function _overloadDiscipline(index, call, targetDefs, definitions) {
+    const targetOwners = new Set(targetDefs.map(d => d.className).filter(Boolean));
+    if (targetOwners.size === 0) return null;
+    const family = definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) &&
+        d.className && targetOwners.has(d.className));
+    if (family.length <= 1) return null;
+    const pinnedKeys = new Set(targetDefs.map(d => `${d.file}:${d.startLine}`));
+    if (family.every(d => pinnedKeys.has(`${d.file}:${d.startLine}`))) return null;
+    const applicable = family.filter(d => _overloadApplicable(index, call, d));
+    if (applicable.length === 0) return null; // shape fits nothing we model — no claim
+    const pinnedApplicable = applicable.some(d => pinnedKeys.has(`${d.file}:${d.startLine}`));
+    if (!pinnedApplicable) return 'other-overload';
+    if (applicable.length === 1) return null; // uniquely the pinned overload
+    return { ambiguous: true, candidates: applicable.length };
 }
 
 /**

@@ -323,6 +323,9 @@ function unverifiedReasonLabel(entry) {
     if (entry.reason === 'method-ambiguous' && entry.dispatchCandidates > 1) {
         return `method-ambiguous — ${entry.dispatchCandidates} same-name definitions`;
     }
+    if (entry.reason === 'overload-ambiguous' && entry.dispatchCandidates > 1) {
+        return `overload-ambiguous — 1 of ${entry.dispatchCandidates} applicable overloads`;
+    }
     return entry.reason;
 }
 

@@ -1140,6 +1140,18 @@ function findCallsInCode(code, parser) {
 
             const enclosingFunction = getCurrentEnclosingFunction();
 
+            // Call-site arg count for arity pruning (no spread syntax in Rust;
+            // UFCS `Type::method(&x, ...)` counts the explicit self — the
+            // pruning range accounts for the shift).
+            const argsNode = node.childForFieldName('arguments');
+            let argCount = 0;
+            if (argsNode) {
+                for (let i = 0; i < argsNode.namedChildCount; i++) {
+                    if (argsNode.namedChild(i).type === 'comment') continue;
+                    argCount++;
+                }
+            }
+
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
                 const firstArg = getFirstStringArg(node);
@@ -1147,6 +1159,7 @@ function findCallsInCode(code, parser) {
                     name: funcNode.text,
                     line: node.startPosition.row + 1,
                     isMethod: false,
+                    argCount,
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
@@ -1218,6 +1231,7 @@ function findCallsInCode(code, parser) {
                         ...(receiverType && { receiverType }),
                         ...(receiverField && { receiverRoot, receiverField }),
                         ...(receiverField && receiverRootType && { receiverRootType }),
+                        argCount,
                         enclosingFunction,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
@@ -1235,6 +1249,7 @@ function findCallsInCode(code, parser) {
                     isMethod: segments.length > 1,
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
                     receiver: segments.length > 1 ? segments.slice(0, -1).join('::') : undefined,
+                    argCount,
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });

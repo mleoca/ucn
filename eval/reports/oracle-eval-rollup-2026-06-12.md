@@ -11,8 +11,8 @@ lie the grep-reliability contract forbids. Target: 0.
 | preact-signals | ts-morph | 24 | 24 | 91.7% | 0.0% | 0.9167 | **0** | n/a (0) | 100.0% |
 | httpx | pyright | 50 | 879 | 89.9% | 33.6% | 0.5632 | **0** | 100.0% (6) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.2% | 0.0% | n/a | **0** | 100.0% (12) | 100.0% |
-| ripgrep | rust-analyzer | 41 | 765 | 100.0% | 7.7% | 0.9233 | **0** | 100.0% (1) | 100.0% |
-| gson | jdtls | 50 | 649 | 64.8% | 14.5% | 0.5033 | **0** | 100.0% (9) | 100.0% |
+| ripgrep | rust-analyzer | 41 | 765 | 100.0% | 7.7% | 0.9229 | **0** | 100.0% (1) | 100.0% |
+| gson | jdtls | 50 | 649 | 94.2% | 29.9% | 0.6425 | **0** | 100.0% (9) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -35,7 +35,7 @@ evidence confirms the file but not the receiver type.
 | cobra | method | 18 | 567 | 98.8% (560/567) | 0.0% (0/0) | n/a | {"confirmed":560,"unverified":0,"reportedNonCall":7,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cobra | class | 3 | 409 | 99.0% (409/413) | 0.0% (0/0) | n/a | {"confirmed":409,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | function | 6 | 568 | 100.0% (568/568) | 0.0% (0/0) | n/a | {"confirmed":568,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| ripgrep | method | 31 | 186 | 100.0% (160/160) | 6.3% (22/347) | 0.9366 | {"confirmed":160,"unverified":22,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| ripgrep | method | 31 | 186 | 100.0% (160/160) | 6.4% (22/345) | 0.9362 | {"confirmed":160,"unverified":22,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | class | 4 | 11 | 100.0% (6/6) | 100.0% (5/5) | 0 | {"confirmed":6,"unverified":5,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| gson | method | 40 | 615 | 64.2% (276/430) | 12.8% (171/1332) | 0.5135 | {"confirmed":276,"unverified":171,"reportedNonCall":36,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
+| gson | method | 40 | 615 | 94.0% (252/268) | 27.4% (195/712) | 0.6664 | {"confirmed":252,"unverified":195,"reportedNonCall":36,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (8/8) | 100.0% (26/26) | 0 | {"confirmed":8,"unverified":26,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

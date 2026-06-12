@@ -2008,7 +2008,7 @@ func World() string { return "world" }
                 assert.ok(!entry.symbols, 'File entry should not contain symbols');
                 assert.ok(!entry.bindings, 'File entry should not contain bindings');
             }
-            assert.strictEqual(cacheData.version, 12, 'Cache version should be 12');
+            assert.strictEqual(cacheData.version, 13, 'Cache version should be 13');
         } finally {
             rm(dir);
         }
@@ -4548,6 +4548,77 @@ func getThing() *Filter { return nil }
             assert.strictEqual(entry.reason, 'possible-dispatch');
             assert.strictEqual(entry.dispatchVia, 'Doer');
             assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #205: arity pruning (Go — too-many only, tuple expansion keeps too-few)
+// ============================================================================
+
+describe('fix #205: arity pruning (Go)', () => {
+    const FILES = {
+        'go.mod': 'module test\n\ngo 1.21\n',
+        'lib.go': `package main
+
+func Take(a int, b int) int { return a + b }
+
+func pair() (int, int) { return 1, 2 }
+`,
+        'caller.go': `package main
+
+func useTuple() int {
+	return Take(pair())
+}
+
+func useExact() int {
+	return Take(1, 2)
+}
+`,
+        // Different package: no same-package binding for Take, so the arity
+        // gate (which binding evidence outranks) is reachable.
+        'other/other.go': `package other
+
+func useTooMany() int {
+	return Take(1, 2, 3)
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('tuple-expansion calls (too few syntactic args) are never excluded', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.go:3:Take');
+            assert.ok(res.confirmed.includes('caller.go:4'),
+                `Take(pair()) fills both params via tuple expansion: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('caller.go:8'),
+                `Take(1, 2) confirms: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('too many args exclude with arity-mismatch (unbound caller)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.go:3:Take');
+            assert.ok(!res.confirmed.includes('other/other.go:4'),
+                `Take(1,2,3) cannot bind a 2-param func: ${res.confirmed}`);
+            assert.strictEqual(res.excluded.byReason['arity-mismatch']?.count, 1,
+                JSON.stringify(res.excluded.byReason));
         } finally { rm(dir); }
     });
 });

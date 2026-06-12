@@ -2122,3 +2122,77 @@ impl Searcher {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #205: arity pruning (Rust — both directions, UFCS self-shift)
+// ============================================================================
+
+describe('fix #205: arity pruning (Rust)', () => {
+    const FILES = {
+        'lib.rs': `pub struct Engine {}
+
+impl Engine {
+    pub fn run(&self, input: i32) -> i32 { input }
+}
+
+pub fn solo(x: i32) -> i32 { x }
+
+pub fn use_bound(e: Engine) -> i32 {
+    e.run(1)
+}
+
+pub fn use_ufcs(e: Engine) -> i32 {
+    Engine::run(&e, 1)
+}
+
+pub fn use_exact() -> i32 {
+    solo(7)
+}
+`,
+        // Separate file: no same-file binding for solo, so the arity gate
+        // (which binding evidence outranks) is reachable.
+        'other.rs': `pub fn use_too_many() -> i32 {
+    solo(1, 2, 3)
+}
+`,
+    };
+
+    function callersOf(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('bound and UFCS call forms both stay confirmed (self-shift)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.rs:4:run');
+            assert.ok(res.confirmed.includes('lib.rs:10'),
+                `e.run(1) bound form confirms: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('lib.rs:14'),
+                `Engine::run(&e, 1) UFCS form confirms: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('arg count outside any signature range excludes with arity-mismatch', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callersOf(index, 'lib.rs:7:solo');
+            assert.ok(res.confirmed.includes('lib.rs:18'),
+                `solo(7) confirms: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('other.rs:2'),
+                `solo(1,2,3) cannot bind a 1-param fn: ${res.confirmed}`);
+            assert.strictEqual(res.excluded.byReason['arity-mismatch']?.count, 1,
+                JSON.stringify(res.excluded.byReason));
+        } finally { rm(dir); }
+    });
+});

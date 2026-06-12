@@ -13,6 +13,10 @@ const { expandGlob, detectProjectPattern, parseGitignore, DEFAULT_IGNORES } = re
 // Read UCN version for cache invalidation
 const UCN_VERSION = require('../package.json').version;
 
+// Index/calls cache format version — bump when the persisted call-record or
+// symbol shape changes (saveCache writes it; loadCache rejects anything else).
+const CACHE_FORMAT_VERSION = 13;
+
 /**
  * Save index to cache file
  * @param {object} index - ProjectIndex instance
@@ -114,7 +118,11 @@ function saveCache(index, cachePath) {
         //      silently disable declared-field receiver typing)
         // v12: fix #203 — callback references carry localShadow (lexical-scope
         //      shadowing computed parser-side)
-        version: 12,
+        // v13: fix #205 — Python/Go/Rust/Java calls carry argCount (+argSpread
+        //      where the language has call-site spread); Java calls carry
+        //      argKinds for overload discipline (stale shapes would silently
+        //      disable arity pruning)
+        version: CACHE_FORMAT_VERSION,
         ucnVersion: UCN_VERSION,  // Invalidate cache when UCN is updated
         configHash,
         root,
@@ -220,7 +228,7 @@ function loadCache(index, cachePath) {
         // v7: symbols/bindings stripped from file entries (dedup)
         // v9: addSymbol propagates isAsync/isGenerator/paramTypes (force rebuild for old)
         // v10: persists _reachableSymbols set
-        if (cacheData.version !== 12) {
+        if (cacheData.version !== CACHE_FORMAT_VERSION) {
             return false;
         }
 

@@ -847,6 +847,21 @@ function findCallsInCode(code, parser) {
             let uncertain = false;
             const assignedTo = assignmentTargetOf(node);
 
+            // Call-site arg count (positional + keyword) for arity pruning.
+            // *args/**kwargs splats make the count open-ended — flag them so
+            // pruning skips the site.
+            const callArgsNode = node.childForFieldName('arguments');
+            let argCount = 0;
+            let argSpread = false;
+            if (callArgsNode) {
+                for (let i = 0; i < callArgsNode.namedChildCount; i++) {
+                    const arg = callArgsNode.namedChild(i);
+                    if (arg.type === 'comment') continue;
+                    if (arg.type === 'list_splat' || arg.type === 'dictionary_splat') argSpread = true;
+                    argCount++;
+                }
+            }
+
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
                 const resolvedName = aliases.get(funcNode.text);
@@ -857,6 +872,8 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     ...(assignedTo && { assignedTo }),
+                    argCount,
+                    ...(argSpread && { argSpread: true }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -912,6 +929,8 @@ function findCallsInCode(code, parser) {
                         ...(receiverIsModule && { receiverIsModule: true }),
                         ...(selfAttribute && { selfAttribute }),
                         ...(assignedTo && { assignedTo }),
+                        argCount,
+                        ...(argSpread && { argSpread: true }),
                         enclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })

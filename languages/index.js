@@ -22,6 +22,7 @@ const STRUCTURAL_TRAITS = {
     hasDynamicImports: true,
     testDirs: [],
     allMethodsVirtual: false,
+    hasArityOverloads: false,
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
@@ -36,6 +37,11 @@ const NOMINAL_TRAITS = {
     // sets and Rust inherent methods bind statically — only interface/trait
     // receivers dispatch there, which is detected per-type, not per-language.
     allMethodsVirtual: false,
+    // Whether one class can define several same-name methods differing only
+    // in parameters (Java overloading). Drives the overload discipline in
+    // the caller contract: a pinned overload is only confirmed when the call
+    // site provably binds it.
+    hasArityOverloads: false,
 };
 
 // Language configurations
@@ -132,6 +138,7 @@ const LANGUAGES = {
             ...NOMINAL_TRAITS,
             selfParam: ['this'],
             allMethodsVirtual: true,
+            hasArityOverloads: true,
             testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],
         },
     },
