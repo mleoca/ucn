@@ -10,7 +10,8 @@ const {
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
-    extractGoDocstring
+    extractGoDocstring,
+    visitNameNodes,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1550,7 +1551,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTreeCached(tree.rootNode, (node) => {
+    visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, field_identifier (method names in selector expressions),
         // and type_identifier (type references in params, return types, composite literals, etc.)
         const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier';

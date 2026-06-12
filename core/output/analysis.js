@@ -190,6 +190,7 @@ function formatContextJson(context) {
                     ...(c.reason && { reason: c.reason }),
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
+                    ...(c.externalContract && { externalContract: true }),
                 })),
                 ...(context.warnings && { warnings: context.warnings })
             }
@@ -231,6 +232,7 @@ function formatContextJson(context) {
                 ...(c.reason && { reason: c.reason }),
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                 ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
+                ...(c.externalContract && { externalContract: true }),
             })),
             callees: callees.map(c => ({
                 name: c.name,

@@ -729,6 +729,39 @@ function traverseTreeCached(rootNode, callback) {
 }
 
 /**
+ * Visit the AST node covering each whole-word text occurrence of `name`.
+ *
+ * Equivalent to a full-tree walk whose callback filters on
+ * `node.text === name` token types — but O(occurrences) instead of
+ * O(nodes): the source string locates candidate offsets (indexOf + ASCII
+ * word-boundary pre-check), and descendantForIndex jumps straight to the
+ * deepest node spanning each. The callback receives the identifier-style
+ * token when the occurrence is code, or a string/comment/longer-identifier
+ * token otherwise — callers' existing type/text guards skip those, so
+ * false-positive candidates are safe and false negatives are impossible
+ * (a token equal to `name` cannot have identifier characters adjacent,
+ * or the token would extend past the name).
+ *
+ * node-tree-sitter indexes are UTF-16 code units, same as JS string
+ * offsets — unicode content needs no special handling.
+ */
+function visitNameNodes(tree, code, name, callback) {
+    const isWordCode = (c) =>
+        (c >= 48 && c <= 57) || (c >= 65 && c <= 90) ||
+        (c >= 97 && c <= 122) || c === 95 || c === 36; // [0-9A-Za-z_$]
+    const len = name.length;
+    let idx = code.indexOf(name);
+    while (idx !== -1) {
+        if ((idx === 0 || !isWordCode(code.charCodeAt(idx - 1))) &&
+            (idx + len >= code.length || !isWordCode(code.charCodeAt(idx + len)))) {
+            const node = tree.rootNode.descendantForIndex(idx);
+            if (node) callback(node);
+        }
+        idx = code.indexOf(name, idx + len);
+    }
+}
+
+/**
  * Clear the cached node list (call when the tree changes).
  */
 function clearNodeListCache() {
@@ -920,6 +953,7 @@ function extractSprintfPrefix(callNode) {
 module.exports = {
     traverseTree,
     traverseTreeCached,
+    visitNameNodes,
     getCachedNodeList,
     clearNodeListCache,
     nodeToLocation,

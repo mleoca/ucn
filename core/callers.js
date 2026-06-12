@@ -199,6 +199,31 @@ function findCallers(index, name, options = {}) {
         }
         return _dispatchCountCache.get(via);
     };
+    // External-contract target (fix #210, gson-measured): the pinned method
+    // carries an explicit override marker (@Override / TS `override` / typing
+    // @override / Rust `impl Trait for X`) and has a SINGLE project-wide
+    // owner — so the overridden definition is not in the project (a visible
+    // project supertype defining the method would be a second owner). The
+    // method name provably exists on an external contract (java.lang.Number,
+    // std Iterator, ...): any external-typed receiver satisfies the same
+    // call, and unique project ownership stops being identity evidence.
+    // Receiver-evidence-free calls route possible-dispatch instead of
+    // confirming. Lazily computed once per query; null = not external.
+    let _extContract; // undefined → not yet computed
+    const externalContractTarget = () => {
+        if (_extContract !== undefined) return _extContract;
+        _extContract = null;
+        if (methodOwnerKeys().size === 1) {
+            const tDefs = (options.targetDefinitions || definitions).filter(d =>
+                !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver));
+            // `some`, not `every`: one marked overload proves the NAME exists
+            // on an external contract — receiver identity is then unprovable
+            // for every call shape (external signatures are invisible).
+            const marked = tDefs.find(d => _externalContractMarker(d));
+            if (marked) _extContract = { via: _externalContractVia(index, marked) };
+        }
+        return _extContract;
+    };
 
     // ---- Rename-alias surfaces (import/export renames) ----
     // Other surface names that can denote this symbol:
@@ -1565,6 +1590,20 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
+                        // Single project-wide owner, but the method provably
+                        // implements an EXTERNAL contract (fix #210): the
+                        // receiver could be any external subtype
+                        // (((Long) obj).intValue() vs LazilyParsedNumber's
+                        // @Override intValue) — unique ownership is not
+                        // identity evidence here. Visible, never excluded.
+                        const extContract = !knownDispatchType && externalContractTarget();
+                        if (extContract) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                ...(extContract.via && { dispatchVia: extContract.via }),
+                                externalContract: true,
+                            });
+                            continue;
+                        }
                     }
                 }
 
@@ -1591,6 +1630,21 @@ function findCallers(index, name, options = {}) {
                     if (call.isMethod && !call.receiverIsModule) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        // External-contract single owner (fix #210): same
+                        // physics as the nominal gate above — an override
+                        // marker proves the name exists on a contract UCN
+                        // cannot see, so the receiver could be any external
+                        // subtype. Checked before the multi-owner branch
+                        // only via owner count (===1) being its precondition.
+                        const extContract = !typeQualifiedReceiver &&
+                            externalContractTarget();
+                        if (extContract) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                ...(extContract.via && { dispatchVia: extContract.via }),
+                                externalContract: true,
+                            });
+                            continue;
+                        }
                         if (!typeQualifiedReceiver && methodOwnerKeys().size > 1) {
                             if (call.receiverType) {
                                 // Known-but-unvalidated type (supertype of the
@@ -3580,6 +3634,66 @@ function _targetAncestryFullyResolved(index, targetDefs) {
         }
     }
     return true;
+}
+
+/**
+ * Explicit override marker on a method definition (fix #210). Marker fields
+ * are language-disjoint: traitImpl is Rust-only, an 'override' modifier is
+ * Java's lowercased @Override annotation, an override-bearing memberType is
+ * TS's `override` keyword, and an override decorator is Python's
+ * typing.@override. The marker is compiler-checked syntax in all four —
+ * never inferred.
+ */
+function _externalContractMarker(def) {
+    if (def.traitImpl) return true;
+    if (def.modifiers && def.modifiers.includes('override')) return true;
+    if (def.memberType && /\boverride\b/.test(def.memberType)) return true;
+    if (def.decorators && def.decorators.some(d =>
+        String(d).replace(/\(.*$/, '').split('.').pop() === 'override')) return true;
+    return false;
+}
+
+/**
+ * Name of the external contract a marked method implements, for dispatch
+ * attribution ("possible-dispatch via Number — external contract"). Rust
+ * impls name the trait directly; Java/TS/Python derive it from the class's
+ * own extends/implements entries that do NOT resolve to project types.
+ * Returns null when the contract type is not uniquely attributable —
+ * the demotion still applies, only the label loses its `via`.
+ */
+function _externalContractVia(index, def) {
+    if (def.traitName) {
+        // rust `impl fmt::Display for X` → Display (strip path + generics)
+        const bare = String(def.traitName).replace(/<.*$/, '').split('::').pop().trim();
+        return bare || null;
+    }
+    const cls = def.className;
+    if (!cls) return null;
+    const classDefs = (index.symbols.get(cls) || []).filter(d =>
+        d.file === def.file &&
+        (d.type === 'class' || d.type === 'struct' || d.type === 'interface' || d.type === 'trait'));
+    const supers = [];
+    for (const cd of classDefs) {
+        if (cd.extends) supers.push(...(Array.isArray(cd.extends) ? cd.extends : [cd.extends]));
+        if (cd.implements) supers.push(...cd.implements);
+    }
+    const externals = [];
+    for (const raw of supers) {
+        const bare = String(raw).replace(/<.*$/, '').split('.').pop().trim();
+        if (!bare) continue;
+        const defs = index.symbols.get(bare);
+        const isProject = !!defs && defs.some(d =>
+            d.type === 'class' || d.type === 'struct' || d.type === 'interface' || d.type === 'trait');
+        if (!isProject && !externals.includes(bare)) externals.push(bare);
+    }
+    if (externals.length === 1) return externals[0];
+    if (externals.length === 0 && supers.length === 0 &&
+        def.modifiers && def.modifiers.includes('override')) {
+        // java: @Override with no explicit supertypes can only override
+        // java.lang.Object (toString/equals/hashCode) — in compiling code.
+        return 'Object';
+    }
+    return null; // several external candidates — attribution unknowable
 }
 
 /** Rust deref-transparent wrappers: Box<X>/Rc<X>/Arc<X> auto-deref to X for method calls. */

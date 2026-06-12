@@ -11,7 +11,8 @@ const {
     nodeToLocation,
     parseStructuredParams,
     extractPythonDocstring,
-    paramTypesFromStructured
+    paramTypesFromStructured,
+    visitNameNodes,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1185,7 +1186,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTreeCached(tree.rootNode, (node) => {
+    visitNameNodes(tree, code, name, (node) => {
         // Only look for identifiers with the matching name
         if (node.type !== 'identifier' || node.text !== name) {
             return true;

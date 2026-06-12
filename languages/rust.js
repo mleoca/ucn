@@ -10,7 +10,8 @@ const {
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
-    extractRustDocstring
+    extractRustDocstring,
+    visitNameNodes,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1869,7 +1870,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTreeCached(tree.rootNode, (node) => {
+    visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, field_identifier (method names in obj.method() calls),
         // and type_identifier (type references in params, return types, struct expressions, etc.)
         const isIdentifier = node.type === 'identifier' || node.type === 'field_identifier' || node.type === 'type_identifier';

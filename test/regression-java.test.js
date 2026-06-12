@@ -2192,3 +2192,140 @@ describe('fix #207: return-type flow and declared-type locals (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #210: external-contract methods (gson-measured, JDK-name collisions).
+// A method with @Override and a SINGLE project-wide owner overrides a
+// contract UCN cannot see (LazilyParsedNumber extends Number → intValue is
+// Number's contract): any external-typed receiver satisfies the same call,
+// so unique project ownership is not identity evidence. Receiver-evidence-
+// free calls route possible-dispatch (visible, never excluded); receiver-
+// evidenced calls keep confirming. Account-gated — legacy paths unchanged.
+// ============================================================================
+
+describe('fix #210: external-contract methods (Java)', () => {
+    const FILES = {
+        'LazyNum.java': `public class LazyNum extends Number {
+    @Override
+    public int intValue() { return 1; }
+    public int ownMethod() { return 2; }
+}
+`,
+        'Caller.java': `public class Caller {
+    void use(Object o) {
+        int a = ((Integer) o).intValue();
+        int b = ((Caller) o).ownMethod();
+    }
+}
+`,
+        'Typed.java': `public class Typed {
+    void go() {
+        LazyNum n = new LazyNum();
+        int c = n.intValue();
+    }
+}
+`,
+        'Plain.java': `public class Plain {
+    @Override
+    public String toString() { return "p"; }
+}
+`,
+        'Stringer.java': `public class Stringer {
+    Object make() { return new Object(); }
+    void show() {
+        String s = make().toString();
+    }
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason,
+                dispatchVia: u.dispatchVia, externalContract: u.externalContract,
+            })),
+            conserved: json.meta.account?.conserved,
+            text: r.result,
+        };
+    }
+
+    it('@Override + single owner routes receiver-evidence-free calls possible-dispatch via the external supertype', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'LazyNum.java:2:intValue');
+            assert.ok(!res.confirmed.includes('Caller.java:3'),
+                `((Integer) o).intValue() could be Number's: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'Caller.java:3');
+            assert.ok(entry, `cast-receiver call stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Number');
+            assert.strictEqual(entry.externalContract, true);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('receiver-evidenced calls keep confirming on external-contract methods', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'LazyNum.java:2:intValue');
+            assert.ok(res.confirmed.includes('Typed.java:4'),
+                `LazyNum-typed receiver outranks the contract demotion: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('un-marked single-owner methods keep confirming (control)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'LazyNum.java:4:ownMethod');
+            assert.ok(res.confirmed.includes('Caller.java:4'),
+                `ownMethod has no override marker — unique ownership stays evidence: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('@Override with no explicit supertypes attributes via Object', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Plain.java:2:toString');
+            const entry = res.unverified.find(u => u.key === 'Stringer.java:4');
+            assert.ok(entry, `o.toString() stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.dispatchVia, 'Object');
+            assert.strictEqual(entry.externalContract, true);
+        } finally { rm(dir); }
+    });
+
+    it('text rendering labels the entry as an external contract', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'LazyNum.java:2:intValue' });
+            assert.ok(r.ok);
+            const output = require('../core/output');
+            const formatted = output.formatContext(r.result);
+            const text = typeof formatted === 'string' ? formatted : formatted.text;
+            assert.ok(text.includes('possible-dispatch via Number — external contract'),
+                `label renders the contract: ${text}`);
+        } finally { rm(dir); }
+    });
+
+    it('legacy (non-account) caller resolution is unchanged', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const { findCallers } = require('../core/callers');
+            const legacy = findCallers(index, 'intValue', {});
+            assert.ok(legacy.some(c => (c.relativePath || c.file).includes('Caller.java') && c.line === 3),
+                `legacy keeps the edge (drop-vs-route asymmetry): ${JSON.stringify(legacy.map(c => `${c.relativePath || c.file}:${c.line}`))}`);
+        } finally { rm(dir); }
+    });
+});

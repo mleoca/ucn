@@ -314,6 +314,13 @@ function formatGitLine(git) {
  */
 function unverifiedReasonLabel(entry) {
     if (!entry || !entry.reason) return '';
+    if (entry.reason === 'possible-dispatch' && entry.externalContract) {
+        // External contract (fix #210): the candidate set is open — any
+        // external subtype of the contract — so no implementation count.
+        return entry.dispatchVia
+            ? `possible-dispatch via ${entry.dispatchVia} — external contract`
+            : 'possible-dispatch — external contract';
+    }
     if (entry.reason === 'possible-dispatch' && entry.dispatchVia) {
         const n = entry.dispatchCandidates;
         return n > 1

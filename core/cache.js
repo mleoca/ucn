@@ -26,7 +26,9 @@ const UCN_VERSION = require('../package.json').version;
 // annotated receivers validate against the aliased type).
 // v18: Go callback references carry localShadow (fix #203 Go parity —
 // func-literal params and block locals shadow bare-identifier references).
-const CACHE_FORMAT_VERSION = 18;
+// v19: Rust trait-impl member symbols carry traitName (fix #210 — external-
+// contract attribution: `impl Iterator for X` members name their contract).
+const CACHE_FORMAT_VERSION = 19;
 
 /**
  * Save index to cache file

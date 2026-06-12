@@ -2775,3 +2775,77 @@ describe('fix #202b: Python self-call sibling-class pinning', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #210: external-contract methods (Python side — typing @override).
+// A method marked @override in a class whose base is external (import from
+// an unresolvable package), with a single project-wide owner: the name
+// provably exists on a contract UCN cannot see, so unique ownership is not
+// identity evidence for untyped receivers. Routes possible-dispatch.
+// ============================================================================
+
+describe('fix #210: external-contract methods (Python)', () => {
+    const FILES = {
+        'mine.py': `from typing import override
+from external_pkg import Base
+
+
+class Mine(Base):
+    @override
+    def compute(self, x):
+        return x + 1
+
+    def plain(self, x):
+        return x
+`,
+        'user.py': `from mine import Mine
+
+
+def drive(o):
+    Mine()
+    return o.compute(1) + o.plain(2)
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason,
+                dispatchVia: u.dispatchVia, externalContract: u.externalContract,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('@override method routes untyped-receiver calls possible-dispatch via the external base', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'mine.py:5:compute');
+            assert.ok(!res.confirmed.includes('user.py:6'),
+                `o.compute() could be Base's: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'user.py:6');
+            assert.ok(entry, `untyped-receiver call stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Base');
+            assert.strictEqual(entry.externalContract, true);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('un-marked single-owner methods keep confirming (control)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'mine.py:10:plain');
+            assert.ok(res.confirmed.includes('user.py:6'),
+                `plain has no override marker — import evidence stays sufficient: ${res.confirmed} / ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});

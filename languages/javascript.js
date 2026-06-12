@@ -12,7 +12,8 @@ const {
     extractParams,
     parseStructuredParams,
     extractJSDocstring,
-    buildTypeAnnotations
+    buildTypeAnnotations,
+    visitNameNodes,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -2506,7 +2507,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTreeCached(tree.rootNode, (node) => {
+    visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, property_identifier (method names in obj.method() calls),
         // type_identifier (TypeScript type annotations), and shorthand_property_identifier_pattern
         // (destructured names in `const { name } = require(...)`)

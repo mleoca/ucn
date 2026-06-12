@@ -2470,3 +2470,93 @@ impl Pal {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #210: external-contract methods (Rust side — `impl ExternalTrait for X`).
+// A method defined in a trait impl whose trait is not a project trait
+// (std Iterator, Display, ...) with a single project-wide owner: any
+// external-typed receiver satisfies the same call, so unique ownership is
+// not identity evidence. Receiver-evidence-free calls route possible-
+// dispatch via the trait (visible, never excluded).
+// ============================================================================
+
+describe('fix #210: external-contract methods (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/lib.rs': `pub mod mine;
+pub mod user;
+`,
+        'src/mine.rs': `pub struct Mine { pub v: u32 }
+
+impl Iterator for Mine {
+    type Item = u32;
+    fn next(&mut self) -> Option<u32> { None }
+}
+
+impl Mine {
+    pub fn fresh() -> Mine { Mine { v: 0 } }
+    pub fn bump(&self) -> u32 { self.v + 1 }
+}
+`,
+        'src/user.rs': `use crate::mine::Mine;
+
+pub fn drive() -> u32 {
+    let _n = Mine::fresh().next();
+    Mine::fresh().bump()
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason,
+                dispatchVia: u.dispatchVia, externalContract: u.externalContract,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('trait-impl member symbols carry traitName', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const next = (index.symbols.get('next') || []).find(d => d.className === 'Mine');
+            assert.ok(next, 'next indexed as Mine member');
+            assert.strictEqual(next.traitImpl, true);
+            assert.strictEqual(next.traitName, 'Iterator');
+        } finally { rm(dir); }
+    });
+
+    it('external-trait method routes chained receiver-blind calls possible-dispatch via the trait', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/mine.rs:5:next');
+            assert.ok(!res.confirmed.includes('src/user.rs:4'),
+                `Mine::fresh().next() could be any Iterator's: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'src/user.rs:4');
+            assert.ok(entry, `chained call stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Iterator');
+            assert.strictEqual(entry.externalContract, true);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('inherent-impl single-owner methods keep confirming (control)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/mine.rs:10:bump');
+            assert.ok(res.confirmed.includes('src/user.rs:5'),
+                `bump is Mine's own method — unique ownership stays evidence: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});

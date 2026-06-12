@@ -5491,3 +5491,73 @@ describe('receiver-blind bindings: chained method calls never confirm via name b
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #210: external-contract methods (TS side — `override` keyword).
+// A method marked `override` in a class extending an external (unresolvable)
+// base, with a single project-wide owner: the name provably exists on a
+// contract UCN cannot see, so unique ownership is not identity evidence for
+// untyped receivers. Routes possible-dispatch via the base (visible).
+// ============================================================================
+
+describe('fix #210: external-contract methods (TS)', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'mine.ts': `import { Base } from 'external-pkg';
+
+export class Mine extends Base {
+    override compute(x: number): number { return x + 1; }
+    plain(x: number): number { return x; }
+}
+`,
+        'user.ts': `import { Mine } from './mine';
+
+export function drive(o) {
+    new Mine();
+    return o.compute(1) + o.plain(2);
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason,
+                dispatchVia: u.dispatchVia, externalContract: u.externalContract,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('override-marked method routes untyped-receiver calls possible-dispatch via the external base', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'mine.ts:4:compute');
+            assert.ok(!res.confirmed.includes('user.ts:5'),
+                `o.compute() could be Base's: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'user.ts:5');
+            assert.ok(entry, `untyped-receiver call stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Base');
+            assert.strictEqual(entry.externalContract, true);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('un-marked single-owner methods keep confirming (control)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'mine.ts:5:plain');
+            assert.ok(res.confirmed.includes('user.ts:5'),
+                `plain has no override marker — import evidence stays sufficient: ${res.confirmed} / ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});

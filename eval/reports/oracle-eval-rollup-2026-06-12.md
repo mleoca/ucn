@@ -14,7 +14,7 @@ lie the grep-reliability contract forbids. Target: 0.
 | grpc-go | gopls | 50 | 840 | 100.0% | 15.0% | 0.8504 | **0** | 100.0% (13) | 100.0% |
 | ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.5% | 0.8247 | **0** | 100.0% (1) | 100.0% |
 | cursive | rust-analyzer | 50 | 637 | 98.9% | 49.7% | 0.4913 | **0** | 100.0% (6) | 100.0% |
-| gson | jdtls | 50 | 649 | 94.7% | 29.4% | 0.6529 | **0** | 100.0% (9) | 100.0% |
+| gson | jdtls | 50 | 649 | 96.2% | 29.8% | 0.664 | **0** | 100.0% (9) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -45,5 +45,5 @@ evidence confirms the file but not the receiver type.
 | cursive | function | 6 | 101 | 98.1% (101/103) | 0.0% (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | method | 39 | 519 | 99.4% (153/154) | 51.1% (353/691) | 0.4826 | {"confirmed":153,"unverified":353,"reportedNonCall":13,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | class | 5 | 17 | 100.0% (3/3) | 19.4% (6/31) | 0.8065 | {"confirmed":3,"unverified":6,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":8,"missingUnexplained":0} |
-| gson | method | 40 | 615 | 94.5% (275/291) | 26.4% (161/611) | 0.6815 | {"confirmed":275,"unverified":161,"reportedNonCall":47,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
+| gson | method | 40 | 615 | 96.1% (269/280) | 26.9% (167/622) | 0.6922 | {"confirmed":269,"unverified":167,"reportedNonCall":47,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (8/8) | 100.0% (26/26) | 0 | {"confirmed":8,"unverified":26,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

@@ -440,6 +440,10 @@ class ProjectIndex {
                 ...(item.attributesWithArgs && item.attributesWithArgs.length > 0 && { attributesWithArgs: item.attributesWithArgs }),
                 ...(item.nameLine && { nameLine: item.nameLine }),
                 ...(item.traitImpl && { traitImpl: true }),
+                // Trait the impl block implements (rust `impl Trait for X`
+                // members) — external-contract detection needs the NAME, not
+                // just the traitImpl flag (fix #210).
+                ...(item.traitName && { traitName: item.traitName }),
                 ...(item.isSignature && { isSignature: true })
             };
             fileEntry.symbols.push(symbol);
@@ -471,7 +475,7 @@ class ProjectIndex {
             if (cls.members) {
                 for (const m of cls.members) {
                     const memberType = m.memberType || 'method';
-                    addSymbol({ ...m, className: cls.name, ...(cls.traitName && { traitImpl: true }) }, memberType);
+                    addSymbol({ ...m, className: cls.name, ...(cls.traitName && { traitImpl: true, traitName: cls.traitName }) }, memberType);
                 }
             }
         }

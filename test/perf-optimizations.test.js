@@ -953,3 +953,86 @@ public class X {
         }
     });
 });
+
+// ── visitNameNodes: occurrence-targeted usage scan ───────────────────────────
+// findUsagesInCode used to walk EVERY tree node checking node.text === name
+// (N-API text materialization per identifier — 78% of account time on
+// grpc-go). visitNameNodes locates the name's whole-word text occurrences in
+// the source string and jumps to each node via descendantForIndex. These
+// tests pin the equivalence edges: unicode offsets (tree-sitter indexes are
+// UTF-16 code units, same as JS strings), $-adjacent identifiers (longer
+// token ≠ name), comment/string occurrences (non-identifier node, skipped
+// by the callbacks' type guards), and multiple occurrences per line.
+
+describe('visitNameNodes usage scan', () => {
+    it('classifies usages identically with unicode content before the occurrence', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'uni.js': `// héllo wörld — ünïcode cömment before the code
+function target() { return 1; }
+const x = target();
+module.exports = { target };
+`,
+        });
+        try {
+            const index = idx(dir);
+            const fileKey = [...index.files.keys()].find(k => k.endsWith('uni.js'));
+            const usages = index._getCachedUsages(fileKey, 'target');
+            // def line 2 and call line 3 — unicode in the comment must not
+            // shift the occurrence offsets (UTF-16 code units throughout);
+            // the comment's own text never matches (no `target` in it).
+            const byType = Object.fromEntries(usages.map(u => [u.usageType, u.line]));
+            assert.strictEqual(byType.definition, 2, JSON.stringify(usages));
+            assert.strictEqual(byType.call, 3, JSON.stringify(usages));
+        } finally { rm(dir); }
+    });
+
+    it('does not attribute $-prefixed identifiers or comment/string occurrences', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'dollar.js': `function run() { return 1; }
+const $run = 2;          // $run is a different identifier; comment says run
+const s = "run in a string";
+const y = run();
+module.exports = { run };
+`,
+        });
+        try {
+            const index = idx(dir);
+            const fileKey = [...index.files.keys()].find(k => k.endsWith('dollar.js'));
+            const usages = index._getCachedUsages(fileKey, 'run');
+            // def line 1 and call line 4 — NOT line 2 ($run is a longer
+            // identifier; the comment mention is a non-identifier node),
+            // NOT line 3 (string content), NOT line 5 ({ run } shorthand
+            // object property — a node type the scan has never collected).
+            const lines = usages.map(u => u.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(lines, [1, 4], JSON.stringify(usages));
+        } finally { rm(dir); }
+    });
+
+    it('captures multiple occurrences on one line across all languages', () => {
+        const { forEachLanguage } = require('./helpers');
+        const FIXTURES = {
+            javascript: { file: 'two.js', code: 'function pair() { return 1; }\nconst v = pair() + pair();\n' },
+            python: { file: 'two.py', code: 'def pair():\n    return 1\n\nv = pair() + pair()\n' },
+            go: { file: 'two.go', code: 'package main\n\nfunc pair() int { return 1 }\n\nfunc main() { v := pair() + pair(); _ = v }\n' },
+            rust: { file: 'two.rs', code: 'pub fn pair() -> u32 { 1 }\n\npub fn main() { let _v = pair() + pair(); }\n' },
+            java: { file: 'Two.java', code: 'public class Two {\n    int pair() { return 1; }\n    int both() { return pair() + pair(); }\n}\n' },
+        };
+        for (const [lang, fx] of Object.entries(FIXTURES)) {
+            const files = { 'package.json': '{"name":"test"}' };
+            files[fx.file] = fx.code;
+            const dir = tmp(files);
+            try {
+                const index = idx(dir);
+                const fileKey = [...index.files.keys()].find(k => k.endsWith(fx.file));
+                const usages = index._getCachedUsages(fileKey, 'pair');
+                const calls = usages.filter(u => u.usageType === 'call');
+                assert.strictEqual(calls.length, 2,
+                    `${lang}: two call usages on the same line: ${JSON.stringify(usages)}`);
+                assert.strictEqual(calls[0].line, calls[1].line, `${lang}: same line`);
+                assert.ok(calls[0].column !== calls[1].column, `${lang}: distinct columns`);
+            } finally { rm(dir); }
+        }
+    });
+});

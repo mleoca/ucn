@@ -10,7 +10,8 @@ const {
     traverseTreeCached,
     nodeToLocation,
     parseStructuredParams,
-    extractJavaDocstring
+    extractJavaDocstring,
+    visitNameNodes,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1367,7 +1368,7 @@ function findUsagesInCode(code, name, parser) {
     const tree = parseTree(parser, code);
     const usages = [];
 
-    traverseTreeCached(tree.rootNode, (node) => {
+    visitNameNodes(tree, code, name, (node) => {
         // Look for identifiers and type_identifiers with the matching name
         // type_identifier is used in Java for type references: new ClassName(), extends ClassName, field types
         if ((node.type !== 'identifier' && node.type !== 'type_identifier') || node.text !== name) {
