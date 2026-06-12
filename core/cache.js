@@ -32,7 +32,7 @@ const UCN_VERSION = require('../package.json').version;
 // commas and strip type-argument suffixes (fix #214 — `extends Base<string,
 // object>` produced parents ["Base<string", "object>"], so every generically
 // extended class had no usable ancestor edges).
-const CACHE_FORMAT_VERSION = 20;
+const CACHE_FORMAT_VERSION = 21; // v21: fileEntry.moduleAssignedNames (fix #217)
 
 /**
  * Save index to cache file

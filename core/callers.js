@@ -750,6 +750,16 @@ function findCallers(index, name, options = {}) {
                                     recordExcluded(filePath, call.line, 'other-definition');
                                     continue;
                                 }
+                                // fix #218: attribute typed as a STRICT ancestor
+                                // of the pinned target's class — reaching the
+                                // subclass override is dynamic dispatch (#204
+                                // physics). Demote-only, account-gated.
+                                if (collectAccount && !targetClasses.has(targetClass)) {
+                                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                        dispatchVia: targetClass,
+                                    });
+                                    continue;
+                                }
                                 resolvedBySameClass = true;
                             } else if (!options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
@@ -817,6 +827,22 @@ function findCallers(index, name, options = {}) {
                                         !(fileEntry.language === 'python' &&
                                             _shareProjectDescendant(index, matchedClass, targetClasses))) {
                                         recordExcluded(filePath, call.line, 'other-definition');
+                                        continue;
+                                    }
+                                    // fix #218 (rich-measured): the match landed on
+                                    // a STRICT ancestor of the pinned target's class
+                                    // (or a Python co-parent via shared descendant) —
+                                    // `self.render()` inside abstract ProgressColumn
+                                    // lexically binds the ancestor's def; reaching the
+                                    // pinned SUBCLASS override is dynamic dispatch,
+                                    // possible but not confirmable (#204 physics).
+                                    // Demote-only, account-gated; when the pinned
+                                    // target IS the declaring class, matchedClass ∈
+                                    // targetClasses and confirmation stands.
+                                    if (collectAccount && !targetClasses.has(matchedClass)) {
+                                        routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                            dispatchVia: matchedClass,
+                                        });
                                         continue;
                                     }
                                 } else if (collectAccount) {
@@ -957,8 +983,19 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
                     if (nameBindings.length > 0 && !tFiles.has(filePath)) {
+                        // Name-level export-chain ownership (fix #217): each
+                        // binding is chased by NAME, not by file — `from
+                        // .render import render` pins to tests/render.py's own
+                        // def and cannot denote markup.render no matter what
+                        // tests/render.py imports (file-level reach said yes
+                        // through console.py — 24 rich FP edges). Exclusion
+                        // requires EVERY binding to be a definitive dead end:
+                        // external pins (#209c) or chains that provably
+                        // terminate away from the targets; any un-modelable
+                        // surface (CJS, star imports, module assignments,
+                        // resolver gaps) routes 'unknown' and blocks exclusion.
                         let reaches = false;
-                        let projectish = false;
+                        let undetermined = false;
                         for (const b of nameBindings) {
                             const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
                             if (!rel) {
@@ -970,21 +1007,21 @@ function findCallers(index, name, options = {}) {
                                 const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
                                 if (mod.startsWith('.') ||
                                     (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
-                                    projectish = true;
+                                    undetermined = true;
                                 }
                                 continue;
                             }
-                            // Resolved to a project file: even if the target is
-                            // not reachable within the BFS hop budget, the chain
-                            // may continue past it — never exclusion evidence.
-                            projectish = true;
                             const resolvedAbs = path.join(index.root, rel);
-                            if (_importReaches(index, resolvedAbs, tFiles)) { reaches = true; break; }
+                            const verdict = _nameBindingReaches(index, resolvedAbs, b.name, tFiles);
+                            if (verdict === 'yes') { reaches = true; break; }
+                            if (verdict === 'unknown') undetermined = true;
                         }
-                        if (!reaches && !projectish) {
-                            // Every import binding of this name points at an
-                            // EXTERNAL module — the bare name is rebound away
-                            // from the project def (compiler-checked).
+                        if (!reaches && !undetermined) {
+                            // Every import binding of this name pins away from
+                            // the pinned targets (external module, or a project
+                            // def the name-chase resolved with certainty) — the
+                            // bare name is rebound away from the target
+                            // (compiler-checked module semantics).
                             recordExcluded(filePath, call.line, 'other-definition-import');
                             continue;
                         }
@@ -1117,7 +1154,19 @@ function findCallers(index, name, options = {}) {
                             }
                             projectish = true;
                             const resolvedAbs = path.join(index.root, rel);
-                            if (_importReaches(index, resolvedAbs, tFiles)) { reaches = true; break; }
+                            // Name-level ownership (fix #217 applied to module
+                            // receivers — zod family D): `z._default(...)` asks
+                            // for the MODULE's `_default` attribute; with three
+                            // project defs of the name, only the one the export
+                            // chain actually exposes can be the callee. The
+                            // chase is definitive only on fully-modeled ESM/
+                            // Python surfaces — 'unknown' (CJS, stars, module
+                            // assignments) falls back to file-level reach.
+                            const verdict = _nameBindingReaches(index, resolvedAbs, call.name, tFiles);
+                            if (verdict === 'yes' ||
+                                (verdict === 'unknown' && _importReaches(index, resolvedAbs, tFiles))) {
+                                reaches = true; break;
+                            }
                         }
                         if (!reaches) {
                             if (!projectish) {
@@ -1587,6 +1636,22 @@ function findCallers(index, name, options = {}) {
                 // evidence — route them through the dispatch tiering below.
                 // Self-receiver calls are not affected (same-class resolution
                 // owns them); captured-receiver calls never bound (skipLocalBinding).
+                // Local-alias calls (fix #218): `get_style = console.get_style;
+                // get_style(x)` is a TRUE edge with compiler-grade evidence,
+                // but it reaches the target through a local variable — the
+                // line's name resolves to the alias, not the def, so reference
+                // oracles place nothing here and grep-parity verification is
+                // impossible. Visible unverified, never confirmed (not even by
+                // same-class/type-qualified/single-owner evidence); the
+                // exclusion-grade checks (typed-receiver mismatch, same-class
+                // pinning, arity) already fired above and win.
+                if (collectAccount && call.aliasCall) {
+                    routeUnverified(filePath, fileEntry, call, 'alias-call', calledAs, {
+                        ...(call.receiver && { dispatchVia: call.receiver }),
+                    });
+                    continue;
+                }
+
                 const receiverBlindBinding = !!bindingId && call.isMethod && !call.receiver;
                 if (collectAccount && call.isMethod && (!bindingId || receiverBlindBinding) && !resolvedBySameClass &&
                     !receiverTypeValidated && !nominalInferredMatch &&
@@ -1671,6 +1736,21 @@ function findCallers(index, name, options = {}) {
                     if (call.isMethod && !call.receiverIsModule) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        // A method call cannot denote a standalone function
+                        // (fix #218, rich-measured: `console.print(...)`
+                        // confirmed scope-match against module-level print):
+                        // only an attribute assignment could rebind one onto a
+                        // receiver, which is beyond name-level evidence. Typed
+                        // receivers are excluded above (#198); untyped ones
+                        // route visible. Module receivers stay exempt
+                        // (rich.print(...) IS the module function).
+                        if (!typeQualifiedReceiver && targetDefs2.length > 0 &&
+                            targetDefs2.every(d => !d.className && !d.receiver)) {
+                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                dispatchCandidates: methodOwnerKeys().size,
+                            });
+                            continue;
+                        }
                         // External-contract single owner (fix #210): same
                         // physics as the nominal gate above — an override
                         // marker proves the name exists on a contract UCN
@@ -3137,6 +3217,100 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
         return base === pkgSeg || base === receiver;
     });
     return { importModule, singleSegment: false, targetInPkg };
+}
+
+/**
+ * Name-level export-chain reachability (fix #217, rich-measured: 24 test-file
+ * `render(bar)` calls confirmed against markup.render although the binding
+ * `from .render import render` pins to tests/render.py's OWN def — file-level
+ * _importReaches chased on through console.py's imports).
+ *
+ * A binding of NAME resolved to a module file can only denote a def in a
+ * target file if the NAME itself flows there: through the file being a target
+ * file, a re-export of the name (`export {x} from` / `export * from` /
+ * Python `from .x import name`), or surfaces the chase cannot model. Verdicts:
+ *   'yes'     — some chain reaches a target file (confirmable, as before)
+ *   'no'      — every chain terminates away from the targets (exclusion-grade:
+ *               the bare name provably denotes a different def)
+ *   'unknown' — un-modelable surface on a live path: CJS exports (assignment-
+ *               based, attribute re-exports indistinguishable from local
+ *               values), star imports, module-scope assignments of the name,
+ *               module-level __getattr__ (PEP 562), unresolved project-ish
+ *               modules, depth exhaustion. Never exclusion evidence.
+ * Pinned targets are defs NAMED `name`, so single renames along the chain
+ * cannot fool a 'no' (a rename changes the exposed attribute name; re-renames
+ * back to the original route through records this chase follows or flags).
+ */
+function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
+    let unknown = false;
+    const visited = new Set();
+    let frontier = [[startAbs, name]];
+    for (let d = 0; d <= maxDepth && frontier.length > 0; d++) {
+        const next = [];
+        for (const [abs, attr] of frontier) {
+            if (targetFiles.has(abs)) return 'yes';
+            const stateKey = `${abs} ${attr}`;
+            if (visited.has(stateKey)) continue;
+            visited.add(stateKey);
+            const fe = index.files.get(abs);
+            if (!fe) { unknown = true; continue; }
+
+            const enqueue = (module, nextAttr) => {
+                const rel = fe.moduleResolved && fe.moduleResolved[module];
+                if (!rel) {
+                    // Unresolved: relative or project-ish → resolver gap, not
+                    // a terminal; clearly external → that path pins outside
+                    // the project (dead end, consistent with #209c).
+                    const mod = String(module);
+                    const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+                    if (mod.startsWith('.') ||
+                        (firstSeg && _projectTopLevelNames(index).has(firstSeg))) unknown = true;
+                    return;
+                }
+                next.push([path.join(index.root, rel), nextAttr]);
+            };
+
+            // CJS export surface is assignment-based (`exports.x = require(..).x`,
+            // `module.exports = require(..)`) and recorded indistinguishably from
+            // local values — a CJS file can never produce a definitive dead end.
+            if ((fe.exportDetails || []).some(e => e.type === 'exports' || e.type === 'module.exports')) {
+                unknown = true;
+            }
+            // JS/TS re-export records: `export {x as y} from './src'` exposes y,
+            // chase continues under the SOURCE-side name; `export * from`
+            // exposes everything the source does. `export * as ns from`
+            // (alias on the re-export-all) exposes ONLY `ns` — a module
+            // namespace object, unmodelable when asked for — never the
+            // source's flattened names.
+            for (const e of (fe.exportDetails || [])) {
+                if (!e.source) continue;
+                if (e.type === 're-export' && (e.alias || e.name) === attr) enqueue(e.source, e.name);
+                else if (e.type === 're-export-all') {
+                    if (e.alias) { if (e.alias === attr) unknown = true; }
+                    else enqueue(e.source, attr);
+                }
+            }
+            // Import bindings of the attr (Python re-export idiom `from .x import
+            // name`, JS import-then-export). importBindings store ORIGINAL names;
+            // importAliases is a flat list (pairing to its import lost), so a
+            // renamed import is followed under BOTH its original and local names —
+            // over-following errs toward 'yes'/'unknown', never toward exclusion.
+            const aliases = fe.importAliases || [];
+            for (const b of (fe.importBindings || [])) {
+                const exposed = [b.name, ...aliases.filter(a => a.original === b.name).map(a => a.local)];
+                if (exposed.includes(attr)) enqueue(b.module, b.name);
+            }
+            // Un-modelable name sources on this file:
+            if ((fe.importNames || []).includes('*')) unknown = true;            // star import
+            if ((fe.moduleAssignedNames || []).includes(attr)) unknown = true;   // module-scope `attr = ...`
+            if ((index.symbols.get('__getattr__') || []).some(s => s.file === abs && !s.className)) {
+                unknown = true;                                                  // PEP 562 dynamic attrs
+            }
+        }
+        frontier = next;
+    }
+    if (frontier.length > 0) unknown = true; // depth exhausted with live paths
+    return unknown ? 'unknown' : 'no';
 }
 
 /**

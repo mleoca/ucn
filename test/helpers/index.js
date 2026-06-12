@@ -260,6 +260,14 @@ function indexSnapshot(index) {
             language: fe.language,
             exports: [...(fe.exports || [])].sort(),
             importCount: (fe.imports || []).length,
+            // Name-level scope/ownership inputs (#209/#215/#217): these MUST
+            // be identical across build paths — build-worker.js once dropped
+            // importBindings entirely and the snapshot missed it.
+            importNames: [...(fe.importNames || [])].sort(),
+            importBindings: (fe.importBindings || []).map(b => `${b.name} ${b.module}`).sort(),
+            importAliases: (fe.importAliases || []).map(a => `${a.original} ${a.local}`).sort(),
+            exportDetails: (fe.exportDetails || []).map(e => JSON.stringify(e)).sort(),
+            moduleAssignedNames: [...(fe.moduleAssignedNames || [])].sort(),
         }))
         .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     const calls = [...index.files.keys()].sort().map(f => [

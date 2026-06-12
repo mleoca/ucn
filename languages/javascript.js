@@ -1487,7 +1487,14 @@ function findCallsInCode(code, parser) {
             if (p.type === 'statement_block') {
                 for (let i = 0; i < p.namedChildCount; i++) {
                     const stmt = p.namedChild(i);
-                    if (stmt.startIndex >= refNode.startIndex) break; // declaration-before-use
+                    // Nested function/class declarations are hoisted within
+                    // their block — they shadow regardless of position
+                    // (fix #218: `function getStyle() {}` after the ref).
+                    if ((stmt.type === 'function_declaration' ||
+                        stmt.type === 'generator_function_declaration' ||
+                        stmt.type === 'class_declaration') &&
+                        stmt.childForFieldName('name')?.text === name) return true;
+                    if (stmt.startIndex >= refNode.startIndex) continue; // declaration-before-use
                     if ((stmt.type === 'lexical_declaration' || stmt.type === 'variable_declaration') &&
                         _declaresName(stmt, name)) return true;
                 }
@@ -2339,7 +2346,20 @@ function findExportsInCode(code, parser) {
 
             // Check for export * from 'x'
             if (node.text.includes('export *') && source) {
-                exports.push({ name: '*', type: 're-export-all', line, source });
+                // `export * as ns from 'x'` exposes ONLY the single name `ns`
+                // (a module namespace object), not x's flattened surface —
+                // record the alias so name-level chases don't walk through it
+                // (fix #218: zod's `export * as core` made z._default look
+                // reachable from core). Name stays '*' for shape stability.
+                let nsAlias = null;
+                for (let i = 0; i < node.namedChildCount; i++) {
+                    const child = node.namedChild(i);
+                    if (child.type === 'namespace_export') {
+                        const id = child.namedChild(0);
+                        if (id) nsAlias = id.text;
+                    }
+                }
+                exports.push({ name: '*', type: 're-export-all', line, source, ...(nsAlias && { alias: nsAlias }) });
                 return true;
             }
 

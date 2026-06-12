@@ -2949,3 +2949,320 @@ describe('fix #215: bare calls need a name binding to reach another file (Python
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #217: name-level export-chain ownership (rich-measured: 24 test-file
+// `render(bar)` calls confirmed against markup.render although the binding
+// `from .render import render` pins to tests/render.py's OWN def — file-level
+// import reach chased on through other imports).
+// ============================================================================
+
+describe('fix #217: import bindings pin by NAME, not by file (Python)', () => {
+    function callers(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    it('binding resolved to a file that defines the name itself is excluded', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'pkg/__init__.py': '',
+            'pkg/markup.py': 'def render(text):\n    return text\n',
+            'pkg/console.py': 'from .markup import render as render_markup\n\ndef use():\n    return render_markup("x")\n',
+            'tests/__init__.py': '',
+            // tests/render.py defines its OWN render — and imports console,
+            // which imports markup: file-level reach would say yes.
+            'tests/render.py': 'from pkg.console import use\n\ndef render(thing):\n    return use() + str(thing)\n',
+            'tests/test_bar.py': 'from tests.render import render\n\ndef test_one():\n    assert render(1)\n',
+            'tests/test_direct.py': 'from pkg.markup import render\n\ndef test_two():\n    assert render("y")\n',
+        });
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'pkg/markup.py:1:render');
+            assert.ok(!res.confirmed.includes('tests/test_bar.py:4'),
+                `binding pins to tests/render.py's def, not markup's: ${res.confirmed}`);
+            assert.ok(!res.unverified.includes('tests/test_bar.py:4'),
+                'excluded-with-reason, not unverified');
+            assert.ok(res.confirmed.includes('tests/test_direct.py:4'),
+                `direct import still confirms: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('re-export barrel chains still confirm; module assignments block exclusion', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'pkg/__init__.py': '',
+            'pkg/impl.py': 'def thing():\n    return 1\n',
+            // Barrel re-exports the name — chase follows it
+            'pkg/barrel.py': 'from pkg.impl import thing\n',
+            'user_barrel.py': 'from pkg.barrel import thing\n\ndef go():\n    return thing()\n',
+            // This module ASSIGNS the name at module level — the chase cannot
+            // model the RHS, so the binding must stay un-excluded (visible
+            // somewhere), never wrongly excluded.
+            'pkg/assigned.py': 'from pkg.impl import thing as _t\n\nthing = _t\n',
+            'user_assigned.py': 'from pkg.assigned import thing\n\ndef go2():\n    return thing()\n',
+        });
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'pkg/impl.py:1:thing');
+            assert.ok(res.confirmed.includes('user_barrel.py:4'),
+                `barrel re-export chain confirms: ${res.confirmed}`);
+            const everywhere = [...res.confirmed, ...res.unverified];
+            assert.ok(everywhere.includes('user_assigned.py:4'),
+                `module-level assignment of the name → undetermined, stays visible: ${JSON.stringify(res)}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #218: rich FP families — comprehension/nested-def shadows, method calls
+// vs function targets, member-access aliases, literal assignment typing,
+// strict-ancestor same-class routing.
+// ============================================================================
+
+describe('fix #218: comprehension and nested-def shadows (Python)', () => {
+    function callers(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    const FILES = {
+        'requirements.txt': '',
+        'lib.py': [
+            'class Console:',
+            '    def get_style(self, name):',
+            '        return name',
+            '',
+            'class Segment:',
+            '    def line(self):',
+            '        return 1',
+            '',
+        ].join('\n'),
+        'user.py': [
+            'from lib import Console, Segment',
+            '',
+            'def test_nested(text):',
+            '    def get_style(t):',
+            '        return t',
+            '    return highlight(text, get_style)',
+            '',
+            'def test_comp(lines):',
+            '    return max(cell_len(line) for line in lines)',
+            '',
+            'def test_lambda(items):',
+            '    return sorted(items, key=lambda line: cell_len(line))',
+            '',
+            'def highlight(t, fn):',
+            '    return fn(t)',
+            '',
+            'def cell_len(x):',
+            '    return len(x)',
+            '',
+        ].join('\n'),
+    };
+
+    it('a nested def shadows callback references to a same-named method', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'lib.py:2:get_style');
+            assert.ok(!res.confirmed.some(c => c.startsWith('user.py')),
+                `nested def get_style shadows the callback ref: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('comprehension and lambda bindings shadow refs inside them', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'lib.py:6:line');
+            assert.ok(!res.confirmed.some(c => c.startsWith('user.py')),
+                `for-in-clause/lambda param bind 'line' locally: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #218: a method call cannot denote a standalone function (Python)', () => {
+    it('console.print routes visible; module receiver rich.print confirms', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'rich/__init__.py': 'def print(*objects):\n    return objects\n',
+            'rich/console.py': 'class Console:\n    def print(self, *objects):\n        return objects\n',
+            'user.py': [
+                'import rich',
+                'from rich.console import Console',
+                '',
+                'def use_module():',
+                '    rich.print("hello")',
+                '',
+                'def use_method(console):',
+                '    console.print("table")',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'rich/__init__.py:1:print' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            const unverified = (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('user.py:5'), `module-receiver call confirms: ${confirmed}`);
+            assert.ok(!confirmed.includes('user.py:8'), `method call ≠ module function: ${confirmed}`);
+            assert.ok(unverified.includes('user.py:8'), `visible, never dropped: ${unverified}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #218: member-access aliases and literal assignment typing (Python)', () => {
+    it('append = output.append never binds bare append() to a class method', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'text.py': [
+                'from typing import List',
+                '',
+                'class Text:',
+                '    def append(self, text):',
+                '        return self',
+                '',
+                '    def markup(self):',
+                '        output: List[str] = []',
+                '        append = output.append',
+                '        append("piece")',
+                '        return "".join(output)',
+                '',
+                '    def true_use(self, other):',
+                '        self.append(other)',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'text.py:4:append' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('text.py:14'), `self.append stays confirmed: ${confirmed}`);
+            assert.ok(!confirmed.includes('text.py:10'), `aliased list.append is not Text.append: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('a typed-receiver alias call is a TRUE edge but routes visible alias-call', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'console.py': 'class Console:\n    def get_style(self, name):\n        return name\n',
+            'tree.py': [
+                'from console import Console',
+                '',
+                'def render(console: Console):',
+                '    get_style = console.get_style',
+                '    return get_style("tree.line")',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'console.py:2:get_style' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            const unv = (json.data.unverifiedCallers || []);
+            assert.ok(!confirmed.includes('tree.py:5'),
+                `alias indirection is not grep-verifiable — never confirmed: ${confirmed}`);
+            assert.ok(unv.some(c => `${c.file}:${c.line}` === 'tree.py:5'),
+                `visible unverified (true edge, conserved): ${JSON.stringify(unv)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a bytes-literal assignment types the receiver for exclusion', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'ansi.py': [
+                'class AnsiDecoder:',
+                '    def decode(self, terminal_text):',
+                '        return terminal_text',
+                '',
+                'def test_decode():',
+                '    ansi_bytes = b"x1b[1mHello"',
+                '    return ansi_bytes.decode("utf-8")',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'ansi.py:2:decode' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            const unverified = (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confirmed.includes('ansi.py:7') && !unverified.includes('ansi.py:7'),
+                `bytes.decode excluded against AnsiDecoder.decode: ${JSON.stringify({ confirmed, unverified })}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #218: strict-ancestor same-class match routes possible-dispatch (Python)', () => {
+    const FILES = {
+        'requirements.txt': '',
+        'progress.py': [
+            'class ProgressColumn:',
+            '    def __call__(self, task):',
+            '        return self.render(task)',
+            '',
+            '    def render(self, task):',
+            '        raise NotImplementedError',
+            '',
+            'class TransferSpeedColumn(ProgressColumn):',
+            '    def render(self, task):',
+            '        return str(task)',
+            '',
+        ].join('\n'),
+    };
+
+    it('pinned subclass override: base-class self-call is possible-dispatch', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'progress.py:9:render' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            const unv = (json.data.unverifiedCallers || []);
+            assert.ok(!confirmed.includes('progress.py:3'),
+                `self.render in the BASE reaches the override only dynamically: ${confirmed}`);
+            assert.ok(unv.some(c => `${c.file}:${c.line}` === 'progress.py:3'),
+                `visible possible-dispatch, conserved: ${JSON.stringify(unv)}`);
+        } finally { rm(dir); }
+    });
+
+    it('pinned base def: the same self-call stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'progress.py:5:render' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('progress.py:3'),
+                `matchedClass ∈ targetClasses — confirmation stands: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});

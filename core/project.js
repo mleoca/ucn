@@ -396,6 +396,11 @@ class ProjectIndex {
             symbols: [],
             bindings: [],
             ...(importAliases && { importAliases }),
+            // Module-scope assignment targets (fix #217): names a module can
+            // expose WITHOUT a def/class/import binding (`render = impl`,
+            // `global name`). The import-binding name-chase treats these as
+            // undetermined — a dead-end verdict would be unsound.
+            ...(parsed.moduleAssignedNames && { moduleAssignedNames: parsed.moduleAssignedNames }),
             ...(isBundled && { isBundled: true }),
             ...(isGenerated && { isGenerated: true })
         };

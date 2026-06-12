@@ -229,6 +229,40 @@ function _processState(node, objects, lines) {
     return false;
 }
 
+/**
+ * Collect module-scope assignment target names (fix #217). A module-level
+ * `render = something` (including inside if/try/for blocks — module control
+ * flow still binds module attributes) or a `global name` declaration creates
+ * a module attribute the import-binding name-chase cannot model, so the
+ * chase must treat such names as undetermined rather than provably absent.
+ */
+function _processModuleAssign(node, names) {
+    if (node.type === 'global_statement') {
+        // `global X` declares that enclosing-function assignments of X bind
+        // the MODULE attribute — collect regardless of nesting.
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const c = node.namedChild(i);
+            if (c.type === 'identifier') names.add(c.text);
+        }
+        return;
+    }
+    if (node.type !== 'assignment' && node.type !== 'named_expression') return;
+    for (let p = node.parent; p; p = p.parent) {
+        // Function scope → local; class body → class attr. Either way, not a
+        // module attribute. if/try/for/with blocks at module level still are.
+        if (p.type === 'function_definition' || p.type === 'class_definition') return;
+    }
+    const left = node.childForFieldName('left') || node.childForFieldName('name');
+    if (!left) return;
+    if (left.type === 'identifier') names.add(left.text);
+    else if (left.type === 'tuple' || left.type === 'pattern_list') {
+        for (let i = 0; i < left.namedChildCount; i++) {
+            const c = left.namedChild(i);
+            if (c.type === 'identifier') names.add(c.text);
+        }
+    }
+}
+
 // --- End single-pass helpers ---
 
 /**
@@ -420,6 +454,7 @@ function parse(code, parser) {
     const functions = [];
     const classes = [];
     const stateObjects = [];
+    const moduleAssigned = new Set();
     const processedFn = new Set();
     const processedCls = new Set();
 
@@ -427,6 +462,7 @@ function parse(code, parser) {
         _processFunction(node, functions, processedFn, lines, code);
         _processClass(node, classes, processedCls, lines);
         _processState(node, stateObjects, lines);
+        _processModuleAssign(node, moduleAssigned);
         return true;
     });
 
@@ -440,6 +476,7 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
+        ...(moduleAssigned.size > 0 && { moduleAssignedNames: [...moduleAssigned].sort() }),
         imports: [],
         exports: []
     };
@@ -572,6 +609,15 @@ function findCallsInCode(code, parser) {
     const aliases = new Map();  // Track local aliases: aliasName -> originalName
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    // Member-access aliases (fix #218): `append = output.append` makes a later
+    // bare `append(part)` a METHOD call on `output` — it must carry the
+    // receiver's evidence, never bind by bare name to a same-file def
+    // (rich text.py: 7 list.append calls confirmed exact-binding against
+    // Text.append). aliasName -> { receiver: string|null, attr: string };
+    // receiver is null for chained/deep objects (self._text.append) — the
+    // rewritten call is then receiver-blind and routes through dispatch tiering.
+    const memberAliases = new Map();
+    const memberAliasesStack = [];  // function-scoped save/restore, like localVarTypes
     const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
@@ -664,27 +710,32 @@ function findCallsInCode(code, parser) {
     // function subtree (excluding nested function bodies, which are separate
     // scopes) for assignment/for/with-as/walrus bindings of the name.
     // Enclosing-function PARAMS are checked at query time in findCallers.
+    const _targetBindsName = (left, name) => {
+        if (!left) return false;
+        if (left.type === 'identifier' && left.text === name) return true;
+        if (left.type === 'pattern_list' || left.type === 'tuple_pattern') {
+            for (let j = 0; j < left.namedChildCount; j++) {
+                if (left.namedChild(j).type === 'identifier' && left.namedChild(j).text === name) return true;
+            }
+        }
+        return false;
+    };
     const _bindsNameInScope = (scopeNode, name) => {
         for (let i = 0; i < scopeNode.namedChildCount; i++) {
             const c = scopeNode.namedChild(i);
             if (c.type === 'function_definition' || c.type === 'async_function_definition' ||
-                c.type === 'class_definition' || c.type === 'lambda') continue; // separate scope
+                c.type === 'class_definition') {
+                // The body is a separate scope, but the DEF NAME itself is an
+                // assignment in THIS scope (fix #218: a nested `def get_style`
+                // shadows the name for sibling references).
+                if (c.childForFieldName('name')?.text === name) return true;
+                continue;
+            }
+            if (c.type === 'lambda') continue; // separate scope, no name
             if (c.type === 'assignment' || c.type === 'augmented_assignment' || c.type === 'named_expression') {
-                const left = c.childForFieldName('left') || c.childForFieldName('name');
-                if (left?.type === 'identifier' && left.text === name) return true;
-                if (left?.type === 'pattern_list' || left?.type === 'tuple_pattern') {
-                    for (let j = 0; j < left.namedChildCount; j++) {
-                        if (left.namedChild(j).type === 'identifier' && left.namedChild(j).text === name) return true;
-                    }
-                }
+                if (_targetBindsName(c.childForFieldName('left') || c.childForFieldName('name'), name)) return true;
             } else if (c.type === 'for_statement') {
-                const left = c.childForFieldName('left');
-                if (left?.type === 'identifier' && left.text === name) return true;
-                if (left?.type === 'pattern_list' || left?.type === 'tuple_pattern') {
-                    for (let j = 0; j < left.namedChildCount; j++) {
-                        if (left.namedChild(j).type === 'identifier' && left.namedChild(j).text === name) return true;
-                    }
-                }
+                if (_targetBindsName(c.childForFieldName('left'), name)) return true;
             } else if (c.type === 'with_statement') {
                 // with open(f) as fh: — as-target is inside with_clause/with_item
                 const text = c.namedChild(0)?.text || '';
@@ -695,8 +746,30 @@ function findCallsInCode(code, parser) {
         }
         return false;
     };
+    const PY_COMPREHENSIONS = new Set([
+        'generator_expression', 'list_comprehension', 'set_comprehension', 'dictionary_comprehension',
+    ]);
     const isShadowedByLocal = (refNode, name) => {
         for (let p = refNode.parent; p; p = p.parent) {
+            // Comprehension for-clause targets are scoped to the comprehension
+            // itself (PEP 3110-era scoping): `cell_len(line) for line in lines`
+            // binds `line` ONLY inside the comprehension — block-accurate, so
+            // check on the way up rather than function-wide (fix #218).
+            if (PY_COMPREHENSIONS.has(p.type)) {
+                for (let i = 0; i < p.namedChildCount; i++) {
+                    const c = p.namedChild(i);
+                    if (c.type === 'for_in_clause' && _targetBindsName(c.childForFieldName('left'), name)) return true;
+                }
+            }
+            // Lambda params shadow their body the same way (fix #218).
+            if (p.type === 'lambda') {
+                const params = p.childForFieldName('parameters');
+                if (params) for (let i = 0; i < params.namedChildCount; i++) {
+                    const c = params.namedChild(i);
+                    if (c.type === 'identifier' && c.text === name) return true;
+                    if (c.type === 'default_parameter' && c.childForFieldName('name')?.text === name) return true;
+                }
+            }
             if (p.type === 'function_definition' || p.type === 'async_function_definition') {
                 const body = p.childForFieldName('body');
                 return body ? _bindsNameInScope(body, name) : false;
@@ -737,6 +810,7 @@ function findCallsInCode(code, parser) {
             });
             // Save localVarTypes so inner declarations don't leak to sibling functions
             localVarTypesStack.push(new Map(localVarTypes));
+            memberAliasesStack.push(new Map(memberAliases));
         }
 
         // Track parameter type annotations: def foo(x: Foo) → x is Foo
@@ -780,8 +854,33 @@ function findCallsInCode(code, parser) {
                         localVarTypes.set(left.text, typeName);
                     }
                 }
+                memberAliases.delete(left.text); // any assignment rebinds the name
+                // Rebinding without a known type makes any previously inferred
+                // type stale — nearest-preceding-assignment semantics (#199's
+                // documented rule). Without this, `x = ""; x = render(); x.m()`
+                // would carry str and falsely exclude project methods.
+                if (!typeNode) localVarTypes.delete(left.text);
+                // Literal assignment types the variable (fix #218):
+                // ansi_bytes = b"…" → bytes; out = [] → list. Compiler-true,
+                // same trust grade as literal receivers ({}.get() → dict).
+                if (!typeNode && right && PY_LITERAL_RECEIVER_TYPES[right.type]) {
+                    let litType = PY_LITERAL_RECEIVER_TYPES[right.type];
+                    if (litType === 'str' && /^[rRuU]*[bB]/.test(right.text)) litType = 'bytes';
+                    localVarTypes.set(left.text, litType);
+                }
                 if (right?.type === 'identifier') {
                     aliases.set(left.text, right.text);
+                }
+                // Member-access alias (fix #218): append = output.append
+                else if (right?.type === 'attribute') {
+                    const attrName = right.childForFieldName('attribute');
+                    const objNode = right.childForFieldName('object');
+                    if (attrName?.type === 'identifier') {
+                        memberAliases.set(left.text, {
+                            receiver: objNode?.type === 'identifier' ? objNode.text : null,
+                            attr: attrName.text,
+                        });
+                    }
                 }
                 // Track partial(fn, ...) aliases: fast_process = partial(process, mode='fast')
                 else if (right?.type === 'call') {
@@ -864,21 +963,50 @@ function findCallsInCode(code, parser) {
             }
 
             if (funcNode.type === 'identifier') {
-                // Direct call: foo()
-                const resolvedName = aliases.get(funcNode.text);
-                const firstArg = getFirstStringArg(node);
-                calls.push({
-                    name: funcNode.text,
-                    ...(resolvedName && { resolvedName }),
-                    line: node.startPosition.row + 1,
-                    isMethod: false,
-                    ...(assignedTo && { assignedTo }),
-                    argCount,
-                    ...(argSpread && { argSpread: true }),
-                    enclosingFunction,
-                    uncertain,
-                    ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
-                });
+                // Member-alias call (fix #218): `append = output.append` makes
+                // this bare call a METHOD call on the alias's receiver — emit
+                // it as one so receiver typing/dispatch tiering applies.
+                // Restricted to self-named aliases (alias === attr, the local
+                // bound-method optimization idiom): a renamed alias's line
+                // doesn't contain the method name, so it sits outside the
+                // account's text ground set — and never matched the target
+                // name before either (no FP to fix there).
+                const memberAlias = memberAliases.get(funcNode.text);
+                if (memberAlias && memberAlias.attr === funcNode.text) {
+                    const recvType = memberAlias.receiver ? localVarTypes.get(memberAlias.receiver) : undefined;
+                    const recvIsModule = !!memberAlias.receiver && moduleAliases.has(memberAlias.receiver) &&
+                        !localVarTypes.has(memberAlias.receiver);
+                    calls.push({
+                        name: memberAlias.attr,
+                        line: node.startPosition.row + 1,
+                        isMethod: true,
+                        aliasCall: true,
+                        ...(memberAlias.receiver && { receiver: memberAlias.receiver }),
+                        ...(recvType && { receiverType: recvType }),
+                        ...(recvIsModule && { receiverIsModule: true }),
+                        ...(assignedTo && { assignedTo }),
+                        argCount,
+                        ...(argSpread && { argSpread: true }),
+                        enclosingFunction,
+                        uncertain,
+                    });
+                } else {
+                    // Direct call: foo()
+                    const resolvedName = aliases.get(funcNode.text);
+                    const firstArg = getFirstStringArg(node);
+                    calls.push({
+                        name: funcNode.text,
+                        ...(resolvedName && { resolvedName }),
+                        line: node.startPosition.row + 1,
+                        isMethod: false,
+                        ...(assignedTo && { assignedTo }),
+                        argCount,
+                        ...(argSpread && { argSpread: true }),
+                        enclosingFunction,
+                        uncertain,
+                        ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
+                    });
+                }
             } else if (funcNode.type === 'attribute') {
                 // Method/attribute call: obj.foo() or self.attr.foo()
                 const attrNode = funcNode.childForFieldName('attribute');
@@ -1000,6 +1128,11 @@ function findCallsInCode(code, parser) {
                 if (saved) {
                     localVarTypes.clear();
                     for (const [k, v] of saved) localVarTypes.set(k, v);
+                }
+                const savedAliases = memberAliasesStack.pop();
+                if (savedAliases) {
+                    memberAliases.clear();
+                    for (const [k, v] of savedAliases) memberAliases.set(k, v);
                 }
             }
         }

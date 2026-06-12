@@ -20,10 +20,10 @@ false-dead = 0.
 | cobra | gopls | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | cobra | gopls | exported | 20 | 20 | 20 | **0** | 0 | 0 |
 | grpc-go | gopls | default | 11 | 11 | 11 | **0** | 0 | 0 |
-| grpc-go | gopls | exported | 280 | 280 | 280 | **0** | 0 | 0 |
+| grpc-go | gopls | exported | 280 | 60 | 60 | **0** | 0 | 0 |
 | ripgrep | rust-analyzer | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | ripgrep | rust-analyzer | exported | 13 | 13 | 13 | **0** | 0 | 0 |
 | cursive | rust-analyzer | default | 0 | 0 | 0 | **0** | 0 | 0 |
-| cursive | rust-analyzer | exported | 130 | 130 | 130 | **0** | 0 | 0 |
+| cursive | rust-analyzer | exported | 130 | 60 | 60 | **0** | 0 | 0 |
 | gson | jdtls | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | gson | jdtls | exported | 0 | 0 | 0 | **0** | 0 | 0 |

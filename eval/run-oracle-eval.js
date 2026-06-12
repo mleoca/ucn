@@ -190,9 +190,20 @@ async function evaluateRepo(repo, oracle) {
         const unverifiedKeys = new Set(unverified.map(c => key(c.file, c.line)));
         const oracleKeys = new Set(oracleCalls.map(c => key(c.file, c.line)));
 
-        // Tier precision (against oracle call edges)
-        const confirmedHits = confirmed.filter(c => oracleKeys.has(key(c.file, c.line))).length;
-        const unverifiedHits = unverified.filter(c => oracleKeys.has(key(c.file, c.line))).length;
+        // Tier precision. Function/method answers are CALL edges — verified
+        // against oracle call refs. Class answers are USAGES by contract
+        // (constructions AND type usages: `raise X(...)` is a call ref, but
+        // `pytest.raises(X)` / `isinstance(v, X)` are reference-kind — equally
+        // real usages, rich-measured 11 of 12 class-kind "FPs"), so any oracle
+        // ref at the line verifies a class usage. Placement/recall stays over
+        // call edges for all kinds.
+        const hitKeys = sym.kind === 'class'
+            ? new Set(oracleRefs
+                .filter(r => !(r.file === sym.file && r.line === sym.line))
+                .map(r => key(r.file, r.line)))
+            : oracleKeys;
+        const confirmedHits = confirmed.filter(c => hitKeys.has(key(c.file, c.line))).length;
+        const unverifiedHits = unverified.filter(c => hitKeys.has(key(c.file, c.line))).length;
 
         // Oracle-edge placement.
         //   reportedNonCall      — line is in the text ground set; by the

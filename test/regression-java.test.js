@@ -2444,3 +2444,66 @@ describe('fix #212: Object-typed receivers route possible-dispatch, never exclud
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #218 (nominal): a same-class match landing on a STRICT ancestor of the
+// pinned target's class routes possible-dispatch — `this.render()` inside an
+// abstract base lexically binds the base's def; reaching a pinned subclass
+// override is dynamic dispatch. Pinning the base def itself stays confirmed.
+// ============================================================================
+
+describe('fix #218: strict-ancestor same-class match routes possible-dispatch (Java)', () => {
+    const FILES = {
+        'pom.xml': '<project/>',
+        'Base.java': [
+            'public abstract class Base {',
+            '    public String call(int task) {',
+            '        return this.render(task);',
+            '    }',
+            '',
+            '    public abstract String render(int task);',
+            '}',
+            '',
+        ].join('\n'),
+        'Speed.java': [
+            'public class Speed extends Base {',
+            '    @Override',
+            '    public String render(int task) {',
+            '        return String.valueOf(task);',
+            '    }',
+            '}',
+            '',
+        ].join('\n'),
+    };
+
+    it('pinned subclass override: base-class this-call is possible-dispatch', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'Speed.java:2:render' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            const unv = (json.data.unverifiedCallers || []);
+            assert.ok(!confirmed.includes('Base.java:3'),
+                `this.render in Base reaches the override only dynamically: ${confirmed}`);
+            assert.ok(unv.some(c => `${c.file}:${c.line}` === 'Base.java:3'),
+                `visible possible-dispatch, conserved: ${JSON.stringify(unv)}`);
+        } finally { rm(dir); }
+    });
+
+    it('pinned base def: the same this-call stays confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'Base.java:6:render' });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('Base.java:3'),
+                `matchedClass ∈ targetClasses — confirmation stands: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});

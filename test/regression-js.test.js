@@ -5819,3 +5819,155 @@ describe('fix #216: member-access callback references keep symbols alive', () =>
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #217 (JS): name-level export-chain ownership. ESM re-export chains
+// (`export {x} from`, `export * from`) keep confirming; a binding resolved to
+// a module that owns the name itself pins there; CJS export surfaces are
+// assignment-based and never produce a definitive dead end.
+// ============================================================================
+
+describe('fix #217: import bindings pin by NAME, not by file (JS)', () => {
+    function callers(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    it('ESM star/named re-export chains keep confirming', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'deep.ts': 'export function thing() { return 1; }\n',
+            'barrel_star.ts': "export * from './deep';\n",
+            'barrel_named.ts': "export { thing } from './deep';\n",
+            'user_star.ts': "import { thing } from './barrel_star';\nexport function a() { return thing(); }\n",
+            'user_named.ts': "import { thing } from './barrel_named';\nexport function b() { return thing(); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'deep.ts:1:thing');
+            assert.ok(res.confirmed.includes('user_star.ts:2'), `export * chain: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('user_named.ts:2'), `export {x} from chain: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('a binding to a module that defines the name itself is excluded', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'markup.ts': 'export function render(t: string) { return t; }\nexport function other(t: string) { return t; }\n',
+            // helper defines its OWN render and also imports markup's API
+            // (under a DIFFERENT name) — file-level reach would chase through
+            // to markup.ts. NOTE: an import-RENAME of `render` here would
+            // over-follow (JS importBindings store original names; import
+            // aliases are not captured) — over-following errs toward keeping
+            // the edge, never toward exclusion.
+            'helper.ts': "import { other } from './markup';\nexport function render(t: string) { return other(t) + '!'; }\n",
+            'user.ts': "import { render } from './helper';\nexport function go() { return render('x'); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'markup.ts:1:render');
+            assert.ok(!res.confirmed.includes('user.ts:2'),
+                `user's render binds helper.ts's def, not markup's: ${res.confirmed}`);
+            assert.ok(!res.unverified.includes('user.ts:2'), 'excluded-with-reason');
+        } finally { rm(dir); }
+    });
+
+    it('CJS chains never produce a definitive dead end', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'deep_cjs.js': 'function thing() { return 1; }\nmodule.exports = { thing };\n',
+            // CJS attribute re-export — indistinguishable from a local value
+            'cjs_attr.js': "exports.thing = require('./deep_cjs').thing;\n",
+            'user_cjs.js': "const { thing } = require('./cjs_attr');\nfunction useCjs() { return thing(); }\nmodule.exports = { useCjs };\n",
+        });
+        try {
+            const index = idx(dir);
+            const res = callers(index, 'deep_cjs.js:1:thing');
+            const everywhere = [...res.confirmed, ...res.unverified];
+            assert.ok(everywhere.includes('user_cjs.js:2'),
+                `CJS surface is un-modelable — must stay visible: ${JSON.stringify(res)}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #218 (JS): nested function declarations are hoisted block bindings —
+// they shadow same-named outer symbols for callback references.
+// ============================================================================
+
+describe('fix #218: nested function declarations shadow callback refs (JS)', () => {
+    it('function getStyle(){} in the enclosing body shadows the import', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'export function getStyle(s) { return s; }\n',
+            'user.js': [
+                "import { getStyle } from './lib.js';",
+                '',
+                'export function testNested(text) {',
+                '    function getStyle(t) { return t + "!"; }',
+                '    return highlight(text, getStyle);',
+                '}',
+                '',
+                'function highlight(t, fn) { return fn(t); }',
+                '',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'lib.js:1:getStyle' });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confirmed.some(c => c.startsWith('user.js')),
+                `nested declaration shadows regardless of position: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #218 (zod family D): `export * as ns from 'x'` exposes ONLY `ns`, not
+// x's flattened surface — module-qualified calls resolve to the def the
+// export chain actually exposes.
+// ============================================================================
+
+describe('fix #218: export * as ns does not flatten into the parent surface', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'core_api.ts': 'export function _default(a: number) { return a; }\n',
+        'core_index.ts': "export * from './core_api';\n",
+        'schemas.ts': 'export function _default(b: number) { return b + 1; }\n',
+        'external.ts': "export * as core from './core_index';\nexport * from './schemas';\n",
+        'user.ts': "import * as z from './external';\nexport function go() { return z._default(1); }\n",
+    };
+
+    function callers(index, handle) {
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    it("z._default pins to the def the chain exposes, not the namespaced one", () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const hidden = callers(index, 'core_api.ts:1:_default');
+            assert.ok(!hidden.confirmed.includes('user.ts:2'),
+                `core's _default is only reachable as z.core._default: ${hidden.confirmed}`);
+            const exposed = callers(index, 'schemas.ts:1:_default');
+            assert.ok(exposed.confirmed.includes('user.ts:2'),
+                `schemas' _default IS z._default: ${exposed.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

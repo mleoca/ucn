@@ -7,7 +7,7 @@ lie the grep-reliability contract forbids. Target: 0.
 
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|
-| zod | ts-morph | 100 | 2917 | 95.5% | 27.8% | 0.6776 | **0** | 100.0% (14) | 100.0% |
+| zod | ts-morph | 100 | 2917 | 96.8% | 27.9% | 0.6889 | **0** | 100.0% (14) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -17,6 +17,6 @@ evidence confirms the file but not the receiver type.
 
 | repo | kind | sampled | oracle edges | tier1 precision | unverified precision | separation | placement |
 |---|---|---|---|---|---|---|---|
-| zod | function | 76 | 1687 | 98.2% (335/341) | 27.5% (1345/4886) | 0.7071 | {"confirmed":335,"unverified":1345,"reportedNonCall":7,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| zod | method | 20 | 1225 | 78.6% (44/56) | 28.0% (1181/4212) | 0.5053 | {"confirmed":44,"unverified":1181,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| zod | function | 76 | 1687 | 100.0% (316/316) | 27.8% (1364/4909) | 0.7221 | {"confirmed":316,"unverified":1364,"reportedNonCall":7,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| zod | method | 20 | 1225 | 78.6% (44/56) | 28.1% (1181/4203) | 0.5047 | {"confirmed":44,"unverified":1181,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | class | 4 | 5 | 100.0% (5/5) | 0.0% (0/0) | n/a | {"confirmed":5,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

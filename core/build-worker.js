@@ -130,6 +130,12 @@ function processFile(filePath) {
         size: stat.size,
         imports: imports.map(i => i.module),
         importNames: imports.flatMap(i => i.names || []),
+        // Paired name↔module bindings (fix #209) — mirrors indexFile; was
+        // missing here, so parallel-built indexes (>500 files) silently lost
+        // the name-level scope/ownership discipline (found during fix #217).
+        importBindings: imports.flatMap(i => (i.names || [])
+            .filter(n => n && n !== '*' && n !== '_' && n !== '.')
+            .map(n => ({ name: n, module: i.module }))),
         exports: exports.map(e => e.name),
         exportDetails: exports,
         symbols: [],
@@ -137,6 +143,7 @@ function processFile(filePath) {
         dynamicImports: dynamicCount || 0,
     };
     if (importAliases) fileEntry.importAliases = importAliases;
+    if (parsed.moduleAssignedNames) fileEntry.moduleAssignedNames = parsed.moduleAssignedNames;
     if (isBundled) fileEntry.isBundled = true;
     if (isGenerated) fileEntry.isGenerated = true;
 
