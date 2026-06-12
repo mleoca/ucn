@@ -2268,7 +2268,10 @@ describe('fix #198 (python): structural receiver type inference', () => {
 });
 
 describe('fix #198b (python): supertype receiver is not a mismatch', () => {
-    it('Base-typed receiver stays confirmed on Child override (dynamic dispatch)', () => {
+    it('Base-typed receiver routes possible-dispatch on Child override (dynamic dispatch)', () => {
+        // #209 aligned structural with the nominal #204 physics: a supertype-
+        // typed receiver may dispatch into the override — never excluded,
+        // visible as possible-dispatch attributed via Base.
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'lib.py': 'class Base:\n    def start(self):\n        return 1\n\nclass Child(Base):\n    def start(self):\n        return 2\n',
@@ -2279,8 +2282,13 @@ describe('fix #198b (python): supertype receiver is not a mismatch', () => {
             const r = execute(index, 'context', { name: 'lib.py:6:start', className: 'Child' });
             assert.ok(r.ok);
             const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
-            assert.ok(confirmed.includes('app.py:4'),
-                `b: Base may dispatch to Child.start — must stay confirmed: ${confirmed}`);
+            assert.ok(!confirmed.includes('app.py:4'),
+                `b: Base is not evidence for Child specifically: ${confirmed}`);
+            const entry = (r.result.unverifiedCallers || [])
+                .find(u => `${u.relativePath}:${u.line}` === 'app.py:4');
+            assert.ok(entry, `b.start() stays VISIBLE: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Base');
             assert.strictEqual(r.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
@@ -2509,6 +2517,130 @@ def schedule(fn):
             assert.ok(confirmed.includes('lib.py:13'),
                 `schedule(effect) without shadowing must stay confirmed: ${confirmed}`);
             assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #209: structural dispatch tiering (httpx-measured) — the #204 nominal
+// discipline applied to JS/TS/Python. File-level import evidence is not
+// receiver evidence; name-level import bindings shadow bare names; external
+// module-qualified attributes are owned by their module; builtin literal
+// receiver types outrank same-file name bindings.
+// ============================================================================
+
+describe('fix #209: structural dispatch tiering (Python)', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'pkg/__init__.py': 'from .decoders import ContentDecoder, TextDecoder\nfrom .urls import URL\n',
+        'pkg/decoders.py': [
+            'class ContentDecoder:',
+            '    def decode(self, data):',
+            '        return data',
+            '',
+            'class TextDecoder:',
+            '    def decode(self, data):',
+            '        return data',
+        ].join('\n'),
+        'pkg/urls.py': [
+            'from urllib.parse import unquote',
+            '',
+            'class URL:',
+            '    def join(self, other):',
+            '        return other',
+            '',
+            'def fragment(path):',
+            '    return unquote(path)',
+            '',
+            'def authority(parts):',
+            '    return "".join(parts)',
+        ].join('\n'),
+        'pkg/utils.py': [
+            'def unquote(value):',
+            '    return value',
+        ].join('\n'),
+        'pkg/models.py': [
+            'from .decoders import ContentDecoder',
+            'import httpcore',
+            '',
+            'def stream(decoder, key):',
+            '    decoder.decode(b"x")',
+            '    key.decode("ascii")',
+            '',
+            'def make_origin(url):',
+            '    return httpcore.URL(url)',
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || json.data.usages || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason, dispatchVia: u.dispatchVia,
+            })),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('untyped-receiver method call against multiple owners routes method-ambiguous', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'pkg/decoders.py:2:decode');
+            assert.ok(!res.confirmed.includes('pkg/models.py:5'),
+                `decoder is untyped and decode has 2 owners: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('pkg/models.py:6'),
+                `key.decode("ascii") is bytes.decode: ${res.confirmed}`);
+            const entries = res.unverified.filter(u =>
+                u.key === 'pkg/models.py:5' || u.key === 'pkg/models.py:6');
+            assert.strictEqual(entries.length, 2,
+                `both stay VISIBLE: ${JSON.stringify(res.unverified)}`);
+            assert.ok(entries.every(e => e.reason === 'method-ambiguous'));
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('an external import binding of the name shadows the bare call', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'pkg/utils.py:1:unquote');
+            assert.ok(!res.confirmed.includes('pkg/urls.py:8'),
+                `urls.py rebinds unquote from urllib.parse: ${res.confirmed}`);
+            assert.ok(res.excluded.byReason['other-definition-import']?.count >= 1,
+                JSON.stringify(res.excluded.byReason));
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('an external module-qualified constructor is owned by that module', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'pkg/urls.py:3:URL');
+            assert.ok(!res.confirmed.includes('pkg/models.py:9'),
+                `httpcore.URL is httpcore's URL, not the project class: ${res.confirmed}`);
+            assert.ok(res.excluded.byReason['external-package']?.count >= 1,
+                JSON.stringify(res.excluded.byReason));
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a literal str receiver outranks a same-file name binding', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'pkg/urls.py:4:join');
+            assert.ok(!res.confirmed.includes('pkg/urls.py:11'),
+                `"".join(parts) is str.join even where URL.join is defined: ${res.confirmed}`);
+            assert.ok(res.excluded.byReason['receiver-type-mismatch']?.count >= 1,
+                JSON.stringify(res.excluded.byReason));
+            assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
 });

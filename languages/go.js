@@ -181,6 +181,28 @@ function _processClass(node, types, processedRanges, lines) {
                     ...(embeddedBases.length > 0 && { extends: embeddedBases.join(', ') })
                 });
             }
+        } else if (spec.type === 'type_alias') {
+            // `type A = B` — A IS B (compiler identity, methods carry over;
+            // unlike `type A B` defined types, which get NO methods from B).
+            // Record the aliased base so callers can treat A-qualified
+            // receivers as B (fix #208).
+            const nameNode = spec.childForFieldName('name');
+            const typeNode = spec.childForFieldName('type');
+            if (nameNode && typeNode) {
+                const aliasOf = typeNode.type === 'type_identifier' ? typeNode.text
+                    : typeNode.type === 'qualified_type' ? typeNode.childForFieldName('name')?.text
+                    : null;
+                const { startLine, endLine } = nodeToLocation(node, lines);
+                types.push({
+                    name: nameNode.text,
+                    startLine,
+                    endLine,
+                    type: 'type',
+                    members: [],
+                    modifiers: /^[A-Z]/.test(nameNode.text) ? ['export'] : [],
+                    ...(aliasOf && { aliasOf }),
+                });
+            }
         }
     }
     return true;
@@ -555,6 +577,54 @@ const GO_BUILTINS = new Set([
     'println', 'real', 'recover'
 ]);
 
+/**
+ * Variable receiving this call's result (fix #207 return-type flow):
+ *   bb := balancer.Get(n)  → { assignedTo: 'bb' }
+ *   x, err := pkg.Make()   → { assignedTo: 'x', assignedTuple: true }
+ *                            (tuple unpack — the flow map pairs the first
+ *                             return element with the first variable)
+ *   y = q()                → { assignedTo: 'y' } (plain `=` only — `+=` etc.
+ *                            don't bind the call's type to the variable)
+ *   a, b := g(), h()       → parallel assignment: each call pairs with its
+ *                            own LHS position, single-value semantics
+ * Identifier targets only; blank (`_`) targets return undefined.
+ */
+function goAssignmentTargetOf(callNode) {
+    let n = callNode;
+    let p = n.parent;
+    let rhsIndex = 0;
+    let rhsCount = 1;
+    if (p && p.type === 'expression_list') {
+        rhsCount = p.namedChildCount;
+        for (let i = 0; i < p.namedChildCount; i++) {
+            if (p.namedChild(i).id === n.id) { rhsIndex = i; break; }
+        }
+        n = p; p = n.parent;
+    }
+    if (!p || (p.type !== 'short_var_declaration' && p.type !== 'assignment_statement')) return undefined;
+    if (p.type === 'assignment_statement') {
+        const op = p.childForFieldName('operator');
+        if (op && op.text !== '=') return undefined;
+    }
+    const right = p.childForFieldName('right');
+    if (!right || right.id !== n.id) return undefined;
+    const left = p.childForFieldName('left');
+    if (!left) return undefined;
+    const names = left.type === 'expression_list'
+        ? Array.from({ length: left.namedChildCount }, (_, i) => left.namedChild(i))
+        : [left];
+    if (rhsCount > 1) {
+        const target = names[rhsIndex];
+        return target?.type === 'identifier' && target.text !== '_'
+            ? { assignedTo: target.text } : undefined;
+    }
+    const target = names[0];
+    if (target?.type !== 'identifier' || target.text === '_') return undefined;
+    return names.length > 1
+        ? { assignedTo: target.text, assignedTuple: true }
+        : { assignedTo: target.text };
+}
+
 function findCallsInCode(code, parser, options = {}) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -876,6 +946,11 @@ function findCallsInCode(code, parser, options = {}) {
                 }
             }
 
+            // Assignment target for return-type flow (fix #207):
+            // bb := balancer.Get(n) lets findCallers type bb from Get's
+            // declared return type at query time.
+            const assigned = goAssignmentTargetOf(node);
+
             if (funcNode.type === 'identifier') {
                 const callName = funcNode.text;
                 // Skip Go built-in function calls
@@ -894,6 +969,8 @@ function findCallsInCode(code, parser, options = {}) {
                     isMethod: false,
                     argCount,
                     ...(argSpread && { argSpread: true }),
+                    ...(assigned && { assignedTo: assigned.assignedTo }),
+                    ...(assigned?.assignedTuple && { assignedTuple: true }),
                     enclosingFunction,
                     uncertain,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
@@ -934,6 +1011,8 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
                         argCount,
                         ...(argSpread && { argSpread: true }),
+                        ...(assigned && { assignedTo: assigned.assignedTo }),
+                        ...(assigned?.assignedTuple && { assignedTuple: true }),
                         enclosingFunction,
                         uncertain,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })

@@ -4087,3 +4087,75 @@ describe('RUST-3: impact on class types shows callers like about does', () => {
     });
 });
 
+
+// ============================================================================
+// call-not-resolved lines render as visible unverified entries (roadmap #4):
+// the account COUNTED unclaimed ground call-lines in its unverified total but
+// listed them nowhere — an edge at such a line was conserved yet invisible
+// (grpc-go-measured: strAddr(r.RemoteAddr) method-reference silently dropped
+// by the typed-receiver callback gate).
+// ============================================================================
+
+describe('call-not-resolved entries are listed in the unverified tier', () => {
+    const FILES = {
+        'go.mod': 'module example.com/m\ngo 1.21\n',
+        'lib/lib.go': `package lib
+
+type Conn struct{}
+
+func (c *Conn) RemoteAddr() string { return "conn" }
+`,
+        'app/app.go': `package app
+
+type Request struct{ x int }
+
+func (r *Request) RemoteAddr() string { return "req" }
+
+func take(f func() string) {}
+
+func use(r *Request) {
+	take(r.RemoteAddr)
+}
+`,
+    };
+
+    it('context lists the unclaimed call line with reason call-not-resolved', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib/lib.go:5:RemoteAddr' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const entry = (json.data.unverifiedCallers || [])
+                .find(u => u.reason === 'call-not-resolved');
+            assert.ok(entry,
+                `unclaimed ground call line is listed: ${JSON.stringify(json.data.unverifiedCallers)}`);
+            assert.strictEqual(entry.file, 'app/app.go');
+            assert.ok(entry.expression.includes('take(r.RemoteAddr)'),
+                `bare entry carries the source text: ${JSON.stringify(entry)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+            // The account already counted it — listing must not double-count
+            assert.ok(json.meta.account.unverified >= 1);
+        } finally { rm(dir); }
+    });
+
+    it('about and impact list the same entry', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const a = execute(index, 'about', { name: 'lib/lib.go:5:RemoteAddr' });
+            assert.ok(a.ok, `about failed: ${a.error}`);
+            const aJson = JSON.parse(output.formatAboutJson(a.result));
+            const aTop = aJson.callers?.unverified?.top || [];
+            assert.ok(aTop.some(u => u.reason === 'call-not-resolved'),
+                `about lists the entry: ${JSON.stringify(aTop)}`);
+
+            const i = execute(index, 'impact', { name: 'lib/lib.go:5:RemoteAddr' });
+            assert.ok(i.ok, `impact failed: ${i.error}`);
+            const iJson = JSON.parse(output.formatImpactJson(i.result));
+            const iSites = iJson.unverifiedSites || iJson.data?.unverifiedSites || [];
+            const iEntry = iSites.find(u => u.reason === 'call-not-resolved');
+            assert.ok(iEntry, `impact lists the entry: ${JSON.stringify(iSites)}`);
+        } finally { rm(dir); }
+    });
+});

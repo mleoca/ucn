@@ -922,6 +922,25 @@ function findCallsInCode(code, parser) {
         return undefined;
     };
 
+    // Variable receiving this call's result (fix #207 return-type flow):
+    // `var x = find();` / `x = find();` → 'x'. Declared-type locals are
+    // already typed directly above — this covers `var` and reassignment,
+    // letting findCallers type x from the producer's declared return type.
+    const assignmentTargetOf = (callNode) => {
+        const p = callNode.parent;
+        if (p?.type === 'variable_declarator') {
+            const value = p.childForFieldName('value');
+            const nameNode = p.childForFieldName('name');
+            if (value && value.id === callNode.id && nameNode?.type === 'identifier') return nameNode.text;
+        }
+        if (p?.type === 'assignment_expression') {
+            const right = p.childForFieldName('right');
+            const left = p.childForFieldName('left');
+            if (right && right.id === callNode.id && left?.type === 'identifier') return left.text;
+        }
+        return undefined;
+    };
+
     // All names declared anywhere in a function body (locals, for/catch/lambda
     // params). Guard for fix #202: a bare identifier receiver is only treated
     // as an implicit-this field when NO local of that name is declared —
@@ -1088,6 +1107,7 @@ function findCallsInCode(code, parser) {
                 }
                 const firstArg = getFirstStringArg(node);
                 const callArgs = getCallArgs(node);
+                const assignedTo = assignmentTargetOf(node);
                 calls.push({
                     name: nameNode.text,
                     // Multi-line chains (builder.x()\n.y()) must report each
@@ -1101,6 +1121,7 @@ function findCallsInCode(code, parser) {
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),
                     argCount: callArgs.argCount,
                     ...(callArgs.argKinds && { argKinds: callArgs.argKinds }),
+                    ...(assignedTo && { assignedTo }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
@@ -1167,22 +1188,29 @@ function findCallsInCode(code, parser) {
             return true;
         }
 
-        // Track local variable types from new Type() assignments
-        // e.g., Foo f = new Foo(); or var f = new Foo();
+        // Track local variable types from declarations (fix #207 extends #202-era
+        // new-Type() inference): the DECLARED type is compiler-checked evidence —
+        // `Service s = lookup();` types s as Service regardless of the value
+        // expression. `var` declarations fall back to new Type() value inference.
         if (node.type === 'local_variable_declaration' && functionStack.length > 0) {
+            const declTypeNode = node.childForFieldName('type');
+            const declaredType = declTypeNode && declTypeNode.text !== 'var'
+                ? extractTypeName(declTypeNode) : null;
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
                 if (child.type === 'variable_declarator') {
                     const nameNode = child.childForFieldName('name');
                     const valueNode = child.childForFieldName('value');
-                    if (nameNode && valueNode && valueNode.type === 'object_creation_expression') {
-                        const typeNode = valueNode.childForFieldName('type');
-                        const typeName = extractTypeName(typeNode);
-                        if (typeName) {
-                            const scopeKey = functionStack[functionStack.length - 1].startLine;
-                            const typeMap = scopeTypes.get(scopeKey);
-                            if (typeMap) typeMap.set(nameNode.text, typeName);
-                        }
+                    // new Type() is the DYNAMIC type — more precise than the
+                    // declared static type (Foo f = new Bar() dispatches to Bar)
+                    let typeName = valueNode?.type === 'object_creation_expression'
+                        ? extractTypeName(valueNode.childForFieldName('type'))
+                        : null;
+                    if (!typeName) typeName = declaredType;
+                    if (nameNode && typeName) {
+                        const scopeKey = functionStack[functionStack.length - 1].startLine;
+                        const typeMap = scopeTypes.get(scopeKey);
+                        if (typeMap) typeMap.set(nameNode.text, typeName);
                     }
                 }
             }

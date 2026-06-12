@@ -2236,3 +2236,177 @@ struct Foo { x: i32 }
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #207: nominal return-type flow (Rust) — variables typed by what the
+// assigned call's declared return annotation says, with Result/Option
+// unwrapping through `?` / .unwrap() / .expect() and Self resolution.
+// ============================================================================
+
+describe('fix #207: nominal return-type flow (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/flags.rs': `pub struct LowArgs { pub n: i32 }
+
+impl LowArgs {
+    pub fn special_mode(&self) -> i32 { self.n }
+}
+
+pub struct Config { pub v: i32 }
+
+impl Config {
+    pub fn make_default() -> Self { Config { v: 0 } }
+    pub fn apply_all(&self) -> i32 { self.v }
+}
+
+pub fn parse_low_raw(s: &str) -> anyhow::Result<LowArgs> {
+    Ok(LowArgs { n: 1 })
+}
+`,
+        'src/main.rs': `mod flags;
+use flags::{parse_low_raw, Config};
+
+fn run_try() -> anyhow::Result<()> {
+    let args = parse_low_raw("x")?;
+    args.special_mode();
+    Ok(())
+}
+
+fn run_unwrap() {
+    let args = parse_low_raw("y").unwrap();
+    args.special_mode();
+}
+
+fn run_factory() {
+    let cfg = Config::make_default();
+    cfg.apply_all();
+}
+
+fn run_no_unwrap() {
+    let res = parse_low_raw("z");
+    res.special_mode();
+}
+
+fn main() { run_factory(); }
+`,
+    };
+
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}:${u.reason}`),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('`?` assignment unwraps Result and confirms calls on the inner type', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'src/flags.rs:4:special_mode');
+            assert.ok(res.confirmed.includes('src/main.rs:6'),
+                `let args = parse_low_raw(..)? types args as LowArgs: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('.unwrap() assignment unwraps Result and confirms calls on the inner type', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'src/flags.rs:4:special_mode');
+            assert.ok(res.confirmed.includes('src/main.rs:12'),
+                `.unwrap() types args as LowArgs: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('Self-returning path factory types the variable as the impl type', () => {
+        // make_default doesn't match the parser's constructor-name heuristic
+        // (new|from|create|...) — only the flow map's Self resolution types cfg.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'src/flags.rs:11:apply_all');
+            assert.ok(res.confirmed.includes('src/main.rs:17'),
+                `Config::make_default() -> Self types cfg as Config: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('a non-unwrapped Result assignment never types as the inner value', () => {
+        // let res = parse_low_raw(..) — res is a Result, not LowArgs;
+        // res.special_mode() must not confirm against LowArgs::special_mode.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'src/flags.rs:4:special_mode');
+            assert.ok(!res.confirmed.includes('src/main.rs:22'),
+                `res is Result-typed, not LowArgs: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #208: type-alias receivers — `pub type StyledString = SpannedString<X>`
+// is the SAME type (compiler identity). Path calls qualified with the alias
+// were excluded as path-type-mismatch (cursive-measured: 24 true
+// StyledString::plain edges).
+// ============================================================================
+
+describe('fix #208: type-alias receivers (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/lib.rs': `pub mod markup;
+pub mod user;
+`,
+        'src/markup.rs': `pub struct SpannedString<T> { pub v: T }
+
+pub type StyledString = SpannedString<u8>;
+
+impl SpannedString<u8> {
+    pub fn plain_text(s: &str) -> Self {
+        SpannedString { v: 0 }
+    }
+}
+`,
+        'src/user.rs': `use crate::markup::StyledString;
+
+pub fn build_label() {
+    let label = StyledString::plain_text("Leaf");
+    let _ = label;
+}
+`,
+    };
+
+    it('alias-qualified path call confirms against the aliased type method', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/markup.rs:6:plain_text' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('src/user.rs:4'),
+                `StyledString::plain_text IS SpannedString::plain_text: ${confirmed} / excluded ${JSON.stringify(json.meta.account.excluded.byReason)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('parser records aliasOf on type-alias symbols', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('StyledString') || [];
+            assert.strictEqual(defs.length, 1);
+            assert.strictEqual(defs[0].type, 'type');
+            assert.strictEqual(defs[0].aliasOf, 'SpannedString');
+        } finally { rm(dir); }
+    });
+});

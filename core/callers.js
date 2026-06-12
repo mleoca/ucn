@@ -356,21 +356,33 @@ function findCallers(index, name, options = {}) {
                     if (!calledAs) continue;
                 }
 
-                // Return-type flow (structural): an untyped method receiver may be a
+                // Return-type flow: an untyped method receiver may be a
                 // variable assigned from a call with a known return annotation
                 // (response = client.get(...) with Client.get() -> Response).
+                // Structural languages get this everywhere (fix #199). Nominal
+                // languages get it on the account surface only (fix #207):
+                // a flow-typed interface receiver must reroute to visible
+                // possible-dispatch on mismatch, and that routing is
+                // collectAccount-gated — legacy commands would silently drop
+                // the edge instead. Real method calls only — the callback/
+                // reference branch keeps its own #206 routing.
                 // Copy-on-enrich: cached call objects stay parser-pure — the flow
                 // type derives from OTHER files' annotations, so it must never be
                 // persisted with this file's calls.
                 if (call.isMethod && call.receiver && !call.receiverType &&
-                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    (langTraits(fileEntry.language)?.typeSystem === 'structural' ||
+                        (collectAccount && !call.isPotentialCallback && !call.isPathCall &&
+                            langTraits(fileEntry.language)?.typeSystem === 'nominal'))) {
                     let flowMap = returnFlowCache.get(filePath);
                     if (flowMap === undefined) {
                         flowMap = _buildReturnTypeFlowMap(index, filePath, calls);
                         returnFlowCache.set(filePath, flowMap);
                     }
-                    const flowType = flowMap && _lookupReturnTypeFlow(flowMap, call);
-                    if (flowType) call = { ...call, receiverType: flowType };
+                    const flowEntry = flowMap && _lookupReturnTypeFlow(flowMap, call);
+                    if (flowEntry) {
+                        call = { ...call, receiverType: flowEntry.type,
+                            ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
+                    }
                 }
 
                 // For potential callbacks (function passed as arg), validate against symbol table
@@ -820,6 +832,59 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Name-level import shadowing (fix #209, httpx-measured): an
+                // explicit import binding of the NAME rebinds it for the whole
+                // file — `from urllib.parse import unquote` makes every bare
+                // `unquote(...)` urllib's, regardless of which project files
+                // this file also imports (file-level import edges are not
+                // name-level evidence; httpx/_urls.py imports ._utils for
+                // OTHER names while unquote comes from urllib). A bare call
+                // only reaches the project def when SOME import binding of the
+                // name resolves to a target file (directly or one barrel hop),
+                // or the target is defined in this file. Mis-resolved project
+                // modules must not exclude: a binding to an unresolved module
+                // whose first segment matches a project directory routes
+                // visible instead.
+                if (!bindingId && !call.isMethod && !calledAs &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    (fileEntry.importBindings || []).length > 0) {
+                    const nameBindings = fileEntry.importBindings.filter(b => b.name === call.name);
+                    const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                    if (nameBindings.length > 0 && !tFiles.has(filePath)) {
+                        let reaches = false;
+                        let projectish = false;
+                        for (const b of nameBindings) {
+                            const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
+                            if (!rel) {
+                                // Unresolved module: external — unless it is
+                                // relative (project-internal by construction)
+                                // or its first segment names a project path
+                                // (resolution gap, not externality evidence)
+                                const mod = String(b.module);
+                                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+                                if (mod.startsWith('.') ||
+                                    (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                                    projectish = true;
+                                }
+                                continue;
+                            }
+                            // Resolved to a project file: even if the target is
+                            // not reachable within the BFS hop budget, the chain
+                            // may continue past it — never exclusion evidence.
+                            projectish = true;
+                            const resolvedAbs = path.join(index.root, rel);
+                            if (_importReaches(index, resolvedAbs, tFiles)) { reaches = true; break; }
+                        }
+                        if (!reaches && !projectish) {
+                            // Every import binding of this name points at an
+                            // EXTERNAL module — the bare name is rebound away
+                            // from the project def (compiler-checked).
+                            recordExcluded(filePath, call.line, 'other-definition-import');
+                            continue;
+                        }
+                    }
+                }
+
                 // Import-graph disambiguation for JS/TS/Python: when multiple definitions of
                 // the same name exist and this call has no bindingId, check whether the calling
                 // file imports from the target definition's file. Skips false positives like
@@ -912,6 +977,52 @@ function findCallers(index, name, options = {}) {
                     if (!options.includeUncertain) {
                         if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                         continue;
+                    }
+                }
+
+                // Module-qualified ownership, structural (fix #209 — the #206
+                // Go rule transferred): `httpcore.URL(...)` denotes URL IN the
+                // httpcore module — an EXTERNAL module's attribute can never be
+                // the project's URL class. Resolve the receiver's own import
+                // binding (name-level — the file importing the target for
+                // other names proves nothing): binding module external →
+                // excluded; resolves to a project file that doesn't reach a
+                // target (directly or one re-export hop) → visible, not
+                // excluded (deep barrel chains exceed the hop budget);
+                // unresolved-but-project-looking → visible (resolver gap).
+                if (!bindingId && !resolvedBySameClass && call.isMethod && call.receiverIsModule &&
+                    call.receiver && langTraits(fileEntry.language)?.typeSystem === 'structural' &&
+                    (fileEntry.importBindings || []).length > 0) {
+                    const recvBindings = fileEntry.importBindings.filter(b => b.name === call.receiver);
+                    const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                    if (recvBindings.length > 0 && !tFiles.has(filePath)) {
+                        let reaches = false;
+                        let projectish = false;
+                        for (const b of recvBindings) {
+                            const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
+                            if (!rel) {
+                                const mod = String(b.module);
+                                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+                                if (mod.startsWith('.') ||
+                                    (firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                                    projectish = true;
+                                }
+                                continue;
+                            }
+                            projectish = true;
+                            const resolvedAbs = path.join(index.root, rel);
+                            if (_importReaches(index, resolvedAbs, tFiles)) { reaches = true; break; }
+                        }
+                        if (!reaches) {
+                            if (!projectish) {
+                                recordExcluded(filePath, call.line, 'external-package');
+                                continue;
+                            }
+                            if (collectAccount) {
+                                routeUnverified(filePath, fileEntry, call, 'no-import-link', calledAs);
+                                continue;
+                            }
+                        }
                     }
                 }
 
@@ -1023,9 +1134,16 @@ function findCallers(index, name, options = {}) {
                 // All languages use receiverType when available (constructor/annotation inference).
                 // Go/Java/Rust additionally fall back to variable name matching.
                 // A declared-field receiver type (fix #202) enters even when a
-                // name-binding matched — bindings don't model receivers.
+                // name-binding matched — bindings don't model receivers. Same
+                // for a BUILTIN-typed receiver (fix #209): `"".join(...)` in
+                // the file that defines URL.join name-binds to the method def,
+                // but the receiver IS a str — the literal type outranks the
+                // name binding (str/dict/Array are never project classes).
+                const builtinReceiverOverride = !!(call.receiverType &&
+                    BUILTIN_RECEIVER_TYPES.has(call.receiverType) &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural');
                 if (call.isMethod && (call.receiver || call.receiverType || fieldHopType) && !resolvedBySameClass &&
-                    (!bindingId || fieldHopType) &&
+                    (!bindingId || fieldHopType || builtinReceiverOverride) &&
                     (call.receiverType || fieldHopType || langTraits(fileEntry.language)?.typeSystem === 'nominal')) {
                     // Target type set: target classes + non-overriding subtypes
                     // (a Child receiver calling an inherited Base method IS a
@@ -1059,7 +1177,11 @@ function findCallers(index, name, options = {}) {
                                 // edges already carry package context.
                                 if (!structural &&
                                     targetDefs.some(d => (d.className || (d.receiver || '').replace(/^\*/, '')) === knownType)) {
-                                    const identity = _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs);
+                                    // Flow-typed receivers (fix #207) resolve identity
+                                    // from the producing annotation's scope — the name
+                                    // was written THERE, not in the consuming file.
+                                    const identity = _resolveReceiverTypeIdentity(
+                                        index, call.receiverTypeFlowFile || filePath, knownType, targetDefs);
                                     if (identity === 'other') {
                                         receiverTypeValidated = false;
                                     } else if (identity === 'unknown') {
@@ -1391,6 +1513,56 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
+                    }
+                }
+
+                // Structural dispatch tiering (fix #209, httpx-measured — the
+                // #204 discipline applied to structural languages): file-level
+                // import/scope evidence speaks for a bare NAME reaching this
+                // file, not for a method call's receiver — `key.decode(enc)`
+                // in a file that imports _decoders.py is bytes.decode, not
+                // ContentDecoder.decode. An untyped-receiver method call
+                // confirms only via binding, same-class, a validated receiver
+                // type, a type-qualified receiver (Class.method static style),
+                // or a single project-wide owner. Multi-owner name matches
+                // route VISIBLE method-ambiguous — never dropped. Same for a
+                // bare call against pure method targets (a bare name cannot
+                // denote a method in JS/TS/Python — only a rebound alias can,
+                // which has no evidence here either).
+                if (collectAccount && !bindingId && !resolvedBySameClass &&
+                    !receiverTypeValidated &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    // Module-qualified calls (z.string(), ns.helper()) are
+                    // exempt: the module IS name-level evidence, and the
+                    // module-ownership block above already routed the ones
+                    // whose module doesn't reach the target.
+                    if (call.isMethod && !call.receiverIsModule) {
+                        const tTypes = dispatchTargetTypes(targetDefs2);
+                        const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        if (!typeQualifiedReceiver && methodOwnerKeys().size > 1) {
+                            if (call.receiverType) {
+                                // Known-but-unvalidated type (supertype of the
+                                // target — dynamic dispatch — or an alias/
+                                // interface name UCN can't validate): a
+                                // possible dispatch edge, attributed via the
+                                // receiver's declared type (#204 physics).
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: call.receiverType,
+                                    dispatchCandidates: countDispatchCandidates(call.receiverType),
+                                });
+                            } else {
+                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                    dispatchCandidates: methodOwnerKeys().size,
+                                });
+                            }
+                            continue;
+                        }
+                    } else if (!calledAs && !call.isConstructor &&
+                        targetDefs2.length > 0 && targetDefs2.every(d => d.className)) {
+                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                            dispatchCandidates: methodOwnerKeys().size,
+                        });
+                        continue;
                     }
                 }
 
@@ -2374,9 +2546,11 @@ function _typeNameFromReturnAnnotation(text) {
 
 /**
  * Per-file return-type-flow map: variables typed by what the assigned call
- * returns. Key `${enclosingFnStartLine||''}:${varName}` → [{ line, type }]
- * (all assignments, so lookups can pick the nearest preceding one).
- * Only three resolvable shapes, all conservative:
+ * returns. Key `${enclosingFnStartLine||''}:${varName}` → [{ line, type,
+ * fromFile? }] (all assignments, so lookups can pick the nearest preceding
+ * one). All producer resolutions are conservative.
+ *
+ * Structural shapes (fix #199 — unchanged):
  *  - typed-receiver method call: receiverType class (or an ancestor walk is
  *    NOT attempted — exact className match only) defines the method with a
  *    return annotation
@@ -2384,16 +2558,44 @@ function _typeNameFromReturnAnnotation(text) {
  *    inheritance chain for inherited methods) defines the method with a
  *    return annotation
  *  - plain call with exactly ONE project definition carrying a return annotation
+ *
+ * Nominal shapes (fix #207 — compiler-checked annotations, so resolution
+ * confidence carries; same-named owners must AGREE on the return type):
+ *  - Go package-qualified producer: bb := balancer.Get(n) — defs resolved
+ *    strictly into the imported package (no root-package trust)
+ *  - Rust path producer: let c = Config::load()? — last path segment as the
+ *    impl type; Result/Option unwrap via assignedUnwrap; Self → the impl type
+ *  - Java static producer (typeQualifiedCallStyle 'static'): var c =
+ *    Config.parse(...) — receiver as className
+ *  - plain producer: Go resolves same-package ONLY (an unqualified Go call
+ *    cannot reach another package); Rust/Java add a same-file narrowing on
+ *    top of the global-unique rule
+ * Nominal entries carry fromFile — the TYPE's defining file resolved from
+ * the PRODUCER's scope (_resolveFlowTypeOrigin) — so the #206 identity
+ * discipline resolves the name where the annotation lives, not where the
+ * consuming call happens to be.
  */
 function _buildReturnTypeFlowMap(index, filePath, calls) {
+    const fileEntry = index.files.get(filePath);
+    const language = fileEntry?.language;
+    const nominal = langTraits(language)?.typeSystem === 'nominal';
     let map = null;
     for (const call of calls) {
         if (!call.assignedTo) continue;
-        let returnType;
+        let returnType, fromFile, selfClass;
         if (call.isMethod && call.receiverType) {
             const defs = index.symbols.get(call.name) || [];
-            const def = defs.find(d => d.className === call.receiverType && d.returnType);
-            returnType = def && def.returnType;
+            if (nominal) {
+                const matches = defs.filter(d => d.className === call.receiverType && d.returnType);
+                if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
+                    returnType = matches[0].returnType;
+                    fromFile = matches[0].file;
+                    selfClass = matches[0].className;
+                }
+            } else {
+                const def = defs.find(d => d.className === call.receiverType && d.returnType);
+                returnType = def && def.returnType;
+            }
         } else if (call.isMethod && ['self', 'this', 'cls'].includes(call.receiver)) {
             const enclosing = index.findEnclosingFunction(filePath, call.line, true);
             let cls = enclosing && enclosing.className;
@@ -2403,7 +2605,7 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 visited.add(cls);
                 const def = (index.symbols.get(call.name) || [])
                     .find(d => d.className === cls && d.returnType);
-                if (def) { returnType = def.returnType; break; }
+                if (def) { returnType = def.returnType; fromFile = def.file; selfClass = cls; break; }
                 const parents = index._getInheritanceParents(cls, ctxFile) || [];
                 const next = parents[0]; // single chain; diamond bases stay untyped
                 if (next && index._resolveClassFile) {
@@ -2411,18 +2613,101 @@ function _buildReturnTypeFlowMap(index, filePath, calls) {
                 }
                 cls = next;
             }
-        } else if (!call.isMethod) {
+        } else if (nominal && call.isMethod && call.isPathCall && call.receiver) {
+            // Rust: let c = config::Config::load()? — the last path segment
+            // names the impl type (module-path producers stay untyped)
+            const seg = call.receiver.split('::').pop();
+            const matches = (index.symbols.get(call.name) || [])
+                .filter(d => d.className === seg && d.returnType);
+            if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
+                returnType = matches[0].returnType;
+                fromFile = matches[0].file;
+                selfClass = seg;
+            }
+        } else if (nominal && call.isMethod && call.receiver &&
+            langTraits(language)?.typeQualifiedCallStyle === 'static') {
+            // Java static factory: var c = Config.parse(...) — only sound for
+            // the static call style; a Go receiver named like a type is a
+            // VARIABLE (fix #206 typeQualifiedCallStyle discipline)
+            const matches = (index.symbols.get(call.name) || [])
+                .filter(d => d.className === call.receiver && d.returnType);
+            if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
+                returnType = matches[0].returnType;
+                fromFile = matches[0].file;
+                selfClass = call.receiver;
+            }
+        } else if (nominal && !call.isMethod && call.receiver &&
+            langTraits(language)?.hasReceiverPackageCalls) {
+            // Go package-qualified producer: bb := balancer.Get(n) — Get
+            // resolves IN the imported package (fix #206 name ownership)
+            const cands = (index.symbols.get(call.name) || [])
+                .filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.returnType);
+            const inPkg = fileEntry && _qualifiedProducerDefs(index, fileEntry, call.receiver, cands);
+            if (inPkg && inPkg.length > 0 && new Set(inPkg.map(d => d.returnType)).size === 1) {
+                returnType = inPkg[0].returnType;
+                fromFile = inPkg[0].file;
+            }
+        } else if (!nominal && call.isMethod && call.receiver && call.receiverIsModule) {
+            // Structural module-qualified producer (fix #209): schema =
+            // z.string() — the module alias resolves through the file's
+            // import bindings to its file (one re-export hop for barrels),
+            // and the producer's return annotation types the variable.
+            // Standalone exports only (className-less): a module attr is
+            // never a class method.
+            const binding = (fileEntry?.importBindings || []).find(b => b.name === call.receiver);
+            const rel = binding && fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
+            if (rel) {
+                const modFile = path.join(index.root, rel);
+                const cands = (index.symbols.get(call.name) || [])
+                    .filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.returnType && !d.className);
+                let matches = cands.filter(d => d.file === modFile);
+                if (matches.length === 0) {
+                    const hop = index.importGraph.get(modFile);
+                    if (hop) matches = cands.filter(d => hop.has(d.file));
+                }
+                if (matches.length > 0 && new Set(matches.map(d => d.returnType)).size === 1) {
+                    returnType = matches[0].returnType;
+                }
+            }
+        } else if (!call.isMethod && !call.receiver) {
             const defs = (index.symbols.get(call.name) || [])
                 .filter(d => !NON_CALLABLE_TYPES.has(d.type));
-            if (defs.length === 1) returnType = defs[0].returnType;
+            let chosen = null;
+            if (nominal && langTraits(language)?.packageScope === 'directory') {
+                // Go: an unqualified call resolves within the package — a
+                // globally-unique def in ANOTHER package is unreachable
+                const dir = path.dirname(filePath);
+                const samePkg = defs.filter(d => d.file && path.dirname(d.file) === dir);
+                if (samePkg.length === 1) chosen = samePkg[0];
+            } else if (defs.length === 1) {
+                chosen = defs[0];
+            } else if (nominal && defs.length > 1) {
+                const sameFile = defs.filter(d => d.file === filePath);
+                if (sameFile.length === 1) chosen = sameFile[0];
+            }
+            if (chosen) { returnType = chosen.returnType; fromFile = chosen.file; }
         }
-        const typeName = returnType && _typeNameFromReturnAnnotation(returnType);
+        if (!returnType) continue;
+        let typeName, entryFromFile;
+        if (nominal) {
+            const parsed = _returnTypeNameNominal(returnType, language, {
+                unwrapped: call.assignedUnwrap, tuple: call.assignedTuple, selfClass,
+            });
+            if (!parsed) continue;
+            const origin = _resolveFlowTypeOrigin(index, fromFile || filePath, parsed.name, parsed.qualifier);
+            if (!origin) continue; // identity unpinnable — don't type at all
+            typeName = parsed.name;
+            entryFromFile = origin.fromFile;
+        } else {
+            typeName = _typeNameFromReturnAnnotation(returnType);
+        }
         if (!typeName) continue;
         const scope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
         const key = `${scope}:${call.assignedTo}`;
         if (!map) map = new Map();
         if (!map.has(key)) map.set(key, []);
-        map.get(key).push({ line: call.line, type: typeName });
+        map.get(key).push({ line: call.line, type: typeName,
+            ...(entryFromFile && { fromFile: entryFromFile }) });
     }
     return map;
 }
@@ -2437,9 +2722,182 @@ function _lookupReturnTypeFlow(map, call) {
         for (const e of entries) {
             if (e.line < call.line && (!best || e.line > best.line)) best = e;
         }
-        if (best) return best.type;
+        if (best) return best;
     }
     return undefined;
+}
+
+// Return-annotation names that must never type a receiver in nominal flow:
+// builtin interfaces/primitives whose project implementors UCN cannot see —
+// a receiver typed `error` CAN dispatch into a project type's Error() method,
+// so excluding on it would lose true edges. (Rust primitives are safe: project
+// extension impls put the primitive name in dispatchTargetTypes.)
+const _GO_FLOW_REJECT = new Set([
+    'error', 'any', 'string', 'bool', 'byte', 'rune', 'uintptr',
+    'int', 'int8', 'int16', 'int32', 'int64',
+    'uint', 'uint8', 'uint16', 'uint32', 'uint64',
+    'float32', 'float64', 'complex64', 'complex128',
+]);
+const _JAVA_FLOW_REJECT = new Set([
+    'Object', 'void', 'int', 'long', 'short', 'byte', 'char',
+    'boolean', 'float', 'double', 'var',
+]);
+
+/** Split generic-argument text on commas at angle/paren/bracket depth 0. */
+function _splitTopLevelGenericArgs(s) {
+    const out = [];
+    let depth = 0, cur = '';
+    for (const ch of s) {
+        if (ch === '<' || ch === '(' || ch === '[') depth++;
+        else if (ch === '>' || ch === ')' || ch === ']') depth--;
+        if (ch === ',' && depth === 0) { out.push(cur); cur = ''; }
+        else cur += ch;
+    }
+    out.push(cur);
+    return out;
+}
+
+/**
+ * Single concrete type name from a NOMINAL return annotation (fix #207).
+ * Returns { name, qualifier } or undefined. Conservative: ambiguous or
+ * non-nominal shapes (slices, maps, chans, fn types, dyn/impl traits,
+ * generic type params, builtin interfaces) return undefined.
+ *  - Go: `*Builder` → Builder; tuple `(T, error)` pairs its FIRST element
+ *    with a tuple-unpacking assignment (`v, err := f()`) — tuple/assignment
+ *    shapes must agree or the parse is wrong; `pkg.Type` keeps the qualifier
+ *  - Rust: Self → the impl type; Result<T,_>/Option<T> unwrap ONLY under
+ *    assignedUnwrap (`?` / .unwrap() / .expect()); Box/Rc/Arc auto-deref via
+ *    _normalizeFieldTypeName
+ *  - Java: plain names and generic bases via _normalizeFieldTypeName
+ */
+function _returnTypeNameNominal(text, language, opts = {}) {
+    if (!text || typeof text !== 'string') return undefined;
+    let t = text.trim();
+    if (language === 'go') {
+        if (t.startsWith('(')) {
+            if (!opts.tuple) return undefined;
+            const inner = t.slice(1, -1);
+            if (inner.includes('func(') || inner.includes('func (')) return undefined;
+            const first = inner.split(',')[0].trim();
+            const parts = first.split(/\s+/);
+            t = parts[parts.length - 1]; // named return `n int` → int
+        } else if (opts.tuple) {
+            return undefined; // v, err := f() needs a multi-return producer
+        }
+    } else if (opts.tuple) {
+        return undefined;
+    }
+    if (language === 'rust') {
+        if (/^&?\s*(mut\s+)?Self$/.test(t)) {
+            return opts.selfClass ? { name: opts.selfClass } : undefined;
+        }
+        if (opts.unwrapped) {
+            const m = t.match(/^(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(Result|Option)\s*<(.*)>$/s);
+            if (!m) return undefined; // unwrap on a non-Result/Option annotation — alias or parse gap
+            t = (_splitTopLevelGenericArgs(m[2])[0] || '').trim();
+            if (/^&?\s*(mut\s+)?Self$/.test(t)) {
+                return opts.selfClass ? { name: opts.selfClass } : undefined;
+            }
+        }
+    } else if (opts.unwrapped) {
+        return undefined;
+    }
+    // Qualifier survives only the Go shape (`pkg.Type`); Rust paths and Java
+    // dotted names lose theirs in normalization — capture it first.
+    let qualifier;
+    if (language === 'go') {
+        const qm = t.replace(/^\*+/, '').match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+        if (qm) qualifier = qm[1];
+    } else {
+        const stripped = t.replace(/^&+\s*/, '').replace(/^mut\s+/, '');
+        if (/^[A-Za-z_$][\w$]*\s*(::|\.)/.test(stripped)) qualifier = '<unresolvable>';
+    }
+    const norm = _normalizeFieldTypeName(t, language);
+    if (!norm) return undefined;
+    if (/^[A-Z][A-Z0-9]?$/.test(norm)) return undefined; // generic type param (T, K, V1)
+    if (language === 'go' && _GO_FLOW_REJECT.has(norm)) return undefined;
+    if (language === 'java' && _JAVA_FLOW_REJECT.has(norm)) return undefined;
+    return { name: norm, qualifier };
+}
+
+/**
+ * Pin a flow type name to its defining file from the PRODUCER's scope
+ * (fix #207 — the #206 identity lesson applied to annotations: `Builder` in
+ * balancer/base.go means balancer.Builder; resolving it from the consuming
+ * file's scope could hit an unrelated same-name type). Returns { fromFile }
+ * or null when identity cannot be pinned:
+ *  - Go-qualified (`pkg.Type`): the qualifier must resolve through the
+ *    producer's imports to exactly one project package — else null
+ *  - Rust/Java-qualified annotations: external paths — only acceptable when
+ *    NO project type shares the name (the name then can't conflate)
+ *  - unqualified: same file → same dir → import edge; unique-anywhere is NOT
+ *    trusted (a use/import of an external type can shadow it invisibly)
+ *  - no project type def at all: external name — safe, can't conflate
+ */
+function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
+    const typeDefs = (index.symbols.get(typeName) || [])
+        .filter(d => IDENTITY_TYPE_KINDS.has(d.type) && d.file);
+    if (typeDefs.length === 0) return { fromFile: producerFile };
+    if (qualifier === '<unresolvable>') return null;
+    if (qualifier) {
+        const fe = index.files.get(producerFile);
+        const inPkg = fe && _qualifiedProducerDefs(index, fe, qualifier, typeDefs);
+        if (inPkg && inPkg.length > 0 && new Set(inPkg.map(d => d.file)).size === 1) {
+            return { fromFile: inPkg[0].file };
+        }
+        return null;
+    }
+    const sameFile = typeDefs.find(d => d.file === producerFile);
+    if (sameFile) return { fromFile: sameFile.file };
+    const dir = path.dirname(producerFile);
+    const sameDir = typeDefs.filter(d => path.dirname(d.file) === dir);
+    if (sameDir.length === 1) return { fromFile: sameDir[0].file };
+    if (sameDir.length > 1) return null;
+    const imports = index.importGraph.get(producerFile);
+    if (imports) {
+        const imported = typeDefs.filter(d => imports.has(d.file));
+        if (imported.length === 1) return { fromFile: imported[0].file };
+    }
+    return null;
+}
+
+/**
+ * Defs that live in the package an import-qualified receiver names, resolved
+ * through the producer file's imports (alias-aware — importNames pairs 1:1
+ * with imports for Go). STRICT counterpart of _receiverPackageResolution:
+ * used for POSITIVE typing (fix #207), so root-package defs ("." — package
+ * identity unverifiable from paths) never match here, while over there they
+ * must never be excluded. Returns null when the receiver names no import.
+ */
+function _qualifiedProducerDefs(index, fileEntry, receiver, defs) {
+    const modules = fileEntry.imports || [];
+    const names = fileEntry.importNames || [];
+    let importModule = null;
+    if (names.length === modules.length) {
+        const i = names.indexOf(receiver);
+        if (i >= 0) importModule = modules[i];
+    }
+    if (!importModule) {
+        importModule = modules.find(mod => {
+            const parts = mod.split('/');
+            const last = parts[parts.length - 1];
+            const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+            return pkgName === receiver;
+        }) || null;
+    }
+    if (!importModule || !importModule.includes('/')) return null;
+    const parts = importModule.split('/');
+    const last = parts[parts.length - 1];
+    const pkgSeg = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+    return defs.filter(d => {
+        if (!d.file) return false;
+        const dir = path.dirname(d.file);
+        const relDir = index.root ? path.relative(index.root, dir) : '';
+        if (!relDir || relDir === '.' || relDir.startsWith('..')) return false;
+        if (importModule === relDir || importModule.endsWith('/' + relDir)) return true;
+        const base = path.basename(dir);
+        return base === pkgSeg || base === receiver;
+    });
 }
 
 // Builtin receiver types from literal/annotation inference (Python builtins,
@@ -2532,6 +2990,54 @@ function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
         return base === pkgSeg || base === receiver;
     });
     return { importModule, singleSegment: false, targetInPkg };
+}
+
+/**
+ * Bounded-depth reachability over the import graph: can `fromAbs` reach any
+ * target file through re-export/import chains? Barrel hierarchies routinely
+ * run 2-3 hops (zod: v4/index → classic/index → schemas), so name-level
+ * module checks must not use a 1-hop budget (fix #209).
+ */
+function _importReaches(index, fromAbs, targetFiles, maxDepth = 4) {
+    if (targetFiles.has(fromAbs)) return true;
+    const visited = new Set([fromAbs]);
+    let frontier = [fromAbs];
+    for (let d = 0; d < maxDepth; d++) {
+        const next = [];
+        for (const f of frontier) {
+            const edges = index.importGraph.get(f);
+            if (!edges) continue;
+            for (const e of edges) {
+                if (visited.has(e)) continue;
+                if (targetFiles.has(e)) return true;
+                visited.add(e);
+                next.push(e);
+            }
+        }
+        if (next.length === 0) break;
+        frontier = next;
+    }
+    return false;
+}
+
+/**
+ * Top-level path segments of the project (dir names + module names of root
+ * files). Used to tell "module failed to resolve because it is EXTERNAL"
+ * from "module failed to resolve because our resolver has a gap" — only the
+ * former is exclusion evidence (fix #209). Memoized on the index.
+ */
+function _projectTopLevelNames(index) {
+    if (index._projectTopLevelNames) return index._projectTopLevelNames;
+    const names = new Set();
+    for (const [, fe] of index.files) {
+        const seg = (fe.relativePath || '').split(/[\\/]/)[0];
+        if (!seg) continue;
+        names.add(seg);
+        const dot = seg.lastIndexOf('.');
+        if (dot > 0) names.add(seg.slice(0, dot)); // utils.py → utils
+    }
+    index._projectTopLevelNames = names;
+    return names;
 }
 
 const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum']);
@@ -2764,6 +3270,39 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
                 if (overrides) continue;
                 targetTypes.add(cName);
                 queue.push(cName);
+            }
+        }
+    }
+    // Type aliases are the SAME type (Rust `pub type StyledString =
+    // SpannedString<Style>`, Go `type A = B`) — compiler-checked identity,
+    // not a subtype edge. Close over them in BOTH directions: a method on
+    // the base must accept alias-qualified receivers (cursive-measured: 24
+    // StyledString::plain edges wrongly excluded as path-type-mismatch),
+    // and a method on an inherent alias impl must accept base receivers.
+    // Sound only when EVERY type-kind def of the name is an alias agreeing
+    // on one base — a same-name alias to a different type in another
+    // package must not confirm foreign receivers (#206 discipline). The
+    // parser records aliasOf for Rust/Go; names without it never close.
+    if (targetTypes.size > 0) {
+        const aliasPairs = [];
+        for (const [aliasName, defs] of index.symbols) {
+            let base = null;
+            let pure = true;
+            for (const d of defs) {
+                if (d.type !== 'type' && !IDENTITY_TYPE_KINDS.has(d.type)) continue;
+                if (d.type === 'type' && d.aliasOf) {
+                    if (base === null) base = d.aliasOf;
+                    else if (base !== d.aliasOf) { pure = false; break; }
+                } else { pure = false; break; }
+            }
+            if (pure && base) aliasPairs.push([aliasName, base]);
+        }
+        let changed = aliasPairs.length > 0;
+        while (changed) {
+            changed = false;
+            for (const [a, b] of aliasPairs) {
+                if (targetTypes.has(b) && !targetTypes.has(a)) { targetTypes.add(a); changed = true; }
+                if (targetTypes.has(a) && !targetTypes.has(b)) { targetTypes.add(b); changed = true; }
             }
         }
     }

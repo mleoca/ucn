@@ -239,6 +239,37 @@ function composeAccount(index, name, rawCallers, filtered) {
 }
 
 /**
+ * Visible entries for ground call-lines no engine candidate claimed
+ * (reason `call-not-resolved`). The account already COUNTS them in its
+ * unverified total (core/account.js buildAccount); listing them closes the
+ * last visible-bucket gap — a real call edge at such a line was conserved
+ * in the arithmetic but rendered nowhere (cursive-measured: 24 oracle call
+ * edges sat invisible in reportedNonCall). Bare one-liners: file:line +
+ * source text, no caller enrichment (the engine had no candidate to enrich).
+ */
+function callNotResolvedEntries(index, account, options = {}) {
+    let entries = (account && account.callNotResolved) || [];
+    if (options.exclude && options.exclude.length > 0) {
+        entries = entries.filter(e => index.matchesFilters(e.relativePath, { exclude: options.exclude }));
+    }
+    return entries.map(e => {
+        let content = '';
+        try {
+            content = (index._readFile(e.file).split('\n')[e.line - 1] || '').trim();
+        } catch { /* unreadable since scan — keep bare */ }
+        return {
+            file: e.file,
+            relativePath: e.relativePath,
+            line: e.line,
+            content,
+            callerName: null,
+            tier: 'unverified',
+            reason: 'call-not-resolved',
+        };
+    });
+}
+
+/**
  * Context: quick caller/callee view for a symbol.
  *
  * @param {object} index - ProjectIndex instance
@@ -285,11 +316,12 @@ function context(index, name, options = {}) {
             if (fa !== fb) return fa.localeCompare(fb);
             return (a.line || 0) - (b.line || 0);
         };
-        typeCallers = [...typeCallers].sort(byFileLine);
-        typeUnverified = [...typeUnverified].sort(byFileLine);
-
         const typeAccount = composeAccount(index, name, rawTypeCallers,
             typeFilteredByFlag.exclude > 0 ? { total: typeFilteredByFlag.exclude, byFlag: typeFilteredByFlag } : undefined);
+        typeUnverified.push(...callNotResolvedEntries(index, typeAccount, options));
+
+        typeCallers = [...typeCallers].sort(byFileLine);
+        typeUnverified = [...typeUnverified].sort(byFileLine);
 
         const result = {
             type: def.type,
@@ -411,6 +443,10 @@ function context(index, name, options = {}) {
     const filteredTotal = filteredByFlag.exclude + filteredByFlag.minConfidence + filteredByFlag.unreachableOnly;
     const account = composeAccount(index, name, rawCallers,
         filteredTotal > 0 ? { total: filteredTotal, byFlag: filteredByFlag } : undefined);
+    const ctxNotResolved = callNotResolvedEntries(index, account, options);
+    if (ctxNotResolved.length > 0) {
+        unverifiedCallers = [...unverifiedCallers, ...ctxNotResolved].sort(byFileLine);
+    }
 
     const callerHistogram = buildHistogram(callers);
     const calleeHistogram = buildHistogram(callees);
@@ -1161,6 +1197,18 @@ function impact(index, name, options = {}) {
             filtered: filteredTotal > 0 ? { total: filteredTotal, byFlag: impactFilteredByFlag } : undefined,
         });
     })();
+    // Impact's unverified sites carry relative paths in `file`
+    const impactNotResolved = callNotResolvedEntries(index, impactAccount, options)
+        .map(e => ({
+            file: e.relativePath, line: e.line, expression: e.content,
+            callerName: null, tier: 'unverified', reason: e.reason,
+        }));
+    if (impactNotResolved.length > 0) {
+        unverifiedSites = [...unverifiedSites, ...impactNotResolved].sort((a, b) => {
+            if (a.file !== b.file) return a.file.localeCompare(b.file);
+            return (a.line || 0) - (b.line || 0);
+        });
+    }
 
     // Apply top limit if specified (limits total call sites shown)
     const totalBeforeLimit = filteredSites.length;
@@ -1419,6 +1467,7 @@ function about(index, name, options = {}) {
         const aboutFilteredTotal = aboutFilteredByFlag.exclude + aboutFilteredByFlag.minConfidence + aboutFilteredByFlag.unreachableOnly;
         aboutAccount = composeAccount(index, symbolName, rawCallers,
             aboutFilteredTotal > 0 ? { total: aboutFilteredTotal, byFlag: aboutFilteredByFlag } : undefined);
+        unverifiedPool.push(...callNotResolvedEntries(index, aboutAccount, options));
         // Stash the post-filter total on allCallers so the result builder can use it.
         Object.defineProperty(allCallers, '__postFilterTotal', {
             value: allCallers.length + shadowSurvivors.length,

@@ -5008,7 +5008,11 @@ describe('fix #198 (js/ts): structural receiver type inference', () => {
 });
 
 describe('fix #198b (js/ts): supertype receiver is not a mismatch', () => {
-    it('Base-typed receiver stays confirmed on Child override (dynamic dispatch)', () => {
+    it('Base-typed receiver routes possible-dispatch on Child override (dynamic dispatch)', () => {
+        // #209 aligned structural with the nominal #204 physics: a receiver
+        // typed as the target's SUPERTYPE may dispatch into the override —
+        // never excluded, visible as possible-dispatch attributed via Base
+        // (it is not receiver evidence FOR Child specifically).
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'lib.ts': 'export class Base {\n    start() { return 1; }\n}\nexport class Child extends Base {\n    start() { return 2; }\n}',
@@ -5019,8 +5023,13 @@ describe('fix #198b (js/ts): supertype receiver is not a mismatch', () => {
             const r = execute(index, 'context', { name: 'lib.ts:5:start', className: 'Child' });
             assert.ok(r.ok);
             const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
-            assert.ok(confirmed.includes('app.ts:4'),
-                `b: Base may dispatch to Child.start — must stay confirmed: ${confirmed}`);
+            assert.ok(!confirmed.includes('app.ts:4'),
+                `b: Base is not evidence for Child specifically: ${confirmed}`);
+            const entry = (r.result.unverifiedCallers || [])
+                .find(u => `${u.relativePath}:${u.line}` === 'app.ts:4');
+            assert.ok(entry, `b.start() stays VISIBLE: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Base');
             assert.strictEqual(r.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
@@ -5254,6 +5263,74 @@ module.exports = { effect, endBatch, realUser };
             assert.ok(json.meta.account.excluded.byReason['local-shadow'],
                 'shadowed ref excluded with local-shadow reason');
             assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #209: structural dispatch tiering (JS/TS) — same engine rules as the
+// Python variant: untyped-receiver method calls against multiple owners are
+// visible method-ambiguous, never scope-confirmed.
+// ============================================================================
+
+describe('fix #209: structural dispatch tiering (JS/TS)', () => {
+    it('untyped-receiver method call against multiple owners routes method-ambiguous', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class JsonCodec {',
+                '    decode(data: string) { return data; }',
+                '}',
+                'export class TextCodec {',
+                '    decode(data: string) { return data; }',
+                '}',
+            ].join('\n'),
+            'app.ts': [
+                'import { JsonCodec } from "./lib";',
+                '',
+                'export function run(codec) {',
+                '    return codec.decode("x");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:2:decode' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!confirmed.includes('app.ts:4'),
+                `codec is untyped and decode has 2 owners: ${confirmed}`);
+            const entry = (r.result.unverifiedCallers || [])
+                .find(u => `${u.relativePath}:${u.line}` === 'app.ts:4');
+            assert.ok(entry, `codec.decode stays VISIBLE: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.strictEqual(entry.reason, 'method-ambiguous');
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('single-owner method name keeps confirming on scope evidence', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Codec {',
+                '    decodeFrames(data: string) { return data; }',
+                '}',
+            ].join('\n'),
+            'app.ts': [
+                'import { Codec } from "./lib";',
+                '',
+                'export function run(codec) {',
+                '    return codec.decodeFrames("x");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'lib.ts:2:decodeFrames' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(confirmed.includes('app.ts:4'),
+                `single project-wide owner stays confirmed (#204 rule): ${confirmed}`);
         } finally { rm(dir); }
     });
 });

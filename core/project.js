@@ -384,6 +384,13 @@ class ProjectIndex {
             size: stat.size,
             imports: imports.map(i => i.module),
             importNames: imports.flatMap(i => i.names || []),
+            // Paired name↔module bindings (fix #209): importNames flattens the
+            // pairing away, but name-level shadow detection needs to know WHICH
+            // module bound a name (`from urllib.parse import unquote` rebinds
+            // the bare name for the whole file).
+            importBindings: imports.flatMap(i => (i.names || [])
+                .filter(n => n && n !== '*' && n !== '_' && n !== '.')
+                .map(n => ({ name: n, module: i.module }))),
             exports: exports.map(e => e.name),
             exportDetails: exports,
             symbols: [],
@@ -422,6 +429,7 @@ class ProjectIndex {
                 ...(item.className && { className: item.className }),
                 ...(item.memberType && { memberType: item.memberType }),
                 ...(item.fieldType && { fieldType: item.fieldType }),
+                ...(item.aliasOf && { aliasOf: item.aliasOf }),
                 ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
                 // Decorator/annotation/attribute argument capture for endpoints command:
                 // these fields hold the parsed first-string-arg of each route-style annotation.

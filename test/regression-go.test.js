@@ -4483,7 +4483,7 @@ func useIface(d Doer) {
 	d.Do()
 }
 
-func getThing() *Filter { return nil }
+func getThing() interface{} { return nil }
 `,
     };
 
@@ -4881,6 +4881,205 @@ func build() (clients.Locality, xdsresource.Locality) {
             assert.ok(!confirmed.includes('builder/builder.go:10'),
                 `xdsresource.Locality{} is the other package's type: ${confirmed}`);
             assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #207: nominal return-type flow (Go) — variables typed by what the
+// assigned call's declared return annotation says (bb := balancer.Get(n)).
+// ============================================================================
+
+describe('fix #207: nominal return-type flow (Go)', () => {
+    const FILES = {
+        'go.mod': 'module example.com/m\ngo 1.21\n',
+        'balancer/base.go': `package balancer
+
+type Builder interface {
+	Build(name string) int
+}
+
+type concrete struct{}
+
+func (c *concrete) Build(name string) int { return 1 }
+
+type other struct{}
+
+func (o *other) Build(name string) int { return 2 }
+
+func Get(name string) Builder { return &concrete{} }
+
+func MakeConcrete(name string) (*concrete, error) { return &concrete{}, nil }
+
+func MakeOther(name string) *other { return &other{} }
+`,
+        'app/app.go': `package app
+
+import "example.com/m/balancer"
+
+func Run() {
+	bb := balancer.Get("x")
+	bb.Build("y")
+	cc, err := balancer.MakeConcrete("z")
+	_ = err
+	cc.Build("w")
+	oo := balancer.MakeOther("q")
+	oo.Build("v")
+}
+`,
+    };
+
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason, dispatchVia: u.dispatchVia,
+            })),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('tuple assignment from a package-qualified producer confirms the typed receiver', () => {
+        // cc, err := balancer.MakeConcrete(...) returns (*concrete, error) —
+        // cc.Build() is a compiler-checked call on concrete.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'balancer/base.go:9:Build');
+            assert.ok(res.confirmed.includes('app/app.go:10'),
+                `cc.Build() flows from MakeConcrete's return tuple: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('interface return routes the consuming call to possible-dispatch with attribution', () => {
+        // bb := balancer.Get(...) returns the Builder INTERFACE — bb.Build()
+        // can dispatch into concrete.Build but is not receiver evidence for it.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'balancer/base.go:9:Build');
+            assert.ok(!res.confirmed.includes('app/app.go:7'),
+                `bb is Builder-typed, not concrete evidence: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'app/app.go:7');
+            assert.ok(entry, `bb.Build() stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Builder');
+        } finally { rm(dir); }
+    });
+
+    it('flow type that provably binds another struct excludes with receiver-type-mismatch', () => {
+        // oo := balancer.MakeOther(...) returns *other, which defines its own
+        // Build — static dispatch, never the pinned concrete.Build.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'balancer/base.go:9:Build');
+            assert.ok(!res.confirmed.includes('app/app.go:12'),
+                `oo is other-typed: ${res.confirmed}`);
+            assert.ok(!res.unverified.some(u => u.key === 'app/app.go:12'),
+                `oo.Build() is positive-evidence excluded: ${JSON.stringify(res.unverified)}`);
+            assert.ok(res.excluded.byReason['receiver-type-mismatch']?.count >= 1,
+                JSON.stringify(res.excluded.byReason));
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('legacy (non-account) callers keep all method-call edges — no flow exclusions', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const { findCallers } = require('../core/callers');
+            const legacy = findCallers(index, 'Build', { file: 'balancer/base.go' });
+            const lines = (legacy.callers || legacy).map(c => `${path.basename(c.file)}:${c.line}`);
+            for (const l of ['app.go:7', 'app.go:10', 'app.go:12']) {
+                assert.ok(lines.includes(l), `legacy keeps ${l}: ${lines}`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('an unqualified call cannot type from a producer in another package', () => {
+        // Go scope rule: an unqualified Get() in app cannot reach
+        // balancer.Get — the flow map must not type from it even though it
+        // is the only Get project-wide.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'balancer/base.go': `package balancer
+
+type concrete struct{}
+
+func (c *concrete) Build(name string) int { return 1 }
+
+func Get(name string) *concrete { return &concrete{} }
+`,
+            'app/app.go': `package app
+
+func Run() {
+	bb := Get("x")
+	bb.Build("y")
+}
+
+func Get(s string) int { return 0 }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'balancer/base.go:5:Build');
+            assert.ok(!res.confirmed.includes('app/app.go:5'),
+                `bb came from app's own Get (returns int), not balancer.Get: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #208: type-alias receivers — Go `type A = B` is the SAME type (methods
+// carry over, unlike defined types `type A B`). Alias symbols are now indexed
+// with aliasOf so alias-qualified receivers resolve to the base type.
+// ============================================================================
+
+describe('fix #208: type-alias receivers (Go)', () => {
+    const FILES = {
+        'go.mod': 'module example.com/m\ngo 1.21\n',
+        'lib/lib.go': `package lib
+
+type Spanned struct{ V int }
+
+func (s *Spanned) Render(x int) int { return s.V + x }
+
+type Styled = Spanned
+`,
+        'app/app.go': `package app
+
+import "example.com/m/lib"
+
+func Use(s *lib.Styled) {
+	s.Render(1)
+}
+`,
+    };
+
+    it('parser records aliasOf and the alias-typed receiver confirms', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('Styled') || [];
+            assert.strictEqual(defs.length, 1, `alias indexed: ${JSON.stringify(defs)}`);
+            assert.strictEqual(defs[0].aliasOf, 'Spanned');
+
+            const r = execute(index, 'context', { name: 'lib/lib.go:5:Render' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('app/app.go:6'),
+                `a *Styled receiver IS *Spanned: ${confirmed} / excluded ${JSON.stringify(json.meta.account.excluded.byReason)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });

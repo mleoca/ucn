@@ -105,6 +105,13 @@ function buildImportGraph(index) {
     for (const [filePath, fileEntry] of index.files) {
         const importedFiles = new Set();
         const seenModules = new Set();
+        // Per-module resolution map (fix #209): module string → resolved
+        // project file (ROOT-RELATIVE — fileEntry persists in the cache, so
+        // paths must stay portable). Lets query-time code answer "which FILE
+        // does the module behind this import binding live in" — file-level
+        // importGraph edges can't (a file importing the target for OTHER
+        // names is not evidence about THIS name's module).
+        const moduleResolved = {};
 
         for (const importModule of fileEntry.imports) {
             // Skip null modules (e.g., dynamic include! macros in Rust)
@@ -128,6 +135,7 @@ function buildImportGraph(index) {
             }
 
             if (resolved && index.files.has(resolved)) {
+                moduleResolved[importModule] = path.relative(index.root, resolved);
                 // For Go, a package import means all files in that directory are dependencies
                 // (Go packages span multiple files in the same directory)
                 const filesToLink = [resolved];
@@ -154,6 +162,7 @@ function buildImportGraph(index) {
         }
 
         index.importGraph.set(filePath, importedFiles);
+        fileEntry.moduleResolved = moduleResolved;
     }
 }
 

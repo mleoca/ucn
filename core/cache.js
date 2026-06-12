@@ -17,7 +17,12 @@ const UCN_VERSION = require('../package.json').version;
 // symbol shape changes (saveCache writes it; loadCache rejects anything else).
 // v14: Go qualified composite literals (pkg.Foo{...}) record the package
 // qualifier as `receiver` (fix #206).
-const CACHE_FORMAT_VERSION = 14;
+// v15: Go/Rust/Java calls record assignedTo (+assignedTuple/assignedUnwrap)
+// for nominal return-type flow; Java declared-type locals feed receiverType
+// (fix #207).
+// v16: Rust/Go type-alias symbols record aliasOf (fix #208 — alias-qualified
+// receivers are the aliased type); Go `type A = B` aliases now indexed.
+const CACHE_FORMAT_VERSION = 16;
 
 /**
  * Save index to cache file

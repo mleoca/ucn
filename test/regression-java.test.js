@@ -2100,3 +2100,95 @@ describe('fix #206: qualified constructor records receiver (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #207: nominal return-type flow + declared-type locals (Java) —
+// `var x = Factory.find()` types x from the producer's declared return;
+// `Service s = anyExpr()` types s from the declaration itself.
+// ============================================================================
+
+describe('fix #207: return-type flow and declared-type locals (Java)', () => {
+    const FILES = {
+        'Service.java': `public class Service {
+    public int run() { return 1; }
+}
+`,
+        'Handler.java': `public interface Handler {
+    int handle();
+}
+`,
+        'WebHandler.java': `public class WebHandler implements Handler {
+    public int handle() { return 2; }
+}
+`,
+        'Registry.java': `public class Registry {
+    public static Service lookup(String name) { return new Service(); }
+    public static Handler pick(String name) { return new WebHandler(); }
+}
+`,
+        'App.java': `public class App {
+    void go() {
+        var s = Registry.lookup("a");
+        s.run();
+        Service t = obtain();
+        t.run();
+        var h = Registry.pick("b");
+        h.handle();
+    }
+    Service obtain() { return new Service(); }
+}
+`,
+    };
+
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason, dispatchVia: u.dispatchVia,
+            })),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('var assigned from a static factory confirms calls on the returned type', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'Service.java:2:run');
+            assert.ok(res.confirmed.includes('App.java:4'),
+                `var s = Registry.lookup(..) types s as Service: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('declared-type local confirms regardless of the value expression', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'Service.java:2:run');
+            assert.ok(res.confirmed.includes('App.java:6'),
+                `Service t = obtain() types t from the declaration: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('interface-returning factory routes the consuming call to possible-dispatch', () => {
+        // var h = Registry.pick(..) returns the Handler INTERFACE — h.handle()
+        // can dispatch into WebHandler.handle but is not receiver evidence.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'WebHandler.java:2:handle');
+            assert.ok(!res.confirmed.includes('App.java:8'),
+                `h is Handler-typed, not WebHandler evidence: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'App.java:8');
+            assert.ok(entry, `h.handle() stays visible: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Handler');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});

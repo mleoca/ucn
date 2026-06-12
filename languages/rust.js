@@ -45,6 +45,30 @@ function extractRustParams(paramsNode) {
 }
 
 /**
+ * Base type name from a type-alias target (fix #208): SpannedString<Style>
+ * → SpannedString, module::Type → Type, &T → T. dyn/impl/tuple/fn shapes
+ * return null — not nominal method receivers.
+ */
+function aliasBaseTypeName(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'type_identifier') return typeNode.text;
+    if (typeNode.type === 'reference_type') {
+        for (let i = 0; i < typeNode.namedChildCount; i++) {
+            const r = aliasBaseTypeName(typeNode.namedChild(i));
+            if (r) return r;
+        }
+        return null;
+    }
+    if (typeNode.type === 'generic_type') {
+        return aliasBaseTypeName(typeNode.namedChild(0));
+    }
+    if (typeNode.type === 'scoped_type_identifier') {
+        return typeNode.childForFieldName('name')?.text || null;
+    }
+    return null;
+}
+
+/**
  * Extract visibility modifier
  */
 function extractVisibility(text) {
@@ -492,6 +516,11 @@ function _processClass(node, types, processedRanges, lines, code) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
             const visibility = extractVisibility(node.text);
+            // `pub type StyledString = SpannedString<Style>;` — the alias IS
+            // the aliased type (compiler identity). Record the base name so
+            // callers can treat alias-qualified receivers as the base type
+            // (fix #208 — cursive StyledString::plain).
+            const aliasOf = aliasBaseTypeName(node.childForFieldName('type'));
 
             types.push({
                 name: nameNode.text,
@@ -500,6 +529,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 type: 'type',
                 members: [],
                 modifiers: visibility ? [visibility] : [],
+                ...(aliasOf && { aliasOf }),
                 ...(docstring && { docstring })
             });
         }
@@ -997,6 +1027,52 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
     }
 }
 
+/**
+ * Variable receiving this call's result (fix #207 return-type flow):
+ *   let x = f(...);          → { assignedTo: 'x' }
+ *   let x = f(...)?;         → { assignedTo: 'x', unwrapped: true }
+ *   let x = f(...).unwrap(); → { assignedTo: 'x', unwrapped: true } (also .expect(...))
+ *   x = f(...);              → { assignedTo: 'x' }
+ * Value-transparent wrappers (`?`, .unwrap(), .expect(), .await) are walked
+ * through so the INNER call carries the target; the flow map then unwraps
+ * Result<T, _>/Option<T> from the producer's return annotation. `let mut x`
+ * works too — the pattern field is the plain identifier.
+ */
+function rustAssignmentTargetOf(callNode) {
+    let n = callNode;
+    let p = n.parent;
+    let unwrapped = false;
+    for (;;) {
+        if (!p) return undefined;
+        if (p.type === 'try_expression') { unwrapped = true; n = p; p = n.parent; continue; }
+        if (p.type === 'await_expression') { n = p; p = n.parent; continue; }
+        if (p.type === 'field_expression' &&
+            p.childForFieldName('value')?.id === n.id &&
+            ['unwrap', 'expect'].includes(p.childForFieldName('field')?.text) &&
+            p.parent?.type === 'call_expression' &&
+            p.parent.childForFieldName('function')?.id === p.id) {
+            unwrapped = true; n = p.parent; p = n.parent; continue;
+        }
+        break;
+    }
+    if (p.type === 'let_declaration') {
+        const value = p.childForFieldName('value');
+        const pattern = p.childForFieldName('pattern');
+        if (value && value.id === n.id && pattern?.type === 'identifier') {
+            return { assignedTo: pattern.text, ...(unwrapped && { unwrapped: true }) };
+        }
+        return undefined;
+    }
+    if (p.type === 'assignment_expression') {
+        const right = p.childForFieldName('right');
+        const left = p.childForFieldName('left');
+        if (right && right.id === n.id && left?.type === 'identifier') {
+            return { assignedTo: left.text, ...(unwrapped && { unwrapped: true }) };
+        }
+    }
+    return undefined;
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
@@ -1140,6 +1216,11 @@ function findCallsInCode(code, parser) {
 
             const enclosingFunction = getCurrentEnclosingFunction();
 
+            // Assignment target for return-type flow (fix #207): let args =
+            // parse_low_raw(...)? lets findCallers type args from the
+            // producer's declared return type at query time.
+            const assigned = rustAssignmentTargetOf(node);
+
             // Call-site arg count for arity pruning (no spread syntax in Rust;
             // UFCS `Type::method(&x, ...)` counts the explicit self — the
             // pruning range accounts for the shift).
@@ -1160,6 +1241,8 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     argCount,
+                    ...(assigned && { assignedTo: assigned.assignedTo }),
+                    ...(assigned?.unwrapped && { assignedUnwrap: true }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
@@ -1232,6 +1315,8 @@ function findCallsInCode(code, parser) {
                         ...(receiverField && { receiverRoot, receiverField }),
                         ...(receiverField && receiverRootType && { receiverRootType }),
                         argCount,
+                        ...(assigned && { assignedTo: assigned.assignedTo }),
+                        ...(assigned?.unwrapped && { assignedUnwrap: true }),
                         enclosingFunction,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
@@ -1250,6 +1335,8 @@ function findCallsInCode(code, parser) {
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
                     receiver: segments.length > 1 ? segments.slice(0, -1).join('::') : undefined,
                     argCount,
+                    ...(assigned && { assignedTo: assigned.assignedTo }),
+                    ...(assigned?.unwrapped && { assignedUnwrap: true }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
