@@ -3,7 +3,9 @@
  *
  * Unlike test/real-repo-stress-analysis.js (shallow clone of HEAD), eval runs
  * must be reproducible: every repo is pinned to a commit SHA so metric drift
- * means UCN changed, not the repo. SHAs pinned 2026-06-11.
+ * means UCN changed, not the repo. SHAs pinned 2026-06-11 (grpc-go/cursive
+ * 2026-06-12 — dispatch-heavy second repos per nominal language, so precision
+ * numbers can't look good by dispatch-light style accident).
  */
 
 'use strict';
@@ -45,11 +47,37 @@ const REPOS = [
         targetCandidates: ['.'],
     },
     {
+        // Dispatch-heavy Go: interface-registry dispatch (resource-type
+        // registries, balancer/resolver Builders, httpfilter registries).
+        // Target is internal/xds ONLY — grpc-go has 10 nested Go modules
+        // (examples/, interop/xds/, ...) that gopls rooted at the main module
+        // does not load; internal/xds is nested-module-free, so the oracle
+        // universe covers UCN's whole indexed universe.
+        name: 'grpc-go',
+        url: 'https://github.com/grpc/grpc-go',
+        commit: '9a130aad0775eec6d573e1c83a558f9039073b9c',
+        language: 'go',
+        targetCandidates: ['internal/xds'],
+    },
+    {
         name: 'ripgrep',
         url: 'https://github.com/BurntSushi/ripgrep',
         commit: '82313cf95849bfe425109ad9506a52154879b1b1',
         language: 'rust',
         targetCandidates: ['crates/core'],
+    },
+    {
+        // Dispatch-heavy Rust: Box<dyn View> registry — dozens of View/
+        // ViewWrapper impls called through trait objects (the TypeAdapter
+        // shape in Rust). Whole workspace (core + wrapper crate + examples):
+        // builder-API callers live in cursive/ and examples/, so a core-only
+        // target leaves real callers outside the measured universe
+        // (zero-trust artifact — measured 2026-06-12).
+        name: 'cursive',
+        url: 'https://github.com/gyscos/cursive',
+        commit: 'b41c5ad050c85c0f37095b439c31f223c7ff4759',
+        language: 'rust',
+        targetCandidates: ['.'],
     },
     {
         name: 'gson',

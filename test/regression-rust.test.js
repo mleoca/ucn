@@ -2196,3 +2196,43 @@ pub fn use_exact() -> i32 {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #206: qualified struct expressions keep their path qualifier
+// ============================================================================
+
+describe('fix #206: qualified struct expression records receiver (Rust)', () => {
+    it('other::Foo { } records receiver, bare Foo { } does not', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "p"\nversion = "0.1.0"\n',
+            'src/main.rs': `mod other;
+
+fn main() {
+    let a = other::Foo { x: 1 };
+    let b = Foo { x: 2 };
+}
+
+struct Foo { x: i32 }
+`,
+            'src/other.rs': 'pub struct Foo { pub x: i32 }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { getCachedCalls } = require('../core/callers');
+            const calls = [];
+            for (const [f] of index.files) {
+                for (const c of getCachedCalls(index, f)) {
+                    if (c.name === 'Foo' && c.isConstructor) calls.push(c);
+                }
+            }
+            const qualified = calls.find(c => c.line === 4);
+            const bare = calls.find(c => c.line === 5);
+            assert.ok(qualified, 'qualified struct expression recorded');
+            assert.strictEqual(qualified.receiver, 'other',
+                `path qualifier kept as receiver: ${JSON.stringify(qualified)}`);
+            assert.ok(bare, 'bare struct expression recorded');
+            assert.strictEqual(bare.receiver, undefined,
+                `bare literal has no receiver: ${JSON.stringify(bare)}`);
+        } finally { rm(dir); }
+    });
+});

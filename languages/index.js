@@ -42,6 +42,16 @@ const NOMINAL_TRAITS = {
     // the caller contract: a pinned overload is only confirmed when the call
     // site provably binds it.
     hasArityOverloads: false,
+    // What a TYPE-QUALIFIED method call looks like, so a receiver that merely
+    // shares the target type's NAME isn't mistaken for the type itself:
+    //   'static'      — Type.method() static form, any arity (Java).
+    //   'method-expr' — Go method expressions T.M(recv, ...): the receiver
+    //                   instance is the FIRST argument, so a zero-arg call on
+    //                   a type-named receiver must be a variable (grpc-go
+    //                   names builder structs and Builder locals both `bb`).
+    //   'path'        — Rust Type::method (isPathCall); a DOT-call receiver
+    //                   matching a type name is a variable, never the type.
+    typeQualifiedCallStyle: 'static',
 };
 
 // Language configurations
@@ -111,6 +121,7 @@ const LANGUAGES = {
             hasReceiverPackageCalls: true,
             exportVisibility: 'capitalization',
             hasDynamicImports: false,
+            typeQualifiedCallStyle: 'method-expr',
             testFileCandidates: (base, ext) => [`${base}_test.go`],
         },
     },
@@ -124,6 +135,7 @@ const LANGUAGES = {
             ...NOMINAL_TRAITS,
             selfParam: ['self', '&self', '&mut self', 'mut self'],
             hasDynamicImports: false,
+            typeQualifiedCallStyle: 'path',
             testFileCandidates: (base, ext) => [`${base}_test.rs`],
             testDirs: ['tests'],
         },

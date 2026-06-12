@@ -2064,3 +2064,39 @@ describe('fix #205: overload discipline and arity pruning (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #206: qualified object creation keeps its package qualifier
+// ============================================================================
+
+describe('fix #206: qualified constructor records receiver (Java)', () => {
+    it('new com.example.Foo() records receiver, new Foo() does not', () => {
+        const dir = tmp({
+            'A.java': `class A {
+    void m() {
+        Object a = new com.example.Foo(1);
+        Object b = new Foo(2);
+    }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { getCachedCalls } = require('../core/callers');
+            const calls = [];
+            for (const [f] of index.files) {
+                for (const c of getCachedCalls(index, f)) {
+                    if (c.name === 'Foo' && c.isConstructor) calls.push(c);
+                }
+            }
+            const qualified = calls.find(c => c.line === 3);
+            const bare = calls.find(c => c.line === 4);
+            assert.ok(qualified, 'qualified constructor recorded');
+            assert.strictEqual(qualified.receiver, 'example',
+                `package qualifier kept as receiver: ${JSON.stringify(qualified)}`);
+            assert.ok(bare, 'bare constructor recorded');
+            assert.strictEqual(bare.receiver, undefined,
+                `bare constructor has no receiver: ${JSON.stringify(bare)}`);
+        } finally { rm(dir); }
+    });
+});

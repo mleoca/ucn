@@ -12,7 +12,7 @@ const fs = require('fs');
 
 const { parse } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
-const { saveCache, loadCache } = require('../core/cache');
+const { saveCache, loadCache, CACHE_FORMAT_VERSION } = require('../core/cache');
 const { parseStackTrace } = require('../core/stacktrace');
 const { tmp, rm, idx, FIXTURES_PATH } = require('./helpers');
 const { execute } = require('../core/execute');
@@ -2008,7 +2008,8 @@ func World() string { return "world" }
                 assert.ok(!entry.symbols, 'File entry should not contain symbols');
                 assert.ok(!entry.bindings, 'File entry should not contain bindings');
             }
-            assert.strictEqual(cacheData.version, 13, 'Cache version should be 13');
+            assert.strictEqual(cacheData.version, CACHE_FORMAT_VERSION,
+                'Cache version should match CACHE_FORMAT_VERSION');
         } finally {
             rm(dir);
         }
@@ -4619,6 +4620,267 @@ func useTooMany() int {
                 `Take(1,2,3) cannot bind a 2-param func: ${res.confirmed}`);
             assert.strictEqual(res.excluded.byReason['arity-mismatch']?.count, 1,
                 JSON.stringify(res.excluded.byReason));
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #206: dispatch-heavy Go false positives (measured on grpc-go internal/xds)
+// ============================================================================
+
+describe('fix #206: package-qualified references and type-name conflation (Go)', () => {
+    function contractCallers(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || json.data.usages || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => ({
+                key: `${u.file}:${u.line}`, reason: u.reason, dispatchVia: u.dispatchVia,
+            })),
+            excluded: json.meta.account?.excluded,
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('pkg.Name const reference is not a confirmed caller of an unrelated method Name', () => {
+        // grpc-go: balancer.Get(priority.Name) references the CONST
+        // priority.Name — confirmed-tier contamination for cdsbalancer's
+        // method Name() before the fix (scope-match via the target's own
+        // same-file evidence).
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'priority/balancer.go': 'package priority\n\nconst Name = "priority_experimental"\n',
+            'cdsbalancer/cds.go': `package cds
+
+import (
+	"example.com/m/priority"
+)
+
+type bb struct{}
+
+func (bb) Name() string { return "cds" }
+
+func newChild() {
+	builder := Get(priority.Name)
+	_ = builder
+}
+
+func Get(s string) int { return len(s) }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'cdsbalancer/cds.go:9:Name');
+            assert.ok(!res.confirmed.includes('cdsbalancer/cds.go:12'),
+                `priority.Name is the const, not the method: ${res.confirmed}`);
+            assert.strictEqual(res.excluded.byReason['other-definition']?.count >= 1, true,
+                JSON.stringify(res.excluded?.byReason));
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('zero-arg call on a variable named like the target type routes method-ambiguous', () => {
+        // grpc-go names builder structs and Builder locals both `bb`:
+        // bb.Name() where bb is a VARIABLE must not count as a
+        // type-qualified call (Go method expressions pass the receiver as
+        // the first argument, so a zero-arg form cannot be the type).
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'cds/cds.go': `package cds
+
+type bb struct{}
+
+func (bb) Name() string { return "cds" }
+`,
+            'other/other.go': `package other
+
+type builder struct{}
+
+func (builder) Name() string { return "other" }
+
+func use(bb interface{ Name() string }) string {
+	return bb.Name()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'cds/cds.go:5:Name');
+            assert.ok(!res.confirmed.includes('other/other.go:8'),
+                `variable bb sharing the type name is not receiver evidence: ${res.confirmed}`);
+            const entry = res.unverified.find(u => u.key === 'other/other.go:8');
+            assert.ok(entry, `stays visible unverified: ${JSON.stringify(res.unverified)}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('qualified composite literal in the target method\'s own file is not a self-edge', () => {
+        // grpc-go: &certprovider.KeyMaterial{...} inside KeyMaterial()
+        // claimed an exact-binding self-edge — pkg.Type can never denote
+        // the current file's package.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'certprovider/provider.go': 'package certprovider\n\ntype KeyMaterial struct{ Roots int }\n',
+            'impl.go': `package impl
+
+import (
+	"example.com/m/certprovider"
+)
+
+type handler struct{}
+
+func (h *handler) KeyMaterial() (*certprovider.KeyMaterial, error) {
+	rootCAs := 1
+	return &certprovider.KeyMaterial{Roots: rootCAs}, nil
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'impl.go:9:KeyMaterial');
+            assert.ok(!res.confirmed.includes('impl.go:11'),
+                `&certprovider.KeyMaterial{} is the struct, not the method: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('composite-field func literal (closure-entry marker) is not a caller edge', () => {
+        // The Go parser records the ENCLOSING function's name at
+        // `Field: func(...) {...}` lines for deadcode reachability — it must
+        // never surface as a confirmed caller (self-edge).
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'main.go': `package main
+
+type opts struct {
+	OnStreamRequest func(int64) error
+}
+
+func spawn(o opts) int { return 0 }
+
+func TestSimple() {
+	s := spawn(opts{
+		OnStreamRequest: func(_ int64) error {
+			return nil
+		},
+	})
+	_ = s
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'main.go:9:TestSimple');
+            assert.ok(!res.confirmed.some(k => k.startsWith('main.go:1')),
+                `closure marker is not a self-caller: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('cross-package same-name type does not validate the receiver (identity discipline)', () => {
+        // grpc-go defines ~20 structs all named bb: `parser := bb{}` in
+        // package leastrequest must not confirm against cdsbalancer's
+        // bb.ParseConfig — and must still confirm against its OWN package's.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'cds/cds.go': `package cds
+
+type bb struct{}
+
+func (bb) ParseConfig(b []byte) int { return len(b) }
+`,
+            'leastrequest/lr.go': `package leastrequest
+
+type bb struct{}
+
+func (bb) ParseConfig(b []byte) int { return len(b) * 2 }
+`,
+            'leastrequest/lr_helper.go': `package leastrequest
+
+func helper(b []byte) int {
+	parser := bb{}
+	return parser.ParseConfig(b)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const cds = contractCallers(index, 'cds/cds.go:5:ParseConfig');
+            assert.ok(!cds.confirmed.includes('leastrequest/lr_helper.go:5'),
+                `leastrequest's bb is a different type: ${cds.confirmed}`);
+            assert.strictEqual(cds.conserved, true);
+            const lr = contractCallers(index, 'leastrequest/lr.go:5:ParseConfig');
+            assert.ok(lr.confirmed.includes('leastrequest/lr_helper.go:5'),
+                `same-package bb{} receiver confirms its own ParseConfig: ${lr.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('member access on a value never confirms a pinned TYPE target', () => {
+        // grpc-go: m.ResourceType (field access) confirmed as a usage of the
+        // struct ResourceType — a value receiver cannot denote a type; only a
+        // package-qualified name can. Stays visible unverified (alias-import
+        // receivers are indistinguishable), never confirmed.
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'types/types.go': 'package types\n\ntype ResourceType struct{ Name string }\n',
+            'rec/rec.go': `package rec
+
+type metric struct {
+	ResourceType string
+}
+
+func record(m metric) string {
+	return emit(m.ResourceType)
+}
+
+func emit(s string) string { return s }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const res = contractCallers(index, 'types/types.go:3:ResourceType');
+            assert.ok(!res.confirmed.includes('rec/rec.go:8'),
+                `m.ResourceType is a field access, not a type usage: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #206b: receiver-package identity for qualified references (Go)', () => {
+    it('xdsresource.Locality{} does not confirm for clients.Locality when both are imported', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'clients/config.go': 'package clients\n\ntype Locality struct{ Zone string }\n',
+            'xdsresource/eds.go': 'package xdsresource\n\ntype Locality struct{ Region string }\n',
+            'builder/builder.go': `package builder
+
+import (
+	"example.com/m/clients"
+	"example.com/m/xdsresource"
+)
+
+func build() (clients.Locality, xdsresource.Locality) {
+	a := clients.Locality{Zone: "L0"}
+	b := xdsresource.Locality{Region: "R0"}
+	return a, b
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'clients/config.go:3:Locality' });
+            assert.ok(r.ok, r.error);
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.usages || json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('builder/builder.go:9'),
+                `clients.Locality{} confirms: ${confirmed}`);
+            assert.ok(!confirmed.includes('builder/builder.go:10'),
+                `xdsresource.Locality{} is the other package's type: ${confirmed}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
         } finally { rm(dir); }
     });
 });

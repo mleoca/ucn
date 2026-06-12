@@ -961,13 +961,18 @@ function findCallsInCode(code, parser, options = {}) {
             const typeNode = node.childForFieldName('type');
             if (typeNode) {
                 let typeName = null;
+                let typeQualifier = null;
                 if (typeNode.type === 'type_identifier') {
                     // Foo{...}
                     typeName = typeNode.text;
                 } else if (typeNode.type === 'qualified_type') {
-                    // pkg.Foo{...}
+                    // pkg.Foo{...} — keep the package qualifier as receiver: a
+                    // package-qualified type can never resolve to a same-file
+                    // binding (Go cannot self-import), so resolution must not
+                    // claim local same-name symbols for it.
                     const tn = typeNode.childForFieldName('name');
                     if (tn) typeName = tn.text;
+                    typeQualifier = typeNode.childForFieldName('package')?.text || null;
                 }
                 // Skip anonymous types (slice_type, map_type, array_type, struct_type, etc.)
                 if (typeName) {
@@ -977,6 +982,7 @@ function findCallsInCode(code, parser, options = {}) {
                         line: node.startPosition.row + 1,
                         isMethod: false,
                         isConstructor: true,
+                        ...(typeQualifier && { receiver: typeQualifier }),
                         enclosingFunction,
                         uncertain: false
                     });

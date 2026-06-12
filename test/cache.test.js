@@ -15,6 +15,7 @@ const { execSync } = require('child_process');
 
 const { parse, parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex, parseDiff } = require('../core/project');
+const { CACHE_FORMAT_VERSION } = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
 describe('Cache Behavior', () => {
@@ -631,7 +632,7 @@ function helper() { return 42; }
             // Verify main cache file does NOT have inline callsCache
             const mainCachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(mainCachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 13, 'Cache version should be current');
+            assert.strictEqual(cacheData.version, CACHE_FORMAT_VERSION, 'Cache version should be current');
             assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
 
             // Verify sharded calls cache exists (calls/manifest.json)
@@ -1983,7 +1984,7 @@ describe('Cache v6 relative paths', () => {
             // Check that cache uses relative paths
             const cachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
-            assert.strictEqual(cacheData.version, 13);
+            assert.strictEqual(cacheData.version, CACHE_FORMAT_VERSION);
 
             // File keys should be relative
             for (const [key] of cacheData.files) {

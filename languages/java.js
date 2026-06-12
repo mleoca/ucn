@@ -1118,9 +1118,14 @@ function findCallsInCode(code, parser) {
                 if (genericIdx > 0) {
                     typeName = typeName.substring(0, genericIdx);
                 }
-                // Handle qualified names like pkg.Class
+                // Handle qualified names like pkg.Class — keep the qualifier
+                // as receiver (fix #206): a qualified type must not resolve to
+                // a same-file binding of an unrelated same-name symbol.
+                let typeQualifier = null;
                 const dotIdx = typeName.lastIndexOf('.');
                 if (dotIdx > 0) {
+                    const qualParts = typeName.substring(0, dotIdx).split('.');
+                    typeQualifier = qualParts[qualParts.length - 1] || null;
                     typeName = typeName.substring(dotIdx + 1);
                 }
 
@@ -1131,6 +1136,7 @@ function findCallsInCode(code, parser) {
                     line: node.startPosition.row + 1,
                     isMethod: false,
                     isConstructor: true,
+                    ...(typeQualifier && { receiver: typeQualifier }),
                     argCount: ctorArgs.argCount,
                     ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
                     enclosingFunction

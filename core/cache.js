@@ -15,7 +15,9 @@ const UCN_VERSION = require('../package.json').version;
 
 // Index/calls cache format version — bump when the persisted call-record or
 // symbol shape changes (saveCache writes it; loadCache rejects anything else).
-const CACHE_FORMAT_VERSION = 13;
+// v14: Go qualified composite literals (pkg.Foo{...}) record the package
+// qualifier as `receiver` (fix #206).
+const CACHE_FORMAT_VERSION = 14;
 
 /**
  * Save index to cache file
@@ -579,5 +581,5 @@ function _computeReachabilityFingerprint(index) {
 
 module.exports = {
     saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
-    _computeReachabilityFingerprint,
+    _computeReachabilityFingerprint, CACHE_FORMAT_VERSION,
 };

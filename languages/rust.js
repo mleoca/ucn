@@ -1268,17 +1268,27 @@ function findCallsInCode(code, parser) {
             const nameNode = node.childForFieldName('name');
             if (nameNode) {
                 let typeName = null;
+                let pathQualifier = null;
                 if (nameNode.type === 'type_identifier') {
                     typeName = nameNode.text;
                 } else if (nameNode.type === 'scoped_type_identifier') {
-                    // path::Foo or Enum::Variant — emit as the rightmost name.
+                    // path::Foo or Enum::Variant — emit as the rightmost name,
+                    // keeping the qualifier as receiver (fix #206): a
+                    // path-qualified type must not resolve to a same-file
+                    // binding of an unrelated same-name symbol.
                     const innerNameNode = nameNode.childForFieldName('name');
                     if (innerNameNode) {
                         typeName = innerNameNode.text;
+                        const pathNode = nameNode.childForFieldName('path');
+                        if (pathNode) {
+                            const segs = pathNode.text.split('::');
+                            pathQualifier = segs[segs.length - 1] || null;
+                        }
                     } else {
                         // Fallback: split by ::
                         const parts = nameNode.text.split('::');
                         typeName = parts[parts.length - 1];
+                        if (parts.length > 1) pathQualifier = parts[parts.length - 2] || null;
                     }
                 }
                 if (typeName) {
@@ -1288,6 +1298,7 @@ function findCallsInCode(code, parser) {
                         line: node.startPosition.row + 1,
                         isMethod: false,
                         isConstructor: true,
+                        ...(pathQualifier && { receiver: pathQualifier }),
                         enclosingFunction
                     });
                 }

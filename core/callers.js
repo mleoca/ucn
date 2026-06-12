@@ -376,6 +376,14 @@ function findCallers(index, name, options = {}) {
                 // For potential callbacks (function passed as arg), validate against symbol table
                 // and skip complex binding resolution — just check the name exists
                 if (call.isPotentialCallback) {
+                    // Go closure-entry marker: a composite-field func literal
+                    // records the ENCLOSING function's name at the closure line
+                    // (deadcode reachability for RunE-style closures) — it is a
+                    // self-line artifact, never a caller edge.
+                    if (!call.isFunctionReference && !call.isMethod && call.fieldName &&
+                        call.enclosingFunction && call.enclosingFunction.name === call.name) {
+                        continue;
+                    }
                     const syms = definitions;
                     if (!syms || syms.length === 0) continue;
                     const cbTargetDefs = options.targetDefinitions || definitions;
@@ -391,16 +399,69 @@ function findCallers(index, name, options = {}) {
                         }
                     }
 
-                    // Nominal type receiver disambiguation for callbacks (e.g. dc.worker)
+                    // Package-qualified reference (Go): `pkg.Name` passed as a
+                    // value denotes a symbol IN package pkg — never the current
+                    // package (Go cannot self-import), never an unrelated
+                    // same-name target. grpc-go-measured: `balancer.Get(priority.Name)`
+                    // references the CONST priority.Name, not a pinned method
+                    // `Name` — the target's own same-file/same-package evidence
+                    // says nothing about what a qualified name resolves to.
                     if (call.isMethod && call.receiver &&
+                        langTraits(fileEntry.language)?.hasReceiverPackageCalls) {
+                        const cbPkgRes = _receiverPackageResolution(index, fileEntry, call.receiver, cbTargetDefs);
+                        if (cbPkgRes) {
+                            if (cbPkgRes.singleSegment) {
+                                // Single-segment import — Go stdlib, always external
+                                recordExcluded(filePath, call.line, 'external-package');
+                                continue;
+                            }
+                            if (!cbPkgRes.targetInPkg) {
+                                recordExcluded(filePath, call.line, 'other-definition');
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Nominal type receiver disambiguation for callbacks (e.g. dc.worker)
+                    if (call.isMethod &&
                         langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                         const targetTypes = new Set();
                         for (const td of cbTargetDefs) {
                             if (td.className) targetTypes.add(td.className);
                             if (td.receiver) targetTypes.add(td.receiver.replace(/^\*/, ''));
                         }
-                        if (targetTypes.size > 0 && call.receiverType) {
+                        if (targetTypes.size > 0 && call.receiver && call.receiverType) {
                             if (!targetTypes.has(call.receiverType)) continue;
+                        }
+                        // Under the account contract, a qualified reference
+                        // whose receiver is neither an imported package
+                        // (resolved above), the target type itself
+                        // (type-qualified method reference), nor a validated
+                        // type is a name match through an UNKNOWN owner — that
+                        // includes receivers the parser could not capture at
+                        // all (indexed/chained selectors: `xs[0].Name`).
+                        // Mirrors the #204 method-call gate: a unique
+                        // project-wide owner still confirms; multiple owners
+                        // route to visible 'method-ambiguous' — never confirmed
+                        // via the target's bare-identifier scope evidence below.
+                        // A pinned TYPE target additionally routes regardless
+                        // of owner count: `m.ResourceType` is a member access
+                        // on a value — it cannot denote the type itself (only
+                        // a package-qualified name can, and that resolved
+                        // above; an alias-imported package receiver stays
+                        // visible here rather than excluded).
+                        if (collectAccount) {
+                            const cbTypes = dispatchTargetTypes(cbTargetDefs);
+                            const cbTypeQualified = call.receiver && cbTypes.has(call.receiver);
+                            const cbTypedMatch = call.receiverType && cbTypes.has(call.receiverType);
+                            const cbAllTypeTargets = cbTargetDefs.length > 0 &&
+                                cbTargetDefs.every(d => IDENTITY_TYPE_KINDS.has(d.type));
+                            if (!cbTypeQualified && !cbTypedMatch &&
+                                (methodOwnerKeys().size > 1 || cbAllTypeTargets)) {
+                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs,
+                                    { dispatchCandidates: methodOwnerKeys().size });
+                                continue;
+                            }
                         }
                     }
 
@@ -592,6 +653,12 @@ function findCallers(index, name, options = {}) {
                 // _buildTypedLocalTypeMap ∈ target types) — receiver evidence
                 // for the dispatch tiering below.
                 let nominalInferredMatch = false;
+                // Identity discipline (fix #206): the receiver's type NAME
+                // matches the target's type, but several distinct types share
+                // that name and none is resolvable from this file's scope —
+                // not confirmation evidence, not exclusion evidence. Routed
+                // method-ambiguous under the account contract.
+                let receiverTypeUnresolved = false;
                 if (call.isMethod) {
                     if (call.selfAttribute && fileEntry.language === 'python') {
                         // self.attr.method() — resolve via attribute type inference
@@ -880,17 +947,36 @@ function findCallers(index, name, options = {}) {
                 // like "fmt", "os") and third-party calls (import graph has no edge to target).
                 if (!call.isMethod && call.receiver && !bindingId &&
                     langTraits(fileEntry.language)?.hasReceiverPackageCalls) {
-                    const callerFileImports = fileEntry.imports || [];
-                    const importModule = callerFileImports.find(mod => {
-                        const parts = mod.split('/');
-                        const last = parts[parts.length - 1];
-                        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
-                        return pkgName === call.receiver;
-                    });
-                    if (importModule) {
-                        if (!importModule.includes('/')) {
+                    const pkgRes = _receiverPackageResolution(index, fileEntry, call.receiver, targetDefs);
+                    if (pkgRes) {
+                        if (pkgRes.singleSegment) {
                             // Single-segment import — Go stdlib, always external
                             recordExcluded(filePath, call.line, 'external-package');
+                            continue;
+                        }
+                        // A package-qualified name can never denote the
+                        // caller's own FILE's package (Go cannot self-import):
+                        // a pinned target defined only in this very file is
+                        // positively a different symbol — measured:
+                        // &certprovider.KeyMaterial{...} inside KeyMaterial()
+                        // claiming a self-edge through a local binding.
+                        if (targetDefs.length > 0 && targetDefs.every(d => d.file === filePath)) {
+                            recordExcluded(filePath, call.line, 'other-definition');
+                            continue;
+                        }
+                        // Receiver-package identity (fix #206b): an import edge
+                        // to the target's file proves the caller USES the
+                        // target's package, not that THIS qualified name
+                        // resolves there. The qualified name denotes a symbol
+                        // in the RECEIVER's module — the target must live in
+                        // that module's package (project-relative module-path
+                        // suffix, or conventional package-segment match).
+                        // grpc-go measured: `&v3corepb.Locality{...}` (aliased
+                        // EXTERNAL envoy proto) and `xdsresource.Locality{...}`
+                        // confirmed for clients.Locality because the caller
+                        // also imported clients/config.go.
+                        if (!pkgRes.targetInPkg) {
+                            recordExcluded(filePath, call.line, 'other-definition');
                             continue;
                         }
                         // Multi-segment import — verify via import graph
@@ -957,7 +1043,31 @@ function findCallers(index, name, options = {}) {
                             // Go embedding has no virtual dispatch. Field-hop types
                             // get the ancestor guard too (Java virtual dispatch).
                             const structural = langTraits(fileEntry.language)?.typeSystem === 'structural';
-                            if (targetTypes.has(knownType)) receiverTypeValidated = true;
+                            if (targetTypes.has(knownType)) {
+                                receiverTypeValidated = true;
+                                // Identity discipline (nominal, fix #206): a
+                                // NAME match is only identity when the
+                                // unqualified type name resolves (same file →
+                                // same package directory → import edge) to the
+                                // target's package. grpc-go defines ~20 structs
+                                // all named `bb` — leastrequest's `parser :=
+                                // bb{}` validating against cdsbalancer's
+                                // bb.ParseConfig is name conflation, not
+                                // receiver evidence. Only DIRECT target type
+                                // names are disciplined — subtype names entered
+                                // targetTypes via the inheritance walk, whose
+                                // edges already carry package context.
+                                if (!structural &&
+                                    targetDefs.some(d => (d.className || (d.receiver || '').replace(/^\*/, '')) === knownType)) {
+                                    const identity = _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs);
+                                    if (identity === 'other') {
+                                        receiverTypeValidated = false;
+                                    } else if (identity === 'unknown') {
+                                        receiverTypeValidated = false;
+                                        receiverTypeUnresolved = true;
+                                    }
+                                }
+                            }
                             const matchesTarget = receiverTypeValidated ||
                                 ((structural || viaFieldHop) && _isAncestorOfTargetClass(index, knownType, targetDefs));
                             // Structural trust gate: a name that is neither a
@@ -989,7 +1099,8 @@ function findCallers(index, name, options = {}) {
                                         d.type === 'class' || d.type === 'struct' || d.type === 'interface' || d.type === 'trait') &&
                                     _targetAncestryFullyResolved(index, targetDefs));
                             const exclusionTrusted = (!structural ||
-                                _receiverTypeTrustedForExclusion(index, knownType)) && fieldHopDefinesMethod;
+                                _receiverTypeTrustedForExclusion(index, knownType)) && fieldHopDefinesMethod &&
+                                !receiverTypeUnresolved; // unresolvable identity is not positive evidence either way
                             if (!matchesTarget && exclusionTrusted) {
                                 // Known type doesn't match target — positive evidence the
                                 // call targets a DIFFERENT symbol. Under the account contract
@@ -1040,8 +1151,22 @@ function findCallers(index, name, options = {}) {
                                         const inferredType = localTypes.get(call.receiver);
                                         if (inferredType) {
                                             if (targetTypes.has(inferredType)) {
-                                                inferredMatch = true;
-                                                nominalInferredMatch = true;
+                                                // Identity discipline (fix #206) — same as the
+                                                // parser-typed branch above: a name match on a
+                                                // DIRECT target type must resolve to the
+                                                // target's package, not a same-named foreign type.
+                                                let identity = 'target';
+                                                if (targetDefs.some(d => (d.className || (d.receiver || '').replace(/^\*/, '')) === inferredType)) {
+                                                    identity = _resolveReceiverTypeIdentity(index, filePath, inferredType, targetDefs);
+                                                }
+                                                if (identity === 'target') {
+                                                    inferredMatch = true;
+                                                    nominalInferredMatch = true;
+                                                } else if (identity === 'other') {
+                                                    inferredMismatch = true;
+                                                } else {
+                                                    receiverTypeUnresolved = true;
+                                                }
                                             } else {
                                                 inferredMismatch = true;
                                             }
@@ -1227,8 +1352,31 @@ function findCallers(index, name, options = {}) {
                     !receiverTypeValidated && !nominalInferredMatch &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     const tTypes = dispatchTargetTypes(targetDefs2);
-                    const typeQualifiedReceiver = call.receiver && tTypes.has(call.receiver);
+                    // A receiver that shares the target type's NAME is only
+                    // type-qualified when the call matches the language's
+                    // qualified-call syntax (typeQualifiedCallStyle trait):
+                    // Rust requires Type::method (a dot-call receiver matching
+                    // a type name is a variable); Go method expressions
+                    // T.M(recv, ...) pass the receiver as the first argument,
+                    // so a zero-arg call on a type-named receiver is a
+                    // variable, not the type (grpc-go's `bb` collision).
+                    let typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                    if (typeQualifiedReceiver) {
+                        const qualStyle = langTraits(fileEntry.language)?.typeQualifiedCallStyle;
+                        if (qualStyle === 'path') typeQualifiedReceiver = !!call.isPathCall;
+                        else if (qualStyle === 'method-expr') typeQualifiedReceiver = call.argCount == null || call.argCount >= 1;
+                    }
                     if (!typeQualifiedReceiver) {
+                        // Unresolvable type-name identity (fix #206): the
+                        // receiver is typed with a name several distinct types
+                        // share, and none resolves from this file's scope —
+                        // visible ambiguous, not confirmable receiver evidence.
+                        if (receiverTypeUnresolved) {
+                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                dispatchCandidates: methodOwnerKeys().size,
+                            });
+                            continue;
+                        }
                         const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
                         if (knownDispatchType && !tTypes.has(knownDispatchType)) {
                             routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
@@ -2314,6 +2462,95 @@ function _receiverTypeTrustedForExclusion(index, typeName) {
     if (BUILTIN_RECEIVER_TYPES.has(typeName)) return true;
     const defs = index.symbols.get(typeName);
     return !!defs && defs.some(d => d.type === 'class' || d.type === 'struct');
+}
+
+/**
+ * Resolve which same-name TYPE an unqualified receiver-type name denotes from
+ * a caller file's scope, and compare it against the pinned target's package
+ * (fix #206 — cross-package type-name conflation: grpc-go defines ~20 structs
+ * all named `bb`; a receiver typed `bb` in package leastrequest is not
+ * evidence for cdsbalancer's bb.ParseConfig).
+ *
+ * Nearest-scope resolution: same file → same directory (Go packages, Java
+ * packages, Rust sibling modules) → an import edge to the defining file.
+ *
+ * Returns:
+ *   'target'  — the name resolves to the target's package, or only one type
+ *               definition exists project-wide (name IS identity)
+ *   'other'   — positive evidence it denotes a DIFFERENT same-name type
+ *   'unknown' — several same-name types exist and none is resolvable from
+ *               this file's scope (not evidence either way)
+ */
+/**
+ * Resolve a Go package-qualified receiver to its import module and decide
+ * whether the pinned targets can live in that module's package (fix #206b).
+ * Alias-aware: importNames[i] pairs 1:1 with imports[i] for Go (one package
+ * name per import), so `v3corepb "github.com/.../core/v3"` resolves from the
+ * alias, not the path segment.
+ *
+ * targetInPkg accepts a target whose project-relative directory is a SUFFIX
+ * of the module path (robust when dir names diverge), or whose directory
+ * basename matches the module's package segment / the receiver (conventional
+ * fallback — also covers root-package projects, where relative dir is '').
+ *
+ * Returns null when the receiver names no import (likely a variable).
+ */
+function _receiverPackageResolution(index, fileEntry, receiver, targetDefs) {
+    const modules = fileEntry.imports || [];
+    const names = fileEntry.importNames || [];
+    let importModule = null;
+    if (names.length === modules.length) {
+        const i = names.indexOf(receiver);
+        if (i >= 0) importModule = modules[i];
+    }
+    if (!importModule) {
+        importModule = modules.find(mod => {
+            const parts = mod.split('/');
+            const last = parts[parts.length - 1];
+            const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+            return pkgName === receiver;
+        }) || null;
+    }
+    if (!importModule) return null;
+    if (!importModule.includes('/')) return { importModule, singleSegment: true, targetInPkg: false };
+    const parts = importModule.split('/');
+    const last = parts[parts.length - 1];
+    const pkgSeg = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+    const targetInPkg = targetDefs.some(d => {
+        if (!d.file) return false;
+        const dir = path.dirname(d.file);
+        const relDir = index.root ? path.relative(index.root, dir) : '';
+        // Root-package target: its directory is the clone dir — package
+        // identity is unverifiable from paths, and exclusion requires
+        // POSITIVE evidence. Never exclude (a root-module import like
+        // `cobra "github.com/spf13/cobra"` must keep confirming root defs
+        // regardless of what the checkout directory is named).
+        if (!relDir || relDir === '.') return true;
+        if (!relDir.startsWith('..') &&
+            (importModule === relDir || importModule.endsWith('/' + relDir))) return true;
+        const base = path.basename(dir);
+        return base === pkgSeg || base === receiver;
+    });
+    return { importModule, singleSegment: false, targetInPkg };
+}
+
+const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum']);
+function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs) {
+    const typeDefs = (index.symbols.get(knownType) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+    if (typeDefs.length <= 1) return 'target';
+    const targetDirs = new Set(targetDefs.map(d => d.file && path.dirname(d.file)).filter(Boolean));
+    const inTargetPkg = (d) => d.file && targetDirs.has(path.dirname(d.file));
+    const sameFile = typeDefs.filter(d => d.file === filePath);
+    if (sameFile.length > 0) return sameFile.some(inTargetPkg) ? 'target' : 'other';
+    const callerDir = path.dirname(filePath);
+    const sameDir = typeDefs.filter(d => d.file && path.dirname(d.file) === callerDir);
+    if (sameDir.length > 0) return sameDir.some(inTargetPkg) ? 'target' : 'other';
+    const imports = index.importGraph.get(filePath);
+    if (imports) {
+        const imported = typeDefs.filter(d => d.file && imports.has(d.file));
+        if (imported.length > 0) return imported.some(inTargetPkg) ? 'target' : 'other';
+    }
+    return 'unknown';
 }
 
 /**
