@@ -14,7 +14,7 @@
  *                         edge UCN neither showed nor accounted for = the
  *                         silent lie the contract forbids)
  *   zeroTrustworthiness — P(oracle finds 0 call refs | UCN shows 0 confirmed
- *                         + 0 unverified): "a UCN zero is as safe as a grep zero"
+ *                         + 0 unverified): "a clean UCN zero is a trustworthy zero"
  *   conservedRate       — account invariant holds on real-repo symbols
  *
  * Usage:
@@ -240,7 +240,7 @@ async function evaluateRepo(repo, oracle) {
         //   missingBeyondText    — line does NOT contain the symbol name (the
         //                          oracle resolved through an export-rename /
         //                          alias, e.g. `export { _gt as gt }`). Outside
-        //                          the text ground set: grep would ALSO miss it.
+        //                          the text ground set: a plain-text name scan would ALSO miss it.
         //                          Documented engine-improvement metric, not a
         //                          contract violation.
         //   missingUnexplained   — in the ground set, indexed, yet unaccounted:
@@ -525,7 +525,7 @@ async function main() {
         'UCN tiered caller answers scored against compiler/LSP ground truth.',
         '`missing-unexplained` is the release gate: an oracle call edge UCN',
         'neither showed (confirmed/unverified) nor accounted for — the silent',
-        'lie the grep-reliability contract forbids. Target: 0.',
+        'lie the tiered caller contract forbids. Target: 0.',
         '',
         '| repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |',
         '|---|---|---|---|---|---|---|---|---|---|',

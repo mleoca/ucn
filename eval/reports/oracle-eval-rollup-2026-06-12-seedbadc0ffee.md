@@ -3,7 +3,7 @@
 UCN tiered caller answers scored against compiler/LSP ground truth.
 `missing-unexplained` is the release gate: an oracle call edge UCN
 neither showed (confirmed/unverified) nor accounted for — the silent
-lie the grep-reliability contract forbids. Target: 0.
+lie the tiered caller contract forbids. Target: 0.
 
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|

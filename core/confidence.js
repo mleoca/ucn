@@ -31,7 +31,7 @@ const SCORES = {
     [RESOLUTION.UNCERTAIN]:        0.25,
 };
 
-// Trust tiers for the grep-reliability contract. CONFIRMED = the resolution
+// Trust tiers for the tiered caller contract. CONFIRMED = the resolution
 // rests on binding/receiver/import evidence; UNVERIFIED = name match without
 // evidence. The mapping is resolution-based, never language-based — evidence
 // flags already come from langTraits dispatch in callers.js, so every

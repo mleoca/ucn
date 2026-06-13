@@ -199,8 +199,8 @@ function tagCalleesSideEffects(index, callees) {
 
 
 /**
- * Compose the conservation account for a caller query (grep-reliability
- * contract). Claims come from the PRE-display-filter findCallers result —
+ * Compose the conservation account for a caller query (the tiered
+ * caller contract). Claims come from the PRE-display-filter findCallers result —
  * the account reconciles pre-display truth; display filters are reported
  * separately in account.filtered.
  *
@@ -366,7 +366,7 @@ function context(index, name, options = {}) {
     const rawCallers = callers;
     const filteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
 
-    // Tier partition (grep-reliability contract): `callers` = confirmed tier
+    // Tier partition (tiered caller contract): `callers` = confirmed tier
     // only; unverified-tier entries (name match without binding/receiver
     // evidence) render in their own section — visible, never silently hidden.
     let unverifiedCallers = [

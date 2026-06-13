@@ -9,7 +9,7 @@
  *
  * The headline baseline metric is `callNotResolvedSymbols`: symbols where the
  * ground set contains AST call lines the engine did not claim — i.e. callers
- * an agent would never see. Phase 2/3 of the grep-reliability program drive
+ * an agent would never see. Phase 2/3 of the tiered caller program drive
  * this to zero-or-visible.
  *
  * Usage:
@@ -222,7 +222,7 @@ function evaluateRepo(repo) {
         // Baseline trust-failure metrics:
         callNotResolvedSymbols: gapSymbols,        // symbols with >= 1 silently-unclaimed call line
         callNotResolvedLines: totalGapLines,       // total silently-unclaimed call lines
-        beyondTextClaims: beyondTextTotal,         // alias finds grep would miss
+        beyondTextClaims: beyondTextTotal,         // alias-resolved finds beyond plain-text name matches
         // Tree contract (trace/blast): conservation of tree-level claims
         treeChecked,
         treeViolations,
@@ -271,7 +271,7 @@ function main() {
         'Symbols sampled per repo, stratified by usage count. `gap symbols` are',
         'symbols where the ground set contains AST call lines the engine did not',
         'claim — callers an agent would never see (the silent false negatives the',
-        'grep-reliability contract eliminates).',
+        'tiered caller contract eliminates).',
         '',
         '| repo | lang | files | sampled | conserved | gap symbols | gap lines | beyond-text | tree violations | avg ms/account |',
         '|---|---|---|---|---|---|---|---|---|---|',

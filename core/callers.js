@@ -149,7 +149,7 @@ function findCallers(index, name, options = {}) {
     const callers = [];
     const stats = options.stats;
 
-    // Conservation accounting (grep-reliability contract): when collectAccount
+    // Conservation accounting (tiered caller contract): when collectAccount
     // is set (context/about/impact only — trace/blast/verify paths must stay
     // byte-identical), candidates that the legacy flags would silently drop are
     // RETAINED as unverified-tier entries (rendered in their own output
@@ -329,7 +329,7 @@ function findCallers(index, name, options = {}) {
     const pendingByFile = new Map(); // filePath -> [{ call, fileEntry, callerSymbol, isMethod, isFunctionReference, receiver }]
     let pendingCount = 0;
     // Route a would-be-dropped candidate into the pending pipeline as an
-    // unverified-tier entry (grep-reliability contract: shown in its own
+    // unverified-tier entry (tiered caller contract: shown in its own
     // section, never silently hidden). Does NOT count toward pendingCount —
     // totals describe the confirmed answer.
     const routeUnverified = (filePath, fileEntry, call, reason, calledAs, meta) => {

@@ -6,5 +6,6 @@ CLAUDE.md
 .npmrc
 demo/
 docs/
+eval/
 test/
 server.json

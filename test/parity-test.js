@@ -1321,7 +1321,7 @@ describe('Output Ordering Contract', () => {
     });
 });
 
-describe('Tiered Output Contract (grep-reliability)', () => {
+describe('Tiered Output Contract', () => {
     const { tmp, rm, idx } = require('./helpers');
     const { execute } = require('../core/execute');
     const output = require('../core/output');

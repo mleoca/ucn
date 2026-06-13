@@ -1110,7 +1110,7 @@ describe('New Formatter Coverage', () => {
                 }
             };
             const { text } = output.formatContext(ctx);
-            assert.ok(text.includes('ACCOUNT: "fn" occurs on 7 lines in 3 files: 2 confirmed, 1 unverified, 3 non-call (1 import, 1 definition, 0 reference, 1 other-text), 0 other-target, 0 unaccounted (+1 beyond-text caller grep would miss)'),
+            assert.ok(text.includes('ACCOUNT: "fn" occurs on 7 lines in 3 files: 2 confirmed, 1 unverified, 3 non-call (1 import, 1 definition, 0 reference, 1 other-text), 0 other-target, 0 unaccounted (+1 beyond-text caller)'),
                 `ACCOUNT line exact format: ${text}`);
             assert.ok(text.includes('WARNING: 1 unparsed file contains "fn" (1 line, NOT analyzed): legacy/old-parser.js'),
                 'Unparsed warning rendered');

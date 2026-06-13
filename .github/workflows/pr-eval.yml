@@ -4,7 +4,7 @@ name: PR Eval Gate
 # ground-truth repos (preact-signals via ts-morph, httpx via pyright —
 # no Go/Rust/Java toolchains needed, ~2 min total). Fails on:
 #  - missing-unexplained > 0 (an oracle call edge UCN neither showed nor
-#    accounted for — the silent lie the grep-reliability contract forbids)
+#    accounted for — the silent lie the tiered caller contract forbids)
 #  - tier-1 precision below the floor (locks the measured numbers in:
 #    preact 88.0 / httpx ~90 as of 2026-06-12 — the floor catches
 #    collapses, not single-point drift)

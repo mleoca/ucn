@@ -114,7 +114,7 @@ function formatAccountLines(account) {
         `${account.excluded ? account.excluded.total : 0} other-target, ` +
         `${account.unaccounted} unaccounted`;
     if (account.beyondText && account.beyondText.count > 0) {
-        line += ` (+${account.beyondText.count} beyond-text caller${account.beyondText.count === 1 ? '' : 's'} grep would miss)`;
+        line += ` (+${account.beyondText.count} beyond-text caller${account.beyondText.count === 1 ? '' : 's'})`;
     }
     lines.push(line);
     if (account.unparsed && account.unparsed.fileCount > 0) {
