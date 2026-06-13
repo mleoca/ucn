@@ -1434,3 +1434,188 @@ describe('endpoints command behavioral', () => {
         assert.match(out, /Matched: \d+/);
     });
 });
+
+// ==================================================================
+// TIERED TREE CONTRACT (v4): trace/blast/reverseTrace/affectedTests
+// ==================================================================
+
+describe('tree contract: blast/reverseTrace frontier + accounts', () => {
+    // Go interface dispatch: r.Run() on an interface-typed receiver is a
+    // possible-dispatch caller candidate of every implementation — visible
+    // in the frontier, never silently dropped, never confirmed.
+    const DISPATCH_FIXTURE = {
+        'go.mod': 'module example.com/m\n',
+        'iface.go': 'package m\n\ntype Runner interface { Run() }\n',
+        'a.go': 'package m\n\ntype A struct{}\n\nfunc (a A) Run() { helperA() }\n\nfunc helperA() {}\n',
+        'b.go': 'package m\n\ntype B struct{}\n\nfunc (b B) Run() {}\n',
+        'use.go': 'package m\n\nfunc Dispatch(r Runner) { r.Run() }\n\nfunc TopLevel() { Dispatch(A{}) }\n',
+    };
+
+    it('blast: unverified edges land in the frontier with parent attribution, not the trunk', () => {
+        const d = tmp(DISPATCH_FIXTURE);
+        try {
+            const ix = idx(d);
+            const b = ix.blast('Run', { depth: 3, file: 'a.go' });
+            assert.strictEqual(b.summary.totalAffected, 0, 'dispatch caller must not be confirmed-affected');
+            assert.strictEqual(b.summary.unverifiedEdges, 1);
+            assert.strictEqual(b.unverifiedFrontier.length, 1);
+            const f = b.unverifiedFrontier[0];
+            assert.strictEqual(f.atNode.name, 'Run');
+            assert.strictEqual(f.hop, 1);
+            assert.strictEqual(f.reason, 'possible-dispatch');
+            assert.strictEqual(f.callerName, 'Dispatch');
+            assert.ok(b.tree.children.length === 0, 'trunk holds confirmed edges only');
+            // Tree account arithmetic
+            assert.strictEqual(b.treeAccount.unverifiedEdges, 1);
+            assert.strictEqual(b.treeAccount.confirmedEdges, 0);
+            // Root text-ground account conserves
+            assert.ok(b.account, 'root account present');
+            assert.ok(b.account.conserved, 'root account conserved');
+        } finally { rm(d); }
+    });
+
+    it('blast --expand-unverified: follows the edge, marks downstream chain-unverified', () => {
+        const d = tmp(DISPATCH_FIXTURE);
+        try {
+            const ix = idx(d);
+            const b = ix.blast('Run', { depth: 3, file: 'a.go', expandUnverified: true });
+            assert.strictEqual(b.tree.children.length, 1);
+            const dispatch = b.tree.children[0];
+            assert.strictEqual(dispatch.name, 'Dispatch');
+            assert.strictEqual(dispatch.viaUnverified, 'possible-dispatch');
+            assert.ok(dispatch.chainUnverified, 'unverified-edge child is chain-marked');
+            const top = dispatch.children[0];
+            assert.strictEqual(top.name, 'TopLevel');
+            assert.ok(top.chainUnverified, 'downstream node inherits the chain mark');
+            assert.strictEqual(b.summary.possiblyAffected, 2);
+            assert.strictEqual(b.summary.totalAffected, 0, 'possible impact never counts as confirmed');
+            assert.ok(b.unverifiedFrontier[0].expanded, 'frontier entry marked expanded');
+            // Text formatter renders the marks
+            const text = output.formatBlast(b);
+            assert.ok(text.includes('[⚠ via possible-dispatch]'), 'tree shows via mark: ' + text);
+            assert.ok(text.includes('possibly affected'), 'summary shows possible count');
+        } finally { rm(d); }
+    });
+
+    it('reverseTrace: unverified-only node is NOT an entry point', () => {
+        const d = tmp(DISPATCH_FIXTURE);
+        try {
+            const ix = idx(d);
+            const rt = ix.reverseTrace('Run', { depth: 3, file: 'a.go' });
+            assert.strictEqual(rt.entryPoints.length, 0, 'no entry-point claim through dropped candidates');
+            assert.ok(!rt.tree.entryPoint, 'root not marked entry point');
+            assert.strictEqual(rt.tree.unverifiedCallerCount, 1, 'root shows its unverified candidates');
+            const text = output.formatReverseTrace(rt);
+            assert.ok(text.includes('no confirmed callers — 1 unverified'), text);
+            assert.ok(!text.includes('★ entry point'), 'no entry-point marker');
+        } finally { rm(d); }
+    });
+
+    it('reverseTrace: zero-candidate node still marks entry points', () => {
+        const d = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function target() {}\nmodule.exports = { target };',
+            'app.js': 'const { target } = require("./lib");\nfunction main() { target(); }\nmodule.exports = { main };',
+        });
+        try {
+            const ix = idx(d);
+            const rt = ix.reverseTrace('target', { depth: 3 });
+            assert.ok(rt.entryPoints.some(e => e.name === 'main'), 'main is a true entry point');
+        } finally { rm(d); }
+    });
+
+    it('affectedTests: possible band from unverified chains, uncovered stays confirmed-band', () => {
+        const d = tmp({
+            ...DISPATCH_FIXTURE,
+            'use_test.go': 'package m\n\nimport "testing"\n\nfunc TestTopLevel(t *testing.T) { TopLevel() }\n',
+        });
+        try {
+            const ix = idx(d);
+            const at = ix.affectedTests('Run', { depth: 3, file: 'a.go' });
+            assert.deepStrictEqual([...at.possiblyAffected].sort(), ['Dispatch', 'TopLevel']);
+            assert.strictEqual(at.summary.possiblyAffected, 2);
+            assert.ok(at.possiblyAffectedTests.some(tf => tf.file === 'use_test.go'),
+                'test reaching the change only via the unverified chain lands in the possible band: ' +
+                JSON.stringify(at.possiblyAffectedTests));
+            assert.ok(!at.testFiles.some(tf => tf.file === 'use_test.go'),
+                'possible-band test file must not claim confirmed coverage');
+            assert.ok(at.uncovered.includes('Run'), 'confirmed-band uncovered keeps the root');
+            const text = output.formatAffectedTests(at);
+            assert.ok(text.includes('POSSIBLY AFFECTED (2)'), text);
+        } finally { rm(d); }
+    });
+
+    it('includeUncertain is an implied no-op for the tree commands', () => {
+        const d = tmp(DISPATCH_FIXTURE);
+        try {
+            const ix = idx(d);
+            const plain = JSON.stringify(ix.blast('Run', { depth: 3, file: 'a.go' }));
+            const flagged = JSON.stringify(ix.blast('Run', { depth: 3, file: 'a.go', includeUncertain: true }));
+            assert.strictEqual(plain, flagged, 'includeUncertain must not change contract output');
+        } finally { rm(d); }
+    });
+
+    it('blast output is deterministic (ordering contract)', () => {
+        const d = tmp(DISPATCH_FIXTURE);
+        try {
+            const ix = idx(d);
+            const a = JSON.stringify(ix.blast('Run', { depth: 3, file: 'a.go', expandUnverified: true }));
+            const b = JSON.stringify(ix.blast('Run', { depth: 3, file: 'a.go', expandUnverified: true }));
+            assert.strictEqual(a, b);
+        } finally { rm(d); }
+    });
+});
+
+describe('tree contract: trace down callee account', () => {
+    it('uncertain method calls become visible unverified callee entries', () => {
+        const d = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': `
+function helperOne() { return 1; }
+class Store { get(k) { return k; } }
+class Cache { get(k) { return k; } }
+function work(m) {
+    helperOne();
+    return m.get('x');
+}
+module.exports = { work, Store, Cache, helperOne };
+`,
+        });
+        try {
+            const ix = idx(d);
+            const t = ix.trace('work', { depth: 1 });
+            assert.ok(t.tree.calleeAccount, 'node carries its callee account');
+            const acct = t.tree.calleeAccount;
+            assert.ok(acct.conserved, 'callee account conserved: ' + JSON.stringify(acct));
+            assert.ok(acct.unverified >= 1, 'm.get(...) is an unverified site');
+            assert.ok(t.tree.unverifiedCallees.some(u => u.name === 'get'),
+                'unverified callee listed: ' + JSON.stringify(t.tree.unverifiedCallees));
+            assert.ok(t.tree.children.some(c => c.name === 'helperOne'), 'confirmed callee in trunk');
+            // Rollup arithmetic
+            const cs = t.treeAccount.callSites;
+            assert.strictEqual(cs.total, cs.confirmed + cs.unverified + cs.external + cs.excluded + cs.filtered);
+            // Text shows the unverified leaf
+            const text = output.formatTrace(t);
+            assert.ok(text.includes('[unverified] get'), text);
+            assert.ok(text.includes('CALLEE ACCOUNT:'), text);
+        } finally { rm(d); }
+    });
+
+    it('trace up: unverified callers render in the frontier, confirmed in CALLED BY', () => {
+        const d = tmp({
+            'go.mod': 'module example.com/m\n',
+            'iface.go': 'package m\n\ntype Runner interface { Run() }\n',
+            'a.go': 'package m\n\ntype A struct{}\n\nfunc (a A) Run() {}\n',
+            'b.go': 'package m\n\ntype B struct{}\n\nfunc (b B) Run() {}\n',
+            'use.go': 'package m\n\nfunc Dispatch(r Runner) { r.Run() }\n\nfunc Direct() { (A{}).Run() }\n',
+        });
+        try {
+            const ix = idx(d);
+            const t = ix.trace('Run', { direction: 'up', depth: 1, file: 'a.go' });
+            assert.ok(t.unverifiedFrontier && t.unverifiedFrontier.length >= 1,
+                'dispatch caller in frontier: ' + JSON.stringify(t.unverifiedFrontier));
+            assert.ok(t.account, 'root account present');
+            assert.ok(t.account.conserved, 'root account conserved');
+        } finally { rm(d); }
+    });
+});

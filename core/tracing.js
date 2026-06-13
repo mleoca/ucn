@@ -3,6 +3,18 @@
  *
  * Extracted from project.js. All functions take an `index` (ProjectIndex)
  * as the first argument instead of using `this`.
+ *
+ * Tiered tree contract (v4): every command here runs findCallers/findCallees
+ * in collectAccount mode. Confirmed-tier edges form the tree trunk; unverified
+ * candidates are VISIBLE — caller-direction edges collect into a global
+ * `unverifiedFrontier` (with parent-node attribution and a reason), callee
+ * unknowns attach to their node as `unverifiedCallees`. Unverified edges are
+ * not expanded by default (expanding a possible-dispatch edge would assert
+ * transitive reach the evidence doesn't support); `expandUnverified` follows
+ * them, marking every downstream node `chainUnverified`. The root hop carries
+ * the same text-ground account as context/impact (composeAccount); interior
+ * hops conserve over the engine-candidate set, rolled up in `treeAccount`.
+ * `includeUncertain` is an implied no-op (the caller-contract precedent).
  */
 
 'use strict';
@@ -14,11 +26,117 @@ const { getCachedCalls } = require('./callers');
 const { detectLanguage, getLanguageModule } = require('../languages');
 
 /**
+ * Contract-mode caller expansion for the tree commands. Memoizes the full
+ * findCallers(collectAccount) result per node and returns the tier partition.
+ * Unverified entries are fully enriched (content + enclosing caller): the
+ * frontier display and the affected-tests possible closure need them all.
+ */
+function _contractCallers(index, funcDef, { includeMethods, callerCache, pin }) {
+    const nodeKey = `${funcDef.file}:${funcDef.startLine}`;
+    const cacheKey = funcDef.bindingId
+        ? `${funcDef.name}:${funcDef.bindingId}`
+        : `${funcDef.name}:${nodeKey}`;
+    let res = callerCache.get(cacheKey);
+    if (!res) {
+        const raw = index.findCallers(funcDef.name, {
+            includeMethods,
+            collectAccount: true,
+            unverifiedEnrichLimit: Infinity,
+            targetDefinitions: (funcDef.bindingId || pin) ? [funcDef] : undefined,
+        });
+        res = {
+            confirmed: raw.filter(c => c.tier !== 'unverified'),
+            unverified: [
+                ...raw.filter(c => c.tier === 'unverified'),
+                ...(raw.unverifiedEntries || []),
+            ],
+            raw,
+        };
+        callerCache.set(cacheKey, res);
+    }
+    return res;
+}
+
+/** Stable frontier ordering: hop, then parent node, then call site. */
+function _sortFrontier(frontier) {
+    frontier.sort((a, b) =>
+        (a.hop - b.hop) ||
+        (a.atNode.file || '').localeCompare(b.atNode.file || '') ||
+        ((a.atNode.line || 0) - (b.atNode.line || 0)) ||
+        (a.relativePath || '').localeCompare(b.relativePath || '') ||
+        ((a.line || 0) - (b.line || 0)));
+    return frontier;
+}
+
+/** Aggregate one node's excluded-with-reason candidates into the tree account. */
+function _aggregateExcluded(treeAccount, raw) {
+    const entries = (raw.accountRaw && raw.accountRaw.excludedEntries) || [];
+    for (const e of entries) {
+        const r = e.reason || 'excluded';
+        treeAccount.excludedTotal++;
+        treeAccount.excludedByReason[r] = (treeAccount.excludedByReason[r] || 0) + 1;
+    }
+}
+
+/**
+ * Dedupe caller call-sites into enclosing-function entries and resolve each
+ * to its symbol-table definition (pseudo-definition when absent). Shared by
+ * the confirmed trunk and the expand-unverified path.
+ */
+function _resolveCallerEntries(index, callers, exclude) {
+    const uniqueCallers = new Map();
+    for (const c of callers) {
+        if (!c.callerName) continue; // skip module-level code
+        if (exclude.length > 0 && !index.matchesFilters(c.relativePath, { exclude })) continue;
+        const callerKey = c.callerStartLine
+            ? `${c.callerFile}:${c.callerStartLine}`
+            : `${c.callerFile}:${c.callerName}`;
+        if (!uniqueCallers.has(callerKey)) {
+            uniqueCallers.set(callerKey, {
+                name: c.callerName,
+                file: c.callerFile,
+                relativePath: c.relativePath,
+                startLine: c.callerStartLine,
+                endLine: c.callerEndLine,
+                callSites: 1,
+                reason: c.reason,
+            });
+        } else {
+            uniqueCallers.get(callerKey).callSites++;
+        }
+    }
+
+    const callerEntries = [];
+    for (const [, caller] of uniqueCallers) {
+        const defs = index.symbols.get(caller.name);
+        let callerDef = defs?.find(d => d.file === caller.file && d.startLine === caller.startLine);
+        if (!callerDef) {
+            // Pseudo-definition for callers not in symbol table
+            callerDef = {
+                name: caller.name,
+                file: caller.file,
+                relativePath: caller.relativePath,
+                startLine: caller.startLine,
+                endLine: caller.endLine,
+                type: 'function'
+            };
+        }
+        callerEntries.push({ def: callerDef, callSites: caller.callSites, reason: caller.reason });
+    }
+
+    // Stable sort by file + line
+    callerEntries.sort((a, b) =>
+        a.def.file.localeCompare(b.def.file) || a.def.startLine - b.def.startLine
+    );
+    return callerEntries;
+}
+
+/**
  * Trace execution flow — build a tree of callees (down), callers (up), or both.
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
- * @param {object} options - { depth, direction, file, className, all, includeMethods, includeUncertain }
+ * @param {object} options - { depth, direction, file, className, all, includeMethods, expandUnverified }
  * @returns {object|null} Trace tree with callers/callees
  */
 function trace(index, name, options = {}) {
@@ -37,11 +155,18 @@ function trace(index, name, options = {}) {
         return null;
     }
     const visited = new Set();
-    // Memoize findCallees/findCallers results within this trace operation.
+    // Memoize findCallees results within this trace operation.
     // At depth 5, the same function appears at multiple tree positions — without
     // caching, findCallees is called redundantly (O(10^depth) → O(unique functions)).
     const calleeCache = new Map();
-    const callerCache = new Map();
+
+    // Down-direction conservation rollup: every call site at every expanded
+    // node lands in exactly one bucket (per-node calleeAccount, summed here).
+    const downAccount = (direction === 'down' || direction === 'both') ? {
+        nodesExpanded: 0,
+        callSites: { total: 0, confirmed: 0, unverified: 0, external: 0, excluded: 0, filtered: 0 },
+        unverifiedByReason: {},
+    } : null;
 
     const buildTree = (funcDef, currentDepth, dir) => {
         const funcName = funcDef.name;
@@ -73,8 +198,29 @@ function trace(index, name, options = {}) {
         if (dir === 'down' || dir === 'both') {
             let callees = calleeCache.get(key);
             if (!callees) {
-                callees = index.findCallees(funcDef, { includeMethods, includeUncertain: options.includeUncertain });
+                callees = index.findCallees(funcDef, { includeMethods, collectAccount: true });
                 calleeCache.set(key, callees);
+            }
+            // Callee contract: per-node account + visible unverified entries.
+            const acct = callees.calleeAccount;
+            if (acct && downAccount) {
+                node.calleeAccount = acct;
+                downAccount.nodesExpanded++;
+                downAccount.callSites.total += acct.totalSites;
+                downAccount.callSites.confirmed += acct.confirmed;
+                downAccount.callSites.unverified += acct.unverified;
+                downAccount.callSites.external += acct.external.count;
+                downAccount.callSites.excluded += acct.excluded.total;
+                downAccount.callSites.filtered += acct.filtered.count;
+            }
+            if (callees.unverifiedCallees && callees.unverifiedCallees.length > 0) {
+                node.unverifiedCallees = callees.unverifiedCallees;
+                if (downAccount) {
+                    for (const u of node.unverifiedCallees) {
+                        downAccount.unverifiedByReason[u.reason] =
+                            (downAccount.unverifiedByReason[u.reason] || 0) + u.callCount;
+                    }
+                }
             }
             for (const callee of callees.slice(0, maxChildren)) {
                 // callee already has the best-matched definition from findCallees
@@ -97,19 +243,42 @@ function trace(index, name, options = {}) {
 
     const tree = buildTree(def, 0, direction);
 
-    // Also get callers if direction is 'up' or 'both'
+    // Also get callers if direction is 'up' or 'both' — one contract hop:
+    // confirmed callers render in CALLED BY, unverified candidates in the
+    // frontier, reconciled by the root text-ground account.
     let callers = [];
     let truncatedCallers = 0;
+    let unverifiedFrontier;
+    let account;
     if (direction === 'up' || direction === 'both') {
-        const allCallers = index.findCallers(name, { includeMethods, includeUncertain: options.includeUncertain, targetDefinitions: [def] });
-        callers = allCallers.slice(0, maxChildren).map(c => ({
+        const rawCallers = index.findCallers(name, {
+            includeMethods,
+            collectAccount: true,
+            unverifiedEnrichLimit: Infinity,
+            targetDefinitions: [def],
+        });
+        const confirmed = rawCallers.filter(c => c.tier !== 'unverified');
+        let unverified = [
+            ...rawCallers.filter(c => c.tier === 'unverified'),
+            ...(rawCallers.unverifiedEntries || []),
+        ];
+        const { composeAccount, callNotResolvedEntries } = require('./analysis');
+        account = composeAccount(index, name, rawCallers);
+        unverified = [...unverified, ...callNotResolvedEntries(index, account, options)];
+        const rootRef = { name: def.name, file: def.relativePath, line: def.startLine };
+        unverifiedFrontier = _sortFrontier(unverified.map(u => ({
+            atNode: rootRef,
+            hop: 1,
+            ...u,
+        })));
+        callers = confirmed.slice(0, maxChildren).map(c => ({
             name: c.callerName || '(anonymous)',
             file: c.relativePath,
             line: c.line,
-            expression: c.content.trim()
+            expression: (c.content || '').trim()
         }));
-        if (allCallers.length > maxChildren) {
-            truncatedCallers = allCallers.length - maxChildren;
+        if (confirmed.length > maxChildren) {
+            truncatedCallers = confirmed.length - maxChildren;
         }
     }
 
@@ -136,6 +305,9 @@ function trace(index, name, options = {}) {
         tree,
         callers: direction !== 'down' ? callers : undefined,
         truncatedCallers: truncatedCallers > 0 ? truncatedCallers : undefined,
+        ...(unverifiedFrontier && unverifiedFrontier.length > 0 && { unverifiedFrontier }),
+        ...(downAccount && { treeAccount: downAccount }),
+        ...(account && { account }),
         warnings: warnings.length > 0 ? warnings : undefined
     };
     } finally { index._endOp(); }
@@ -147,7 +319,7 @@ function trace(index, name, options = {}) {
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
- * @param {object} options - { depth, file, className, all, exclude, includeMethods, includeUncertain }
+ * @param {object} options - { depth, file, className, all, exclude, includeMethods, expandUnverified }
  * @returns {object|null} Blast radius tree with summary
  */
 function blast(index, name, options = {}) {
@@ -156,8 +328,8 @@ function blast(index, name, options = {}) {
         const maxDepth = Math.max(0, options.depth ?? 3);
         const maxChildren = options.all ? Infinity : 10;
         const includeMethods = options.includeMethods ?? true;
-        const includeUncertain = options.includeUncertain || false;
         const exclude = options.exclude || [];
+        const expandUnverified = !!options.expandUnverified;
 
         const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
@@ -165,10 +337,24 @@ function blast(index, name, options = {}) {
         const visited = new Set();
         const callerCache = new Map();
         const affectedFunctions = new Set();
+        const possiblyAffectedSet = new Set();
         const affectedFiles = new Set();
+        const frontier = [];
         let maxDepthReached = 0;
+        let rootRaw = null;
+        let rootFiltered = 0;
+        const treeAccount = {
+            nodesExpanded: 0,
+            confirmedEdges: 0,
+            unverifiedEdges: 0,
+            unverifiedByReason: {},
+            excludedTotal: 0,
+            excludedByReason: {},
+            filteredEdges: 0,
+            depthLimitNodes: 0,
+        };
 
-        const buildCallerTree = (funcDef, currentDepth) => {
+        const buildCallerTree = (funcDef, currentDepth, chainUnverified) => {
             const key = `${funcDef.file}:${funcDef.startLine}`;
             if (currentDepth > maxDepth) return null;
             if (visited.has(key)) {
@@ -185,8 +371,12 @@ function blast(index, name, options = {}) {
 
             if (currentDepth > maxDepthReached) maxDepthReached = currentDepth;
             if (currentDepth > 0) {
-                affectedFunctions.add(key);
-                affectedFiles.add(funcDef.file);
+                if (chainUnverified) {
+                    possiblyAffectedSet.add(key);
+                } else {
+                    affectedFunctions.add(key);
+                    affectedFiles.add(funcDef.file);
+                }
             }
 
             const node = {
@@ -194,75 +384,51 @@ function blast(index, name, options = {}) {
                 file: funcDef.relativePath,
                 line: funcDef.startLine,
                 type: funcDef.type || 'function',
+                ...(chainUnverified && { chainUnverified: true }),
                 children: []
             };
 
             if (currentDepth < maxDepth) {
-                const callerCacheKey = funcDef.bindingId
-                    ? `${funcDef.name}:${funcDef.bindingId}`
-                    : `${funcDef.name}:${key}`;
-                let callers = callerCache.get(callerCacheKey);
-                if (!callers) {
-                    callers = index.findCallers(funcDef.name, {
-                        includeMethods,
-                        includeUncertain,
-                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                const { confirmed, unverified, raw } = _contractCallers(index, funcDef, { includeMethods, callerCache });
+                treeAccount.nodesExpanded++;
+                _aggregateExcluded(treeAccount, raw);
+                if (currentDepth === 0) rootRaw = raw;
+
+                // Confirmed-tier call sites form the trunk
+                let callers = confirmed;
+                if (exclude.length > 0) {
+                    const before = callers.length;
+                    callers = callers.filter(c => index.matchesFilters(c.relativePath, { exclude }));
+                    treeAccount.filteredEdges += before - callers.length;
+                    if (currentDepth === 0) rootFiltered += before - callers.length;
+                }
+                treeAccount.confirmedEdges += callers.length;
+
+                // Unverified-tier candidates: visible frontier entries,
+                // expanded only under expandUnverified.
+                let nodeUnverified = unverified;
+                if (exclude.length > 0) {
+                    const before = nodeUnverified.length;
+                    nodeUnverified = nodeUnverified.filter(c => index.matchesFilters(c.relativePath, { exclude }));
+                    treeAccount.filteredEdges += before - nodeUnverified.length;
+                    if (currentDepth === 0) rootFiltered += before - nodeUnverified.length;
+                }
+                for (const u of nodeUnverified) {
+                    treeAccount.unverifiedEdges++;
+                    const r = u.reason || 'unverified';
+                    treeAccount.unverifiedByReason[r] = (treeAccount.unverifiedByReason[r] || 0) + 1;
+                    frontier.push({
+                        atNode: { name: node.name, file: node.file, line: node.line },
+                        hop: currentDepth + 1,
+                        ...u,
+                        ...(expandUnverified && u.callerName ? { expanded: true } : {}),
                     });
-                    callerCache.set(callerCacheKey, callers);
                 }
 
-                // Deduplicate callers by enclosing function (multiple call sites → one tree node)
-                const uniqueCallers = new Map();
-                for (const c of callers) {
-                    if (!c.callerName) continue; // skip module-level code
-                    // Apply exclude filter
-                    if (exclude.length > 0 && !index.matchesFilters(c.relativePath, { exclude })) continue;
-                    const callerKey = c.callerStartLine
-                        ? `${c.callerFile}:${c.callerStartLine}`
-                        : `${c.callerFile}:${c.callerName}`;
-                    if (!uniqueCallers.has(callerKey)) {
-                        uniqueCallers.set(callerKey, {
-                            name: c.callerName,
-                            file: c.callerFile,
-                            relativePath: c.relativePath,
-                            startLine: c.callerStartLine,
-                            endLine: c.callerEndLine,
-                            callSites: 1
-                        });
-                    } else {
-                        uniqueCallers.get(callerKey).callSites++;
-                    }
-                }
-
-                // Resolve definitions and build child nodes
-                const callerEntries = [];
-                for (const [, caller] of uniqueCallers) {
-                    // Look up actual definition from symbol table
-                    const defs = index.symbols.get(caller.name);
-                    let callerDef = defs?.find(d => d.file === caller.file && d.startLine === caller.startLine);
-
-                    if (!callerDef) {
-                        // Pseudo-definition for callers not in symbol table
-                        callerDef = {
-                            name: caller.name,
-                            file: caller.file,
-                            relativePath: caller.relativePath,
-                            startLine: caller.startLine,
-                            endLine: caller.endLine,
-                            type: 'function'
-                        };
-                    }
-
-                    callerEntries.push({ def: callerDef, callSites: caller.callSites });
-                }
-
-                // Stable sort by file + line
-                callerEntries.sort((a, b) =>
-                    a.def.file.localeCompare(b.def.file) || a.def.startLine - b.def.startLine
-                );
+                const callerEntries = _resolveCallerEntries(index, callers, []);
 
                 for (const { def: cDef, callSites } of callerEntries.slice(0, maxChildren)) {
-                    const childTree = buildCallerTree(cDef, currentDepth + 1);
+                    const childTree = buildCallerTree(cDef, currentDepth + 1, chainUnverified);
                     if (childTree) {
                         childTree.callSites = callSites;
                         node.children.push(childTree);
@@ -273,19 +439,66 @@ function blast(index, name, options = {}) {
                     node.truncatedChildren = callerEntries.length - maxChildren;
                     // Count truncated callers in summary
                     for (const { def: cDef } of callerEntries.slice(maxChildren)) {
-                        const key = `${cDef.file}:${cDef.startLine}`;
-                        if (!visited.has(key)) {
-                            affectedFunctions.add(key);
-                            affectedFiles.add(cDef.file);
+                        const tKey = `${cDef.file}:${cDef.startLine}`;
+                        if (!visited.has(tKey)) {
+                            if (chainUnverified) {
+                                possiblyAffectedSet.add(tKey);
+                            } else {
+                                affectedFunctions.add(tKey);
+                                affectedFiles.add(cDef.file);
+                            }
                         }
                     }
                 }
+
+                // Follow unverified edges on request: every downstream node is
+                // marked chainUnverified — reach asserted by an unverified hop
+                // is possible impact, never confirmed impact.
+                if (expandUnverified && nodeUnverified.length > 0) {
+                    const unvEntries = _resolveCallerEntries(index, nodeUnverified, []);
+                    for (const { def: cDef, callSites, reason } of unvEntries.slice(0, maxChildren)) {
+                        const childTree = buildCallerTree(cDef, currentDepth + 1, true);
+                        if (childTree) {
+                            childTree.callSites = callSites;
+                            childTree.viaUnverified = reason || 'unverified';
+                            node.children.push(childTree);
+                        }
+                    }
+                    for (const { def: cDef } of unvEntries.slice(maxChildren)) {
+                        const tKey = `${cDef.file}:${cDef.startLine}`;
+                        if (!visited.has(tKey)) possiblyAffectedSet.add(tKey);
+                    }
+                }
+            } else {
+                // Depth limit: this node's callers were not searched.
+                treeAccount.depthLimitNodes++;
             }
 
             return node;
         };
 
-        const tree = buildCallerTree(def, 0);
+        const tree = buildCallerTree(def, 0, false);
+
+        // Root text-ground account (the context/impact contract at hop 1).
+        // Ground call-lines no candidate claimed are frontier entries too —
+        // counted in the account's unverified total, listed here.
+        let account;
+        if (rootRaw) {
+            const { composeAccount, callNotResolvedEntries } = require('./analysis');
+            account = composeAccount(index, name, rootRaw,
+                rootFiltered > 0 ? { total: rootFiltered, byFlag: { exclude: rootFiltered } } : undefined);
+            for (const e of callNotResolvedEntries(index, account, options)) {
+                treeAccount.unverifiedEdges++;
+                treeAccount.unverifiedByReason['call-not-resolved'] =
+                    (treeAccount.unverifiedByReason['call-not-resolved'] || 0) + 1;
+                frontier.push({
+                    atNode: { name: def.name, file: def.relativePath, line: def.startLine },
+                    hop: 1,
+                    ...e,
+                });
+            }
+        }
+        _sortFrontier(frontier);
 
         // Smart hints
         if (tree && tree.children.length === 0) {
@@ -304,11 +517,17 @@ function blast(index, name, options = {}) {
             line: def.startLine,
             maxDepth,
             includeMethods,
+            expandUnverified: expandUnverified || undefined,
             tree,
+            unverifiedFrontier: frontier,
+            treeAccount,
+            ...(account && { account }),
             summary: {
                 totalAffected: affectedFunctions.size,
                 totalFiles: affectedFiles.size,
-                maxDepthReached
+                maxDepthReached,
+                unverifiedEdges: treeAccount.unverifiedEdges,
+                ...(expandUnverified && { possiblyAffected: possiblyAffectedSet.size }),
             },
             warnings: warnings.length > 0 ? warnings : undefined
         };
@@ -320,9 +539,15 @@ function blast(index, name, options = {}) {
  * Like blast but focused on "how does execution reach this function?"
  * Marks leaf nodes (functions with no callers) as entry points.
  *
+ * Entry-point soundness (tree contract): a node is an entry point only when
+ * it has zero confirmed AND zero unverified caller candidates. Zero confirmed
+ * with unverified candidates renders `unverifiedCallerCount` instead — the
+ * legacy behavior marked such nodes "entry point" after silently dropping
+ * possible-dispatch callers.
+ *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
- * @param {object} options - { depth, file, className, all, exclude, includeMethods, includeUncertain }
+ * @param {object} options - { depth, file, className, all, exclude, includeMethods, expandUnverified }
  * @returns {object|null} Reverse trace tree with entry points
  */
 function reverseTrace(index, name, options = {}) {
@@ -331,8 +556,8 @@ function reverseTrace(index, name, options = {}) {
         const maxDepth = Math.max(0, options.depth ?? 5);
         const maxChildren = options.all ? Infinity : 10;
         const includeMethods = options.includeMethods ?? true;
-        const includeUncertain = options.includeUncertain || false;
         const exclude = options.exclude || [];
+        const expandUnverified = !!options.expandUnverified;
 
         const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
@@ -340,9 +565,37 @@ function reverseTrace(index, name, options = {}) {
         const visited = new Set();
         const callerCache = new Map();
         const entryPoints = [];
+        const frontier = [];
         let maxDepthReached = 0;
+        let rootRaw = null;
+        let rootFiltered = 0;
+        let rootUnverifiedCount = 0;
+        const treeAccount = {
+            nodesExpanded: 0,
+            confirmedEdges: 0,
+            unverifiedEdges: 0,
+            unverifiedByReason: {},
+            excludedTotal: 0,
+            excludedByReason: {},
+            filteredEdges: 0,
+            depthLimitNodes: 0,
+        };
 
-        const buildCallerTree = (funcDef, currentDepth) => {
+        // Tier-partitioned, exclude-filtered callers of a node (memoized).
+        const nodeCallers = (funcDef, isExpansion) => {
+            const { confirmed, unverified, raw } = _contractCallers(index, funcDef, { includeMethods, callerCache });
+            let conf = confirmed;
+            let unv = unverified;
+            if (exclude.length > 0) {
+                const before = conf.length + unv.length;
+                conf = conf.filter(c => index.matchesFilters(c.relativePath, { exclude }));
+                unv = unv.filter(c => index.matchesFilters(c.relativePath, { exclude }));
+                if (isExpansion) treeAccount.filteredEdges += before - conf.length - unv.length;
+            }
+            return { confirmed: conf, unverified: unv, raw };
+        };
+
+        const buildCallerTree = (funcDef, currentDepth, chainUnverified) => {
             const key = `${funcDef.file}:${funcDef.startLine}`;
             if (currentDepth > maxDepth) return null;
             if (visited.has(key)) {
@@ -363,69 +616,35 @@ function reverseTrace(index, name, options = {}) {
                 file: funcDef.relativePath,
                 line: funcDef.startLine,
                 type: funcDef.type || 'function',
+                ...(chainUnverified && { chainUnverified: true }),
                 children: []
             };
 
             if (currentDepth < maxDepth) {
-                const callerCacheKey = funcDef.bindingId
-                    ? `${funcDef.name}:${funcDef.bindingId}`
-                    : `${funcDef.name}:${key}`;
-                let callers = callerCache.get(callerCacheKey);
-                if (!callers) {
-                    callers = index.findCallers(funcDef.name, {
-                        includeMethods,
-                        includeUncertain,
-                        targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
+                const { confirmed, unverified, raw } = nodeCallers(funcDef, true);
+                treeAccount.nodesExpanded++;
+                _aggregateExcluded(treeAccount, raw);
+                if (currentDepth === 0) {
+                    rootRaw = raw;
+                    rootUnverifiedCount = unverified.length;
+                }
+                treeAccount.confirmedEdges += confirmed.length;
+                for (const u of unverified) {
+                    treeAccount.unverifiedEdges++;
+                    const r = u.reason || 'unverified';
+                    treeAccount.unverifiedByReason[r] = (treeAccount.unverifiedByReason[r] || 0) + 1;
+                    frontier.push({
+                        atNode: { name: node.name, file: node.file, line: node.line },
+                        hop: currentDepth + 1,
+                        ...u,
+                        ...(expandUnverified && u.callerName ? { expanded: true } : {}),
                     });
-                    callerCache.set(callerCacheKey, callers);
                 }
 
-                // Deduplicate callers by enclosing function
-                const uniqueCallers = new Map();
-                for (const c of callers) {
-                    if (!c.callerName) continue;
-                    if (exclude.length > 0 && !index.matchesFilters(c.relativePath, { exclude })) continue;
-                    const callerKey = c.callerStartLine
-                        ? `${c.callerFile}:${c.callerStartLine}`
-                        : `${c.callerFile}:${c.callerName}`;
-                    if (!uniqueCallers.has(callerKey)) {
-                        uniqueCallers.set(callerKey, {
-                            name: c.callerName,
-                            file: c.callerFile,
-                            relativePath: c.relativePath,
-                            startLine: c.callerStartLine,
-                            endLine: c.callerEndLine,
-                            callSites: 1
-                        });
-                    } else {
-                        uniqueCallers.get(callerKey).callSites++;
-                    }
-                }
-
-                // Resolve definitions and build child nodes
-                const callerEntries = [];
-                for (const [, caller] of uniqueCallers) {
-                    const defs = index.symbols.get(caller.name);
-                    let callerDef = defs?.find(d => d.file === caller.file && d.startLine === caller.startLine);
-                    if (!callerDef) {
-                        callerDef = {
-                            name: caller.name,
-                            file: caller.file,
-                            relativePath: caller.relativePath,
-                            startLine: caller.startLine,
-                            endLine: caller.endLine,
-                            type: 'function'
-                        };
-                    }
-                    callerEntries.push({ def: callerDef, callSites: caller.callSites });
-                }
-
-                callerEntries.sort((a, b) =>
-                    a.def.file.localeCompare(b.def.file) || a.def.startLine - b.def.startLine
-                );
+                const callerEntries = _resolveCallerEntries(index, confirmed, []);
 
                 for (const { def: cDef, callSites } of callerEntries.slice(0, maxChildren)) {
-                    const childTree = buildCallerTree(cDef, currentDepth + 1);
+                    const childTree = buildCallerTree(cDef, currentDepth + 1, chainUnverified);
                     if (childTree) {
                         childTree.callSites = callSites;
                         node.children.push(childTree);
@@ -435,59 +654,86 @@ function reverseTrace(index, name, options = {}) {
                 if (callerEntries.length > maxChildren) {
                     node.truncatedChildren = callerEntries.length - maxChildren;
                     // Count entry points in truncated branches so summary is accurate
-                    // Use callerCache to avoid redundant findCallers calls
                     for (const { def: cDef } of callerEntries.slice(maxChildren)) {
                         const cKey = `${cDef.file}:${cDef.startLine}`;
                         if (!visited.has(cKey)) {
-                            const cCacheKey = cDef.bindingId
-                                ? `${cDef.name}:${cDef.bindingId}`
-                                : `${cDef.name}:${cKey}`;
-                            let cCallers = callerCache.get(cCacheKey);
-                            if (!cCallers) {
-                                cCallers = index.findCallers(cDef.name, {
-                                    includeMethods, includeUncertain,
-                                    targetDefinitions: cDef.bindingId ? [cDef] : undefined,
-                                    maxResults: 1, // Only need to know if any exist
-                                });
-                                callerCache.set(cCacheKey, cCallers);
-                            }
-                            if (cCallers.length === 0) {
+                            const tiers = nodeCallers(cDef, false);
+                            if (tiers.confirmed.length === 0 && tiers.unverified.length === 0) {
                                 entryPoints.push({ name: cDef.name, file: cDef.relativePath || path.relative(index.root, cDef.file), line: cDef.startLine });
                             }
                         }
                     }
                 }
 
-                // Mark as entry point if no callers found (and not at depth limit)
-                if (uniqueCallers.size === 0 && currentDepth > 0) {
-                    node.entryPoint = true;
-                    entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                if (expandUnverified && unverified.length > 0) {
+                    const unvEntries = _resolveCallerEntries(index, unverified, []);
+                    for (const { def: cDef, callSites, reason } of unvEntries.slice(0, maxChildren)) {
+                        const childTree = buildCallerTree(cDef, currentDepth + 1, true);
+                        if (childTree) {
+                            childTree.callSites = callSites;
+                            childTree.viaUnverified = reason || 'unverified';
+                            node.children.push(childTree);
+                        }
+                    }
+                }
+
+                // Entry point only when BOTH tiers are empty; unverified-only
+                // nodes are visibly not-confirmed instead.
+                if (callerEntries.length === 0 && currentDepth > 0) {
+                    if (unverified.length === 0) {
+                        node.entryPoint = true;
+                        entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                    } else {
+                        node.unverifiedCallerCount = unverified.length;
+                    }
                 }
             } else if (currentDepth > 0) {
                 // At depth limit: check if this node is an entry point
-                const callers = index.findCallers(funcDef.name, {
-                    includeMethods,
-                    includeUncertain,
-                    targetDefinitions: funcDef.bindingId ? [funcDef] : undefined,
-                });
-                const hasCallers = callers.some(c => c.callerName &&
-                    (exclude.length === 0 || index.matchesFilters(c.relativePath, { exclude })));
-                if (!hasCallers) {
-                    node.entryPoint = true;
-                    entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                treeAccount.depthLimitNodes++;
+                const tiers = nodeCallers(funcDef, false);
+                if (tiers.confirmed.filter(c => c.callerName).length === 0) {
+                    if (tiers.unverified.length === 0) {
+                        node.entryPoint = true;
+                        entryPoints.push({ name: funcDef.name, file: funcDef.relativePath, line: funcDef.startLine });
+                    } else {
+                        node.unverifiedCallerCount = tiers.unverified.length;
+                    }
                 }
             }
 
             return node;
         };
 
-        const tree = buildCallerTree(def, 0);
+        const tree = buildCallerTree(def, 0, false);
 
-        // Also mark root as entry point if it has no callers
+        // Also mark root as entry point if it has no callers in either tier
         if (tree && tree.children.length === 0 && maxDepth > 0) {
-            tree.entryPoint = true;
-            entryPoints.push({ name: def.name, file: def.relativePath, line: def.startLine });
+            if (rootUnverifiedCount === 0) {
+                tree.entryPoint = true;
+                entryPoints.push({ name: def.name, file: def.relativePath, line: def.startLine });
+            } else {
+                tree.unverifiedCallerCount = rootUnverifiedCount;
+            }
         }
+
+        // Root text-ground account + unclaimed ground call-lines
+        let account;
+        if (rootRaw) {
+            const { composeAccount, callNotResolvedEntries } = require('./analysis');
+            account = composeAccount(index, name, rootRaw,
+                rootFiltered > 0 ? { total: rootFiltered, byFlag: { exclude: rootFiltered } } : undefined);
+            for (const e of callNotResolvedEntries(index, account, options)) {
+                treeAccount.unverifiedEdges++;
+                treeAccount.unverifiedByReason['call-not-resolved'] =
+                    (treeAccount.unverifiedByReason['call-not-resolved'] || 0) + 1;
+                frontier.push({
+                    atNode: { name: def.name, file: def.relativePath, line: def.startLine },
+                    hop: 1,
+                    ...e,
+                });
+            }
+        }
+        _sortFrontier(frontier);
 
         // Smart hints
         if (tree && tree.children.length === 0) {
@@ -506,12 +752,17 @@ function reverseTrace(index, name, options = {}) {
             line: def.startLine,
             maxDepth,
             includeMethods,
+            expandUnverified: expandUnverified || undefined,
             tree,
             entryPoints,
+            unverifiedFrontier: frontier,
+            treeAccount,
+            ...(account && { account }),
             summary: {
                 totalEntryPoints: entryPoints.length,
                 totalFunctions: visited.size - 1, // exclude root
-                maxDepthReached
+                maxDepthReached,
+                unverifiedEdges: treeAccount.unverifiedEdges,
             },
             warnings: warnings.length > 0 ? warnings : undefined
         };
@@ -522,42 +773,99 @@ function reverseTrace(index, name, options = {}) {
  * Find tests affected by a change to the given function.
  * Composes blast() (transitive callers) with test file scanning.
  *
+ * Two bands (tree contract): `affectedFunctions`/`testFiles` come from the
+ * confirmed-chain closure; names reachable only through >= 1 unverified hop
+ * land in `possiblyAffected`, their additional test files in
+ * `possiblyAffectedTests`. Coverage/uncovered claims are confirmed-band only.
+ *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
- * @param {object} options - { depth, file, className, exclude, includeMethods, includeUncertain }
+ * @param {object} options - { depth, file, className, exclude, includeMethods }
  * @returns {object|null} Affected test files with coverage stats
  */
 function affectedTests(index, name, options = {}) {
     index._beginOp();
     try {
-        // Step 1: Get all transitively affected functions via blast
+        const maxDepth = Math.max(0, options.depth ?? 3);
+        // Step 1: confirmed closure via blast (contract mode, no truncation)
         const blastResult = index.blast(name, {
-            depth: options.depth ?? 3,
+            depth: maxDepth,
             file: options.file,
             className: options.className,
             all: true,
             exclude: options.exclude,
             includeMethods: options.includeMethods,
-            includeUncertain: options.includeUncertain,
         });
         if (!blastResult) return null;
 
-        // Step 2: Collect all affected function names from the tree
+        // Step 2: Collect confirmed-affected function names (and node keys)
         const affectedNames = new Set();
+        const confirmedKeys = new Set();
         affectedNames.add(name);
         const collectNames = (node) => {
             if (!node) return;
             affectedNames.add(node.name);
+            confirmedKeys.add(`${node.file}:${node.line}`);
             for (const child of node.children || []) collectNames(child);
         };
         collectNames(blastResult.tree);
 
-        // Step 3: Scan test files for all affected names using AST
-        // Only count call and test-case matches as real coverage — not imports or bare references.
+        // Step 2b: possible closure — BFS seeded by the frontier's enclosing
+        // functions, following both edge tiers, bounded by the same depth.
+        // Names reached only this way are possibly affected, never confirmed.
         const exclude = options.exclude;
         const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
+        const includeMethods = options.includeMethods ?? true;
+        const possiblyNames = new Set();
+        {
+            const callerCache = new Map();
+            const possibleVisited = new Set();
+            const queue = [];
+            const enqueueCaller = (c, depth) => {
+                if (!c.callerName || !c.callerFile) return;
+                if (excludeArr.length > 0 && !index.matchesFilters(c.relativePath, { exclude: excludeArr })) return;
+                const defs = index.symbols.get(c.callerName);
+                let cDef = defs?.find(d => d.file === c.callerFile && d.startLine === c.callerStartLine);
+                if (!cDef) {
+                    cDef = {
+                        name: c.callerName,
+                        file: c.callerFile,
+                        relativePath: c.relativePath,
+                        startLine: c.callerStartLine,
+                        endLine: c.callerEndLine,
+                        type: 'function'
+                    };
+                }
+                queue.push({ def: cDef, depth });
+            };
+            for (const fe of blastResult.unverifiedFrontier || []) {
+                enqueueCaller(fe, fe.hop);
+            }
+            while (queue.length > 0) {
+                const { def: d, depth } = queue.shift();
+                if (depth > maxDepth) continue;
+                const k = `${d.relativePath || path.relative(index.root, d.file)}:${d.startLine}`;
+                if (possibleVisited.has(k)) continue;
+                possibleVisited.add(k);
+                if (!confirmedKeys.has(k) && !affectedNames.has(d.name)) {
+                    possiblyNames.add(d.name);
+                }
+                if (depth < maxDepth) {
+                    const { confirmed, unverified } = _contractCallers(index, d, { includeMethods, callerCache });
+                    for (const c of confirmed) enqueueCaller(c, depth + 1);
+                    for (const c of unverified) enqueueCaller(c, depth + 1);
+                }
+            }
+            // A name in both bands is confirmed — the possible band only adds.
+            for (const n of affectedNames) possiblyNames.delete(n);
+        }
+
+        // Step 3: Scan test files for all affected names using AST
+        // Only count call and test-case matches as real coverage — not imports or bare references.
         const className = options.className || null;
         const results = [];
+        const possibleResults = [];
+        const scanNames = [...affectedNames, ...possiblyNames];
         for (const [filePath, fileEntry] of index.files) {
             let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
             // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
@@ -573,7 +881,7 @@ function affectedTests(index, name, options = {}) {
                 const content = index._readFile(filePath);
                 const fileMatches = new Map();
 
-                for (const funcName of affectedNames) {
+                for (const funcName of scanNames) {
                     // Fast pre-check
                     if (!content.includes(funcName)) continue;
 
@@ -647,22 +955,40 @@ function affectedTests(index, name, options = {}) {
 
                     // Only count functions with call or test-case matches as covered.
                     // Import-only or reference-only functions are not real coverage.
-                    const realCoveredFunctions = coveredFunctions.filter(fn => {
+                    const realCoveredAll = coveredFunctions.filter(fn => {
                         const fnMatches = deduped.filter(m => m.functionName === fn);
                         return fnMatches.some(m => m.matchType === 'call' || m.matchType === 'test-case');
                     });
+                    const realCoveredFunctions = realCoveredAll.filter(fn => affectedNames.has(fn));
+                    const possiblyCovered = realCoveredAll.filter(fn => possiblyNames.has(fn));
 
-                    // Only include file if it has real coverage
-                    const realMatches = deduped.filter(m =>
-                        m.matchType === 'call' || m.matchType === 'test-case' ||
-                        realCoveredFunctions.includes(m.functionName)
-                    );
                     if (realCoveredFunctions.length > 0) {
+                        // Confirmed band: matches for confirmed-covered names
+                        const realMatches = deduped.filter(m =>
+                            affectedNames.has(m.functionName) &&
+                            (m.matchType === 'call' || m.matchType === 'test-case' ||
+                             realCoveredFunctions.includes(m.functionName))
+                        );
                         results.push({
                             file: fileEntry.relativePath,
                             coveredFunctions: realCoveredFunctions,
+                            ...(possiblyCovered.length > 0 && { possiblyCovered }),
                             matchCount: realMatches.length,
                             matches: realMatches
+                        });
+                    } else if (possiblyCovered.length > 0) {
+                        // Possible band: file reaches the change only through
+                        // unverified chains.
+                        const possibleMatches = deduped.filter(m =>
+                            possiblyNames.has(m.functionName) &&
+                            (m.matchType === 'call' || m.matchType === 'test-case' ||
+                             possiblyCovered.includes(m.functionName))
+                        );
+                        possibleResults.push({
+                            file: fileEntry.relativePath,
+                            coveredFunctions: possiblyCovered,
+                            matchCount: possibleMatches.length,
+                            matches: possibleMatches
                         });
                     }
                 }
@@ -671,30 +997,33 @@ function affectedTests(index, name, options = {}) {
 
         // Sort by coverage breadth then alphabetically
         results.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || a.file.localeCompare(b.file));
+        possibleResults.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || a.file.localeCompare(b.file));
 
         // Compute coverage stats.
         // Filter out test function names from affectedNames — they are callers,
         // not production symbols that need test coverage.
-        const productionNames = new Set();
-        for (const n of affectedNames) {
+        const isProductionName = (n) => {
             // Check if this name is only found in test files. Inline test
             // functions (#[test] fns in Rust's #[cfg(test)] mods, Go Test*)
             // live in production-path FILES but are tests themselves — the
             // language's getEntryPointKind says so; they need no coverage.
-            let foundInSource = false;
             for (const [fp, fe] of index.files) {
                 if (isTestFile(fe.relativePath, fe.language)) continue;
                 const langModule = getLanguageModule(fe.language);
                 const kindOf = langModule?.getEntryPointKind;
                 if (fe.symbols?.some(s => s.name === n && (!kindOf || kindOf(s) !== 'test'))) {
-                    foundInSource = true;
-                    break;
+                    return true;
                 }
             }
-            if (foundInSource) productionNames.add(n);
+            return false;
+        };
+        const productionNames = new Set();
+        for (const n of affectedNames) {
+            if (isProductionName(n)) productionNames.add(n);
         }
         // Fall back to full set if filtering removed everything (e.g., test-only project)
         const namesForCoverage = productionNames.size > 0 ? productionNames : affectedNames;
+        const possiblyProduction = [...possiblyNames].filter(isProductionName);
 
         const coveredSet = new Set();
         for (const r of results) for (const f of r.coveredFunctions) {
@@ -706,12 +1035,19 @@ function affectedTests(index, name, options = {}) {
             root: blastResult.root, file: blastResult.file, line: blastResult.line,
             depth: blastResult.maxDepth,
             affectedFunctions: [...namesForCoverage],
+            possiblyAffected: possiblyProduction,
             testFiles: results,
+            possiblyAffectedTests: possibleResults,
+            ...(blastResult.account && { account: blastResult.account }),
+            treeAccount: blastResult.treeAccount,
             summary: {
                 totalAffected: namesForCoverage.size,
                 totalTestFiles: results.length,
                 coveredFunctions: coveredSet.size,
                 uncoveredCount: uncovered.length,
+                possiblyAffected: possiblyProduction.length,
+                possiblyAffectedTests: possibleResults.length,
+                unverifiedEdges: blastResult.summary ? blastResult.summary.unverifiedEdges : 0,
             },
             uncovered,
             warnings: blastResult.warnings,

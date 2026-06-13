@@ -197,6 +197,7 @@ function parseFlags(tokens) {
         includeExported: tokens.includes('--include-exported') || undefined,
         includeDecorated: tokens.includes('--include-decorated') || undefined,
         includeUncertain: tokens.includes('--include-uncertain') || undefined,
+        expandUnverified: tokens.includes('--expand-unverified') || undefined,
         includeMethods: tokens.some(a => a === '--include-methods=false' || a === '--no-include-methods') ? false : tokens.some(a => a === '--include-methods' || (a.startsWith('--include-methods=') && a !== '--include-methods=false')) ? true : undefined,
         detailed: tokens.includes('--detailed') || undefined,
         topLevel: tokens.includes('--top-level') || undefined,
@@ -283,7 +284,7 @@ const knownFlags = new Set([
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests', '--exclude-tests',
-    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--no-include-methods', '--include-uncertain', '--detailed', '--calls-only',
+    '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--no-include-methods', '--include-uncertain', '--expand-unverified', '--detailed', '--calls-only',
     '--file', '--context', '--exclude', '--not', '--in',
     '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
     '--default', '--top', '--no-follow-symlinks',
@@ -655,11 +656,11 @@ function runProjectCommand(rootDir, command, arg) {
         }
         // Tiered-output contract: unverified callers are always shown for
         // these commands, so the legacy reveal flags are implied no-ops.
-        if (['about', 'context', 'impact'].includes(canonical)) {
+        if (['about', 'context', 'impact', 'trace', 'blast', 'reverseTrace', 'affectedTests'].includes(canonical)) {
             if (flags.includeUncertain) {
-                console.error(`Note: --include-uncertain is implied for '${toCliName(canonical)}' — unverified callers are always shown (tiered).`);
+                console.error(`Note: --include-uncertain is implied for '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
             }
-            if (flags.includeMethods) {
+            if (['about', 'context', 'impact'].includes(canonical) && flags.includeMethods) {
                 console.error(`Note: --include-methods is implied for '${toCliName(canonical)}' — method calls are tiered by receiver evidence.`);
             }
         }
@@ -1539,8 +1540,11 @@ Common Flags:
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method calls (obj.fn) in trace/blast/smart/verify analysis
                         (implied for about/context/impact — method calls are tiered by evidence)
-  --include-uncertain Include ambiguous/uncertain matches in trace/blast/smart/verify
-                        (implied for about/context/impact — unverified callers always shown, tiered)
+  --include-uncertain Include ambiguous/uncertain matches in smart/verify
+                        (implied for about/context/impact/trace/blast/reverse-trace/affected-tests —
+                        unverified candidates always shown, tiered)
+  --expand-unverified Follow unverified caller edges in blast/reverse-trace trees
+                        (downstream nodes marked as unverified chains — possible, not confirmed, impact)
   --hide-confidence   Hide confidence scores (shown by default in about, context)
   --min-confidence=N  Filter low-confidence edges (about, context, blast, trace,
                         reverse-trace, smart, affected-tests)

@@ -879,4 +879,7 @@ module.exports = {
     formatImpactJson,
     formatAbout,
     formatAboutJson,
+    // Shared with output/tracing.js: the tree commands render the same
+    // root-hop ACCOUNT/WARNING/FILTERED lines as context/impact.
+    formatAccountLines,
 };

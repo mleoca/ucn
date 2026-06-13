@@ -154,6 +154,57 @@ function evaluateRepo(repo) {
     }
     const accountMs = Date.now() - accountStart;
 
+    // Tree contract check (trace/blast tiered trees): on a sub-sample, run
+    // blast + trace and verify the tree-level conservation claims — the root
+    // text-ground account conserves, the frontier matches the tree account's
+    // unverified count, and every expanded node's callee account partitions
+    // its call sites. Violations are engine bugs, gate-style.
+    const treeStart = Date.now();
+    let treeChecked = 0;
+    let treeViolations = 0;
+    const treeViolationSamples = [];
+    const treeSample = symbols.slice(0, Math.min(10, symbols.length));
+    for (const { name } of treeSample) {
+        try {
+            const b = index.blast(name, { depth: 2 });
+            if (b) {
+                treeChecked++;
+                const problems = [];
+                if (b.account && !b.account.conserved) problems.push('root-account-not-conserved');
+                if (b.treeAccount.unverifiedEdges !== (b.unverifiedFrontier || []).length) {
+                    problems.push(`frontier-mismatch ${b.treeAccount.unverifiedEdges} vs ${(b.unverifiedFrontier || []).length}`);
+                }
+                if (problems.length > 0) {
+                    treeViolations++;
+                    if (treeViolationSamples.length < 5) treeViolationSamples.push({ name, cmd: 'blast', problems });
+                }
+            }
+            const t = index.trace(name, { depth: 2 });
+            if (t && t.treeAccount) {
+                treeChecked++;
+                const cs = t.treeAccount.callSites;
+                const ok = cs.total === cs.confirmed + cs.unverified + cs.external + cs.excluded + cs.filtered;
+                let nodeOk = true;
+                const walk = (n) => {
+                    if (!n) return;
+                    if (n.calleeAccount && !n.calleeAccount.conserved) nodeOk = false;
+                    (n.children || []).forEach(walk);
+                };
+                walk(t.tree);
+                if (!ok || !nodeOk) {
+                    treeViolations++;
+                    if (treeViolationSamples.length < 5) {
+                        treeViolationSamples.push({ name, cmd: 'trace', problems: [!ok && 'rollup-arithmetic', !nodeOk && 'node-account-not-conserved'].filter(Boolean) });
+                    }
+                }
+            }
+        } catch (e) {
+            treeViolations++;
+            if (treeViolationSamples.length < 5) treeViolationSamples.push({ name, cmd: 'tree', problems: [e.message] });
+        }
+    }
+    const treeMs = Date.now() - treeStart;
+
     const evaluated = perSymbol.filter(s => !s.error);
     const summary = {
         repo: repo.name,
@@ -172,11 +223,19 @@ function evaluateRepo(repo) {
         callNotResolvedSymbols: gapSymbols,        // symbols with >= 1 silently-unclaimed call line
         callNotResolvedLines: totalGapLines,       // total silently-unclaimed call lines
         beyondTextClaims: beyondTextTotal,         // alias finds grep would miss
+        // Tree contract (trace/blast): conservation of tree-level claims
+        treeChecked,
+        treeViolations,
+        treeViolationSamples,
+        treeMs,
     };
 
     process.stdout.write(`  sampled ${summary.sampled} symbols: conserved ${(summary.conservedRate * 100).toFixed(1)}%, ` +
         `${summary.callNotResolvedSymbols} symbols with unclaimed call lines (${summary.callNotResolvedLines} lines), ` +
         `${summary.beyondTextClaims} beyond-text claims (avg ${summary.avgAccountMs}ms/account)\n`);
+    process.stdout.write(`  tree contract: ${summary.treeChecked} trees checked, ${summary.treeViolations} violations` +
+        (summary.treeViolations > 0 ? ` ${JSON.stringify(summary.treeViolationSamples)}` : '') +
+        ` (${summary.treeMs}ms)\n`);
 
     return { summary, perSymbol };
 }
@@ -214,15 +273,15 @@ function main() {
         'claim — callers an agent would never see (the silent false negatives the',
         'grep-reliability contract eliminates).',
         '',
-        '| repo | lang | files | sampled | conserved | gap symbols | gap lines | beyond-text | avg ms/account |',
-        '|---|---|---|---|---|---|---|---|---|',
+        '| repo | lang | files | sampled | conserved | gap symbols | gap lines | beyond-text | tree violations | avg ms/account |',
+        '|---|---|---|---|---|---|---|---|---|---|',
     ];
     for (const { summary: s } of results) {
         if (s.error) {
             lines.push(`| ${s.repo} | — | — | — | — | — | — | — | ERROR: ${s.error} |`);
             continue;
         }
-        lines.push(`| ${s.repo} | ${s.language} | ${s.files} | ${s.sampled} | ${(s.conservedRate * 100).toFixed(1)}% | ${s.callNotResolvedSymbols} | ${s.callNotResolvedLines} | ${s.beyondTextClaims} | ${s.avgAccountMs} |`);
+        lines.push(`| ${s.repo} | ${s.language} | ${s.files} | ${s.sampled} | ${(s.conservedRate * 100).toFixed(1)}% | ${s.callNotResolvedSymbols} | ${s.callNotResolvedLines} | ${s.beyondTextClaims} | ${s.treeViolations}/${s.treeChecked} | ${s.avgAccountMs} |`);
     }
     lines.push('');
     const mdPath = path.join(REPORTS_DIR, `conservation-rollup-${date}.md`);

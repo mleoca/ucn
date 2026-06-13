@@ -95,6 +95,7 @@ const PARAM_MAP = {
     server_only:       'serverOnly',
     client_only:       'clientOnly',
     hide_uncertain:    'hideUncertain',
+    expand_unverified: 'expandUnverified',
 };
 
 // ============================================================================
@@ -114,8 +115,14 @@ const FLAG_APPLICABILITY = {
     // unverified display cap.
     context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'all'],
     impact:       ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'top', 'unreachableOnly', 'compact'],
-    blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    // trace/blast/reverseTrace/affectedTests run the tiered tree contract:
+    // includeUncertain is an implied no-op (unverified edges are always
+    // visible — frontier/possible band); expandUnverified follows unverified
+    // CALLER edges, marking downstream nodes chainUnverified (blast/
+    // reverseTrace only — surface trace is down-direction, where unresolved
+    // callees have no definition to expand into).
+    blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
+    reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
     smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
     trace:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     example:      ['name', 'file', 'className', 'diverse', 'top', 'includeTests'],

@@ -2641,4 +2641,7 @@ module.exports = {
     // of call-not-resolved is closed — the listing contract (counted ⇒
     // listed) is pinned directly since no fixture can reach it end-to-end.
     callNotResolvedEntries,
+    // Shared with tracing.js (trace/blast/reverseTrace root accounts) — the
+    // tree commands compose the same text-ground account at their root hop.
+    composeAccount,
 };

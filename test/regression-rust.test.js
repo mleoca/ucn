@@ -2996,3 +2996,45 @@ describe('fix #222b: use-as import renames keep type-qualified calls confirmable
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #223: receiver-qualified same-name calls resolve to the named type's
+// binding instead of fanning out to every same-name def (callee-arm-measured:
+// ripgrep's HiArgs::from_low_args calls Patterns::/Paths::/BinaryDetection::
+// from_low_args — each def was claimed at all three sites).
+// ============================================================================
+
+describe('fix #223: type-qualified same-name callee resolves per type', () => {
+    it('A::build calling B::build and C::build does not spray defs across sites', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct A;',                                  // 1
+                'pub struct B;',                                  // 2
+                'pub struct C;',                                  // 3
+                'impl B { pub fn build(_n: u32) -> B { B } }',    // 4
+                'impl C { pub fn build(_n: u32) -> C { C } }',    // 5
+                'impl A {',                                       // 6
+                '    pub fn build(n: u32) -> A {',                // 7
+                '        let _b = B::build(n);',                  // 8
+                '        let _c = C::build(n);',                  // 9
+                '        A',                                      // 10
+                '    }',                                          // 11
+                '}',                                              // 12
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const aBuild = (index.symbols.get('build') || []).find(d => d.className === 'A');
+            assert.ok(aBuild, 'A::build indexed');
+            const callees = index.findCallees(aBuild, { includeMethods: true, collectAccount: true });
+            const buildEdges = callees.filter(c => c.name === 'build');
+            const bEdge = buildEdges.find(e => e.className === 'B');
+            const cEdge = buildEdges.find(e => e.className === 'C');
+            assert.ok(bEdge && cEdge, 'both typed callees present: ' + JSON.stringify(buildEdges.map(e => e.className)));
+            assert.deepStrictEqual(bEdge.sites, [8], 'B::build claims only its own site');
+            assert.deepStrictEqual(cEdge.sites, [9], 'C::build claims only its own site');
+            assert.ok(callees.calleeAccount.conserved, 'account conserved');
+        } finally { rm(dir); }
+    });
+});

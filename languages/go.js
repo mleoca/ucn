@@ -1181,7 +1181,13 @@ function findCallsInCode(code, parser, options = {}) {
                     const firstArg = getFirstStringArg(node);
                     calls.push({
                         name: fieldNode.text,
-                        line: node.startPosition.row + 1,
+                        // Name-node line convention (#201/RUST-2, fix #223):
+                        // a method call on a multi-line receiver —
+                        // (&pkg.Name{...}).String() — reports the FIELD's own
+                        // line, not the chain-start line. The account's ground
+                        // set and the oracles key by the name's line; Go was
+                        // the only parser still using the call node's start.
+                        line: fieldNode.startPosition.row + 1,
                         isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),

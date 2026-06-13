@@ -338,6 +338,7 @@ const HANDLERS = {
             ...buildCallerOptions(p),
             depth: depthVal ?? 3,
             all: p.all || depthVal !== undefined,
+            expandUnverified: !!p.expandUnverified,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const note = treeNote(result);
@@ -359,6 +360,7 @@ const HANDLERS = {
             ...buildCallerOptions(p),
             depth: depthVal ?? 5,
             all: p.all || depthVal !== undefined,
+            expandUnverified: !!p.expandUnverified,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const note = treeNote(result);
@@ -397,6 +399,7 @@ const HANDLERS = {
             ...buildCallerOptions(p),
             depth: depthVal ?? 3,
             all: p.all || depthVal !== undefined,
+            expandUnverified: !!p.expandUnverified,
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const note = treeNote(result);

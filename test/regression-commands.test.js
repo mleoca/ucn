@@ -2091,9 +2091,15 @@ describe('reverse-trace: upward call chain to entry points', () => {
     // Also: handler → helper (second entry point)
     // entryA has no callers (entry point)
     // entryB has no callers (entry point)
+    // entry.js imports its callees properly — under the tiered tree contract
+    // a bare cross-file name without an import edge is an unverified frontier
+    // entry, not a trunk node (the legacy fixture relied on name-only scope
+    // confirmation that the contract routes visible-unverified).
     const fixture = {
         'package.json': '{"name":"rtrace-test"}',
         'entry.js': `
+const { orchestrator } = require('./mid');
+const { helper } = require('./util');
 function main() { orchestrator(); }
 function handler() { helper(); }
 module.exports = { main, handler };

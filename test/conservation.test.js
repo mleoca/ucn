@@ -460,8 +460,8 @@ describe('conservation: drop points carry reasons (Phase 2 engine instrumentatio
     });
 });
 
-describe('conservation: account is additive — trace/blast unchanged', () => {
-    it('trace and blast JSON carry no account/tier fields', () => {
+describe('conservation: tree commands run the contract — verify/smart stay legacy', () => {
+    it('blast/reverseTrace carry root account + tree account; trace down carries callee rollup', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'lib.js': 'function inner() { return 1; }\nfunction outer() { return inner(); }\nmodule.exports = { inner, outer };',
@@ -470,7 +470,35 @@ describe('conservation: account is additive — trace/blast unchanged', () => {
         try {
             const index = idx(dir);
             const { execute } = require('../core/execute');
-            for (const cmd of ['trace', 'blast', 'reverseTrace']) {
+            for (const cmd of ['blast', 'reverseTrace']) {
+                const r = execute(index, cmd, { name: 'inner' });
+                assert.ok(r.ok, `${cmd} should succeed`);
+                assert.ok(r.result.account, `${cmd} must carry the root text-ground account`);
+                assert.ok(r.result.account.conserved, `${cmd} root account must conserve`);
+                assert.ok(r.result.treeAccount, `${cmd} must carry the tree account`);
+                assert.ok(Array.isArray(r.result.unverifiedFrontier), `${cmd} must carry the frontier array`);
+            }
+            const t = execute(index, 'trace', { name: 'outer' });
+            assert.ok(t.ok, 'trace should succeed');
+            assert.ok(t.result.treeAccount, 'trace down must carry the callee rollup');
+            assert.ok(t.result.treeAccount.callSites, 'callee rollup has callSites buckets');
+            const cs = t.result.treeAccount.callSites;
+            assert.strictEqual(cs.total,
+                cs.confirmed + cs.unverified + cs.external + cs.excluded + cs.filtered,
+                'callee rollup must conserve');
+        } finally { rm(dir); }
+    });
+
+    it('verify/smart results stay legacy — no account/tier leakage', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function inner() { return 1; }\nfunction outer() { return inner(); }\nmodule.exports = { inner, outer };',
+            'app.js': 'const { outer } = require("./lib");\nfunction main() { return outer(); }\nmodule.exports = { main };',
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            for (const cmd of ['verify', 'smart']) {
                 const r = execute(index, cmd, { name: 'inner' });
                 assert.ok(r.ok, `${cmd} should succeed`);
                 const json = JSON.stringify(r.result);

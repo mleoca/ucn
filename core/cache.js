@@ -47,7 +47,11 @@ const UCN_VERSION = require('../package.json').version;
 // v25 (fix #222): turbofish path receivers — `Vec::<T>::new()` records
 // receiver 'Vec' in BOTH the macro token-tree branch (was receiver-less) and
 // the AST branch (was 'Vec::<T>').
-const CACHE_FORMAT_VERSION = 25;
+// v26 (fix #223): Go selector-call line attribution moves to the FIELD
+// node's line (the #201/RUST-2 name-node convention — multi-line receivers
+// like `(&pkg.Name{...}).String()` reported the chain-start line; Go was the
+// only parser still keying calls off the call node's start).
+const CACHE_FORMAT_VERSION = 26;
 
 /**
  * Save index to cache file

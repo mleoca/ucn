@@ -13,7 +13,7 @@ lie the grep-reliability contract forbids. Target: 0.
 | httpx | pyright | 50 | 879 | 99.9% | 29.3% | 0.7061 | **0** | 100.0% (7) | 100.0% |
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.9% | 25.0% | 0.7494 | **0** | 100.0% (13) | 100.0% |
-| grpc-go | gopls | 50 | 840 | 100.0% | 17.8% | 0.8215 | **0** | 100.0% (13) | 100.0% |
+| grpc-go | gopls | 50 | 840 | 100.0% | 17.9% | 0.8212 | **0** | 100.0% (13) | 100.0% |
 | ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.0% | 0.8301 | **0** | 100.0% (1) | 100.0% |
 | cursive | rust-analyzer | 50 | 637 | 98.9% | 51.2% | 0.4763 | **0** | 100.0% (6) | 100.0% |
 | gson | jdtls | 50 | 649 | 96.2% | 33.5% | 0.6275 | **0** | 100.0% (9) | 100.0% |
@@ -43,7 +43,7 @@ evidence confirms the file but not the receiver type.
 | cobra | method | 18 | 567 | 99.8% (557/558) | 25.0% (2/8) | 0.7482 | {"confirmed":557,"unverified":2,"reportedNonCall":8,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cobra | class | 3 | 409 | 100.0% (409/409) | 0.0% (0/0) | n/a | {"confirmed":409,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | function | 12 | 101 | 100.0% (101/101) | 0.0% (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| grpc-go | method | 30 | 351 | 100.0% (7/7) | 18.0% (204/1136) | 0.8204 | {"confirmed":7,"unverified":204,"reportedNonCall":140,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| grpc-go | method | 30 | 351 | 100.0% (7/7) | 18.0% (204/1134) | 0.8201 | {"confirmed":7,"unverified":204,"reportedNonCall":140,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | class | 8 | 388 | 100.0% (388/388) | 0.0% (0/7) | 1 | {"confirmed":388,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | function | 6 | 568 | 100.0% (568/568) | 0.0% (0/0) | n/a | {"confirmed":568,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | method | 31 | 186 | 100.0% (161/161) | 14.2% (21/148) | 0.8581 | {"confirmed":161,"unverified":21,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -53,3 +53,24 @@ evidence confirms the file but not the receiver type.
 | cursive | class | 5 | 17 | 100.0% (3/3) | 31.6% (6/19) | 0.6842 | {"confirmed":3,"unverified":6,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":8,"missingUnexplained":0} |
 | gson | method | 40 | 615 | 96.1% (273/284) | 30.8% (199/646) | 0.6533 | {"confirmed":273,"unverified":197,"reportedNonCall":13,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (8/8) | 100.0% (26/26) | 0 | {"confirmed":8,"unverified":26,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+
+## Callee arm (trace-down contract)
+
+The same oracle edges re-read from the CALLER side: for each oracle
+call ref of a sampled symbol, the enclosing function's callee answer
+(findCallees collectAccount — the trace-down engine path) must show
+the site (confirmed edge / unverified entry) or account for it
+(conserved bucket). `callee-missing-unexplained` gates at 0.
+
+| repo | callee precision | confirmed | other-def | unverified | accounted | module-level | beyond-text | **missing-unexplained** |
+|---|---|---|---|---|---|---|---|---|
+| zod | 100.0% (74/74) | 74 | 24 | 60 | 0 | 1703 | 0 | **0** |
+| preact-signals | 100.0% (15/15) | 15 | 0 | 4 | 1 | 4 | 0 | **0** |
+| express | 100.0% (4/4) | 4 | 0 | 0 | 0 | 258 | 0 | **0** |
+| httpx | 100.0% (303/303) | 302 | 1 | 540 | 36 | 0 | 0 | **0** |
+| rich | 98.6% (216/219) | 215 | 27 | 99 | 38 | 122 | 0 | **0** |
+| cobra | 99.9% (1537/1538) | 1536 | 0 | 8 | 0 | 7 | 0 | **0** |
+| grpc-go | 98.0% (350/357) | 350 | 378 | 100 | 0 | 12 | 0 | **0** |
+| ripgrep | 100.0% (709/709) | 709 | 9 | 43 | 4 | 0 | 0 | **0** |
+| cursive | 100.0% (322/322) | 321 | 9 | 299 | 0 | 0 | 8 | **0** |
+| gson | 96.1% (270/281) | 270 | 136 | 73 | 0 | 38 | 0 | **0** |

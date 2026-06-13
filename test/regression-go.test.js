@@ -5511,3 +5511,51 @@ describe('fix #221: Go function references carry functionReference in JSON', () 
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #223: Go selector-call line attribution follows the name-node
+// convention (#201/RUST-2) — a method call on a multi-line receiver
+// ((&pkg.Name{...}).String()) reports the FIELD's own line, not the
+// chain-start line. The account's ground set and the oracle eval key by the
+// name's line; Go was the only parser still using the call node's start
+// (grpc-go-measured: the callee arm's single missing-unexplained edge).
+// ============================================================================
+
+describe('fix #223: Go multi-line receiver method call reports the field line', () => {
+    it('(&Name{...}).String() across lines records String at its own line', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'main.go': [
+                'package main',                  // 1
+                '',                              // 2
+                'type Name struct {',            // 3
+                '\tID string',                   // 4
+                '}',                             // 5
+                '',                              // 6
+                'func (n *Name) String() string { return n.ID }', // 7
+                '',                              // 8
+                'func Build(id string) string {',// 9
+                '\treturn (&Name{',              // 10
+                '\t\tID: id,',                   // 11
+                '\t}).String()',                 // 12
+                '}',                             // 13
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { getCachedCalls } = require('../core/callers');
+            const file = [...index.files.keys()].find(f => f.endsWith('main.go'));
+            const calls = getCachedCalls(index, file) || [];
+            const stringCall = calls.find(c => c.name === 'String' && c.isMethod);
+            assert.ok(stringCall, 'String call captured');
+            assert.strictEqual(stringCall.line, 12, 'reported at the field line, not the chain start');
+            // The callee answer claims the site (trace-down contract)
+            const def = index.symbols.get('Build')[0];
+            const callees = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            const claimed = callees.some(e => e.sites && e.sites.includes(12)) ||
+                (callees.unverifiedCallees || []).some(u => u.sites.includes(12));
+            assert.ok(claimed, 'site visible in the callee answer');
+            assert.ok(callees.calleeAccount.conserved, 'callee account conserved');
+        } finally { rm(dir); }
+    });
+});

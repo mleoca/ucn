@@ -2366,6 +2366,66 @@ function findCallees(index, def, options = {}) {
         let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
         let selfMethodCalls = null; // collected for Python self.method() resolution
 
+        // Callee conservation account (trace-down contract): every call record
+        // in the def's scope lands in exactly one bucket — confirmed callee
+        // edge, retained unverified entry (visible, with reason), external/
+        // builtin, excluded-with-reason, or display-filtered. The unit is the
+        // call RECORD (a line may hold several); siteIds (record ordinals)
+        // keep the arithmetic exact when one record yields multiple edges
+        // (same-name overload fan-out). collectAccount-gated: legacy callers
+        // of findCallees (context/about/smart) see byte-identical results.
+        const collectAccount = !!options.collectAccount;
+        const calleeAccount = collectAccount ? {
+            totalSites: 0,
+            confirmed: 0,
+            unverified: 0,
+            external: { count: 0, sample: [] },
+            excluded: { total: 0, byReason: {} },
+            filtered: { count: 0, byReason: {} },
+        } : null;
+        const claimedSiteIds = collectAccount ? new Set() : null;
+        const unverifiedCallees = collectAccount ? new Map() : null; // name|reason -> entry
+        const noteSite = (siteId, bucket, reason, call) => {
+            if (!calleeAccount || claimedSiteIds.has(siteId)) return;
+            claimedSiteIds.add(siteId);
+            if (bucket === 'confirmed') {
+                calleeAccount.confirmed++;
+            } else if (bucket === 'unverified') {
+                calleeAccount.unverified++;
+            } else if (bucket === 'external') {
+                calleeAccount.external.count++;
+                if (call && calleeAccount.external.sample.length < 3) {
+                    calleeAccount.external.sample.push({ name: call.name, line: call.line });
+                }
+            } else if (bucket === 'excluded') {
+                const r = reason || 'excluded';
+                calleeAccount.excluded.total++;
+                if (!calleeAccount.excluded.byReason[r]) calleeAccount.excluded.byReason[r] = 0;
+                calleeAccount.excluded.byReason[r]++;
+            } else if (bucket === 'filtered') {
+                const r = reason || 'filtered';
+                calleeAccount.filtered.count++;
+                if (!calleeAccount.filtered.byReason[r]) calleeAccount.filtered.byReason[r] = 0;
+                calleeAccount.filtered.byReason[r]++;
+            }
+        };
+        // Retain an uncertain/unresolved call as a visible unverified callee
+        // entry (aggregated by name+reason) and claim its site.
+        const noteUnverified = (siteId, call, reason) => {
+            if (!collectAccount || claimedSiteIds.has(siteId)) return;
+            noteSite(siteId, 'unverified', reason, call);
+            const key = `${call.name}|${reason}`;
+            let entry = unverifiedCallees.get(key);
+            if (!entry) {
+                const defs = index.symbols.get(call.name) || [];
+                const owners = defs.filter(s => !NON_CALLABLE_TYPES.has(s.type)).length;
+                entry = { name: call.name, reason, callCount: 0, sites: [], ownerCount: owners };
+                unverifiedCallees.set(key, entry);
+            }
+            entry.callCount++;
+            entry.sites.push(call.line);
+        };
+
         // Build local variable type map for receiver resolution
         // Scans for patterns like: bt = Backtester(...) → bt maps to Backtester
         let localTypes = null;
@@ -2375,7 +2435,10 @@ function findCallees(index, def, options = {}) {
             localTypes = _buildTypedLocalTypeMap(index, def, calls);
         }
 
+        let siteOrdinal = -1;
         for (const call of calls) {
+            siteOrdinal++;
+            const siteId = siteOrdinal;
             // Filter to calls within this function's scope
             // Method 1: Direct match via enclosingFunction (fast path for direct calls)
             const isDirectMatch = call.enclosingFunction &&
@@ -2388,6 +2451,7 @@ function findCallees(index, def, options = {}) {
             const isNestedCallback = isInRange && !isInInnerSymbol && !isDirectMatch;
 
             if (!isDirectMatch && !isNestedCallback) continue;
+            if (calleeAccount) calleeAccount.totalSites++;
 
             // Smart method call handling:
             // - Go: include all method calls (Go doesn't use this/self/cls)
@@ -2431,9 +2495,15 @@ function findCallees(index, def, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
+                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                         } else {
-                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1 });
+                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                         }
+                    } else if (collectAccount) {
+                        // Locally-typed receiver, but the type defines no such
+                        // method in the index — visible, never silently dropped.
+                        noteUnverified(siteId, call, 'uncertain-receiver');
                     }
                     continue;
                 } else if (call.receiverType) {
@@ -2467,8 +2537,10 @@ function findCallees(index, def, options = {}) {
                         const existing = callees.get(key);
                         if (existing) {
                             existing.count += 1;
+                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                         } else {
-                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1 });
+                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                         }
                         continue;
                     }
@@ -2516,22 +2588,29 @@ function findCallees(index, def, options = {}) {
                                 const existing = callees.get(key);
                                 if (existing) {
                                     existing.count += 1;
+                                    if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                                 } else {
-                                    callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1 });
+                                    callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                                        ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                                 }
                                 continue;
                             }
                         }
                         // Import resolved but no project definition matches — external call, skip
+                        noteSite(siteId, 'external', null, call);
                         continue;
                     }
                 } else if (langTraits(language)?.methodCallInclusion === 'explicit' && !options.includeMethods) {
+                    noteSite(siteId, 'filtered', 'method-calls-excluded', call);
                     continue;
                 }
             }
 
             // Skip keywords and built-ins
-            if (index.isKeyword(call.name, language)) continue;
+            if (index.isKeyword(call.name, language)) {
+                noteSite(siteId, 'external', null, call);
+                continue;
+            }
 
             // Use resolved name (from alias tracking) if available
             // For multi-target aliases (ternary), pick the first that exists in symbol table
@@ -2551,11 +2630,15 @@ function findCallees(index, def, options = {}) {
                 const syms = index.symbols.get(effectiveName);
                 if (!syms || !syms.some(s =>
                     ['function', 'method', 'constructor', 'static', 'public', 'abstract'].includes(s.type))) {
+                    // Argument-position name with no function definition — a
+                    // local variable or data, positively not a callee edge.
+                    noteSite(siteId, 'excluded', 'callback-no-evidence', call);
                     continue;
                 }
                 const hasBinding = fileEntry?.bindings?.some(b => b.name === call.name);
                 const inSameFile = syms.some(s => s.file === def.file);
                 if (!hasBinding && !inSameFile) {
+                    noteSite(siteId, 'excluded', 'callback-no-evidence', call);
                     continue;
                 }
             }
@@ -2563,21 +2646,21 @@ function findCallees(index, def, options = {}) {
             // Collect selfAttribute calls for second-pass resolution
             if (call.selfAttribute && language === 'python') {
                 if (!selfAttrCalls) selfAttrCalls = [];
-                selfAttrCalls.push(call);
+                selfAttrCalls.push({ call, siteId });
                 continue;
             }
 
             // Collect self/this.method() calls for same-class resolution
             if (call.isMethod && ['self', 'cls', 'this'].includes(call.receiver)) {
                 if (!selfMethodCalls) selfMethodCalls = [];
-                selfMethodCalls.push(call);
+                selfMethodCalls.push({ call, siteId });
                 continue;
             }
 
             // Collect super().method() calls for parent-class resolution
             if (call.isMethod && call.receiver === 'super') {
                 if (!selfMethodCalls) selfMethodCalls = [];
-                selfMethodCalls.push(call);
+                selfMethodCalls.push({ call, siteId });
                 continue;
             }
 
@@ -2585,6 +2668,7 @@ function findCallees(index, def, options = {}) {
             let calleeKey = call.bindingId || effectiveName;
             let bindingResolved = call.bindingId;
             let isUncertain = call.uncertain;
+            let uncertainReason = null; // account-mode reason for the unverified bucket
             if (!call.bindingId && fileEntry?.bindings) {
                 let bindings = fileEntry.bindings.filter(b => b.name === call.name);
                 // For Go, also check sibling files in same directory (same package scope)
@@ -2635,9 +2719,11 @@ function findCallees(index, def, options = {}) {
                                     bindingResolved = matchingDef.bindingId;
                                 } else {
                                     isUncertain = true;
+                                    uncertainReason = 'method-ambiguous';
                                 }
                             } else {
                                 isUncertain = true;
+                                uncertainReason = 'method-ambiguous';
                             }
                         }
                     }
@@ -2664,21 +2750,48 @@ function findCallees(index, def, options = {}) {
                 } else if (bindings.length > 1) {
                     if (call.name === def.name) {
                         // Calling same-name function (e.g., Java overloads)
-                        // Add ALL other overloads as potential callees
-                        const otherBindings = bindings.filter(b =>
+                        // Add ALL other overloads as potential callees.
+                        // A RECEIVER-QUALIFIED same-name call names its type
+                        // (Rust `Patterns::from_low_args(...)`, Go `T.M(...)`)
+                        // — resolve to the matching class's binding instead of
+                        // spraying every same-name def (#223, ripgrep-measured
+                        // on the callee eval arm: HiArgs::from_low_args calls
+                        // three sibling types' from_low_args — every def was
+                        // claimed at all three sites). Variable receivers match
+                        // no class → unchanged full fan-out; bare calls (Java
+                        // implicit-this overloads) keep fanning out.
+                        let otherBindings = bindings.filter(b =>
                             b.startLine !== def.startLine
                         );
+                        const fanReceiver = call.receiver || call.receiverType;
+                        if (fanReceiver && otherBindings.length > 1) {
+                            const symsForName = index.symbols.get(call.name) || [];
+                            const classMatched = otherBindings.filter(b => {
+                                const bSym = symsForName.find(s => s.bindingId === b.id);
+                                const cls = bSym && (bSym.className ||
+                                    (bSym.receiver && bSym.receiver.replace(/^\*/, '')));
+                                return cls === fanReceiver;
+                            });
+                            if (classMatched.length > 0) otherBindings = classMatched;
+                        }
                         for (const ob of otherBindings) {
                             const existing = callees.get(ob.id);
                             if (existing) {
                                 existing.count += 1;
+                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                             } else {
                                 callees.set(ob.id, {
                                     name: effectiveName,
                                     bindingId: ob.id,
-                                    count: 1
+                                    count: 1,
+                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] })
                                 });
                             }
+                        }
+                        if (otherBindings.length === 0) {
+                            // All same-name bindings are the def itself — a
+                            // recursive self-call, never a callee edge.
+                            noteSite(siteId, 'excluded', 'self-recursion', call);
                         }
                         continue; // Already added all overloads, skip normal add
                     } else if (def.className && !call.isMethod) {
@@ -2699,9 +2812,11 @@ function findCallees(index, def, options = {}) {
                                 }
                             } else {
                                 isUncertain = true;
+                                uncertainReason = 'binding-ambiguous';
                             }
                         } else {
                             isUncertain = true;
+                            uncertainReason = 'binding-ambiguous';
                         }
                     } else {
                         // Try to resolve to a binding defined within the parent function's
@@ -2714,25 +2829,47 @@ function findCallees(index, def, options = {}) {
                             calleeKey = bindingResolved;
                         } else {
                             isUncertain = true;
+                            uncertainReason = 'binding-ambiguous';
                         }
                     }
                 }
             }
 
-            if (isUncertain && !options.includeUncertain) {
-                if (options.stats) options.stats.uncertain = (options.stats.uncertain || 0) + 1;
-                continue;
+            if (isUncertain) {
+                if (collectAccount) {
+                    // Contract mode: uncertain callee edges are never silently
+                    // dropped NOR silently confirmed — visible unverified
+                    // entries with a reason. --include-uncertain is an implied
+                    // no-op here (the caller-contract precedent).
+                    if (options.stats) options.stats.uncertain = (options.stats.uncertain || 0) + 1;
+                    noteUnverified(siteId, call, uncertainReason || 'uncertain-receiver');
+                    continue;
+                }
+                if (!options.includeUncertain) {
+                    if (options.stats) options.stats.uncertain = (options.stats.uncertain || 0) + 1;
+                    continue;
+                }
             }
 
             const existing = callees.get(calleeKey);
             if (existing) {
                 existing.count += 1;
+                if (collectAccount) {
+                    existing.sites.push(call.line);
+                    existing.siteIds.push(siteId);
+                    if (call.isPotentialCallback || call.isFunctionReference) existing.isFunctionReference = true;
+                }
             } else {
                 callees.set(calleeKey, {
                     name: effectiveName,
                     bindingId: bindingResolved,
                     count: 1,
-                    ...(call.isConstructor && { isConstructor: true })
+                    ...(call.isConstructor && { isConstructor: true }),
+                    ...(collectAccount && {
+                        sites: [call.line],
+                        siteIds: [siteId],
+                        ...((call.isPotentialCallback || call.isFunctionReference) && { isFunctionReference: true }),
+                    })
                 });
             }
         }
@@ -2741,7 +2878,7 @@ function findCallees(index, def, options = {}) {
         // Respect includeMethods=false — skip self/this method resolution entirely
         if (selfAttrCalls && def.className && options.includeMethods !== false) {
             const attrTypes = getInstanceAttributeTypes(index, def.file, def.className);
-            for (const call of selfAttrCalls) {
+            for (const { call, siteId } of selfAttrCalls) {
                     let targetClass = attrTypes ? attrTypes.get(call.selfAttribute) : null;
                     // Unique method heuristic: if attr type unknown but method exists on exactly one class
                     if (!targetClass) {
@@ -2756,36 +2893,45 @@ function findCallees(index, def, options = {}) {
                             }
                         }
                     }
-                    if (!targetClass) continue;
+                    if (!targetClass) { noteUnverified(siteId, call, 'self-attr-unresolved'); continue; }
 
                     // Find method in symbol table where className matches
                     const symbols = index.symbols.get(call.name);
-                    if (!symbols) continue;
+                    if (!symbols) { noteUnverified(siteId, call, 'self-attr-unresolved'); continue; }
 
                     const match = symbols.find(s => s.className === targetClass);
-                    if (!match) continue;
+                    if (!match) { noteUnverified(siteId, call, 'self-attr-unresolved'); continue; }
 
                     const key = match.bindingId || `${targetClass}.${call.name}`;
                     const existing = callees.get(key);
                     if (existing) {
                         existing.count += 1;
+                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                     } else {
                         callees.set(key, {
                             name: call.name,
                             bindingId: match.bindingId,
-                            count: 1
+                            count: 1,
+                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] })
                         });
                     }
                 }
+        } else if (selfAttrCalls && collectAccount) {
+            // Pass skipped (no class context, or methods display-filtered):
+            // claim the sites so the account stays conserved.
+            for (const { call, siteId } of selfAttrCalls) {
+                if (options.includeMethods === false) noteSite(siteId, 'filtered', 'method-calls-excluded', call);
+                else noteUnverified(siteId, call, 'self-attr-unresolved');
+            }
         }
 
         // Third pass: resolve self/this/super.method() calls to same-class or parent methods
         // Falls back to walking the inheritance chain if not found in same class
         // Respect includeMethods=false — skip self/this method resolution entirely
         if (selfMethodCalls && def.className && options.includeMethods !== false) {
-            for (const call of selfMethodCalls) {
+            for (const { call, siteId } of selfMethodCalls) {
                 const symbols = index.symbols.get(call.name);
-                if (!symbols) continue;
+                if (!symbols) { noteUnverified(siteId, call, 'inherited-unresolved'); continue; }
 
                 // For super().method(), skip same-class — start from parent
                 let match = call.receiver === 'super'
@@ -2813,19 +2959,26 @@ function findCallees(index, def, options = {}) {
                     }
                 }
 
-                if (!match) continue;
+                if (!match) { noteUnverified(siteId, call, 'inherited-unresolved'); continue; }
 
                 const key = match.bindingId || `${match.className}.${call.name}`;
                 const existing = callees.get(key);
                 if (existing) {
                     existing.count += 1;
+                    if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                 } else {
                     callees.set(key, {
                         name: call.name,
                         bindingId: match.bindingId,
-                        count: 1
+                        count: 1,
+                        ...(collectAccount && { sites: [call.line], siteIds: [siteId] })
                     });
                 }
+            }
+        } else if (selfMethodCalls && collectAccount) {
+            for (const { call, siteId } of selfMethodCalls) {
+                if (options.includeMethods === false) noteSite(siteId, 'filtered', 'method-calls-excluded', call);
+                else noteUnverified(siteId, call, 'inherited-unresolved');
             }
         }
 
@@ -2840,9 +2993,21 @@ function findCallees(index, def, options = {}) {
         // Pre-compute import graph for callee confidence scoring
         const callerImportSet = index.importGraph.get(def.file) || new Set();
 
-        for (const { name: calleeName, bindingId, count, isConstructor } of callees.values()) {
+        for (const { name: calleeName, bindingId, count, isConstructor, sites, siteIds, isFunctionReference } of callees.values()) {
+            const claimSites = (bucket, reason) => {
+                if (!collectAccount || !siteIds) return;
+                for (let i = 0; i < siteIds.length; i++) {
+                    noteSite(siteIds[i], bucket, reason, { name: calleeName, line: sites[i] });
+                }
+            };
             const symbols = index.symbols.get(calleeName);
-            if (symbols && symbols.length > 0) {
+            if (!symbols || symbols.length === 0) {
+                // Name not in the symbol table — external library, builtin, or
+                // unindexed code. Visible in the callee account, not an edge.
+                claimSites('external', null);
+                continue;
+            }
+            if (symbols.length > 0) {
                 let callee = symbols[0];
 
                 // If we have a binding ID, find the exact matching symbol
@@ -2940,7 +3105,10 @@ function findCallees(index, def, options = {}) {
                     const isFuncField = callee.type === 'field' && callee.fieldType &&
                         /^func\b/.test(callee.fieldType);
                     // Constructor calls (new Foo()) are always callable regardless of type
-                    if (!isFuncField && !isConstructor) continue;
+                    if (!isFuncField && !isConstructor) {
+                        claimSites('excluded', 'non-callable-shadow');
+                        continue;
+                    }
                 }
 
                 // Skip test-file callees when caller is production code and
@@ -2948,6 +3116,7 @@ function findCallees(index, def, options = {}) {
                 if (!callerIsTest && !bindingId) {
                     const calleeFileEntry = index.files.get(callee.file);
                     if (calleeFileEntry && isTestFile(calleeFileEntry.relativePath, calleeFileEntry.language)) {
+                        claimSites('excluded', 'test-file-no-import-link');
                         continue;
                     }
                 }
@@ -2958,18 +3127,42 @@ function findCallees(index, def, options = {}) {
                         (callee.file === def.file) || callerImportSet.has(callee.file),
                     isUncertain: false, // uncertain callees already filtered above
                 });
+                claimSites('confirmed', null);
                 result.push({
                     ...callee,
                     callCount: count,
                     weight: index.calculateWeight(count),
                     confidence: calleeScored.confidence,
                     resolution: calleeScored.resolution,
+                    ...(collectAccount && {
+                        tier: TIER.CONFIRMED,
+                        sites: [...sites].sort((a, b) => a - b),
+                        ...(isFunctionReference && { functionReference: true }),
+                    }),
                 });
             }
         }
 
         // Sort by call count (core dependencies first)
         result.sort((a, b) => b.callCount - a.callCount);
+
+        if (calleeAccount) {
+            const claimed = calleeAccount.confirmed + calleeAccount.unverified +
+                calleeAccount.external.count + calleeAccount.excluded.total +
+                calleeAccount.filtered.count;
+            calleeAccount.unaccounted = calleeAccount.totalSites - claimed;
+            calleeAccount.conserved = calleeAccount.unaccounted === 0;
+            // Stable ordering (output contract): by name, then reason.
+            const unverifiedList = [...unverifiedCallees.values()]
+                .map(e => ({ ...e, sites: [...e.sites].sort((a, b) => a - b) }))
+                .sort((a, b) => a.name.localeCompare(b.name) || a.reason.localeCompare(b.reason));
+            Object.defineProperty(result, 'calleeAccount', {
+                value: calleeAccount, enumerable: false, writable: true, configurable: true,
+            });
+            Object.defineProperty(result, 'unverifiedCallees', {
+                value: unverifiedList, enumerable: false, writable: true, configurable: true,
+            });
+        }
 
         return result;
     } catch (e) {

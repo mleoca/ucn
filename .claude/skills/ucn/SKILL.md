@@ -57,7 +57,10 @@ Walks UP the caller chain recursively. Shows the full tree of functions affected
 ucn blast helper                     # callers of callers (depth 3)
 ucn blast helper --depth=5           # deeper chain
 ucn blast helper --exclude=test      # skip test callers
+ucn blast helper --expand-unverified # follow unverified edges too (marked ⚠, possible impact)
 ```
+
+The tree trunk is confirmed-evidence-only; dispatch-possible/ambiguous caller candidates appear in an `UNVERIFIED EDGES` section (see "Reading Tiered Output" below).
 
 ### 4. `trace` — Understand execution flow (downward)
 
@@ -214,7 +217,7 @@ ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pyte
 
 `audit-async` is the focused tool for the `awaited=false` case across an entire async function body.
 
-## Reading Tiered Output (about / context / impact)
+## Reading Tiered Output (about / context / impact / trace / blast / reverse-trace / affected-tests)
 
 Caller answers are a **partition of every text occurrence** of the symbol — nothing is silently hidden. Sections:
 
@@ -229,7 +232,17 @@ Caller answers are a **partition of every text occurrence** of the symbol — no
 
 Resolution labels in `evidence:` lines (high to low): `exact-binding` (0.98, import/binding evidence) · `same-class` (0.92) · `receiver-hint` (0.80, inferred receiver type) · `scope-match` (0.65, import/receiver-binding scope evidence) · `name-only` (0.40) · `uncertain` (0.25). Confirmed tier = scope-match and above. JSON output keeps per-edge decimals plus `tier`.
 
-Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain`/`--include-methods` are **implied no-ops** for about/context/impact (everything is shown, tiered); they keep their meaning for `trace`/`blast`/`smart`/`verify`/`reverse-trace`/`affected-tests`.
+Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain` is an **implied no-op** for about/context/impact/trace/blast/reverse-trace/affected-tests (everything is shown, tiered); it keeps its meaning for `smart`/`verify`. `--include-methods` is an implied no-op for about/context/impact.
+
+### Tree commands (trace / blast / reverse-trace / affected-tests)
+
+The tree trunk holds **confirmed edges only**. Unverified caller candidates render in an `UNVERIFIED EDGES` section with parent attribution (`at <node> (hop N): file:line [enclosing fn] (reason)`) and are **not expanded by default** — pass `--expand-unverified` to follow them; every downstream node is then marked `[⚠ via <reason>]` / `[⚠ unverified chain]` and counted as *possibly affected*, never confirmed. Unresolved callee calls (`trace` down) render as `[unverified] name — reason` leaves under their node. Reconciliation lines:
+
+- `ACCOUNT:` — the root hop's text-ground partition (same as context/impact).
+- `TREE ACCOUNT:` — interior conservation: nodes expanded, confirmed/unverified/excluded edge counts by reason, depth-limit cuts.
+- `CALLEE ACCOUNT:` (trace down) — every call site in every expanded node lands in confirmed/unverified/external/excluded/filtered.
+
+`reverse-trace` marks `★ entry point` only when a node has **zero candidates in both tiers**; zero confirmed with unverified candidates shows `⚠ no confirmed callers — N unverified` instead. `affected-tests` splits its answer into the confirmed band (`Test files to run`, coverage, `Uncovered`) and a `POSSIBLY AFFECTED` band (functions + test files reachable only through unverified chains).
 
 ## Symbol Handles (stable IDs)
 
@@ -265,6 +278,7 @@ ucn [target] <command> [name] [--flags]
 | `--in=src/core` | Limit search to a subdirectory |
 | `--depth=N` | Control tree depth for `trace`, `graph`, and detail level for `find` (default 3). Also expands all children — no breadth limit |
 | `--all` | Expand truncated sections. Applies to `about`, `blast`, `trace`, `reverse-trace`, `related`, `find`, `toc`, `fn`, `class`, `graph`, `diff-impact` |
+| `--expand-unverified` | `blast`/`reverse-trace`: follow unverified caller edges in the tree. Downstream nodes are marked as unverified chains — possible, not confirmed, impact |
 | `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
 | `--exclude-tests` | Exclude test entries from `entrypoints` (tests are included by default since they ARE entry points). |
 | `--include-methods` | Include `obj.method()` calls in caller/callee analysis. Implied (no-op) for `about`/`context`/`impact` — method calls are always analyzed and tiered by receiver evidence. Applies to `verify`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |

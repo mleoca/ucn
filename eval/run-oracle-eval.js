@@ -36,6 +36,7 @@ const fs = require('fs');
 const path = require('path');
 
 const { ProjectIndex } = require('../core/project');
+const { getCachedCalls } = require('../core/callers');
 const { execute } = require('../core/execute');
 const output = require('../core/output');
 const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
@@ -87,6 +88,16 @@ const SYMBOL_KINDS = ['function', 'method', 'class'];
 
 function emptyPlacement() {
     return { confirmed: 0, unverified: 0, reportedNonCall: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 };
+}
+
+// Callee-arm placement (trace-down contract): every oracle call edge X←D,
+// re-read from D's side — UCN's findCallees(D) answer must show it (confirmed
+// edge site / unverified entry site) or account for it (conserved bucket).
+// moduleLevel = call site outside any function — findCallees' universe is
+// function scopes by design (trace can never reach it).
+function emptyCalleePlacement() {
+    return { confirmed: 0, confirmedOtherDef: 0, unverified: 0, accounted: 0,
+        moduleLevel: 0, missingExplained: 0, missingBeyondText: 0, missingUnexplained: 0 };
 }
 
 function emptyKindTotals() {
@@ -162,6 +173,9 @@ async function evaluateRepo(repo, oracle) {
     };
     const byKind = new Map(SYMBOL_KINDS.map(k => [k, emptyKindTotals()]));
     const unexplainedSamples = [];
+    const calleeAnswerCache = new Map();
+    const calleeUnexplainedSamples = [];
+    const calleeTotals = { sites: 0, hits: 0, placement: emptyCalleePlacement() };
 
     for (const sym of sampled) {
         const oracleRefs = refCache.get(sym) || [];
@@ -249,12 +263,90 @@ async function evaluateRepo(repo, oracle) {
             }
         }
 
+        // ── Callee arm (trace-down contract) ──────────────────────────
+        // The same oracle edges, verified from the CALLER's side: for each
+        // oracle call ref of X, the enclosing function D's callee answer
+        // (findCallees collectAccount — the trace-down engine path) must
+        // show or account for the site. Precision: every confirmed callee
+        // site D→X is checked against the oracle refs (function-reference
+        // sites verify against any-kind refs — the #221 usage-style rule;
+        // class-kind constructor edges likewise per #218f).
+        const calleePlacement = emptyCalleePlacement();
+        let calleeSites = 0, calleeHits = 0;
+        {
+            const seenPrecisionDefs = new Set();
+            for (const oc of oracleCalls) {
+                if (!indexedFiles.has(oc.file)) { calleePlacement.missingExplained++; continue; }
+                const absFile = path.join(index.root, oc.file);
+                const encl = index.findEnclosingFunction(absFile, oc.line, true);
+                if (!encl) { calleePlacement.moduleLevel++; continue; }
+                const dKey = `${absFile}:${encl.startLine}`;
+                let ucnCallees = calleeAnswerCache.get(dKey);
+                if (!ucnCallees) {
+                    ucnCallees = index.findCallees({ ...encl, file: absFile }, {
+                        includeMethods: true, collectAccount: true,
+                    });
+                    calleeAnswerCache.set(dKey, ucnCallees);
+                }
+                // Precision over D's confirmed edges pinned to THIS symbol —
+                // once per (symbol, D) pair.
+                if (!seenPrecisionDefs.has(dKey)) {
+                    seenPrecisionDefs.add(dKey);
+                    for (const e of ucnCallees) {
+                        if (e.name !== sym.name || e.relativePath !== sym.file || e.startLine !== sym.line) continue;
+                        for (const siteLine of e.sites || []) {
+                            calleeSites++;
+                            const k = key(oc.file, siteLine);
+                            if (oracleKeys.has(k) ||
+                                ((e.functionReference || sym.kind === 'class') && anyRefKeys.has(k))) {
+                                calleeHits++;
+                            }
+                        }
+                    }
+                }
+                // Placement of this oracle edge in D's answer
+                const exactEdge = ucnCallees.find(e =>
+                    e.name === sym.name && e.sites && e.sites.includes(oc.line) &&
+                    e.relativePath === sym.file && e.startLine === sym.line);
+                if (exactEdge) { calleePlacement.confirmed++; continue; }
+                const otherDefEdge = ucnCallees.find(e =>
+                    e.name === sym.name && e.sites && e.sites.includes(oc.line));
+                if (otherDefEdge) { calleePlacement.confirmedOtherDef++; continue; }
+                const unvEntry = (ucnCallees.unverifiedCallees || []).find(u =>
+                    u.sites && u.sites.includes(oc.line));
+                if (unvEntry) { calleePlacement.unverified++; continue; }
+                if (!lineMatchesSymbol(index.root, oc.file, oc.line, sym.name)) {
+                    calleePlacement.missingBeyondText++;
+                    continue;
+                }
+                // Conserved account + a call record at the line ⇒ the site is
+                // claimed by SOME bucket (external/excluded/filtered) — visible
+                // in the callee account, not a silent gap.
+                const acct = ucnCallees.calleeAccount;
+                const records = getCachedCalls(index, absFile) || [];
+                const hasRecord = records.some(c => c.line === oc.line &&
+                    c.line >= encl.startLine && c.line <= encl.endLine);
+                if (acct && acct.conserved && hasRecord) {
+                    calleePlacement.accounted++;
+                } else {
+                    calleePlacement.missingUnexplained++;
+                    if (calleeUnexplainedSamples.length < 10) {
+                        calleeUnexplainedSamples.push({ symbol: sym.name, edge: key(oc.file, oc.line), enclosing: encl.name });
+                    }
+                }
+            }
+        }
+
         // Zero-trustworthiness
         const ucnZero = confirmed.length === 0 && unverified.length === 0;
         if (ucnZero) {
             totals.zeroCases++;
             if (oracleCalls.length === 0) totals.zeroAgreed++;
         }
+
+        calleeTotals.sites += calleeSites;
+        calleeTotals.hits += calleeHits;
+        for (const k of Object.keys(calleePlacement)) calleeTotals.placement[k] += calleePlacement[k];
 
         totals.confirmedEdges += confirmed.length;
         totals.confirmedHits += confirmedHits;
@@ -281,6 +373,8 @@ async function evaluateRepo(repo, oracle) {
             confirmed: confirmed.length, confirmedHits,
             unverified: unverified.length, unverifiedHits,
             placement,
+            calleePlacement,
+            calleeSites, calleeHits,
             conserved: account ? account.conserved : null,
         });
     }
@@ -327,6 +421,13 @@ async function evaluateRepo(repo, oracle) {
         zeroTrustworthiness: totals.zeroCases ? rate(totals.zeroAgreed, totals.zeroCases) : null,
         zeroCases: totals.zeroCases,
         conservedRate: rate(totals.conserved, totals.evaluated),
+        // Callee arm (trace-down contract)
+        calleePrecision: rate(calleeTotals.hits, calleeTotals.sites),
+        calleeSites: calleeTotals.sites,
+        calleeHits: calleeTotals.hits,
+        calleePlacement: calleeTotals.placement,
+        calleeMissingUnexplained: calleeTotals.placement.missingUnexplained,
+        calleeUnexplainedSamples,
     };
 
     process.stdout.write(`  tier1Precision ${pct(summary.tier1Precision)} | unverifiedPrecision ${pct(summary.unverifiedPrecision)} | ` +
@@ -338,8 +439,13 @@ async function evaluateRepo(repo, oracle) {
             `unverified ${pct(k.unverifiedPrecision)} (${k.unverifiedHits}/${k.unverifiedEdges}) | ` +
             `placement ${JSON.stringify(k.oraclePlacement)}\n`);
     }
+    process.stdout.write(`  callee arm: precision ${pct(summary.calleePrecision)} (${summary.calleeHits}/${summary.calleeSites}) | ` +
+        `placement ${JSON.stringify(summary.calleePlacement)}\n`);
     if (summary.missingUnexplained > 0) {
         process.stdout.write(`  ⚠ GATE FAILURE: ${summary.missingUnexplained} oracle call edge(s) unexplained: ${JSON.stringify(unexplainedSamples.slice(0, 3))}\n`);
+    }
+    if (summary.calleeMissingUnexplained > 0) {
+        process.stdout.write(`  ⚠ CALLEE GATE FAILURE: ${summary.calleeMissingUnexplained} oracle edge(s) unexplained in callee answers: ${JSON.stringify(calleeUnexplainedSamples.slice(0, 3))}\n`);
     }
 
     if (oracle.dispose) {
@@ -398,6 +504,7 @@ async function main() {
             const result = await evaluateRepo(repo, oracle);
             results.push(result);
             if (result.summary.missingUnexplained > 0) gateFailed = true;
+            if (result.summary.calleeMissingUnexplained > 0) gateFailed = true;
             if (minPrecision != null && result.summary.tier1Precision < minPrecision) {
                 process.stdout.write(`  ⚠ PRECISION GATE FAILURE: tier1 ${pct(result.summary.tier1Precision)} < floor ${pct(minPrecision)}\n`);
                 gateFailed = true;
@@ -441,6 +548,22 @@ async function main() {
         for (const [kind, k] of Object.entries(s.byKind)) {
             lines.push(`| ${s.repo} | ${kind} | ${k.sampled} | ${k.oracleCallEdges} | ${pct(k.tier1Precision)} (${k.confirmedHits}/${k.confirmedEdges}) | ${pct(k.unverifiedPrecision)} (${k.unverifiedHits}/${k.unverifiedEdges}) | ${k.tierSeparation ?? 'n/a'} | ${JSON.stringify(k.oraclePlacement)} |`);
         }
+    }
+    lines.push('');
+    lines.push('## Callee arm (trace-down contract)');
+    lines.push('');
+    lines.push('The same oracle edges re-read from the CALLER side: for each oracle');
+    lines.push('call ref of a sampled symbol, the enclosing function\'s callee answer');
+    lines.push('(findCallees collectAccount — the trace-down engine path) must show');
+    lines.push('the site (confirmed edge / unverified entry) or account for it');
+    lines.push('(conserved bucket). `callee-missing-unexplained` gates at 0.');
+    lines.push('');
+    lines.push('| repo | callee precision | confirmed | other-def | unverified | accounted | module-level | beyond-text | **missing-unexplained** |');
+    lines.push('|---|---|---|---|---|---|---|---|---|');
+    for (const { summary: s } of results) {
+        if (s.error || !s.calleePlacement) continue;
+        const cp = s.calleePlacement;
+        lines.push(`| ${s.repo} | ${pct(s.calleePrecision)} (${s.calleeHits}/${s.calleeSites}) | ${cp.confirmed} | ${cp.confirmedOtherDef} | ${cp.unverified} | ${cp.accounted} | ${cp.moduleLevel} | ${cp.missingBeyondText} | **${cp.missingUnexplained}** |`);
     }
     lines.push('');
     const mdPath = path.join(REPORTS_DIR, `oracle-eval-rollup-${date}${seedSuffix}.md`);

@@ -609,3 +609,36 @@ describe('Cross-language endpoints: polyglot bridging', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('Cross-language: callee account conserves on every fixture symbol', () => {
+    forEachLanguage((lang) => {
+        it(`${lang}: every def's callee account partitions its call sites`, () => {
+            const dir = path.join(FIXTURES_PATH, lang);
+            if (!fs.existsSync(dir)) return;
+            const index = idx(dir);
+            const NON_CALLABLE = new Set(['class', 'struct', 'interface', 'type', 'field', 'impl', 'trait']);
+            let checked = 0;
+            for (const [, defs] of index.symbols) {
+                for (const def of defs) {
+                    if (NON_CALLABLE.has(def.type)) continue;
+                    const r = index.findCallees(def, { includeMethods: true, collectAccount: true });
+                    const a = r.calleeAccount;
+                    if (!a) continue;
+                    checked++;
+                    assert.ok(a.conserved,
+                        `${lang} ${def.name} (${def.relativePath}:${def.startLine}) not conserved: ${JSON.stringify(a)}`);
+                    // Legacy identity: collectAccount must not change the edge set
+                    const legacy = index.findCallees(def, { includeMethods: true });
+                    assert.strictEqual(
+                        r.map(c => `${c.name}:${c.file}:${c.startLine}`).join('|'),
+                        legacy.map(c => `${c.name}:${c.file}:${c.startLine}`).join('|'),
+                        `${lang} ${def.name}: account mode changed callee edges`);
+                    // Legacy edges carry no contract fields
+                    assert.ok(legacy.every(c => c.tier === undefined && c.sites === undefined),
+                        `${lang} ${def.name}: legacy callees must not carry tier/sites`);
+                }
+            }
+            assert.ok(checked > 0, `${lang}: no defs checked`);
+        });
+    });
+});
