@@ -280,7 +280,7 @@ flags.followSymlinks = !args.includes('--no-follow-symlinks');
 
 // Known flags for validation
 const knownFlags = new Set([
-    '--help', '-h', '--mcp',
+    '--help', '-h', '--version', '-v', '--mcp',
     '--json', '--verbose', '--no-quiet', '--quiet',
     '--code-only', '--with-types', '--top-level', '--exact', '--case-sensitive',
     '--no-cache', '--clear-cache', '--include-tests', '--exclude-tests',
@@ -301,6 +301,12 @@ const knownFlags = new Set([
 // Handle help flag
 if (args.includes('--help') || args.includes('-h')) {
     printUsage();
+    process.exit(0);
+}
+
+// Handle version flag — read from package.json (single source of truth, shared with MCP serverInfo)
+if (args.includes('--version') || args.includes('-v')) {
+    console.log(require('../package.json').version);
     process.exit(0);
 }
 
@@ -1577,6 +1583,7 @@ Common Flags:
   --staged            Analyze staged changes (diff-impact)
   --no-follow-symlinks  Don't follow symbolic links
   -i, --interactive   Keep index in memory for multiple queries
+  -v, --version       Print the UCN version and exit
 
 Quick Start:
   ucn toc                             # See project structure

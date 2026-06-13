@@ -6,8 +6,9 @@ __pycache__/
 CLAUDE.md
 AGENTS.md
 
-# Local Claude settings (not the skill)
-.claude/settings.local.json
+# Claude local/runtime files — keep only the tracked skill
+.claude/*
+!.claude/skills/
 
 # MCP registry tokens
 .mcpregistry_*
@@ -25,8 +26,10 @@ test/agent-understanding-benchmark-report.md
 test/bug-hunting/
 
 
-# Claude scheduled tasks
-.claude/scheduled_tasks.lock
-
 # Eval reports: JSON snapshots are large/regenerable; markdown roll-ups are committed
 eval/reports/*.json
+
+/.claude-plugin/
+/.agents/
+/plugins/
+/docs/skills-marketplace.md

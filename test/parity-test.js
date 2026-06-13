@@ -1039,7 +1039,7 @@ describe('Architecture Guards', () => {
         // CLI structural/mode flags not per-command — exempt from FLAG_APPLICABILITY
         const exemptFlags = new Set([
             'json', 'no-cache', 'clear-cache', 'interactive', 'i',
-            'help', 'h', 'version', 'mcp', 'no-quiet', 'quiet', 'verbose',
+            'help', 'h', 'version', 'v', 'mcp', 'no-quiet', 'quiet', 'verbose',
             'expand', 'not', 'no-follow-symlinks', 'no-regex', 'default',
             'max-files', 'max-chars', 'workers',
         ]);

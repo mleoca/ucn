@@ -1,9 +1,14 @@
 **/.ucn-cache/
 AGENTS.md
 CLAUDE.md
-.claude/settings.local.json
+.claude/*
+!.claude/skills/
+.claude-plugin/
+.agents/
+plugins/
 .mcpregistry_*
 .npmrc
+.github/
 demo/
 docs/
 eval/
