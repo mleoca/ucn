@@ -60,10 +60,10 @@ jobs:
       - name: Conservation eval (pinned repos)
         run: node eval/conservation-real.js
 
-      - name: Oracle eval (gate: missing-unexplained = 0)
+      - name: "Oracle eval (gate: missing-unexplained = 0)"
         run: node eval/run-oracle-eval.js
 
-      - name: Deadcode eval (gate: default-arm false-dead = 0)
+      - name: "Deadcode eval (gate: default-arm false-dead = 0)"
         run: node eval/run-deadcode-eval.js --sample 300
 
       - name: Upload reports
