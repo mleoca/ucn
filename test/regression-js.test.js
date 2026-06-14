@@ -6352,3 +6352,38 @@ describe('fix #222: parser-detected shadow excludes on every record shape', () =
         } finally { rm(dir); }
     });
 });
+
+describe('deadcode: TS method on out-of-tree base is not dead (fix: #210 analog)', () => {
+    it('hides a public method whose class extends an unresolved base; standalone stays claimable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                "import { Base } from 'some-external-pkg';",
+                '',
+                'class Widget extends Base {',          // non-exported, external base
+                '    customStep(): number { return 1; }',  // plain public method -> hidden (Rule B)
+                '}',
+                '',
+                'function orphanJs(): number { return 2; }',   // standalone, unused -> still dead
+                '',
+                'const w = new Widget();',              // keep the class itself referenced
+                'void w;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.deadcode();
+            const names = def.map(d => d.name);
+            assert.ok(!names.includes('customStep'),
+                `customStep's class extends an out-of-tree base — must not be claimed dead: ${names}`);
+            assert.strictEqual(def.excludedExternalContract, 1,
+                `exactly customStep is counted under excludedExternalContract: ${def.excludedExternalContract}`);
+            assert.ok(names.includes('orphanJs'),
+                `standalone unused function is still dead: ${names}`);
+            const exp = index.deadcode({ includeExported: true });
+            const r = exp.find(d => d.name === 'customStep');
+            assert.ok(r && r.externalContract === true,
+                'customStep revealed + labeled externalContract under includeExported');
+        } finally { rm(dir); }
+    });
+});

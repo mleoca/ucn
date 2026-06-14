@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
-const { NON_CALLABLE_TYPES } = require('./shared');
+const { NON_CALLABLE_TYPES, isOverrideMarked } = require('./shared');
 const { scoreEdge, tierForResolution, TIER } = require('./confidence');
 const { findGoModule } = require('./imports');
 
@@ -233,7 +233,7 @@ function findCallers(index, name, options = {}) {
             // `some`, not `every`: one marked overload proves the NAME exists
             // on an external contract — receiver identity is then unprovable
             // for every call shape (external signatures are invisible).
-            const marked = tDefs.find(d => _externalContractMarker(d));
+            const marked = tDefs.find(d => isOverrideMarked(d));
             if (marked) _extContract = { via: _externalContractVia(index, marked) };
         }
         return _extContract;
@@ -3838,7 +3838,7 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
         const next = [];
         for (const [abs, attr] of frontier) {
             if (targetFiles.has(abs)) return 'yes';
-            const stateKey = `${abs} ${attr}`;
+            const stateKey = `${abs}\x00${attr}`;
             if (visited.has(stateKey)) continue;
             visited.add(stateKey);
             const fe = index.files.get(abs);
@@ -4463,22 +4463,8 @@ function _targetAncestryFullyResolved(index, targetDefs) {
     return true;
 }
 
-/**
- * Explicit override marker on a method definition (fix #210). Marker fields
- * are language-disjoint: traitImpl is Rust-only, an 'override' modifier is
- * Java's lowercased @Override annotation, an override-bearing memberType is
- * TS's `override` keyword, and an override decorator is Python's
- * typing.@override. The marker is compiler-checked syntax in all four —
- * never inferred.
- */
-function _externalContractMarker(def) {
-    if (def.traitImpl) return true;
-    if (def.modifiers && def.modifiers.includes('override')) return true;
-    if (def.memberType && /\boverride\b/.test(def.memberType)) return true;
-    if (def.decorators && def.decorators.some(d =>
-        String(d).replace(/\(.*$/, '').split('.').pop() === 'override')) return true;
-    return false;
-}
+// _externalContractMarker moved to core/shared.js as isOverrideMarked (shared
+// with deadcode's out-of-tree override suppression — one source of truth).
 
 /**
  * Name of the external contract a marked method implements, for dispatch

@@ -194,7 +194,7 @@ function formatStatsJson(stats) {
  * @param {string} [options.exportedHint] - Hint about exported symbols exclusion
  */
 function formatDeadcode(results, options = {}) {
-    if (results.length === 0 && !results.excludedDecorated && !results.excludedExported) {
+    if (results.length === 0 && !results.excludedDecorated && !results.excludedExported && !results.excludedExternalContract) {
         return 'No dead code found.';
     }
 
@@ -232,7 +232,11 @@ function formatDeadcode(results, options = {}) {
         const declStr = item.declaredOn
             ? ` [declared on ${item.declaredOn.kind} ${item.declaredOn.name} — contract surface, not executable code]`
             : '';
-        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}${declStr}`);
+        // Revealed under --include-exported: mark as external-reachable, not dead.
+        const extStr = item.externalContract
+            ? ' [reachable via out-of-tree base — external contract, not dead]'
+            : '';
+        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}${declStr}${extStr}`);
     }
 
     if (hidden > 0) {
@@ -250,6 +254,10 @@ function formatDeadcode(results, options = {}) {
     if (results.excludedExported > 0) {
         const exportedHint = options.exportedHint || `${results.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.`;
         lines.push(`\n${exportedHint}`);
+    }
+    if (results.excludedExternalContract > 0) {
+        const extHint = options.externalContractHint || `${results.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use --include-exported to include them.`;
+        lines.push(`\n${extHint}`);
     }
 
     if (lines.length === 0) {
@@ -270,6 +278,7 @@ function formatDeadcodeJson(results) {
             count: results.length,
             ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
             ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
+            ...(results.excludedExternalContract > 0 && { excludedExternalContract: results.excludedExternalContract }),
             symbols: results.map(item => {
                 const handleSym = { ...item, relativePath: item.relativePath || item.file };
                 const handle = formatSymbolHandle(handleSym);
@@ -283,7 +292,8 @@ function formatDeadcodeJson(results) {
                     ...(item.isExported && { isExported: true }),
                     ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
                     ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations }),
-                    ...(item.declaredOn && { declaredOn: item.declaredOn })
+                    ...(item.declaredOn && { declaredOn: item.declaredOn }),
+                    ...(item.externalContract && { externalContract: true })
                 };
             }),
         },

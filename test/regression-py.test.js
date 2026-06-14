@@ -3436,3 +3436,80 @@ describe('fix #222: external-module producers block single-owner confirmation (s
         } finally { rm(dir); }
     });
 });
+
+describe('deadcode: out-of-tree base-class overrides are not dead (fix: #210 analog)', () => {
+    // FastAPI-measured false positives: build_middleware_stack overrides
+    // Starlette, bytes_schema overrides Pydantic's GenerateJsonSchema — the
+    // only caller lives in an unindexed dependency, so a zero usage count is
+    // not evidence of deadness.
+    it('hides a public method whose class extends an unresolved base; standalone code stays claimable', () => {
+        const dir = tmp({
+            'app.py': [
+                'from framework import Base  # external, not in this project',
+                '',
+                'class Widget(Base):',
+                '    def render(self):',           // public method on an out-of-tree base -> hidden
+                '        return 1',
+                '',
+                'def orphan():',                   // standalone, can override nothing -> stays claimable
+                '    return 3',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.deadcode();
+            const names = def.map(d => d.name);
+            assert.ok(!names.includes('render'),
+                `render overrides an out-of-tree base — must not be claimed dead: ${names}`);
+            assert.strictEqual(def.excludedExternalContract, 1,
+                `exactly render is counted under excludedExternalContract: ${def.excludedExternalContract}`);
+            assert.ok(names.includes('orphan'),
+                `standalone function with no callers is still dead: ${names}`);
+
+            // --include-exported reveals it, labeled as external-contract surface
+            const exp = index.deadcode({ includeExported: true });
+            const r = exp.find(d => d.name === 'render');
+            assert.ok(r, 'render is revealed under includeExported');
+            assert.strictEqual(r.externalContract, true, 'revealed render is labeled externalContract');
+        } finally { rm(dir); }
+    });
+
+    it('still claims a dead public method when the base IS in-project (no external contract)', () => {
+        const dir = tmp({
+            'base.py': 'class Base:\n    def shared(self):\n        return 0\n',
+            'child.py': [
+                'from base import Base',
+                '',
+                'class Child(Base):',
+                '    def never_called(self):',   // overrides nothing external; nobody calls it
+                '        return 1',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const names = index.deadcode().map(d => d.name);
+            assert.ok(names.includes('never_called'),
+                `in-project-only inheritance: a truly-unused method is still dead: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('does not shield inherent methods when the only base is the universal object root', () => {
+        // class Foo(object) is semantically identical to class Foo — the universal
+        // root dispatches nothing arbitrary, so a cosmetic base must not change the verdict.
+        const dir = tmp({
+            'app.py': [
+                'class Foo(object):',
+                '    def dead_method(self):',
+                '        return 1',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = index.deadcode();
+            assert.ok(def.map(d => d.name).includes('dead_method'),
+                `class Foo(object) must behave like class Foo — dead_method stays dead: ${def.map(d => d.name)}`);
+            assert.strictEqual(def.excludedExternalContract, 0,
+                `the object root is not an external-contract base: ${def.excludedExternalContract}`);
+        } finally { rm(dir); }
+    });
+});

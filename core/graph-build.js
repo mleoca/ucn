@@ -263,4 +263,4 @@ function splitParentList(clause) {
         .filter(Boolean);
 }
 
-module.exports = { buildDirIndex, buildImportGraph, buildInheritanceGraph, _resolveJavaPackageImport };
+module.exports = { buildDirIndex, buildImportGraph, buildInheritanceGraph, splitParentList, _resolveJavaPackageImport };

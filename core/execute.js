@@ -751,9 +751,10 @@ const HANDLERS = {
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             note = limitNote(limit, result.length);
             const sliced = result.slice(0, limit);
-            // Preserve custom properties (excludedExported, excludedDecorated) from deadcode()
+            // Preserve custom properties (excludedExported, excludedDecorated, excludedExternalContract) from deadcode()
             if (result.excludedExported != null) sliced.excludedExported = result.excludedExported;
             if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
+            if (result.excludedExternalContract != null) sliced.excludedExternalContract = result.excludedExternalContract;
             result = sliced;
         }
         const tNote = truncationNote(index);

@@ -576,7 +576,8 @@ server.registerTool(
                 let dcText = output.formatDeadcode(result, {
                     top: ep.top || 0,
                     decoratedHint: !ep.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use include_decorated=true to include them.` : undefined,
-                    exportedHint: !ep.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined
+                    exportedHint: !ep.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use include_exported=true to audit them.` : undefined,
+                    externalContractHint: !ep.includeExported && result.excludedExternalContract > 0 ? `${result.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use include_exported=true to include them.` : undefined
                 });
                 if (dcNote) dcText += '\n\n' + dcNote;
                 return tr(dcText);

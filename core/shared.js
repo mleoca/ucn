@@ -139,6 +139,26 @@ function looksLikeHandle(input) {
     return /^.+:\d+(?::.+)?$/.test(input);
 }
 
+/**
+ * Explicit override marker on a method definition (fix #210). Marker fields are
+ * language-disjoint and compiler-checked syntax (never inferred): traitImpl is
+ * Rust's `impl Trait`, an 'override' modifier is Java's lowercased @Override, an
+ * override-bearing memberType is TS's `override` keyword, and an override
+ * decorator is Python's typing.@override. Shared by the external-contract
+ * reasoning in both the caller dispatch gate and deadcode (out-of-tree override
+ * suppression) — one source of truth so a new marker is added once, not in two
+ * drifting copies.
+ */
+function isOverrideMarked(def) {
+    if (def.traitImpl) return true;
+    const mods = def.modifiers || [];
+    if (mods.includes('override')) return true;
+    if (def.memberType && /\boverride\b/.test(def.memberType)) return true;
+    if (def.decorators && def.decorators.some(d =>
+        String(d).replace(/\(.*$/, '').split('.').pop() === 'override')) return true;
+    return false;
+}
+
 module.exports = {
     pickBestDefinition,
     addTestExclusions,
@@ -148,4 +168,5 @@ module.exports = {
     parseSymbolHandle,
     looksLikeHandle,
     isTestPath,
+    isOverrideMarked,
 };

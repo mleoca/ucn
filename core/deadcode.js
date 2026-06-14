@@ -8,6 +8,90 @@
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
+const { splitParentList } = require('./graph-build');
+const { isOverrideMarked } = require('./shared');
+
+const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
+
+/** Strip a base-type expression to its bare name: `Mapping[str, int]`→Mapping, `java.util.List<Foo>`→List, `a::b::C`→C. */
+function _bareBaseName(raw) {
+    return String(raw).replace(/[<[(].*$/s, '').split('.').pop().split('::').pop().trim();
+}
+
+// The universal object root (Python `object`, Java/JS `Object`) has a fixed,
+// known method surface — Object/dunder methods, themselves entry points — so it
+// never dispatches an arbitrary subclass method by name or override. It is NOT
+// an external *dispatching* base: `class Foo(object)` must still report its
+// genuinely-dead inherent methods, exactly like `class Foo`, instead of
+// diverging on a purely cosmetic base declaration. (Java `Object` is the
+// universalSupertype trait; `object` is the Python equivalent — a language
+// convention, rule #9.)
+const _UNIVERSAL_ROOTS = new Set(['object', 'Object']);
+
+/** True when a base name resolves to NO in-project class/struct/interface/trait/record (an out-of-tree type). */
+function _baseIsExternal(index, bare) {
+    if (!bare || _UNIVERSAL_ROOTS.has(bare)) return false;
+    const defs = index.symbols.get(bare);
+    return !(defs && defs.some(d => _CLASS_KINDS.includes(d.type)));
+}
+
+/**
+ * Does the method's enclosing class EXTEND at least one base that is NOT in the
+ * project index? An out-of-tree base is a framework/library type UCN can't see;
+ * via inheritance it may dispatch into a public method of the subclass
+ * polymorphically (Starlette → build_middleware_stack) or by name convention
+ * (Pydantic → bytes_schema). The class def is matched in the method's own file.
+ *
+ * `implements` is deliberately NOT consulted: implementing an external
+ * interface/trait makes only the INTERFACE'S OWN methods a contract (those
+ * carry traitImpl/@Override markers → handled by Rule A), not the class's
+ * unrelated inherent methods. Counting it would wrongly shield, e.g., a Rust
+ * struct's genuinely-dead inherent method just because the struct also
+ * `impl Display for`s.
+ */
+function _classHasExternalBase(index, symbol) {
+    const classDefs = (index.symbols.get(symbol.className) || []).filter(c =>
+        c.file === symbol.file && _CLASS_KINDS.includes(c.type));
+    for (const cd of classDefs) {
+        if (!cd.extends) continue;
+        const supers = Array.isArray(cd.extends) ? cd.extends : splitParentList(cd.extends);
+        for (const raw of supers) {
+            if (_baseIsExternal(index, _bareBaseName(raw))) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * A method that may be reached through an out-of-tree base class — the deadcode
+ * analog of fix #210's external-contract methods. A zero in-project usage count
+ * is NOT evidence of deadness here; claiming the symbol dead invites deleting a
+ * live framework override (e.g. FastAPI.build_middleware_stack overriding
+ * Starlette, or GenerateJsonSchema.bytes_schema name-dispatched by Pydantic —
+ * the only caller lives in an unindexed dependency).
+ *   (A) explicit override marker (@Override / `override` / typing.@override /
+ *       Rust `impl Trait for X`) AND a single project-wide method owner of the
+ *       name (no in-project supertype defines it → the contract is external —
+ *       the #210 ownerCount===1 rule).
+ *   (B) a public-by-shape method whose class EXTENDS an unresolved base.
+ *       Private/underscore members are never external-contract surface, so a
+ *       genuinely-dead one stays claimable (the fix #211 shape predicate).
+ * Data-driven, not language-keyed: classes without an `extends` clause (Go
+ * embedding, Rust structs / inherent impls) never trip (B), and Rust trait
+ * impls trip (A) via traitImpl — so new languages inherit correct behavior.
+ */
+function overridesOutOfTreeBase(index, symbol) {
+    if (!symbol.className) return false; // standalone function can't override
+    if (isOverrideMarked(symbol)) {
+        const owners = (index.symbols.get(symbol.name) || []).filter(s => s.className);
+        if (owners.length <= 1) return true;
+    }
+    const mods = symbol.modifiers || [];
+    const publicByShape = !mods.includes('private') &&
+        !symbol.name.startsWith('#') && !symbol.name.startsWith('_');
+    if (publicByShape && _classHasExternalBase(index, symbol)) return true;
+    return false;
+}
 
 /** Check if a position in a line is inside a string literal (quotes/backticks) */
 function isInsideString(line, pos) {
@@ -228,6 +312,7 @@ function deadcode(index, options = {}) {
     const results = [];
     let excludedDecorated = 0;
     let excludedExported = 0;
+    let excludedExternalContract = 0;
 
     // Ensure callee index is built (lazy, reused across operations)
     if (!index.calleeIndex) {
@@ -488,6 +573,16 @@ function deadcode(index, options = {}) {
             const totalUsages = nonDefUsages.length;
 
             if (totalUsages === 0) {
+                // External-contract override: the method may be invoked through
+                // an out-of-tree base class UCN can't index (deadcode analog of
+                // fix #210). A zero usage count is not evidence of deadness.
+                // Hidden by default; revealed under --include-exported, since
+                // it is external-reachable surface, not internal dead code.
+                const isExternalContract = overridesOutOfTreeBase(index, symbol);
+                if (isExternalContract && !options.includeExported) {
+                    excludedExternalContract++;
+                    continue;
+                }
                 // Collect decorators/annotations for hint display
                 // Python: symbol.decorators (e.g., ['app.route("/path")', 'login_required'])
                 // Java/Rust/Go: symbol.modifiers may contain annotations (e.g., 'bean', 'scheduled')
@@ -530,7 +625,8 @@ function deadcode(index, options = {}) {
                     usageCount: 0,
                     ...(decorators.length > 0 && { decorators }),
                     ...(annotations.length > 0 && { annotations }),
-                    ...(declaredOn && { declaredOn })
+                    ...(declaredOn && { declaredOn }),
+                    ...(isExternalContract && { externalContract: true })
                 });
             }
         }
@@ -545,6 +641,7 @@ function deadcode(index, options = {}) {
     // Attach exclusion counts as array properties (backwards-compatible)
     results.excludedDecorated = excludedDecorated;
     results.excludedExported = excludedExported;
+    results.excludedExternalContract = excludedExternalContract;
 
     return results;
     } finally { index._endOp(); }
