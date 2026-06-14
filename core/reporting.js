@@ -538,28 +538,23 @@ function doctor(index, options = {}) {
     const fileCounts = { total: 0, scanned: 0 };
     const langs = {};
     let totalSymbols = 0;  // counted post-filter for accuracy when --in is set
+    // Each category tracks: count = total OCCURRENCES (uses), fileCount = TRUE
+    // number of files affected (uncapped), files = a capped sample for display.
+    // Keeping count and fileCount distinct is what lets the formatter say
+    // "481 uses in 121 files" instead of mislabeling a file count as uses or
+    // presenting the 10-file display cap as the population (field-report #2).
+    const BLINDSPOT_FILE_CAP = 10;
     const blindSpots = {
-        dynamicImports: { count: 0, files: [] },
-        evalCalls:      { count: 0, files: [] },
-        reflection:     { count: 0, files: [] },
-        parseFailures:  { count: 0, files: [] },
+        dynamicImports: { count: 0, fileCount: 0, files: [] },
+        evalCalls:      { count: 0, fileCount: 0, files: [] },
+        reflection:     { count: 0, fileCount: 0, files: [] },
+        parseFailures:  { count: 0, fileCount: 0, files: [] },
     };
 
-    // Reflection signals per language. These run textually over the source — fast,
-    // and acceptable since UCN already records dynamic-import counts at parse time.
-    const REFLECTION_PATTERNS = {
-        python:     /\b(getattr|hasattr|setattr|__import__|importlib\.import_module)\s*\(/,
-        javascript: /\bnew Function\s*\(|\bReflect\.\w+\s*\(/,
-        typescript: /\bnew Function\s*\(|\bReflect\.\w+\s*\(/,
-        go:         /"reflect"|reflect\.\w+\s*\(/,
-        java:       /\.getDeclaredMethod\b|\.getMethod\b|\.getDeclaredField\b|Class\.forName\b/,
-        rust:       /\bAny::downcast/,
-    };
-    const EVAL_PATTERNS = {
-        python:     /\b(eval|exec)\s*\(/,
-        javascript: /\beval\s*\(/,
-        typescript: /\beval\s*\(/,
-    };
+    // Reflection/eval signals come from the shared text-blind-spot counter
+    // (core/shared.js) — the SAME routine detectCompleteness uses for the about
+    // footer, so the two never drift (field-report #2). Occurrence counts.
+    const { hasTextBlindspots, countTextBlindspots } = require('./shared');
 
     for (const [filePath, fe] of index.files) {
         fileCounts.total++;
@@ -574,29 +569,22 @@ function doctor(index, options = {}) {
         langs[lang].lines += fe.lines || 0;
         totalSymbols += (fe.symbols || []).length;
 
-        if (fe.dynamicImports && fe.dynamicImports > 0) {
-            blindSpots.dynamicImports.count += fe.dynamicImports;
-            if (blindSpots.dynamicImports.files.length < 10) blindSpots.dynamicImports.files.push(rel);
-        }
-        if (fe.parseError) {
-            blindSpots.parseFailures.count++;
-            if (blindSpots.parseFailures.files.length < 10) blindSpots.parseFailures.files.push(rel);
-        }
+        const recordBlind = (cat, occurrences) => {
+            if (occurrences <= 0) return;
+            cat.count += occurrences;
+            cat.fileCount++;
+            if (cat.files.length < BLINDSPOT_FILE_CAP) cat.files.push(rel);
+        };
 
-        // Read file once for eval/reflection signals
-        const evalRe = EVAL_PATTERNS[lang];
-        const reflRe = REFLECTION_PATTERNS[lang];
-        if (evalRe || reflRe) {
+        if (fe.dynamicImports && fe.dynamicImports > 0) recordBlind(blindSpots.dynamicImports, fe.dynamicImports);
+        if (fe.parseError) recordBlind(blindSpots.parseFailures, 1);
+
+        // Read file once for eval/reflection signals (shared counter).
+        if (hasTextBlindspots(lang)) {
             try {
-                const content = fs.readFileSync(filePath, 'utf-8');
-                if (evalRe && evalRe.test(content)) {
-                    blindSpots.evalCalls.count++;
-                    if (blindSpots.evalCalls.files.length < 10) blindSpots.evalCalls.files.push(rel);
-                }
-                if (reflRe && reflRe.test(content)) {
-                    blindSpots.reflection.count++;
-                    if (blindSpots.reflection.files.length < 10) blindSpots.reflection.files.push(rel);
-                }
+                const bs = countTextBlindspots(fs.readFileSync(filePath, 'utf-8'), lang);
+                recordBlind(blindSpots.evalCalls, bs.eval);
+                recordBlind(blindSpots.reflection, bs.reflection);
             } catch (e) { /* ignore read errors */ }
         }
     }
@@ -620,57 +608,87 @@ function doctor(index, options = {}) {
 
     // Compute trust verdict.
     //
-    // 1. If a deep sample produced no edges (empty project, --in matches nothing),
-    //    don't pretend that's "0% confident" — return UNKNOWN.
-    // 2. Coverage gives the headline %, but blind spots (eval/reflection/dynamic
-    //    imports) downgrade the verdict by one tier each — a project that resolves
-    //    99% of edges but is full of `getattr` is not actually "HIGH" trust.
-    // 3. Parse failures always cap at MEDIUM regardless of coverage.
+    // Field-report #1: the old logic dropped the tier by one PER blind-spot
+    // category present, so any non-trivial Python/TS project (all of which have
+    // some getattr/eval/dynamic import) was forced to LOW even when --deep
+    // measured ~99% of edges at confidence ≥ 0.5 — a self-contradicting verdict
+    // ("99.1% ... LOW") that trains agents to distrust a healthy index. The fix:
+    //   - When --deep coverage exists it drives the tier. Coverage measures the
+    //     CONFIDENCE of edges UCN FOUND, NOT completeness — a reflection-hidden
+    //     edge is absent from the sample, never a low-confidence edge dragging
+    //     the % down — so sparse blind spots are a CAVEAT, while PERVASIVE ones
+    //     (a large share of files) can hide edges the sample can't see and cap
+    //     the verdict at MEDIUM (density, not mere presence; see below).
+    //   - Parse failures are a separate exception: a file UCN couldn't parse is
+    //     not in the sample at all, a genuine uncounted hole → cap at MEDIUM.
+    //   - Without --deep there is no measurement, so blind spots are the only
+    //     signal — but bounded to ONE tier total (not one per category), so a
+    //     handful of getattr doesn't read as untrustworthy.
     let trust = 'UNKNOWN';
     let trustReason = '';
-    const reasons = [];
+    const tier = ['HIGH', 'MEDIUM', 'LOW'];
+
+    const blindSignals = [];
+    if (blindSpots.parseFailures.count > 0) blindSignals.push(`${blindSpots.parseFailures.count} parse failure(s)`);
+    if (blindSpots.evalCalls.count > 0) blindSignals.push(`${blindSpots.evalCalls.count} eval/exec use(s) in ${blindSpots.evalCalls.fileCount} file(s)`);
+    if (blindSpots.reflection.count > 0) blindSignals.push(`${blindSpots.reflection.count} reflection use(s) in ${blindSpots.reflection.fileCount} file(s)`);
+    if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s) in ${blindSpots.dynamicImports.fileCount} file(s)`);
 
     if (coverage && coverage.total > 0) {
         const safe = coverage.high + coverage.medium;
         const safePct = safe / coverage.total;
-        let baseLevel;
-        if (safePct >= 0.85) baseLevel = 'HIGH';
-        else if (safePct >= 0.6) baseLevel = 'MEDIUM';
-        else baseLevel = 'LOW';
-        reasons.push(`${(safePct * 100).toFixed(1)}% of edges have confidence ≥ 0.5`);
-
-        // Blind-spot downgrades — each kind drops one tier.
-        const tier = ['HIGH', 'MEDIUM', 'LOW'];
-        let idx = tier.indexOf(baseLevel);
-        const blindSignals = [];
-        if (blindSpots.parseFailures.count > 0) { idx = Math.max(idx, 1); blindSignals.push(`${blindSpots.parseFailures.count} parse failure(s)`); }
-        if (blindSpots.evalCalls.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.evalCalls.count} eval call(s)`); }
-        if (blindSpots.reflection.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.reflection.count} reflection use(s)`); }
-        if (blindSpots.dynamicImports.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s)`); }
+        let idx = safePct >= 0.85 ? 0 : safePct >= 0.6 ? 1 : 2;
+        // Parse failures: unparsed files aren't in the sample at all.
+        if (blindSpots.parseFailures.count > 0) idx = Math.max(idx, 1);
+        // Coverage measures the CONFIDENCE of edges UCN found, NOT completeness:
+        // a call hidden behind reflection/dynamic dispatch is simply absent from
+        // findCallers' result, never a low-confidence edge that drags the % down.
+        // So when blind spots are PERVASIVE — affecting a large share of files —
+        // they can hide a real fraction of the call graph that the sample can't
+        // see, and the verdict is capped at MEDIUM. Density, not mere presence:
+        // a handful of getattr stays a caveat (the old code dropped a tier per
+        // category, forcing every project to LOW); reflection across half the
+        // files does cap. Gated on a file-count floor — file share is meaningless
+        // for a handful of files, so small projects ride on coverage alone.
+        const scanned = fileCounts.scanned || 1;
+        const share = (fc) => fc / scanned;
+        const pervasiveBlindSpot = scanned >= 10 && (
+            share(blindSpots.reflection.fileCount) >= 0.5 ||
+            share(blindSpots.dynamicImports.fileCount) >= 0.4 ||
+            share(blindSpots.evalCalls.fileCount) >= 0.15
+        );
+        const baseIdx = idx;
+        if (pervasiveBlindSpot) idx = Math.max(idx, 1);
+        const capped = idx > baseIdx;
         trust = tier[idx];
-        if (blindSignals.length) reasons.push(`blind spots: ${blindSignals.join(', ')}`);
+        const reasons = [`${(safePct * 100).toFixed(1)}% of found edges have confidence ≥ 0.5`];
+        if (blindSignals.length) {
+            reasons.push(capped
+                ? `capped at MEDIUM — pervasive blind spots may hide edges the sample can't see: ${blindSignals.join(', ')}`
+                : `blind spots (caveat — coverage measures found edges, not completeness): ${blindSignals.join(', ')}`);
+        }
         trustReason = reasons.join('; ');
     } else if (coverage) {
         // Sampled but zero edges — can't say anything about confidence.
         trust = 'UNKNOWN';
         trustReason = 'no edges sampled (empty scope or filter matched nothing)';
     } else if (fileCounts.scanned > 0) {
-        // Cheap path (no --deep): use blind-spot signals.
-        const tier = ['HIGH', 'MEDIUM', 'LOW'];
+        // Cheap path (no --deep): no measurement, so blind spots are the only
+        // signal — bounded to one tier total. Run --deep for a measured verdict.
         let idx = 0;
-        const blindSignals = [];
-        if (blindSpots.parseFailures.count > 0) { idx = Math.max(idx, 1); blindSignals.push(`${blindSpots.parseFailures.count} parse failure(s)`); }
-        if (blindSpots.evalCalls.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.evalCalls.count} eval call(s)`); }
-        if (blindSpots.reflection.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.reflection.count} reflection use(s)`); }
-        if (blindSpots.dynamicImports.count > 0) { idx = Math.min(2, idx + 1); blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s)`); }
+        if (blindSpots.parseFailures.count > 0) idx = Math.max(idx, 1);
+        if (blindSpots.evalCalls.count + blindSpots.reflection.count + blindSpots.dynamicImports.count > 0) {
+            idx = Math.min(2, idx + 1);
+        }
         trust = tier[idx];
         trustReason = blindSignals.length
-            ? `coverage not deep-checked; blind spots: ${blindSignals.join(', ')}`
-            : 'no parse failures; coverage not deep-checked';
+            ? `coverage not deep-checked (run --deep); blind spots: ${blindSignals.join(', ')}`
+            : 'no parse failures; coverage not deep-checked (run --deep)';
     }
 
     return {
         root: index.root,
+        version: require('../package.json').version,  // running ucn version — surfaces MCP/CLI drift (field-report #3)
         files: fileCounts,
         symbols: totalSymbols,
         languages: langs,

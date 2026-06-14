@@ -13,6 +13,7 @@ function formatDoctor(result) {
     const lines = [];
     lines.push(`UCN Trust Report — ${result.root}`);
     lines.push('═'.repeat(60));
+    if (result.version) lines.push(`Version: ucn ${result.version}`);
     lines.push(`Index: ${result.files.scanned} file${result.files.scanned === 1 ? '' : 's'}, ${result.symbols} symbol${result.symbols === 1 ? '' : 's'}`);
 
     if (result.filter) lines.push(`Filter: ${result.filter}`);
@@ -60,13 +61,22 @@ function formatDoctor(result) {
         ['Reflection',      bs.reflection],
         ['Parse failures',  bs.parseFailures],
     ];
+    const unitFor = { 'Dynamic imports': 'import', 'Eval/exec calls': 'use', 'Reflection': 'use', 'Parse failures': 'failure' };
     let anyBlindSpot = false;
     for (const [label, info] of bsLines) {
         if (info && info.count > 0) {
             anyBlindSpot = true;
-            const sample = info.files.slice(0, 3).map(f => `    - ${f}`).join('\n');
-            const more = info.files.length > 3 ? `\n    ... and ${info.files.length - 3} more` : '';
-            lines.push(`  ${label}: ${info.count} in ${info.files.length} file${info.files.length === 1 ? '' : 's'}`);
+            // fileCount is the TRUE (uncapped) number of files; info.files is a
+            // capped display sample. Show "N use(s) in M file(s)" and, when the
+            // sample is truncated, "... and K more file(s)" against the true M —
+            // never present the display cap as the population (field-report #2).
+            const fileCount = info.fileCount != null ? info.fileCount : info.files.length;
+            const unit = unitFor[label] || 'use';
+            lines.push(`  ${label}: ${info.count} ${unit}${info.count === 1 ? '' : 's'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`);
+            const shownFiles = info.files.slice(0, 3);
+            const sample = shownFiles.map(f => `    - ${f}`).join('\n');
+            const moreFiles = fileCount - shownFiles.length;
+            const more = moreFiles > 0 ? `\n    ... and ${moreFiles} more file${moreFiles === 1 ? '' : 's'}` : '';
             if (sample) lines.push(sample + more);
         }
     }

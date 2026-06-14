@@ -159,6 +159,49 @@ function isOverrideMarked(def) {
     return false;
 }
 
+// Per-language text patterns for the "blind spots" UCN's AST can't follow:
+// eval/exec-style code execution and reflection (dynamic attribute access /
+// dynamic dispatch). ONE source of truth so doctor's trust scan and
+// detectCompleteness's about-footer warning count identically (field-report #2:
+// they used to diverge — doctor 497 reflection vs footer 194, eval 3 vs 2 —
+// because each kept its own regex set). Dynamic imports are NOT here: those are
+// structural (fileEntry.dynamicImports), the AST-accurate count both paths share.
+// `new Function(...)` is categorized as eval (code execution), not reflection.
+const BLINDSPOT_TEXT_PATTERNS = {
+    reflection: {
+        python:     /\b(getattr|hasattr|setattr|__import__|importlib\.import_module)\s*\(/g,
+        javascript: /\bReflect\.\w+\s*\(/g,
+        typescript: /\bReflect\.\w+\s*\(/g,
+        go:         /\breflect\.\w+\s*\(/g,
+        java:       /\.getDeclaredMethod\b|\.getMethod\b|\.getDeclaredField\b|Class\.forName\b/g,
+        rust:       /\bAny::downcast/g,
+    },
+    eval: {
+        python:     /\b(eval|exec)\s*\(/g,
+        javascript: /\beval\s*\(|\bnew\s+Function\s*\(/g,
+        typescript: /\beval\s*\(|\bnew\s+Function\s*\(/g,
+    },
+};
+
+/** True when a language has any text-blind-spot pattern (so callers can skip the file read otherwise). */
+function hasTextBlindspots(language) {
+    return !!(BLINDSPOT_TEXT_PATTERNS.reflection[language] || BLINDSPOT_TEXT_PATTERNS.eval[language]);
+}
+
+/**
+ * Count text-detected blind spots (eval/exec, reflection) in one file's source.
+ * Returns { eval, reflection } OCCURRENCE counts (global match). Shared by doctor
+ * and detectCompleteness so both report the same numbers (field-report #2).
+ */
+function countTextBlindspots(content, language) {
+    const reRe = BLINDSPOT_TEXT_PATTERNS.reflection[language];
+    const evRe = BLINDSPOT_TEXT_PATTERNS.eval[language];
+    return {
+        eval: evRe ? (content.match(evRe) || []).length : 0,
+        reflection: reRe ? (content.match(reRe) || []).length : 0,
+    };
+}
+
 module.exports = {
     pickBestDefinition,
     addTestExclusions,
@@ -169,4 +212,6 @@ module.exports = {
     looksLikeHandle,
     isTestPath,
     isOverrideMarked,
+    hasTextBlindspots,
+    countTextBlindspots,
 };

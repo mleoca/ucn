@@ -901,6 +901,118 @@ describe('doctor command', () => {
             assert.ok(result.trust);
         } finally { rm(dir); }
     });
+
+    it('counts blind-spot occurrences and true file count separately (field-report #2)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def f(o):\n    getattr(o, "x")\n    getattr(o, "y")\n    hasattr(o, "z")\n    return 1\n',
+            'b.py': 'def g(o):\n    return setattr(o, "p", 1)\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            const r = result.blindSpots.reflection;
+            assert.strictEqual(r.count, 4, `4 reflection uses (3 in a.py + 1 in b.py), got ${r.count}`);
+            assert.strictEqual(r.fileCount, 2, `2 files contain reflection, got ${r.fileCount}`);
+        } finally { rm(dir); }
+    });
+
+    it('does not force a well-resolved project to LOW just for having blind spots (field-report #1)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'def helper(x):\n    return x + 1\n',
+            'app.py': 'from lib import helper\n\ndef main(y):\n    eval("1+1")\n    getattr(y, "z")\n    return helper(1) + helper(2)\n\nmain(0)\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', { deep: true });
+            assert.ok(ok);
+            assert.ok(result.blindSpots.evalCalls.count >= 1, 'eval flagged');
+            assert.ok(result.blindSpots.reflection.count >= 1, 'getattr flagged');
+            // The bug: 3 blind-spot categories used to drop the tier to LOW even at
+            // 99% coverage. Now coverage drives the verdict; blind spots are a caveat.
+            if (result.coverage && result.coverage.total > 0) {
+                const safePct = (result.coverage.high + result.coverage.medium) / result.coverage.total;
+                if (safePct >= 0.85) {
+                    assert.strictEqual(result.trust, 'HIGH',
+                        `high coverage + blind spots should be HIGH, got ${result.trust} (${result.trustReason})`);
+                }
+            }
+            assert.notStrictEqual(result.trust, 'LOW',
+                `blind-spot presence alone must not yield LOW: ${result.trustReason}`);
+        } finally { rm(dir); }
+    });
+
+    it('cheap-path bounds blind-spot downgrade to one tier, not LOW (field-report #1)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def f(o):\n    return getattr(o, "x")\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {}); // no --deep
+            assert.ok(ok);
+            assert.notStrictEqual(result.trust, 'LOW',
+                `one blind-spot category without parse failures must not be LOW: ${result.trust}`);
+        } finally { rm(dir); }
+    });
+
+    it('caps the --deep verdict below HIGH when blind spots are pervasive (field-report #1, reviewer)', () => {
+        // Coverage only buckets confidence of FOUND edges — a reflection-hidden
+        // call is absent, not low-confidence. So pervasive reflection (here 8 of
+        // 12 files) can hide a real slice of the call graph the sample can't see,
+        // and must cap trust below HIGH even when found-edge confidence is high.
+        const files = { 'requirements.txt': '', 'helper.py': 'def helper(x):\n    return x + 1\n' };
+        for (let i = 0; i < 11; i++) {
+            const refl = i < 8 ? '    getattr(o, "k")\n' : '';
+            files[`mod${i}.py`] = `from helper import helper\n\ndef use${i}(o):\n${refl}    return helper(${i})\n`;
+        }
+        const dir = tmp(files);
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', { deep: true });
+            assert.ok(ok);
+            assert.ok(result.files.scanned >= 10, `density gating needs >=10 files, got ${result.files.scanned}`);
+            assert.strictEqual(result.blindSpots.reflection.fileCount, 8,
+                `reflection in 8 files, got ${result.blindSpots.reflection.fileCount}`);
+            assert.notStrictEqual(result.trust, 'HIGH',
+                `pervasive blind spots must cap below HIGH: ${result.trust} (${result.trustReason})`);
+            assert.notStrictEqual(result.trust, 'UNKNOWN',
+                `should still produce a coverage-based verdict: ${result.trustReason}`);
+        } finally { rm(dir); }
+    });
+
+    it('doctor and the about-footer (detectCompleteness) agree on all three blind-spot counts (field-report #2)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'import importlib\n\ndef f(o):\n    importlib.import_module("x")\n    getattr(o, "k")\n    hasattr(o, "j")\n    eval("1+1")\n    return 1\n',
+            'b.js': 'function g(o) {\n  const m = "fs";\n  import(m);\n  Reflect.get(o, "k");\n  eval("1");\n  return 1;\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            const comp = index.detectCompleteness();
+            const cnt = (t) => { const w = comp.warnings.find(x => x.type === t); return w ? w.count : 0; };
+            assert.strictEqual(result.blindSpots.dynamicImports.count, cnt('dynamic_imports'), 'dynamic imports agree');
+            assert.strictEqual(result.blindSpots.evalCalls.count, cnt('eval'), 'eval agree');
+            assert.strictEqual(result.blindSpots.reflection.count, cnt('reflection'), 'reflection agree');
+            // non-zero so the test actually exercises agreement, not 0===0
+            assert.ok(result.blindSpots.reflection.count > 0 && result.blindSpots.evalCalls.count > 0,
+                'eval and reflection counts should be non-zero');
+        } finally { rm(dir); }
+    });
+
+    it('reports the running ucn version in the result (field-report #3)', () => {
+        const dir = tmp({ 'requirements.txt': '', 'a.py': 'def f():\n    return 1\n' });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            assert.match(result.version || '', /^\d+\.\d+\.\d+/, `version should be present: ${result.version}`);
+        } finally { rm(dir); }
+    });
 });
 
 // ── side-effect tags on callees ────────────────────────────────────────────

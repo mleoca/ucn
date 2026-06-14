@@ -898,6 +898,41 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('truncated'), 'Should mention truncation');
         });
 
+        it('flags "0 prod + N test" with method-style unverified callers as not-dead (field-report #5)', () => {
+            const base = {
+                found: true,
+                symbol: { name: 'compute', type: 'function', file: 'scoring.py', startLine: 10, endLine: 12 },
+                totalUsages: 4,
+                usages: { calls: 4, imports: 0, references: 0 },
+                callees: { total: 0, top: [] },
+                tests: { totalMatches: 0, fileCount: 0, files: [] },
+                otherDefinitions: [],
+                code: 'def compute(s):\n    return sum(s)',
+            };
+            // 0 prod confirmed (only a test caller) + method-ambiguous unverified
+            const withHint = { ...base, callers: {
+                total: 1,
+                top: [{ file: 'tests/test_scoring.py', line: 7, callerName: 'test_compute', expression: 'compute([1, 2])' }],
+                unverified: { total: 3, top: [
+                    { file: 'prod.py', line: 12, callerName: 'main', expression: 'a.compute(x)', reason: 'method-ambiguous' },
+                ] },
+            } };
+            const t1 = output.formatAbout(withHint);
+            assert.ok(t1.includes('0 production callers CONFIRMED'), 'shows the not-dead-code note');
+            assert.ok(t1.includes('method-style') && t1.includes('not dead code'), 'explains why');
+
+            // Negative control: a production confirmed caller → no note
+            const noHint = { ...base, callers: {
+                total: 1,
+                top: [{ file: 'src/main.py', line: 3, callerName: 'main', expression: 'compute(x)' }],
+                unverified: { total: 1, top: [
+                    { file: 'prod.py', line: 12, callerName: 'other', expression: 'a.compute(x)', reason: 'method-ambiguous' },
+                ] },
+            } };
+            assert.ok(!output.formatAbout(noHint).includes('0 production callers CONFIRMED'),
+                'no note when a production caller is confirmed');
+        });
+
         it('shows other definitions when present', () => {
             const about = {
                 found: true,

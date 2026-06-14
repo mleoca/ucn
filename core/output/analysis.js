@@ -732,6 +732,21 @@ function formatAbout(about, options = {}) {
             for (const c of testTop) renderAboutCaller(c);
         }
         if (aboutCallerReach.note) lines.push(aboutCallerReach.note);
+
+        // Field-report #5: when every CONFIRMED caller is a test and the
+        // production call sites are method-style (landed in UNVERIFIED as
+        // method-ambiguous — e.g. a module function sharing a name with a
+        // method), the bare "0 prod" count reads like dead code. Flag it so the
+        // empty prod count isn't misread; the real calls are listed below.
+        if (prodTop.length === 0 && testTop.length > 0) {
+            const uv = about.callers.unverified;
+            const methodStyle = uv && uv.top
+                ? uv.top.some(u => u.reason === 'method-ambiguous' || u.reason === 'possible-dispatch')
+                : false;
+            if (uv && uv.total > 0 && methodStyle) {
+                lines.push(`  Note: 0 production callers CONFIRMED — the ${uv.total} call site(s) under UNVERIFIED below include method-style calls that may bind to this or a same-name method, so this is not dead code.`);
+            }
+        }
     }
 
     // Callers — UNVERIFIED tier (always visible; the contract forbids hiding)

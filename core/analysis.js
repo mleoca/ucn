@@ -12,7 +12,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
-const { NON_CALLABLE_TYPES, addTestExclusions } = require('./shared');
+const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots } = require('./shared');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageModule } = require('../languages');
 
@@ -600,20 +600,20 @@ function detectCompleteness(index) {
             const content = index._readFile(filePath);
 
             if (langTraits(fileEntry.language)?.hasDynamicImports) {
-                // Dynamic imports: import(), require(variable), __import__
-                dynamicImports += (content.match(/import\s*\([^'"]/g) || []).length;
-                dynamicImports += (content.match(/require\s*\([^'"]/g) || []).length;
-                dynamicImports += (content.match(/__import__\s*\(/g) || []).length;
-
-                // eval, Function constructor
-                evalUsage += (content.match(/(^|[^a-zA-Z_])eval\s*\(/gm) || []).length;
-                evalUsage += (content.match(/new\s+Function\s*\(/g) || []).length;
+                // Dynamic imports: use the parser's structural count — the SAME
+                // source `doctor` uses — instead of a text regex. The old
+                // /import\s*\(/ matched Python grouped imports `from x import
+                // (...)`, flashing a false "N dynamic imports" incompleteness
+                // warning on essentially every Python project (field-report #2,
+                // reviewer-confirmed: doctor and about now agree on one count).
+                dynamicImports += fileEntry.dynamicImports || 0;
             }
 
-            // Reflection: getattr, hasattr, Reflect
-            reflectionUsage += (content.match(/\bgetattr\s*\(/g) || []).length;
-            reflectionUsage += (content.match(/\bhasattr\s*\(/g) || []).length;
-            reflectionUsage += (content.match(/\bReflect\./g) || []).length;
+            // eval/exec and reflection: the SAME shared counter doctor uses, so
+            // the about footer and the trust report never diverge (field-report #2).
+            const bs = countTextBlindspots(content, fileEntry.language);
+            evalUsage += bs.eval;
+            reflectionUsage += bs.reflection;
         } catch (e) {
             // Skip unreadable files
         }

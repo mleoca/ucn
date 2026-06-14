@@ -791,7 +791,9 @@ server.registerTool(
 async function main() {
     const transport = new StdioServerTransport();
     await server.connect(transport);
-    console.error('UCN MCP server running on stdio');
+    // Print the running version so MCP-vs-CLI drift is visible (field-report #3:
+    // a stale `npx -y ucn` cache can silently run an older engine than the CLI).
+    console.error(`UCN MCP server v${require('../package.json').version} running on stdio`);
 }
 
 main().catch(e => {
