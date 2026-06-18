@@ -9,6 +9,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const packageJson = require('../package.json');
 
 const { detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
@@ -299,6 +300,11 @@ const knownFlags = new Set([
 ]);
 
 // Handle help flag
+if (args.includes('--version') || args.includes('-v')) {
+    console.log(packageJson.version);
+    process.exit(0);
+}
+
 if (args.includes('--help') || args.includes('-h')) {
     printUsage();
     process.exit(0);
@@ -1578,6 +1584,7 @@ Common Flags:
   --top-level         Show only top-level functions in toc
   --max-lines=N       Max source lines for class (large classes show summary)
   --workers=N         Parallel build workers (auto-detect; 0 to disable, env: UCN_WORKERS)
+  -v, --version       Print UCN version
   --no-cache          Disable caching
   --clear-cache       Clear cache before running
   --base=<ref>        Git ref for diff-impact (default: HEAD)
