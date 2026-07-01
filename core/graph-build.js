@@ -161,6 +161,35 @@ function buildImportGraph(index) {
             }
         }
 
+        // From-import submodules (fix #224): `from . import jobs` binds
+        // jobs.py as a plain NAME — the parser can't know (a from-import name
+        // may be a symbol), the resolver can. Resolve the composed dotted
+        // specifier; a project-file hit records it in moduleResolved AND adds
+        // the import edge, so scope resolution and module-receiver ownership
+        // see the submodule exactly like `import jobs`.
+        if (langTraits(fileEntry.language)?.submoduleImports) {
+            for (const b of (fileEntry.importBindings || [])) {
+                if (!b || !b.name || b.module == null) continue;
+                const mod = String(b.module);
+                const spec = mod.endsWith('.') ? mod + b.name : mod + '.' + b.name;
+                if (moduleResolved[spec] || seenModules.has(spec)) continue;
+                seenModules.add(spec);
+                const resolved = resolveImport(spec, filePath, {
+                    aliases: index.config.aliases,
+                    language: fileEntry.language,
+                    root: index.root
+                });
+                if (resolved && index.files.has(resolved)) {
+                    moduleResolved[spec] = path.relative(index.root, resolved);
+                    importedFiles.add(resolved);
+                    if (!index.exportGraph.has(resolved)) {
+                        index.exportGraph.set(resolved, new Set());
+                    }
+                    index.exportGraph.get(resolved).add(filePath);
+                }
+            }
+        }
+
         index.importGraph.set(filePath, importedFiles);
         fileEntry.moduleResolved = moduleResolved;
     }

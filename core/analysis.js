@@ -360,7 +360,11 @@ function context(index, name, options = {}) {
         // --all lifts the unverified enrichment cap (content + caller lookup)
         unverifiedEnrichLimit: options.all ? Infinity : undefined,
     });
-    let callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+    // Callee side runs the contract too (v4): uncertain/unresolved calls in
+    // the def's scope become VISIBLE unverifiedCallees entries + a conserved
+    // per-node calleeAccount instead of silently dropping (#223 machinery).
+    let callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, collectAccount: true });
+    const rawCallees = callees;
     // Pre-display-filter result for the conservation account (filters below
     // build new arrays and would lose the non-enumerable accountRaw).
     const rawCallers = callers;
@@ -470,6 +474,7 @@ function context(index, name, options = {}) {
         callers,
         unverifiedCallers,
         callees,
+        unverifiedCallees: rawCallees.unverifiedCallees || [],
         callerHistogram,
         calleeHistogram,
         meta: {
@@ -481,6 +486,7 @@ function context(index, name, options = {}) {
             includeMethods: !!options.includeMethods,
             projectLanguage: index._getPredominantLanguage(),
             account,
+            calleeAccount: rawCallees.calleeAccount,
             // No detected entry points (e.g. library code) — reachability
             // markers are meaningless and suppressed by formatters.
             hasEntrypoints: reachableSet.size > 0,
@@ -517,7 +523,9 @@ function smart(index, name, options = {}) {
     }
     const code = index.extractCode(def);
     const stats = { uncertain: 0 };
-    const callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats });
+    // Callee contract (v4): uncertain/unresolved calls surface as visible
+    // unverifiedCallees + a conserved calleeAccount, never a silent drop.
+    const callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, collectAccount: true });
 
     const filesInScope = new Set([def.file]);
     callees.forEach(c => filesInScope.add(c.file));
@@ -557,6 +565,7 @@ function smart(index, name, options = {}) {
         }
     }
 
+    const smartUnverified = callees.unverifiedCallees || [];
     return {
         target: {
             ...def,
@@ -564,12 +573,14 @@ function smart(index, name, options = {}) {
         },
         dependencies,
         types,
+        unverifiedCallees: smartUnverified,
         meta: {
-            complete: stats.uncertain === 0 && dynamicImports === 0,
+            complete: stats.uncertain === 0 && dynamicImports === 0 && smartUnverified.length === 0,
             skipped: 0,
             dynamicImports,
             uncertain: stats.uncertain,
-            projectLanguage: index._getPredominantLanguage()
+            projectLanguage: index._getPredominantLanguage(),
+            calleeAccount: callees.calleeAccount
         }
     };
     } finally { index._endOp(); }
@@ -668,6 +679,10 @@ function related(index, name, options = {}) {
         return null;
     }
     const related = {
+        // Advisory command (v4 two-tier surface): ranked similarity
+        // heuristics, not a verified claim — formatters print the label,
+        // JSON consumers read the field.
+        advisory: 'similarity-heuristics',
         target: {
             name: def.name,
             file: def.relativePath,
@@ -1760,7 +1775,7 @@ function diffImpact(index, options = {}) {
             moduleLevelChanges: [],
             newFunctions: [],
             deletedFunctions: [],
-            summary: { modifiedFunctions: 0, deletedFunctions: 0, newFunctions: 0, totalCallSites: 0, affectedFiles: 0 }
+            summary: { modifiedFunctions: 0, deletedFunctions: 0, newFunctions: 0, totalCallSites: 0, unverifiedCallSites: 0, affectedFiles: 0 }
         };
     }
 
@@ -1789,6 +1804,7 @@ function diffImpact(index, options = {}) {
     const deletedFunctions = [];
     const callerFileSet = new Set();
     let totalCallSites = 0;
+    let totalUnverifiedSites = 0;
 
     for (const change of changes) {
         const lang = detectLanguage(change.filePath);
@@ -2014,7 +2030,13 @@ function diffImpact(index, options = {}) {
             }
         }
 
-        // For each affected function, find callers
+        // For each affected function, find callers under the tiered caller
+        // contract (v4): confirmed edges populate `callers`; evidence-less
+        // candidates render in `unverifiedCallers` with reasons; positively
+        // excluded sites reconcile in the per-symbol conservation account.
+        // The pre-v4 hand-rolled nominal receiver filter is gone — the engine's
+        // receiver physics (#198/#202/#204/#206/#220) decide tier and exclusion,
+        // and its same-dir heuristic could silently drop true callers.
         for (const [, data] of affectedSymbols) {
             const { symbol, addedLines: aLines, deletedLines: dLines } = data;
 
@@ -2022,59 +2044,34 @@ function diffImpact(index, options = {}) {
             const allDefs = index.symbols.get(symbol.name) || [];
             const targetDefs = allDefs.filter(d => d.file === change.filePath && d.startLine === symbol.startLine);
 
-            let callers = index.findCallers(symbol.name, {
+            const rawCallers = index.findCallers(symbol.name, {
                 targetDefinitions: targetDefs.length > 0 ? targetDefs : undefined,
                 includeMethods: true,
-                includeUncertain: false,
+                collectAccount: true,
             });
 
-            // For Go/Java/Rust methods with a className, filter callers whose
-            // receiver clearly belongs to a different type (same logic as impact()).
-            const targetDef = targetDefs[0] || symbol;
-            if (targetDef.className && langTraits(lang)?.typeSystem === 'nominal') {
-                const targetClassName = targetDef.className;
-                // Pre-compute how many types share this method name
-                const methodDefs = index.symbols.get(symbol.name);
-                const classNames = new Set();
-                if (methodDefs) {
-                    for (const d of methodDefs) {
-                        if (d.className) classNames.add(d.className);
-                        else if (d.receiver) classNames.add(d.receiver.replace(/^\*/, ''));
-                    }
-                }
-                const isWidelyShared = classNames.size > 3;
-                callers = callers.filter(c => {
-                    if (!c.isMethod) return true;
-                    const r = c.receiver;
-                    if (r && ['self', 'cls', 'this', 'super'].includes(r)) return true;
-                    // No receiver (chained/complex expression): only include if method is
-                    // unique or rare across types — otherwise too many false positives
-                    if (!r) {
-                        return classNames.size <= 1;
-                    }
-                    // Use receiverType from findCallers when available
-                    if (c.receiverType) {
-                        return c.receiverType === targetClassName ||
-                               c.receiverType === targetDef.receiver?.replace(/^\*/, '');
-                    }
-                    // Unique method heuristic: if the method exists on exactly one class/type, include
-                    if (classNames.size === 1 && classNames.has(targetClassName)) return true;
-                    // For widely shared method names (Get, Set, Run, etc.), require same-package
-                    // evidence when receiver type is unknown
-                    if (isWidelyShared) {
-                        const callerFile = c.file || '';
-                        const targetDir = path.dirname(change.filePath);
-                        return path.dirname(callerFile) === targetDir;
-                    }
-                    // Unknown receiver + multiple classes with this method → filter out
-                    return false;
-                });
-            }
+            const confirmed = rawCallers.filter(c => c.tier !== 'unverified');
+            let unverified = rawCallers.filter(c => c.tier === 'unverified')
+                .concat(rawCallers.unverifiedEntries || []);
 
-            for (const c of callers) {
+            // Per-symbol conservation account over the text ground set (same
+            // ring as impact — every changed symbol is a root the user touched
+            // directly). Ground call-lines no candidate claimed become visible
+            // one-liners (call-not-resolved), never silent gaps.
+            const account = composeAccount(index, symbol.name, rawCallers);
+            for (const e of callNotResolvedEntries(index, account)) unverified.push(e);
+            unverified.sort((a, b) => {
+                const ap = a.relativePath || '';
+                const bp = b.relativePath || '';
+                if (ap !== bp) return ap.localeCompare(bp);
+                return (a.line || 0) - (b.line || 0);
+            });
+
+            for (const c of confirmed) {
                 callerFileSet.add(c.file);
             }
-            totalCallSites += callers.length;
+            totalCallSites += confirmed.length;
+            totalUnverifiedSites += unverified.length;
 
             functions.push({
                 name: symbol.name,
@@ -2085,13 +2082,28 @@ function diffImpact(index, options = {}) {
                 signature: index.formatSignature(symbol),
                 addedLines: aLines,
                 deletedLines: dLines,
-                callers: callers.map(c => ({
+                callers: confirmed.map(c => ({
                     file: c.file,
                     relativePath: c.relativePath,
                     line: c.line,
                     callerName: c.callerName,
-                    content: c.content.trim()
-                }))
+                    content: (c.content || '').trim(),
+                    confidence: c.confidence,
+                    resolution: c.resolution,
+                    ...(c.tier && { tier: c.tier }),
+                })),
+                unverifiedCallers: unverified.map(u => ({
+                    file: u.file,
+                    relativePath: u.relativePath,
+                    line: u.line,
+                    callerName: u.callerName ?? null,
+                    content: (u.content || '').trim(),
+                    tier: 'unverified',
+                    ...(u.reason && { reason: u.reason }),
+                    ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
+                    ...(u.dispatchCandidates != null && { dispatchCandidates: u.dispatchCandidates }),
+                })),
+                account,
             });
         }
     }
@@ -2107,6 +2119,7 @@ function diffImpact(index, options = {}) {
             deletedFunctions: deletedFunctions.length,
             newFunctions: newFunctions.length,
             totalCallSites,
+            unverifiedCallSites: totalUnverifiedSites,
             affectedFiles: callerFileSet.size
         }
     };

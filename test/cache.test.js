@@ -73,6 +73,31 @@ describe('Cache Behavior', () => {
         }
     });
 
+    it('detects a modification made inside the 2s freshness window (MCP agent edit-then-query)', () => {
+        const tmpDir = createTempDir();
+        try {
+            const testFile = path.join(tmpDir, 'test.js');
+            fs.writeFileSync(testFile, 'function original() {}');
+
+            const index = new ProjectIndex(tmpDir);
+            index.build('**/*.js', { quiet: true });
+
+            // Confirm freshness (sets _lastFreshAt — the MCP burst window)
+            assert.strictEqual(index.isCacheStale(), false, 'fresh right after build');
+            assert.ok(index._lastFreshAt, 'freshness timestamp recorded');
+
+            // Agent edits the file and re-queries within 2 seconds. The stat
+            // sweep must run UNCONDITIONALLY — only the new-file glob hides
+            // behind the window. Pre-fix this returned false (stale answer
+            // served as fresh).
+            fs.writeFileSync(testFile, 'function modified() { return 42; }');
+            assert.strictEqual(index.isCacheStale(), true,
+                'modification inside the freshness window must be detected');
+        } finally {
+            cleanup(tmpDir);
+        }
+    });
+
     it('should detect new files added to project', () => {
         const tmpDir = createTempDir();
         try {

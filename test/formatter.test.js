@@ -1541,7 +1541,9 @@ describe('New Formatter Coverage', () => {
             assert.ok(!text.includes('NEW FUNCTIONS:'), 'Should not show new functions section');
             assert.ok(!text.includes('DELETED FUNCTIONS:'), 'Should not show deleted section');
             assert.ok(!text.includes('MODULE-LEVEL CHANGES:'), 'Should not show module-level section');
-            assert.ok(text.includes('Callers: none found'), 'Should say no callers');
+            // v4 tiered contract: zero confirmed callers ≠ none exist — wording
+            // says "none confirmed" (unverified candidates render separately).
+            assert.ok(text.includes('Callers: none confirmed'), 'Should say no confirmed callers');
         });
 
     });

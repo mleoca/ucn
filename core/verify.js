@@ -8,7 +8,6 @@
 const path = require('path');
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { escapeRegExp } = require('./shared');
-const { extractImports } = require('./imports');
 
 // ============================================================================
 // CALL-SITE CLASSIFICATION (Feature A)
@@ -467,121 +466,107 @@ function isNamespaceContainerFor(index, receiver, funcName, defFile) {
 }
 
 /**
- * BUG-BW: Build the list of call sites for `plan` using the SAME findCallers
- * + className filter logic that verify uses. This guarantees plan and verify
- * agree on which sites need updating — the previous implementation routed
- * through `index.impact()` whose filter is stricter for unresolved receivers
- * (e.g. `this.repo.save()`), causing plan to miss class-method call sites
- * that verify finds.
+ * v4 tiered caller sweep shared by verify and plan (BUG-BW lockstep): run
+ * findCallers in collectAccount mode and partition candidates into the
+ * confirmed band (arg-checked / planned) and the VISIBLE unverified band
+ * (rendered with reasons, never silently dropped). The pre-v4 className and
+ * receiver heuristics are gone — engine receiver physics decide tier and
+ * exclusion, and their fallback branches could silently drop true callers.
  *
- * Returns an array of plan-shaped sites: { file, line, expression, args, argCount }.
+ * One verify-local promotion survives as positive evidence the engine does
+ * not yet model: a receiver naming a namespace/class/module CONTAINER whose
+ * body defines the target (BUG-BX `Utils.helper()`) confirms — containment
+ * is identity evidence, not a naming heuristic.
+ *
+ * @param {object} index - ProjectIndex instance
+ * @param {string} name - Symbol name
+ * @param {object} def - Resolved definition (pinned target)
+ * @returns {{ confirmed: Array, unverified: Array, account: object }}
+ */
+function contractedCallerSweep(index, name, def) {
+    const rawCallers = index.findCallers(name, {
+        includeMethods: true,
+        targetDefinitions: [def],
+        collectAccount: true,
+    });
+
+    const promotes = (c) => c.isMethod && c.receiver &&
+        isNamespaceContainerFor(index, c.receiver, name, def.file);
+
+    const confirmed = [];
+    const unverified = [];
+    for (const c of rawCallers) {
+        if (c.tier !== 'unverified') { confirmed.push(c); continue; }
+        if (promotes(c)) { confirmed.push({ ...c, tier: 'confirmed', resolution: 'receiver-hint' }); continue; }
+        unverified.push(c);
+    }
+    for (const u of rawCallers.unverifiedEntries || []) {
+        if (promotes(u)) confirmed.push({ ...u, tier: 'confirmed', resolution: 'receiver-hint' });
+        else unverified.push(u);
+    }
+
+    // Conservation account from the POST-promotion claims (impact's manual
+    // composition — composeAccount would count promoted entries unverified).
+    const { computeGroundSet, buildAccount } = require('./account');
+    const groundSet = computeGroundSet(index, name);
+    const accountRaw = rawCallers.accountRaw || { unverifiedLines: [], excludedEntries: [] };
+    const confirmedEntries = confirmed.map(c => ({ file: c.file, line: c.line }));
+    const unverifiedEntries = [
+        ...accountRaw.unverifiedLines,
+        ...unverified.map(u => ({ file: u.file, line: u.line })),
+    ];
+    for (const s of rawCallers.shadowEntries || []) {
+        (s.tier === 'unverified' ? unverifiedEntries : confirmedEntries).push({ file: s.file, line: s.line });
+    }
+    const account = buildAccount(index, name, {
+        groundSet,
+        confirmedEntries,
+        unverifiedEntries,
+        excludedEntries: accountRaw.excludedEntries,
+    });
+
+    // Ground call-lines no engine candidate claimed: visible one-liners
+    // (already counted unverified in the account arithmetic).
+    const { callNotResolvedEntries } = require('./analysis');
+    for (const e of callNotResolvedEntries(index, account)) unverified.push(e);
+    unverified.sort((a, b) => {
+        const ap = a.relativePath || '';
+        const bp = b.relativePath || '';
+        if (ap !== bp) return ap.localeCompare(bp);
+        return (a.line || 0) - (b.line || 0);
+    });
+
+    return { confirmed, unverified, account };
+}
+
+/** Map an unverified sweep entry to the public site shape (relative `file`). */
+function unverifiedSiteShape(u) {
+    return {
+        file: u.relativePath,
+        line: u.line,
+        expression: (u.content || '').trim(),
+        callerName: u.callerName ?? null,
+        tier: 'unverified',
+        ...(u.reason && { reason: u.reason }),
+        ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
+        ...(u.dispatchCandidates != null && { dispatchCandidates: u.dispatchCandidates }),
+    };
+}
+
+/**
+ * BUG-BW: Build the list of call sites for `plan` using the SAME sweep verify
+ * uses. This guarantees plan and verify agree on which sites need updating.
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name being refactored
  * @param {object} def - Resolved definition
- * @param {object} options - { file, className, line }
- * @returns {Array}
+ * @returns {{ sites: Array, unverifiedSites: Array, account: object }}
  */
-function computePlanCallSites(index, name, def, options) {
-    let callerResults = index.findCallers(name, {
-        includeMethods: true,
-        includeUncertain: false,
-        targetDefinitions: [def],
-    });
-
-    // Mirror verify's className filter (kept inline rather than re-extracted to
-    // avoid changing verify's behavior).
-    if (options.className && def.className) {
-        const targetClassName = def.className;
-        callerResults = callerResults.filter(c => {
-            if (!c.isMethod) return true;
-            const r = c.receiver;
-            if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
-            if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
-            // Local var type inference from constructor assignments
-            if (c.callerFile) {
-                const callerDef = c.callerStartLine ? { file: c.callerFile, startLine: c.callerStartLine, endLine: c.callerEndLine } : null;
-                if (callerDef) {
-                    const callerCalls = index.getCachedCalls(c.callerFile);
-                    if (callerCalls && Array.isArray(callerCalls)) {
-                        const localTypes = new Map();
-                        for (const call of callerCalls) {
-                            if (call.line >= callerDef.startLine && call.line <= callerDef.endLine) {
-                                if (!call.isMethod && !call.receiver) {
-                                    const syms = index.symbols.get(call.name);
-                                    if (syms && syms.some(s => s.type === 'class')) {
-                                        const content = index._readFile(c.callerFile);
-                                        const clines = content.split('\n');
-                                        const cline = clines[call.line - 1] || '';
-                                        const m = cline.match(/^\s*(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/);
-                                        if (m && m[2] === call.name) {
-                                            localTypes.set(m[1], call.name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        const receiverType = localTypes.get(r);
-                        if (receiverType) return receiverType === targetClassName;
-                    }
-                }
-            }
-            // Param type annotations
-            if (c.callerFile && c.callerStartLine) {
-                const callerSymbol = index.findEnclosingFunction(c.callerFile, c.line, true);
-                if (callerSymbol && callerSymbol.paramsStructured) {
-                    for (const param of callerSymbol.paramsStructured) {
-                        if (param.name === r && param.type) {
-                            const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
-                            if (typeMatches && typeMatches.some(t => t === targetClassName)) {
-                                return true;
-                            }
-                            return false;
-                        }
-                    }
-                }
-            }
-            // Unique method heuristic
-            const methodDefs = index.symbols.get(name);
-            if (methodDefs) {
-                const classNames = new Set();
-                for (const d of methodDefs) {
-                    if (d.className) classNames.add(d.className);
-                }
-                if (classNames.size === 1 && classNames.has(targetClassName)) {
-                    return true;
-                }
-            }
-            return false;
-        });
-    }
-
-    // Apply the same isMethodCall / non-method filter verify uses.
-    const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
-    const targetBasename = path.basename(def.file, path.extname(def.file));
-    const defFileEntry = index.files.get(def.file);
-    const defLang = defFileEntry?.language;
-
-    const importNameCache = new Map();
-    function getImportedNames(filePath) {
-        if (importNameCache.has(filePath)) return importNameCache.get(filePath);
-        const names = new Set();
-        const fe = index.files.get(filePath);
-        if (!fe) { importNameCache.set(filePath, names); return names; }
-        try {
-            const content = index._readFile(filePath);
-            const { imports: rawImports, importAliases } = extractImports(content, fe.language);
-            for (const imp of rawImports) {
-                if (imp.names) for (const n of imp.names) names.add(n);
-            }
-            if (importAliases) for (const alias of importAliases) names.add(alias.local);
-        } catch (e) { /* skip */ }
-        importNameCache.set(filePath, names);
-        return names;
-    }
+function computePlanCallSites(index, name, def) {
+    const { confirmed, unverified, account } = contractedCallerSweep(index, name, def);
 
     const sites = [];
-    for (const c of callerResults) {
+    for (const c of confirmed) {
         const call = {
             file: c.file,
             relativePath: c.relativePath,
@@ -591,22 +576,6 @@ function computePlanCallSites(index, name, def, options) {
             receiver: c.receiver,
         };
         const analysis = analyzeCallSite(index, call, name);
-
-        if (analysis.isMethodCall && !defIsMethod) {
-            const callReceiver = call.receiver;
-            if (callReceiver && callReceiver === targetBasename) {
-                const importedNames = getImportedNames(call.file);
-                if (!importedNames.has(callReceiver)) continue;
-            } else if (callReceiver && langTraits(defLang)?.hasReceiverPackageCalls) {
-                const targetDir = path.basename(path.dirname(def.file));
-                if (callReceiver !== targetDir) continue;
-            } else if (callReceiver && isNamespaceContainerFor(index, callReceiver, name, def.file)) {
-                // BUG-BX: TS namespace-qualified call — accept.
-            } else {
-                continue;
-            }
-        }
-
         sites.push({
             file: call.relativePath,
             line: call.line,
@@ -622,7 +591,7 @@ function computePlanCallSites(index, name, def, options) {
         if (fc !== 0) return fc;
         return (a.line || 0) - (b.line || 0);
     });
-    return sites;
+    return { sites, unverifiedSites: unverified.map(unverifiedSiteShape), account };
 }
 
 /**
@@ -966,93 +935,13 @@ function verify(index, name, options = {}) {
     const optionalCount = nonRestParams.filter(p => p.optional || p.default !== undefined).length;
     const minArgs = expectedParamCount - optionalCount;
 
-    // Get all call sites using findCallers for accurate resolution
-    // (usages-based approach misses calls when className is set or local names collide)
-    // BUG-H3: accept user-supplied flag. The default keeps the historical behavior:
-    // findCallers always returns method calls (so callers like obj.method() are seen),
-    // and the secondary filter below drops them when verifying a non-method def
-    // (e.g. dict.get() vs standalone get()). Passing --include-methods opts out of
-    // the secondary filter so all method-style calls are treated as candidates.
-    const verifyIncludeMethods = options.includeMethods === true;
-    const verifyIncludeUncertain = options.includeUncertain ?? false;
-    let callerResults = index.findCallers(name, {
-        // Always pass true to findCallers so method calls are visible — the secondary
-        // filter inside verify is the one that does the policy-driven filtering.
-        includeMethods: true,
-        includeUncertain: verifyIncludeUncertain,
-        targetDefinitions: [def],
-    });
-
-    // When className is explicitly provided, filter out method calls whose
-    // receiver clearly belongs to a different type (same logic as impact()).
-    if (options.className && def.className) {
-        const targetClassName = def.className;
-        callerResults = callerResults.filter(c => {
-            if (!c.isMethod) return true;
-            const r = c.receiver;
-            if (!r || ['self', 'cls', 'this', 'super'].includes(r)) return true;
-            if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
-            // Check local variable type inference from constructor assignments
-            if (c.callerFile) {
-                const callerDef = c.callerStartLine ? { file: c.callerFile, startLine: c.callerStartLine, endLine: c.callerEndLine } : null;
-                if (callerDef) {
-                    const callerCalls = index.getCachedCalls(c.callerFile);
-                    if (callerCalls && Array.isArray(callerCalls)) {
-                        const localTypes = new Map();
-                        for (const call of callerCalls) {
-                            if (call.line >= callerDef.startLine && call.line <= callerDef.endLine) {
-                                if (!call.isMethod && !call.receiver) {
-                                    const syms = index.symbols.get(call.name);
-                                    if (syms && syms.some(s => s.type === 'class')) {
-                                        const content = index._readFile(c.callerFile);
-                                        const clines = content.split('\n');
-                                        const cline = clines[call.line - 1] || '';
-                                        const m = cline.match(/^\s*(\w+)\s*=\s*(?:await\s+)?(\w+)\s*\(/);
-                                        if (m && m[2] === call.name) {
-                                            localTypes.set(m[1], call.name);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        const receiverType = localTypes.get(r);
-                        if (receiverType) {
-                            return receiverType === targetClassName;
-                        }
-                    }
-                }
-            }
-            // Check parameter type annotations: def foo(tracker: SourceTracker) → tracker.record()
-            if (c.callerFile && c.callerStartLine) {
-                const callerSymbol = index.findEnclosingFunction(c.callerFile, c.line, true);
-                if (callerSymbol && callerSymbol.paramsStructured) {
-                    for (const param of callerSymbol.paramsStructured) {
-                        if (param.name === r && param.type) {
-                            const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
-                            if (typeMatches && typeMatches.some(t => t === targetClassName)) {
-                                return true;
-                            }
-                            return false;
-                        }
-                    }
-                }
-            }
-            // Unique method heuristic: if the called method exists on exactly one class
-            // and it matches the target, include the call (no other class could match)
-            const methodDefs = index.symbols.get(name);
-            if (methodDefs) {
-                const classNames = new Set();
-                for (const d of methodDefs) {
-                    if (d.className) classNames.add(d.className);
-                }
-                if (classNames.size === 1 && classNames.has(targetClassName)) {
-                    return true;
-                }
-            }
-            // className explicitly set but receiver type unknown — filter it out
-            return false;
-        });
-    }
+    // v4 tiered contract: the confirmed band is arg-checked below; unverified
+    // candidates stay VISIBLE in their own band with reasons (never silently
+    // dropped). Engine receiver physics replace the pre-v4 className filter
+    // and the isMethodCall secondary filter — --include-methods and
+    // --include-uncertain are implied no-ops for verify.
+    const { confirmed: callerResults, unverified: sweepUnverified, account } =
+        contractedCallerSweep(index, name, def);
 
     // Convert caller results to usage-like objects for analyzeCallSite.
     // Carry callerFile/callerStartLine through so we can compute inTestCase.
@@ -1071,36 +960,7 @@ function verify(index, name, options = {}) {
     const mismatches = [];
     const uncertain = [];
 
-    // If the definition is NOT a method, filter out method calls (e.g., dict.get() vs get())
-    // This prevents false positives where a standalone function name matches method calls.
-    // Exception: module-level calls (module.func()) are kept when the receiver matches the
-    // target module's name and is an imported name (e.g., jobs.submit() where jobs is imported
-    // and the function lives in jobs.py).
     const defIsMethod = !!(def.isMethod || def.type === 'method' || def.className);
-    const targetBasename = path.basename(def.file, path.extname(def.file));
-    const defFileEntry = index.files.get(def.file);
-    const defLang = defFileEntry?.language;
-
-    // Build import-name lookup for receiver checking (module.func() vs dict.get())
-    const importNameCache = new Map();
-    function getImportedNames(filePath) {
-        if (importNameCache.has(filePath)) return importNameCache.get(filePath);
-        const names = new Set();
-        const fe = index.files.get(filePath);
-        if (!fe) { importNameCache.set(filePath, names); return names; }
-        try {
-            const content = index._readFile(filePath);
-            const { imports: rawImports, importAliases } = extractImports(content, fe.language);
-            for (const imp of rawImports) {
-                if (imp.names) for (const n of imp.names) names.add(n);
-            }
-            if (importAliases) {
-                for (const alias of importAliases) names.add(alias.local);
-            }
-        } catch (e) { /* skip */ }
-        importNameCache.set(filePath, names);
-        return names;
-    }
 
     // Helper: extract pattern flags (Feature A/B) from analyzeCallSite result.
     // Reused so each valid/mismatch/uncertain entry carries the same shape.
@@ -1116,40 +976,6 @@ function verify(index, name, options = {}) {
 
     for (const call of calls) {
         const analysis = analyzeCallSite(index, call, name);
-
-        // Skip method calls when verifying a non-method definition.
-        // This prevents false positives (e.g., dict.get() vs standalone get()).
-        // Allow module-level calls only when:
-        // 1. Receiver matches target file's basename (e.g., jobs == jobs for jobs.py)
-        // 2. Receiver is an imported name (not a local variable)
-        // BUG-H3: when verifyIncludeMethods is true, keep method-style calls that
-        // findCallers already accepted (binding/import resolution did the heavy lifting).
-        // The receiver-based filtering below is a secondary safety net — skip it when
-        // user explicitly opted into method calls.
-        if (analysis.isMethodCall && !defIsMethod && !verifyIncludeMethods) {
-            const callReceiver = call.receiver;
-            if (callReceiver && callReceiver === targetBasename) {
-                const importedNames = getImportedNames(call.file);
-                if (!importedNames.has(callReceiver)) continue;
-                // Receiver matches target module and is imported — keep it
-            } else if (callReceiver && langTraits(defLang)?.hasReceiverPackageCalls) {
-                // Go: receiver is package alias (last segment of import path, e.g., "controller"
-                // from "k8s.io/.../pkg/controller"), not the filename ("controller_utils").
-                // Check if receiver matches the directory name of the target file.
-                const targetDir = path.basename(path.dirname(def.file));
-                if (callReceiver !== targetDir) {
-                    continue;
-                }
-                // Receiver matches package directory — keep it
-            } else if (callReceiver && isNamespaceContainerFor(index, callReceiver, name, def.file)) {
-                // BUG-BX: TS namespace-qualified call (e.g. `Utils.helper()` where
-                // `Utils` is a `namespace` symbol containing `helper`). Treat the
-                // call as a direct invocation of the namespace member function.
-                // Same handling for class static methods and module containers.
-            } else {
-                continue;
-            }
-        }
 
         // Carry callerFile/callerStartLine so tagInTestCase can resolve the
         // enclosing function in a later pass.
@@ -1327,6 +1153,11 @@ function verify(index, name, options = {}) {
         validDetails: valid,
         mismatchDetails: mismatches,
         uncertainDetails: uncertain,
+        // v4 tiered contract: candidates without binding/receiver evidence are
+        // NOT arg-checked (they may target another symbol) but stay visible.
+        unverifiedCount: sweepUnverified.length,
+        unverifiedSites: sweepUnverified.map(unverifiedSiteShape),
+        account,
         patterns: patternsAgg,
         scopeWarning
     };
@@ -1359,12 +1190,12 @@ function plan(index, name, options = {}) {
         returnType: arrowTypes.returnType
     } : {});
 
-    // BUG-BW: plan must discover call sites the same way verify does for class
-    // methods. Previously plan relied on `index.impact()` whose filter rejected
-    // calls with unresolved receivers (e.g. `this.field.method()`), even when
-    // verify's filter accepts them. Compute call sites locally to keep plan
-    // and verify in lock-step.
-    const planCallSites = computePlanCallSites(index, name, def, options);
+    // BUG-BW: plan must discover call sites the same way verify does — both
+    // run contractedCallerSweep (v4 tiered contract), so plan and verify stay
+    // in lock-step by construction. Unverified candidates are NOT planned
+    // (they may target another symbol) but stay visible with reasons.
+    const { sites: planCallSites, unverifiedSites: planUnverified, account: planAccount } =
+        computePlanCallSites(index, name, def);
     const impactScopeWarning = computePlanScopeWarning(index, name, def, options);
 
     // Reject ambiguous multi-op invocations rather than silently coalescing.
@@ -1568,6 +1399,11 @@ function plan(index, name, options = {}) {
         totalChanges: changes.length,
         filesAffected: new Set(changes.map(c => c.file)).size,
         changes,
+        // v4 tiered contract: sites that MAY also need this change but lack
+        // binding/receiver evidence — review manually before refactoring.
+        unverifiedCount: planUnverified.length,
+        unverifiedSites: planUnverified,
+        account: planAccount,
         scopeWarning: impactScopeWarning
     };
     } finally { index._endOp(); }

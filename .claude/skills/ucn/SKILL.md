@@ -217,7 +217,7 @@ ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pyte
 
 `audit-async` is the focused tool for the `awaited=false` case across an entire async function body.
 
-## Reading Tiered Output (about / context / impact / trace / blast / reverse-trace / affected-tests)
+## Reading Tiered Output (about / context / impact / trace / blast / reverse-trace / affected-tests / diff-impact / verify / plan / check)
 
 Caller answers are a **partition of every text occurrence** of the symbol — nothing is silently hidden. Sections:
 
@@ -232,7 +232,18 @@ Caller answers are a **partition of every text occurrence** of the symbol — no
 
 Resolution labels in `evidence:` lines (high to low): `exact-binding` (0.98, import/binding evidence) · `same-class` (0.92) · `receiver-hint` (0.80, inferred receiver type) · `scope-match` (0.65, import/receiver-binding scope evidence) · `name-only` (0.40) · `uncertain` (0.25). Confirmed tier = scope-match and above. JSON output keeps per-edge decimals plus `tier`.
 
-Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain` is an **implied no-op** for about/context/impact/trace/blast/reverse-trace/affected-tests (everything is shown, tiered); it keeps its meaning for `smart`/`verify`. `--include-methods` is an implied no-op for about/context/impact.
+Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain` and `--include-methods` are **implied no-ops** for every contracted command (about/context/impact/trace/blast/reverse-trace/affected-tests/diff-impact/verify/plan/smart) — everything is shown, tiered.
+
+### Refactor commands run the same contract (v4)
+
+- `verify` arg-checks the **confirmed** band only; candidates without evidence render in `UNVERIFIED CALL SITES (N)` with reasons and are NOT arg-checked (they may target another symbol). A wrong-arity method call with binding evidence is flagged **by default** now. The `ACCOUNT:` line reconciles.
+- `plan` plans changes for confirmed sites; `UNVERIFIED CALL SITES` lists sites that MAY also need the change — review them before refactoring. Plan and verify agree by construction.
+- `diff-impact` reports per-changed-function confirmed `Callers` + `Unverified call sites` + a per-symbol `ACCOUNT:` line. `check` shows `N callers (+M unverified)` per changed function; ORPHAN requires zero candidates in BOTH tiers.
+- `context`/`smart` also account the **callee** side: `CALLEES — UNVERIFIED (N)` entries + a `CALLEE ACCOUNT:` arithmetic line.
+
+### Advisory commands self-label
+
+`related`, `example`, `stacktrace`, and `endpoints --bridge` print an `Advisory:` line (and carry an `advisory` field in JSON): their answers are ranked heuristics, not verified claims. Contracted commands carry accounts; advisory commands say so — there is no third category.
 
 ### Tree commands (trace / blast / reverse-trace / affected-tests)
 

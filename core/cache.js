@@ -51,7 +51,12 @@ const UCN_VERSION = require('../package.json').version;
 // node's line (the #201/RUST-2 name-node convention — multi-line receivers
 // like `(&pkg.Name{...}).String()` reported the chain-start line; Go was the
 // only parser still keying calls off the call node's start).
-const CACHE_FORMAT_VERSION = 26;
+// v27 (fix #224): Python from-import submodules — `from . import jobs` binds
+// jobs.py as a plain NAME; graph-build resolves the composed submodule
+// specifier ('.jobs') into fileEntry.moduleResolved and adds the import edge,
+// so submodule receivers behave like `import jobs` module receivers
+// (persisted moduleResolved/importGraph shapes gain entries).
+const CACHE_FORMAT_VERSION = 27;
 
 /**
  * Save index to cache file
@@ -421,11 +426,13 @@ function loadCache(index, cachePath) {
  * @returns {boolean} - True if cache needs rebuilding
  */
 function isCacheStale(index) {
-    // Ultra-fast path: skip full check if last confirmed-fresh < 2s ago (covers MCP burst calls).
-    // Only uses _lastFreshAt (set at the end of a successful full check), not cache save timestamp.
-    if (index._lastFreshAt && Date.now() - index._lastFreshAt < 2000) {
-        return false;
-    }
+    // Modified/deleted detection (stat sweep) runs UNCONDITIONALLY — agents
+    // edit a file and re-query through MCP within seconds, and a stale answer
+    // presented as fresh is the worst trust failure the tool can produce.
+    // The 2s freshness window below shields only the expensive directory
+    // walk (new-file detection): a brand-new file queried within 2s of the
+    // last full check is a far rarer race than an edit, and the walk is the
+    // part that costs real time on large repos.
 
     // Fast path: check cached files for modifications/deletions first (stat-only).
     // This returns early without the expensive directory walk when any file changed.
@@ -452,6 +459,13 @@ function isCacheStale(index) {
         } catch (e) {
             return true; // File deleted or inaccessible
         }
+    }
+
+    // Ultra-fast skip for the SLOW path only: last confirmed-fresh < 2s ago
+    // (covers MCP burst calls). Uses _lastFreshAt (set at the end of a
+    // successful full check), never the cache save timestamp.
+    if (index._lastFreshAt && Date.now() - index._lastFreshAt < 2000) {
+        return false;
     }
 
     // Slow path: glob the project to detect new files added since last build.

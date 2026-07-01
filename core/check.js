@@ -77,11 +77,16 @@ function check(index, options = {}) {
             ? verifyResult.mismatchDetails
             : [];
 
-        // For modified functions, the existing diffImpact result has `callers` already
+        // For modified functions, the contracted diffImpact result carries both
+        // bands already (confirmed `callers` + visible `unverifiedCallers`).
         let callers = Array.isArray(fn.callers) ? fn.callers : [];
+        let unverifiedCallers = Array.isArray(fn.unverifiedCallers) ? fn.unverifiedCallers : [];
         if (callers.length === 0 && fn._kind === 'added') {
             try {
-                callers = index.findCallers(fn.name, { includeMethods: true, includeUncertain: false }) || [];
+                const raw = index.findCallers(fn.name, { includeMethods: true, collectAccount: true }) || [];
+                callers = raw.filter(c => c.tier !== 'unverified');
+                unverifiedCallers = raw.filter(c => c.tier === 'unverified')
+                    .concat(raw.unverifiedEntries || []);
             } catch (e) { /* skip */ }
         }
 
@@ -91,14 +96,17 @@ function check(index, options = {}) {
             line: fn.startLine || fn.line,
             kind: fn._kind,
             callerCount: callers.length,
+            unverifiedCallerCount: unverifiedCallers.length,
             signatureMismatches: mismatches.length,
             ...(mismatches.length > 0 && { mismatches: mismatches.slice(0, 5) }),
         };
 
-        // Orphan = newly added with zero callers AND not detected as an entry point.
-        // (A new helper called by another new helper is still NOT orphan; reachability
-        //  is rebuilt as the user iterates, and false positives here cause noise.)
-        if (item.kind === 'added' && callers.length === 0) {
+        // Orphan = newly added with zero caller CANDIDATES IN EITHER TIER and
+        // not detected as an entry point. Zero confirmed + N unverified is NOT
+        // orphan (the #223 reverseTrace entry-point soundness rule — claiming
+        // "nobody calls this" after routing candidates to the unverified tier
+        // would be the exact silent-drop the contract forbids).
+        if (item.kind === 'added' && callers.length === 0 && unverifiedCallers.length === 0) {
             // Check entry points: if the symbol is a known entry-point pattern, not orphan
             let isEntry = false;
             try {
@@ -122,6 +130,7 @@ function check(index, options = {}) {
             line: d.startLine || 0,
             kind: 'deleted',
             callerCount: 0,
+            unverifiedCallerCount: 0,
             signatureMismatches: 0,
         });
     }
@@ -157,7 +166,7 @@ function check(index, options = {}) {
             actions.push({
                 severity: 'warn',
                 kind: 'orphan_new',
-                message: `${it.name} is new but has no callers and is not an entry point`,
+                message: `${it.name} is new but has no callers (confirmed or unverified) and is not an entry point`,
             });
         }
     }

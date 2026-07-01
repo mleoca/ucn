@@ -150,6 +150,9 @@ const FLAG_APPLICABILITY = {
     graph:        ['file', 'depth', 'direction', 'all'],
     circularDeps: ['file', 'exclude'],
     // Refactoring
+    // verify runs the tiered caller contract (v4): includeMethods/
+    // includeUncertain are implied no-ops (unverified sites always visible in
+    // their own band); kept in the matrix so legacy invocations don't warn.
     verify:       ['name', 'file', 'className', 'includeMethods', 'includeUncertain'],
     plan:         ['name', 'file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],

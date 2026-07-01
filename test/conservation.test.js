@@ -460,7 +460,7 @@ describe('conservation: drop points carry reasons (Phase 2 engine instrumentatio
     });
 });
 
-describe('conservation: tree commands run the contract — verify/smart stay legacy', () => {
+describe('conservation: tree/diffImpact/verify/plan/context-callees/smart run the contract', () => {
     it('blast/reverseTrace carry root account + tree account; trace down carries callee rollup', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
@@ -489,22 +489,158 @@ describe('conservation: tree commands run the contract — verify/smart stay leg
         } finally { rm(dir); }
     });
 
-    it('verify/smart results stay legacy — no account/tier leakage', () => {
+    it('diffImpact runs the contract — per-symbol account + tiered callers (v4)', () => {
+        const { execFileSync } = require('child_process');
         const dir = tmp({
             'package.json': '{"name":"t"}',
-            'lib.js': 'function inner() { return 1; }\nfunction outer() { return inner(); }\nmodule.exports = { inner, outer };',
-            'app.js': 'const { outer } = require("./lib");\nfunction main() { return outer(); }\nmodule.exports = { main };',
+            'lib.js': [
+                'class Store {',
+                '  save(x) { return x; }',
+                '}',
+                'function save(x) { return x + 1; }',
+                'module.exports = { Store, save };',
+            ].join('\n'),
+            'app.js': [
+                'const { save } = require("./lib");',
+                '// save is called at startup',
+                'function main() { return save(5); }',
+                'function other(db) { return db.save(1); }',
+            ].join('\n'),
+        });
+        try {
+            execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+            execFileSync('git', ['add', '.'], { cwd: dir, stdio: 'pipe' });
+            execFileSync('git', ['-c', 'user.email=t@t.c', '-c', 'user.name=T', 'commit', '-m', 'init'], { cwd: dir, stdio: 'pipe' });
+            // Modify the standalone save()
+            fs.writeFileSync(path.join(dir, 'lib.js'), [
+                'class Store {',
+                '  save(x) { return x; }',
+                '}',
+                'function save(x) { return x + 2; }',
+                'module.exports = { Store, save };',
+            ].join('\n'));
+
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const r = execute(index, 'diffImpact', { base: 'HEAD' });
+            assert.ok(r.ok, 'diffImpact should succeed');
+            const fn = (r.result.functions || []).find(f => f.name === 'save');
+            assert.ok(fn, 'modified save should be reported');
+
+            // Confirmed tier: the bound direct call
+            assert.ok(fn.callers.some(c => c.callerName === 'main' && c.tier === 'confirmed'),
+                'main() direct call must be a confirmed caller');
+            // Unverified tier: evidence-less method call is VISIBLE with a reason,
+            // never silently dropped (pre-v4 diffImpact dropped it)
+            assert.ok(fn.unverifiedCallers.some(u => u.callerName === 'other' && u.reason),
+                `db.save(1) must appear in unverifiedCallers with a reason: ${JSON.stringify(fn.unverifiedCallers)}`);
+
+            // Per-symbol conservation account
+            assert.ok(fn.account, 'per-symbol account must be present');
+            assert.ok(fn.account.conserved, `account must conserve: ${JSON.stringify(fn.account)}`);
+            const a = fn.account;
+            assert.strictEqual(
+                a.confirmed + a.unverified + a.nonCall.total + a.excluded.total + a.unparsed.lines + a.unaccounted,
+                a.groundTotal, 'buckets must sum to groundTotal');
+
+            // Summary carries both bands
+            assert.strictEqual(r.result.summary.totalCallSites, 1, 'confirmed count');
+            assert.strictEqual(r.result.summary.unverifiedCallSites, 1, 'unverified count');
+        } finally { rm(dir); }
+    });
+
+    it('verify/plan run the contract — account + visible unverified band (v4)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'class Store {',
+                '  save(x) { return x; }',
+                '}',
+                'function save(x) { return x + 1; }',
+                'module.exports = { Store, save };',
+            ].join('\n'),
+            'app.js': [
+                'const { save } = require("./lib");',
+                'function main() { return save(5); }',
+                'function other(db) { return db.save(1, 2); }',
+            ].join('\n'),
         });
         try {
             const index = idx(dir);
             const { execute } = require('../core/execute');
-            for (const cmd of ['verify', 'smart']) {
-                const r = execute(index, cmd, { name: 'inner' });
-                assert.ok(r.ok, `${cmd} should succeed`);
-                const json = JSON.stringify(r.result);
-                assert.ok(!json.includes('"account"'), `${cmd} JSON must not contain account: ${json.slice(0, 200)}`);
-                assert.ok(!json.includes('"tier"'), `${cmd} JSON must not contain tier: ${json.slice(0, 200)}`);
-            }
+
+            const v = execute(index, 'verify', { name: 'save', file: 'lib.js', line: 4 });
+            assert.ok(v.ok, 'verify should succeed');
+            // Confirmed band arg-checked as before
+            assert.strictEqual(v.result.totalCalls, 1, 'confirmed band: the bound direct call');
+            assert.strictEqual(v.result.valid, 1);
+            // Unverified band visible with reason — pre-v4 verify silently dropped it
+            assert.strictEqual(v.result.unverifiedCount, 1, 'db.save must be visible unverified');
+            assert.ok(v.result.unverifiedSites[0].reason, 'unverified site carries a reason');
+            // Conservation account
+            assert.ok(v.result.account, 'verify must carry the account');
+            assert.ok(v.result.account.conserved, `verify account must conserve: ${JSON.stringify(v.result.account)}`);
+
+            // BUG-BW lockstep under the contract: plan's confirmed sites === verify's
+            const p = execute(index, 'plan', { name: 'save', file: 'lib.js', line: 4, addParam: 'opt' });
+            assert.ok(p.ok, 'plan should succeed');
+            assert.strictEqual(p.result.totalChanges, v.result.totalCalls,
+                'plan totalChanges must equal verify totalCalls');
+            assert.strictEqual(p.result.unverifiedCount, v.result.unverifiedCount,
+                'plan and verify agree on the unverified band');
+            assert.ok(p.result.account && p.result.account.conserved, 'plan account must conserve');
+        } finally { rm(dir); }
+    });
+
+    it('advisory commands self-label (v4 two-tier surface)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function helperFn(x) { return x; }\nfunction helperUtil() { return helperFn(2); }\nmodule.exports = { helperFn, helperUtil };',
+            'app.js': 'const { helperFn } = require("./lib");\nfunction main() { return helperFn(1); }',
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.related('helperFn').advisory, 'similarity-heuristics',
+                'related must self-label advisory');
+            assert.strictEqual(index.example('helperFn').advisory, 'scored-selection',
+                'example must self-label advisory');
+            assert.strictEqual(index.parseStackTrace('at main (app.js:2:20)').advisory,
+                'best-effort-frame-matching', 'stacktrace must self-label advisory');
+        } finally { rm(dir); }
+    });
+
+    it('context/smart callee sides run the contract — calleeAccount + visible unverified callees (v4)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function inner() { return 1; }\nmodule.exports = { inner };',
+            'app.js': [
+                'const { inner } = require("./lib");',
+                'function outer(db) {',
+                '  db.mystery(1);',       // uncertain receiver — unresolved callee
+                '  return inner();',       // confirmed callee
+                '}',
+                'module.exports = { outer };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+
+            const c = execute(index, 'context', { name: 'outer' });
+            assert.ok(c.ok, 'context should succeed');
+            assert.ok(c.result.callees.some(x => x.name === 'inner'), 'inner is a confirmed callee');
+            const acct = c.result.meta.calleeAccount;
+            assert.ok(acct, 'context must carry the calleeAccount');
+            assert.strictEqual(acct.totalSites,
+                acct.confirmed + acct.unverified + acct.external.count + acct.excluded.total + acct.filtered.count,
+                `callee account must conserve: ${JSON.stringify(acct)}`);
+            assert.ok(Array.isArray(c.result.unverifiedCallees), 'unverifiedCallees band present');
+
+            const s = execute(index, 'smart', { name: 'outer' });
+            assert.ok(s.ok, 'smart should succeed');
+            assert.ok(s.result.meta.calleeAccount, 'smart must carry the calleeAccount');
+            assert.ok(Array.isArray(s.result.unverifiedCallees), 'smart unverifiedCallees band present');
+            assert.strictEqual(s.result.meta.calleeAccount.conserved, true, 'smart callee account conserves');
         } finally { rm(dir); }
     });
 });

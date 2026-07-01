@@ -662,11 +662,11 @@ function runProjectCommand(rootDir, command, arg) {
         }
         // Tiered-output contract: unverified callers are always shown for
         // these commands, so the legacy reveal flags are implied no-ops.
-        if (['about', 'context', 'impact', 'trace', 'blast', 'reverseTrace', 'affectedTests'].includes(canonical)) {
+        if (['about', 'context', 'impact', 'trace', 'blast', 'reverseTrace', 'affectedTests', 'verify', 'smart'].includes(canonical)) {
             if (flags.includeUncertain) {
                 console.error(`Note: --include-uncertain is implied for '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
             }
-            if (['about', 'context', 'impact'].includes(canonical) && flags.includeMethods) {
+            if (['about', 'context', 'impact', 'verify'].includes(canonical) && flags.includeMethods) {
                 console.error(`Note: --include-methods is implied for '${toCliName(canonical)}' — method calls are tiered by receiver evidence.`);
             }
         }

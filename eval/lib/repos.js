@@ -121,6 +121,62 @@ const REPOS = [
     },
 ];
 
+// ============================================================================
+// FRESH-REPO ARM (generalization guard)
+// ============================================================================
+// The pinned board proves stability; the fresh arm proves the receiver
+// physics generalize to code the engine was never tuned on (the untuned-repo
+// stress test found the deadcode base-override family exactly this way).
+// Repos here are UNPINNED — each run resolves HEAD via ls-remote, records the
+// SHA in the report (reproducible after the fact), and rotates through the
+// pool by ISO week so successive runs cover different repos. None of these
+// appear in REPOS, and none should ever be used to tune a fix — a fresh repo
+// that surfaces a family graduates INTO the pinned board if it's used for
+// engineering, and gets replaced here.
+const FRESH_POOL = [
+    { name: 'hono', url: 'https://github.com/honojs/hono', language: 'typescript', targetCandidates: ['src'] },
+    { name: 'zustand', url: 'https://github.com/pmndrs/zustand', language: 'typescript', targetCandidates: ['src'] },
+    { name: 'fastify', url: 'https://github.com/fastify/fastify', language: 'javascript', targetCandidates: ['.'] },
+    { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['src'] },
+    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['src/flask'] },
+    { name: 'click', url: 'https://github.com/pallets/click', language: 'python', targetCandidates: ['src/click'] },
+    { name: 'chi', url: 'https://github.com/go-chi/chi', language: 'go', targetCandidates: ['.'] },
+    { name: 'viper', url: 'https://github.com/spf13/viper', language: 'go', targetCandidates: ['.'] },
+    { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
+    { name: 'clap', url: 'https://github.com/clap-rs/clap', language: 'rust', targetCandidates: ['.'] },
+    { name: 'javapoet', url: 'https://github.com/square/javapoet', language: 'java', targetCandidates: ['javapoet/src/main/java', 'src/main/java'] },
+    { name: 'jsoup', url: 'https://github.com/jhy/jsoup', language: 'java', targetCandidates: ['src/main/java'] },
+];
+
+/**
+ * Resolve a fresh repo's current HEAD SHA (no clone — ls-remote) and pin the
+ * repo object to it, so cloneAtCommit and the report machinery work
+ * unchanged. Returns the SHA.
+ */
+function resolveFreshCommit(repo) {
+    const out = execSync(`git ls-remote ${repo.url} HEAD`, { stdio: 'pipe', timeout: 60000 }).toString();
+    const sha = out.split(/\s+/)[0];
+    if (!/^[0-9a-f]{40}$/.test(sha)) {
+        throw new Error(`ls-remote gave no usable SHA for ${repo.url}: ${out.slice(0, 120)}`);
+    }
+    repo.commit = sha;
+    return sha;
+}
+
+/**
+ * Deterministic weekly rotation over FRESH_POOL: the same UTC week picks the
+ * same repos (re-runs reproduce), successive weeks advance the window.
+ */
+function selectFreshRepos(count, now = Date.now()) {
+    const week = Math.floor(now / (7 * 24 * 3600 * 1000));
+    const start = week % FRESH_POOL.length;
+    const picked = [];
+    for (let i = 0; i < Math.min(count, FRESH_POOL.length); i++) {
+        picked.push(FRESH_POOL[(start + i) % FRESH_POOL.length]);
+    }
+    return picked;
+}
+
 /**
  * Clone a repo at its pinned commit (or reuse an existing checkout of that
  * commit). Returns the absolute repo path.
@@ -166,4 +222,4 @@ function seededRandom(seed) {
     };
 }
 
-module.exports = { REPOS, EVAL_TEMP_DIR, cloneAtCommit, resolveTarget, seededRandom };
+module.exports = { REPOS, FRESH_POOL, EVAL_TEMP_DIR, cloneAtCommit, resolveTarget, seededRandom, resolveFreshCommit, selectFreshRepos };

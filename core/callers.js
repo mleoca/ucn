@@ -1246,6 +1246,18 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // From-import submodule receiver (fix #224): `from . import
+                // jobs` + `jobs.submit(...)` — the receiver resolves to a
+                // project module FILE (graph-build composed the submodule
+                // specifier), so it behaves as a module receiver below.
+                // Confirm/route-enabling only: the class-method exclusion
+                // branch keeps its parser-marked receiverIsModule condition
+                // (a rare package attribute/submodule name collision must not
+                // become exclusion evidence).
+                const recvSubmoduleRel = (!call.receiverIsModule && call.isMethod && call.receiver &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural')
+                    ? _submoduleReceiverModule(index, fileEntry, call.receiver) : null;
+
                 // Module receiver: httpx.get() / ns.helper() dispatches to a
                 // module export — it can never be a CLASS METHOD call. Applies
                 // only when every target is a class method; standalone-function
@@ -1275,7 +1287,8 @@ function findCallers(index, name, options = {}) {
                 // target (directly or one re-export hop) → visible, not
                 // excluded (deep barrel chains exceed the hop budget);
                 // unresolved-but-project-looking → visible (resolver gap).
-                if (!bindingId && !resolvedBySameClass && call.isMethod && call.receiverIsModule &&
+                if (!bindingId && !resolvedBySameClass && call.isMethod &&
+                    (call.receiverIsModule || recvSubmoduleRel) &&
                     call.receiver && langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
                     const recvBindings = fileEntry.importBindings.filter(b => b.name === call.receiver);
@@ -1284,7 +1297,8 @@ function findCallers(index, name, options = {}) {
                         let reaches = false;
                         let projectish = false;
                         for (const b of recvBindings) {
-                            const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[b.module];
+                            const rel = (fileEntry.moduleResolved && fileEntry.moduleResolved[b.module]) ||
+                                recvSubmoduleRel;
                             if (!rel) {
                                 const mod = String(b.module);
                                 const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
@@ -2046,8 +2060,9 @@ function findCallers(index, name, options = {}) {
                     // Module-qualified calls (z.string(), ns.helper()) are
                     // exempt: the module IS name-level evidence, and the
                     // module-ownership block above already routed the ones
-                    // whose module doesn't reach the target.
-                    if (call.isMethod && !call.receiverIsModule) {
+                    // whose module doesn't reach the target. Submodule
+                    // receivers (fix #224) are module receivers too.
+                    if (call.isMethod && !call.receiverIsModule && !recvSubmoduleRel) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
                         // External-producer receiver (fix #222, httpx-measured
@@ -3900,6 +3915,28 @@ function _nameBindingReaches(index, startAbs, name, targetFiles, maxDepth = 4) {
     }
     if (frontier.length > 0) unknown = true; // depth exhausted with live paths
     return unknown ? 'unknown' : 'no';
+}
+
+/**
+ * From-import submodule receivers (fix #224): `from . import jobs` binds
+ * jobs.py as a plain NAME — the parser can't mark it a module alias (a
+ * from-import name may be a symbol), but the resolver proved it at build
+ * time: graph-build records the composed submodule specifier ('.jobs') in
+ * fileEntry.moduleResolved when it resolves to a project file. A hit makes
+ * the receiver a MODULE receiver at query time. Returns the ROOT-RELATIVE
+ * module file or null. Trait-gated (`submoduleImports` — Python only).
+ */
+function _submoduleReceiverModule(index, fileEntry, receiverName) {
+    if (!receiverName || !fileEntry || !fileEntry.moduleResolved) return null;
+    if (!langTraits(fileEntry.language)?.submoduleImports) return null;
+    for (const b of (fileEntry.importBindings || [])) {
+        if (!b || b.name !== receiverName || b.module == null) continue;
+        const mod = String(b.module);
+        const spec = mod.endsWith('.') ? mod + receiverName : mod + '.' + receiverName;
+        const rel = fileEntry.moduleResolved[spec];
+        if (rel) return rel;
+    }
+    return null;
 }
 
 /**

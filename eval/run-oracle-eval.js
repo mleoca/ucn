@@ -26,6 +26,10 @@
  *   node eval/run-oracle-eval.js --min-precision 0.85   # ALSO gate on tier-1 precision
  *                                                 # (PR gate: catch regressions, not just
  *                                                 # contract violations)
+ *   node eval/run-oracle-eval.js --fresh 2        # fresh-repo arm: 2 UNPINNED repos from
+ *                                                 # the weekly rotation (generalization
+ *                                                 # guard — repos the engine was never
+ *                                                 # tuned on; HEAD SHA recorded in report)
  *
  * NOT part of npm test — run via `npm run eval:oracle` or eval.yml.
  */
@@ -39,7 +43,7 @@ const { ProjectIndex } = require('../core/project');
 const { getCachedCalls } = require('../core/callers');
 const { execute } = require('../core/execute');
 const output = require('../core/output');
-const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
+const { REPOS, cloneAtCommit, resolveTarget, seededRandom, resolveFreshCommit, selectFreshRepos } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -60,7 +64,12 @@ const minPrecision = readArgValue(args, '--min-precision') ? Number(readArgValue
 // dated rollup.
 const DEFAULT_SEED = 0xACE0FBA5E;
 const sampleSeed = readArgValue(args, '--seed') ? Number(readArgValue(args, '--seed')) : DEFAULT_SEED;
-const seedSuffix = sampleSeed === DEFAULT_SEED ? '' : `-seed${sampleSeed.toString(16)}`;
+// Fresh-repo arm (--fresh [N], default 2): rotate through UNPINNED repos the
+// engine was never tuned on — the generalization guard. Fresh runs get their
+// own report filenames so they never clobber the canonical dated rollup.
+const freshCount = args.includes('--fresh') ? (Number(readArgValue(args, '--fresh')) || 2) : 0;
+const freshSuffix = freshCount ? '-fresh' : '';
+const seedSuffix = (sampleSeed === DEFAULT_SEED ? '' : `-seed${sampleSeed.toString(16)}`) + freshSuffix;
 const REPORTS_DIR = path.join(__dirname, 'reports');
 
 // Order matters: per repo the FIRST language match wins — pyright (stronger
@@ -485,12 +494,17 @@ function rate(n, d) { return d ? Number((n / d).toFixed(4)) : 0; }
 function pct(x) { return `${(x * 100).toFixed(1)}%`; }
 
 async function main() {
-    const oracleRepos = REPOS.filter(r =>
+    const baseRepos = freshCount ? selectFreshRepos(freshCount) : REPOS;
+    const oracleRepos = baseRepos.filter(r =>
         ORACLES.some(o => o.languages.includes(r.language)) &&
         (!repoFilterSet || repoFilterSet.has(r.name)));
     if (oracleRepos.length === 0) {
         console.error(`No matching repos for oracle languages${repoFilter ? ` and --repo ${repoFilter}` : ''}.`);
         process.exit(1);
+    }
+    if (freshCount) {
+        for (const repo of oracleRepos) resolveFreshCommit(repo);
+        process.stdout.write(`Fresh-repo arm: ${oracleRepos.map(r => `${r.name}@${r.commit.slice(0, 8)}`).join(', ')}\n`);
     }
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
@@ -520,7 +534,7 @@ async function main() {
     }
 
     const lines = [
-        `# Oracle eval — ${date}`,
+        `# Oracle eval — ${date}${freshCount ? ' (fresh-repo arm: unpinned rotation)' : ''}`,
         '',
         'UCN tiered caller answers scored against compiler/LSP ground truth.',
         '`missing-unexplained` is the release gate: an oracle call edge UCN',

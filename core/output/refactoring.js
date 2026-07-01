@@ -2,6 +2,30 @@
  * core/output/refactoring.js - Verify/plan/stacktrace formatters
  */
 
+const { unverifiedReasonLabel, advisoryLine } = require('./shared');
+const { formatAccountLines } = require('./analysis');
+
+/**
+ * Render the v4 unverified band shared by verify and plan: capped one-liners
+ * with reasons. Returns [] when the band is empty.
+ */
+function _unverifiedBandLines(sites, cap = 10) {
+    if (!sites || sites.length === 0) return [];
+    const lines = [];
+    lines.push('');
+    lines.push(`UNVERIFIED CALL SITES (${sites.length}) — call syntax, no binding/receiver evidence; review manually:`);
+    for (const u of sites.slice(0, cap)) {
+        const caller = u.callerName ? ` [${u.callerName}]` : '';
+        const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
+        const expr = u.expression ? `: ${u.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+        lines.push(`  ${u.file}:${u.line}${caller}${expr}${reason}`);
+    }
+    if (sites.length > cap) {
+        lines.push(`  (+${sites.length - cap} more unverified)`);
+    }
+    return lines;
+}
+
 /**
  * Format plan command output - text
  * Shows before/after signatures and all changes needed
@@ -58,6 +82,15 @@ function formatPlan(plan, options = {}) {
         }
     }
 
+    // v4 tiered contract: candidates without evidence are not planned but
+    // stay visible — a rename that misses one of these breaks at runtime.
+    lines.push(..._unverifiedBandLines(plan.unverifiedSites));
+    const planAccountLines = formatAccountLines(plan.account);
+    if (planAccountLines.length > 0) {
+        lines.push('');
+        lines.push(...planAccountLines);
+    }
+
     return lines.join('\n');
 }
 
@@ -98,7 +131,11 @@ function formatPlanJson(plan) {
             line: c.line,
             expression: c.expression,
             suggestion: c.suggestion
-        }))
+        })),
+        // v4 tiered contract passthrough
+        unverifiedCount: plan.unverifiedCount,
+        unverifiedSites: plan.unverifiedSites,
+        account: plan.account,
     }, null, 2);
 }
 
@@ -164,6 +201,9 @@ function formatVerify(result, options = {}) {
     lines.push(`  Valid: ${result.valid}`);
     lines.push(`  Mismatches: ${result.mismatches}`);
     lines.push(`  Uncertain: ${result.uncertain}`);
+    if (result.unverifiedCount > 0) {
+        lines.push(`  Unverified (not arg-checked): ${result.unverifiedCount}`);
+    }
     if (result.scopeWarning) {
         lines.push(`  Note: ${result.scopeWarning.hint}`);
     }
@@ -204,6 +244,15 @@ function formatVerify(result, options = {}) {
             lines.push(`    ${u.expression}`);
             lines.push(`    Reason: ${u.reason}`);
         }
+    }
+
+    // v4 tiered contract: unverified band (distinct from UNCERTAIN above,
+    // which is arg-parse uncertainty among CONFIRMED sites).
+    lines.push(..._unverifiedBandLines(result.unverifiedSites));
+    const accountLines = formatAccountLines(result.account);
+    if (accountLines.length > 0) {
+        lines.push('');
+        lines.push(...accountLines);
     }
 
     return lines.join('\n');
@@ -248,7 +297,11 @@ function formatVerifyJson(result) {
             expression: u.expression,
             reason: u.reason,
             patterns: u.patterns,
-        }))
+        })),
+        // v4 tiered contract passthrough
+        unverifiedCount: result.unverifiedCount,
+        unverifiedSites: result.unverifiedSites,
+        account: result.account,
     }, null, 2);
 }
 
@@ -264,6 +317,8 @@ function formatStackTrace(result) {
     const lines = [];
     lines.push(`Stack trace: ${result.frameCount} frames`);
     lines.push('═'.repeat(60));
+    const stAdvisory = advisoryLine(result.advisory);
+    if (stAdvisory) lines.push(stAdvisory);
 
     for (let i = 0; i < result.frames.length; i++) {
         const frame = result.frames[i];

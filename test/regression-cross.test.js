@@ -5301,11 +5301,14 @@ describe('BUG-H3: impact and verify honor --include-methods flag', () => {
         } finally { rm(dir); }
     });
 
-    it('verify --include-methods opts into checking obj.fn() arity', () => {
+    it('verify arg-checks evidence-backed obj.fn() by default (v4 tiered contract)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function fetch(url) { return url; }\nmodule.exports = { fetch };',
-            // Method call with wrong arity — should be flagged when include-methods is on
+            // Method call with wrong arity — receiver `obj = require("./lib")`
+            // has binding evidence → confirmed tier → arg-checked BY DEFAULT.
+            // Pre-v4 the default verify silently dropped this call and missed
+            // the mismatch (pre-commit false green).
             'caller.js': 'const obj = require("./lib");\nfunction call() { obj.fetch("a", "b"); }',
         });
         try {
@@ -5313,12 +5316,15 @@ describe('BUG-H3: impact and verify honor --include-methods flag', () => {
             const def = execute(index, 'verify', { name: 'fetch' });
             const inc = execute(index, 'verify', { name: 'fetch', includeMethods: true });
             assert.ok(def.ok && inc.ok);
-            // Default verify drops method calls (totalCalls 0 here).
-            assert.strictEqual(def.result.totalCalls, 0,
-                `default verify should drop method calls, got ${def.result.totalCalls}`);
-            // With --include-methods, the obj.fetch() call shows up.
-            assert.ok(inc.result.totalCalls >= 1,
-                `verify --include-methods should see method call, got ${inc.result.totalCalls}`);
+            assert.strictEqual(def.result.totalCalls, 1,
+                `default verify must confirm the evidence-backed method call, got ${def.result.totalCalls}`);
+            assert.strictEqual(def.result.mismatches, 1,
+                `wrong-arity method call must be flagged by default, got ${def.result.mismatches}`);
+            // --include-methods is an implied no-op under the contract.
+            assert.strictEqual(inc.result.totalCalls, def.result.totalCalls,
+                '--include-methods must not change the confirmed band');
+            assert.strictEqual(inc.result.mismatches, def.result.mismatches,
+                '--include-methods must not change the mismatches');
         } finally { rm(dir); }
     });
 

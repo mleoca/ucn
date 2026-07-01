@@ -30,7 +30,10 @@ function formatCheck(result) {
             if (it.signatureMismatches > 0) tags.push(`SIG-DRIFT(${it.signatureMismatches})`);
             if (it.orphan) tags.push('ORPHAN');
             const tagStr = tags.length ? ' [' + tags.join(', ') + ']' : '';
-            const callers = it.callerCount != null ? `${it.callerCount} caller${it.callerCount === 1 ? '' : 's'}` : '';
+            let callers = it.callerCount != null ? `${it.callerCount} caller${it.callerCount === 1 ? '' : 's'}` : '';
+            if (it.unverifiedCallerCount > 0) {
+                callers += ` (+${it.unverifiedCallerCount} unverified)`;
+            }
             lines.push(`  ${it.name} (${it.file}:${it.line})${tagStr}  ${callers}`);
             if (it.mismatches && it.mismatches.length > 0) {
                 for (const m of it.mismatches.slice(0, 3)) {

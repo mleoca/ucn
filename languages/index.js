@@ -23,6 +23,11 @@ const STRUCTURAL_TRAITS = {
     testDirs: [],
     allMethodsVirtual: false,
     hasArityOverloads: false,
+    // Whether `from pkg import name` can bind a SUBMODULE file as a plain
+    // name (fix #224). Python sets true: graph-build resolves the composed
+    // dotted specifier and records it in moduleResolved, making the receiver
+    // a module receiver at query time. JS from-imports bind values only.
+    submoduleImports: false,
     // Class members are public unless marked otherwise (#name, _name,
     // `private`). An exported class therefore exposes its non-private methods
     // as public API — deadcode treats them as exported (fix #211). Languages
@@ -153,6 +158,11 @@ const LANGUAGES = {
         traits: {
             ...STRUCTURAL_TRAITS,
             selfParam: ['self', 'cls'],
+            // fix #224: `from pkg import name` may bind a SUBMODULE file, not
+            // a symbol — graph-build resolves the composed dotted specifier
+            // and query code treats such receivers as module receivers. JS
+            // from-imports bind values only (`import * as ns` is parser-marked).
+            submoduleImports: true,
             testFileCandidates: (base, ext) => [`test_${base}.py`, `${base}_test.py`],
             testDirs: ['tests'],
         },

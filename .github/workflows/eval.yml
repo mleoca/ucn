@@ -63,6 +63,9 @@ jobs:
       - name: "Oracle eval (gate: missing-unexplained = 0)"
         run: node eval/run-oracle-eval.js
 
+      - name: "Fresh-repo oracle eval (2 unpinned repos, weekly rotation — generalization gate)"
+        run: node eval/run-oracle-eval.js --fresh 2
+
       - name: "Deadcode eval (gate: default-arm false-dead = 0)"
         run: node eval/run-deadcode-eval.js --sample 300
 

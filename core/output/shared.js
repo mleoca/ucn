@@ -336,7 +336,25 @@ function unverifiedReasonLabel(entry) {
     return entry.reason;
 }
 
+// Advisory label line for heuristic commands (v4 two-tier surface: contracted
+// commands carry accounts; advisory commands say so explicitly, in text AND
+// via the result's `advisory` field for JSON consumers).
+const ADVISORY_LABELS = {
+    'similarity-heuristics': 'ranked by similarity heuristics (same file, shared callers/callees, name overlap)',
+    'scored-selection': 'examples picked by usage-quality scoring',
+    'best-effort-frame-matching': 'frames matched by path similarity',
+    'heuristic-route-matching': 'route↔request matches are heuristic (see per-match EXACT/PARTIAL/UNCERTAIN tiers)',
+};
+
+/** Render the advisory line for a result's `advisory` field, or null. */
+function advisoryLine(advisory) {
+    if (!advisory) return null;
+    const desc = ADVISORY_LABELS[advisory] || advisory;
+    return `Advisory: ${desc} — suggestions, not verified claims.`;
+}
+
 module.exports = {
+    advisoryLine,
     dynamicImportsNote,
     formatFileError,
     unverifiedReasonLabel,

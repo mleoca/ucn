@@ -1067,6 +1067,10 @@ function endpoints(index, options = {}) {
     }
 
     return {
+        // Advisory when bridging (v4 two-tier surface): route↔request
+        // matching is heuristic (per-match tiers EXACT/PARTIAL/UNCERTAIN),
+        // not a verified claim. Route/request EXTRACTION is AST-based.
+        ...(opts.bridge && { advisory: 'heuristic-route-matching' }),
         routes,
         requests,
         bridges,

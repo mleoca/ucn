@@ -832,8 +832,10 @@ function example(index, name, options = {}) {
     const best = scored[0];
 
     // Default behavior: one best representative.
+    // Advisory command (v4 two-tier surface): scored example selection, not
+    // a verified "best" claim.
     if (!options.diverse) {
-        return { best, totalCalls: calls.length };
+        return { advisory: 'scored-selection', best, totalCalls: calls.length };
     }
 
     // --diverse: cluster call sites by AST argument-shape and return one
@@ -891,6 +893,7 @@ function example(index, name, options = {}) {
     });
 
     return {
+        advisory: 'scored-selection',
         best,
         totalCalls: calls.length,
         clusters,

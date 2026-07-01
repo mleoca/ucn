@@ -12,6 +12,8 @@
 
 'use strict';
 
+const { advisoryLine } = require('./shared');
+
 const SEP_TIER = { exact: 'EXACT', partial: 'PARTIAL', uncertain: 'UNCERTAIN' };
 
 function pad(s, n) {
@@ -27,7 +29,7 @@ function formatEndpoints(result, options = {}) {
     if (!showBridge) {
         return formatRoutesAndRequests(routes, requests, meta, options);
     }
-    return formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options);
+    return formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options, result.advisory);
 }
 
 /**
@@ -111,13 +113,15 @@ function formatRoutesAndRequests(routes, requests, meta, options) {
     return lines.join('\n').trimEnd();
 }
 
-function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options = {}) {
+function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, options = {}, advisory = null) {
     const lines = [];
     const matched = bridges.length;
     const unmatchedOnly = !!options.unmatched;
 
     lines.push(`Endpoint Bridges`);
     lines.push(`================`);
+    const brAdvisory = advisoryLine(advisory);
+    if (brAdvisory) lines.push(brAdvisory);
     lines.push(`Server routes: ${meta.totalRoutes}    Client requests: ${meta.totalRequests}`);
     // HIGH-3: percentage = unique matched client requests / total client
     // requests. Counting bridges directly inflates >100% on many-to-many

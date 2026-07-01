@@ -2,7 +2,7 @@
  * core/output/search.js - Text search, structural search, example, typedef, tests formatters
  */
 
-const { detectDoubleEscaping } = require('./shared');
+const { detectDoubleEscaping, advisoryLine } = require('./shared');
 
 /**
  * Format search command output
@@ -170,6 +170,8 @@ function formatExample(result, name) {
     lines.push(`Best example of "${name}":`);
     lines.push('═'.repeat(60));
     lines.push(`${best.relativePath}:${best.line}`);
+    const exAdvisory = advisoryLine(result.advisory);
+    if (exAdvisory) lines.push(exAdvisory);
     lines.push('');
 
     if (best.before) {
@@ -206,6 +208,8 @@ function formatExampleDiverse(result, name) {
     const total = result.totalClusters || result.clusters.length;
     lines.push(`Diverse examples of "${name}" — ${result.clusters.length} of ${total} cluster(s), ${result.totalCalls} total calls:`);
     lines.push('═'.repeat(60));
+    const divAdvisory = advisoryLine(result.advisory);
+    if (divAdvisory) lines.push(divAdvisory);
 
     for (let i = 0; i < result.clusters.length; i++) {
         const c = result.clusters[i];

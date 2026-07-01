@@ -356,6 +356,9 @@ function parseStackTrace(index, stackText) {
     }
 
     return {
+        // Advisory command (v4 two-tier surface): frames matched by path
+        // similarity scoring, not verified identity.
+        advisory: 'best-effort-frame-matching',
         frameCount: frames.length,
         frames
     };

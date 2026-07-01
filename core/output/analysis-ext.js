@@ -2,7 +2,8 @@
  * core/output/analysis-ext.js - Extended analysis formatters (related, smart, diffImpact)
  */
 
-const { dynamicImportsNote, formatLineRanges } = require('./shared');
+const { dynamicImportsNote, formatLineRanges, unverifiedReasonLabel, advisoryLine } = require('./shared');
+const { formatAccountLines, formatCalleeAccountLine, unverifiedCalleeLines } = require('./analysis');
 
 /**
  * Format related command output - text
@@ -18,6 +19,8 @@ function formatRelated(related, options = {}) {
     lines.push(`Related to ${related.target.name}`);
     lines.push('═'.repeat(60));
     lines.push(`${related.target.file}:${related.target.line}`);
+    const relAdvisory = advisoryLine(related.advisory);
+    if (relAdvisory) lines.push(relAdvisory);
     lines.push('');
 
     // Same file
@@ -135,6 +138,12 @@ function formatSmart(smart, options = {}) {
         }
     }
 
+    // v4 callee contract: unresolved calls inside the target — visible with
+    // reasons (they may be dependencies smart could not inline).
+    lines.push(...unverifiedCalleeLines(smart.unverifiedCallees, false));
+    const smartCalleeAcct = formatCalleeAccountLine(smart.meta && smart.meta.calleeAccount);
+    if (smartCalleeAcct) lines.push(`\n${smartCalleeAcct}`);
+
     return lines.join('\n');
 }
 
@@ -168,7 +177,10 @@ function formatSmartJson(result) {
                 callCount: d.callCount,
                 code: d.code
             })),
-            types: result.types || []
+            types: result.types || [],
+            // v4 callee contract: visible unresolved-call entries, reconciled
+            // by meta.calleeAccount.
+            unverifiedCallees: result.unverifiedCallees || []
         }
     });
 }
@@ -191,6 +203,7 @@ function formatDiffImpact(result, options = {}) {
     if (s.deletedFunctions > 0) parts.push(`${s.deletedFunctions} deleted`);
     if (s.newFunctions > 0) parts.push(`${s.newFunctions} new`);
     parts.push(`${s.totalCallSites || 0} call sites across ${s.affectedFiles || 0} files`);
+    if (s.unverifiedCallSites > 0) parts.push(`${s.unverifiedCallSites} unverified`);
     lines.push(parts.join(', '));
     lines.push('');
 
@@ -221,7 +234,28 @@ function formatDiffImpact(result, options = {}) {
                     lines.push(`    ... ${truncated} more callers (use file= to scope diff to specific files, or use impact with class_name= for type-filtered results)`);
                 }
             } else {
-                lines.push('  Callers: none found');
+                lines.push('  Callers: none confirmed');
+            }
+
+            // Unverified tier: visible one-liners with reasons (never silently dropped)
+            const unverified = fn.unverifiedCallers || [];
+            if (unverified.length > 0) {
+                const cap = options.all ? Infinity : 10;
+                lines.push(`  Unverified call sites (${unverified.length}) — call syntax, no binding/receiver evidence:`);
+                for (const u of unverified.slice(0, cap)) {
+                    const caller = u.callerName ? ` [${u.callerName}]` : '';
+                    const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
+                    const expr = u.content ? `: ${u.content.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                    lines.push(`    ${u.relativePath}:${u.line}${caller}${expr}${reason}`);
+                }
+                if (unverified.length > cap) {
+                    lines.push(`    (+${unverified.length - cap} more unverified)`);
+                }
+            }
+
+            // Conservation contract lines, indented inside the function block
+            for (const al of formatAccountLines(fn.account)) {
+                lines.push(`  ${al}`);
             }
         }
     }

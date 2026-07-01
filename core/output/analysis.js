@@ -137,6 +137,36 @@ function formatAccountLines(account) {
     return lines;
 }
 
+/**
+ * Single-node CALLEE ACCOUNT line (context/smart — the per-def callee
+ * contract from #223). Matches the tree rollup's arithmetic phrasing.
+ */
+function formatCalleeAccountLine(acct) {
+    if (!acct) return null;
+    let line = `CALLEE ACCOUNT: ${acct.totalSites} call site${acct.totalSites === 1 ? '' : 's'} = ` +
+        `${acct.confirmed} confirmed + ${acct.unverified} unverified + ` +
+        `${acct.external.count} external/builtin + ${acct.excluded.total} excluded`;
+    if (acct.filtered.count > 0) line += ` + ${acct.filtered.count} filtered`;
+    if (!acct.conserved) line += ` — ${acct.unaccounted} UNACCOUNTED`;
+    return line;
+}
+
+/**
+ * Render unverified callee entries (aggregated name+reason from findCallees
+ * collectAccount) as one-liners. Returns [] when the band is empty.
+ */
+function unverifiedCalleeLines(entries, compact) {
+    if (!entries || entries.length === 0) return [];
+    const lines = [];
+    lines.push(`${compact ? '' : '\n'}CALLEES — UNVERIFIED (${entries.length}) — call syntax, receiver/binding unresolved:`);
+    for (const u of entries) {
+        const owners = u.ownerCount > 1 ? ` (${u.ownerCount} owners)` : '';
+        const sites = u.sites && u.sites.length > 0 ? ` L${u.sites.join(',L')}` : '';
+        lines.push(`  ${u.name} ×${u.callCount} — ${u.reason}${owners}${sites}`);
+    }
+    return lines;
+}
+
 /** "NON-CALL OCCURRENCES" summary line from the account. */
 function formatNonCallLine(account, hintName) {
     if (!account || !account.nonCall || account.nonCall.total === 0) return null;
@@ -244,8 +274,14 @@ function formatContextJson(context) {
                 params: c.params,  // FULL params
                 weight: c.weight || 'normal',  // Dependency weight: core, setup, utility
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.tier && { tier: c.tier }),
+                ...(c.sites && { sites: c.sites }),
+                ...(c.functionReference && { functionReference: true }),
                 ...(c.reachable !== undefined && { reachable: c.reachable }),
             })),
+            // v4 callee contract: visible unresolved-call entries (aggregated
+            // name+reason), reconciled by meta.calleeAccount.
+            unverifiedCallees: context.unverifiedCallees || [],
             ...(context.warnings && { warnings: context.warnings })
         }
     });
@@ -490,6 +526,10 @@ function formatContext(ctx, options = {}) {
     }
     if (calleeReach.note && !compact) lines.push(calleeReach.note);
 
+    // Unverified callee band (v4): aggregated name+reason entries — visible,
+    // never silently dropped. Not expandable (no definition resolved).
+    lines.push(...unverifiedCalleeLines(ctx.unverifiedCallees, compact));
+
     // Conservation contract lines: non-call summary + ACCOUNT/WARNING/FILTERED
     const account = ctx.meta && ctx.meta.account;
     if (account) {
@@ -501,6 +541,8 @@ function formatContext(ctx, options = {}) {
             lines.push(...accountLines);
         }
     }
+    const ctxCalleeAcct = formatCalleeAccountLine(ctx.meta && ctx.meta.calleeAccount);
+    if (ctxCalleeAcct) lines.push(ctxCalleeAcct);
 
     if (expandable.length > 0) {
         lines.push(`\n${expandHint}`);
@@ -897,4 +939,7 @@ module.exports = {
     // Shared with output/tracing.js: the tree commands render the same
     // root-hop ACCOUNT/WARNING/FILTERED lines as context/impact.
     formatAccountLines,
+    // Shared with output/analysis-ext.js (smart): single-node callee contract.
+    formatCalleeAccountLine,
+    unverifiedCalleeLines,
 };
