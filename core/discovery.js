@@ -148,11 +148,19 @@ function parseGitignore(projectRoot) {
         // Strip trailing slash (directory indicator) — shouldIgnore checks names, not types
         let pattern = line.endsWith('/') ? line.slice(0, -1) : line;
 
-        // Strip leading slash (root-relative indicator) — we only match by name
-        if (pattern.startsWith('/')) pattern = pattern.slice(1);
+        // Leading slash = ANCHORED to the .gitignore's directory (fix #226).
+        // git semantics: `/locale` ignores only the root-level locale, never
+        // src/locale. Stripping the slash and matching by bare name silently
+        // excluded real source trees (dayjs ignores its BUILD outputs /locale
+        // /plugin — src/locale and src/plugin are ~160 tracked source files
+        // UCN never indexed, with no warning). Anchored patterns keep the
+        // slash; shouldIgnore applies them only at the walk's anchor root.
+        const anchored = pattern.startsWith('/');
+        if (anchored) pattern = pattern.slice(1);
 
-        // Skip patterns with path separators — shouldIgnore matches single name segments,
-        // not full paths. Patterns like "foo/bar" would need walkDir-level support.
+        // Skip patterns with interior path separators — shouldIgnore matches
+        // single name segments, not full paths. Patterns like "foo/bar" would
+        // need walkDir-level support.
         if (pattern.includes('/')) continue;
 
         // Skip empty after stripping
@@ -161,7 +169,7 @@ function parseGitignore(projectRoot) {
         // Avoid duplicating built-in ignores
         if (DEFAULT_IGNORES.includes(pattern)) continue;
 
-        patterns.push(pattern);
+        patterns.push(anchored ? '/' + pattern : pattern);
     }
 
     return patterns;
@@ -211,6 +219,9 @@ function expandGlob(pattern, options = {}) {
         ignores,
         maxDepth,
         followSymlinks,
+        // Anchored gitignore patterns ('/name') apply only to entries directly
+        // under the project root — the .gitignore's own directory (fix #226).
+        anchorRoot: root,
         onFile: (filePath) => {
             if (files.length < maxFiles) {
                 files.push(filePath);
@@ -309,7 +320,7 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
     for (const entry of entries) {
         const fullPath = path.join(dir, entry.name);
 
-        if (shouldIgnore(entry.name, options.ignores, dir)) continue;
+        if (shouldIgnore(entry.name, options.ignores, dir, dir === options.anchorRoot)) continue;
 
         let isDir = entry.isDirectory();
         let isFile = entry.isFile();
@@ -340,14 +351,22 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
 /**
  * Check if a file/directory name should be ignored
  * @param {string} name - File/directory name
- * @param {string[]} ignores - Patterns to always ignore
+ * @param {string[]} ignores - Patterns to always ignore. Patterns with a
+ *   leading '/' are ANCHORED (git semantics, fix #226): they match only when
+ *   `atAnchorRoot` is true — i.e. the entry sits directly in the directory
+ *   the .gitignore belongs to. Default false errs toward KEEPING files.
  * @param {string} [parentDir] - Parent directory path (for conditional checks)
+ * @param {boolean} [atAnchorRoot] - Whether parentDir IS the anchor root
  */
 const _globRegexCache = new Map();
 
-function shouldIgnore(name, ignores, parentDir) {
+function shouldIgnore(name, ignores, parentDir, atAnchorRoot = false) {
     // Check unconditional ignores
-    for (const pattern of ignores) {
+    for (let pattern of ignores) {
+        if (pattern.charCodeAt(0) === 47 /* '/' */) {
+            if (!atAnchorRoot) continue;
+            pattern = pattern.slice(1);
+        }
         if (pattern.includes('*')) {
             let regex = _globRegexCache.get(pattern);
             if (!regex) {

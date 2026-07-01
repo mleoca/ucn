@@ -247,7 +247,15 @@ OTHER:
 - stacktrace: Parse a stack trace, show source context per frame. Requires stack param. Handles JS, Python, Go, Rust, Java formats.
 - api: Public API surface of project or file: all exported/public symbols with signatures. Use to understand what a library exposes. Pass file to scope to one file. Python needs __all__; use toc instead.
 - stats: Quick project stats: file counts, symbol counts, lines of code by language and symbol type. Use functions=true for per-function line counts sorted by size (complexity audit). Set hot=true with top=N for the most-called functions (project orientation primitive).
-- audit_async: Find async calls inside async functions that are likely missing await (probable bugs). JS/TS/Python only. Filter with file/exclude/limit.` + generateMcpParamSection();
+- audit_async: Find async calls inside async functions that are likely missing await (probable bugs). JS/TS/Python only. Filter with file/exclude/limit.
+
+READING OUTPUT (trust contract):
+- Caller/impact answers PARTITION every text occurrence of the symbol — nothing is silently hidden. CONFIRMED entries carry binding/receiver/import evidence (safe to act on). UNVERIFIED entries are call-syntax matches without evidence, each with a reason — treat as possible callers before a breaking change. The ACCOUNT line reconciles the arithmetic; "0 unaccounted" means the partition is complete.
+- A CONFIRMED(0) + UNVERIFIED(0) answer with 0 unaccounted and no WARNING is a trustworthy zero: the symbol genuinely has no callers.
+- WARNING lines list unparsed files containing the symbol — their lines were NOT analyzed; fall back to text search there.
+- verify arg-checks and plan plans CONFIRMED sites only; their UNVERIFIED CALL SITES sections list candidates to review manually. check reports "N callers (+M unverified)" per changed function.
+- context/smart/trace also account the callee side (CALLEE ACCOUNT line + unverified callees with reasons).
+- Advisory commands (related, example, stacktrace, endpoints bridge=true) mark output "Advisory:" — ranked heuristics, not verified claims. Every other listed answer is contract-backed.` + generateMcpParamSection();
 
 server.registerTool(
     'ucn',
@@ -261,8 +269,8 @@ server.registerTool(
             exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
             exclude_tests: z.boolean().optional().describe('Exclude test files from results. Used by entrypoints (where tests are included by default).'),
-            include_methods: z.boolean().optional().describe('Include obj.method() calls in trace/blast/smart/verify (implied for about/context/impact — method calls tiered by receiver evidence)'),
-            include_uncertain: z.boolean().optional().describe('Include uncertain matches in smart/verify (implied for about/context/impact/trace/blast/reverse_trace/affected_tests — unverified candidates always shown, tiered)'),
+            include_methods: z.boolean().optional().describe('Include obj.method() callee expansion in trace/blast. No effect on about/context/impact/verify — method calls are always analyzed and tiered by receiver evidence'),
+            include_uncertain: z.boolean().optional().describe('No effect on tiered commands (about/context/impact/trace/blast/reverse_trace/affected_tests/verify/smart) — unverified candidates are always shown with reasons'),
             expand_unverified: z.boolean().optional().describe('blast/reverse_trace: follow unverified caller edges in the tree — downstream nodes are marked as unverified chains (possible, not confirmed, impact)'),
             min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
             show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),

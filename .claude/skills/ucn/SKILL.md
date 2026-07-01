@@ -232,7 +232,7 @@ Caller answers are a **partition of every text occurrence** of the symbol — no
 
 Resolution labels in `evidence:` lines (high to low): `exact-binding` (0.98, import/binding evidence) · `same-class` (0.92) · `receiver-hint` (0.80, inferred receiver type) · `scope-match` (0.65, import/receiver-binding scope evidence) · `name-only` (0.40) · `uncertain` (0.25). Confirmed tier = scope-match and above. JSON output keeps per-edge decimals plus `tier`.
 
-Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain` and `--include-methods` are **implied no-ops** for every contracted command (about/context/impact/trace/blast/reverse-trace/affected-tests/diff-impact/verify/plan/smart) — everything is shown, tiered.
+Flags: `--min-confidence=0.7` filters confirmed edges (hidden count appears in FILTERED). `--include-uncertain` and `--include-methods` have **no effect** on tiered commands (about/context/impact/trace/blast/reverse-trace/affected-tests/diff-impact/verify/plan/smart) — everything is always shown, tiered by evidence.
 
 ### Refactor commands run the same contract (v4)
 
@@ -292,7 +292,7 @@ ucn [target] <command> [name] [--flags]
 | `--expand-unverified` | `blast`/`reverse-trace`: follow unverified caller edges in the tree. Downstream nodes are marked as unverified chains — possible, not confirmed, impact |
 | `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
 | `--exclude-tests` | Exclude test entries from `entrypoints` (tests are included by default since they ARE entry points). |
-| `--include-methods` | Include `obj.method()` calls in caller/callee analysis. Implied (no-op) for `about`/`context`/`impact` — method calls are always analyzed and tiered by receiver evidence. Applies to `verify`, `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
+| `--include-methods` | Include `obj.method()` callee expansion in `trace`/`blast`/`smart`/`affected-tests`. No effect on `about`/`context`/`impact`/`verify` — method calls are always analyzed and tiered by receiver evidence |
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |
@@ -314,7 +314,7 @@ ucn [target] <command> [name] [--flags]
 | `--max-lines=N` | Max source lines for `class` (large classes show summary by default) |
 | `--case-sensitive` | Case-sensitive text search (default: case-insensitive) |
 | `--exact` | Exact name match only in `find`/`typedef` (no substring) |
-| `--include-uncertain` | Include ambiguous/uncertain matches. Implied (no-op) for `about`/`context`/`impact` — unverified callers are always shown in their own tier. Applies to `blast`, `smart`, `trace`, `reverse-trace`, `affected-tests` |
+| `--include-uncertain` | No effect on tiered commands — unverified candidates are always shown in their own section with reasons |
 | `--hide-confidence` | Hide confidence scores (shown by default) in `context`/`about` |
 | `--min-confidence=N` | Filter edges below confidence threshold (e.g., `--min-confidence=0.7` keeps only high-confidence edges) |
 | `--calls-only` | Only show call/test-case matches in `tests` (skip file-level results) |

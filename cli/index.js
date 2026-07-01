@@ -546,7 +546,7 @@ function runFileCommand(filePath, command, arg) {
         case 'toc':
             printOutput(result, output.formatTocJson, r => output.formatToc(r, {
                 detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
-                uncertainHint: 'use --include-uncertain to include all'
+                uncertainHint: 'run "ucn . about <name>" for tiered detail on a specific symbol'
             }));
             break;
         case 'find':
@@ -664,10 +664,10 @@ function runProjectCommand(rootDir, command, arg) {
         // these commands, so the legacy reveal flags are implied no-ops.
         if (['about', 'context', 'impact', 'trace', 'blast', 'reverseTrace', 'affectedTests', 'verify', 'smart'].includes(canonical)) {
             if (flags.includeUncertain) {
-                console.error(`Note: --include-uncertain is implied for '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
+                console.error(`Note: --include-uncertain has no effect on '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
             }
             if (['about', 'context', 'impact', 'verify'].includes(canonical) && flags.includeMethods) {
-                console.error(`Note: --include-methods is implied for '${toCliName(canonical)}' — method calls are tiered by receiver evidence.`);
+                console.error(`Note: --include-methods has no effect on '${toCliName(canonical)}' — method calls are always tiered by receiver evidence.`);
             }
         }
     }
@@ -681,7 +681,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (note) console.error(note);
             printOutput(result, output.formatTocJson, r => output.formatToc(r, {
                 detailedHint: 'Add --detailed to list all functions, or "ucn . about <name>" for full details on a symbol',
-                uncertainHint: 'use --include-uncertain to include all'
+                uncertainHint: 'run "ucn . about <name>" for tiered detail on a specific symbol'
             }));
             break;
         }
@@ -735,9 +735,7 @@ function runProjectCommand(rootDir, command, arg) {
                 console.log(output.formatContextJson(ctx));
             } else {
                 const { text, expandable } = output.formatContext(ctx, {
-                    methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                     expandHint: 'Use "expand <N>" or --expand to see code for items',
-                    uncertainHint: 'use --include-uncertain to include all',
                     showConfidence: flags.showConfidence !== false,
                     compact: !!flags.compact,
                 });
@@ -798,7 +796,7 @@ function runProjectCommand(rootDir, command, arg) {
             const { ok, result, error, note } = execute(index, 'smart', { name: arg, ...flags });
             if (!ok) fail(error);
             printOutput(result, output.formatSmartJson, r => output.formatSmart(r, {
-                uncertainHint: 'use --include-uncertain to include all'
+                uncertainHint: 'unverified callees are listed below with reasons'
             }));
             if (note) console.error(note);
             break;
@@ -1329,8 +1327,6 @@ function runGlobCommand(pattern, command, arg) {
                 console.log(output.formatContextJson(result));
             } else {
                 const { text } = output.formatContext(result, {
-                    methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
-                    uncertainHint: 'use --include-uncertain to include all',
                     expandHint: 'Use --expand to see inline callee previews',
                     showConfidence: flags.showConfidence !== false,
                     compact: !!flags.compact,
@@ -1545,11 +1541,11 @@ Common Flags:
   --include-tests     Include test files in usage counts (about) and results (find, usages, deadcode)
   --exclude-tests     Exclude test files (entrypoints — tests are included by default)
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
-  --include-methods   Include method calls (obj.fn) in trace/blast/smart/verify analysis
-                        (implied for about/context/impact — method calls are tiered by evidence)
-  --include-uncertain Include ambiguous/uncertain matches in smart/verify
-                        (implied for about/context/impact/trace/blast/reverse-trace/affected-tests —
-                        unverified candidates always shown, tiered)
+  --include-methods   Include method-call (obj.fn) callee expansion in trace/blast/smart/affected-tests
+                        (no effect on about/context/impact/verify — method calls are always
+                        tiered by receiver evidence)
+  --include-uncertain No effect on tiered commands — unverified candidates are always
+                        shown in their own section with reasons
   --expand-unverified Follow unverified caller edges in blast/reverse-trace trees
                         (downstream nodes marked as unverified chains — possible, not confirmed, impact)
   --hide-confidence   Hide confidence scores (shown by default in about, context)
@@ -1748,7 +1744,7 @@ Flags can be added per-command: context myFunc --include-methods
 const INTERACTIVE_DISPATCH = {
     // ── Understanding Code ───────────────────────────────────────────
     about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence !== false, git: !!f.git }) },
-    smart:        { params: 'name', format: (r) => output.formatSmart(r, { uncertainHint: 'use --include-uncertain to include all' }) },
+    smart:        { params: 'name', format: (r) => output.formatSmart(r, { uncertainHint: 'unverified callees are listed below with reasons' }) },
     impact:       { params: 'name', format: (r) => output.formatImpact(r) },
     blast:        { params: 'name', format: (r) => output.formatBlast(r) },
     trace:        { params: 'name', format: (r) => output.formatTrace(r) },
@@ -1760,7 +1756,7 @@ const INTERACTIVE_DISPATCH = {
     // ── Finding Code ─────────────────────────────────────────────────
     find:          { params: 'name', format: (r, a, f) => output.formatFindDetailed(r, a, { depth: f.depth, top: f.top, all: f.all }) },
     usages:        { params: 'name', format: (r, a) => output.formatUsages(r, a) },
-    toc:           { params: 'flags', format: (r) => output.formatToc(r, { detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol', uncertainHint: 'use --include-uncertain to include all' }) },
+    toc:           { params: 'flags', format: (r) => output.formatToc(r, { detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol', uncertainHint: 'run "about <name>" for tiered detail on a specific symbol' }) },
     tests:         { params: 'name', format: (r, a) => output.formatTests(r, a) },
     affectedTests: { params: 'name', format: (r, _a, f) => output.formatAffectedTests(r, { all: f.all }) },
     typedef:       { params: 'name', format: (r, a) => output.formatTypedef(r, a) },
@@ -1887,9 +1883,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             const { ok, result, error, note } = execute(index, 'context', { name: arg, ...iflags });
             if (!ok) { console.log(error); return; }
             const { text, expandable } = output.formatContext(result, {
-                methodsHint: 'Note: obj.method() calls excluded — use --include-methods to include them',
                 expandHint: 'Use "expand <N>" to see code for item N',
-                uncertainHint: 'use --include-uncertain to include all',
                 showConfidence: iflags.showConfidence !== false,
             });
             console.log(text);

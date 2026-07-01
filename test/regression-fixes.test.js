@@ -302,12 +302,17 @@ config/local.json
         assert.ok(patterns.includes('public'), 'Should include public');
         assert.ok(!patterns.includes('next.lock'), 'Should skip next.lock (already in DEFAULT_IGNORES)');
         assert.ok(patterns.includes('.cache'), 'Should include .cache');
-        assert.ok(patterns.includes('tmp_build'), 'Should include tmp_build (leading / stripped)');
+        // fix #226: root-relative patterns KEEP the leading slash (anchored —
+        // git semantics: /tmp_build ignores only the root-level tmp_build,
+        // never src/tmp_build; shouldIgnore applies them at anchorRoot only).
+        assert.ok(patterns.includes('/tmp_build'), 'Should include /tmp_build (anchored, slash preserved)');
+        assert.ok(!patterns.includes('tmp_build'), 'Anchored pattern must not appear unanchored');
         assert.ok(patterns.includes('*.bak'), 'Should include *.bak glob');
         assert.ok(!patterns.includes('node_modules'), 'Should skip node_modules (already in DEFAULT_IGNORES)');
         assert.ok(!patterns.includes('!important.log'), 'Should skip negation patterns');
         assert.ok(!patterns.includes('important.log'), 'Should skip negation patterns');
-        assert.ok(!patterns.some(p => p.includes('/')), 'Should skip patterns with path separators');
+        assert.ok(!patterns.some(p => p.slice(1).includes('/')),
+            'Should skip patterns with interior path separators (leading anchor slash allowed)');
         assert.ok(patterns.includes('*.log'), 'Should include *.log');
     } finally {
         fs.rmSync(tmpDir, { recursive: true, force: true });

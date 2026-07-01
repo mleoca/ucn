@@ -133,13 +133,19 @@ const REPOS = [
 // appear in REPOS, and none should ever be used to tune a fix — a fresh repo
 // that surfaces a family graduates INTO the pinned board if it's used for
 // engineering, and gets replaced here.
+// Target rule (dayjs-measured, the cursive lesson): the oracle roots at the
+// TARGET, UCN roots at its detected project root — so the target must cover
+// the repo's CALLER universe (dayjs callers live in test/, outside 'src';
+// every UCN edge there counted as an unverifiable claim and tier-1 cratered
+// to 2.1% by universe mismatch, not engine physics). Default '.'; narrower
+// only where the language server needs a specific project-model root (Java).
 const FRESH_POOL = [
-    { name: 'hono', url: 'https://github.com/honojs/hono', language: 'typescript', targetCandidates: ['src'] },
-    { name: 'zustand', url: 'https://github.com/pmndrs/zustand', language: 'typescript', targetCandidates: ['src'] },
+    { name: 'hono', url: 'https://github.com/honojs/hono', language: 'typescript', targetCandidates: ['.'] },
+    { name: 'zustand', url: 'https://github.com/pmndrs/zustand', language: 'typescript', targetCandidates: ['.'] },
     { name: 'fastify', url: 'https://github.com/fastify/fastify', language: 'javascript', targetCandidates: ['.'] },
-    { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['src'] },
-    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['src/flask'] },
-    { name: 'click', url: 'https://github.com/pallets/click', language: 'python', targetCandidates: ['src/click'] },
+    { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['.'] },
+    { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
+    { name: 'click', url: 'https://github.com/pallets/click', language: 'python', targetCandidates: ['.'] },
     { name: 'chi', url: 'https://github.com/go-chi/chi', language: 'go', targetCandidates: ['.'] },
     { name: 'viper', url: 'https://github.com/spf13/viper', language: 'go', targetCandidates: ['.'] },
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },

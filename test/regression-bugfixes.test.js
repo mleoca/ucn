@@ -2800,3 +2800,49 @@ t.process('test-input');
     });
 });
 
+
+// ============================================================================
+// Fix #226: anchored .gitignore patterns (/name) apply only at the project root
+// ============================================================================
+// dayjs-measured (fresh-repo eval arm): `/locale` and `/plugin` in .gitignore
+// ignore BUILD OUTPUTS at the repo root — but UCN stripped the leading slash
+// and matched by bare name at every depth, silently excluding src/locale and
+// src/plugin (~160 tracked source files, no warning). Silent blind spots are
+// the worst trust failure: the index looked complete and wasn't.
+describe('fix #226: anchored gitignore patterns are root-only', () => {
+    it('indexes src/locale when .gitignore has /locale; unanchored patterns still match everywhere', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            '.gitignore': '/locale\nvendor\n',
+            'locale/gen.js': 'function generated() { return 1; }',          // root-level: ignored
+            'src/locale/en.js': 'function localeEn() { return 2; }',        // source: MUST be indexed
+            'vendor/lib.js': 'function vendored() { return 3; }',           // unanchored: ignored
+            'src/vendor/util.js': 'function vendoredDeep() { return 4; }',  // unanchored: ignored at depth too
+            'src/app.js': 'function app() { return 5; }',
+        });
+        try {
+            const index = idx(dir);
+            const rels = new Set([...index.files.values()].map(fe => fe.relativePath));
+            assert.ok(rels.has('src/locale/en.js'),
+                `src/locale must be indexed (anchored /locale is root-only): ${[...rels].join(', ')}`);
+            assert.ok(rels.has('src/app.js'), 'sanity: src/app.js indexed');
+            assert.ok(!rels.has('locale/gen.js'), 'root-level locale/ must stay ignored');
+            assert.ok(!rels.has('vendor/lib.js'), 'unanchored vendor ignored at root');
+            assert.ok(!rels.has('src/vendor/util.js'), 'unanchored vendor ignored at depth');
+
+            // isCacheStale uses the same machinery: a new file in the ignored
+            // root-level dir must NOT flag staleness; one in src/locale must.
+            assert.strictEqual(index.isCacheStale(), false, 'fresh after build');
+            fs.writeFileSync(path.join(dir, 'locale', 'more.js'), 'function more() {}');
+            index._lastFreshAt = 0; // bypass the burst window for the glob check
+            assert.strictEqual(index.isCacheStale(), false,
+                'new file in root-ignored dir must not flag staleness');
+            fs.writeFileSync(path.join(dir, 'src', 'locale', 'de.js'), 'function localeDe() {}');
+            index._lastFreshAt = 0;
+            assert.strictEqual(index.isCacheStale(), true,
+                'new file in src/locale (real source) must flag staleness');
+        } finally {
+            rm(dir);
+        }
+    });
+});
