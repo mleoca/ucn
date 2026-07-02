@@ -6,6 +6,19 @@ const { isTestFile } = require('./discovery');
 const { detectLanguage } = require('./parser');
 
 /**
+ * Code-unit string comparison (rule 11 / fix #227): output ordering is part
+ * of the public contract and must be byte-identical across machines —
+ * localeCompare depends on the host ICU locale (case-insensitive-ish
+ * collation, locale tailoring), so two machines can render the same result
+ * in different orders. Every output-path comparator uses this instead.
+ */
+function codeUnitCompare(a, b) {
+    const sa = String(a ?? '');
+    const sb = String(b ?? '');
+    return sa < sb ? -1 : sa > sb ? 1 : 0;
+}
+
+/**
  * Path-based test heuristic — matches the same patterns as `find`'s exclusion
  * logic so that `about` and `find` agree on which files are de-emphasized.
  *
@@ -59,7 +72,7 @@ function pickBestDefinition(matches, opts = {}) {
     });
     // Stable sort: by score desc, then alphabetical relativePath (so two equal-score
     // matches always pick the same one across runs).
-    scored.sort((a, b) => (b.score - a.score) || a.rp.localeCompare(b.rp));
+    scored.sort((a, b) => (b.score - a.score) || codeUnitCompare(a.rp, b.rp));
     return scored[0].match;
 }
 
@@ -206,6 +219,7 @@ module.exports = {
     pickBestDefinition,
     addTestExclusions,
     escapeRegExp,
+    codeUnitCompare,
     NON_CALLABLE_TYPES,
     formatSymbolHandle,
     parseSymbolHandle,

@@ -64,7 +64,7 @@ the site (confirmed edge / unverified entry) or account for it
 
 | repo | callee precision | confirmed | other-def | unverified | accounted | module-level | beyond-text | **missing-unexplained** |
 |---|---|---|---|---|---|---|---|---|
-| zod | 100.0% (75/75) | 75 | 24 | 59 | 0 | 1703 | 0 | **0** |
+| zod | 100.0% (41/41) | 41 | 22 | 95 | 0 | 1703 | 0 | **0** |
 | preact-signals | 100.0% (15/15) | 15 | 0 | 4 | 1 | 4 | 0 | **0** |
 | express | 100.0% (4/4) | 4 | 0 | 0 | 0 | 258 | 0 | **0** |
 | httpx | 100.0% (368/368) | 367 | 1 | 475 | 36 | 0 | 0 | **0** |
@@ -73,4 +73,4 @@ the site (confirmed edge / unverified entry) or account for it
 | grpc-go | 98.1% (356/363) | 356 | 372 | 100 | 0 | 12 | 0 | **0** |
 | ripgrep | 100.0% (729/729) | 729 | 0 | 32 | 4 | 0 | 0 | **0** |
 | cursive | 100.0% (387/387) | 383 | 2 | 244 | 0 | 0 | 8 | **0** |
-| gson | 97.1% (271/279) | 271 | 145 | 63 | 0 | 38 | 0 | **0** |
+| gson | 97.1% (271/279) | 271 | 141 | 67 | 0 | 38 | 0 | **0** |

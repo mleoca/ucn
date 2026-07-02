@@ -2723,9 +2723,10 @@ module.exports = { a, b };
                 { name: 'ep', file: 'b.js', line: 1, type: 'function', children: [], entryPoint: true }
             ] },
             entryPoints: [{ name: 'ep', file: 'b.js', line: 1 }],
-            summary: { totalEntryPoints: 1, totalFunctions: 1, maxDepthReached: 1 },
+            summary: { totalEntryPoints: 1, totalFunctions: 2, maxDepthReached: 1 },
         });
         assert.ok(single.includes('1 entry point reaches'), 'singular entry point');
+        // fix #237: intermediates exclude the entry points themselves
         assert.ok(single.includes('1 intermediate function'), 'singular function');
 
         // 2 entry points → plural
@@ -2736,10 +2737,23 @@ module.exports = { a, b };
                 { name: 'ep2', file: 'c.js', line: 1, type: 'function', children: [], entryPoint: true },
             ] },
             entryPoints: [{ name: 'ep1', file: 'b.js', line: 1 }, { name: 'ep2', file: 'c.js', line: 1 }],
-            summary: { totalEntryPoints: 2, totalFunctions: 2, maxDepthReached: 1 },
+            summary: { totalEntryPoints: 2, totalFunctions: 4, maxDepthReached: 1 },
         });
         assert.ok(plural.includes('2 entry points reach '), 'plural entry points');
         assert.ok(plural.includes('2 intermediate functions'), 'plural functions');
+
+        // Entry points reaching the root directly (no intermediates) say so
+        // instead of counting the entry points as intermediates (fix #237).
+        const direct = output.formatReverseTrace({
+            root: 't', file: 'a.js', line: 1, maxDepth: 5, includeMethods: true,
+            tree: { name: 't', file: 'a.js', line: 1, type: 'function', children: [
+                { name: 'ep', file: 'b.js', line: 1, type: 'function', children: [], entryPoint: true }
+            ] },
+            entryPoints: [{ name: 'ep', file: 'b.js', line: 1 }],
+            summary: { totalEntryPoints: 1, totalFunctions: 1, maxDepthReached: 1 },
+        });
+        assert.ok(direct.includes('reaches t directly'), `direct reach wording: ${direct}`);
+        assert.ok(!direct.includes('intermediate'), 'no intermediate claim for direct reach');
     });
 });
 
@@ -4733,6 +4747,122 @@ describe('fix #234: context/smart default includeMethods for method targets like
                 JSON.stringify(ctx.result.callers.map(c => `${c.relativePath}:${c.line}:${c.tier}`)),
                 JSON.stringify(withFlag.result.callers.map(c => `${c.relativePath}:${c.line}:${c.tier}`)),
                 '--include-methods is a true no-op for method targets');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #237: W7 command-level batch', () => {
+    it('usages --limit: summary counts describe the full result set', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction a() { return helper(); }\nfunction b() { return helper(); }\nmodule.exports = { a, b };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'helper', limit: 1 });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.length, 1, 'listed entries truncated to the limit');
+            const text = output.formatUsages(r.result, 'helper');
+            assert.match(text, /1 definitions, 2 calls, 1 imports/,
+                `summary reflects the full set: ${text.split('\n')[0]}`);
+            const json = JSON.parse(output.formatUsagesJson(r.result, 'helper'));
+            assert.strictEqual(json.data.callCount, 2, 'JSON callCount is the full count');
+        } finally { rm(dir); }
+    });
+
+    it('search taxonomy: records and enums reachable via --type class/type', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Rec.java': 'package p;\n\npublic record Point(int x, int y) {\n    public int sum() { return x + y; }\n}\n',
+            'Color.java': 'package p;\n\npublic enum Color { RED, GREEN }\n',
+        });
+        try {
+            const index = idx(dir);
+            const cls = execute(index, 'search', { type: 'class' });
+            assert.ok(cls.ok);
+            const clsNames = cls.result.results.map(s => s.name);
+            assert.ok(clsNames.includes('Point'), `record in --type class: ${clsNames}`);
+            assert.ok(clsNames.includes('Color'), `enum in --type class: ${clsNames}`);
+            const typ = execute(index, 'search', { type: 'type' });
+            assert.ok(typ.result.results.some(s => s.name === 'Point'), 'record in --type type');
+        } finally { rm(dir); }
+    });
+
+    it('search taxonomy: private and property kinds reachable via --type function', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'svc.py': 'class Svc:\n    def _request(self, data):\n        return data\n\n    @property\n    def size(self):\n        return 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const fns = execute(index, 'search', { type: 'function' });
+            assert.ok(fns.ok);
+            const names = fns.result.results.map(s => s.name);
+            assert.ok(names.includes('_request'), `private method in --type function: ${names}`);
+            assert.ok(names.includes('size'), `property in --type function: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('search --type call exposes field-hop receivers and --receiver matches them', () => {
+        const dir = tmp({
+            'go.mod': 'module t\n',
+            'main.go': 'package main\n\ntype DataService struct{}\n\nfunc (s *DataService) Save() {}\n\ntype Manager struct {\n\tservice *DataService\n}\n\nfunc (m *Manager) Run() {\n\tm.service.Save()\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'search', { type: 'call', receiver: 'service' });
+            assert.ok(r.ok);
+            const hit = r.result.results.find(s => s.name.endsWith('.Save'));
+            assert.ok(hit, `--receiver service finds the field-hop call: ${JSON.stringify(r.result.results)}`);
+            assert.strictEqual(hit.receiver, 'm.service', 'receiver renders the dotted hop form');
+        } finally { rm(dir); }
+    });
+
+    it('trace --depth 0 prints its note once', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function a() { return b(); }\nfunction b() { return 1; }\nmodule.exports = { a, b };',
+        });
+        try {
+            const out = runCli(dir, 'trace', ['a'], ['--depth', '0']);
+            const count = (out.match(/depth=0/g) || []).length;
+            assert.strictEqual(count, 1, `depth-0 note appears once:\n${out}`);
+        } finally { rm(dir); }
+    });
+
+    it('--hide-confidence suppresses the evidence lines in context and about', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { return helper(); }\nmodule.exports = { main };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'helper' });
+            assert.ok(r.ok);
+            const shown = output.formatContext(r.result, {}).text ?? output.formatContext(r.result, {});
+            const shownText = typeof shown === 'string' ? shown : shown.text;
+            assert.match(shownText, /evidence:/, 'evidence line shown by default');
+            const hidden = output.formatContext(r.result, { showConfidence: false });
+            const hiddenText = typeof hidden === 'string' ? hidden : hidden.text;
+            assert.ok(!/evidence:/.test(hiddenText), 'evidence line suppressed with --hide-confidence');
+        } finally { rm(dir); }
+    });
+
+    it('about USAGES header agrees with the ACCOUNT reference count', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'deco.py': 'def with_logging(fn):\n    return fn\n',
+            'main.py': 'from deco import with_logging\n\n@with_logging\ndef work():\n    return 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'about', { name: 'with_logging' });
+            assert.ok(r.ok);
+            assert.ok(r.result.usages.references >= 1,
+                `decorator application counts as a reference: ${JSON.stringify(r.result.usages)}`);
+            assert.ok(r.result.totalUsages >= 1, 'headline total is not 0');
         } finally { rm(dir); }
     });
 });

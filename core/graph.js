@@ -8,6 +8,7 @@
 'use strict';
 
 const path = require('path');
+const { codeUnitCompare } = require('./shared');
 const { extractImports, resolveImport } = require('./imports');
 const { langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
@@ -608,7 +609,7 @@ function circularDeps(index, options = {}) {
             result = uniqueCycles.filter(c => c.files.some(f => f.includes(fileFilter)));
         }
 
-        result.sort((a, b) => a.length - b.length || a.files[0].localeCompare(b.files[0]));
+        result.sort((a, b) => a.length - b.length || codeUnitCompare(a.files[0], b.files[0]));
 
         // Count files that participate in import graph (have edges)
         let filesWithImports = 0;

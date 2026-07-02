@@ -424,7 +424,7 @@ function formatContext(ctx, options = {}) {
         ? `CALLERS — CONFIRMED (${callers.length}, ${prodCallers.length} prod + ${testCallers.length} test):`
         : `CALLERS — CONFIRMED (${callers.length}):`;
     lines.push(`${compact ? '' : '\n'}${tierHeader}`);
-    const callerEvidence = formatEvidenceLine(callers);
+    const callerEvidence = options.showConfidence !== false ? formatEvidenceLine(callers) : null;
     if (callerEvidence && !compact) lines.push(callerEvidence);
     const callerReach = reachabilityDisplay(callers, hasEntrypoints, 'caller');
     const renderCaller = (c) => {
@@ -493,7 +493,7 @@ function formatContext(ctx, options = {}) {
 
     const callees = ctx.callees || [];
     lines.push(`${compact ? '' : '\n'}CALLEES (${callees.length}):`);
-    const calleeEvidence = formatEvidenceLine(callees);
+    const calleeEvidence = options.showConfidence !== false ? formatEvidenceLine(callees) : null;
     if (calleeEvidence && !compact) lines.push(calleeEvidence);
     const calleeReach = reachabilityDisplay(callees, hasEntrypoints, 'callee');
     for (const c of callees) {
@@ -757,7 +757,7 @@ function formatAbout(about, options = {}) {
         } else {
             lines.push(`CALLERS — CONFIRMED (${about.callers.total}${testTop.length > 0 ? `, ${prodTop.length} prod + ${testTop.length} test` : ''}):`);
         }
-        const callerEvidence = formatEvidenceLine(top);
+        const callerEvidence = options.showConfidence !== false ? formatEvidenceLine(top) : null;
         if (callerEvidence) lines.push(callerEvidence);
         const aboutCallerReach = reachabilityDisplay(top, hasEntrypoints, 'caller');
         const renderAboutCaller = (c) => {
@@ -814,7 +814,7 @@ function formatAbout(about, options = {}) {
         } else {
             lines.push(`CALLEES (${about.callees.total}):`);
         }
-        const calleeEvidence = formatEvidenceLine(about.callees.top);
+        const calleeEvidence = options.showConfidence !== false ? formatEvidenceLine(about.callees.top) : null;
         if (calleeEvidence) lines.push(calleeEvidence);
         const aboutCalleeReach = reachabilityDisplay(about.callees.top, hasEntrypoints, 'callee');
         for (const c of about.callees.top) {

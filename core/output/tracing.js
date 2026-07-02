@@ -9,6 +9,7 @@
  */
 
 const { unverifiedReasonLabel } = require('./shared');
+const { codeUnitCompare } = require('../shared');
 const { formatAccountLines } = require('./analysis');
 
 /**
@@ -56,10 +57,10 @@ function renderUnverifiedCallees(lines, node, prefix, isParentLast) {
 function treeAccountLine(ta) {
     if (!ta) return null;
     const reasons = Object.entries(ta.unverifiedByReason || {})
-        .sort((a, b) => a[0].localeCompare(b[0]))
+        .sort((a, b) => codeUnitCompare(a[0], b[0]))
         .map(([r, n]) => `${n} ${r}`).join(', ');
     const excludedReasons = Object.entries(ta.excludedByReason || {})
-        .sort((a, b) => a[0].localeCompare(b[0]))
+        .sort((a, b) => codeUnitCompare(a[0], b[0]))
         .map(([r, n]) => `${n} ${r}`).join(', ');
     let line = `TREE ACCOUNT: ${ta.nodesExpanded} node${ta.nodesExpanded === 1 ? '' : 's'} expanded · ` +
         `${ta.confirmedEdges} confirmed edge${ta.confirmedEdges === 1 ? '' : 's'} · ` +
@@ -75,7 +76,7 @@ function calleeAccountLine(ta) {
     if (!ta || !ta.callSites) return null;
     const cs = ta.callSites;
     const reasons = Object.entries(ta.unverifiedByReason || {})
-        .sort((a, b) => a[0].localeCompare(b[0]))
+        .sort((a, b) => codeUnitCompare(a[0], b[0]))
         .map(([r, n]) => `${n} ${r}`).join(', ');
     let line = `CALLEE ACCOUNT: ${ta.nodesExpanded} node${ta.nodesExpanded === 1 ? '' : 's'} expanded · ` +
         `${cs.total} call site${cs.total === 1 ? '' : 's'} = ${cs.confirmed} confirmed + ` +
@@ -463,9 +464,14 @@ function formatReverseTrace(result, options = {}) {
     if (result.summary) {
         lines.push('');
         const { totalEntryPoints, totalFunctions, unverifiedEdges } = result.summary;
+        // totalFunctions counts every traversed node incl. the entry points
+        // themselves — "intermediate" excludes them (fix #237: '4 entry
+        // points reach X through 6 intermediate functions' counted the 4
+        // entry points among the 6).
+        const intermediates = Math.max(0, totalFunctions - (totalEntryPoints || 0));
         let s;
         if (totalFunctions > 0) {
-            s = `Summary: ${totalEntryPoints} entry point${totalEntryPoints !== 1 ? 's' : ''} reach${totalEntryPoints === 1 ? 'es' : ''} ${result.root} through ${totalFunctions} intermediate function${totalFunctions !== 1 ? 's' : ''}`;
+            s = `Summary: ${totalEntryPoints} entry point${totalEntryPoints !== 1 ? 's' : ''} reach${totalEntryPoints === 1 ? 'es' : ''} ${result.root}${intermediates > 0 ? ` through ${intermediates} intermediate function${intermediates !== 1 ? 's' : ''}` : ' directly'}`;
         } else if (unverifiedEdges > 0) {
             s = `Summary: no confirmed callers — ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (not an entry-point claim)`;
         } else {

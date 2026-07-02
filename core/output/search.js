@@ -253,7 +253,16 @@ function formatExampleDiverse(result, name) {
  */
 function formatExampleJson(result, name) {
     if (!result || !result.best) {
-        return JSON.stringify({ found: false, query: name, error: `No call examples found for "${name}"` }, null, 2);
+        // Surface the excluded-test-usages count in JSON too (fix #237 — the
+        // handler note that used to carry it duplicated the text body).
+        const excluded = result?.excludedTestCalls || 0;
+        return JSON.stringify({
+            found: false, query: name,
+            ...(excluded > 0 && { excludedTestCalls: excluded }),
+            error: excluded > 0
+                ? `No call examples found for "${name}" (excluded ${excluded} test-file usage${excluded === 1 ? '' : 's'} — pass --include-tests to include them)`
+                : `No call examples found for "${name}"`,
+        }, null, 2);
     }
 
     const best = result.best;

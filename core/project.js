@@ -13,7 +13,7 @@ const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parse, cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
-const { escapeRegExp, NON_CALLABLE_TYPES } = require('./shared');
+const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare } = require('./shared');
 const stacktrace = require('./stacktrace');
 const indexCache = require('./cache');
 const deadcodeModule = require('./deadcode');
@@ -1393,7 +1393,7 @@ class ProjectIndex {
 
         // Sort by file then line
         methods.sort((a, b) => {
-            if (a.relativePath !== b.relativePath) return a.relativePath.localeCompare(b.relativePath);
+            if (a.relativePath !== b.relativePath) return codeUnitCompare(a.relativePath, b.relativePath);
             return a.startLine - b.startLine;
         });
 

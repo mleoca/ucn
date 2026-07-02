@@ -8,6 +8,7 @@
 'use strict';
 
 const fs = require('fs');
+const { codeUnitCompare } = require('./shared');
 const path = require('path');
 const { isTestFile } = require('./discovery');
 
@@ -304,7 +305,7 @@ function getStats(index, options = {}) {
             if (approximate) usedHeuristicSplit = true;
             // Sort locations by (file, startLine) for stable display.
             locations.sort((a, b) =>
-                a.file.localeCompare(b.file) ||
+                codeUnitCompare(a.file, b.file) ||
                 (a.startLine || 0) - (b.startLine || 0)
             );
             const primary = locations[0];
@@ -329,7 +330,7 @@ function getStats(index, options = {}) {
         // Stable order: callCount desc, then (relativePath, startLine) asc.
         hotList.sort((a, b) =>
             (b.callCount - a.callCount) ||
-            a.file.localeCompare(b.file) ||
+            codeUnitCompare(a.file, b.file) ||
             (a.startLine || 0) - (b.startLine || 0)
         );
 

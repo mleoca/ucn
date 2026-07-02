@@ -1706,8 +1706,12 @@ send(\`\${HOST}/api\`, JSON.stringify({}));
         } finally { rm(dir); }
     });
 
-    it('execute(example) with no callers includes user-friendly note', () => {
+    it('execute(example) with only test callers surfaces the excluded count once', () => {
+        // fix #237: the handler note duplicated the formatter body — the
+        // excluded-test-usages message now lives in the body (text + JSON)
+        // and the handler returns no note.
         const { execute } = require('../core/execute');
+        const output = require('../core/output');
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': "function tmp(opts) { return opts; }\nmodule.exports = { tmp };",
@@ -1716,9 +1720,12 @@ send(\`\${HOST}/api\`, JSON.stringify({}));
         try {
             const index = idx(dir);
             const r = execute(index, 'example', { name: 'tmp' });
-            assert.ok(r.ok, 'execute should succeed (with note)');
-            assert.ok(r.note && /test-file/.test(r.note),
-                `expected note mentioning test-file, got: ${r.note}`);
+            assert.ok(r.ok, 'execute should succeed');
+            assert.strictEqual(r.note, undefined, 'no handler note — the body carries the message');
+            const text = output.formatExample(r.result, 'tmp');
+            assert.match(text, /test-file/, `body mentions the excluded test usage: ${text}`);
+            const json = JSON.parse(output.formatExampleJson(r.result, 'tmp'));
+            assert.strictEqual(json.excludedTestCalls, 1, 'JSON carries the excluded count');
         } finally { rm(dir); }
     });
 

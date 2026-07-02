@@ -13,6 +13,7 @@
 'use strict';
 
 const { advisoryLine } = require('./shared');
+const { codeUnitCompare } = require('../shared');
 
 const SEP_TIER = { exact: 'EXACT', partial: 'PARTIAL', uncertain: 'UNCERTAIN' };
 
@@ -142,7 +143,7 @@ function formatBridges(bridges, unmatchedRoutes, unmatchedRequests, meta, option
         }
         // Sort routes alphabetically
         const sorted = [...byRoute.values()].sort((a, b) => {
-            if (a.route.file !== b.route.file) return a.route.file.localeCompare(b.route.file);
+            if (a.route.file !== b.route.file) return codeUnitCompare(a.route.file, b.route.file);
             return a.route.line - b.route.line;
         });
 

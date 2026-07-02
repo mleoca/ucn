@@ -20,7 +20,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp } = require('./shared');
+const { escapeRegExp, codeUnitCompare } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
 const { detectLanguage, getLanguageModule } = require('../languages');
@@ -61,9 +61,9 @@ function _contractCallers(index, funcDef, { includeMethods, callerCache, pin }) 
 function _sortFrontier(frontier) {
     frontier.sort((a, b) =>
         (a.hop - b.hop) ||
-        (a.atNode.file || '').localeCompare(b.atNode.file || '') ||
+        codeUnitCompare((a.atNode.file || ''), b.atNode.file || '') ||
         ((a.atNode.line || 0) - (b.atNode.line || 0)) ||
-        (a.relativePath || '').localeCompare(b.relativePath || '') ||
+        codeUnitCompare((a.relativePath || ''), b.relativePath || '') ||
         ((a.line || 0) - (b.line || 0)));
     return frontier;
 }
@@ -126,7 +126,7 @@ function _resolveCallerEntries(index, callers, exclude) {
 
     // Stable sort by file + line
     callerEntries.sort((a, b) =>
-        a.def.file.localeCompare(b.def.file) || a.def.startLine - b.def.startLine
+        codeUnitCompare(a.def.file, b.def.file) || a.def.startLine - b.def.startLine
     );
     return callerEntries;
 }
@@ -996,8 +996,8 @@ function affectedTests(index, name, options = {}) {
         }
 
         // Sort by coverage breadth then alphabetically
-        results.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || a.file.localeCompare(b.file));
-        possibleResults.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || a.file.localeCompare(b.file));
+        results.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || codeUnitCompare(a.file, b.file));
+        possibleResults.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || codeUnitCompare(a.file, b.file));
 
         // Compute coverage stats.
         // Filter out test function names from affectedNames — they are callers,

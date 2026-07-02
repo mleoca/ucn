@@ -3305,3 +3305,52 @@ pub fn generic_call<T: Default>() -> T {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #237 (Rust): same-name fan-out needs receiver evidence', () => {
+    // Campaign G1-rust BUG-7: CacheService.get's `cache.get(key)` (untyped
+    // MutexGuard receiver) hit the same-name fan-out and sprayed a confirmed
+    // callee edge onto ApiClient.get — reachability credit then leaked from
+    // CacheService.get's test callers onto ApiClient.get while its sibling
+    // methods stayed unreachable. Name-equality with the enclosing def is
+    // not receiver evidence.
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': `use std::collections::HashMap;
+
+pub struct CacheService {
+    cache: HashMap<String, i32>,
+}
+
+impl CacheService {
+    pub fn get(&self, key: &str) -> Option<i32> {
+        let cache = &self.cache;
+        cache.get(key).copied()
+    }
+}
+
+pub struct ApiClient;
+
+impl ApiClient {
+    pub fn get(&self) -> i32 {
+        1
+    }
+}
+`,
+    };
+
+    it('untyped-receiver same-name call never sprays onto sibling classes', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('get').find(s => s.className === 'CacheService');
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.ok(!acct.some(c => c.className === 'ApiClient'),
+                `cache.get() must not confirm ApiClient.get: ${JSON.stringify(acct.map(c => c.className))}`);
+            const legacy = index.findCallees(def);
+            assert.ok(!legacy.some(c => c.className === 'ApiClient'), 'legacy mode agrees');
+            assert.ok((acct.unverifiedCallees || []).some(u => u.name === 'get'),
+                `the call stays visible unverified: ${JSON.stringify(acct.unverifiedCallees)}`);
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

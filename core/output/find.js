@@ -268,15 +268,17 @@ function formatUsagesJson(usages, name) {
         };
     };
 
+    // Full-set counts under --limit (fix #237) — listed entries stay truncated.
+    const sc = usages.summaryCounts;
     return JSON.stringify({
         meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0 },
         data: {
             symbol: name,
-            definitionCount: definitions.length,
-            callCount: calls.length,
-            importCount: imports.length,
-            referenceCount: references.length,
-            totalUsages: refs.length,
+            definitionCount: sc ? sc.definitions : definitions.length,
+            callCount: sc ? sc.calls : calls.length,
+            importCount: sc ? sc.imports : imports.length,
+            referenceCount: sc ? sc.references : references.length,
+            totalUsages: sc ? (sc.calls + sc.imports + sc.references) : refs.length,
             definitions: definitions.map(d => {
                 const handle = formatSymbolHandle({ ...d, name: d.name || name });
                 return {
@@ -308,8 +310,12 @@ function formatUsages(usages, name, options = {}) {
     const imports = usages.filter(u => u.usageType === 'import');
     const refs = usages.filter(u => !u.isDefinition && u.usageType === 'reference');
 
+    // Under --limit the listed entries are truncated but the summary must
+    // describe the FULL result set (fix #237) — the handler attaches the
+    // full counts as a non-enumerable property.
+    const sc = usages.summaryCounts;
     const lines = [];
-    lines.push(`Usages of "${name}": ${defs.length} definitions, ${calls.length} calls, ${imports.length} imports, ${refs.length} references`);
+    lines.push(`Usages of "${name}": ${sc ? sc.definitions : defs.length} definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references`);
     if (!compact) lines.push('═'.repeat(60));
 
     function renderContextLines(usage) {

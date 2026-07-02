@@ -23,6 +23,7 @@
 'use strict';
 
 const fs = require('fs');
+const { codeUnitCompare } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
 const { langTraits } = require('../languages');
@@ -353,10 +354,10 @@ function extractServerRoutes(index) {
 
     // Sort deterministically (file, line, method, path)
     routes.sort((a, b) => {
-        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
         if (a.line !== b.line) return a.line - b.line;
-        if (a.method !== b.method) return a.method.localeCompare(b.method);
-        return a.path.localeCompare(b.path);
+        if (a.method !== b.method) return codeUnitCompare(a.method, b.method);
+        return codeUnitCompare(a.path, b.path);
     });
 
     // Cache it
@@ -726,10 +727,10 @@ function extractClientRequests(index) {
 
     // Stable sort
     requests.sort((a, b) => {
-        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
         if (a.line !== b.line) return a.line - b.line;
-        if (a.method !== b.method) return a.method.localeCompare(b.method);
-        return a.path.localeCompare(b.path);
+        if (a.method !== b.method) return codeUnitCompare(a.method, b.method);
+        return codeUnitCompare(a.path, b.path);
     });
 
     if (!index._endpointsCache) index._endpointsCache = {};
@@ -887,13 +888,13 @@ function bridgeEndpoints(index) {
     // For each (request) keep all matches but sort with best first
     bridges.sort((a, b) => {
         // Group by request first
-        const reqCmpFile = a.request.file.localeCompare(b.request.file);
+        const reqCmpFile = codeUnitCompare(a.request.file, b.request.file);
         if (reqCmpFile !== 0) return reqCmpFile;
         if (a.request.line !== b.request.line) return a.request.line - b.request.line;
         // Then by confidence desc
         if (a.confidence !== b.confidence) return b.confidence - a.confidence;
         // Then by route file/line
-        if (a.route.file !== b.route.file) return a.route.file.localeCompare(b.route.file);
+        if (a.route.file !== b.route.file) return codeUnitCompare(a.route.file, b.route.file);
         return a.route.line - b.route.line;
     });
 

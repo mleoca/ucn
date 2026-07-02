@@ -8,7 +8,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp } = require('./shared');
+const { escapeRegExp, codeUnitCompare } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { getCachedCalls } = require('./callers');
@@ -59,7 +59,7 @@ function find(index, name, options = {}) {
                     all.push({ ...sym, _fuzzyScore: 800 });
                 }
             }
-            all.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            all.sort((a, b) => codeUnitCompare((a.name || ''), b.name || ''));
             return _applyFindFilters(index, all, options);
         }
         const globRegex = new RegExp('^' + name.replace(/[.+^${}()|[\]\\]/g, '\\$&').replace(/\*/g, '.*').replace(/\?/g, '.') + '$', 'i');
@@ -71,7 +71,7 @@ function find(index, name, options = {}) {
                 }
             }
         }
-        matches.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        matches.sort((a, b) => codeUnitCompare((a.name || ''), b.name || ''));
         return _applyFindFilters(index, matches, options);
     }
 
@@ -621,25 +621,38 @@ function structuralSearch(index, options = {}) {
                 if (!calls) continue;
                 for (const call of calls) {
                     if (nameMatcher && !nameMatcher(call.name)) continue;
+                    // Field-hop receivers (`tm.service.Save()`) carry
+                    // receiverRoot/receiverField instead of receiver —
+                    // expose the dotted form so --receiver can match them
+                    // and the call renders with its receiver (fix #237).
+                    const callReceiver = call.receiver ||
+                        (call.receiverField
+                            ? (call.receiverRoot ? `${call.receiverRoot}.${call.receiverField}` : call.receiverField)
+                            : null);
                     if (receiver) {
-                        if (!call.receiver) continue;
-                        if (!matchesSubstring(call.receiver, receiver, options.caseSensitive)) continue;
+                        if (!callReceiver) continue;
+                        if (!matchesSubstring(callReceiver, receiver, options.caseSensitive)) continue;
                     }
                     results.push({
                         kind: 'call',
-                        name: call.receiver ? `${call.receiver}.${call.name}` : call.name,
+                        name: callReceiver ? `${callReceiver}.${call.name}` : call.name,
                         file: fileEntry.relativePath,
                         line: call.line,
-                        receiver: call.receiver || null,
+                        receiver: callReceiver,
                         isMethod: call.isMethod || false,
                     });
                 }
             }
         } else {
-            // Search symbols (functions, classes, methods, types)
-            const functionTypes = new Set(['function', 'constructor', 'method', 'arrow', 'static', 'classmethod', 'abstract']);
-            const classTypes = new Set(['class', 'struct', 'interface', 'impl', 'trait']);
-            const typeTypes = new Set(['type', 'enum', 'interface', 'trait']);
+            // Search symbols (functions, classes, methods, types).
+            // Every indexed symbol kind must be reachable through some type
+            // filter (fix #237): 'private'/'property' are function defs
+            // (Python underscore methods, @property members — both already
+            // match --type method via isMethod); Java records and enums are
+            // classes, and records are types too.
+            const functionTypes = new Set(['function', 'constructor', 'method', 'arrow', 'static', 'classmethod', 'abstract', 'private', 'property']);
+            const classTypes = new Set(['class', 'struct', 'interface', 'impl', 'trait', 'record', 'enum']);
+            const typeTypes = new Set(['type', 'enum', 'interface', 'trait', 'record']);
             const methodTypes = new Set(['method', 'constructor']);
 
             for (const [symbolName, definitions] of index.symbols) {
@@ -742,7 +755,7 @@ function structuralSearch(index, options = {}) {
         }
 
         // Sort by file, then line
-        results.sort((a, b) => a.file.localeCompare(b.file) || a.line - b.line);
+        results.sort((a, b) => codeUnitCompare(a.file, b.file) || a.line - b.line);
 
         // Apply top limit
         const total = results.length;
@@ -897,7 +910,7 @@ function example(index, name, options = {}) {
 
     // Order clusters: largest first, ties broken by shapeKey for determinism.
     const clusterList = [...clusterMap.values()].sort((a, b) =>
-        (b.count - a.count) || a.shapeKey.localeCompare(b.shapeKey)
+        (b.count - a.count) || codeUnitCompare(a.shapeKey, b.shapeKey)
     );
 
     // Pick representative per cluster: highest-scoring member; ties broken
@@ -905,7 +918,7 @@ function example(index, name, options = {}) {
     const clusters = clusterList.slice(0, top).map(cluster => {
         const sortedMembers = [...cluster.members].sort((a, b) =>
             (b.score - a.score) ||
-            (a.relativePath || a.file || '').localeCompare(b.relativePath || b.file || '') ||
+            codeUnitCompare((a.relativePath || a.file || ''), b.relativePath || b.file || '') ||
             (a.line || 0) - (b.line || 0)
         );
         const rep = sortedMembers[0];

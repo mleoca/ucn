@@ -9,7 +9,7 @@ const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = 
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
-const { isOverrideMarked } = require('./shared');
+const { isOverrideMarked, codeUnitCompare } = require('./shared');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -634,7 +634,7 @@ function deadcode(index, options = {}) {
 
     // Sort by file then line
     results.sort((a, b) => {
-        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
         return a.startLine - b.startLine;
     });
 

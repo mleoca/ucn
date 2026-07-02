@@ -7,7 +7,7 @@
 
 const path = require('path');
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
-const { escapeRegExp } = require('./shared');
+const { escapeRegExp, codeUnitCompare } = require('./shared');
 
 // ============================================================================
 // CALL-SITE CLASSIFICATION (Feature A)
@@ -638,7 +638,7 @@ function contractedCallerSweep(index, name, def) {
     unverified.sort((a, b) => {
         const ap = a.relativePath || '';
         const bp = b.relativePath || '';
-        if (ap !== bp) return ap.localeCompare(bp);
+        if (ap !== bp) return codeUnitCompare(ap, bp);
         return (a.line || 0) - (b.line || 0);
     });
 
@@ -697,7 +697,7 @@ function computePlanCallSites(index, name, def) {
     clearTreeCache(index);
     // Stable ordering (matches CLAUDE.md rule #11): files alphabetical, sites by line ascending.
     sites.sort((a, b) => {
-        const fc = String(a.file).localeCompare(String(b.file));
+        const fc = codeUnitCompare(String(a.file), String(b.file));
         if (fc !== 0) return fc;
         return (a.line || 0) - (b.line || 0);
     });

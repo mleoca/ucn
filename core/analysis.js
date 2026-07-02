@@ -12,7 +12,7 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
-const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots } = require('./shared');
+const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots, codeUnitCompare } = require('./shared');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageModule } = require('../languages');
 
@@ -320,7 +320,7 @@ function context(index, name, options = {}) {
         const byFileLine = (a, b) => {
             const fa = a.relativePath || a.file || '';
             const fb = b.relativePath || b.file || '';
-            if (fa !== fb) return fa.localeCompare(fb);
+            if (fa !== fb) return codeUnitCompare(fa, fb);
             return (a.line || 0) - (b.line || 0);
         };
         const typeAccount = composeAccount(index, name, rawTypeCallers,
@@ -416,7 +416,7 @@ function context(index, name, options = {}) {
     const byFileLine = (a, b) => {
         const fa = a.relativePath || a.file || '';
         const fb = b.relativePath || b.file || '';
-        if (fa !== fb) return fa.localeCompare(fb);
+        if (fa !== fb) return codeUnitCompare(fa, fb);
         return (a.line || 0) - (b.line || 0);
     };
     callers = [...callers].sort(byFileLine);
@@ -428,7 +428,7 @@ function context(index, name, options = {}) {
         // Tiebreaker: file then line, for determinism
         const fa = a.relativePath || a.file || '';
         const fb = b.relativePath || b.file || '';
-        if (fa !== fb) return fa.localeCompare(fb);
+        if (fa !== fb) return codeUnitCompare(fa, fb);
         return (a.startLine || 0) - (b.startLine || 0);
     });
 
@@ -1045,7 +1045,7 @@ function impact(index, name, options = {}) {
         });
     }
     unverifiedSites.sort((a, b) => {
-        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
         return (a.line || 0) - (b.line || 0);
     });
 
@@ -1107,7 +1107,7 @@ function impact(index, name, options = {}) {
         }));
     if (impactNotResolved.length > 0) {
         unverifiedSites = [...unverifiedSites, ...impactNotResolved].sort((a, b) => {
-            if (a.file !== b.file) return a.file.localeCompare(b.file);
+            if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
             return (a.line || 0) - (b.line || 0);
         });
     }
@@ -1168,7 +1168,7 @@ function impact(index, name, options = {}) {
         callerHistogram,
         // Stable ordering: files alphabetical, sites by line ascending. Documented contract.
         byFile: Array.from(byFile.entries())
-            .sort((a, b) => a[0].localeCompare(b[0]))
+            .sort((a, b) => codeUnitCompare(a[0], b[0]))
             .map(([file, sites]) => ({
                 file,
                 count: sites.length,
@@ -1370,6 +1370,17 @@ function about(index, name, options = {}) {
         aboutAccount = composeAccount(index, symbolName, rawCallers,
             aboutFilteredTotal > 0 ? { total: aboutFilteredTotal, byFlag: aboutFilteredByFlag } : undefined);
         unverifiedPool.push(...callNotResolvedEntries(index, aboutAccount, options));
+        // The USAGES fast path hardcodes references:0 (counting them needs a
+        // text scan) — but the account just DID that scan and classified the
+        // reference lines. Reconcile so the USAGES header never contradicts
+        // the ACCOUNT line rendered below it (fix #237: `about with_logging`
+        // said "0 references" while the account counted the @with_logging
+        // decorator application).
+        if (usagesByType && usagesByType.references === 0 &&
+            aboutAccount?.nonCall?.references > 0) {
+            usagesByType.references = aboutAccount.nonCall.references;
+            usagesByType.total += aboutAccount.nonCall.references;
+        }
         // Stash the post-filter total on allCallers so the result builder can use it.
         Object.defineProperty(allCallers, '__postFilterTotal', {
             value: allCallers.length + shadowSurvivors.length,
@@ -1404,7 +1415,7 @@ function about(index, name, options = {}) {
         unverifiedPool.sort((a, b) => {
             const fa = a.relativePath || '';
             const fb = b.relativePath || '';
-            if (fa !== fb) return fa.localeCompare(fb);
+            if (fa !== fb) return codeUnitCompare(fa, fb);
             return (a.line || 0) - (b.line || 0);
         });
         aboutUnverified = {
@@ -1982,7 +1993,7 @@ function diffImpact(index, options = {}) {
             unverified.sort((a, b) => {
                 const ap = a.relativePath || '';
                 const bp = b.relativePath || '';
-                if (ap !== bp) return ap.localeCompare(bp);
+                if (ap !== bp) return codeUnitCompare(ap, bp);
                 return (a.line || 0) - (b.line || 0);
             });
 
@@ -2058,7 +2069,7 @@ function diffImpact(index, options = {}) {
             }
             remaining.sort((a, b) => a.relativePath === b.relativePath
                 ? a.line - b.line
-                : a.relativePath.localeCompare(b.relativePath));
+                : codeUnitCompare(a.relativePath, b.relativePath));
             del.remainingCallSites = remaining;
         }
     }
@@ -2585,12 +2596,12 @@ function auditAsync(index, options = {}) {
 
         // Stable ordering (rule #11): sort by (file, line, callerName, calleeName).
         issues.sort((a, b) => {
-            const fc = String(a.file).localeCompare(String(b.file));
+            const fc = codeUnitCompare(String(a.file), String(b.file));
             if (fc !== 0) return fc;
             if (a.line !== b.line) return a.line - b.line;
-            const cc = String(a.callerName || '').localeCompare(String(b.callerName || ''));
+            const cc = codeUnitCompare(String(a.callerName || ''), String(b.callerName || ''));
             if (cc !== 0) return cc;
-            return String(a.calleeName || '').localeCompare(String(b.calleeName || ''));
+            return codeUnitCompare(String(a.calleeName || ''), String(b.calleeName || ''));
         });
 
         return {

@@ -190,9 +190,9 @@ function truncationNote(index) {
 /** Build notes for tree-based results (blast, trace, reverseTrace, affectedTests). */
 function treeNote(result) {
     const parts = [];
-    if (result?.warnings?.length > 0) {
-        for (const w of result.warnings) parts.push(w.message || w);
-    }
+    // result.warnings are NOT copied here — the tree formatters render them
+    // in the body (Note: lines under the header); copying them into the
+    // handler note printed each warning twice (fix #237).
     if (result?.tree?.truncatedChildren > 0) {
         parts.push(`${result.tree.truncatedChildren} children truncated. Use --depth=N or --all to expand.`);
     }
@@ -480,14 +480,9 @@ const HANDLERS = {
         });
         if (!result) return { ok: false, error: `No examples found for "${p.name}".` };
         // MEDIUM-8: when no non-test examples found but test-file usages
-        // exist, return success with a note so the user knows to retry.
-        if (!result.best && result.excludedTestCalls > 0) {
-            return {
-                ok: true,
-                result,
-                note: `0 examples found (excluded ${result.excludedTestCalls} test-file usage${result.excludedTestCalls === 1 ? '' : 's'} — pass --include-tests to include them)`,
-            };
-        }
+        // exist, the formatter surfaces that fact in the body ("No call
+        // examples found ... excluded N test-file usages") — no handler
+        // note, which printed the same message twice (fix #237).
         return { ok: true, result };
     },
 
@@ -643,6 +638,19 @@ const HANDLERS = {
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             notes.push(limitNote(limit, result.length));
             limited = result.slice(0, limit);
+            // Summary counts describe the FULL result set — the limit applies
+            // to listed entries only (fix #237: the header claimed '0 calls'
+            // for a called function whenever the definition filled the limit).
+            // Non-enumerable so the JSON array shape is unchanged.
+            Object.defineProperty(limited, 'summaryCounts', {
+                value: {
+                    definitions: result.filter(u => u.isDefinition).length,
+                    calls: result.filter(u => u.usageType === 'call').length,
+                    imports: result.filter(u => u.usageType === 'import').length,
+                    references: result.filter(u => !u.isDefinition && u.usageType === 'reference').length,
+                },
+                enumerable: false, writable: true, configurable: true,
+            });
         }
         return { ok: true, result: limited, note: notes.length ? notes.join(' ') : undefined };
     },

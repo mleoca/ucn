@@ -13,6 +13,7 @@
 'use strict';
 
 const fs = require('fs');
+const { codeUnitCompare } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
 const { getLanguageModule } = require('../languages');
@@ -916,7 +917,7 @@ function detectEntrypoints(index, options = {}) {
 
     // Sort by file, then line
     filtered.sort((a, b) => {
-        if (a.file !== b.file) return a.file.localeCompare(b.file);
+        if (a.file !== b.file) return codeUnitCompare(a.file, b.file);
         return a.line - b.line;
     });
 

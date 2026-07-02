@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
-const { NON_CALLABLE_TYPES, isOverrideMarked } = require('./shared');
+const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare } = require('./shared');
 const { scoreEdge, tierForResolution, TIER } = require('./confidence');
 const { findGoModule } = require('./imports');
 
@@ -2515,7 +2515,7 @@ function findCallers(index, name, options = {}) {
         // Retained unverified-tier entries, sorted (relativePath, line) per the
         // output ordering contract.
         unverifiedEntries.sort((a, b) => {
-            if (a.relativePath !== b.relativePath) return a.relativePath.localeCompare(b.relativePath);
+            if (a.relativePath !== b.relativePath) return codeUnitCompare(a.relativePath, b.relativePath);
             return (a.line || 0) - (b.line || 0);
         });
         Object.defineProperty(callers, 'unverifiedEntries', {
@@ -3070,14 +3070,13 @@ function findCallees(index, def, options = {}) {
                         // spraying every same-name def (#223, ripgrep-measured
                         // on the callee eval arm: HiArgs::from_low_args calls
                         // three sibling types' from_low_args — every def was
-                        // claimed at all three sites). Variable receivers match
-                        // no class → unchanged full fan-out; bare calls (Java
+                        // claimed at all three sites). Bare calls (Java
                         // implicit-this overloads) keep fanning out.
                         let otherBindings = bindings.filter(b =>
                             b.startLine !== def.startLine
                         );
                         const fanReceiver = call.receiver || call.receiverType;
-                        if (fanReceiver && otherBindings.length > 1) {
+                        if (fanReceiver && otherBindings.length > 0) {
                             const symsForName = index.symbols.get(call.name) || [];
                             const classMatched = otherBindings.filter(b => {
                                 const bSym = symsForName.find(s => s.bindingId === b.id);
@@ -3085,8 +3084,24 @@ function findCallees(index, def, options = {}) {
                                     (bSym.receiver && bSym.receiver.replace(/^\*/, '')));
                                 return cls === fanReceiver;
                             });
-                            if (classMatched.length > 0) otherBindings = classMatched;
+                            if (classMatched.length > 0) {
+                                otherBindings = classMatched;
+                            } else if (call.isMethod && call.receiver) {
+                                // Untyped-receiver same-name method call:
+                                // name-equality with the enclosing def is not
+                                // receiver evidence (fix #237 — CacheService
+                                // .get's `cache.get(key)` sprayed a confirmed
+                                // edge onto ApiClient.get, leaking reachability
+                                // credit across classes). Route through the
+                                // uncertain machinery: multi-owner names stay
+                                // visible method-ambiguous; the single-owner
+                                // rule (with its defeaters) may still confirm.
+                                isUncertain = true;
+                                uncertainReason = 'method-ambiguous';
+                                otherBindings = null;
+                            }
                         }
+                        if (otherBindings) {
                         for (const ob of otherBindings) {
                             const existing = callees.get(ob.id);
                             if (existing) {
@@ -3107,6 +3122,9 @@ function findCallees(index, def, options = {}) {
                             noteSite(siteId, 'excluded', 'self-recursion', call);
                         }
                         continue; // Already added all overloads, skip normal add
+                        }
+                        // otherBindings === null: fall through to the
+                        // single-owner check + uncertain handling below.
                     } else if (def.className && !call.isMethod) {
                         // Implicit same-class call (Java: execute() means this.execute())
                         // Try to resolve to a binding in the same class via symbol lookup
@@ -3486,7 +3504,7 @@ function findCallees(index, def, options = {}) {
             // Stable ordering (output contract): by name, then reason.
             const unverifiedList = [...unverifiedCallees.values()]
                 .map(e => ({ ...e, sites: [...e.sites].sort((a, b) => a - b) }))
-                .sort((a, b) => a.name.localeCompare(b.name) || a.reason.localeCompare(b.reason));
+                .sort((a, b) => codeUnitCompare(a.name, b.name) || codeUnitCompare(a.reason, b.reason));
             Object.defineProperty(result, 'calleeAccount', {
                 value: calleeAccount, enumerable: false, writable: true, configurable: true,
             });
@@ -4722,6 +4740,10 @@ function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, fl
     if (traits?.typeSystem === 'nominal' && call.argCount != null &&
         !_callArityCompatible(call, ownerDefs, language)) return null;
     const match = ownerDefs[0];
+    // The owner's def IS the querying def: an untyped-receiver call cannot
+    // prove self-recursion (a true one resolves via self/this/Self) — the
+    // receiver is more likely an external value (fix #237).
+    if (match.file === def.file && match.startLine === def.startLine) return null;
     const callerFe = index.files.get(def.file);
     const matchFe = index.files.get(match.file);
     if (matchFe && callerFe &&
