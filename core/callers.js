@@ -2215,8 +2215,14 @@ function findCallers(index, name, options = {}) {
                         // (rich.print(...) IS the module function).
                         if (!typeQualifiedReceiver && targetDefs2.length > 0 &&
                             targetDefs2.every(d => !d.className && !d.receiver)) {
+                            // Candidates here are the standalone defs the call
+                            // MIGHT reach through an unmodeled module receiver
+                            // (dynamic import) — methodOwnerKeys counts method
+                            // owners only and reported a contradictory 0
+                            // (fix #230).
                             routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
-                                dispatchCandidates: methodOwnerKeys().size,
+                                dispatchCandidates: methodOwnerKeys().size ||
+                                    targetDefs2.filter(d => !NON_CALLABLE_TYPES.has(d.type)).length,
                             });
                             continue;
                         }

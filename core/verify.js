@@ -1257,7 +1257,10 @@ function verify(index, name, options = {}) {
             optional: p.optional || p.default !== undefined,
             hasDefault: p.default !== undefined
         })),
-        expectedArgs: { min: minArgs, max: hasRest ? '∞' : expectedParamCount },
+        // max: null = unbounded (rest param) — typed for JSON consumers;
+        // the text formatter renders it as `${min}+` (fix #230, was the
+        // string '∞' leaking into JSON output).
+        expectedArgs: { min: minArgs, max: hasRest ? null : expectedParamCount },
         totalCalls: valid.length + mismatches.length + uncertain.length,
         valid: valid.length,
         mismatches: mismatches.length,

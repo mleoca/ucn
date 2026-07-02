@@ -303,7 +303,7 @@ ucn [target] <command> [name] [--flags]
 | `--hot` | List top N most-called functions in `stats` (use with `--top=N`, default 10). Best orientation primitive when entering a new repo |
 | `--diverse` | Cluster `example` call sites by argument shape and return one representative per cluster (use with `--top=N`, default 3) |
 | `--git` | Attach git enrichment to `about` / `brief`: last commit (ISO + author) and recent change count (last 30 days). Skipped silently when not a git repo |
-| `--json` | Machine-readable JSON output. Some commands wrap in `{meta, data}` (e.g., `find`, `deadcode`); others return flat objects (e.g., `about`, `impact`, `verify`, `plan`, `imports`) — check each command's output shape |
+| `--json` | Machine-readable JSON output. Most commands wrap in `{meta, data}` (e.g., `find`, `deadcode`, `context`, `verify`, `plan`, `diff-impact` — completeness signals and the ACCOUNT live in `meta`); `about` and `impact` return their full result object flat — check each command's output shape |
 | `--code-only` | Exclude matches in comments and strings (`search`/`usages`) |
 | `--with-types` | Include related type definitions in `smart`/`about` output |
 | `--detailed` | Show full symbol listing per file in `toc` |

@@ -4578,3 +4578,75 @@ describe('fix #230: plan rename import ownership, multi-call lines, remove-param
         } finally { rm(dir); }
     });
 });
+
+describe('fix #230: output surface polish (campaign F-family)', () => {
+    it('diff-impact reports a clean one-line error for an invalid ref', () => {
+        const r = execute(idx(process.cwd()), 'diffImpact', { base: 'no-such-ref-xyz' });
+        assert.strictEqual(r.ok, false);
+        assert.ok(/git diff failed — ambiguous argument/.test(r.error),
+            `clean message, got: ${r.error}`);
+        assert.ok(!r.error.includes('Command failed'), 'no raw exec dump');
+    });
+
+    it('related --top caps sameFile and reports sameFileTotal', () => {
+        const dir = tmp({
+            'lib.py': 'def a():\n    pass\n\ndef b():\n    pass\n\ndef c():\n    pass\n\ndef d():\n    pass\n\ndef target():\n    pass\n',
+        });
+        try {
+            const r = execute(idx(dir), 'related', { name: 'target', top: 2 });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.sameFile.length, 2, '--top caps sameFile');
+            assert.strictEqual(r.result.sameFileTotal, 4);
+        } finally { rm(dir); }
+    });
+
+    it('smart header uses the project-relative path', () => {
+        const dir = tmp({
+            'lib.py': 'def helper():\n    return 1\n\ndef main():\n    return helper()\n',
+        });
+        try {
+            const r = execute(idx(dir), 'smart', { name: 'main' });
+            assert.ok(r.ok);
+            const output = require('../core/output');
+            const text = output.formatSmart(r.result);
+            assert.match(text.split('\n')[0], /^main \(lib\.py:4\)/,
+                `relative path in header, got: ${text.split('\n')[0]}`);
+        } finally { rm(dir); }
+    });
+
+    it('verify JSON: {meta, data} envelope with account in meta; rest-param max is null', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function spread(...args) { return args; }\nfunction go() { return spread(1, 2, 3); }\nmodule.exports = { spread, go };\n',
+        });
+        try {
+            const r = execute(idx(dir), 'verify', { name: 'spread' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.expectedArgs.max, null, 'unbounded max is null, not a string');
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatVerifyJson(r.result));
+            assert.ok(json.meta && json.data, '{meta, data} envelope');
+            assert.ok(json.meta.account, 'account lives in meta');
+            const text = output.formatVerify(r.result);
+            assert.match(text, /Expected arguments: 0\+/, 'text renders unbounded as N+');
+        } finally { rm(dir); }
+    });
+
+    it('method-ambiguous unverified sites never report dispatchCandidates: 0', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'esm.mjs': 'export function sideThing(w, z) { return w + z; }\n',
+            'use.mjs': "export async function go() {\n  const m = await import('./esm.mjs');\n  return m.sideThing(3, 4);\n}\n",
+        });
+        try {
+            const r = execute(idx(dir), 'verify', { name: 'sideThing' });
+            assert.ok(r.ok);
+            for (const site of (r.result.unverifiedSites || [])) {
+                if (site.reason === 'method-ambiguous' && site.dispatchCandidates != null) {
+                    assert.ok(site.dispatchCandidates >= 1,
+                        `ambiguous among zero owners is contradictory: ${JSON.stringify(site)}`);
+                }
+            }
+        } finally { rm(dir); }
+    });
+});

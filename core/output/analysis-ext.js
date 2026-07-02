@@ -23,18 +23,21 @@ function formatRelated(related, options = {}) {
     if (relAdvisory) lines.push(relAdvisory);
     lines.push('');
 
-    // Same file
+    // Same file (result is already capped by --top at the source; total in
+    // sameFileTotal — fix #230)
     let relatedTruncated = false;
     if (related.sameFile.length > 0) {
         const maxSameFile = options.top || (options.all ? Infinity : 8);
-        lines.push(`SAME FILE (${related.sameFile.length}):`);
+        const sameFileTotal = related.sameFileTotal || related.sameFile.length;
+        lines.push(`SAME FILE (${sameFileTotal}):`);
         for (const f of related.sameFile.slice(0, maxSameFile)) {
             const params = f.params ? `(${f.params})` : '';
             lines.push(`  :${f.line} ${f.name}${params}`);
         }
-        if (related.sameFile.length > maxSameFile) {
+        const shown = Math.min(related.sameFile.length, maxSameFile);
+        if (sameFileTotal > shown) {
             relatedTruncated = true;
-            lines.push(`  ... and ${related.sameFile.length - maxSameFile} more`);
+            lines.push(`  ... and ${sameFileTotal - shown} more`);
         }
         lines.push('');
     }
@@ -106,7 +109,9 @@ function formatSmart(smart, options = {}) {
     if (!smart) return 'Function not found.';
 
     const lines = [];
-    lines.push(`${smart.target.name} (${smart.target.file}:${smart.target.startLine})`);
+    // Project-relative path in the header, like every other command (fix #230
+    // — the absolute def.file leaked here).
+    lines.push(`${smart.target.name} (${smart.target.relativePath || smart.target.file}:${smart.target.startLine})`);
     lines.push('═'.repeat(60));
 
     if (smart.meta) {
@@ -303,7 +308,17 @@ function formatDiffImpact(result, options = {}) {
 }
 
 function formatDiffImpactJson(result) {
-    return JSON.stringify(result, null, 2);
+    // Standard {meta, data} envelope (fix #230 — diff-impact was one of
+    // three commands still emitting a bare result object). Per-symbol
+    // accounts stay on each entry inside data; meta carries the aggregate
+    // completeness signal.
+    return JSON.stringify({
+        meta: {
+            complete: (result?.summary?.unverifiedCallSites || 0) === 0,
+            unverified: result?.summary?.unverifiedCallSites || 0,
+        },
+        data: result,
+    }, null, 2);
 }
 
 module.exports = {

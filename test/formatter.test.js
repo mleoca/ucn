@@ -145,12 +145,15 @@ describe('JSON formatters', () => {
             ]
         };
         const json = JSON.parse(output.formatPlanJson(plan));
-        assert.strictEqual(json.found, true);
-        assert.strictEqual(json.function, 'myFunc');
-        assert.strictEqual(json.totalChanges, 2);
-        assert.strictEqual(json.changes[0].suggestion, 'myFunc(1, 2, undefined)');
+        // {meta, data} envelope (fix #230)
+        assert.ok(json.meta, 'meta envelope present');
+        assert.strictEqual(json.meta.complete, true);
+        assert.strictEqual(json.data.found, true);
+        assert.strictEqual(json.data.function, 'myFunc');
+        assert.strictEqual(json.data.totalChanges, 2);
+        assert.strictEqual(json.data.changes[0].suggestion, 'myFunc(1, 2, undefined)');
         // Internal fields should not leak
-        assert.strictEqual(json.changes[0]._internal, undefined);
+        assert.strictEqual(json.data.changes[0]._internal, undefined);
     });
 
     it('formatPlanJson handles not-found', () => {
@@ -200,9 +203,12 @@ describe('JSON formatters', () => {
             uncertainDetails: []
         };
         const json = JSON.parse(output.formatVerifyJson(result));
-        assert.strictEqual(json.found, true);
-        assert.strictEqual(json.mismatches, 1);
-        assert.strictEqual(json.mismatchDetails[0].actual, 0);
+        // {meta, data} envelope (fix #230)
+        assert.ok(json.meta, 'meta envelope present');
+        assert.strictEqual(json.meta.complete, true);
+        assert.strictEqual(json.data.found, true);
+        assert.strictEqual(json.data.mismatches, 1);
+        assert.strictEqual(json.data.mismatchDetails[0].actual, 0);
     });
 
     // BUG M1: STATUS banner must reflect actual outcome, not just mismatch count.
@@ -2218,10 +2224,12 @@ describe('Additional Formatter Coverage', () => {
             assert.strictEqual(json.symbols[0].name, 'unused', 'Should include symbol');
         });
 
-        it('formatDiffImpactJson passthroughs data', () => {
+        it('formatDiffImpactJson wraps the result in {meta, data}', () => {
             const result = { changedFunctions: [], deletedFunctions: [] };
             const json = JSON.parse(output.formatDiffImpactJson(result));
-            assert.ok(Array.isArray(json.changedFunctions), 'Should passthrough');
+            assert.ok(json.meta, 'meta envelope present');
+            assert.strictEqual(json.meta.complete, true);
+            assert.ok(Array.isArray(json.data.changedFunctions), 'result inside data');
         });
     });
 });

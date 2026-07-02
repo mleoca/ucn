@@ -121,26 +121,34 @@ function formatPlanJson(plan) {
         }, null, 2);
     }
 
+    // Standard {meta, data} envelope (fix #230 — plan was one of three
+    // commands still emitting a bare result object).
     return JSON.stringify({
-        found: true,
-        function: plan.function,
-        file: plan.file,
-        startLine: plan.startLine,
-        operation: plan.operation,
-        before: { signature: plan.before.signature },
-        after: { signature: plan.after.signature },
-        totalChanges: plan.totalChanges,
-        filesAffected: plan.filesAffected,
-        changes: plan.changes.map(c => ({
-            file: c.file,
-            line: c.line,
-            expression: c.expression,
-            suggestion: c.suggestion
-        })),
-        // v4 tiered contract passthrough
-        unverifiedCount: plan.unverifiedCount,
-        unverifiedSites: plan.unverifiedSites,
-        account: plan.account,
+        meta: {
+            complete: (plan.unverifiedCount || 0) === 0,
+            unverified: plan.unverifiedCount || 0,
+            ...(plan.account && { account: plan.account }),
+        },
+        data: {
+            found: true,
+            function: plan.function,
+            file: plan.file,
+            startLine: plan.startLine,
+            operation: plan.operation,
+            before: { signature: plan.before.signature },
+            after: { signature: plan.after.signature },
+            totalChanges: plan.totalChanges,
+            filesAffected: plan.filesAffected,
+            changes: plan.changes.map(c => ({
+                file: c.file,
+                line: c.line,
+                expression: c.expression,
+                suggestion: c.suggestion
+            })),
+            // v4 tiered contract passthrough
+            unverifiedCount: plan.unverifiedCount,
+            unverifiedSites: plan.unverifiedSites,
+        },
     }, null, 2);
 }
 
@@ -181,9 +189,9 @@ function formatVerify(result, options = {}) {
     lines.push(result.signature);
     lines.push('');
 
-    // Expected args
+    // Expected args (max null = unbounded rest param)
     const { min, max } = result.expectedArgs;
-    const expectedStr = min === max ? `${min}` : `${min}-${max}`;
+    const expectedStr = max == null ? `${min}+` : (min === max ? `${min}` : `${min}-${max}`);
     lines.push(`Expected arguments: ${expectedStr}`);
     lines.push('');
 
@@ -274,39 +282,49 @@ function formatVerifyJson(result) {
         return JSON.stringify({ found: false, error: `Function "${result.function}" not found.` }, null, 2);
     }
 
+    // Standard {meta, data} envelope (fix #230 — verify was one of three
+    // commands still emitting a bare result object). Completeness signals
+    // and the account live in meta, like context/impact/about.
     return JSON.stringify({
-        found: true,
-        function: result.function,
-        file: result.file,
-        startLine: result.startLine,
-        signature: result.signature,
-        expectedArgs: result.expectedArgs,
-        totalCalls: result.totalCalls,
-        valid: result.valid,
-        mismatches: result.mismatches,
-        uncertain: result.uncertain,
-        // Feature A/B: surface aggregate patterns and per-site flags.
-        patterns: result.patterns,
-        mismatchDetails: result.mismatchDetails.map(m => ({
-            file: m.file,
-            line: m.line,
-            expression: m.expression,
-            expected: m.expected,
-            actual: m.actual,
-            args: m.args || [],
-            patterns: m.patterns,
-        })),
-        uncertainDetails: result.uncertainDetails.map(u => ({
-            file: u.file,
-            line: u.line,
-            expression: u.expression,
-            reason: u.reason,
-            patterns: u.patterns,
-        })),
-        // v4 tiered contract passthrough
-        unverifiedCount: result.unverifiedCount,
-        unverifiedSites: result.unverifiedSites,
-        account: result.account,
+        meta: {
+            complete: result.uncertain === 0 && (result.unverifiedCount || 0) === 0,
+            uncertain: result.uncertain,
+            unverified: result.unverifiedCount || 0,
+            ...(result.account && { account: result.account }),
+        },
+        data: {
+            found: true,
+            function: result.function,
+            file: result.file,
+            startLine: result.startLine,
+            signature: result.signature,
+            expectedArgs: result.expectedArgs,
+            totalCalls: result.totalCalls,
+            valid: result.valid,
+            mismatches: result.mismatches,
+            uncertain: result.uncertain,
+            // Feature A/B: surface aggregate patterns and per-site flags.
+            patterns: result.patterns,
+            mismatchDetails: result.mismatchDetails.map(m => ({
+                file: m.file,
+                line: m.line,
+                expression: m.expression,
+                expected: m.expected,
+                actual: m.actual,
+                args: m.args || [],
+                patterns: m.patterns,
+            })),
+            uncertainDetails: result.uncertainDetails.map(u => ({
+                file: u.file,
+                line: u.line,
+                expression: u.expression,
+                reason: u.reason,
+                patterns: u.patterns,
+            })),
+            // v4 tiered contract passthrough
+            unverifiedCount: result.unverifiedCount,
+            unverifiedSites: result.unverifiedSites,
+        },
     }, null, 2);
 }
 

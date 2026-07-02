@@ -711,6 +711,12 @@ function related(index, name, options = {}) {
         related.sameFile.sort((a, b) =>
             Math.abs(a.line - def.startLine) - Math.abs(b.line - def.startLine)
         );
+        // --top caps every section the same way (fix #230 — sameFile ignored
+        // it, so JSON consumers got the full list while similarNames et al.
+        // were capped).
+        const sameFileLimit = options.top || (options.all ? Infinity : 10);
+        related.sameFileTotal = related.sameFile.length;
+        if (related.sameFile.length > sameFileLimit) related.sameFile = related.sameFile.slice(0, sameFileLimit);
     }
 
     // 2. Similar names (shared prefix/suffix, camelCase similarity)
@@ -1629,13 +1635,22 @@ function diffImpact(index, options = {}) {
 
     let diffText;
     try {
-        diffText = execFileSync('git', diffArgs, { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024 });
+        // Capture stderr (fix #230): an invalid ref used to leak git's raw
+        // "fatal: ambiguous argument" straight to the terminal AND repeat it
+        // inside the error message.
+        diffText = execFileSync('git', diffArgs, {
+            cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024,
+            stdio: ['ignore', 'pipe', 'pipe'],
+        });
     } catch (e) {
         // git diff exits non-zero when there are diff errors, but also for invalid refs
         if (e.stdout) {
             diffText = e.stdout;
         } else {
-            throw new Error(`git diff failed: ${e.message}`, { cause: e });
+            const fatal = String(e.stderr || '').split('\n').find(l => l.startsWith('fatal:'));
+            throw new Error(fatal
+                ? `git diff failed — ${fatal.replace(/^fatal:\s*/, '')}`
+                : `git diff failed: ${e.message}`, { cause: e });
         }
     }
 
