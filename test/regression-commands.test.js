@@ -4407,3 +4407,37 @@ describe('fix #228: verify/plan not-found return an error envelope (nonzero exit
         } finally { rm(dir); }
     });
 });
+
+describe('fix #228: impact runs pure engine physics — agrees with context on the same pin', () => {
+    it('a declared-field-hop caller confirmed by context is not dropped by impact', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'svc.go': [
+                'package main', '',
+                'type DataService struct{}', '',
+                'func (s *DataService) Save(x int) error {', '\treturn nil', '}',
+            ].join('\n'),
+            'mgr.go': [
+                'package main', '',
+                'type TaskManager struct {', '\tservice *DataService', '}', '',
+                'func (tm *TaskManager) SyncTasks() error {', '\treturn tm.service.Save(1)', '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = execute(index, 'context', { name: 'Save', className: 'DataService' });
+            assert.ok(ctx.ok);
+            const ctxCallers = ctx.result.callers.map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(ctxCallers.includes('mgr.go:8'), `context confirms the field-hop caller: ${ctxCallers}`);
+
+            const imp = execute(index, 'impact', { name: 'Save', className: 'DataService' });
+            assert.ok(imp.ok);
+            assert.strictEqual(imp.result.totalCallSites, 1,
+                'impact must keep the same confirmed caller (legacy filter dropped it)');
+            const impSites = imp.result.byFile
+                .flatMap(f => f.sites.map(x => `${f.file}:${x.line}`));
+            assert.ok(impSites.includes('mgr.go:8'), `impact call sites: ${impSites}`);
+            assert.ok(imp.result.account.conserved, 'impact account conserves');
+        } finally { rm(dir); }
+    });
+});

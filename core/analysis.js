@@ -883,144 +883,15 @@ function impact(index, name, options = {}) {
         impactAccountRaw = callerResults.accountRaw;
         impactRoutedUnverified = callerResults.unverifiedEntries || [];
 
-        // When the target definition has a className (including Go/Rust methods which
-        // now get className from receiver), filter out method calls whose receiver
-        // clearly belongs to a different type. This helps with common method names
-        // like .close(), .get() etc. where many types have the same method.
-        if (def.className) {
-            const targetClassName = def.className;
-            // Pre-compute how many types share this method name
-            const _impMethodDefs = index.symbols.get(name);
-            const _impClassNames = new Set();
-            if (_impMethodDefs) {
-                for (const d of _impMethodDefs) {
-                    if (d.className) _impClassNames.add(d.className);
-                    else if (d.receiver) _impClassNames.add(d.receiver.replace(/^\*/, ''));
-                }
-            }
-            const keepForTargetClass = (c) => {
-                // Keep non-method calls and self/this/cls calls (already resolved by findCallers)
-                if (!c.isMethod) return true;
-                const r = c.receiver;
-                if (r && ['self', 'cls', 'this', 'super'].includes(r)) return true;
-                // Use receiverType from findCallers when available (Go/Java/Rust type inference)
-                if (c.receiverType) {
-                    return c.receiverType === targetClassName ? 'strong' : false;
-                }
-                // No receiver (chained/complex expression): only include if method is
-                // unique or rare across types — otherwise too many false positives
-                if (!r) {
-                    return _impClassNames.size <= 1;
-                }
-                // Check if receiver matches the target class name (case-insensitive camelCase convention)
-                if (r.toLowerCase().includes(targetClassName.toLowerCase())) return true;
-                // Check if receiver is an instance of the target class using local variable type inference
-                if (c.callerFile) {
-                    const callerDef = c.callerStartLine ? { file: c.callerFile, startLine: c.callerStartLine, endLine: c.callerEndLine } : null;
-                    if (callerDef) {
-                        const callerCalls = index.getCachedCalls(c.callerFile);
-                        if (callerCalls && Array.isArray(callerCalls)) {
-                            const localTypes = new Map();
-                            for (const call of callerCalls) {
-                                if (call.line >= callerDef.startLine && call.line <= callerDef.endLine) {
-                                    if (!call.isMethod && !call.receiver) {
-                                        const syms = index.symbols.get(call.name);
-                                        if (syms && syms.some(s => s.type === 'class')) {
-                                            // Found a constructor call — check for assignment pattern
-                                            const fileEntry = index.files.get(c.callerFile);
-                                            if (fileEntry) {
-                                                const content = index._readFile(c.callerFile);
-                                                const lines = content.split('\n');
-                                                const line = lines[call.line - 1] || '';
-                                                // Match "var = ClassName(...)" or "var = new ClassName(...)" or "Type var = new ClassName<>(...)"
-                                                const m = line.match(/(\w+)\s*=\s*(?:await\s+)?(?:new\s+)?(\w+)\s*(?:<[^>]*>)?\s*\(/);
-                                                if (m && m[2] === call.name) {
-                                                    localTypes.set(m[1], call.name);
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            const receiverType = localTypes.get(r);
-                            if (receiverType) {
-                                return receiverType === targetClassName ? 'strong' : false;
-                            }
-                        }
-                    }
-                }
-                // Check class field declarations for receiver type: private DataService service
-                if (c.callerFile) {
-                    const callerEnclosing = index.findEnclosingFunction(c.callerFile, c.line, true);
-                    if (callerEnclosing?.className) {
-                        const classSyms = index.symbols.get(callerEnclosing.className);
-                        if (classSyms) {
-                            const classDef = classSyms.find(s => s.type === 'class' || s.type === 'struct' || s.type === 'interface');
-                            if (classDef) {
-                                const content = index._readFile(c.callerFile);
-                                const lines = content.split('\n');
-                                // Scan class body for field declarations matching the receiver
-                                for (let li = classDef.startLine - 1; li < (classDef.endLine || classDef.startLine + 50) && li < lines.length; li++) {
-                                    const line = lines[li];
-                                    // Match Java/TS field: [modifiers] TypeName<...> receiverName [= ...]
-                                    const fieldMatch = line.match(new RegExp(`\\b(\\w+)(?:<[^>]*>)?\\s+${r.replace(/[.*+?^${}()|[\]\\]/g, '\\\\$&')}\\s*[;=]`));
-                                    if (fieldMatch) {
-                                        const fieldType = fieldMatch[1];
-                                        if (fieldType === targetClassName) return 'strong';
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                // Check parameter type annotations: def foo(tracker: SourceTracker) → tracker.record()
-                if (c.callerFile && c.callerStartLine) {
-                    const callerSymbol = index.findEnclosingFunction(c.callerFile, c.line, true);
-                    if (callerSymbol && callerSymbol.paramsStructured) {
-                        for (const param of callerSymbol.paramsStructured) {
-                            if (param.name === r && param.type) {
-                                // Check if the type annotation contains the target class name
-                                const typeMatches = param.type.match(/\b([A-Za-z_]\w*)\b/g);
-                                if (typeMatches && typeMatches.some(t => t === targetClassName)) {
-                                    return 'strong';
-                                }
-                                // Type annotation exists but doesn't match target class — filter out
-                                return false;
-                            }
-                        }
-                    }
-                }
-                // Unique method heuristic: if the called method exists on exactly one class/type
-                // and it matches the target, include the call (no other class could match)
-                if (_impClassNames.size === 1 && _impClassNames.has(targetClassName)) {
-                    return true;
-                }
-                // Type-scoped query but receiver type unknown — filter it out.
-                // Unknown receivers are likely unrelated.
-                return false;
-            };
-            // Conservation: post-hoc rejects are positive type-mismatch evidence —
-            // they MOVE into the excluded bucket instead of vanishing. Survivors
-            // verified by STRONG evidence (receiverType / local constructor /
-            // field declaration / param annotation match) are upgraded to the
-            // confirmed tier — the filter just proved the receiver's type.
-            callerResults = callerResults.filter(c => {
-                const keep = keepForTargetClass(c);
-                if (!keep) {
-                    impactPostHocExcluded.push({ file: c.file, line: c.line, reason: 'receiver-type-mismatch' });
-                    return false;
-                }
-                if (keep === 'strong' && c.tier === 'unverified') {
-                    c.tier = 'confirmed';
-                    c.resolution = 'receiver-hint';
-                    c.confidence = 0.80;
-                }
-                return true;
-            });
-        }
+        // No post-hoc receiver filter here (fix #228, the #225 precedent):
+        // the engine's receiver physics (#198/#202/#204/#206/#219/#220) decide
+        // tier and exclusion inside findCallers with the pinned definition.
+        // The old hand-rolled filter re-derived receiver types with regexes
+        // and DROPPED confirmed field-hop/embedding callers that context and
+        // about kept — impact answered differently from its siblings on the
+        // same pin.
 
-        callSites = [];
+        callSites = [];        callSites = [];
         for (const c of callerResults) {
             const analysis = index.analyzeCallSite(
                 { file: c.file, relativePath: c.relativePath, line: c.line, content: c.content },
