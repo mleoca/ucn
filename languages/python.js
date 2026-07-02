@@ -1460,43 +1460,43 @@ function findInstanceAttributeTypes(code, parser) {
 
         const attrTypes = new Map();
 
-        // Check for @dataclass decorator — scan annotated class-level fields
+        // Scan annotated class-level fields: name: Type [= ...]. Originally
+        // @dataclass-only (fix #28); a BARE class-body annotation is the
+        // same compiler-visible typing evidence (`engine: Engine` inside
+        // class Car types self.engine — pyright enforces it), so those scan
+        // for every class (fix #234). Annotations WITH a value stay
+        // dataclass-only: `tracker: BracketTracker = None` in a plain class
+        // is routinely rebound to something else per-instance, while a
+        // dataclass field default is constructor-managed.
         const parentNode = node.parent;
-        if (parentNode?.type === 'decorated_definition') {
-            for (let d = 0; d < parentNode.childCount; d++) {
-                const dec = parentNode.child(d);
-                if (dec.type !== 'decorator') continue;
-                // Match @dataclass or @dataclasses.dataclass
-                const decText = dec.text;
-                if (decText.startsWith('@dataclass') || decText.includes('.dataclass')) {
-                    // Scan class body for annotated fields: name: Type = ...
-                    for (let i = 0; i < body.childCount; i++) {
-                        const stmt = body.child(i);
-                        if (stmt.type !== 'expression_statement') continue;
-                        const assign = stmt.firstChild;
-                        if (!assign || assign.type !== 'assignment') continue;
+        const isDataclass = parentNode?.type === 'decorated_definition' &&
+            Array.from({ length: parentNode.childCount }, (_, d) => parentNode.child(d))
+                .some(dec => dec.type === 'decorator' &&
+                    (dec.text.startsWith('@dataclass') || dec.text.includes('.dataclass')));
+        for (let i = 0; i < body.childCount; i++) {
+            const stmt = body.child(i);
+            if (stmt.type !== 'expression_statement') continue;
+            const assign = stmt.firstChild;
+            if (!assign || assign.type !== 'assignment') continue;
 
-                        // Must have a type annotation
-                        const typeNode = assign.childForFieldName('type');
-                        if (!typeNode) continue;
+            // Must have a type annotation
+            const typeNode = assign.childForFieldName('type');
+            if (!typeNode) continue;
+            if (!isDataclass && assign.childForFieldName('right')) continue;
 
-                        // Extract type name from annotation
-                        const typeIdent = typeNode.type === 'type' ? typeNode.firstChild : typeNode;
-                        if (!typeIdent || typeIdent.type !== 'identifier') continue;
-                        const typeName = typeIdent.text;
+            // Extract type name from annotation
+            const typeIdent = typeNode.type === 'type' ? typeNode.firstChild : typeNode;
+            if (!typeIdent || typeIdent.type !== 'identifier') continue;
+            const typeName = typeIdent.text;
 
-                        // Skip primitives and lowercase types
-                        if (PRIMITIVE_TYPES.has(typeName)) continue;
-                        if (typeName[0] < 'A' || typeName[0] > 'Z') continue;
+            // Skip primitives and lowercase types
+            if (PRIMITIVE_TYPES.has(typeName)) continue;
+            if (typeName[0] < 'A' || typeName[0] > 'Z') continue;
 
-                        // Field name from LHS
-                        const lhs = assign.childForFieldName('left');
-                        if (!lhs || lhs.type !== 'identifier') continue;
-                        attrTypes.set(lhs.text, typeName);
-                    }
-                    break;
-                }
-            }
+            // Field name from LHS
+            const lhs = assign.childForFieldName('left');
+            if (!lhs || lhs.type !== 'identifier') continue;
+            attrTypes.set(lhs.text, typeName);
         }
 
         // Scan __init__ for self.X = ClassName(...) assignments

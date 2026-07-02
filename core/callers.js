@@ -855,7 +855,7 @@ function findCallers(index, name, options = {}) {
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                         if (!callerSymbol?.className) {
                             // Can't resolve — include only if includeMethods requested
-                            if (!options.includeMethods) {
+                            if (options.collectAccount || !options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
@@ -885,7 +885,7 @@ function findCallers(index, name, options = {}) {
                                     continue;
                                 }
                                 resolvedBySameClass = true;
-                            } else if (!options.includeMethods) {
+                            } else if (options.collectAccount || !options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
@@ -901,7 +901,7 @@ function findCallers(index, name, options = {}) {
                         // whenever the method name had several project-wide owners).
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                         if (!callerSymbol?.className) {
-                            if (!options.includeMethods) {
+                            if (options.collectAccount || !options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
@@ -997,7 +997,7 @@ function findCallers(index, name, options = {}) {
                                     }
                                 }
                                 resolvedBySameClass = true;
-                            } else if (!options.includeMethods) {
+                            } else if (options.collectAccount || !options.includeMethods) {
                                 routeUnverified(filePath, fileEntry, call, 'method-no-evidence', calledAs);
                                 continue;
                             }
