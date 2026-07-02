@@ -361,7 +361,7 @@ describe('MCP Demo Fixes — formatImports', () => {
 
 describe('MCP Demo Fixes — formatTrace', () => {
 
-    it('formatTrace includes include_methods hint when explicitly excluded', () => {
+    it('formatTrace notes hidden method edges only when the account filtered some', () => {
         const traceData = {
             root: 'test',
             file: 'a.js',
@@ -372,12 +372,17 @@ describe('MCP Demo Fixes — formatTrace', () => {
             tree: { name: 'test', file: 'a.js', line: 1, children: [] }
         };
         const text = output.formatTrace(traceData);
-        assert.ok(text.includes('obj.method() calls excluded'), 'Should hint about include-methods when excluded');
+        assert.ok(!text.includes('hidden'), 'nothing filtered — no note');
 
-        // With includeMethods: true (default), no hint
-        const traceData2 = { ...traceData, includeMethods: true };
-        const text2 = output.formatTrace(traceData2);
-        assert.ok(!text2.includes('obj.method() calls excluded'), 'Should not hint when includeMethods=true (default)');
+        const withFiltered = {
+            ...traceData,
+            treeAccount: { callSites: { total: 2, confirmed: 1, unverified: 0, external: 0, excluded: 0, filtered: 1 } },
+        };
+        const text2 = output.formatTrace(withFiltered);
+        assert.ok(text2.includes('obj.method() callee edge(s) hidden'), 'filtered edges reported');
+
+        const text3 = output.formatTrace({ ...withFiltered, includeMethods: true });
+        assert.ok(!text3.includes('hidden'), 'no note when includeMethods=true');
     });
 
 });
@@ -469,8 +474,11 @@ class UserService:
         }
     });
 
-    it('formatContext shows class method hint when callers <= 3', () => {
-        // Class method with 1 caller
+    it('formatContext never prints the legacy instance-dispatch hedge note', () => {
+        // Under the tiered contract, instance-dispatch candidates render in
+        // the unverified band with reasons and the ACCOUNT line reconciles
+        // every occurrence — the old "not tracked by static analysis" note
+        // asserted an untracked category that no longer exists.
         const ctx1 = {
             function: 'get_user',
             file: 'service.py',
@@ -481,37 +489,9 @@ class UserService:
             meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: true, isMethod: true, className: 'UserService' }
         };
         const { text: text1 } = output.formatContext(ctx1);
-        assert.ok(text1.includes('class/struct method'), 'Should show class method hint for 1 caller');
-        assert.ok(text1.includes('constructed or injected'), 'Should mention injected instances');
+        assert.ok(!text1.includes('not tracked by static analysis'), 'hedge note must not render');
+        assert.ok(!text1.includes('constructed or injected'), 'hedge note must not render');
 
-        // Non-method function with 1 caller — no hint
-        const ctx2 = {
-            function: 'helper',
-            file: 'utils.py',
-            startLine: 1,
-            endLine: 3,
-            callers: [{ relativePath: 'main.py', line: 5, callerName: 'main', content: 'helper()' }],
-            callees: [],
-            meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: true }
-        };
-        const { text: text2 } = output.formatContext(ctx2);
-        assert.ok(!text2.includes('class/struct method'), 'Should NOT show hint for standalone function');
-
-        // Class method with many callers — no hint
-        const manyCallers = Array.from({ length: 10 }, (_, i) => ({
-            relativePath: `file${i}.py`, line: i + 1, callerName: `fn${i}`, content: `svc.get_user(${i})`
-        }));
-        const ctx3 = {
-            function: 'get_user',
-            file: 'service.py',
-            startLine: 3,
-            endLine: 5,
-            callers: manyCallers,
-            callees: [],
-            meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: true, isMethod: true, className: 'UserService' }
-        };
-        const { text: text3 } = output.formatContext(ctx3);
-        assert.ok(!text3.includes('class/struct method'), 'Should NOT show hint when callers > 3');
     });
 
 });

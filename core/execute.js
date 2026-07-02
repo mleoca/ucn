@@ -497,6 +497,8 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        const classErr = validateClassName(index, p.name, p.className);
+        if (classErr) return { ok: false, error: classErr };
         const result = index.related(p.name, {
             file: p.file,
             className: p.className,
@@ -1209,6 +1211,9 @@ const HANDLERS = {
             ...(p.includeMethods !== undefined && { includeMethods: p.includeMethods }),
             ...(p.includeUncertain !== undefined && { includeUncertain: p.includeUncertain }),
         });
+        if (result && result.found === false) {
+            return { ok: false, error: `Function "${p.name}" not found.` };
+        }
         return { ok: true, result };
     },
 
@@ -1235,6 +1240,9 @@ const HANDLERS = {
             // Exact-definition pin (stable-handle roundtrip) — see verify.
             ...(p.line && { line: p.line }),
         });
+        if (result && result.found === false) {
+            return { ok: false, error: `Function "${p.name}" not found.` };
+        }
         return { ok: true, result };
     },
 

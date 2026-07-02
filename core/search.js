@@ -765,6 +765,9 @@ function example(index, name, options = {}) {
     const usageResults = usages(index, name, {
         codeOnly: true,
         className: options.className,
+        // Scope examples to files matching --file (the flag was accepted but
+        // silently ignored before).
+        file: options.file,
         exclude,
         context: 5
     });
@@ -778,6 +781,7 @@ function example(index, name, options = {}) {
             const allUsages = usages(index, name, {
                 codeOnly: true,
                 className: options.className,
+                file: options.file,
                 exclude: [],
                 context: 0,
             });

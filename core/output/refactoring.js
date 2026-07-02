@@ -38,7 +38,12 @@ function formatPlan(plan, options = {}) {
         return `Function "${plan.function}" not found.`;
     }
     if (plan.error) {
-        return `Error: ${plan.error}\nCurrent parameters: ${plan.currentParams?.join(', ') || 'none'}`;
+        // Only show the parameter list when the error result carries one —
+        // unrelated errors (multi-op rejection) don't, and "none" would be
+        // wrong for functions that have parameters.
+        return plan.currentParams
+            ? `Error: ${plan.error}\nCurrent parameters: ${plan.currentParams.join(', ') || 'none'}`
+            : `Error: ${plan.error}`;
     }
 
     const lines = [];

@@ -1229,9 +1229,14 @@ function plan(index, name, options = {}) {
             };
         }
         operation = 'add-param';
+        // Default parameter values only exist in some languages (trait).
+        // For Go/Java/Rust a --default value is a suggested ARGUMENT for the
+        // call sites, never signature syntax — `opt = null` is not valid Go.
+        const planFileEntry = index.files.get(def.file);
+        const langHasDefaults = langTraits(planFileEntry?.language)?.hasDefaultParams !== false;
         const newParam = {
             name: options.addParam,
-            ...(options.defaultValue && { default: options.defaultValue })
+            ...(options.defaultValue && langHasDefaults && { default: options.defaultValue })
         };
 
         // When adding a param, insert before rest params (*args/**kwargs) and
@@ -1267,11 +1272,17 @@ function plan(index, name, options = {}) {
         const newRet = arrowTypes?.returnType || def.returnType;
         if (newRet) newSignature += `: ${newRet}`;
 
-        // Describe changes needed at each call site
+        // Describe changes needed at each call site. Without language support
+        // for default values, every call site must pass the new argument.
         for (const site of planCallSites) {
-            const suggestion = options.defaultValue
-                ? `No change needed (has default value)`
-                : `Add argument: ${options.addParam}`;
+            let suggestion;
+            if (options.defaultValue && langHasDefaults) {
+                suggestion = `No change needed (has default value)`;
+            } else if (options.defaultValue) {
+                suggestion = `Add argument: ${options.defaultValue} (no default parameter values in ${planFileEntry?.language || 'this language'})`;
+            } else {
+                suggestion = `Add argument: ${options.addParam}`;
+            }
             changes.push({
                 file: site.file,
                 line: site.line,

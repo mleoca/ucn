@@ -21,6 +21,11 @@ const STRUCTURAL_TRAITS = {
     exportVisibility: 'keyword',
     hasDynamicImports: true,
     testDirs: [],
+    // Whether the language supports default parameter values in function
+    // signatures (JS/TS/Python: yes). Drives plan --add-param --default:
+    // without them, every call site needs the new argument and the rendered
+    // signature must not use `= value` syntax (Go/Java/Rust).
+    hasDefaultParams: true,
     allMethodsVirtual: false,
     hasArityOverloads: false,
     // Whether `from pkg import name` can bind a SUBMODULE file as a plain
@@ -54,6 +59,8 @@ const NOMINAL_TRAITS = {
     exportVisibility: 'keyword',
     hasDynamicImports: true,
     testDirs: [],
+    // Go/Java/Rust have no default parameter values — see STRUCTURAL_TRAITS.
+    hasDefaultParams: false,
     // Whether ANY instance method call can dynamically dispatch to a subtype
     // override (Java: all instance methods are virtual). Go struct method
     // sets and Rust inherent methods bind statically — only interface/trait

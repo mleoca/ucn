@@ -152,8 +152,11 @@ module.exports = { greet, main };
     }
 });
 
-// Issue 5: formatTrace includes include_methods hint when explicitly excluded
-it('formatTrace includes include_methods hint when explicitly excluded', () => {
+// Issue 5 (updated for fact-based notes): formatTrace mentions hidden method
+// edges only when the account actually FILTERED some — a bare
+// includeMethods:false with nothing filtered stays silent (the note used to
+// claim an exclusion that never happened).
+it('formatTrace notes hidden method edges only when the account filtered some', () => {
     const { formatTrace } = require('../core/output');
     const traceData = {
         root: 'test',
@@ -165,12 +168,18 @@ it('formatTrace includes include_methods hint when explicitly excluded', () => {
         tree: { name: 'test', file: 'a.js', line: 1, children: [] }
     };
     const text = formatTrace(traceData);
-    assert.ok(text.includes('obj.method() calls excluded'), 'Should hint about include-methods when excluded');
+    assert.ok(!text.includes('hidden'), 'no filtered edges — no note');
 
-    // With includeMethods: true (default), no hint
-    const traceData2 = { ...traceData, includeMethods: true };
+    const traceData2 = {
+        ...traceData,
+        treeAccount: { callSites: { total: 3, confirmed: 2, unverified: 0, external: 0, excluded: 0, filtered: 1 } },
+    };
     const text2 = formatTrace(traceData2);
-    assert.ok(!text2.includes('obj.method() calls excluded'), 'Should not hint when includeMethods=true (default)');
+    assert.ok(text2.includes('1 obj.method() callee edge(s) hidden'), 'filtered edges are reported with their count');
+
+    const traceData3 = { ...traceData2, includeMethods: true };
+    const text3 = formatTrace(traceData3);
+    assert.ok(!text3.includes('hidden'), 'no note when includeMethods=true');
 });
 
 }); // end describe('MCP Demo Fixes')

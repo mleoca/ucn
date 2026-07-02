@@ -221,7 +221,7 @@ function parseFlags(tokens) {
         addParam: getValueFlag('--add-param'),
         removeParam: getValueFlag('--remove-param'),
         renameTo: getValueFlag('--rename-to'),
-        defaultValue: getValueFlag('--default'),
+        defaultValue: getValueFlag('--default-value') ?? getValueFlag('--default'),
         base: getValueFlag('--base'),
         staged: tokens.includes('--staged') || undefined,
         deep: tokens.includes('--deep') || undefined,
@@ -286,7 +286,7 @@ const knownFlags = new Set([
     '--no-cache', '--clear-cache', '--include-tests', '--exclude-tests',
     '--include-exported', '--include-decorated', '--expand', '--interactive', '-i', '--all', '--include-methods', '--no-include-methods', '--include-uncertain', '--expand-unverified', '--detailed', '--calls-only',
     '--file', '--context', '--exclude', '--not', '--in',
-    '--depth', '--direction', '--add-param', '--remove-param', '--rename-to',
+    '--depth', '--direction', '--add-param', '--remove-param', '--rename-to', '--default-value',
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions', '--hot', '--diverse', '--git',
@@ -344,7 +344,7 @@ try {
 // Value flags that consume the next token (space form: --flag value)
 const VALUE_FLAGS = new Set([
     '--file', '--depth', '--top', '--context', '--direction',
-    '--add-param', '--remove-param', '--rename-to', '--default',
+    '--add-param', '--remove-param', '--rename-to', '--default', '--default-value',
     '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name',
     '--type', '--param', '--receiver', '--returns', '--decorator',
     '--limit', '--max-files', '--min-confidence', '--stack', '--framework',
@@ -1502,7 +1502,7 @@ FILE DEPENDENCIES
 ═══════════════════════════════════════════════════════════════════════════════
 REFACTORING HELPERS
 ═══════════════════════════════════════════════════════════════════════════════
-  plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to)
+  plan <name>         Preview refactoring (--add-param, --remove-param, --rename-to, --default-value)
   verify <name>       Check all call sites match signature
   diff-impact         What changed in git diff and who calls it (--base, --staged)
   check               Pre-commit summary: diff-impact + verify + affected-tests in one shot
@@ -1658,7 +1658,7 @@ Commands:
   typedef <name>         Find type definitions
   deadcode               Find unused functions/classes
   verify <name>          Check call sites match signature
-  plan <name>            Preview refactoring (--add-param=, --remove-param=, --rename-to=)
+  plan <name>            Preview refactoring (--add-param=, --remove-param=, --rename-to=, --default-value=)
   stacktrace <text>      Parse a stack trace
   api                    Show public symbols
   diff-impact            What changed and who's affected

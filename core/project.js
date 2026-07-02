@@ -1546,7 +1546,10 @@ class ProjectIndex {
             // Prefer typed rendering when paramTypes/paramsStructured carry annotations
             const { renderTypedParams } = require('./output/shared');
             const typed = renderTypedParams(def);
-            parts.push(`(${typed != null ? typed : def.params})`);
+            // Zero-param functions render `()` — some parsers store the '...'
+            // placeholder for EMPTY lists, which reads as unknown/variadic.
+            const noParams = Array.isArray(def.paramsStructured) && def.paramsStructured.length === 0;
+            parts.push(`(${typed != null ? typed : (noParams ? '' : def.params)})`);
         }
         if (def.returnType) {
             parts.push(`: ${String(def.returnType).replace(/\s+/g, ' ').trim()}`);

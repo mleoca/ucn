@@ -1501,7 +1501,7 @@ describe('FIX 122 — formatTrace includeMethods strict check', () => {
         assert.ok(!text.includes('obj.method()'), `should not show methods hint when includeMethods is undefined, got: ${text}`);
     });
 
-    it('should show methods hint when includeMethods is explicitly false', () => {
+    it('shows the methods note only when the account filtered edges (fact-based)', () => {
         const trace = {
             name: 'test',
             file: 'test.js',
@@ -1510,7 +1510,12 @@ describe('FIX 122 — formatTrace includeMethods strict check', () => {
             includeMethods: false,
         };
         const text = output.formatTrace(trace);
-        assert.ok(text.includes('obj.method()'), `should show methods hint when includeMethods is false`);
+        assert.ok(!text.includes('obj.method()'), 'nothing filtered — no note');
+        const text2 = output.formatTrace({
+            ...trace,
+            treeAccount: { callSites: { total: 1, confirmed: 0, unverified: 0, external: 0, excluded: 0, filtered: 1 } },
+        });
+        assert.ok(text2.includes('obj.method() callee edge(s) hidden'), 'filtered edges reported');
     });
 });
 

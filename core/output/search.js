@@ -260,6 +260,7 @@ function formatExampleJson(result, name) {
     const env = {
         found: true,
         query: name,
+        ...(result.advisory && { advisory: result.advisory }),
         totalCalls: result.totalCalls,
         best: {
             file: best.relativePath || best.file,

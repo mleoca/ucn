@@ -2543,7 +2543,7 @@ module.exports = { entry, pathA, pathB, target };
         } finally { rm(d); }
     });
 
-    it('formatter shows includeMethods=false note', () => {
+    it('formatter notes hidden method edges only when the account filtered some', () => {
         const mockResult = {
             root: 'test',
             file: 'a.js',
@@ -2555,7 +2555,9 @@ module.exports = { entry, pathA, pathB, target };
             summary: { totalEntryPoints: 1, totalFunctions: 0, maxDepthReached: 0 },
         };
         const text = output.formatReverseTrace(mockResult);
-        assert.ok(text.includes('obj.method() calls excluded'), 'should show methods excluded note');
+        assert.ok(!text.includes('hidden'), 'nothing filtered — no note');
+        const text2 = output.formatReverseTrace({ ...mockResult, treeAccount: { filteredEdges: 2 } });
+        assert.ok(text2.includes('2 obj.method() caller edge(s) hidden'), 'filtered edges reported with count');
     });
 
     it('formatter shows warnings', () => {
@@ -4329,6 +4331,79 @@ describe('fix #228: unsatisfiable definition pins error instead of silently fall
             const r = execute(index, 'verify', { name: 'camelToSnake', file: 'utils.js', line: 99 });
             assert.strictEqual(r.ok, false, 'stale handle line must not silently resolve elsewhere');
             assert.ok(r.error.includes('utils.js:1'), 'error lists the real definition line');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #228: plan default values respect language support (hasDefaultParams trait)', () => {
+    it('Go plan --add-param with default renders a valid signature and requires the arg at call sites', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'lib.go': 'package main\n\nfunc Add(x int) int {\n\treturn x\n}\n',
+            'app.go': 'package main\n\nfunc main() {\n\t_ = Add(1)\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Add', addParam: 'opt', defaultValue: 'nil' });
+            assert.ok(r.ok);
+            assert.ok(!r.result.after.signature.includes('= nil'),
+                `Go signature must not use default-value syntax: ${r.result.after.signature}`);
+            assert.ok(r.result.changes.every(c => !c.suggestion.includes('No change needed')),
+                'every Go call site needs the new argument');
+        } finally { rm(dir); }
+    });
+
+    it('JS plan --add-param with default keeps default semantics', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function add(x) { return x; }\nmodule.exports = { add };',
+            'app.js': 'const { add } = require("./lib");\nfunction main() { return add(1); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'add', addParam: 'opt', defaultValue: 'null' });
+            assert.ok(r.ok);
+            assert.ok(r.result.after.signature.includes('opt = null'), 'JS keeps default syntax');
+            assert.ok(r.result.changes.every(c => c.suggestion.includes('No change needed')),
+                'JS call sites need no change');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #228: example respects --file and self-labels in JSON', () => {
+    it('--file scopes example search; advisory survives into JSON', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function helper(x) { return x; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nfunction main() { return helper(1); }',
+        });
+        try {
+            const index = idx(dir);
+            const scoped = execute(index, 'example', { name: 'helper', file: 'lib.js' });
+            assert.ok(!scoped.ok || !scoped.result.best,
+                'no call examples exist in lib.js — the file scope must apply');
+            const all = execute(index, 'example', { name: 'helper' });
+            assert.ok(all.ok && all.result.best, 'unscoped example still found');
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatExampleJson(all.result, 'helper'));
+            assert.strictEqual(json.advisory, 'scored-selection', 'advisory label present in JSON');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #228: verify/plan not-found return an error envelope (nonzero exit)', () => {
+    it('missing symbol yields ok:false for verify and plan', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function real() { return 1; }\nmodule.exports = { real };',
+        });
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'xyzzy_nope' });
+            assert.strictEqual(v.ok, false);
+            assert.ok(v.error.includes('not found'));
+            const p = execute(index, 'plan', { name: 'xyzzy_nope', renameTo: 'y' });
+            assert.strictEqual(p.ok, false);
         } finally { rm(dir); }
     });
 });

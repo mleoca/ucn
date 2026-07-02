@@ -456,11 +456,9 @@ function formatContext(ctx, options = {}) {
     }
     if (callerReach.note && !compact) lines.push(callerReach.note);
 
-    // Structural hint: class methods may have callers through constructed/injected instances
-    // that static analysis can't track. Only show when caller count is low (≤3) to avoid noise.
-    if (ctx.meta && (ctx.meta.isMethod || ctx.meta.className || ctx.meta.receiver) && callers.length <= 3) {
-        lines.push(`  Note: ${ctx.function} is a class/struct method — additional callers through constructed or injected instances are not tracked by static analysis.`);
-    }
+    // No hedge note here: under the tiered contract, instance-dispatch caller
+    // candidates ARE analyzed — they render in the unverified band with
+    // reasons, and the ACCOUNT line reconciles every text occurrence.
 
     // UNVERIFIED tier: call-syntax matches without binding/receiver evidence.
     // Always visible (the contract: never silently hide an occurrence), capped

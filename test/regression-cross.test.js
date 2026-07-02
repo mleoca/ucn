@@ -1635,10 +1635,12 @@ class UserService:
     }
 });
 
-it('formatContext shows class method hint when callers <= 3', () => {
+it('formatContext never prints the legacy instance-dispatch hedge note', () => {
     const { formatContext } = require('../core/output');
-
-    // Class method with 1 caller
+    // Under the tiered contract, instance-dispatch candidates render in the
+    // unverified band with reasons and the ACCOUNT line reconciles every
+    // occurrence — the old hedge note asserted an untracked category that no
+    // longer exists.
     const ctx1 = {
         function: 'get_user',
         file: 'service.py',
@@ -1649,37 +1651,8 @@ it('formatContext shows class method hint when callers <= 3', () => {
         meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: true, isMethod: true, className: 'UserService' }
     };
     const { text: text1 } = formatContext(ctx1);
-    assert.ok(text1.includes('class/struct method'), 'Should show class method hint for 1 caller');
-    assert.ok(text1.includes('constructed or injected'), 'Should mention injected instances');
-
-    // Non-method function with 1 caller — no hint
-    const ctx2 = {
-        function: 'helper',
-        file: 'utils.py',
-        startLine: 1,
-        endLine: 3,
-        callers: [{ relativePath: 'main.py', line: 5, callerName: 'main', content: 'helper()' }],
-        callees: [],
-        meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: true }
-    };
-    const { text: text2 } = formatContext(ctx2);
-    assert.ok(!text2.includes('class/struct method'), 'Should NOT show hint for standalone function');
-
-    // Class method with many callers — no hint
-    const manyCallers = Array.from({ length: 10 }, (_, i) => ({
-        relativePath: `file${i}.py`, line: i + 1, callerName: `fn${i}`, content: `svc.get_user(${i})`
-    }));
-    const ctx3 = {
-        function: 'get_user',
-        file: 'service.py',
-        startLine: 3,
-        endLine: 5,
-        callers: manyCallers,
-        callees: [],
-        meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, includeMethods: true, isMethod: true, className: 'UserService' }
-    };
-    const { text: text3 } = formatContext(ctx3);
-    assert.ok(!text3.includes('class/struct method'), 'Should NOT show hint when callers > 3');
+    assert.ok(!text1.includes('not tracked by static analysis'), 'hedge note must not render');
+    assert.ok(!text1.includes('constructed or injected'), 'hedge note must not render');
 });
 
 // --- deadcode: decorated/annotated functions now detected ---

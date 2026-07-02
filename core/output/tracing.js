@@ -207,8 +207,11 @@ function formatTrace(trace, options = {}) {
         lines.push(`\nSome results truncated. ${allHint}`);
     }
 
-    if (trace.includeMethods === false) {
-        const methodsHint = options.methodsHint || 'Note: obj.method() calls excluded — use --include-methods to include them';
+    // Only claim filtering when the account actually filtered edges — the
+    // flag is a no-op for languages where method callees are always analyzed.
+    const traceFiltered = (trace.treeAccount?.callSites?.filtered ?? trace.treeAccount?.filteredEdges ?? 0);
+    if (trace.includeMethods === false && traceFiltered > 0) {
+        const methodsHint = options.methodsHint || `Note: ${traceFiltered} obj.method() callee edge(s) hidden (counted as filtered in the account). Use --include-methods to show them.`;
         lines.push(`\n${methodsHint}`);
     }
 
@@ -339,8 +342,9 @@ function formatBlast(blast, options = {}) {
         lines.push(`\nSome results truncated. ${allHint}`);
     }
 
-    if (blast.includeMethods === false) {
-        lines.push('\nNote: obj.method() calls excluded. Use --include-methods to include them.');
+    const blastFiltered = (blast.treeAccount?.filteredEdges ?? 0);
+    if (blast.includeMethods === false && blastFiltered > 0) {
+        lines.push(`\nNote: ${blastFiltered} obj.method() caller edge(s) hidden (counted as filtered in the account). Use --include-methods to show them.`);
     }
 
     return lines.join('\n');
@@ -487,8 +491,9 @@ function formatReverseTrace(result, options = {}) {
         lines.push(`\nSome results truncated. ${allHint}`);
     }
 
-    if (result.includeMethods === false) {
-        lines.push('\nNote: obj.method() calls excluded. Use --include-methods to include them.');
+    const rtFiltered = (result.treeAccount?.filteredEdges ?? 0);
+    if (result.includeMethods === false && rtFiltered > 0) {
+        lines.push(`\nNote: ${rtFiltered} obj.method() caller edge(s) hidden (counted as filtered in the account). Use --include-methods to show them.`);
     }
 
     return lines.join('\n');
