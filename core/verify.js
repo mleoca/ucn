@@ -154,6 +154,15 @@ function findCallNode(node, callTypes, targetRow, funcName) {
                 const typeName = typeNode.text.replace(/<.*>$/, '').split('.').pop();
                 if (typeName === funcName) return node;
             }
+        } else if (node.type === 'new_expression') {
+            // JS/TS constructor: new ClassName(args) — class is in 'constructor'
+            // field (fix #230: these sites used to fall out as "Could not
+            // parse call arguments" and every class verify went uncertain).
+            const ctorNode = node.childForFieldName('constructor');
+            if (ctorNode) {
+                const typeName = ctorNode.text.replace(/<.*>$/, '').split('.').pop();
+                if (typeName === funcName) return node;
+            }
         } else {
             // Check if this call is for our target function
             let funcNode = node.childForFieldName('function') ||
@@ -466,6 +475,83 @@ function isNamespaceContainerFor(index, receiver, funcName, defFile) {
 }
 
 /**
+ * Constructor parameter lists for a CLASS verify/plan target (fix #230): a
+ * class def carries no paramsStructured, so `verify Task` used to arg-check
+ * `new Task(id, name)` against 0..0 — a false red on every parameterized
+ * constructor, in every language. Sources: indexed constructor members
+ * (JS/TS `constructor`, Python `__init__` — emitted with type
+ * 'constructor'), or a Java AST walk (constructors are deliberately not
+ * indexed as members there). Returns an array of paramsStructured lists —
+ * one per constructor overload — or null when the class declares none.
+ * @param {object} index - ProjectIndex instance
+ * @param {object} def - Resolved definition (any type; non-class returns null)
+ * @param {string} lang - The definition file's language
+ * @returns {Array<Array<object>>|null}
+ */
+function _constructorParamLists(index, def, lang) {
+    if (!def || def.type !== 'class' || !def.file) return null;
+    const lists = [];
+    const endLine = def.endLine != null ? def.endLine : Infinity;
+    for (const ctorName of ['constructor', '__init__']) {
+        for (const d of (index.symbols.get(ctorName) || [])) {
+            if (d.className === def.name && d.file === def.file &&
+                d.startLine >= def.startLine && d.startLine <= endLine &&
+                Array.isArray(d.paramsStructured)) {
+                lists.push(d.paramsStructured);
+            }
+        }
+    }
+    if (lists.length > 0) return lists;
+    if (lang !== 'java') return null;
+    let parser, content;
+    try {
+        parser = getParser('java');
+        content = index._readFile(def.file);
+    } catch (e) {
+        return null;
+    }
+    if (!parser || content == null) return null;
+    const tree = safeParse(parser, content);
+    if (!tree) return null;
+    const { parseStructuredParams } = require('../languages/utils');
+    const targetRow = def.startLine - 1;
+    let classNode = null;
+    (function findClass(node) {
+        if (classNode || !node) return;
+        if ((node.type === 'class_declaration' || node.type === 'enum_declaration' ||
+             node.type === 'record_declaration') &&
+            node.startPosition.row <= targetRow && node.endPosition.row >= targetRow) {
+            const nameNode = node.childForFieldName('name');
+            if (nameNode && nameNode.text === def.name) {
+                classNode = node;
+                return;
+            }
+        }
+        for (let i = 0; i < node.namedChildCount; i++) findClass(node.namedChild(i));
+    })(tree.rootNode);
+    if (!classNode) return null;
+    // Records declare their canonical constructor's params on the header.
+    if (classNode.type === 'record_declaration') {
+        const recParams = classNode.childForFieldName('parameters');
+        if (recParams) lists.push(parseStructuredParams(recParams, 'java') || []);
+    }
+    const collectCtors = (body) => {
+        if (!body) return;
+        for (let i = 0; i < body.namedChildCount; i++) {
+            const child = body.namedChild(i);
+            if (child.type === 'constructor_declaration') {
+                const paramsNode = child.childForFieldName('parameters');
+                lists.push(parseStructuredParams(paramsNode, 'java') || []);
+            } else if (child.type === 'enum_body_declarations') {
+                collectCtors(child);
+            }
+        }
+    };
+    collectCtors(classNode.childForFieldName('body'));
+    return lists.length > 0 ? lists : null;
+}
+
+/**
  * v4 tiered caller sweep shared by verify and plan (BUG-BW lockstep): run
  * findCallers in collectAccount mode and partition candidates into the
  * confirmed band (arg-checked / planned) and the VISIBLE unverified band
@@ -656,7 +742,8 @@ function analyzeCallSite(index, call, funcName) {
         }
 
         // Call node types vary by language
-        const callTypes = new Set(['call_expression', 'call', 'method_invocation', 'object_creation_expression']);
+        const callTypes = new Set(['call_expression', 'call', 'method_invocation',
+            'object_creation_expression', 'new_expression']);
         const targetRow = call.line - 1; // tree-sitter is 0-indexed
 
         // Find the call expression at the target line matching funcName
@@ -923,17 +1010,29 @@ function verify(index, name, options = {}) {
     // BUG-BY: enrich types for arrow functions whose types live on the
     // enclosing variable_declarator's type_annotation rather than inline.
     const arrowTypes = extractArrowTypesFromVarDecl(index, def);
-    let params = (arrowTypes?.paramsStructured) || def.paramsStructured || [];
+    // Class target: arg-check against CONSTRUCTOR parameters (fix #230).
+    // Multiple lists = constructor overloads (Java): a call is valid when it
+    // fits the combined range; a class with only an inherited constructor
+    // (extends, no own ctor) has an arity UCN can't see — accept any count
+    // rather than false-flag every call against the implicit 0-arg default.
+    const ctorParamLists = _constructorParamLists(index, def, lang);
+    const inheritedCtorOnly = !ctorParamLists && def.type === 'class' && !!def.extends;
     const selfParams = langTraits(lang)?.selfParam;
-    if (selfParams && params.length > 0 && selfParams.includes(params[0].name)) {
-        params = params.slice(1);
-    }
-    const hasRest = params.some(p => p.rest);
+    const stripSelf = (list) => (selfParams && list.length > 0 && list[0] && selfParams.includes(list[0].name))
+        ? list.slice(1) : list;
+    const rawParamLists = ctorParamLists ||
+        [(arrowTypes?.paramsStructured) || def.paramsStructured || []];
+    const params = stripSelf(rawParamLists[0]);
+    const arities = rawParamLists.map(l => {
+        const list = stripSelf(l);
+        const nonRest = list.filter(p => !p.rest);
+        const optional = nonRest.filter(p => p.optional || p.default !== undefined).length;
+        return { hasRest: list.some(p => p.rest), max: nonRest.length, min: nonRest.length - optional };
+    });
+    const hasRest = inheritedCtorOnly || arities.some(a => a.hasRest);
     // Rest params don't count toward expected/min — they accept 0+ extra args
-    const nonRestParams = params.filter(p => !p.rest);
-    const expectedParamCount = nonRestParams.length;
-    const optionalCount = nonRestParams.filter(p => p.optional || p.default !== undefined).length;
-    const minArgs = expectedParamCount - optionalCount;
+    const expectedParamCount = Math.max(...arities.map(a => a.max));
+    const minArgs = inheritedCtorOnly ? 0 : Math.min(...arities.map(a => a.min));
 
     // v4 tiered contract: the confirmed band is arg-checked below; unverified
     // candidates stay VISIBLE in their own band with reasons (never silently
@@ -1010,7 +1109,20 @@ function verify(index, name, options = {}) {
             continue;
         }
 
-        const argCount = analysis.argCount;
+        let argCount = analysis.argCount;
+        // Method-expression / UFCS receiver shift (fix #230): Go
+        // `M.Add(*m, 2)` and Rust `Engine::run(&e, 1)` pass the receiver as
+        // the FIRST argument — the same +1 shift the #205 arity discipline
+        // already applies when confirming these sites. Without it the
+        // arg-check false-flagged every confirmed method-expression call.
+        const targetTypeName = def.className || (def.receiver || '').replace(/^\*/, '');
+        if (targetTypeName && call.receiver === targetTypeName && argCount > 0) {
+            const qualStyle = langTraits(lang)?.typeQualifiedCallStyle;
+            if ((qualStyle === 'method-expr' && def.receiver) ||
+                (qualStyle === 'path' && def.isMethod)) {
+                argCount -= 1;
+            }
+        }
 
         // Check if arg count is valid
         if (hasRest) {

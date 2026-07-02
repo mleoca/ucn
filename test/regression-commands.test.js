@@ -4441,3 +4441,93 @@ describe('fix #228: impact runs pure engine physics — agrees with context on t
         } finally { rm(dir); }
     });
 });
+
+describe('fix #230: verify class targets arg-check the CONSTRUCTOR; ctor-call parsing; receiver shift', () => {
+    // A class def carries no paramsStructured, so `verify Task` used to
+    // arg-check `new Task(id, name)` against 0..0 — a false red on every
+    // parameterized constructor in every language. JS `new_expression` sites
+    // additionally failed to parse at all ("Could not parse call arguments"),
+    // and Go method-expression / Rust UFCS calls missed the +1 receiver shift
+    // the #205 arity discipline already applies.
+
+    it('Java: constructor overloads produce an arity range; only the no-fit call mismatches', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Task.java': 'public class Task {\n    private String id;\n    public Task(String id, String name) { this.id = id; }\n    public Task(String id) { this.id = id; }\n}\n',
+            'UseTask.java': 'public class UseTask {\n    Task a() { return new Task("a", "b"); }\n    Task b() { return new Task("a"); }\n    Task c() { return new Task("a", "b", "c"); }\n}\n',
+        });
+        try {
+            const v = execute(idx(dir), 'verify', { name: 'Task' });
+            assert.ok(v.ok, `verify failed: ${v.error}`);
+            assert.deepStrictEqual(v.result.expectedArgs, { min: 1, max: 2 });
+            assert.strictEqual(v.result.valid, 2);
+            assert.strictEqual(v.result.mismatches, 1, 'only the 3-arg call mismatches');
+        } finally { rm(dir); }
+    });
+
+    it('Python: __init__ params drive the check (self stripped)', () => {
+        const dir = tmp({
+            'task.py': 'class Task:\n    def __init__(self, tid, name):\n        self.tid = tid\n\ndef make():\n    return Task(1, "x")\n',
+        });
+        try {
+            const v = execute(idx(dir), 'verify', { name: 'Task' });
+            assert.ok(v.ok);
+            assert.deepStrictEqual(v.result.expectedArgs, { min: 2, max: 2 });
+            assert.strictEqual(v.result.valid, 1);
+            assert.strictEqual(v.result.mismatches, 0);
+        } finally { rm(dir); }
+    });
+
+    it('JS: new_expression sites parse and arg-check against the constructor', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'task.js': 'class JTask {\n  constructor(tid, name) { this.tid = tid; }\n}\nfunction jmake() { return new JTask(1, "x"); }\nmodule.exports = { JTask, jmake };\n',
+            'bad.js': "const { JTask } = require('./task');\nfunction bad() { return new JTask(1); }\nmodule.exports = { bad };\n",
+        });
+        try {
+            const v = execute(idx(dir), 'verify', { name: 'JTask' });
+            assert.ok(v.ok);
+            assert.deepStrictEqual(v.result.expectedArgs, { min: 2, max: 2 });
+            assert.strictEqual(v.result.valid, 1, 'new JTask(1, "x") parses and validates');
+            assert.strictEqual(v.result.mismatches, 1, 'new JTask(1) is a mismatch, not unparseable');
+            assert.strictEqual(v.result.uncertain, 0);
+        } finally { rm(dir); }
+    });
+
+    it('class with only an inherited constructor never false-flags calls', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.js': 'class Base {\n  constructor(a, b) { this.a = a; }\n}\nclass Child extends Base {}\nfunction make() { return new Child(1, 2); }\nmodule.exports = { Base, Child, make };\n',
+        });
+        try {
+            const v = execute(idx(dir), 'verify', { name: 'Child' });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.mismatches, 0,
+                'inherited-ctor arity is unknown — never a false mismatch');
+        } finally { rm(dir); }
+    });
+
+    it('Go method-expression and Rust UFCS calls get the +1 receiver shift', () => {
+        const goDir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'a.go': 'package main\n\ntype M struct{}\n\nfunc (m *M) Add(x int) int { return x }\n',
+            'b.go': 'package main\n\nfunc use(m *M) int {\n\treturn M.Add(*m, 2)\n}\n\nfunc bound(m *M) int {\n\treturn m.Add(3)\n}\n',
+        });
+        try {
+            const v = execute(idx(goDir), 'verify', { name: 'Add' });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.mismatches, 0, 'M.Add(*m, 2) is 1 logical arg');
+            assert.strictEqual(v.result.valid, 2);
+        } finally { rm(goDir); }
+        const rsDir = tmp({
+            'Cargo.toml': '[package]\nname="p"\nversion="0.1.0"\n',
+            'src/lib.rs': 'pub struct Engine;\n\nimpl Engine {\n    pub fn run(&self, n: i32) -> i32 { n }\n}\n\npub fn bound(e: &Engine) -> i32 { e.run(1) }\n\npub fn ufcs(e: &Engine) -> i32 { Engine::run(e, 1) }\n',
+        });
+        try {
+            const v = execute(idx(rsDir), 'verify', { name: 'run' });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.mismatches, 0, 'Engine::run(e, 1) is 1 logical arg');
+            assert.strictEqual(v.result.valid, 2);
+        } finally { rm(rsDir); }
+    });
+});
