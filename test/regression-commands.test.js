@@ -2947,9 +2947,23 @@ describe('circular-deps: circular dependency detection', () => {
         });
         try {
             const index = idx(dir);
-            const { ok, result } = execute(index, 'circularDeps', { file: 'nonexistent' });
+            const { ok, result } = execute(index, 'circularDeps', { file: 'a.js' });
             assert.ok(ok);
-            assert.strictEqual(result.summary.totalCycles, 0);
+            assert.strictEqual(result.summary.totalCycles, 1);
+        } finally { rm(dir); }
+    });
+
+    it('execute() errors on a --file pattern matching no files (fix #240)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'const b = require("./b"); module.exports = {};',
+            'b.js': 'const a = require("./a"); module.exports = {};',
+        });
+        try {
+            const index = idx(dir);
+            const res = execute(index, 'circularDeps', { file: 'nonexistent' });
+            assert.strictEqual(res.ok, false, 'unknown file pattern should error, not silently report 0 cycles');
+            assert.ok(res.error.includes('nonexistent'), 'error names the pattern');
         } finally { rm(dir); }
     });
 
@@ -4940,5 +4954,53 @@ describe('fix #239: wave-3 urgent correctness batch', () => {
         assert.ok(!out.includes('all have callers'),
             'the note must not assert a fact the audit never checked');
         assert.match(out, /excluded from the audit/, `note states current semantics: ${out.split('\n').filter(l => l.includes('excluded'))}`);
+    });
+});
+
+describe('fix #240: graph depth truncation is reported by the engine', () => {
+    it('sets depthTruncated when edges exist beyond maxDepth, and the formatter says so', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'require("./b");',
+            'b.js': 'require("./c");',
+            'c.js': 'require("./d");',
+            'd.js': 'module.exports = 1;',
+        });
+        try {
+            const index = idx(dir);
+            const cut = execute(index, 'graph', { file: 'a.js', direction: 'imports', depth: 1 });
+            assert.ok(cut.ok);
+            assert.strictEqual(cut.result.depthTruncated, true, 'engine marks the cut');
+            assert.strictEqual(cut.result.maxDepth, 1);
+            const text = output.formatGraph(cut.result, {});
+            assert.ok(text.includes('Depth limited to 1'),
+                'note renders — the engine cuts at the same depth the formatter used to check, so only the engine can know');
+
+            // default handler depth is 2 — the 4-file chain needs 3 to fit
+            const full = execute(index, 'graph', { file: 'a.js', direction: 'imports', depth: 3 });
+            assert.ok(full.ok);
+            assert.ok(!full.result.depthTruncated, 'no false truncation when the graph fits the depth');
+            const fullText = output.formatGraph(full.result, {});
+            assert.ok(!fullText.includes('Depth limited'), 'no note when nothing was cut');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #240: exporters uses parsed import records for line attribution (JS)', () => {
+    it('reports the require line, not the first substring match', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'module.exports = { helper: () => 1 };',
+            'app.js': '// lib has important helpers\nconst { helper } = require("./lib");\nhelper();',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'exporters', { file: 'lib.js' });
+            assert.ok(r.ok);
+            const app = r.result.find(x => x.file === 'app.js');
+            assert.ok(app);
+            assert.strictEqual(app.importLine, 2, 'require line, not the comment');
+            assert.strictEqual(app.module, './lib', 'module string surfaced');
+        } finally { rm(dir); }
     });
 });

@@ -3566,3 +3566,71 @@ describe('fix #238 (Python): super().__init__ is a resolvable callee, not a buil
         } finally { rm(dir); }
     });
 });
+
+describe('fix #240 (Python): import lines from the parser, dynamic-import consistency', () => {
+    it('repeated and substring-shadowed imports each report their own AST line', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'timeout.py': 'def t(): pass',
+            'main.py': '# osmosis is important here\nimport timeout\n\ndef f():\n    import timeout\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'main.py' });
+            assert.ok(r.ok);
+            const lines = r.result.filter(i => i.module === 'timeout').map(i => i.line);
+            assert.deepStrictEqual(lines, [2, 5],
+                'each import statement keeps its own line — never the comment or the first occurrence');
+        } finally { rm(dir); }
+    });
+
+    it('exporters never attributes the import to a comment mentioning the module', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'util.py': 'def helper(): pass',
+            'main.py': '# util has important helpers\n# see util for details\nimport util\n\ndef go(): util.helper()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'exporters', { file: 'util.py' });
+            assert.ok(r.ok);
+            const main = r.result.find(x => x.file === 'main.py');
+            assert.ok(main, 'main.py is an importer');
+            assert.strictEqual(main.importLine, 3, 'line of the import statement, not the comments');
+        } finally { rm(dir); }
+    });
+
+    it('string-literal importlib imports report isDynamic consistently with type', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'x.py': 'def x(): pass',
+            'main.py': 'import importlib\ndef f():\n    m = importlib.import_module("x")\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'main.py' });
+            assert.ok(r.ok);
+            const dyn = r.result.find(i => i.type === 'dynamic');
+            assert.ok(dyn, 'dynamic import listed');
+            assert.strictEqual(dyn.isDynamic, true, 'type dynamic implies isDynamic');
+            assert.strictEqual(dyn.resolved, 'x.py', 'string-literal path still resolves');
+        } finally { rm(dir); }
+    });
+
+    it('exporters resolves from-import submodule lines (fix #224 spec composition)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'pkg/__init__.py': '',
+            'pkg/jobs.py': 'def run(): pass',
+            'pkg/api.py': '# jobs module is important\nfrom . import jobs\n\ndef go(): jobs.run()\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'exporters', { file: 'pkg/jobs.py' });
+            assert.ok(r.ok);
+            const api = r.result.find(x => x.file === 'pkg/api.py');
+            assert.ok(api, 'api.py is an importer via from-import submodule');
+            assert.strictEqual(api.importLine, 2, 'line of the from-import, not the comment');
+        } finally { rm(dir); }
+    });
+});

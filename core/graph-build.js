@@ -30,8 +30,11 @@ function buildDirIndex(index) {
  * Resolve a Java package import to a project file.
  * Handles regular imports, static imports (strips member name), and wildcards (strips .*).
  * Progressively strips trailing segments to find the class file.
+ * With `opts.all`, returns an ARRAY of files: for a package wildcard
+ * (com.pkg.*) that's every file directly in the package — Java wildcard
+ * imports pull in the whole package, and they are NOT recursive.
  */
-function _resolveJavaPackageImport(index, importModule, javaFileIndex) {
+function _resolveJavaPackageImport(index, importModule, javaFileIndex, opts = {}) {
     const isWildcard = importModule.endsWith('.*');
     // Strip wildcard suffix (e.g., "com.pkg.Class.*" -> "com.pkg.Class")
     const mod = isWildcard ? importModule.slice(0, -2) : importModule;
@@ -48,7 +51,7 @@ function _resolveJavaPackageImport(index, importModule, javaFileIndex) {
                 const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
                 for (const absPath of candidates) {
                     if (absPath.endsWith(fileSuffix)) {
-                        return absPath;
+                        return opts.all ? [absPath] : absPath;
                     }
                 }
             }
@@ -59,24 +62,31 @@ function _resolveJavaPackageImport(index, importModule, javaFileIndex) {
             const fileSuffix = '/' + segments.slice(0, i).join('/') + '.java';
             for (const absPath of index.files.keys()) {
                 if (absPath.endsWith(fileSuffix)) {
-                    return absPath;
+                    return opts.all ? [absPath] : absPath;
                 }
             }
         }
     }
 
     // For wildcard imports (com.pkg.model.*), the package may be a directory
-    // containing .java files. Check if any file lives under this package path.
+    // containing .java files. Match files DIRECTLY in the package directory —
+    // a bare `includes()` also matched subpackage files, but Java wildcards
+    // are not recursive.
     if (isWildcard) {
-        const dirSuffix = '/' + segments.join('/') + '/';
+        const dirSuffix = '/' + segments.join('/');
+        const matches = [];
         for (const absPath of index.files.keys()) {
-            if (absPath.includes(dirSuffix)) {
-                return absPath;
+            if (absPath.endsWith('.java') && path.dirname(absPath).endsWith(dirSuffix)) {
+                matches.push(absPath);
+                if (!opts.all) break;
             }
+        }
+        if (matches.length > 0) {
+            return opts.all ? matches : matches[0];
         }
     }
 
-    return null;
+    return opts.all ? [] : null;
 }
 
 /**
@@ -130,15 +140,27 @@ function buildImportGraph(index) {
 
             // Java package imports: resolve by progressive suffix matching
             // Handles regular, static (com.pkg.Class.method), and wildcard (com.pkg.Class.*) imports
+            let javaWildcardFiles = null;
             if (!resolved && fileEntry.language === 'java' && !importModule.startsWith('.')) {
-                resolved = _resolveJavaPackageImport(index, importModule, javaFileIndex);
+                if (importModule.endsWith('.*')) {
+                    // A package wildcard depends on EVERY file in the package
+                    // (the Go filesToLink analog) — linking only the first
+                    // dropped dependency edges for the rest of the package.
+                    const all = _resolveJavaPackageImport(index, importModule, javaFileIndex, { all: true });
+                    if (all.length > 0) {
+                        resolved = all[0];
+                        if (all.length > 1) javaWildcardFiles = all;
+                    }
+                } else {
+                    resolved = _resolveJavaPackageImport(index, importModule, javaFileIndex);
+                }
             }
 
             if (resolved && index.files.has(resolved)) {
                 moduleResolved[importModule] = path.relative(index.root, resolved);
                 // For Go, a package import means all files in that directory are dependencies
                 // (Go packages span multiple files in the same directory)
-                const filesToLink = [resolved];
+                const filesToLink = javaWildcardFiles ? [...javaWildcardFiles] : [resolved];
                 if (langTraits(fileEntry.language)?.packageScope === 'directory') {
                     const pkgDir = path.dirname(resolved);
                     const dirFiles = dirToGoFiles.get(pkgDir) || [];

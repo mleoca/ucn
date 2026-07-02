@@ -2877,3 +2877,56 @@ describe('fix #238 (Java): constructor delegation and enum constants record call
         } finally { rm(dir); }
     });
 });
+
+describe('fix #240 (Java): wildcard package imports link every package file, non-recursively', () => {
+    it('links ALL files of the package, and exporters reports the import line for each', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/com/lib/A.java': 'package com.lib;\npublic class A { public void a() {} }',
+            'src/com/lib/B.java': 'package com.lib;\npublic class B { public void b() {} }',
+            'src/com/app/Main.java': 'package com.app;\nimport com.lib.*;\npublic class Main {\n    public static void main(String[] args) { new A(); new B(); }\n}',
+        });
+        try {
+            const index = idx(dir);
+            for (const target of ['src/com/lib/A.java', 'src/com/lib/B.java']) {
+                const r = execute(index, 'exporters', { file: target });
+                assert.ok(r.ok);
+                const main = r.result.find(x => x.file === 'src/com/app/Main.java');
+                assert.ok(main, `Main.java imports ${target} via the wildcard`);
+                assert.strictEqual(main.importLine, 2, 'line of the import statement');
+            }
+        } finally { rm(dir); }
+    });
+
+    it('does NOT link subpackage files — Java wildcards are not recursive', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/com/lib/A.java': 'package com.lib;\npublic class A {}',
+            'src/com/lib/sub/Deep.java': 'package com.lib.sub;\npublic class Deep {}',
+            'src/com/app/Main.java': 'package com.app;\nimport com.lib.*;\npublic class Main { public static void main(String[] args) { new A(); } }',
+        });
+        try {
+            const index = idx(dir);
+            const deep = execute(index, 'exporters', { file: 'src/com/lib/sub/Deep.java' });
+            assert.ok(deep.ok);
+            assert.ok(!deep.result.some(x => x.file.endsWith('Main.java')),
+                'com.lib.* must not reach com/lib/sub/Deep.java');
+        } finally { rm(dir); }
+    });
+
+    it('a wildcard over a package with only subpackage files resolves to nothing (external)', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/com/lib/sub/Deep.java': 'package com.lib.sub;\npublic class Deep {}',
+            'src/com/app/Main.java': 'package com.app;\nimport com.lib.*;\npublic class Main {}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'src/com/app/Main.java' });
+            assert.ok(r.ok);
+            const wc = r.result.find(i => i.module === 'com.lib.*');
+            assert.ok(wc, 'wildcard import listed');
+            assert.strictEqual(wc.resolved, null, 'no direct package files — unresolved, not a subpackage hit');
+        } finally { rm(dir); }
+    });
+});

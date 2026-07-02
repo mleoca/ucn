@@ -883,6 +883,9 @@ const HANDLERS = {
             file: p.file,
             exclude,
         });
+        if (result && result.error) {
+            return { ok: false, error: result.message || result.error };
+        }
         const limit = num(p.limit, undefined);
         let note;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
@@ -1218,6 +1221,8 @@ const HANDLERS = {
     },
 
     circularDeps: (index, p) => {
+        const fileErr = checkFilePatternMatch(index, p.file);
+        if (fileErr) return { ok: false, error: fileErr };
         const result = index.circularDeps({
             file: p.file,
             exclude: toExcludeArray(p.exclude),

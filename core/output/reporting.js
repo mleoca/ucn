@@ -368,6 +368,7 @@ function formatEntrypointsJson(results) {
                     framework: ep.framework,
                     patternId: ep.patternId,
                     evidence: ep.evidence,
+                    ...(ep.registeredAt && { registeredAt: ep.registeredAt }),
                     confidence: ep.confidence,
                 };
             }),

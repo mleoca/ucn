@@ -303,8 +303,11 @@ function findCargoRoot(startDir) {
     while (dir !== path.dirname(dir)) {
         const cargoPath = path.join(dir, 'Cargo.toml');
         if (fs.existsSync(cargoPath)) {
+            // Flat-layout crates (lib.rs/main.rs next to Cargo.toml, no src/)
+            // root their module tree at the Cargo.toml directory — requiring
+            // src/ left every crate:: path in such crates unresolved.
             const srcDir = path.join(dir, 'src');
-            const result = fs.existsSync(srcDir) ? { root: dir, srcDir } : null;
+            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir };
             cargoCache.set(startDir, result);
             return result;
         }
@@ -312,6 +315,31 @@ function findCargoRoot(startDir) {
     }
 
     cargoCache.set(startDir, null);
+    return null;
+}
+
+/**
+ * Resolve the FILE that owns the module rooted at `dir`: dir/mod.rs (2015
+ * layout), <dir>.rs (2018 layout — the module file sits beside its directory),
+ * or the crate root lib.rs/main.rs. Used when a use-path names an ITEM
+ * declared directly in that module file (e.g. `use super::CONFIG`) — there is
+ * no <item>.rs to find, the import points at the module file itself.
+ * @param {string} dir - Module directory
+ * @param {string} [fromFile] - Importing file, never returned as its own target
+ * @returns {string|null}
+ */
+function rustModuleOwnFile(dir, fromFile) {
+    const candidates = [
+        path.join(dir, 'mod.rs'),
+        dir + '.rs',
+        path.join(dir, 'lib.rs'),
+        path.join(dir, 'main.rs'),
+    ];
+    for (const c of candidates) {
+        if (c !== fromFile && fs.existsSync(c) && fs.statSync(c).isFile()) {
+            return c;
+        }
+    }
     return null;
 }
 
@@ -358,7 +386,10 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
 
         const rest = importPath.slice('crate::'.length);
         const segments = rest.split('::');
-        return resolveRustModulePath(cargo.srcDir, segments);
+        // `use crate::ITEM` where ITEM is declared in the crate root file has
+        // no ITEM.rs — the import points at lib.rs/main.rs itself.
+        return resolveRustModulePath(cargo.srcDir, segments) ||
+            rustModuleOwnFile(cargo.srcDir, fromFile);
     }
 
     // super:: paths - resolve relative to parent module
@@ -380,7 +411,11 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
             dir = path.dirname(dir);
         }
         const segments = rest.split('::');
-        return resolveRustModulePath(dir, segments);
+        // `use super::ITEM` where ITEM is declared in the parent module FILE
+        // (mod.rs / <dir>.rs / crate root) — or in an inline `mod {}` there —
+        // has no ITEM.rs to find; the import points at the parent file itself.
+        return resolveRustModulePath(dir, segments) ||
+            rustModuleOwnFile(dir, fromFile);
     }
 
     // self:: paths - resolve within current module directory

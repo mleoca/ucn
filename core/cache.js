@@ -74,7 +74,12 @@ const UCN_VERSION = require('../package.json').version;
 // (JS/TS 'constructor' with receiver 'super'; Java under the target class
 // name), Java enum-constant constructor invocations (RED(1)), and Go/Rust
 // zero-param signatures record '' instead of the '...' unknown sentinel.
-const CACHE_FORMAT_VERSION = 32;
+// v33 (fix #240): persisted importGraph/exportGraph/moduleResolved content
+// changed — Java wildcard imports link EVERY file directly in the package
+// (non-recursively; subpackage false links dropped), Rust flat-layout crates
+// (no src/) resolve crate:: paths, and super::/crate:: item imports fall back
+// to the parent module FILE (mod.rs / <dir>.rs / lib.rs / main.rs).
+const CACHE_FORMAT_VERSION = 33;
 
 /**
  * Save index to cache file

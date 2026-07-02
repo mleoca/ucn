@@ -5755,3 +5755,64 @@ describe('fix #238 (Go): zero-param functions record empty params, not the unkno
         } finally { rm(dir); }
     });
 });
+
+describe('fix #240 (Go): exporters import lines, entrypoint definition attribution', () => {
+    it('exporters reports the parsed import line, including for sibling package files', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t',
+            'lib/a.go': 'package lib\n\nfunc A() {}',
+            'lib/b.go': 'package lib\n\nfunc B() {}',
+            'main.go': '// this package is important\npackage main\n\nimport "example.com/t/lib"\n\nfunc main() { lib.A(); lib.B() }',
+        });
+        try {
+            const index = idx(dir);
+            // the package import links BOTH lib files; each reports the import stmt line
+            for (const target of ['lib/a.go', 'lib/b.go']) {
+                const r = execute(index, 'exporters', { file: target });
+                assert.ok(r.ok);
+                const main = r.result.find(x => x.file === 'main.go');
+                assert.ok(main, `main.go imports ${target} via the package import`);
+                assert.strictEqual(main.importLine, 4, 'line of the import statement');
+            }
+        } finally { rm(dir); }
+    });
+
+    it('callPattern entry points are attributed to the handler DEFINITION, registration kept as evidence', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'main.go': 'package main\n\nimport "net/http"\n\nfunc main() {\n\thttp.HandleFunc("/home", HomeHandler)\n}',
+            'handlers.go': 'package main\n\nimport "net/http"\n\nfunc HomeHandler(w http.ResponseWriter, r *http.Request) {}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'entrypoints', {});
+            assert.ok(r.ok);
+            const home = r.result.find(e => e.name === 'HomeHandler');
+            assert.ok(home, 'HomeHandler detected');
+            assert.strictEqual(home.file, 'handlers.go', 'file is the definition file');
+            assert.strictEqual(home.line, 5, 'line is the definition start line');
+            assert.ok(home.evidence[0].includes('registered at main.go:6'),
+                'registration site preserved as evidence');
+            assert.deepStrictEqual(home.registeredAt, { file: 'main.go', line: 6 });
+            // the handle must resolve: about <name> --file <file> --line <line>
+            const about = execute(index, 'about', { name: 'HomeHandler', file: home.file, line: home.line });
+            assert.ok(about.ok, 'entrypoint handle resolves through about');
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints --type validates its value instead of returning silent empty', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'main.go': 'package main\n\nfunc main() {}',
+        });
+        try {
+            const index = idx(dir);
+            const bad = execute(index, 'entrypoints', { type: 'bogus' });
+            assert.strictEqual(bad.ok, false, 'invalid type errors');
+            assert.ok(bad.error.includes('Valid:'), 'error lists valid types');
+            const good = execute(index, 'entrypoints', { type: 'runtime' });
+            assert.ok(good.ok);
+            assert.ok(good.result.some(e => e.name === 'main'), 'valid type still filters');
+        } finally { rm(dir); }
+    });
+});

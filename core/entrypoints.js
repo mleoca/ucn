@@ -523,6 +523,20 @@ function buildCallbackEntrypointMap(index) {
 
     const result = new Map(); // name -> info
 
+    // Attribute the entry point to the handler's DEFINITION, not the
+    // registration call site: `about handler --file X --line N` handles must
+    // resolve, and reachability seeding matches (absoluteFile, line) against
+    // symbol defs — a handler defined in a different file than its
+    // registration was never seeded. The registration site is kept as
+    // evidence (registrationFile/registrationLine).
+    const resolveHandlerDef = (name, registrationFile) => {
+        const defs = index.symbols.get(name);
+        if (!defs || defs.length === 0) return null;
+        // Prefer a def in the registration file; defs are canonical-sorted,
+        // so falling back to the first is deterministic.
+        return defs.find(d => d.file === registrationFile) || defs[0];
+    };
+
     for (const [filePath, fileEntry] of index.files) {
         const lang = fileEntry.language;
 
@@ -569,13 +583,16 @@ function buildCallbackEntrypointMap(index) {
                     if (!index.symbols.has(call.name)) continue;
 
                     if (!result.has(call.name)) {
+                        const def = resolveHandlerDef(call.name, filePath);
                         result.set(call.name, {
                             framework: route.pattern.framework,
                             type: route.pattern.type,
                             patternId: route.pattern.id,
                             method: route.call.name.toUpperCase(),
-                            file: filePath,
-                            line: call.line,
+                            file: def ? def.file : filePath,
+                            line: def ? def.startLine : call.line,
+                            registrationFile: filePath,
+                            registrationLine: call.line,
                         });
                     }
                 }
@@ -593,13 +610,16 @@ function buildCallbackEntrypointMap(index) {
                     if (pattern.typePattern.test(call.compositeType) &&
                         pattern.fieldPattern.test(call.fieldName)) {
                         if (!result.has(call.name)) {
+                            const def = resolveHandlerDef(call.name, filePath);
                             result.set(call.name, {
                                 framework: pattern.framework,
                                 type: pattern.type,
                                 patternId: pattern.id,
                                 method: call.fieldName,
-                                file: filePath,
-                                line: call.line,
+                                file: def ? def.file : filePath,
+                                line: def ? def.startLine : call.line,
+                                registrationFile: filePath,
+                                registrationLine: call.line,
                             });
                         }
                         break;
@@ -623,6 +643,18 @@ function buildCallbackEntrypointMap(index) {
  * @returns {Array<{ name, file, line, type, framework, patternId, evidence, confidence }>}
  */
 function detectEntrypoints(index, options = {}) {
+    // Validate --type against the pattern registry up front — an unknown
+    // value used to fall through to the filter and silently return nothing.
+    if (options.type) {
+        const validTypes = new Set(FRAMEWORK_PATTERNS.map(p => p.type));
+        if (!validTypes.has(options.type)) {
+            return {
+                error: 'invalid-type',
+                message: `Unknown type "${options.type}". Valid: ${[...validTypes].sort().join(', ')}.`,
+            };
+        }
+    }
+
     // Build callback entrypoint map (call-pattern detection)
     const callbackMap = buildCallbackEntrypointMap(index);
 
@@ -744,6 +776,17 @@ function detectEntrypoints(index, options = {}) {
         if (seen.has(key)) continue;
         seen.add(key);
 
+        let evidence = `${info.method} route handler`;
+        let registeredAt;
+        if (info.registrationFile) {
+            const regEntry = index.files.get(info.registrationFile);
+            const regRel = regEntry?.relativePath || info.registrationFile;
+            registeredAt = { file: regRel, line: info.registrationLine };
+            if (info.registrationFile !== info.file || info.registrationLine !== info.line) {
+                evidence += ` — registered at ${regRel}:${info.registrationLine}`;
+            }
+        }
+
         results.push({
             name,
             file: relPath,
@@ -752,7 +795,8 @@ function detectEntrypoints(index, options = {}) {
             type: info.type,
             framework: info.framework,
             patternId: info.patternId,
-            evidence: [`${info.method} route handler`],
+            evidence: [evidence],
+            ...(registeredAt && { registeredAt }),
             confidence: 0.90,
         });
     }

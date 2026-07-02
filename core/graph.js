@@ -33,9 +33,12 @@ function imports(index, filePath) {
         const content = index._readFile(normalizedPath);
         const { imports: rawImports } = extractImports(content, fileEntry.language);
 
-        const contentLines = content.split('\n');
-
         return rawImports.map(imp => {
+            // Every parser records the import's AST line; use it directly.
+            // (The old substring re-derivation matched 'os' inside 'osmosis',
+            // comments, and collapsed repeated modules to the first line.)
+            const line = imp.line ?? null;
+
             // Skip imports with null module (e.g. Rust include! with dynamic path)
             if (!imp.module) {
                 return {
@@ -45,7 +48,7 @@ function imports(index, filePath) {
                     resolved: null,
                     isExternal: false,
                     isDynamic: true,
-                    line: null
+                    line
                 };
             }
 
@@ -54,13 +57,6 @@ function imports(index, filePath) {
             // Go side-effect/dot imports and Rust glob uses also set dynamic=true but have valid module paths.
             const isUnresolvableDynamic = imp.dynamic && (imp.type === 'require' || imp.type === 'dynamic');
             if (isUnresolvableDynamic) {
-                let line = null;
-                for (let i = 0; i < contentLines.length; i++) {
-                    if (contentLines[i].includes(imp.module || 'require')) {
-                        line = i + 1;
-                        break;
-                    }
-                }
                 return {
                     module: imp.module,
                     names: imp.names,
@@ -84,28 +80,48 @@ function imports(index, filePath) {
                 resolvedPath = index._resolveJavaPackageImport(imp.module);
             }
 
-            // Find line number of import
-            let line = null;
-            for (let i = 0; i < contentLines.length; i++) {
-                if (contentLines[i].includes(imp.module)) {
-                    line = i + 1;
-                    break;
-                }
-            }
-
             return {
                 module: imp.module,
                 names: imp.names,
                 type: imp.type,
                 resolved: resolvedPath ? path.relative(index.root, resolvedPath) : null,
                 isExternal: !resolvedPath,
-                isDynamic: false,
+                // A string-literal dynamic import (import('./x'), importlib.import_module("x"))
+                // is still mechanically dynamic even when the path resolves —
+                // `type: 'dynamic'` with `isDynamic: false` was a contradiction.
+                isDynamic: imp.type === 'dynamic',
                 line
             };
         });
     } catch (e) {
         return [];
     }
+}
+
+/**
+ * Decide whether a symbol is exported, using evidence at the right scope:
+ * the file-level export list speaks for TOP-LEVEL names only — a struct
+ * field or method sharing an exported function's name is not itself exported.
+ * Member symbols (className set) are judged by their OWN visibility marker:
+ * export/public modifiers, Rust `pub`/`pub(crate)`, or Go capitalization.
+ */
+function symbolIsExported(symbol, fileEntry, exportedNames) {
+    const modifiers = symbol.modifiers || [];
+    if (modifiers.includes('export') || modifiers.includes('public')) return true;
+    if (modifiers.some(m => typeof m === 'string' && /^pub\b/.test(m))) return true;
+    if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' &&
+        /^[A-Z]/.test(symbol.name || '')) return true;
+    if (symbol.className) return false;
+    return exportedNames.has(symbol.name);
+}
+
+/**
+ * Signature for export listings: members render as `Class.name(...)` so a
+ * Go/Rust/Java method is distinguishable from a free function of the same name.
+ */
+function formatExportSignature(index, symbol) {
+    if (!symbol.className) return index.formatSignature(symbol);
+    return index.formatSignature({ ...symbol, name: `${symbol.className}.${symbol.name}` });
 }
 
 /**
@@ -121,39 +137,72 @@ function exporters(index, filePath) {
     const targetPath = resolved;
 
     const importers = index.exportGraph.get(targetPath) || new Set();
+    const targetRel = path.relative(index.root, targetPath);
+    const targetDir = path.dirname(targetRel);
 
-    return [...importers].map(importerPath => {
+    const results = [...importers].map(importerPath => {
         const fileEntry = index.files.get(importerPath);
 
-        // Find the import line
+        // Locate the import statement via the importer's own parsed import
+        // records: fileEntry.moduleResolved (built with the import graph) maps
+        // each module string to the project file it resolved to, and the
+        // parser records each import's AST line. (The old basename+'import'
+        // substring heuristic matched comments, returned null for Rust
+        // use/mod, and misfired on prose like 'important'.)
         let importLine = null;
-        try {
-            const content = index._readFile(importerPath);
-            const lines = content.split('\n');
-            let targetBasename = path.basename(targetPath, path.extname(targetPath));
-
-            // For __init__.py, search for the package name (parent dir)
-            // e.g., "from tools import X" → search for "tools" not "__init__"
-            if (targetBasename === '__init__') {
-                targetBasename = path.basename(path.dirname(targetPath));
-            }
-
-            for (let i = 0; i < lines.length; i++) {
-                if (lines[i].includes(targetBasename) &&
-                    (lines[i].includes('import') || lines[i].includes('require') || lines[i].includes('from'))) {
-                    importLine = i + 1;
-                    break;
+        let importModule = null;
+        const mr = (fileEntry && fileEntry.moduleResolved) || {};
+        let matchModules = Object.keys(mr).filter(m => mr[m] === targetRel);
+        if (matchModules.length === 0) {
+            // Directory-level links: a Go package import (or Java wildcard)
+            // links every file in the target's directory — the module string
+            // resolved to a sibling, but the statement still covers the target.
+            matchModules = Object.keys(mr).filter(m => {
+                if (path.dirname(mr[m]) !== targetDir) return false;
+                const lang = fileEntry.language;
+                if (langTraits(lang)?.packageScope === 'directory') return true;
+                if (lang === 'java' && m.endsWith('.*')) return true;
+                return false;
+            });
+        }
+        if (matchModules.length > 0 && fileEntry) {
+            try {
+                const content = index._readFile(importerPath);
+                const { imports: rawImports } = extractImports(content, fileEntry.language);
+                const wanted = new Set(matchModules);
+                const submodules = langTraits(fileEntry.language)?.submoduleImports;
+                for (const imp of rawImports) {
+                    if (!imp.module) continue;
+                    let matched = wanted.has(imp.module) ? imp.module : null;
+                    // Python from-import submodules resolve under a composed
+                    // spec (`from . import jobs` → '.jobs', fix #224) that the
+                    // raw record stores as module '.' + name 'jobs'.
+                    if (!matched && submodules && imp.names) {
+                        for (const n of imp.names) {
+                            const spec = imp.module.endsWith('.') ? imp.module + n : imp.module + '.' + n;
+                            if (wanted.has(spec)) { matched = spec; break; }
+                        }
+                    }
+                    if (matched && imp.line != null &&
+                        (importLine === null || imp.line < importLine)) {
+                        importLine = imp.line;
+                        importModule = matched;
+                    }
                 }
+            } catch (e) {
+                // Skip — file unreadable, leave importLine null
             }
-        } catch (e) {
-            // Skip
         }
 
         return {
             file: fileEntry ? fileEntry.relativePath : path.relative(index.root, importerPath),
-            importLine
+            importLine,
+            ...(importModule !== null && { module: importModule })
         };
     });
+
+    results.sort((a, b) => codeUnitCompare(a.file, b.file));
+    return results;
 }
 
 /**
@@ -187,10 +236,10 @@ function fileExports(index, filePath, _visited) {
     const isPythonImplicit = fileEntry.language === 'python' && exportedNames.size === 0;
 
     for (const symbol of fileEntry.symbols) {
-        const isExported = exportedNames.has(symbol.name) ||
-            (symbol.modifiers && symbol.modifiers.includes('export')) ||
-            (symbol.modifiers && symbol.modifiers.includes('public')) ||
-            (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbol.name)) ||
+        // impl blocks group members; the block itself is not an exportable
+        // symbol (its name collides with the struct's, which IS listed).
+        if (symbol.type === 'impl') continue;
+        const isExported = symbolIsExported(symbol, fileEntry, exportedNames) ||
             (isPythonImplicit && symbol.name && !symbol.name.startsWith('_') && !symbol.className && !symbol.isMethod);
 
         if (isExported) {
@@ -200,9 +249,10 @@ function fileExports(index, filePath, _visited) {
                 file: fileEntry.relativePath,
                 startLine: symbol.startLine,
                 endLine: symbol.endLine,
+                ...(symbol.className && { className: symbol.className }),
                 params: symbol.params,
                 returnType: symbol.returnType,
-                signature: index.formatSignature(symbol)
+                signature: formatExportSignature(index, symbol)
             });
         }
     }
@@ -400,21 +450,18 @@ function api(index, filePath, options = {}) {
         const exportedNames = new Set(fileEntry.exports);
 
         for (const symbol of fileEntry.symbols) {
-            const isExported = exportedNames.has(symbol.name) ||
-                (symbol.modifiers && symbol.modifiers.includes('export')) ||
-                (symbol.modifiers && symbol.modifiers.includes('public')) ||
-                (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' && /^[A-Z]/.test(symbol.name));
-
-            if (isExported) {
+            if (symbol.type === 'impl') continue;
+            if (symbolIsExported(symbol, fileEntry, exportedNames)) {
                 results.push({
                     name: symbol.name,
                     type: symbol.type,
                     file: fileEntry.relativePath,
                     startLine: symbol.startLine,
                     endLine: symbol.endLine,
+                    ...(symbol.className && { className: symbol.className }),
                     params: symbol.params,
                     returnType: symbol.returnType,
-                    signature: index.formatSignature(symbol)
+                    signature: formatExportSignature(index, symbol)
                 });
             }
         }
@@ -480,6 +527,7 @@ function graph(index, filePath, options = {}) {
         const visited = new Set();
         const nodes = [];
         const edges = [];
+        let truncated = false;
 
         const traverse = (file, depth) => {
             if (visited.has(file)) return;
@@ -489,12 +537,17 @@ function graph(index, filePath, options = {}) {
             const relPath = fileEntry ? fileEntry.relativePath : path.relative(index.root, file);
             nodes.push({ file, relativePath: relPath, depth });
 
-            // Stop traversal at max depth but still register the node above
-            if (depth >= maxDepth) return;
-
             const neighbors = dir === 'imports'
                 ? (index.importGraph.get(file) || new Set())
                 : (index.exportGraph.get(file) || new Set());
+
+            // Stop traversal at max depth but still register the node above.
+            // Record that edges exist beyond the cut so the formatter can say
+            // so — the data itself carries no deeper nodes to notice.
+            if (depth >= maxDepth) {
+                if ([...neighbors].some(n => !visited.has(n))) truncated = true;
+                return;
+            }
 
             for (const neighbor of neighbors) {
                 edges.push({ from: file, to: neighbor });
@@ -503,7 +556,7 @@ function graph(index, filePath, options = {}) {
         };
 
         traverse(targetPath, 0);
-        return { nodes, edges };
+        return { nodes, edges, truncated };
     };
 
     if (direction === 'both') {
@@ -514,6 +567,8 @@ function graph(index, filePath, options = {}) {
         return {
             root: targetPath,
             direction: 'both',
+            maxDepth,
+            depthTruncated: importsGraph.truncated || importersGraph.truncated,
             imports: { nodes: importsGraph.nodes, edges: importsGraph.edges },
             importers: { nodes: importersGraph.nodes, edges: importersGraph.edges },
             // Keep combined for backward compat
@@ -527,6 +582,8 @@ function graph(index, filePath, options = {}) {
     return {
         root: targetPath,
         direction,
+        maxDepth,
+        depthTruncated: subgraph.truncated,
         nodes: subgraph.nodes,
         edges: subgraph.edges
     };

@@ -11,9 +11,12 @@ function formatImports(imports, filePath) {
     if (imports?.error) return formatFileError(imports, filePath);
     const lines = [`Imports in ${filePath}:\n`];
 
-    const internal = imports.filter(i => !i.isExternal && !i.isDynamic);
-    const external = imports.filter(i => i.isExternal && !i.isDynamic);
-    const dynamic = imports.filter(i => i.isDynamic);
+    // A string-literal dynamic import that resolved is a project-internal
+    // dependency (isDynamic marks the MECHANISM); only unresolved dynamic
+    // imports belong in the DYNAMIC (unresolved) section.
+    const internal = imports.filter(i => i.resolved);
+    const external = imports.filter(i => !i.resolved && !i.isDynamic);
+    const dynamic = imports.filter(i => !i.resolved && i.isDynamic);
 
     if (internal.length > 0) {
         lines.push('INTERNAL:');
@@ -66,7 +69,8 @@ function formatImportsJson(imports, filePath) {
             names: i.names,
             type: i.type,
             resolved: i.resolved || null,
-            isDynamic: !!i.isDynamic
+            isDynamic: !!i.isDynamic,
+            line: i.line ?? null
         }))
     }, null, 2);
 }
@@ -247,7 +251,11 @@ function formatGraph(graph, options = {}) {
 
     const showAll = options.showAll || false;
     const maxChildren = showAll ? Infinity : 8;
-    const maxDepth = options.maxDepth !== undefined ? options.maxDepth : Infinity;
+    const maxDepth = options.maxDepth !== undefined ? options.maxDepth
+        : (graph.maxDepth !== undefined ? graph.maxDepth : Infinity);
+    // The engine stops traversal at ITS maxDepth, so the data never reaches
+    // the formatter's own depth check — the engine reports the cut instead.
+    const engineTruncated = !!graph.depthTruncated;
 
     function printTree(nodes, edges, rootFile) {
         const visited = new Set();     // all nodes ever printed (for diamond dep detection)
@@ -328,6 +336,7 @@ function formatGraph(graph, options = {}) {
             lines.push('  (none)');
         }
 
+        anyDepthLimited = anyDepthLimited || engineTruncated;
         if (anyDepthLimited || totalTruncated > 0) {
             lines.push('\n' + '─'.repeat(60));
             if (anyDepthLimited) {
@@ -343,7 +352,8 @@ function formatGraph(graph, options = {}) {
         lines.push(`Dependency graph for ${rootRelPath}`);
         lines.push('═'.repeat(60));
 
-        const { truncatedNodes, depthLimited } = printTree(graph.nodes, graph.edges, graph.root);
+        const { truncatedNodes, depthLimited: fmtDepthLimited } = printTree(graph.nodes, graph.edges, graph.root);
+        const depthLimited = fmtDepthLimited || engineTruncated;
 
         if (depthLimited || truncatedNodes > 0) {
             lines.push('\n' + '─'.repeat(60));
@@ -372,6 +382,8 @@ function formatGraphJson(graph) {
         nodes: graph.nodes,
         edges: graph.edges
     };
+    if (graph.maxDepth !== undefined) result.maxDepth = graph.maxDepth;
+    if (graph.depthTruncated) result.depthTruncated = true;
     if (graph.imports) result.imports = graph.imports;
     if (graph.importers) result.importers = graph.importers;
     return JSON.stringify(result, null, 2);

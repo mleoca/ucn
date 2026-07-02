@@ -3370,3 +3370,120 @@ describe('fix #238 (Rust): zero-param functions record empty params, not the unk
         } finally { rm(dir); }
     });
 });
+
+describe('fix #240 (Rust): flat-layout crates, super:: parent-file resolution, fileExports member visibility', () => {
+    it('crate:: paths resolve in flat-layout crates (no src/ directory)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="flat"',
+            'lib.rs': 'pub mod engine;\npub const LIMIT: u32 = 5;',
+            'engine.rs': 'use crate::LIMIT;\npub fn run() -> u32 { LIMIT }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'engine.rs' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(i => i.resolved === 'lib.rs'),
+                'crate::LIMIT resolves to lib.rs when the crate root sits beside Cargo.toml');
+        } finally { rm(dir); }
+    });
+
+    it('use super::ITEM resolves to the parent module FILE when ITEM is declared there', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub mod sub;\npub const MAX: u32 = 9;',
+            'src/sub/mod.rs': 'use super::MAX;\npub fn m() -> u32 { MAX }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'src/sub/mod.rs' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(i => i.module === 'super::MAX' && i.resolved === 'src/lib.rs'),
+                'super::MAX points at lib.rs, not external');
+            // and the reverse direction: exporters shows the use line
+            const exp = execute(index, 'exporters', { file: 'src/lib.rs' });
+            const sub = exp.result.find(x => x.file === 'src/sub/mod.rs');
+            assert.ok(sub, 'sub/mod.rs listed as importer of lib.rs');
+            assert.strictEqual(sub.importLine, 1, 'use line from the parser, not a text scan');
+        } finally { rm(dir); }
+    });
+
+    it('exporters reports the use statement line for Rust (never null from the import-keyword heuristic)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub mod util;\npub mod app;',
+            'src/util.rs': 'pub fn helper() {}',
+            'src/app.rs': '// utility functions live in util\nuse crate::util::helper;\npub fn run() { helper(); }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'exporters', { file: 'src/util.rs' });
+            assert.ok(r.ok);
+            const app = r.result.find(x => x.file === 'src/app.rs');
+            assert.ok(app, 'app.rs is an importer');
+            assert.strictEqual(app.importLine, 2, 'line of the use statement, not the comment mentioning util');
+        } finally { rm(dir); }
+    });
+
+    it('fileExports judges members by their own visibility, never by name collision with file exports', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub mod widget;',
+            'src/widget.rs': 'pub struct Widget { pub size: u32, len: usize }\n' +
+                'impl Widget { pub fn size(&self) -> u32 { self.size } fn hidden(&self) {} }\n' +
+                'pub fn len() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'fileExports', { file: 'src/widget.rs' });
+            assert.ok(r.ok);
+            // private field `len` collides with pub fn `len` — must NOT be listed
+            assert.ok(!r.result.some(e => e.type === 'field' && e.name === 'len'),
+                'private field not listed via name collision');
+            // the impl block collides with the struct name — not an exportable symbol
+            assert.ok(!r.result.some(e => e.type === 'impl'), 'impl block not listed');
+            // pub method IS listed, carrying its class
+            const size = r.result.find(e => e.type === 'method' && e.name === 'size');
+            assert.ok(size, 'pub method listed');
+            assert.strictEqual(size.className, 'Widget', 'method carries className');
+            assert.ok(size.signature.includes('Widget.size'), 'signature shows the owning type');
+            // private method not listed
+            assert.ok(!r.result.some(e => e.name === 'hidden'), 'private method not listed');
+            // top-level pub fn still listed
+            assert.ok(r.result.some(e => e.type === 'function' && e.name === 'len'), 'pub fn listed');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #240 (Rust): parent-file fallback never shadows real module files', () => {
+    it('super::name resolves to the sibling module file when one exists', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub mod sub;\npub mod helper;',
+            'src/helper.rs': 'pub fn helper() {}',
+            'src/sub/mod.rs': 'use super::helper;\npub fn m() { helper::helper() }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'src/sub/mod.rs' });
+            const imp = r.result.find(i => i.module === 'super::helper');
+            assert.strictEqual(imp.resolved, 'src/helper.rs',
+                'sibling module file wins over the parent-file fallback');
+        } finally { rm(dir); }
+    });
+
+    it('2018-layout parent module file (<dir>.rs) resolves for super:: items', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub mod sub;',
+            'src/sub.rs': 'pub mod inner;\npub const K: u32 = 1;',
+            'src/sub/inner.rs': 'use super::K;\npub fn f() -> u32 { K }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'src/sub/inner.rs' });
+            const imp = r.result.find(i => i.module === 'super::K');
+            assert.strictEqual(imp.resolved, 'src/sub.rs',
+                'the module file beside its directory owns super:: items');
+        } finally { rm(dir); }
+    });
+});
