@@ -617,17 +617,21 @@ const HANDLERS = {
         // handler — the hidden count must be VISIBLE (fix #234, campaign
         // G2-java: usages silently hid test-file usages while search noted
         // them — a silently incomplete answer from the raw escape hatch).
+        // Normalize the user's exclude first (fix #239): MCP delivers a CSV
+        // STRING, and matchesFilters iterates its CHARACTERS — exclude=test
+        // emptied every TypeScript project ('t' matched the .ts extension).
+        const userExclude = toExcludeArray(p.exclude);
         const unfiltered = index.usages(p.name, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
             className: p.className,
             file: p.file,
-            exclude: p.exclude,
+            exclude: userExclude,
             in: p.in,
         });
         const notes = [];
         let result = unfiltered;
-        if (exclude !== p.exclude && Array.isArray(unfiltered)) {
+        if (exclude.length !== userExclude.length && Array.isArray(unfiltered)) {
             result = unfiltered.filter(u => index.matchesFilters(u.relativePath, { exclude }));
             const hidden = unfiltered.length - result.length;
             if (hidden > 0) notes.push(`${hidden} test-file usage(s) hidden by default — pass --include-tests to include them.`);
@@ -664,7 +668,9 @@ const HANDLERS = {
             all: p.all,
             top: num(p.top, undefined),
             file: p.file,
-            exclude: p.exclude,
+            // Normalized (fix #239) — a raw MCP CSV string iterated
+            // per-character emptied whole projects (exclude=test vs .ts).
+            exclude: toExcludeArray(p.exclude),
             in: p.in,
         });
         // Apply limit to detailed toc entries (symbols are in f.symbols.functions/classes arrays)
@@ -772,7 +778,15 @@ const HANDLERS = {
     tests: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
-        applyClassMethodSyntax(p);
+        // tests() accepts a FILE PATH as the target ("tests helper.go" — the
+        // engine's isFilePath branch searches the basename). Class.method
+        // splitting would shear the filename at the dot into
+        // className='helper', name='go' and silently return nothing
+        // (fix #239, G3-go-measured). Mirror the engine's file-path test.
+        const testsTargetIsFile = typeof p.name === 'string' && (
+            p.name.includes('/') || p.name.includes('\\') ||
+            /\.(js|ts|py|go|java|rs)$/.test(p.name));
+        if (!testsTargetIsFile) applyClassMethodSyntax(p);
         if (p.file) {
             const fileErr = checkFilePatternMatch(index, p.file);
             if (fileErr) return { ok: false, error: fileErr };

@@ -530,6 +530,15 @@ function deadcode(index, options = {}) {
             if (index.calleeIndex.has(name)) {
                 continue;
             }
+            // Constructor members are invoked through the CLASS name
+            // (fix #239, G2-js-measured: `new Widget()` indexes under
+            // 'Widget' — the member lookup claimed every instantiated
+            // class's constructor dead).
+            if (symbol.className &&
+                (symbol.type === 'constructor' || name === 'constructor' || name === '__init__') &&
+                index.calleeIndex.has(symbol.className)) {
+                continue;
+            }
 
             // Slow path: check AST-based usage index for remaining names
             const allUsages = usageIndex.get(name) || [];

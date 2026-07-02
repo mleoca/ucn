@@ -1053,7 +1053,7 @@ function runProjectCommand(rootDir, command, arg) {
                 r => output.formatDeadcode(r, {
                     top: flags.top,
                     decoratedHint: !flags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
-                    exportedHint: !flags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined,
+                    exportedHint: !flags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.` : undefined,
                     externalContractHint: !flags.includeExported && result.excludedExternalContract > 0 ? `${result.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use --include-exported to include them.` : undefined
                 })
             );
@@ -1909,7 +1909,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             console.log(output.formatDeadcode(result, {
                 top: iflags.top,
                 decoratedHint: !iflags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
-                exportedHint: !iflags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.` : undefined,
+                exportedHint: !iflags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.` : undefined,
                 externalContractHint: !iflags.includeExported && result.excludedExternalContract > 0 ? `${result.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use --include-exported to include them.` : undefined
             }));
             break;

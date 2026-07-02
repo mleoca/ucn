@@ -713,6 +713,12 @@ function structuralSearch(index, options = {}) {
                     if (unused) {
                         index.buildCalleeIndex();
                         if (index.calleeIndex.has(symbolName)) continue;
+                        // Constructor members are invoked through the CLASS
+                        // name (fix #239): `new Widget()` indexes under
+                        // 'Widget', never under 'constructor'/'__init__'.
+                        if (def.className &&
+                            (def.type === 'constructor' || symbolName === 'constructor' || symbolName === '__init__') &&
+                            index.calleeIndex.has(def.className)) continue;
                         // Runtime-invoked entry points are never unused (fix
                         // #234, campaign G2 ×4 languages: Go main/init, Java
                         // main, Rust main/#[test] all listed — the deadcode

@@ -252,7 +252,7 @@ function formatDeadcode(results, options = {}) {
         lines.push(`\n${decoratedHint}`);
     }
     if (results.excludedExported > 0) {
-        const exportedHint = options.exportedHint || `${results.excludedExported} exported symbol(s) excluded (all have callers). Use --include-exported to audit them.`;
+        const exportedHint = options.exportedHint || `${results.excludedExported} exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.`;
         lines.push(`\n${exportedHint}`);
     }
     if (results.excludedExternalContract > 0) {

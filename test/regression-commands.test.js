@@ -4866,3 +4866,79 @@ describe('fix #237: W7 command-level batch', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #239: wave-3 urgent correctness batch', () => {
+    it('usages/toc normalize a CSV-string exclude — never iterate its characters', () => {
+        // MCP delivers exclude as a string; matchesFilters iterates arrays.
+        // Char 't' compiled to a pattern matching the '.ts' extension and
+        // emptied whole TypeScript projects.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.ts': 'export function createConfig() { return 1; }\nexport const v = createConfig();\n',
+        });
+        try {
+            const index = idx(dir);
+            const u = execute(index, 'usages', { name: 'createConfig', exclude: 'test' });
+            assert.ok(u.ok);
+            assert.ok(u.result.length >= 1, `string exclude must not empty results: ${u.result.length}`);
+            const t = execute(index, 'toc', { exclude: 'dist,vendor' });
+            assert.ok(t.ok);
+            const fileCount = t.result.totalFiles ?? (t.result.files || []).length;
+            assert.ok(fileCount >= 1, `toc with string exclude keeps the project: ${fileCount}`);
+        } finally { rm(dir); }
+    });
+
+    it('affectedTests className pin scopes the ROOT name only — wrapper coverage survives', () => {
+        const dir = tmp({
+            'go.mod': 'module t\n',
+            'lib2.go': 'package t\n\ntype Repo struct{}\n\nfunc NewRepo() *Repo { return &Repo{} }\n\nfunc (r *Repo) Save(a, b string) error { return nil }\n\nfunc SaveAll(r *Repo) error { return r.Save("a", "b") }\n',
+            'lib2_test.go': 'package t\n\nimport "testing"\n\nfunc TestSaveAll(t *testing.T) {\n\tSaveAll(NewRepo())\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const pinned = execute(index, 'affectedTests', { name: 'Save', className: 'Repo' });
+            assert.ok(pinned.ok);
+            assert.ok((pinned.result.testFiles || []).some(t => t.file.includes('lib2_test')),
+                `pinned Repo.Save finds coverage through the SaveAll wrapper: ${JSON.stringify(pinned.result.testFiles)}`);
+        } finally { rm(dir); }
+    });
+
+    it('tests accepts a file-path target without Class.method shearing', () => {
+        const dir = tmp({
+            'go.mod': 'module fx\n',
+            'helper.go': 'package fx\n\nfunc helper() int { return 1 }\n',
+            'helper_test.go': 'package fx\n\nimport "testing"\n\nfunc TestHelper(t *testing.T) {\n\t_ = helper()\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'helper.go' });
+            assert.ok(r.ok);
+            assert.ok((r.result || []).some(t => (t.file || t.relativePath || '').includes('helper_test')),
+                `file-path form finds the covering test: ${JSON.stringify(r.result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('instantiated-class constructors are never unused/dead', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'w.js': 'class Widget {\n  constructor(size) { this.size = size; }\n  spin() { return this.size; }\n}\nfunction makeWidget() { return new Widget(3).spin(); }\nmodule.exports = { makeWidget };\n',
+        });
+        try {
+            const index = idx(dir);
+            const u = execute(index, 'search', { type: 'function', unused: true });
+            assert.ok(!u.result.results.some(s => s.name === 'constructor'),
+                `new Widget(3) keeps the constructor used: ${JSON.stringify(u.result.results.map(s => s.name))}`);
+            const d = execute(index, 'deadcode', {});
+            const dead = d.result.symbols || d.result || [];
+            assert.ok(!dead.some?.(s => s.name === 'constructor'),
+                `deadcode never claims the instantiated constructor: ${JSON.stringify(dead)}`);
+        } finally { rm(dir); }
+    });
+
+    it('deadcode exported-exclusion note states the exclusion, not an unchecked claim', () => {
+        const out = runCli('test/fixtures/go', 'deadcode', [], []);
+        assert.ok(!out.includes('all have callers'),
+            'the note must not assert a fact the audit never checked');
+        assert.match(out, /excluded from the audit/, `note states current semantics: ${out.split('\n').filter(l => l.includes('excluded'))}`);
+    });
+});

@@ -889,10 +889,19 @@ function affectedTests(index, name, options = {}) {
                     const astUsages = index._getCachedUsages(filePath, funcName);
                     if (!astUsages || astUsages.length === 0) continue;
 
+                    // className scoping applies to the ROOT symbol's own name
+                    // only (fix #239, G3-go-measured): downstream names in the
+                    // closure are DIFFERENT symbols the blast tree already
+                    // resolved with full receiver physics — a bare call to a
+                    // standalone wrapper (SaveAll) can never carry the root's
+                    // class receiver, so filtering it lost real coverage
+                    // ("No test files found" while TestSaveAll exists).
+                    const scopeToClass = className && funcName === name ? className : null;
+
                     // Build instance type map for className scoping (if applicable)
                     let instanceTypeMap = null;
-                    if (className) {
-                        instanceTypeMap = _buildInstanceTypeMapForTracing(index, filePath, content, className);
+                    if (scopeToClass) {
+                        instanceTypeMap = _buildInstanceTypeMapForTracing(index, filePath, content, scopeToClass);
                     }
 
                     const seenLines = new Set();
@@ -912,16 +921,16 @@ function affectedTests(index, name, options = {}) {
                         }
 
                         // className scoping for calls: check receiver
-                        if (className && matchType === 'call') {
-                            if (!_receiverMatchesClassTracing(usage, className, instanceTypeMap,
+                        if (scopeToClass && matchType === 'call') {
+                            if (!_receiverMatchesClassTracing(usage, scopeToClass, instanceTypeMap,
                                 index.getLineContent(filePath, usage.line), funcName)) continue;
                         }
 
                         // className scoping for references: require class-associated receiver
-                        if (className && matchType === 'reference') {
+                        if (scopeToClass && matchType === 'reference') {
                             if (!usage.receiver) continue;
-                            if (usage.receiver !== className &&
-                                !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === className)) {
+                            if (usage.receiver !== scopeToClass &&
+                                !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === scopeToClass)) {
                                 continue;
                             }
                         }
