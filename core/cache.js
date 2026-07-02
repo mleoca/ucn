@@ -61,7 +61,10 @@ const UCN_VERSION = require('../package.json').version;
 // arrays by (relativePath, startLine, type, className), calleeIndex sorted),
 // so fresh-build, cache-load, and incremental-rebuild states are
 // byte-equivalent and command output no longer depends on cache history.
-const CACHE_FORMAT_VERSION = 28;
+// v29 (fix #229): Rust impl members and Java class methods carry method-level
+// `generics` — generic-param receiver types (t.wipe() on TStore: Wipe) resolve
+// against the enclosing declaration instead of excluding as type mismatches.
+const CACHE_FORMAT_VERSION = 29;
 
 /**
  * Save index to cache file

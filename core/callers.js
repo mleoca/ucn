@@ -704,7 +704,6 @@ function findCallers(index, name, options = {}) {
                 const selfReceivers = new Set(['self', 'cls', 'this', 'super']);
                 const skipLocalBinding = call.receiver && !selfReceivers.has(call.receiver);
                 if (!bindingId && !skipLocalBinding) {
-                    let bindings = (fileEntry.bindings || []).filter(b => b.name === call.name);
                     // A bare call cannot bind to a METHOD def where bare names
                     // never reach methods (fix #220, cobra-measured): Go's
                     // func (c *Command) MarkFlagDirname and func MarkFlagDirname
@@ -717,15 +716,24 @@ function findCallers(index, name, options = {}) {
                     // cells.cell_len, not Text.cell_len) and a JS class
                     // member is not a file binding either — the structural
                     // dispatch gates can't own this case because a matched
-                    // bindingId bypasses them.
-                    if (!call.isMethod && bindings.length > 0 &&
-                        !langTraits(fileEntry.language)?.bareCallReachesMethods) {
-                        const defsOfName = index.symbols.get(call.name) || [];
-                        bindings = bindings.filter(b => {
-                            const sym = defsOfName.find(s => s.file === filePath && s.startLine === b.startLine);
+                    // bindingId bypasses them. Fix #229: the filter applies
+                    // per source file — sibling-file bindings from Go's
+                    // package-scope concat below carry interface members and
+                    // methods too (`type Notifier interface { Notify() }`
+                    // next to `func Notify()` stole the bindingId and
+                    // excluded the true caller as other-definition).
+                    const bareNeverMethod = !call.isMethod &&
+                        !langTraits(fileEntry.language)?.bareCallReachesMethods;
+                    const defsOfName = bareNeverMethod ? (index.symbols.get(call.name) || []) : null;
+                    const dropMethodBindings = (list, file) => {
+                        if (!bareNeverMethod || list.length === 0) return list;
+                        return list.filter(b => {
+                            const sym = defsOfName.find(s => s.file === file && s.startLine === b.startLine);
                             return !(sym && (sym.className || sym.receiver));
                         });
-                    }
+                    };
+                    let bindings = dropMethodBindings(
+                        (fileEntry.bindings || []).filter(b => b.name === call.name), filePath);
                     // For Go, also check sibling files in same directory (same package scope)
                     if (bindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
                         const dir = path.dirname(filePath);
@@ -734,7 +742,8 @@ function findCallers(index, name, options = {}) {
                             if (fp !== filePath) {
                                 const fe = index.files.get(fp);
                                 if (fe) {
-                                    const sibling = (fe.bindings || []).filter(b => b.name === call.name);
+                                    const sibling = dropMethodBindings(
+                                        (fe.bindings || []).filter(b => b.name === call.name), fp);
                                     bindings = bindings.concat(sibling);
                                 }
                             }
@@ -1037,8 +1046,17 @@ function findCallers(index, name, options = {}) {
                     fieldDispatchType = _declaredFieldInterfaceType(index, fieldHopRootType, call.receiverField, fileEntry.language);
                 }
 
-                // Skip uncertain calls unless resolved by same-class matching or explicitly requested
-                if (isUncertain && !resolvedBySameClass && !options.includeUncertain) {
+                // Skip uncertain calls unless resolved by same-class matching or
+                // explicitly requested. A declared-field hop type (fix #219) or
+                // interface-field dispatch type IS receiver evidence — those
+                // calls flow to the receiver-class disambiguation below, which
+                // confirms (receiver-hint), excludes (mismatch), or attributes
+                // possible-dispatch. Before fix #229 this gate fired first
+                // whenever the method name had no same-file binding, so the
+                // tier of `this.logger.info()` depended on file LAYOUT (same
+                // file confirmed, cross-file routed method-no-evidence).
+                if (isUncertain && !resolvedBySameClass && !options.includeUncertain &&
+                    !fieldHopType && !fieldDispatchType) {
                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                     routeUnverified(filePath, fileEntry, call,
                         call.isMethod ? 'method-no-evidence' : 'ambiguous-binding', calledAs);
@@ -1239,8 +1257,15 @@ function findCallers(index, name, options = {}) {
                         recordExcluded(filePath, call.line, 'method-kind-mismatch');
                         continue;
                     }
-                    if (!call.isMethod && targetHasClass) {
-                        // Non-method call but target is a class method — skip
+                    if (!call.isMethod && targetHasClass &&
+                        !(!call.receiver && langTraits(fileEntry.language)?.bareCallReachesMethods)) {
+                        // Non-method call but target is a class method — skip.
+                        // Bare-call direction honors bareCallReachesMethods
+                        // (fix #229, same as the callback-path twin): a Java
+                        // bare call CAN denote a method — static imports
+                        // (`import static app.U.twice; twice(21)`) and
+                        // inherited implicit this-calls. Package-qualified
+                        // calls (receiver set) keep the exclusion.
                         recordExcluded(filePath, call.line, 'method-kind-mismatch');
                         continue;
                     }
@@ -1462,15 +1487,17 @@ function findCallers(index, name, options = {}) {
                     const targetTypes = dispatchTargetTypes(targetDefs);
                     if (targetTypes.size > 0) {
                         // Use inferred receiverType when available (Go/Java/Rust parameter type tracking)
-                        // Generic type parameters by convention are not type
-                        // identity in EITHER direction (fix #220): a receiver
-                        // typed 'T' neither validates against a blanket-impl
-                        // target named 'T' nor excludes a concrete target —
-                        // T may be instantiated with anything. A short-caps
-                        // name with a real project type def is a class.
+                        // Generic type parameters are not type identity in
+                        // EITHER direction (fix #220, made precise by #229):
+                        // a receiver typed 'T' or 'TStore' neither validates
+                        // against a blanket-impl target nor excludes a
+                        // concrete one — T may be instantiated with anything,
+                        // including the target class. Declared-in-enclosing-
+                        // scope check first (`fn f<TStore: Wipe>(t: &TStore)`
+                        // shadows even a same-named project type), 1-2-char
+                        // ALL-CAPS convention as fallback.
                         let knownType = call.receiverType || fieldHopType;
-                        if (knownType && /^[A-Z][A-Z0-9]?$/.test(knownType) &&
-                            !(index.symbols.get(knownType) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) knownType = null;
+                        if (knownType && _isGenericParamReceiverType(index, filePath, call.line, knownType)) knownType = null;
                         if (knownType) {
                             const viaFieldHop = !call.receiverType; // declared-field hop (fix #202)
                             // Exclusion requires an UNRELATED type. A receiver typed
@@ -1589,7 +1616,14 @@ function findCallers(index, name, options = {}) {
                                         localTypeCache.set(cacheKey, localTypes);
                                     }
                                     if (localTypes) {
-                                        const inferredType = localTypes.get(call.receiver);
+                                        // The inference map re-derives receiver types
+                                        // from the calls cache — the same generic-param
+                                        // guard applies (fix #229: `t.wipe()` on
+                                        // `t: &T` used to re-infer 'T' here and
+                                        // exclude after the typed branch nulled it).
+                                        let inferredType = localTypes.get(call.receiver);
+                                        if (inferredType && _isGenericParamReceiverType(
+                                            index, filePath, call.line, inferredType)) inferredType = null;
                                         if (inferredType) {
                                             if (targetTypes.has(inferredType)) {
                                                 // Identity discipline (fix #206) — same as the
@@ -1738,12 +1772,35 @@ function findCallers(index, name, options = {}) {
                 // syntactic args is not evidence in Go — only too-many prunes.
                 // Binding/same-class evidence outranks the count (then a
                 // mismatch more likely means our param parse is wrong).
+                let arityNoFit = false;
                 if (collectAccount && !bindingId && !resolvedBySameClass &&
                     call.argCount != null && !call.argSpread &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                     !_callArityCompatible(call, targetDefs, fileEntry.language)) {
-                    recordExcluded(filePath, call.line, 'arity-mismatch');
-                    continue;
+                    // Fits-elsewhere carve-out (fix #229): "binds a different
+                    // symbol" needs a different symbol the call COULD bind.
+                    // When the argument count also fits no OTHER callable def
+                    // of the name project-wide, a wrong-arity call at an
+                    // EVIDENCE-BACKED site is a BROKEN CALL SITE (or a parse
+                    // gap) — the thing verify/diff-impact exist to surface
+                    // after a signature change. Marked and allowed to flow:
+                    // receiver/type-qualified evidence confirms it into
+                    // verify's arg-check (mismatch band). The exclusion stays
+                    // when a sibling overload or another definition fits the
+                    // count (jdtls-measured), and the dispatch gate below
+                    // re-excludes marked calls that would only confirm via the
+                    // single-owner rule — that rule presumes no other
+                    // candidate, which the wrong arity disproves toward
+                    // EXTERNAL code (Arrays.asList(1,2,3) vs a project 0-param
+                    // asList: unique project ownership is not evidence here).
+                    const pinnedKeys = new Set(targetDefs.map(d => `${d.file}:${d.startLine}`));
+                    const otherDefs = definitions.filter(d =>
+                        !NON_CALLABLE_TYPES.has(d.type) && !pinnedKeys.has(`${d.file}:${d.startLine}`));
+                    if (otherDefs.length > 0 && _callArityCompatible(call, otherDefs, fileEntry.language)) {
+                        recordExcluded(filePath, call.line, 'arity-mismatch');
+                        continue;
+                    }
+                    arityNoFit = true;
                 }
 
                 // Overload discipline (fix #205, languages with arity/type
@@ -1989,6 +2046,75 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
+                        // Wrong-arity call that fits no project def (fix #229
+                        // carve-out marker): the single-owner rule presumes no
+                        // other candidate exists, but the arity disproves the
+                        // project-side match — the call binds EXTERNAL code
+                        // (Arrays.asList(1,2,3)). Only receiver/type-qualified
+                        // evidence may carry a wrong-arity call to the
+                        // mismatch band; ownership alone re-excludes here.
+                        if (arityNoFit) {
+                            recordExcluded(filePath, call.line, 'arity-mismatch');
+                            continue;
+                        }
+                    }
+                }
+
+                // Bare-call name ownership, Java (fix #229): where
+                // bareCallReachesMethods a bare call CAN denote a method —
+                // via a static import or an inherited implicit this-call —
+                // but file-level scope evidence cannot CONFIRM one: a bare
+                // name in Java resolves through the class scope (own +
+                // inherited members) or a static import, never through
+                // package-mate visibility. Confirmed tier: the enclosing
+                // class is a dispatch-capable receiver type for the target
+                // (inherited this-call), or a static import of the name /
+                // wildcard static import resolves to a target file
+                // (compiler-grade name evidence, the #217 rule). A static
+                // import resolving to a DIFFERENT project file owns the name
+                // (other-definition-import); everything else routes VISIBLE
+                // (external static imports and unresolved ancestry are not
+                // exclusion evidence — JLS scope nesting also lets inherited
+                // members shadow imports, so 'unknown' never excludes).
+                if (collectAccount && !call.isMethod && !call.receiver && !bindingId &&
+                    !resolvedBySameClass &&
+                    langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                    langTraits(fileEntry.language)?.bareCallReachesMethods &&
+                    targetDefs2.length > 0 && targetDefs2.every(d =>
+                        !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver))) {
+                    const tTypes = dispatchTargetTypes(targetDefs2);
+                    const enclosingClass = callerSymbol && callerSymbol.className;
+                    if (!(enclosingClass && tTypes.has(enclosingClass))) {
+                        const targetFiles = new Set(targetDefs2.map(d => d.file).filter(Boolean));
+                        let verdict = null; // 'target' | 'other' | 'unknown'
+                        for (const im of (fileEntry.importBindings || [])) {
+                            const mod = String(im.module || '');
+                            if (im.name === call.name && mod.endsWith('.' + call.name)) {
+                                const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[mod];
+                                verdict = rel
+                                    ? (targetFiles.has(path.join(index.root, rel)) ? 'target' : 'other')
+                                    : 'unknown';
+                                break;
+                            }
+                        }
+                        if (verdict === null && fileEntry.moduleResolved) {
+                            for (const [mod, rel] of Object.entries(fileEntry.moduleResolved)) {
+                                if (mod.endsWith('.*') && targetFiles.has(path.join(index.root, rel))) {
+                                    verdict = 'target';
+                                    break;
+                                }
+                            }
+                        }
+                        if (verdict === 'other') {
+                            recordExcluded(filePath, call.line, 'other-definition-import');
+                            continue;
+                        }
+                        if (verdict !== 'target') {
+                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                dispatchCandidates: methodOwnerKeys().size,
+                            });
+                            continue;
+                        }
                     }
                 }
 
@@ -2134,6 +2260,31 @@ function findCallers(index, name, options = {}) {
                         routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
                             dispatchCandidates: methodOwnerKeys().size,
                         });
+                        continue;
+                    }
+                }
+
+                // Receiver-less counterpart of the gate's arityNoFit guard
+                // (fix #229): a bare/package-qualified wrong-arity call may
+                // reach the mismatch band only on compiler-grade NAME evidence
+                // — an import binding of the name resolving to a target file
+                // (a `use`/static-import pins the name, so the wrong arity is
+                // a broken call site, not another target). Scope-match alone
+                // cannot carry it: the arity disproves the project-side match,
+                // so the call more likely binds code UCN cannot see.
+                if (arityNoFit && !call.isMethod) {
+                    let arityNameEvidence = false;
+                    const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
+                    for (const im of (fileEntry.importBindings || [])) {
+                        if (im.name !== call.name) continue;
+                        const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[String(im.module || '')];
+                        if (rel && tFiles.has(path.join(index.root, rel))) {
+                            arityNameEvidence = true;
+                            break;
+                        }
+                    }
+                    if (!arityNameEvidence) {
+                        recordExcluded(filePath, call.line, 'arity-mismatch');
                         continue;
                     }
                 }
@@ -3988,6 +4139,74 @@ function _projectTopLevelNames(index) {
 }
 
 const IDENTITY_TYPE_KINDS = new Set(['class', 'struct', 'interface', 'trait', 'enum']);
+
+/**
+ * Parse a generics/type-parameter list text (`<T: Wipe, U>`, `<T extends X>`,
+ * Go `[T any, U comparable]`) into the set of declared type-parameter NAMES.
+ * Rust lifetimes (`'a`) and const params (`const N: usize`) are not receiver
+ * types and are skipped.
+ */
+function _genericParamNames(genericsText) {
+    if (!genericsText || typeof genericsText !== 'string') return null;
+    const inner = genericsText.trim().replace(/^[<[]/, '').replace(/[>\]]$/, '');
+    const names = new Set();
+    let depth = 0, start = 0;
+    const parts = [];
+    for (let i = 0; i < inner.length; i++) {
+        const ch = inner[i];
+        if (ch === '<' || ch === '[' || ch === '(') depth++;
+        else if (ch === '>' || ch === ']' || ch === ')') depth--;
+        else if (ch === ',' && depth === 0) { parts.push(inner.slice(start, i)); start = i + 1; }
+    }
+    parts.push(inner.slice(start));
+    for (let p of parts) {
+        p = p.trim();
+        if (!p || p.startsWith("'") || p.startsWith('const ')) continue;
+        const m = p.match(/^([A-Za-z_][A-Za-z0-9_]*)/);
+        if (m) names.add(m[1]);
+    }
+    return names.size > 0 ? names : null;
+}
+
+/**
+ * Is typeName a declared GENERIC TYPE PARAMETER in scope at this call site —
+ * on the enclosing function itself (`fn f<TStore: Wipe>(t: &TStore)`) or on
+ * its class/struct (`impl<T> Processor<T>` methods see the struct's `<T>`)?
+ * A generic param is never type identity in either direction (fix #229, the
+ * #220(1) convention rule made precise): it may be instantiated with the
+ * target class, so it neither validates nor excludes — and the declaration
+ * shadows any same-named project type inside the function.
+ */
+function _isEnclosingGenericParam(index, filePath, line, typeName) {
+    const enclosing = index.findEnclosingFunction(filePath, line, true);
+    if (!enclosing) return false;
+    const own = _genericParamNames(enclosing.generics);
+    if (own && own.has(typeName)) return true;
+    if (enclosing.className) {
+        const classDefs = (index.symbols.get(enclosing.className) || []).filter(d =>
+            IDENTITY_TYPE_KINDS.has(d.type) && d.file === filePath);
+        for (const cd of classDefs) {
+            const cg = _genericParamNames(cd.generics);
+            if (cg && cg.has(typeName)) return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * Receiver-type identity guard shared by the parser-typed branch and the
+ * local-inference fallback: a name is NOT usable as type identity when it is
+ * a generic type param — declared in the enclosing scope, or matching the
+ * 1-2-char ALL-CAPS convention (T, K, V, T1) with no project type def (the
+ * declaring scope may be outside what UCN parsed).
+ */
+function _isGenericParamReceiverType(index, filePath, line, typeName) {
+    if (!typeName) return false;
+    if (/^[A-Z][A-Z0-9]?$/.test(typeName) &&
+        !(index.symbols.get(typeName) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) return true;
+    return _isEnclosingGenericParam(index, filePath, line, typeName);
+}
+
 function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs) {
     const typeDefs = (index.symbols.get(knownType) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
     if (typeDefs.length <= 1) return 'target';

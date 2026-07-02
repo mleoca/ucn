@@ -6387,3 +6387,57 @@ describe('deadcode: TS method on out-of-tree base is not dead (fix: #210 analog)
         } finally { rm(dir); }
     });
 });
+
+describe('fix #229 (TS): cross-file declared-field receiver hop confirms at receiver-hint', () => {
+    // `this.logger.info('x')` with `private logger: Logger` — the uncertain
+    // gate used to fire before the field-hop evidence was consumed whenever
+    // the method name had no same-file binding, so the tier depended on file
+    // LAYOUT: same file confirmed, cross-file routed 'method-no-evidence'
+    // (and unverified sites are not arg-checked — a wrong-arity call went
+    // green). Field-hop evidence now flows to receiver-class disambiguation
+    // regardless of layout.
+    it('cross-file field hop confirms and arg-checks', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'logger.ts': 'export class Logger {\n  info(msg: string): void {}\n}\n',
+            'mgr.ts': "import { Logger } from './logger';\nexport class Manager {\n  private logger: Logger;\n  constructor() { this.logger = new Logger(); }\n  run(): void { this.logger.info('x'); }\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'info', className: 'Logger' });
+            assert.ok(v.ok, `verify failed: ${v.error}`);
+            assert.strictEqual(v.result.valid, 1, 'cross-file field-hop call must be confirmed valid');
+            assert.strictEqual(v.result.unverifiedCount, 0);
+        } finally { rm(dir); }
+    });
+
+    it('wrong-arity cross-file field-hop call is a mismatch, not unverified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'logger.ts': 'export class Logger {\n  info(msg: string): void {}\n}\n',
+            'mgr.ts': "import { Logger } from './logger';\nexport class Manager {\n  private logger: Logger;\n  constructor() { this.logger = new Logger(); }\n  run(): void { this.logger.info(); }\n}\n",
+        });
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'info', className: 'Logger' });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.mismatches, 1, 'zero-arg call vs 1-required must be a mismatch');
+        } finally { rm(dir); }
+    });
+
+    it('builtin field type still excludes (WeakMap.has is not Registry.has)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'registry.ts': 'export class Registry {\n  has(k: string): boolean { return true; }\n}\n',
+            'user.ts': 'export class Cache {\n  private _map: WeakMap<object, string> = new WeakMap();\n  check(s: object): boolean { return this._map.has(s); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'Registry.has' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.callers.length, 0);
+            assert.strictEqual((r.result.unverifiedCallers || []).length, 0,
+                'WeakMap-typed field receiver is excluded-with-reason, not unverified');
+        } finally { rm(dir); }
+    });
+});

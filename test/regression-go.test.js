@@ -5559,3 +5559,57 @@ describe('fix #223: Go multi-line receiver method call reports the field line', 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #229 (Go): sibling-file interface member must not steal the bare-call binding', () => {
+    // a.go declares BOTH `type Notifier interface { Notify(int) error }` and
+    // `func Notify(int) error`; b.go calls bare `Notify(3)`. A bare Go call
+    // can never denote a method (bareCallReachesMethods=false), but the
+    // package-scope sibling-binding concat used to skip the kind filter —
+    // the interface MEMBER binding won bindingId and the true caller was
+    // excluded other-definition (verify valid=0, plan rename missed the site).
+    const FILES = {
+        'go.mod': 'module example.com/m\ngo 1.21\n',
+        'a.go': `package m
+
+type Notifier interface {
+	Notify(x int) error
+}
+
+func Notify(x int) error {
+	return nil
+}
+`,
+        'b.go': `package m
+
+func direct() error {
+	return Notify(3)
+}
+`,
+    };
+
+    it('confirms the cross-file bare call against the standalone function', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'verify', { name: 'Notify' });
+            assert.ok(r.ok, `verify failed: ${r.error}`);
+            assert.strictEqual(r.result.valid, 1, 'b.go:4 call must be confirmed valid');
+            assert.ok(r.result.validDetails.some(v => v.file === 'b.go' && v.line === 4));
+            const ctx = execute(index, 'context', { name: 'Notify' });
+            assert.ok(ctx.ok);
+            assert.ok(ctx.result.callers.some(c => c.relativePath === 'b.go' && c.line === 4),
+                'context must list b.go:4 as a confirmed caller');
+        } finally { rm(dir); }
+    });
+
+    it('plan rename lists the cross-file call site', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'Notify', renameTo: 'NotifyAll' });
+            assert.ok(r.ok, `plan failed: ${r.error}`);
+            const files = (r.result.changes || []).map(c => c.file);
+            assert.ok(files.includes('b.go'), `plan must include b.go, got: ${files.join(', ')}`);
+        } finally { rm(dir); }
+    });
+});

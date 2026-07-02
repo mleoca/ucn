@@ -2583,3 +2583,125 @@ describe('fix #220 (Java): chained receivers + bare-call control', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #229 (Java): bare-call name ownership — static imports and inheritance', () => {
+    // `import static app.U.twice; twice(21)` is a compiler-certain call to
+    // U.twice — the main-path kind filter used to exclude it method-kind-
+    // mismatch (the callback path honored bareCallReachesMethods, the plain
+    // path did not), so verify went green and plan rename broke the build.
+    // The replacement gate also stops the opposite FP: package-mate scope is
+    // NOT how Java resolves bare names, so a bare call with no static import
+    // and no ancestry routes visible instead of confirming scope-match.
+    const FILES = {
+        'pom.xml': '<project/>',
+        'app/U.java': 'package app;\npublic class U {\n    public static int twice(int x) { return x * 2; }\n}\n',
+        'app/C.java': 'package app;\nimport static app.U.twice;\npublic class C {\n    int use() { return twice(21); }\n}\n',
+        'app/D.java': 'package app;\nimport external.lib.Base;\npublic class D extends Base {\n    int other() { return twice(9); }\n}\n',
+    };
+
+    it('static-import bare call confirms; no-import bare call routes visible', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'twice' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c => c.relativePath === 'app/C.java' && c.line === 4),
+                'C.java:4 (static import) must be confirmed');
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'app/D.java'),
+                'D.java (no static import, external base) must NOT be confirmed');
+            assert.ok((r.result.unverifiedCallers || []).some(u =>
+                (u.relativePath || u.file) === 'app/D.java' && u.line === 4),
+                'D.java:4 must be visible unverified');
+        } finally { rm(dir); }
+    });
+
+    it('verify counts the static-import call; plan rename lists the call site', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'twice' });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.valid, 1, 'static-import call site must be arg-checked valid');
+            const p = execute(index, 'plan', { name: 'twice', renameTo: 'thrice' });
+            assert.ok(p.ok);
+            const callChange = (p.result.changes || []).find(c => c.file === 'app/C.java' && c.line === 4);
+            assert.ok(callChange, 'plan must list the C.java:4 call site, not just the import line');
+        } finally { rm(dir); }
+    });
+
+    it('static import bound to a DIFFERENT class excludes against the pinned target', () => {
+        const dir = tmp({
+            ...FILES,
+            'app/V.java': 'package app;\npublic class V {\n    public int twice(int x) { return x + x; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'V.twice' });
+            assert.ok(r.ok);
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'app/C.java'),
+                'C.java static-imports U.twice — never a confirmed caller of V.twice');
+            assert.ok(!(r.result.unverifiedCallers || []).some(u => (u.relativePath || u.file) === 'app/C.java'),
+                'C.java is excluded other-definition-import, not unverified');
+        } finally { rm(dir); }
+    });
+
+    it('cross-file inherited bare this-call confirms', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'app/V.java': 'package app;\npublic class V {\n    public int twice(int x) { return x + x; }\n}\n',
+            'app/Sub.java': 'package app;\npublic class Sub extends V {\n    int go() { return twice(4); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'V.twice' });
+            assert.ok(r.ok);
+            assert.ok(r.result.callers.some(c => c.relativePath === 'app/Sub.java' && c.line === 3),
+                'inherited implicit this-call must be confirmed');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #229 (Java): wrong-arity evidence-backed calls reach the mismatch band', () => {
+    // The #205 arity prune excluded any call whose arg count fit no pinned
+    // def — but "binds a different symbol" needs a different symbol the call
+    // COULD bind. With no other def fitting the count, a wrong-arity call is
+    // the broken call site verify/diff-impact exist to surface (the
+    // pre-commit false-green). Sibling-fitting calls keep the exclusion.
+    it('typed-receiver and type-qualified static wrong-arity calls are mismatches', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'app/A.java': 'package app;\npublic class A {\n    public String f(String a, int b, boolean c) { return a; }\n    public static String g(String a, int b) { return a; }\n}\n',
+            'app/B.java': 'package app;\npublic class B {\n    void viaStatic() { A.g("only-one"); }\n    void viaTyped(A a) { a.f("x", 2); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const vg = execute(index, 'verify', { name: 'g' });
+            assert.ok(vg.ok);
+            assert.strictEqual(vg.result.mismatches, 1, 'A.g("only-one") must be a visible mismatch');
+            const vf = execute(index, 'verify', { name: 'f' });
+            assert.ok(vf.ok);
+            assert.strictEqual(vf.result.mismatches, 1, 'a.f("x",2) must be a visible mismatch');
+        } finally { rm(dir); }
+    });
+
+    it('call fitting NO overload is a mismatch; call fitting a sibling stays excluded', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'app/Calc.java': 'package app;\npublic class Calc {\n    public int add(int a) { return a; }\n    public int add(int a, int b) { return a + b; }\n}\n',
+            'app/UseCalc.java': 'package app;\npublic class UseCalc {\n    int go(Calc c) { return c.add(1, 2, 3); }\n}\n',
+            'app/UseCalc2.java': 'package app;\npublic class UseCalc2 {\n    int go(Calc c) { return c.add(4, 5); }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            // Pin add(int): the 3-arg call fits neither overload — mismatch;
+            // the 2-arg call fits the sibling add(int,int) — excluded.
+            const v = execute(index, 'verify', { name: 'add', file: 'Calc.java', line: 3 });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.mismatches, 1);
+            assert.ok(v.result.mismatchDetails.some(m => m.file === 'app/UseCalc.java'),
+                'the no-overload-fits site is the mismatch');
+            assert.ok(!v.result.mismatchDetails.some(m => m.file === 'app/UseCalc2.java'),
+                'the sibling-fitting site stays excluded');
+        } finally { rm(dir); }
+    });
+});

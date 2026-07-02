@@ -681,6 +681,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     memberType = 'abstract';
                 }
 
+                const memberGenerics = extractGenerics(child);
                 members.push({
                     name: nameNode.text,
                     params: extractJavaParams(paramsNode),
@@ -693,7 +694,10 @@ function extractClassMembers(classNode, codeOrLines) {
                     ...(returnType && { returnType }),
                     ...(docstring && { docstring }),
                     ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
-                    ...(nameLine !== startLine && { nameLine })
+                    ...(nameLine !== startLine && { nameLine }),
+                    // Method-level type params (fix #229): generic-param receiver
+                    // types inside the method resolve against this declaration.
+                    ...(memberGenerics && { generics: memberGenerics })
                 });
             }
         }

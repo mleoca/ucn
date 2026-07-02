@@ -825,6 +825,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 for (const attr of attributes) modifiers.push(attr);
                 if (inCfgTest) modifiers.push('cfg_test_module');
 
+                const memberGenerics = extractGenerics(child);
                 members.push({
                     name: nameNode.text,
                     params: extractRustParams(paramsNode),
@@ -837,7 +838,10 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                     modifiers,
                     ...(typeName && { receiver: typeName }),  // All impl members get receiver for findMethodsForType
                     ...(returnType && { returnType }),
-                    ...(docstring && { docstring })
+                    ...(docstring && { docstring }),
+                    // Method-level type params (fix #229): generic-param receiver
+                    // types inside the method resolve against this declaration.
+                    ...(memberGenerics && { generics: memberGenerics })
                 });
             }
         }

@@ -5538,3 +5538,68 @@ describe('fix #214: generic extends clauses split on top-level commas only', () 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #229: generic-param receivers are never type identity (Rust/Java/Go)', () => {
+    // fn f<T: Wipe>(t: &T) { t.wipe() } — T/TStore can be instantiated with
+    // the target class, so a generic-param receiver type must never exclude
+    // (receiver-type-mismatch) a possible dispatch into the target. Two old
+    // bypasses: the local-type-inference fallback re-inferred the nulled name
+    // from the calls cache, and multi-char names (TStore) escaped the
+    // 1-2-char convention regex. Now the enclosing scope's declared type
+    // params decide, any name length.
+    function callerBands(index, name) {
+        const r = execute(index, 'context', { name });
+        assert.ok(r.ok, `context failed: ${r.error}`);
+        return {
+            confirmed: (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`),
+            unverified: (r.result.unverifiedCallers || []).map(u => `${u.relativePath || u.file}:${u.line}`),
+        };
+    }
+
+    it('Rust: inline bound, where clause, and multi-char TStore all route visible; concrete mismatch still excludes', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "p"\nversion = "0.1.0"\n',
+            'src/lib.rs': 'mod store;\nmod a;\nmod b;\nmod d;\nmod e;\n',
+            'src/store.rs': 'pub trait Wipe { fn wipe(&self) -> bool; }\npub struct MemStore;\nimpl Wipe for MemStore { fn wipe(&self) -> bool { true } }\n',
+            'src/a.rs': 'use crate::store::Wipe;\npub fn inline_bound<T: Wipe>(t: &T) -> bool { t.wipe() }\n',
+            'src/b.rs': 'use crate::store::Wipe;\npub fn where_bound<T>(t: &T) -> bool where T: Wipe { t.wipe() }\n',
+            'src/d.rs': 'use crate::store::Wipe;\npub fn long_generic<TStore: Wipe>(t: &TStore) -> bool { t.wipe() }\n',
+            'src/e.rs': 'pub struct DiskStore;\nimpl DiskStore { pub fn wipe(&self) -> bool { false } }\npub fn concrete(d: &DiskStore) -> bool { d.wipe() }\n',
+        });
+        try {
+            const bands = callerBands(idx(dir), 'MemStore.wipe');
+            for (const site of ['src/a.rs:2', 'src/b.rs:2', 'src/d.rs:2']) {
+                assert.ok(bands.unverified.includes(site),
+                    `${site} must be visible unverified, got: ${JSON.stringify(bands)}`);
+            }
+            assert.ok(!bands.unverified.includes('src/e.rs:3') && !bands.confirmed.includes('src/e.rs:3'),
+                'concrete DiskStore receiver stays excluded');
+        } finally { rm(dir); }
+    });
+
+    it('Java: multi-char generic method type param routes visible', () => {
+        const dir = tmp({
+            'Wiper.java': 'public interface Wiper {\n    boolean wipe();\n}\n',
+            'MemStore.java': 'public class MemStore implements Wiper {\n    public boolean wipe() { return true; }\n}\n',
+            'Runner.java': 'public class Runner {\n    public <TStore extends Wiper> boolean run(TStore t) {\n        return t.wipe();\n    }\n}\n',
+        });
+        try {
+            const bands = callerBands(idx(dir), 'MemStore.wipe');
+            assert.ok(bands.unverified.includes('Runner.java:3'),
+                `Runner.java:3 must be visible unverified, got: ${JSON.stringify(bands)}`);
+        } finally { rm(dir); }
+    });
+
+    it('Go: multi-char generic type param routes visible', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'store.go': 'package m\n\ntype Wiper interface {\n\tWipe() bool\n}\n\ntype MemStore struct{}\n\nfunc (MemStore) Wipe() bool { return true }\n',
+            'run.go': 'package m\n\nfunc Run[TStore Wiper](t TStore) bool {\n\treturn t.Wipe()\n}\n',
+        });
+        try {
+            const bands = callerBands(idx(dir), 'MemStore.Wipe');
+            assert.ok(bands.unverified.includes('run.go:4'),
+                `run.go:4 must be visible unverified, got: ${JSON.stringify(bands)}`);
+        } finally { rm(dir); }
+    });
+});
