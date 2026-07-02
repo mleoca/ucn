@@ -1445,16 +1445,32 @@ function plan(index, name, options = {}) {
         }
         const callerArgIndex = paramIndex - selfOffset;
 
-        // Describe changes at each call site
-        for (const site of planCallSites) {
-            if (site.args && site.argCount > callerArgIndex) {
-                changes.push({
-                    file: site.file,
-                    line: site.line,
-                    expression: site.expression,
-                    suggestion: `Remove argument ${callerArgIndex + 1}: ${site.args[callerArgIndex] || '?'}`,
-                    args: site.args
-                });
+        // Removing the receiver param itself (self/cls/&self): bound calls
+        // pass it implicitly — no caller-side change exists (fix #230; used
+        // to emit "Remove argument 0: ?" at every site).
+        if (callerArgIndex >= 0) {
+            // Describe changes at each call site
+            for (const site of planCallSites) {
+                if (site.args && site.argCount > callerArgIndex) {
+                    changes.push({
+                        file: site.file,
+                        line: site.line,
+                        expression: site.expression,
+                        suggestion: `Remove argument ${callerArgIndex + 1}: ${site.args[callerArgIndex] || '?'}`,
+                        args: site.args
+                    });
+                } else if (!site.args) {
+                    // Arguments unparseable (macro bodies, generated code) —
+                    // surface for manual review instead of dropping silently
+                    // (fix #230).
+                    changes.push({
+                        file: site.file,
+                        line: site.line,
+                        expression: site.expression,
+                        suggestion: 'Could not parse arguments — review this call site manually',
+                        needsReview: true
+                    });
+                }
             }
         }
     }
@@ -1463,10 +1479,18 @@ function plan(index, name, options = {}) {
         operation = 'rename';
         newSignature = currentSignature.replace(new RegExp('\\b' + escapeRegExp(name) + '\\b'), options.renameTo);
 
-        // All call sites need renaming
+        // All call sites need renaming. Global replace: a line with several
+        // calls (`compute(compute(1))`) renames every occurrence, and the
+        // line appears ONCE however many call records it holds (fix #230 —
+        // the non-global regex left the inner call behind and emitted a
+        // duplicate entry per record).
+        const renamedLines = new Set();
         for (const site of planCallSites) {
+            const lineKey = `${site.file}:${site.line}`;
+            if (renamedLines.has(lineKey)) continue;
+            renamedLines.add(lineKey);
             const newExpression = site.expression.replace(
-                new RegExp('\\b' + escapeRegExp(name) + '\\b'),
+                new RegExp('\\b' + escapeRegExp(name) + '\\b', 'g'),
                 options.renameTo
             );
             changes.push({
@@ -1478,7 +1502,17 @@ function plan(index, name, options = {}) {
             });
         }
 
-        // Also include import statements that reference the renamed function
+        // Also include import statements that reference the renamed function.
+        // Name ownership (fix #230, the #217 rule): an import of the same
+        // NAME from an unrelated module is not this rename's import —
+        // renaming alpha.compute must not rewrite `from beta import compute`
+        // (the plan's own call-site sweep already excludes caller_b's calls
+        // as other-definition-import; the import pass has to agree).
+        // 'no' (the binding provably resolves elsewhere) skips; 'unknown'
+        // (CJS surfaces, star imports, resolver gaps) keeps the import —
+        // a missed import breaks the rename just as surely.
+        const { _nameBindingReaches } = require('./callers');
+        const renameTargetFiles = new Set([def.file]);
         const usages = index.usages(name, { codeOnly: true });
         const importUsages = usages.filter(u => u.usageType === 'import' && !u.isDefinition);
         for (const imp of importUsages) {
@@ -1487,6 +1521,10 @@ function plan(index, name, options = {}) {
                 c.file === (imp.relativePath || imp.file) && c.line === imp.line
             );
             if (alreadyCovered) continue;
+            if (imp.file && def.file &&
+                _nameBindingReaches(index, imp.file, name, renameTargetFiles) === 'no') {
+                continue;
+            }
             const newImport = imp.content.trim().replace(
                 new RegExp('\\b' + escapeRegExp(name) + '\\b'),
                 options.renameTo

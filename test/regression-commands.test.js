@@ -4531,3 +4531,50 @@ describe('fix #230: verify class targets arg-check the CONSTRUCTOR; ctor-call pa
         } finally { rm(rsDir); }
     });
 });
+
+describe('fix #230: plan rename import ownership, multi-call lines, remove-param edges', () => {
+    it('rename never rewrites a same-name import from an unrelated module', () => {
+        const dir = tmp({
+            'alpha.py': 'def compute(x):\n    return x\n',
+            'beta.py': 'def compute(x, y, z):\n    return x + y + z\n',
+            'caller_a.py': 'from alpha import compute\n\ndef go():\n    return compute(1)\n',
+            'caller_b.py': 'from beta import compute\n\ndef go():\n    return compute(1, 2, 3)\n',
+        });
+        try {
+            const p = execute(idx(dir), 'plan', { name: 'compute', file: 'alpha.py', renameTo: 'calc' });
+            assert.ok(p.ok, `plan failed: ${p.error}`);
+            const files = p.result.changes.map(c => c.file);
+            assert.ok(files.includes('caller_a.py'), 'alpha importer included');
+            assert.ok(!files.includes('caller_b.py'),
+                `beta importer must NOT be rewritten: ${JSON.stringify(p.result.changes)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a line with nested calls renames every occurrence, once', () => {
+        const dir = tmp({
+            'alpha.py': 'def compute(x):\n    return x\n',
+            'nested.py': 'from alpha import compute\n\ndef nested():\n    return compute(compute(1))\n',
+        });
+        try {
+            const p = execute(idx(dir), 'plan', { name: 'compute', file: 'alpha.py', renameTo: 'calc' });
+            assert.ok(p.ok);
+            const lineChanges = p.result.changes.filter(c => c.file === 'nested.py' && c.line === 4);
+            assert.strictEqual(lineChanges.length, 1, 'one entry per line');
+            assert.strictEqual(lineChanges[0].newExpression, 'return calc(calc(1))');
+        } finally { rm(dir); }
+    });
+
+    it('remove-param self emits no bogus call-site changes', () => {
+        const dir = tmp({
+            'svc.py': 'class Svc:\n    def run(self, x):\n        return x\n\ndef use(s: Svc):\n    return s.run(5)\n',
+        });
+        try {
+            const p = execute(idx(dir), 'plan', { name: 'run', removeParam: 'self' });
+            assert.ok(p.ok);
+            assert.strictEqual(p.result.changes.length, 0,
+                `bound calls pass self implicitly — no caller-side change: ${JSON.stringify(p.result.changes)}`);
+            assert.ok(!p.result.before.params.includes('self') || p.result.after.params.length ===
+                p.result.before.params.length - 1, 'signature change recorded');
+        } finally { rm(dir); }
+    });
+});

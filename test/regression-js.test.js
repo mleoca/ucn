@@ -3655,15 +3655,23 @@ describe('BUG-BW: plan finds class-method call sites the same way verify does', 
             const i = idx(dir);
             const v = execute(i, 'verify', { name: 'process', className: 'Service' });
             assert.ok(v.ok);
-            const verifyTotal = v.result.totalCalls;
+            const verifyLines = new Set(v.result.validDetails.map(d => `${d.file}:${d.line}`));
+            assert.ok(verifyLines.size > 0, 'verify must find call sites');
             const p = execute(i, 'plan', { name: 'process', className: 'Service', renameTo: 'doProcess' });
             assert.ok(p.ok);
-            // Plan rename adds call-site changes for each verified call site
-            // (and may add an import-statement change too — count the call-site
-            // ones via the suggestion prefix).
+            // Plan rename emits ONE change per line (fix #230), with a global
+            // replace covering every call on that line — every line verify
+            // confirms must be covered.
             const renameChanges = p.result.changes.filter(c => c.suggestion.startsWith('Rename to:'));
-            assert.ok(renameChanges.length >= verifyTotal,
-                `plan should rename at least ${verifyTotal} call sites; got ${renameChanges.length}`);
+            const renamedLines = new Set(renameChanges.map(c => `${c.file}:${c.line}`));
+            for (const lk of verifyLines) {
+                assert.ok(renamedLines.has(lk), `plan must cover verified line ${lk}`);
+            }
+            const doubleLine = renameChanges.find(c => c.line === 7);
+            assert.ok(doubleLine, 'the two-call line is covered');
+            assert.strictEqual(doubleLine.newExpression,
+                'go(x: number) { this.svc.doProcess(x); this.svc.doProcess(x+1); }',
+                'both same-line calls renamed in the single entry');
         } finally { rm(dir); }
     });
 });
