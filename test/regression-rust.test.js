@@ -3038,3 +3038,62 @@ describe('fix #223: type-qualified same-name callee resolves per type', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #232 (Rust): Self:: path calls resolve same-class, never path-type-mismatch', () => {
+    // Campaign G1-rust BUG-1: `Self::new()` inside an impl was excluded
+    // path-type-mismatch whenever `new` had several project-wide defs — the
+    // multi-def path filter lacked the #222(2) Self exemption. Self IS the
+    // enclosing impl's type: same-class resolution confirms it for the impl's
+    // class and excludes it for a pinned sibling (#202b).
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': `pub struct Foo;
+
+impl Foo {
+    pub fn new() -> Self {
+        Foo
+    }
+}
+
+impl Default for Foo {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+pub struct Bar;
+
+impl Bar {
+    pub fn new() -> Self {
+        Bar
+    }
+}
+`,
+    };
+
+    it('confirms Self::new() for the enclosing impl class despite a same-name sibling', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'new', className: 'Foo' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c => c.line === 11 && c.callerName === 'default'),
+                'Self::new() inside impl Default for Foo must be a confirmed caller of Foo::new');
+        } finally { rm(dir); }
+    });
+
+    it('excludes Self::new() for a pinned sibling class with reason other-definition', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'new', className: 'Bar' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.callers.length, 0, 'Bar::new has no callers');
+            assert.ok(!(r.result.unverifiedCallers || []).some(u => u.line === 11),
+                'the Foo Self-call must not be unverified for Bar::new');
+            const excl = r.result.meta?.account?.excluded?.byReason || {};
+            assert.ok((excl['other-definition']?.count || excl['other-definition'] || 0) >= 1,
+                `Self::new must be excluded other-definition for Bar: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+});

@@ -6571,3 +6571,104 @@ module.exports = { cb, Holder };
         } finally { rm(dir); }
     });
 });
+
+describe('fix #232 (JS/TS): builtin-global receivers and optional-chaining receiver evidence', () => {
+    it('console.log routes possible-dispatch, never confirms via single-owner', () => {
+        // Campaign G1-ts BUG-1: console.log() confirmed scope-match against a
+        // private Logger.log — its single project-wide owner. console names a
+        // HOST object; demote-only (window.fn = projectFn is a real pattern).
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'logger.ts': 'export class Logger {\n  private log(msg: string): void {}\n  info(msg: string): void { this.log(msg); }\n}\n',
+            'main.ts': 'import { Logger } from "./logger";\nexport function run(l: Logger): void {\n  console.log("hi");\n  l.info("x");\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'log', className: 'Logger' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(!r.result.callers.some(c => c.relativePath === 'main.ts'),
+                'console.log must not be a confirmed caller of Logger.log');
+            const unv = (r.result.unverifiedCallers || []).find(u => u.relativePath === 'main.ts');
+            assert.ok(unv, 'console.log stays visible in the unverified band');
+            assert.ok((unv.dispatchVia || '').includes('console'),
+                `attribution names the builtin global: ${JSON.stringify(unv)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a shadowing project def of the global name keeps normal physics', () => {
+        // Counter-probe: `const console = new Logger()` — the name is project-
+        // bound, so the builtin-global demotion must not fire.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': 'class Logger { log(m) { return m; } }\nfunction run() {\n  const console = new Logger();\n  return console.log("hi");\n}\nmodule.exports = { Logger, run };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'log', className: 'Logger' });
+            assert.ok(r.ok);
+            assert.ok(r.result.callers.some(c => c.line === 4),
+                'locally-constructed console (typed Logger) must confirm');
+        } finally { rm(dir); }
+    });
+
+    it('optional-chaining calls get plain-call receiver physics', () => {
+        // Campaign G1-js BUG-1: b?.ping() carried receiverType A but routed
+        // method-no-evidence — the ?. optionality flag pre-empted the
+        // receiver-class disambiguation.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'use.js': 'class A { ping() { return 1; } }\nfunction plainCall() { const a = new A(); return a.ping(); }\nfunction optCall() { const b = new A(); return b?.ping(); }\nfunction optChainCall() { const c = new A(); return c?.ping?.(); }\nclass B { ping() { return 2; } }\nfunction other() { const d = new B(); return d?.ping(); }\nmodule.exports = { A, B, plainCall, optCall, optChainCall, other };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'ping', className: 'A' });
+            assert.ok(r.ok);
+            for (const line of [2, 3, 4]) {
+                assert.ok(r.result.callers.some(c => c.line === line),
+                    `line ${line} must be confirmed (receiver-hint)`);
+            }
+            assert.ok(!r.result.callers.some(c => c.line === 6),
+                'd?.ping() with receiverType B must not confirm against A.ping');
+            const excl = r.result.meta?.account?.excluded?.byReason || {};
+            assert.ok(excl['receiver-type-mismatch'],
+                `B-typed optional call excluded with reason: ${JSON.stringify(excl)}`);
+        } finally { rm(dir); }
+    });
+
+    it('bare foo?.() keeps routing unverified (no receiver evidence)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function foo() { return 1; }\nfunction run(cb) {\n  foo?.();\n}\nmodule.exports = { foo, run };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'foo' });
+            assert.ok(r.ok);
+            assert.ok(!r.result.callers.some(c => c.line === 3) ||
+                (r.result.unverifiedCallers || []).some(u => u.line === 3) === false,
+                'behavior stays visible-or-confirmed, never dropped');
+            const acct = r.result.meta?.account;
+            assert.ok(acct.conserved !== false, 'account conserves');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #232: related honors the definition pin', () => {
+    it('errors when --file matches no definition of the symbol', () => {
+        // Campaign G1-rust BUG-6 / G1-py BUG-3 / G1-ts BUG-2 (three cells
+        // independently): related fell back to a different file silently.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
+            'b.js': 'const { target } = require("./a");\nfunction user() { return target(); }\nmodule.exports = { user };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'related', { name: 'target', file: 'b.js' });
+            assert.strictEqual(r.ok, false, 'unsatisfiable pin must error');
+            assert.ok(/not found in files matching/.test(r.error), r.error);
+            const ok = execute(index, 'related', { name: 'target', file: 'a.js' });
+            assert.ok(ok.ok, 'matching pin still works');
+        } finally { rm(dir); }
+    });
+});

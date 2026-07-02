@@ -7,15 +7,15 @@ lie the tiered caller contract forbids. Target: 0.
 
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|
-| zod | ts-morph | 50 | 1861 | 99.4% | 30.6% | 0.6888 | **0** | 100.0% (8) | 100.0% |
+| zod | ts-morph | 50 | 1861 | 99.4% | 30.7% | 0.687 | **0** | 100.0% (9) | 100.0% |
 | preact-signals | ts-morph | 24 | 24 | 100.0% | 8.3% | 0.9167 | **0** | 66.7% (3) | 100.0% |
 | express | ts-morph | 39 | 262 | 100.0% | 0.3% | 0.9975 | **0** | 50.0% (2) | 100.0% |
-| httpx | pyright | 50 | 879 | 99.9% | 29.3% | 0.7061 | **0** | 100.0% (7) | 100.0% |
+| httpx | pyright | 50 | 879 | 99.9% | 37.3% | 0.6256 | **0** | 100.0% (7) | 100.0% |
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.9% | 6.0% | 0.9394 | **0** | 100.0% (13) | 100.0% |
 | grpc-go | gopls | 50 | 840 | 100.0% | 14.9% | 0.8509 | **0** | 100.0% (13) | 100.0% |
 | ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.0% | 0.8301 | **0** | 100.0% (1) | 100.0% |
-| cursive | rust-analyzer | 50 | 637 | 98.9% | 51.0% | 0.4785 | **0** | 100.0% (6) | 100.0% |
+| cursive | rust-analyzer | 50 | 637 | 98.9% | 51.2% | 0.4767 | **0** | 100.0% (6) | 100.0% |
 | gson | jdtls | 50 | 649 | 96.2% | 33.3% | 0.6295 | **0** | 100.0% (9) | 100.0% |
 
 ## Per-kind breakdown
@@ -26,7 +26,7 @@ evidence confirms the file but not the receiver type.
 
 | repo | kind | sampled | oracle edges | tier1 precision | unverified precision | separation | placement |
 |---|---|---|---|---|---|---|---|
-| zod | function | 36 | 1655 | 100.0% (142/142) | 29.7% (1510/5081) | 0.7028 | {"confirmed":142,"unverified":1510,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| zod | function | 36 | 1655 | 100.0% (142/142) | 29.9% (1510/5050) | 0.701 | {"confirmed":142,"unverified":1510,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | method | 10 | 199 | 96.8% (30/31) | 40.8% (171/419) | 0.5596 | {"confirmed":28,"unverified":171,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | class | 4 | 7 | 100.0% (7/7) | 0.0% (0/0) | n/a | {"confirmed":7,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | function | 13 | 17 | 100.0% (15/15) | 0.0% (0/3) | 1 | {"confirmed":14,"unverified":0,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -34,7 +34,7 @@ evidence confirms the file but not the receiver type.
 | preact-signals | class | 1 | 2 | 100.0% (3/3) | 0.0% (0/2) | 1 | {"confirmed":2,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | express | function | 37 | 262 | 100.0% (273/273) | 0.3% (2/802) | 0.9975 | {"confirmed":259,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":2,"missingUnexplained":0} |
 | httpx | function | 8 | 38 | 100.0% (38/38) | 0.0% (0/0) | n/a | {"confirmed":38,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| httpx | method | 30 | 365 | 99.7% (357/358) | 2.6% (8/303) | 0.9708 | {"confirmed":357,"unverified":8,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| httpx | method | 30 | 365 | 99.7% (357/358) | 3.8% (8/213) | 0.9596 | {"confirmed":357,"unverified":8,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | httpx | class | 12 | 476 | 100.0% (364/364) | 100.0% (114/114) | 0 | {"confirmed":362,"unverified":114,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | rich | function | 6 | 80 | 98.8% (79/80) | 2.9% (1/34) | 0.9581 | {"confirmed":79,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | rich | method | 32 | 312 | 96.7% (263/272) | 19.5% (49/251) | 0.7717 | {"confirmed":263,"unverified":49,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -49,7 +49,7 @@ evidence confirms the file but not the receiver type.
 | ripgrep | method | 31 | 186 | 100.0% (161/161) | 14.2% (21/148) | 0.8581 | {"confirmed":161,"unverified":21,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | class | 4 | 11 | 100.0% (6/6) | 100.0% (5/5) | 0 | {"confirmed":6,"unverified":5,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | function | 6 | 101 | 98.1% (101/103) | 0.0% (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| cursive | method | 39 | 519 | 99.4% (155/156) | 51.5% (352/683) | 0.4782 | {"confirmed":155,"unverified":352,"reportedNonCall":12,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| cursive | method | 39 | 519 | 99.4% (162/163) | 51.7% (355/686) | 0.4764 | {"confirmed":162,"unverified":355,"reportedNonCall":2,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | class | 5 | 17 | 100.0% (3/3) | 31.6% (6/19) | 0.6842 | {"confirmed":3,"unverified":6,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":8,"missingUnexplained":0} |
 | gson | method | 40 | 615 | 96.1% (273/284) | 30.6% (199/650) | 0.6551 | {"confirmed":273,"unverified":197,"reportedNonCall":13,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (8/8) | 100.0% (26/26) | 0 | {"confirmed":8,"unverified":26,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

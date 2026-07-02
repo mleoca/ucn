@@ -497,6 +497,8 @@ const HANDLERS = {
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
         const result = index.related(p.name, {

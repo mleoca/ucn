@@ -890,8 +890,15 @@ function findCallers(index, name, options = {}) {
                                 continue;
                             }
                         }
-                    } else if (['self', 'cls', 'this', 'super'].includes(call.receiver)) {
-                        // self/this/super.method() — resolve to same-class or parent method
+                    } else if (['self', 'cls', 'this', 'super'].includes(call.receiver) ||
+                               (call.receiver === 'Self' && fileEntry.language === 'rust')) {
+                        // self/this/super.method() — resolve to same-class or parent method.
+                        // Rust `Self::method()` (fix #232) is the path-call same-class form:
+                        // Self IS the enclosing impl's type, so the #202b pinning check
+                        // confirms it for the impl's class and excludes it for a pinned
+                        // sibling — it must never reach the uppercase path-receiver
+                        // discipline below (which excluded it as path-type-mismatch
+                        // whenever the method name had several project-wide owners).
                         const callerSymbol = index.findEnclosingFunction(filePath, call.line, true);
                         if (!callerSymbol?.className) {
                             if (!options.includeMethods) {
@@ -1055,8 +1062,14 @@ function findCallers(index, name, options = {}) {
                 // whenever the method name had no same-file binding, so the
                 // tier of `this.logger.info()` depended on file LAYOUT (same
                 // file confirmed, cross-file routed method-no-evidence).
+                // A parser-typed receiver defers too (fix #232): `b?.ping()`
+                // carries the optionality `uncertain` flag AND receiverType 'A'
+                // — the ?. is a null guard, not evidence uncertainty, so the
+                // record gets plain-call physics (validated match confirms,
+                // trusted mismatch excludes). Bare `foo?.()` has no receiver
+                // evidence and keeps routing here.
                 if (isUncertain && !resolvedBySameClass && !options.includeUncertain &&
-                    !fieldHopType && !fieldDispatchType) {
+                    !fieldHopType && !fieldDispatchType && !call.receiverType) {
                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                     routeUnverified(filePath, fileEntry, call,
                         call.isMethod ? 'method-no-evidence' : 'ambiguous-binding', calledAs);
@@ -1709,8 +1722,11 @@ function findCallers(index, name, options = {}) {
                                 }
                                 if (!matchesTarget) {
                                     // Rust/Go path calls (Type::method() / pkg.Method()): receiver IS the type name
-                                    // If it doesn't match target, it's definitely a different type — filter it
-                                    if (call.isPathCall && /^[A-Z]/.test(call.receiver)) {
+                                    // If it doesn't match target, it's definitely a different type — filter it.
+                                    // `Self` exempt (fix #232, the #222(2) rule): Self names the
+                                    // enclosing impl's type, not a foreign one — same-class
+                                    // resolution above owns it.
+                                    if (call.isPathCall && /^[A-Z]/.test(call.receiver) && call.receiver !== 'Self') {
                                         isUncertain = true;
                                         typeMismatch = true;
                                         if (collectAccount) {
@@ -2201,6 +2217,27 @@ function findCallers(index, name, options = {}) {
                         if (!typeQualifiedReceiver && call.receiverExternalFlow) {
                             routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                 dispatchVia: call.receiverExternalFlow,
+                                externalContract: true,
+                            });
+                            continue;
+                        }
+                        // Builtin-global receiver (fix #232, campaign-measured:
+                        // console.log() confirmed scope-match against a private
+                        // Logger.log — its single project-wide owner). console/
+                        // window/process/... name HOST objects, so unique
+                        // project ownership is not identity evidence for the
+                        // receiver. Shadowing keeps normal physics: a project
+                        // def, file binding, or parser-typed receiver of the
+                        // name wins. Demote-only (`window.fn = projectFn`
+                        // attachment is a real pattern — #222(4) name-knowledge
+                        // rule): visible possible-dispatch, never excluded.
+                        if (!typeQualifiedReceiver && call.receiver && !call.receiverType &&
+                            ['javascript', 'typescript', 'tsx', 'html'].includes(fileEntry.language) &&
+                            JS_GLOBAL_RECEIVERS.has(call.receiver) &&
+                            (index.symbols.get(call.receiver) || []).length === 0 &&
+                            !fileEntry.bindings?.some(b => b.name === call.receiver)) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: `${call.receiver} — builtin global`,
                                 externalContract: true,
                             });
                             continue;
@@ -3918,6 +3955,16 @@ function _qualifiedProducerDefs(index, fileEntry, receiver, defs) {
 // Builtin receiver types from literal/annotation inference (Python builtins,
 // JS globals, TS predefined types). Definitionally not project classes, so a
 // mismatch against a project class target is always positive evidence.
+// ECMAScript host/ambient OBJECT globals (fix #232): a method call on one of
+// these names — unshadowed by any project def or file binding — reaches host
+// code, not a project method. Name-knowledge only, so demote-only: routes
+// possible-dispatch, never excludes (window.fn = projectFn is a real pattern).
+const JS_GLOBAL_RECEIVERS = new Set([
+    'console', 'window', 'document', 'globalThis', 'process', 'navigator',
+    'Math', 'JSON', 'Reflect', 'Intl', 'localStorage', 'sessionStorage',
+    'crypto', 'performance', 'history', 'location', 'screen',
+]);
+
 const BUILTIN_RECEIVER_TYPES = new Set([
     'dict', 'list', 'set', 'tuple', 'str', 'int', 'float', 'bool', 'bytes', 'frozenset',
     'Array', 'String', 'Object', 'RegExp', 'Number', 'Boolean', 'Map', 'Set', 'Promise',
