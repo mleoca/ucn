@@ -6672,3 +6672,102 @@ describe('fix #232: related honors the definition pin', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #236 (JS): callee-side type-qualified and single-owner confirmation', () => {
+    // Campaign G1-js BUG-2: trace-down routed Kit.make() (imported class
+    // receiver) and k.run() (single project-wide owner) to unverifiedCallees
+    // 'uncertain-receiver' while context/reverseTrace CONFIRMED the identical
+    // edges — trace trees stopped expanding at statically-resolvable calls.
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'lib.js': 'class Kit {\n  static make() { return new Kit(); }\n  run() { return 1; }\n}\nmodule.exports = { Kit };',
+        'app.js': 'const { Kit } = require("./lib");\nfunction main() {\n  const k = Kit.make();\n  return k.run();\n}\nmodule.exports = { main };',
+    };
+
+    it('confirms Kit.make() through the imported class binding', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.ok(acct.some(c => c.name === 'make' && c.className === 'Kit' && c.tier === 'confirmed'),
+                `Kit.make() must confirm: ${JSON.stringify(acct.map(c => c.name))}`);
+        } finally { rm(dir); }
+    });
+
+    it('confirms k.run() via the single project-wide owner rule', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.ok(acct.some(c => c.name === 'run' && c.className === 'Kit' && c.tier === 'confirmed'),
+                `k.run() must confirm via single owner: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.strictEqual((acct.unverifiedCallees || []).length, 0,
+                `no unverified leftovers: ${JSON.stringify(acct.unverifiedCallees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('trace expands through the statically-resolvable calls', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'trace', { name: 'main' });
+            assert.ok(r.ok, `trace failed: ${r.error}`);
+            const children = (r.result.tree?.children || []).map(c => c.name);
+            assert.ok(children.includes('make') && children.includes('run'),
+                `trace main must expand make and run: ${JSON.stringify(children)}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: a second owner of the name defeats single-owner confirmation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'class Kit {\n  run() { return 1; }\n}\nclass Bot {\n  run() { return 2; }\n}\nmodule.exports = { Kit, Bot };',
+            'app.js': 'function main(k) {\n  return k.run();\n}\nmodule.exports = { main };',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.strictEqual(acct.filter(c => c.name === 'run').length, 0,
+                `two owners: k.run() must stay unverified: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.ok((acct.unverifiedCallees || []).some(u => u.name === 'run'),
+                'k.run() stays visible in the unverified band');
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: builtin-global receivers never confirm via single-owner (#232)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'class Logger {\n  error(msg) { return msg; }\n}\nmodule.exports = { Logger };',
+            'app.js': 'function main() {\n  console.error("boom");\n}\nmodule.exports = { main };',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.strictEqual(acct.filter(c => c.name === 'error').length, 0,
+                `console.error() must not confirm Logger.error: ${JSON.stringify(acct.map(c => c.name))}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: a capitalized receiver with no scope evidence keeps old routing', () => {
+        // `Component.render()` where Component is a parameter — the class of
+        // the same name is defined elsewhere and NOT imported (#215): no
+        // confirmation through an out-of-scope name.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'class Component {\n  render() { return 1; }\n}\nclass Widget {\n  render() { return 2; }\n}\nmodule.exports = { Component, Widget };',
+            'app.js': 'function main(Component) {\n  return Component.render();\n}\nmodule.exports = { main };',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.strictEqual(acct.filter(c => c.name === 'render').length, 0,
+                `unbound Component.render() must not confirm: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

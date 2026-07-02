@@ -2644,6 +2644,14 @@ function findCallees(index, def, options = {}) {
             localTypes = _buildTypedLocalTypeMap(index, def, calls);
         }
 
+        // Return-type flow map (lazy — only built if a single-owner
+        // resolution needs the external-producer/typed-receiver defeater).
+        let _flowMap;
+        const flowMap = () => {
+            if (_flowMap === undefined) _flowMap = _buildReturnTypeFlowMap(index, def.file, calls);
+            return _flowMap;
+        };
+
         let siteOrdinal = -1;
         for (const call of calls) {
             siteOrdinal++;
@@ -2682,6 +2690,35 @@ function findCallees(index, def, options = {}) {
                 if (hopRoot) fieldHopType = _declaredFieldType(index, hopRoot, call.receiverField, language);
             }
 
+            // Go package-qualified receiver: resolve the import module up
+            // front so the dispatch chain can tell package calls apart from
+            // type-qualified method expressions (fix #236 — a receiver that
+            // is neither stays eligible for type-qualified resolution below).
+            let goImportModule = null;
+            if (call.isMethod && call.receiver && langTraits(language)?.hasReceiverPackageCalls) {
+                const goImports = fileEntry?.imports || [];
+                // Handle Go version suffixes: k8s.io/klog/v2 → klog, not v2
+                goImportModule = goImports.find(mod => {
+                    const parts = mod.split('/');
+                    const last = parts[parts.length - 1];
+                    const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+                    return pkgName === call.receiver;
+                }) || null;
+            }
+
+            // Type-qualified receiver resolution (fix #236): the receiver
+            // NAMES a type — Foo::new() / Kit.make() / Helper.process().
+            // Only consulted when no stronger evidence (local type, parser
+            // receiverType, field hop, import package) claims the call.
+            let typeQual = null;
+            if (call.isMethod && !call.isConstructor && call.receiver &&
+                !call.receiverType && !fieldHopType && !goImportModule &&
+                !call.receiverIsModule && !call.selfAttribute &&
+                !['self', 'cls', 'this', 'super', 'Self'].includes(call.receiver) &&
+                !(localTypes && localTypes.has(call.receiver))) {
+                typeQual = _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language);
+            }
+
             // Smart method call handling:
             // - Go: include all method calls (Go doesn't use this/self/cls)
             // - self/this.method(): resolve to same-class method (handled below)
@@ -2690,8 +2727,10 @@ function findCallees(index, def, options = {}) {
             if (call.isMethod) {
                 if (call.selfAttribute && language === 'python') {
                     // Will be resolved in second pass below
-                } else if (['self', 'cls', 'this'].includes(call.receiver)) {
+                } else if (['self', 'cls', 'this'].includes(call.receiver) ||
+                           (call.receiver === 'Self' && language === 'rust')) {
                     // self.method() / cls.method() / this.method() — resolve to same-class method below
+                    // Rust Self::method() resolves same-impl the same way (fix #236, the #232 callee analog)
                 } else if (call.receiver === 'super') {
                     // super().method() — resolve to parent class method below
                 } else if (localTypes && localTypes.has(call.receiver)) {
@@ -2798,19 +2837,12 @@ function findCallees(index, def, options = {}) {
                         continue;
                     }
                     // No match found with inferred type — fall through to include as unresolved
-                } else if (langTraits(language)?.hasReceiverPackageCalls && call.receiver) {
+                } else if (goImportModule) {
                     // Go package-qualified calls: klog.Infof(), wait.UntilWithContext()
-                    // Check if receiver is an import alias and resolve to correct package
-                    const goImports = fileEntry?.imports || [];
-                    // Find import whose package name matches the receiver
-                    // Handle Go version suffixes: k8s.io/klog/v2 → klog, not v2
-                    const importModule = goImports.find(mod => {
-                        const parts = mod.split('/');
-                        const last = parts[parts.length - 1];
-                        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
-                        return pkgName === call.receiver;
-                    });
-                    if (importModule) {
+                    // The receiver is an import alias (resolved above) — find
+                    // definitions from that package.
+                    const importModule = goImportModule;
+                    {
                         // Receiver is an import alias — resolve to definitions from that package
                         const symbols = index.symbols.get(call.name);
                         if (symbols) {
@@ -2853,6 +2885,32 @@ function findCallees(index, def, options = {}) {
                         noteSite(siteId, 'external', null, call);
                         continue;
                     }
+                } else if (typeQual) {
+                    // Type-qualified receiver (fix #236): the receiver NAMES a
+                    // type, so the type owns the call — Foo::new() is Foo's
+                    // new; String::new() / Math.max() are external and must
+                    // never confirm a project method through a bare name
+                    // binding (the caller side excludes the identical edges
+                    // as path-type-mismatch — the two directions now agree).
+                    if (typeQual.match) {
+                        const match = typeQual.match;
+                        const key = match.bindingId || `${typeQual.typeName}.${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        } else {
+                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                        }
+                        continue;
+                    }
+                    if (typeQual.external) {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    }
+                    noteUnverified(siteId, call, typeQual.unverified);
+                    continue;
                 } else if (langTraits(language)?.methodCallInclusion === 'explicit' && !options.includeMethods) {
                     noteSite(siteId, 'filtered', 'method-calls-excluded', call);
                     continue;
@@ -2904,7 +2962,9 @@ function findCallees(index, def, options = {}) {
             }
 
             // Collect self/this.method() calls for same-class resolution
-            if (call.isMethod && ['self', 'cls', 'this'].includes(call.receiver)) {
+            // (Rust Self::method() resolves the same way — fix #236)
+            if (call.isMethod && (['self', 'cls', 'this'].includes(call.receiver) ||
+                (call.receiver === 'Self' && language === 'rust'))) {
                 if (!selfMethodCalls) selfMethodCalls = [];
                 selfMethodCalls.push({ call, siteId });
                 continue;
@@ -3085,6 +3145,24 @@ function findCallees(index, def, options = {}) {
                             uncertainReason = 'binding-ambiguous';
                         }
                     }
+                }
+            }
+
+            // Single project-wide owner (fix #236 — the caller side's
+            // #204/#209 rule on the callee side): an untyped-receiver method
+            // call whose name has exactly ONE owner type resolves to that
+            // owner's method — `k.run()` where only Kit defines run. Without
+            // it, trace trees stopped expanding at statically-resolvable
+            // calls the caller direction confirms.
+            if (isUncertain && call.isMethod && call.receiver && !bindingResolved) {
+                const fm = flowMap();
+                const flowEntry = fm ? _lookupReturnTypeFlow(fm, call) : undefined;
+                const owner = _calleeSingleOwnerMatch(index, def, fileEntry, call, effectiveName, language, flowEntry);
+                if (owner) {
+                    isUncertain = false;
+                    bindingResolved = owner.bindingId;
+                    calleeKey = owner.bindingId ||
+                        `${owner.className || (owner.receiver || '').replace(/^\*/, '')}.${effectiveName}`;
                 }
             }
 
@@ -4469,6 +4547,187 @@ function _nonCallableFieldMember(index, typeName, name, language) {
         }
     }
     return true;
+}
+
+/**
+ * Callee-side type-qualified receiver resolution (fix #236 — the caller
+ * side's #206/#208/#220/#222 identity discipline brought to findCallees).
+ * A receiver that NAMES a type owns the call: `Foo::new()` is Foo's new and
+ * nothing else's, `String::new()` can never be a project method, `Kit.make()`
+ * through an imported class binding is Kit's make. Returns:
+ *   { match, typeName }    — confirm this definition
+ *   { external: true }     — type-qualified call on a builtin/external type
+ *   { unverified: reason } — visible, never confirmed through a name binding
+ *   null                   — receiver is not provably a type; no opinion
+ * Shape gates follow typeQualifiedCallStyle (#206): Rust requires the path
+ * form (a dot-call receiver matching a type name is a variable); Go method
+ * expressions pass the receiver instance as the first argument, so zero-arg
+ * calls on type-named receivers are variables. `use X as Y` aliases are
+ * judged by the original name (#222b); pure type-alias sets close over their
+ * base (#208). Structural class receivers additionally need scope evidence
+ * (#215): the class defined in this file or a file binding of the name —
+ * an unbound capitalized receiver may be a parameter or local.
+ */
+function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
+    let receiver = call.receiver;
+    if (!receiver) return null;
+    const traits = langTraits(language);
+    const style = traits?.typeQualifiedCallStyle;
+    if (style === 'path' && !call.isPathCall) return null;
+    if (style === 'method-expr' && call.argCount != null && call.argCount < 1) return null;
+
+    const typeKindsOf = (name) => (index.symbols.get(name) || [])
+        .filter(d => IDENTITY_TYPE_KINDS.has(d.type) || (d.type === 'type' && d.aliasOf));
+
+    // Multi-segment path receivers (std::sync::Arc::new): the LAST segment
+    // is the type; the qualifier owns it (#206). A crate-internal qualifier
+    // (crate/self/super) resolves by name below; std/core/alloc paths are
+    // provably external even when a project type shares the name; any other
+    // qualified name is unpinnable without a module resolver — visible when
+    // a project type shares the name, external when none does.
+    if (style === 'path' && receiver.includes('::')) {
+        const segs = receiver.split('::');
+        const lastSeg = segs[segs.length - 1];
+        if (!/^[A-Z]/.test(lastSeg)) return null; // module-path function call
+        if (['crate', 'self', 'super'].includes(segs[0])) {
+            receiver = lastSeg;
+        } else if (typeKindsOf(lastSeg).length === 0) {
+            return { external: true };
+        } else if (['std', 'core', 'alloc'].includes(segs[0])) {
+            return { external: true };
+        } else {
+            return { unverified: 'method-ambiguous' };
+        }
+    }
+    if (!/^[A-Z]/.test(receiver)) return null;
+    let typeDefs = typeKindsOf(receiver);
+    if (typeDefs.length === 0) {
+        for (const im of (fileEntry?.importBindings || [])) {
+            if (im.name !== receiver) continue;
+            const orig = String(im.module || '').split('::').pop();
+            if (orig && orig !== receiver && typeKindsOf(orig).length > 0) {
+                receiver = orig;
+                typeDefs = typeKindsOf(orig);
+                break;
+            }
+        }
+    }
+    if (typeDefs.length === 0) {
+        // No project type of this name. Rust path receivers are provably
+        // types (modules are lowercase, variables cannot be path-qualified):
+        // a generic-param name stays visible — its instantiation could be
+        // any project type — everything else (String::new, Arc::new) is
+        // external. Java CamelCase receivers are classes (Math.max) —
+        // external; ALL_CAPS receivers are constants (variables) and keep
+        // normal resolution. Go capitalizes exported package-level VARIABLES
+        // too, and a structural capitalized receiver may be a parameter or
+        // local — neither acts without a project type def.
+        if (style === 'path') {
+            if (_isGenericParamReceiverType(index, def.file, call.line, receiver)) {
+                return { unverified: 'method-ambiguous' };
+            }
+            return { external: true };
+        }
+        if (language === 'java' && /[a-z]/.test(receiver) &&
+            !_isGenericParamReceiverType(index, def.file, call.line, receiver)) {
+            return { external: true };
+        }
+        return null;
+    }
+    if (traits?.typeSystem === 'structural') {
+        const inFile = typeDefs.some(d => d.file === def.file);
+        const bound = (fileEntry?.bindings || []).some(b => b.name === receiver);
+        if (!inFile && !bound) return null;
+    }
+    // Alias closure (#208): a pure alias set agreeing on one base is the
+    // SAME type — the method may live on the base's inherent impl.
+    const candidateTypes = [receiver];
+    if (typeDefs.every(d => d.type === 'type' && d.aliasOf)) {
+        const bases = new Set(typeDefs.map(d => d.aliasOf));
+        if (bases.size === 1) candidateTypes.push(bases.values().next().value);
+    }
+    const symbols = index.symbols.get(call.name) || [];
+    const isCallable = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+        (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
+    const matchOn = (tn) => symbols.find(s => isCallable(s) &&
+        (s.className === tn || (s.receiver && s.receiver.replace(/^\*/, '') === tn)));
+    let match = null;
+    let matchedType = null;
+    for (const tn of candidateTypes) {
+        match = matchOn(tn);
+        if (match) { matchedType = tn; break; }
+    }
+    if (!match && traits?.typeSystem === 'nominal') {
+        for (const tn of candidateTypes) {
+            const parentNames = index._getInheritanceParents?.(tn, def.file);
+            if (!parentNames) continue;
+            for (const pName of parentNames) {
+                match = matchOn(pName);
+                if (match) { matchedType = pName; break; }
+            }
+            if (match) break;
+        }
+    }
+    if (match) return { match, typeName: matchedType };
+    // A project type that does not define the method: a trait/interface
+    // receiver dispatches across N impls; otherwise the method comes from a
+    // derive/trait impl/external contract the index cannot pin. Visible —
+    // never confirmed through an unrelated name binding.
+    const dispatchy = typeDefs.some(d => d.type === 'trait' || d.type === 'interface');
+    return { unverified: dispatchy ? 'method-ambiguous' : 'uncertain-receiver' };
+}
+
+/**
+ * Single project-wide owner resolution for an untyped-receiver method call
+ * (fix #236 — the caller side's #204/#209 rule on the callee side): when
+ * every callable definition of the name lives on ONE owner type, `k.run()`
+ * can only be that owner's method. Defeaters mirror the caller contract:
+ * builtin-global receivers (#232 — name knowledge, not evidence), module
+ * receivers (#209/#224 — module attribute lookup, not instance dispatch),
+ * a standalone function sharing the name (rebinding can route the call
+ * there, #218b), callable fields as second owners (#219), external-contract
+ * override markers (#210 — the overridden definition lives OUTSIDE the
+ * project), receivers typed by the flow map to something other than the
+ * owner (#199/#207/#222(4)), nominal arity mismatch (#205), and a test-file
+ * owner for a production caller. Returns the owner's definition or null.
+ */
+function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, flowEntry) {
+    if (JS_GLOBAL_RECEIVERS.has(call.receiver)) return null;
+    if (call.receiverIsModule) return null;
+    const traits = langTraits(language);
+    if (traits?.typeSystem === 'structural' &&
+        _submoduleReceiverModule(index, fileEntry, call.receiver)) return null;
+    const defs = index.symbols.get(name) || [];
+    const ownerKeys = new Set();
+    const ownerDefs = [];
+    for (const d of defs) {
+        if (NON_CALLABLE_TYPES.has(d.type)) {
+            if (d.type === 'field' && d.className && _callableFieldDef(index, d)) {
+                ownerKeys.add(d.className);
+            }
+            continue;
+        }
+        const o = d.className || (d.receiver && d.receiver.replace(/^\*/, ''));
+        if (!o) return null;
+        ownerKeys.add(o);
+        ownerDefs.push(d);
+    }
+    if (ownerKeys.size !== 1 || ownerDefs.length === 0) return null;
+    if (ownerDefs.length > 1 && traits?.hasArityOverloads) return null;
+    if (ownerDefs.some(d => isOverrideMarked(d))) return null;
+    if (flowEntry) {
+        const owner = ownerKeys.values().next().value;
+        if (flowEntry.externalVia || (flowEntry.type && flowEntry.type !== owner)) return null;
+    }
+    if (traits?.typeSystem === 'nominal' && call.argCount != null &&
+        !_callArityCompatible(call, ownerDefs, language)) return null;
+    const match = ownerDefs[0];
+    const callerFe = index.files.get(def.file);
+    const matchFe = index.files.get(match.file);
+    if (matchFe && callerFe &&
+        isTestFile(matchFe.relativePath, matchFe.language) &&
+        !isTestFile(callerFe.relativePath, callerFe.language)) return null;
+    return match;
 }
 
 /**

@@ -3513,3 +3513,38 @@ describe('deadcode: out-of-tree base-class overrides are not dead (fix: #210 ana
         } finally { rm(dir); }
     });
 });
+
+describe('fix #236 (Python): callee-side class-qualified and single-owner receivers', () => {
+    it('ClassName.method() through an import binding confirms; instance single-owner confirms', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'engine.py': 'class Engine:\n    @classmethod\n    def create(cls):\n        return cls()\n\n    def start(self):\n        return 1\n',
+            'app.py': 'from engine import Engine\n\ndef main():\n    e = Engine.create()\n    return e.start()\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.ok(acct.some(c => c.name === 'create' && c.className === 'Engine'),
+                `Engine.create() must confirm: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.ok(acct.some(c => c.name === 'start' && c.className === 'Engine'),
+                `e.start() must confirm via single owner: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: a module receiver never confirms via single-owner (#209)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'report.py': 'class Report:\n    def close(self):\n        return 1\n',
+            'app.py': 'import matplotlib.pyplot as plt\n\ndef main():\n    plt.close()\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main')[0];
+            const acct = index.findCallees(def, { collectAccount: true, includeMethods: true });
+            assert.strictEqual(acct.filter(c => c.name === 'close').length, 0,
+                `plt.close() must not confirm Report.close: ${JSON.stringify(acct.map(c => c.name))}`);
+        } finally { rm(dir); }
+    });
+});

@@ -3143,3 +3143,165 @@ pub fn pick() -> Boundary {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #236 (Rust): callee-side path-receiver identity', () => {
+    // Campaign G1-rust BUG-2/BUG-3: builtin path calls (String::new(),
+    // Arc::new(Mutex::new(Vec::new()))) CONFIRMED callee edges to arbitrary
+    // same-named project methods through bare name bindings — including
+    // fan-out double-claims (one site in two defs' sites[]) and self-
+    // recursion edges — while findCallers excluded the identical edges as
+    // path-type-mismatch. The receiver NAMES the type; the type owns the call.
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': `pub struct Task;
+
+impl Task {
+    pub fn new() -> Self {
+        Task
+    }
+}
+
+pub struct TaskProcessor;
+
+impl TaskProcessor {
+    pub fn new() -> Self {
+        TaskProcessor
+    }
+}
+
+pub struct TaskManager;
+
+impl TaskManager {
+    pub fn new() -> i32 {
+        let _x = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        0
+    }
+}
+
+pub fn make_string() -> String {
+    String::new()
+}
+
+pub fn make_task() -> Task {
+    crate::Task::new()
+}
+`,
+    };
+
+    it('routes builtin path calls external — never a project callee edge', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('make_string')[0];
+            const legacy = index.findCallees(def);
+            assert.strictEqual(legacy.length, 0,
+                `String::new() must not confirm a project new: ${JSON.stringify(legacy.map(c => c.className))}`);
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.strictEqual(acct.length, 0);
+            assert.strictEqual(acct.calleeAccount.external.count, 1,
+                'String::new() lands in the external bucket');
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('never fans one builtin path site out across same-name project defs', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('new').find(s => s.className === 'TaskManager');
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.strictEqual(acct.filter(c => c.name === 'new').length, 0,
+                `Arc/Mutex/Vec ::new must not claim Task.new/TaskProcessor.new: ${JSON.stringify(acct.map(c => c.className))}`);
+            assert.strictEqual(acct.calleeAccount.external.count, 3,
+                'all three builtin path calls route external');
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: project-type path calls still confirm, crate:: qualifier included', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('make_task')[0];
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.ok(acct.some(c => c.name === 'new' && c.className === 'Task'),
+                `crate::Task::new() must confirm Task::new: ${JSON.stringify(acct.map(c => c.className))}`);
+            const legacy = index.findCallees(def);
+            assert.ok(legacy.some(c => c.name === 'new' && c.className === 'Task'),
+                'legacy mode confirms the same edge');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #236 (Rust): Self:: callees, alias closure, generic-param receivers', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': `pub struct Widget;
+
+impl Widget {
+    pub fn build() -> i32 {
+        Self::helper()
+    }
+    pub fn helper() -> i32 {
+        2
+    }
+}
+
+pub struct Other;
+
+impl Other {
+    pub fn helper() -> i32 {
+        3
+    }
+}
+
+pub type Gadget = Widget;
+
+pub fn use_alias() -> i32 {
+    Gadget::helper()
+}
+
+pub fn generic_call<T: Default>() -> T {
+    T::default()
+}
+`,
+    };
+
+    it('Self::method() resolves to the enclosing impl, not a sibling', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('build')[0];
+            const acct = index.findCallees(def, { collectAccount: true });
+            const helpers = acct.filter(c => c.name === 'helper');
+            assert.strictEqual(helpers.length, 1);
+            assert.strictEqual(helpers[0].className, 'Widget',
+                `Self::helper() inside Widget must be Widget::helper: ${JSON.stringify(helpers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('alias-qualified path calls confirm through the base type (#208)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('use_alias')[0];
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.ok(acct.some(c => c.name === 'helper' && c.className === 'Widget'),
+                `Gadget::helper() must confirm Widget::helper: ${JSON.stringify(acct.map(c => c.className))}`);
+        } finally { rm(dir); }
+    });
+
+    it('generic-param path receivers route visible method-ambiguous, never confirm or vanish', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('generic_call')[0];
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.strictEqual(acct.length, 0, 'T::default() must not confirm any project def');
+            assert.ok((acct.unverifiedCallees || []).some(u =>
+                u.name === 'default' && u.reason === 'method-ambiguous'),
+                `T::default() must be visible unverified: ${JSON.stringify(acct.unverifiedCallees)}`);
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

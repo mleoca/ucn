@@ -2800,3 +2800,42 @@ describe('fix #231 (Java): try-with-resources declarations type receivers', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #236 (Java): callee-side static-style type-qualified receivers', () => {
+    const FILES = {
+        'pom.xml': '<project/>',
+        'Helper.java': 'public class Helper {\n    public static int process(int x) {\n        return x * 2;\n    }\n}\n',
+        'App.java': 'public class App {\n    public int main() {\n        int v = Helper.process(3);\n        int m = Math.max(v, 10);\n        return m;\n    }\n}\n',
+    };
+
+    it('Helper.process() confirms the project class method; Math.max() routes external', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('main').find(s => s.className === 'App');
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.ok(acct.some(c => c.name === 'process' && c.className === 'Helper'),
+                `Helper.process() must confirm: ${JSON.stringify(acct.map(c => c.name))}`);
+            assert.strictEqual(acct.filter(c => c.name === 'max').length, 0,
+                'Math.max() must not confirm any project def');
+            assert.ok(acct.calleeAccount.external.count >= 1,
+                `Math.max() lands external: ${JSON.stringify(acct.calleeAccount)}`);
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: an external-class receiver never confirms a same-name project method', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Sorter.java': 'import java.util.List;\npublic class Sorter {\n    public void sort(List<Integer> xs) {\n    }\n}\n',
+            'App.java': 'import java.util.Collections;\nimport java.util.List;\npublic class App {\n    public void run(List<Integer> xs) {\n        Collections.sort(xs);\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const def = index.symbols.get('run').find(s => s.className === 'App');
+            const acct = index.findCallees(def, { collectAccount: true });
+            assert.strictEqual(acct.filter(c => c.name === 'sort').length, 0,
+                `Collections.sort() must not confirm Sorter.sort: ${JSON.stringify(acct.map(c => c.name))}`);
+        } finally { rm(dir); }
+    });
+});
