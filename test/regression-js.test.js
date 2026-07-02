@@ -6814,3 +6814,73 @@ describe('fix #238 (TS): super(config) constructor delegation surfaces in both d
         } finally { rm(dir); }
     });
 });
+
+describe('fix #241 (JS/TS): usages classification and band exhaustiveness', () => {
+    it('classifies `const X = require(...)` as an import, not a definition', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'service.js': 'class Service {}\nmodule.exports = Service;',
+            'main.js': 'const Service = require("./service");\nnew Service();',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'Service' });
+            const imp = r.result.find(u => u.relativePath === 'main.js' && u.line === 1);
+            assert.ok(imp, 'require line present');
+            assert.strictEqual(imp.usageType, 'import',
+                'default-require binding is the import of the symbol');
+        } finally { rm(dir); }
+    });
+
+    it('records CJS shorthand export properties as references', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'utils.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'helper' });
+            const exp = r.result.find(u => u.line === 2);
+            assert.ok(exp, 'module.exports = { helper } line recorded');
+            assert.strictEqual(exp.usageType, 'reference');
+        } finally { rm(dir); }
+    });
+
+    it('renders non-definition definer-shaped records in the REFERENCES band', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function target() { return 1; }\nmodule.exports = { target };',
+            'b.js': 'const target = 5;\nconsole.log(target);',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'target' });
+            const text = output.formatUsages(r.result, 'target');
+            // b.js:1 defines a DIFFERENT target (usageType 'definition',
+            // isDefinition false) — must be visible, and the summary counts
+            // must partition every record into exactly one band.
+            assert.ok(text.includes('b.js:1'), 'shadowing definer site visible');
+            const json = JSON.parse(output.formatUsagesJson(r.result, 'target'));
+            const d = json.data;
+            assert.strictEqual(
+                d.definitionCount + d.callCount + d.importCount + d.referenceCount,
+                d.definitionCount + d.totalUsages,
+                'bands partition the record set');
+            const listed = d.calls.length + d.imports.length + d.references.length;
+            assert.strictEqual(listed, d.totalUsages, 'every counted record is listed in a band');
+        } finally { rm(dir); }
+    });
+
+    it('keeps same-file namespace-qualified usages when the receiver is defined here (TS)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'ns.ts': 'namespace Geometry {\n  export function area(w: number, h: number): number { return w * h; }\n}\nfunction useAll(): void {\n  const a = Geometry.area(3, 4);\n}',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'area' });
+            assert.ok(r.result.some(u => u.line === 5 && u.usageType === 'call'),
+                'Geometry.area(3, 4) in the defining file is a usage');
+        } finally { rm(dir); }
+    });
+});

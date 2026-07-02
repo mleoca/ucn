@@ -2930,3 +2930,17 @@ describe('fix #240 (Java): wildcard package imports link every package file, non
         } finally { rm(dir); }
     });
 });
+
+describe('fix #241 (Java): zero-param methods record empty params, not the unknown sentinel', () => {
+    it('params is "" for empty parens and keeps real params intact', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'A.java': 'public class A {\n    public void zero() {}\n    public void two(int a, String b) {}\n}',
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.symbols.get('zero')[0].params, '');
+            assert.strictEqual(index.symbols.get('two')[0].params, 'int a, String b');
+        } finally { rm(dir); }
+    });
+});

@@ -24,10 +24,13 @@ function parseTree(parser, code) {
  * Extract Java parameters
  */
 function extractJavaParams(paramsNode) {
+    // Distinguish "we have no node" (genuinely unknown) from "node is empty".
+    // Returning '...' for empty parens conflated zero-param methods with
+    // unknown signatures in JSON output (fix #241; go/rust got this in #238,
+    // the shared utils.extractParams already had it).
     if (!paramsNode) return '...';
     const text = paramsNode.text;
     let params = text.replace(/^\(|\)$/g, '').trim();
-    if (!params) return '...';
     return params;
 }
 

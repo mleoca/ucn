@@ -3634,3 +3634,17 @@ describe('fix #240 (Python): import lines from the parser, dynamic-import consis
         } finally { rm(dir); }
     });
 });
+
+describe('fix #241 (Python): zero-param functions record empty params, not the unknown sentinel', () => {
+    it('params is "" for empty parens and keeps real params intact', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def zero(): pass\n\ndef two(a, b=1): pass\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(index.symbols.get('zero')[0].params, '');
+            assert.strictEqual(index.symbols.get('two')[0].params, 'a, b=1');
+        } finally { rm(dir); }
+    });
+});

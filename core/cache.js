@@ -79,7 +79,11 @@ const UCN_VERSION = require('../package.json').version;
 // (non-recursively; subpackage false links dropped), Rust flat-layout crates
 // (no src/) resolve crate:: paths, and super::/crate:: item imports fall back
 // to the parent module FILE (mod.rs / <dir>.rs / lib.rs / main.rs).
-const CACHE_FORMAT_VERSION = 33;
+// v34 (fix #241): Java/Python zero-param signatures record '' instead of the
+// '...' unknown sentinel (completes #238's Go/Rust fix), and Rust struct field
+// member symbols carry their own visibility in `modifiers` (pub/pub(crate)/...)
+// so export listings judge fields per-symbol.
+const CACHE_FORMAT_VERSION = 34;
 
 /**
  * Save index to cache file

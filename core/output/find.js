@@ -242,7 +242,11 @@ function formatUsagesJson(usages, name) {
 
     const calls = refs.filter(u => u.usageType === 'call');
     const imports = refs.filter(u => u.usageType === 'import');
-    const references = refs.filter(u => u.usageType === 'reference');
+    // Exhaustive complement (fix #241): a non-definition record that is
+    // neither call nor import lands in references — same-name definer sites
+    // (usageType 'definition', isDefinition false: shadowing locals, other
+    // defs of the name) used to inflate totals while rendering in NO band.
+    const references = refs.filter(u => u.usageType !== 'call' && u.usageType !== 'import');
 
     // Each usage record points at a call site. We emit a per-occurrence handle
     // pointing at the SITE itself in the form "relativePath:line:callerName"
@@ -308,7 +312,8 @@ function formatUsages(usages, name, options = {}) {
     const defs = usages.filter(u => u.isDefinition);
     const calls = usages.filter(u => u.usageType === 'call');
     const imports = usages.filter(u => u.usageType === 'import');
-    const refs = usages.filter(u => !u.isDefinition && u.usageType === 'reference');
+    // Exhaustive complement (fix #241) — see formatUsagesJson.
+    const refs = usages.filter(u => !u.isDefinition && u.usageType !== 'call' && u.usageType !== 'import');
 
     // Under --limit the listed entries are truncated but the summary must
     // describe the FULL result set (fix #237) — the handler attaches the

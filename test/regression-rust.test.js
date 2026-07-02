@@ -3487,3 +3487,24 @@ describe('fix #240 (Rust): parent-file fallback never shadows real module files'
         } finally { rm(dir); }
     });
 });
+
+describe('fix #241 (Rust): field visibility recorded on struct field members', () => {
+    it('pub fields are listed in fileExports; private fields are not', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub mod widget;',
+            'src/widget.rs': 'pub struct Widget { pub size: u32, pub(crate) shared: u8, len: usize }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'fileExports', { file: 'src/widget.rs' });
+            assert.ok(r.ok);
+            const size = r.result.find(e => e.type === 'field' && e.name === 'size');
+            assert.ok(size, 'pub field listed');
+            assert.strictEqual(size.className, 'Widget');
+            assert.ok(r.result.some(e => e.type === 'field' && e.name === 'shared'),
+                'pub(crate) field visible beyond the file — listed');
+            assert.ok(!r.result.some(e => e.name === 'len'), 'private field not listed');
+        } finally { rm(dir); }
+    });
+});

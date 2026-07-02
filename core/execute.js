@@ -651,7 +651,11 @@ const HANDLERS = {
                     definitions: result.filter(u => u.isDefinition).length,
                     calls: result.filter(u => u.usageType === 'call').length,
                     imports: result.filter(u => u.usageType === 'import').length,
-                    references: result.filter(u => !u.isDefinition && u.usageType === 'reference').length,
+                    // Exhaustive complement (fix #241): every non-definition
+                    // record that isn't a call or import is a reference —
+                    // same-name definer sites (usageType 'definition' with
+                    // isDefinition false) used to render in NO band.
+                    references: result.filter(u => !u.isDefinition && u.usageType !== 'call' && u.usageType !== 'import').length,
                 },
                 enumerable: false, writable: true, configurable: true,
             });

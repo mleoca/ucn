@@ -2623,10 +2623,14 @@ function findUsagesInCode(code, name, parser, tree) {
 
     visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, property_identifier (method names in obj.method() calls),
-        // type_identifier (TypeScript type annotations), and shorthand_property_identifier_pattern
-        // (destructured names in `const { name } = require(...)`)
+        // type_identifier (TypeScript type annotations), shorthand_property_identifier_pattern
+        // (destructured names in `const { name } = require(...)`), and
+        // shorthand_property_identifier (value-position shorthand — CJS export
+        // objects `module.exports = { helper }` and option objects `f({ helper })`
+        // reference the symbol but produced no usage record at all, fix #241)
         const isIdentifier = node.type === 'identifier' || node.type === 'property_identifier' ||
-            node.type === 'type_identifier' || node.type === 'shorthand_property_identifier_pattern';
+            node.type === 'type_identifier' || node.type === 'shorthand_property_identifier_pattern' ||
+            node.type === 'shorthand_property_identifier';
         if (!isIdentifier || node.text !== name) {
             return true;
         }
@@ -2661,10 +2665,27 @@ function findUsagesInCode(code, name, parser, tree) {
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
-            // Definition: variable name in declarator (left side of =)
+            // Definition: variable name in declarator (left side of =).
+            // When the right side is require()/import() the line IS the import
+            // of the symbol — `const Service = require('./service')` classified
+            // as 'definition' made the project's only import invisible (fix #241).
             else if (parent.type === 'variable_declarator' &&
                      sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
+                let value = parent.childForFieldName('value');
+                if (value && value.type === 'await_expression') {
+                    value = value.namedChild(0);
+                }
+                // Unwrap require('./x').member — still an import binding
+                if (value && value.type === 'member_expression') {
+                    value = value.childForFieldName('object');
+                }
+                if (value && value.type === 'call_expression') {
+                    const func = value.childForFieldName('function');
+                    if (func && (func.text === 'require' || func.type === 'import')) {
+                        usageType = 'import';
+                    }
+                }
             }
             // Definition: class name
             else if (parent.type === 'class_declaration' &&

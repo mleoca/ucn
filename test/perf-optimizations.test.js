@@ -1001,12 +1001,15 @@ module.exports = { run };
             const index = idx(dir);
             const fileKey = [...index.files.keys()].find(k => k.endsWith('dollar.js'));
             const usages = index._getCachedUsages(fileKey, 'run');
-            // def line 1 and call line 4 — NOT line 2 ($run is a longer
-            // identifier; the comment mention is a non-identifier node),
-            // NOT line 3 (string content), NOT line 5 ({ run } shorthand
-            // object property — a node type the scan has never collected).
+            // def line 1, call line 4, and the { run } export shorthand on
+            // line 5 as a reference (fix #241 — value-position shorthand
+            // properties ARE usages of the symbol). NOT line 2 ($run is a
+            // longer identifier; the comment mention is a non-identifier
+            // node), NOT line 3 (string content).
             const lines = usages.map(u => u.line).sort((a, b) => a - b);
-            assert.deepStrictEqual(lines, [1, 4], JSON.stringify(usages));
+            assert.deepStrictEqual(lines, [1, 4, 5], JSON.stringify(usages));
+            assert.strictEqual(usages.find(u => u.line === 5).usageType, 'reference',
+                'shorthand export property is a reference');
         } finally { rm(dir); }
     });
 

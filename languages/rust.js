@@ -662,11 +662,17 @@ function extractStructFields(structNode, codeOrLines) {
             const typeNode = field.childForFieldName('type');
 
             if (nameNode) {
+                // Record the field's own visibility (pub / pub(crate) / ...) so
+                // export listings can judge members per-symbol (fix #241 —
+                // pub fields were invisible to fileExports, and private fields
+                // used to leak in via name collision with file-level exports).
+                const visibility = extractVisibility(field.text);
                 fields.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     memberType: 'field',
+                    ...(visibility && { modifiers: [visibility] }),
                     ...(typeNode && { fieldType: typeNode.text })
                 });
             }

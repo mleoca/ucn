@@ -233,6 +233,16 @@ function usages(index, name, options = {}) {
                     return _importedHasDef;
                 };
 
+                // A qualified usage whose RECEIVER is a symbol defined in this
+                // file is never external-package noise — `Geometry.area(3, 4)`
+                // in the file declaring namespace Geometry was dropped by the
+                // receiver filter while find's usageCounts counted it (fix
+                // #241). Keyed on the receiver, not the target name: a file
+                // defining its own `Separator` while using external
+                // `Ns.Separator` must still filter the latter (bug #23).
+                const receiverDefinedHere = (recv) =>
+                    !!recv && fileEntry.symbols && fileEntry.symbols.some(s => s.name === recv);
+
                 for (const u of astUsages) {
                     // Skip if this is a definition line (already added above)
                     if (definitions.some(d => d.file === filePath && d.startLine === u.line)) {
@@ -241,12 +251,13 @@ function usages(index, name, options = {}) {
 
                     // Filter member expressions with unrelated receivers in JS/TS/Python.
                     // Keeps: standalone usages, self/this/cls/super, method calls on known types,
+                    //        qualified usages whose receiver this file defines,
                     //        and module access (output.fn()) when the imported file defines the name.
                     // Filters: namespace access to external packages (DropdownMenuPrimitive.Separator).
                     if (u.receiver && !['self', 'this', 'cls', 'super'].includes(u.receiver) &&
                         fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
                         const hasMethodDef = definitions.some(d => d.className);
-                        if (!hasMethodDef && !importedFileHasDef()) {
+                        if (!hasMethodDef && !receiverDefinedHere(u.receiver) && !importedFileHasDef()) {
                             continue;
                         }
                     }
