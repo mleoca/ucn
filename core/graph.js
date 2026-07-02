@@ -229,6 +229,21 @@ function fileExports(index, filePath, _visited) {
     const results = [];
     const exportedNames = new Set(fileEntry.exports);
 
+    // Names exported ONLY under an alias (`export { foo as myFoo }`, no
+    // plain export) are importable only AS the alias — the alias entry is
+    // added from exportDetails below; the bare name would be a lie (fix #245).
+    const aliasedAway = new Set();
+    if (fileEntry.exportDetails) {
+        const plainClauseNames = new Set(fileEntry.exportDetails
+            .filter(e => e.type === 'named' && !e.source && !e.alias)
+            .map(e => e.name));
+        for (const e of fileEntry.exportDetails) {
+            if (e.type === 'named' && !e.source && e.alias && !plainClauseNames.has(e.name)) {
+                aliasedAway.add(e.name);
+            }
+        }
+    }
+
     // Python convention: when a module declares no `__all__`, every top-level
     // non-`_` name is considered public. We don't want this in the underlying
     // export list (deadcode would think everything is exported), so fileExports
@@ -239,6 +254,7 @@ function fileExports(index, filePath, _visited) {
         // impl blocks group members; the block itself is not an exportable
         // symbol (its name collides with the struct's, which IS listed).
         if (symbol.type === 'impl') continue;
+        if (aliasedAway.has(symbol.name) && !(symbol.modifiers || []).includes('export')) continue;
         const isExported = symbolIsExported(symbol, fileEntry, exportedNames) ||
             (isPythonImplicit && symbol.name && !symbol.name.startsWith('_') && !symbol.className && !symbol.isMethod);
 
@@ -294,16 +310,32 @@ function fileExports(index, filePath, _visited) {
                             for (const srcExp of sourceExportsResult) {
                                 if (!matchedNames.has(srcExp.name)) {
                                     matchedNames.add(srcExp.name);
-                                    results.push({ ...srcExp, file: fileEntry.relativePath, reExportedFrom: srcExp.file });
+                                    // The entry belongs to the BARREL file —
+                                    // its line is the `export *` statement,
+                                    // never the source's line numbers (fix
+                                    // #245: barrel.ts:9-11 on a 1-line file).
+                                    results.push({
+                                        ...srcExp,
+                                        file: fileEntry.relativePath,
+                                        startLine: exp.line,
+                                        endLine: exp.line,
+                                        reExportedFrom: srcExp.file,
+                                    });
                                 }
                             }
                         } else {
-                            // Named re-export: find the specific symbol
+                            // Named re-export: find the specific symbol.
+                            // Consumers import the ALIAS when one exists —
+                            // `export { foo as myFoo } from './lib'` is
+                            // importable only as myFoo (fix #245); the
+                            // source-side name stays in sourceName.
+                            const displayName = exp.alias || exp.name;
                             const srcSymbol = sourceEntry.symbols.find(s => s.name === exp.name);
                             if (srcSymbol) {
                                 matchedNames.add(exp.name);
                                 results.push({
-                                    name: exp.name,
+                                    name: displayName,
+                                    ...(exp.alias && { sourceName: exp.name }),
                                     type: srcSymbol.type,
                                     file: fileEntry.relativePath,
                                     startLine: exp.line,
@@ -317,7 +349,8 @@ function fileExports(index, filePath, _visited) {
                                 // Symbol not found in source — still list it as a re-export
                                 matchedNames.add(exp.name);
                                 results.push({
-                                    name: exp.name,
+                                    name: displayName,
+                                    ...(exp.alias && { sourceName: exp.name }),
                                     type: 're-export',
                                     file: fileEntry.relativePath,
                                     startLine: exp.line,
@@ -332,6 +365,61 @@ function fileExports(index, filePath, _visited) {
                     }
                 }
             }
+        }
+
+        // Local export clauses: `export { foo, bar }` / `export { foo as
+        // myFoo }`. A clause-exported CONST has no isVariable flag and no
+        // symbol entry, and a two-step barrel (`import { foo } from './lib';
+        // export { foo };`) matched nothing — both rendered empty (fix
+        // #245). Aliased local exports list under the ALIAS.
+        for (const exp of fileEntry.exportDetails) {
+            if (exp.type !== 'named' || exp.source || exp.isVariable) continue;
+            const displayName = exp.alias || exp.name;
+            if (matchedNames.has(displayName)) continue;
+            if (!exp.alias && matchedNames.has(exp.name)) continue;
+            const localSym = fileEntry.symbols.find(s => s.name === exp.name && !s.className);
+            if (localSym) {
+                matchedNames.add(displayName);
+                results.push({
+                    name: displayName,
+                    ...(exp.alias && { sourceName: exp.name }),
+                    type: localSym.type,
+                    file: fileEntry.relativePath,
+                    startLine: localSym.startLine,
+                    endLine: localSym.endLine,
+                    params: localSym.params,
+                    returnType: localSym.returnType,
+                    signature: index.formatSignature(localSym)
+                });
+                continue;
+            }
+            // Two-step barrel: the name is an import binding — resolve it
+            const binding = (fileEntry.importBindings || []).find(b => b.name === exp.name);
+            const resolvedRel = binding && fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
+            let srcSymbol = null, srcRel = null;
+            if (resolvedRel) {
+                for (const [, fe2] of index.files) {
+                    if (fe2.relativePath === resolvedRel) {
+                        srcSymbol = fe2.symbols.find(s => s.name === exp.name && !s.className) || null;
+                        srcRel = fe2.relativePath;
+                        break;
+                    }
+                }
+            }
+            matchedNames.add(displayName);
+            results.push({
+                name: displayName,
+                ...(exp.alias && { sourceName: exp.name }),
+                type: srcSymbol ? srcSymbol.type : 'variable',
+                file: fileEntry.relativePath,
+                startLine: exp.line,
+                endLine: exp.line,
+                params: srcSymbol ? srcSymbol.params : undefined,
+                returnType: srcSymbol ? srcSymbol.returnType : null,
+                signature: srcSymbol ? index.formatSignature(srcSymbol)
+                    : `export ${exp.name}${exp.alias ? ' as ' + exp.alias : ''}`,
+                ...(srcRel && { reExportedFrom: srcRel })
+            });
         }
     }
 
@@ -529,6 +617,8 @@ function graph(index, filePath, options = {}) {
         const edges = [];
         let truncated = false;
 
+        const cutNodes = [];
+
         const traverse = (file, depth) => {
             if (visited.has(file)) return;
             visited.add(file);
@@ -537,17 +627,17 @@ function graph(index, filePath, options = {}) {
             const relPath = fileEntry ? fileEntry.relativePath : path.relative(index.root, file);
             nodes.push({ file, relativePath: relPath, depth });
 
+            // Stop traversal at max depth but still register the node above.
+            // Edges from cut nodes are resolved in a post-pass (below) so the
+            // outcome never depends on visit order.
+            if (depth >= maxDepth) {
+                cutNodes.push(file);
+                return;
+            }
+
             const neighbors = dir === 'imports'
                 ? (index.importGraph.get(file) || new Set())
                 : (index.exportGraph.get(file) || new Set());
-
-            // Stop traversal at max depth but still register the node above.
-            // Record that edges exist beyond the cut so the formatter can say
-            // so — the data itself carries no deeper nodes to notice.
-            if (depth >= maxDepth) {
-                if ([...neighbors].some(n => !visited.has(n))) truncated = true;
-                return;
-            }
 
             for (const neighbor of neighbors) {
                 edges.push({ from: file, to: neighbor });
@@ -556,6 +646,25 @@ function graph(index, filePath, options = {}) {
         };
 
         traverse(targetPath, 0);
+
+        // Deterministic cut-frontier pass (fix #245): a cut node's edge to a
+        // node ALREADY in the result needs no deeper traversal — emit it
+        // (the diamond b→a edge used to vanish); only neighbors genuinely
+        // outside the result mark the graph depth-truncated. The in-traversal
+        // peek made both outcomes depend on import order.
+        for (const file of cutNodes) {
+            const neighbors = dir === 'imports'
+                ? (index.importGraph.get(file) || new Set())
+                : (index.exportGraph.get(file) || new Set());
+            for (const neighbor of neighbors) {
+                if (visited.has(neighbor)) {
+                    edges.push({ from: file, to: neighbor });
+                } else {
+                    truncated = true;
+                }
+            }
+        }
+
         return { nodes, edges, truncated };
     };
 

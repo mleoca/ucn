@@ -83,7 +83,12 @@ const UCN_VERSION = require('../package.json').version;
 // '...' unknown sentinel (completes #238's Go/Rust fix), and Rust struct field
 // member symbols carry their own visibility in `modifiers` (pub/pub(crate)/...)
 // so export listings judge fields per-symbol.
-const CACHE_FORMAT_VERSION = 34;
+// v35 (fix #245): persisted exports/exportDetails/imports content changed —
+// the JS/TS export scanner records `export abstract class`, `export declare`
+// wrappers, and `export namespace` (the namespace is the importable name),
+// and TS import-equals (`import x = require('./y')`) produces an import
+// record (the dependency edge was invisible to all filedeps commands).
+const CACHE_FORMAT_VERSION = 35;
 
 /**
  * Save index to cache file

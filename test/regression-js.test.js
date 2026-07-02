@@ -6884,3 +6884,79 @@ describe('fix #241 (JS/TS): usages classification and band exhaustiveness', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #245 (JS/TS): export scanner and fileExports assembly', () => {
+    it('export abstract class / export declare function / export namespace are exports', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'abs.ts': 'export abstract class Alone {\n  abstract m(): void;\n}',
+            'decl.ts': 'export declare function ambient(): void;',
+            'ns.ts': 'export namespace Geo {\n  export function area(r: number): number { return r; }\n}',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(execute(index, 'fileExports', { file: 'abs.ts' }).result.some(e => e.name === 'Alone'));
+            assert.ok(execute(index, 'fileExports', { file: 'decl.ts' }).result.some(e => e.name === 'ambient'));
+            assert.ok(execute(index, 'fileExports', { file: 'ns.ts' }).result.some(e => e.name === 'Geo'),
+                'the NAMESPACE is the importable name');
+        } finally { rm(dir); }
+    });
+
+    it('export clauses list consts, two-step barrels, and alias names', () => {
+        const dir = tmp({
+            'package.json': '{"name":"x","type":"module"}',
+            'lib.js': 'export function foo() { return 1; }',
+            'local.js': 'function foo() { return 1; }\nconst bar = 2;\nexport { foo, bar };',
+            'twostep.js': 'import { foo } from "./lib.js";\nexport { foo };',
+            'renamed.js': 'export { foo as myFoo } from "./lib.js";',
+            'fnrenamed.js': 'function foo() { return 1; }\nexport { foo as myFoo };',
+        });
+        try {
+            const index = idx(dir);
+            const l = execute(index, 'fileExports', { file: 'local.js' }).result;
+            assert.ok(l.some(e => e.name === 'bar'), 'clause-exported const listed');
+            assert.ok(execute(index, 'fileExports', { file: 'twostep.js' }).result.some(e => e.name === 'foo'),
+                'import-then-export barrel listed');
+            const r = execute(index, 'fileExports', { file: 'renamed.js' }).result;
+            assert.ok(r.some(e => e.name === 'myFoo' && e.sourceName === 'foo'),
+                'consumers import the alias');
+            const f = execute(index, 'fileExports', { file: 'fnrenamed.js' }).result;
+            assert.ok(f.some(e => e.name === 'myFoo') && !f.some(e => e.name === 'foo'),
+                'only the importable name is listed');
+        } finally { rm(dir); }
+    });
+
+    it('TS import-equals creates the dependency edge; star re-exports carry the barrel line', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'deep.ts': '// 1\n// 2\n// 3\n// 4\n// 5\n// 6\n// 7\n// 8\nexport function deepFn(x: number): number { return x; }',
+            'barrel.ts': 'export * from "./deep";',
+            'importeq.ts': 'import deep = require("./deep");\nexport const u = deep;',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(execute(index, 'imports', { file: 'importeq.ts' }).result.some(i => i.resolved === 'deep.ts'),
+                'import x = require() records the edge');
+            assert.ok(execute(index, 'exporters', { file: 'deep.ts' }).result.some(x => x.file === 'importeq.ts'));
+            const df = execute(index, 'fileExports', { file: 'barrel.ts' }).result.find(e => e.name === 'deepFn');
+            assert.strictEqual(df.startLine, 1, 'barrel.ts:9-11 was a phantom location');
+        } finally { rm(dir); }
+    });
+
+    it('graph depth truncation is order-independent and keeps both-endpoint edges', () => {
+        for (const order of [['a', 'b'], ['b', 'a']]) {
+            const dir = tmp({
+                'package.json': '{"name":"r"}',
+                'root.js': `const x = require("./${order[0]}");\nconst y = require("./${order[1]}");\nmodule.exports = {};`,
+                'a.js': 'module.exports = { x: 1 };',
+                'b.js': 'const a = require("./a");\nmodule.exports = { y: () => a.x };',
+            });
+            try {
+                const g = execute(idx(dir), 'graph', { file: 'root.js', direction: 'imports', depth: 1 });
+                assert.ok(g.result.edges.some(e => e.from.endsWith('b.js') && e.to.endsWith('a.js')),
+                    `${order}: diamond edge present`);
+                assert.ok(!g.result.depthTruncated, `${order}: nothing lies beyond the cut`);
+            } finally { rm(dir); }
+        }
+    });
+});

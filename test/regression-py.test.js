@@ -3716,3 +3716,18 @@ describe('fix #244 (Python): setUp self.attr receivers and interior-node class s
         } finally { rm(dir); }
     });
 });
+
+describe('fix #245 (Python): flask route shortcuts stay flask', () => {
+    it('@app.route and @app.post on the same app attribute to one framework', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'webapp.py': 'from flask import Flask\napp = Flask(__name__)\n\n@app.route("/home")\ndef home():\n    pass\n\n@app.post("/save")\ndef save():\n    pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const eps = execute(index, 'entrypoints', {}).result;
+            assert.strictEqual(eps.find(e => e.name === 'home').framework, 'flask');
+            assert.strictEqual(eps.find(e => e.name === 'save').framework, 'flask');
+        } finally { rm(dir); }
+    });
+});

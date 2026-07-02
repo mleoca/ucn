@@ -70,6 +70,20 @@ const FRAMEWORK_PATTERNS = [
         pattern: /^(Get|Post|Put|Delete|Patch|Options|Head|All|Controller|Injectable|Module)$/,
     },
 
+    // Flask (Python) — decorators: @app.route('/path'), @bp.get('/path').
+    // Listed BEFORE fastapi: both frameworks share the @app.get/@app.post
+    // shortcuts, and @app.route is Flask-only — a file using @app.route +
+    // @app.post on the SAME app object got split across two frameworks
+    // (fix #245; first match wins in matchDecoratorOrModifier).
+    {
+        id: 'flask-route',
+        languages: new Set(['python']),
+        type: 'http',
+        framework: 'flask',
+        detection: 'decorator',
+        pattern: /^(app|bp|blueprint)\.(route|get|post|put|delete|patch)/,
+    },
+
     // FastAPI (Python) — decorators: @app.get('/path'), @router.post('/path')
     {
         id: 'fastapi-route',
@@ -78,16 +92,6 @@ const FRAMEWORK_PATTERNS = [
         framework: 'fastapi',
         detection: 'decorator',
         pattern: /^(app|router)\.(get|post|put|delete|patch|options|head)/,
-    },
-
-    // Flask (Python) — decorators: @app.route('/path'), @bp.get('/path')
-    {
-        id: 'flask-route',
-        languages: new Set(['python']),
-        type: 'http',
-        framework: 'flask',
-        detection: 'decorator',
-        pattern: /^(app|bp|blueprint)\.(route|get|post|put|delete|patch)/,
     },
 
     // Django (Python) — decorators: @api_view, @action, @permission_classes

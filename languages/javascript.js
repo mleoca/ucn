@@ -2258,6 +2258,21 @@ function findImportsInCode(code, parser) {
                     const text = child.text;
                     modulePath = text.slice(1, -1);
                 }
+                // TS import-equals: `import x = require('./y')` — the
+                // dependency edge was invisible to imports/exporters/graph/
+                // circularDeps (fix #245; `export = fn` was already captured).
+                if (child.type === 'import_require_clause') {
+                    let alias = null, src = null;
+                    for (let j = 0; j < child.namedChildCount; j++) {
+                        const c = child.namedChild(j);
+                        if (c.type === 'identifier') alias = c.text;
+                        if (c.type === 'string') src = c.text.slice(1, -1);
+                    }
+                    if (src) {
+                        imports.push({ module: src, names: alias ? [alias] : [], type: 'require', line });
+                    }
+                    return true;
+                }
                 if (child.type === 'import_clause') {
                     // Process import clause
                     for (let j = 0; j < child.namedChildCount; j++) {
@@ -2495,10 +2510,41 @@ function findExportsInCode(code, parser) {
                     if (nameNode) {
                         exports.push({ name: nameNode.text, type: isDefaultExport ? 'default' : 'named', line });
                     }
-                } else if (child.type === 'class_declaration') {
+                } else if (child.type === 'class_declaration' || child.type === 'abstract_class_declaration') {
+                    // tree-sitter-typescript emits abstract_class_declaration
+                    // for `export abstract class X` — the symbol extractor
+                    // knew the node type, the export scanner did not (fix
+                    // #245: the class was never recorded as an export).
                     const nameNode = child.childForFieldName('name');
                     if (nameNode) {
                         exports.push({ name: nameNode.text, type: isDefaultExport ? 'default' : 'named', line });
+                    }
+                } else if (child.type === 'ambient_declaration') {
+                    // export declare function/class/const X — the ambient
+                    // wrapper holds the real declaration (fix #245).
+                    for (let j = 0; j < child.namedChildCount; j++) {
+                        const inner = child.namedChild(j);
+                        const nameNode = inner.childForFieldName?.('name');
+                        if (nameNode) {
+                            exports.push({ name: nameNode.text, type: 'named', line });
+                        } else if (inner.type === 'lexical_declaration' || inner.type === 'variable_declaration') {
+                            for (let k = 0; k < inner.namedChildCount; k++) {
+                                const d = inner.namedChild(k);
+                                const n = d.type === 'variable_declarator' && d.childForFieldName('name');
+                                if (n && n.type === 'identifier') {
+                                    exports.push({ name: n.text, type: 'named', line, isVariable: true, declKind: 'declare' });
+                                }
+                            }
+                        }
+                    }
+                } else if (child.type === 'internal_module' || child.type === 'module') {
+                    // export namespace Geo { ... } — the NAMESPACE is the
+                    // importable name; its inner members are reached as
+                    // Geo.member (fix #245: only inner names were listed,
+                    // none of them importable).
+                    const nameNode = child.childForFieldName('name');
+                    if (nameNode) {
+                        exports.push({ name: nameNode.text, type: 'named', line });
                     }
                 } else if (child.type === 'type_alias_declaration') {
                     // export type X = ...

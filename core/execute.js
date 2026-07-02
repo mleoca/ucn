@@ -100,8 +100,10 @@ function applyHandleSyntax(p) {
 /** Normalize exclude to an array (accepts string CSV, array, or falsy). */
 function toExcludeArray(exclude) {
     if (!exclude) return [];
-    if (Array.isArray(exclude)) return exclude;
-    return exclude.split(',').map(s => s.trim()).filter(Boolean);
+    if (Array.isArray(exclude)) return exclude.map(String);
+    // Programmatic callers can pass anything — a number here used to
+    // surface the raw "exclude.split is not a function" TypeError (fix #245).
+    return String(exclude).split(',').map(s => s.trim()).filter(Boolean);
 }
 
 /** Apply test exclusions unless includeTests is set. */
