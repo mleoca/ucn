@@ -5052,3 +5052,30 @@ describe('fix #242: surface polish — deadcode JSON truncation, graph grammar, 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #243: deadcode --in and entrypoints --framework validation', () => {
+    it('deadcode errors on an in-directory matching no files', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function x() {}\nmodule.exports = {};',
+        });
+        try {
+            const index = idx(dir);
+            const bad = execute(index, 'deadcode', { in: 'nosuchdir' });
+            assert.strictEqual(bad.ok, false, 'typo path must not report a clean bill');
+            assert.ok(bad.error.includes('nosuchdir'));
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints errors on an unknown framework, listing valid names', () => {
+        const dir = tmp({ 'go.mod': 'module t', 'main.go': 'package main\nfunc main() {}' });
+        try {
+            const index = idx(dir);
+            const bad = execute(index, 'entrypoints', { framework: 'bogus' });
+            assert.strictEqual(bad.ok, false);
+            assert.ok(bad.error.includes('Valid:'));
+            const good = execute(index, 'entrypoints', { framework: 'go,junit' });
+            assert.ok(good.ok, 'comma-separated valid frameworks accepted');
+        } finally { rm(dir); }
+    });
+});

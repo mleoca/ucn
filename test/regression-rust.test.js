@@ -3508,3 +3508,53 @@ describe('fix #241 (Rust): field visibility recorded on struct field members', (
         } finally { rm(dir); }
     });
 });
+
+describe('fix #243 (Rust): same-name suppression, main-name guard, actix entry typing', () => {
+    it('two never-called same-name functions are BOTH reported dead', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'main.rs': 'mod a;\nmod b;\nfn main() { println!("hi"); }\n',
+            'a.rs': 'fn orphan_helper() -> i32 { 1 }\n',
+            'b.rs': 'fn orphan_helper() -> i32 { 2 }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.strictEqual(r.result.filter(s => s.name === 'orphan_helper').length, 2,
+                'definition lines are declarations, not usages of each other');
+        } finally { rm(dir); }
+    });
+
+    it('an impl method named main is an ordinary method — audited, not an entry point', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/main.rs': 'mod app;\nfn main() { println!("hi"); }',
+            'src/app.rs': 'pub struct App;\nimpl App {\n    fn main(&self) -> i32 { 42 }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const eps = execute(index, 'entrypoints', {});
+            const mains = eps.result.filter(e => e.name === 'main');
+            assert.strictEqual(mains.length, 1);
+            assert.strictEqual(mains[0].file, 'src/main.rs');
+            const dc = execute(index, 'deadcode', {});
+            assert.ok(dc.result.some(s => s.name === 'main' && s.file === 'src/app.rs'),
+                'App::main has zero callers and is claimable');
+        } finally { rm(dir); }
+    });
+
+    it('#[actix_web::main] is a runtime entry, never an HTTP route', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/main.rs': 'use actix_web::{get, App};\n\n#[get("/items")]\nasync fn list_items() -> String { String::new() }\n\n#[actix_web::main]\nasync fn main() { }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'entrypoints', {});
+            assert.strictEqual(r.result.find(e => e.name === 'main').type, 'runtime');
+            assert.strictEqual(r.result.find(e => e.name === 'list_items').type, 'http');
+            const httpOnly = execute(index, 'entrypoints', { type: 'http' });
+            assert.ok(!httpOnly.result.some(e => e.name === 'main'));
+        } finally { rm(dir); }
+    });
+});

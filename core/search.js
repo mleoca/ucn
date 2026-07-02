@@ -745,7 +745,13 @@ function structuralSearch(index, options = {}) {
                             for (const [, dDefs] of index.symbols) {
                                 for (const d of dDefs) {
                                     for (const dec of d.decorators || []) {
-                                        unusedDecoratorNames.add(String(dec).replace(/^@/, '').split('(')[0].trim());
+                                        const base = String(dec).replace(/^@/, '').split('(')[0].trim();
+                                        unusedDecoratorNames.add(base);
+                                        // Dotted decorators (@bus.subscribe) invoke the
+                                        // METHOD — protect the last segment too (fix
+                                        // #243, the deadcode false-dead's twin here).
+                                        const lastSeg = base.split('.').pop();
+                                        if (lastSeg && lastSeg !== base) unusedDecoratorNames.add(lastSeg);
                                     }
                                 }
                             }

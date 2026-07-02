@@ -841,6 +841,15 @@ const HANDLERS = {
     deadcode: (index, p) => {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
+        // A typo'd 'in' directory used to yield a clean-sounding 'No dead
+        // code found.' (fix #243) — validate it like the file pattern.
+        if (p.in) {
+            let anyIn = false;
+            for (const [, fe] of index.files) {
+                if (index.matchesFilters(fe.relativePath, { in: p.in })) { anyIn = true; break; }
+            }
+            if (!anyIn) return { ok: false, error: `No files matched the 'in' directory filter '${p.in}'.` };
+        }
         let result = index.deadcode({
             includeExported: p.includeExported || false,
             includeDecorated: p.includeDecorated || false,

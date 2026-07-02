@@ -431,10 +431,21 @@ function deadcode(index, options = {}) {
                             let dottedScope;
                             if (pos > 0 && line[pos - 1] === '.' &&
                                 (pos + nameLen >= line.length || line[pos + nameLen] !== '(')) {
+                                // Bare dotted DECORATOR application (@bus.subscribe,
+                                // @a.b.helper) executes at import time — always a
+                                // usage, whatever the receiver is (fix #243,
+                                // FALSE-DEAD: deleting @bus.subscribe's subscribe
+                                // breaks the module at import; the receiver `bus`
+                                // is a local instance, not an import binding).
+                                const before = line.slice(0, pos);
+                                const atIdx = before.lastIndexOf('@');
+                                const isDecoratorRef = atIdx !== -1 &&
+                                    /^[\w$.]*$/.test(before.slice(atIdx + 1)) &&
+                                    before.slice(0, atIdx).trim() === '';
                                 let r = pos - 2;
                                 while (r >= 0 && /[\w$]/.test(line[r])) r--;
                                 const receiver = line.slice(r + 1, pos - 1);
-                                if (!receiver) continue;
+                                if (!receiver && !isDecoratorRef) continue;
                                 if (['this', 'self', 'cls'].includes(receiver)) {
                                     dottedScope = 'same-file';
                                 } else {
@@ -442,8 +453,14 @@ function deadcode(index, options = {}) {
                                         .find(b => b.name === receiver);
                                     const resolved = binding && fileEntry.moduleResolved &&
                                         fileEntry.moduleResolved[binding.module];
-                                    if (!resolved) continue;
-                                    dottedScope = resolved;
+                                    if (resolved) {
+                                        dottedScope = resolved;
+                                    } else if (!isDecoratorRef) {
+                                        continue;
+                                    }
+                                    // decorator with unresolvable receiver:
+                                    // keep the usage UNSCOPED (conservative —
+                                    // keeps every same-name symbol alive)
                                 }
                             }
                             // Skip object literal key: name followed by ':' (not '::' for Rust paths)
@@ -466,7 +483,37 @@ function deadcode(index, options = {}) {
         }
     }
 
+    // Symbol types whose definition NAME line provably cannot reference a
+    // same-name VALUE — used to stop same-name defs keeping each other alive
+    // (fix #243). 'state' and 'field' stay OUT: `helper = other.helper` and
+    // Java `int helper = Other.helper();` genuinely reference the name.
+    const DEF_NAME_LINE_KINDS = new Set([
+        'function', 'method', 'static', 'public', 'abstract', 'constructor',
+        'private', 'classmethod', 'property', 'setter', 'deleter',
+        'class', 'struct', 'interface', 'trait', 'record', 'enum', 'namespace', 'impl',
+    ]);
+
     for (const [name, symbols] of index.symbols) {
+        // Definition NAME lines of same-name def-kind symbols are
+        // declarations, not usages — two never-called same-name methods used
+        // to keep each other alive (fix #243: three unreferenced `delete`
+        // methods invisible). nameLine only (never a decorated def's
+        // startLine — a `@helper` decorator line IS a usage of the name).
+        let sameNameDefLines = null;
+        const defNameLines = () => {
+            if (sameNameDefLines) return sameNameDefLines;
+            sameNameDefLines = new Map();
+            for (const other of symbols) {
+                if (!DEF_NAME_LINE_KINDS.has(other.type)) continue;
+                const ln = other.nameLine ?? other.startLine;
+                if (ln == null) continue;
+                let set = sameNameDefLines.get(other.file);
+                if (!set) { set = new Set(); sameNameDefLines.set(other.file, set); }
+                set.add(ln);
+            }
+            return sameNameDefLines;
+        };
+
         for (const symbol of symbols) {
             // Skip non-function/class types (callableTypes defined above)
             if (!callableTypes.includes(symbol.type)) {
@@ -551,6 +598,7 @@ function deadcode(index, options = {}) {
             // unrelated module's same-name symbol.
             let nonDefUsages = allUsages.filter(u =>
                 !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine)) &&
+                !(defNameLines().get(u.file)?.has(u.line)) &&
                 (!u.dottedScope ||
                     (u.dottedScope === 'same-file'
                         ? u.file === symbol.file

@@ -3648,3 +3648,35 @@ describe('fix #241 (Python): zero-param functions record empty params, not the u
         } finally { rm(dir); }
     });
 });
+
+describe('fix #243 (Python): bare dotted decorators keep the decorating method alive', () => {
+    it('deadcode never claims a method used as @instance.method', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname="t"\n',
+            'events.py': 'class Bus:\n    def subscribe(self, fn):\n        return fn\n\nbus = Bus()\n\n@bus.subscribe\ndef on_message(msg):\n    pass\non_message(1)\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(!r.result.some(s => s.name === 'subscribe'),
+                'decorator application is an import-time call — deleting subscribe breaks the module');
+            const su = execute(index, 'search', { unused: true });
+            const list = su.result.results || su.result;
+            assert.ok(!list.some(s => s.name === 'subscribe'), 'search --unused spares it too');
+        } finally { rm(dir); }
+    });
+
+    it('an alias assignment line still counts as a usage (never excluded as a def line)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': 'def helper():\n    return 1\n',
+            'b.py': 'import a\nhelper = a.helper\nprint(helper)\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(!r.result.some(s => s.name === 'helper' && s.file === 'a.py'),
+                'the alias line references a.helper — excluding it would be a false-dead');
+        } finally { rm(dir); }
+    });
+});

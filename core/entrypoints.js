@@ -132,6 +132,25 @@ const FRAMEWORK_PATTERNS = [
         methodPattern: /^(HandleFunc|Handle)$/,
     },
 
+    // Actix (Rust) — the runtime/test macros are NOT routes (fix #243:
+    // #[actix_web::main] was typed http, so --type runtime missed main on
+    // actix apps and --type http listed it as a route).
+    {
+        id: 'actix-main',
+        languages: new Set(['rust']),
+        type: 'runtime',
+        framework: 'actix',
+        detection: 'modifier',
+        pattern: /^actix_web::main$/,
+    },
+    {
+        id: 'actix-test',
+        languages: new Set(['rust']),
+        type: 'test',
+        framework: 'actix',
+        detection: 'modifier',
+        pattern: /^actix_web::test$/,
+    },
     // Actix (Rust) — modifiers from #[get("/path")], #[post("/path")]
     {
         id: 'actix-route',
@@ -139,7 +158,7 @@ const FRAMEWORK_PATTERNS = [
         type: 'http',
         framework: 'actix',
         detection: 'modifier',
-        pattern: /^(get|post|put|delete|patch|actix_web::main|actix_web::test)$/,
+        pattern: /^(get|post|put|delete|patch)$/,
     },
 
     // ── Dependency Injection ────────────────────────────────────────────
@@ -258,7 +277,8 @@ const FRAMEWORK_PATTERNS = [
 
     // ── Go Runtime Entry Points ─────────────────────────────────────────
 
-    // Go main function (program entry)
+    // Go main function (program entry). symbolFilter: only FREE functions —
+    // a method named main on a receiver is an ordinary method (fix #243).
     {
         id: 'go-main',
         languages: new Set(['go']),
@@ -266,6 +286,7 @@ const FRAMEWORK_PATTERNS = [
         framework: 'go',
         detection: 'namePattern',
         pattern: /^main$/,
+        symbolFilter: (s) => !s.className && !s.receiver,
     },
 
     // Go init functions (package initialization, called by runtime)
@@ -276,6 +297,7 @@ const FRAMEWORK_PATTERNS = [
         framework: 'go',
         detection: 'namePattern',
         pattern: /^init$/,
+        symbolFilter: (s) => !s.className && !s.receiver,
     },
 
     // Go test functions (called by go test)
@@ -290,7 +312,8 @@ const FRAMEWORK_PATTERNS = [
 
     // ── Java entry points ─────────────────────────────────────────────
 
-    // Java main(String[] args) — JVM entry point
+    // Java main(String[] args) — JVM entry point. Java main IS a method, but
+    // only a STATIC one is JVM-invocable (fix #243).
     {
         id: 'java-main',
         languages: new Set(['java']),
@@ -298,6 +321,7 @@ const FRAMEWORK_PATTERNS = [
         framework: 'java',
         detection: 'namePattern',
         pattern: /^main$/,
+        symbolFilter: (s) => (s.modifiers || []).includes('static'),
     },
 
     // JUnit @Test family — Java parser lowercases annotations into `modifiers`,
@@ -335,7 +359,8 @@ const FRAMEWORK_PATTERNS = [
 
     // ── Rust entry points ─────────────────────────────────────────────
 
-    // Rust main() — fn main() is the binary entry point
+    // Rust main() — the FREE function fn main() is the binary entry point;
+    // an impl method named main is an ordinary method (fix #243)
     {
         id: 'rust-main',
         languages: new Set(['rust']),
@@ -343,6 +368,7 @@ const FRAMEWORK_PATTERNS = [
         framework: 'rust',
         detection: 'namePattern',
         pattern: /^main$/,
+        symbolFilter: (s) => !s.className && !s.receiver,
     },
 
     // Rust #[test] attribute — Rust parser stores attributes as `modifiers`,
@@ -655,6 +681,20 @@ function detectEntrypoints(index, options = {}) {
         }
     }
 
+    // Same discipline for --framework (fix #243) — a typo like 'flsk'
+    // silently filtered everything to an empty result.
+    if (options.framework) {
+        const validFrameworks = new Set(FRAMEWORK_PATTERNS.map(p => p.framework.toLowerCase()));
+        const wanted = String(options.framework).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+        const unknown = wanted.filter(f => !validFrameworks.has(f));
+        if (unknown.length > 0) {
+            return {
+                error: 'invalid-framework',
+                message: `Unknown framework "${unknown.join('", "')}". Valid: ${[...validFrameworks].sort().join(', ')}.`,
+            };
+        }
+    }
+
     // Build callback entrypoint map (call-pattern detection)
     const callbackMap = buildCallbackEntrypointMap(index);
 
@@ -744,6 +784,9 @@ function detectEntrypoints(index, options = {}) {
             // Check name-based patterns (main, init, TestXxx, etc.)
             for (const np of namePatterns) {
                 if (!np.languages.has(fileEntry.language)) continue;
+                // Per-pattern symbol predicate (fix #243) — e.g. main must be
+                // a free function (Rust/Go) or a static method (Java)
+                if (np.symbolFilter && !np.symbolFilter(symbol)) continue;
                 if (np.pattern.test(name)) {
                     const key = `${symbol.file}:${symbol.startLine}:${name}`;
                     if (seen.has(key)) continue;

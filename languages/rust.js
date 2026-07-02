@@ -2140,7 +2140,10 @@ function getEntryPointKind(symbol) {
     // Functions inside #[cfg(test)] mod blocks — test-only code, even if they
     // lack a direct #[test] attribute (e.g. shared helpers in `mod tests`).
     if (m.includes('cfg_test_module')) return 'test';
-    if (symbol.name === 'main') return 'main';
+    // Only the FREE function fn main() is the binary entry — an impl method
+    // named `main` is an ordinary method (fix #243; it was never audited by
+    // deadcode and entrypoints listed it as runtime).
+    if (symbol.name === 'main' && !symbol.className && !symbol.receiver) return 'main';
     // Trait-impl methods are framework entry points (invoked by trait holder).
     if (symbol.isMethod && symbol.className && symbol.traitImpl) return 'framework';
     return null;

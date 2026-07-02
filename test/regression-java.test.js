@@ -2944,3 +2944,32 @@ describe('fix #241 (Java): zero-param methods record empty params, not the unkno
         } finally { rm(dir); }
     });
 });
+
+describe('fix #243 (Java): same-name dead methods reported; static main kept as entry', () => {
+    it('a never-called method is dead even when an unrelated interface declares the same name', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Shape.java': 'public interface Shape { double area(); }',
+            'A.java': 'public class A {\n    public double area() { return 1.0; }\n}',
+            'Main.java': 'public class Main { public static void main(String[] args) { new A(); } }',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', { includeExported: true });
+            assert.ok(r.result.some(s => s.name === 'area' && s.file === 'A.java'),
+                'A does not implement Shape — the declaration line is not a usage');
+        } finally { rm(dir); }
+    });
+
+    it('public static main stays an entry point (Java main IS a method)', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Main.java': 'public class Main {\n    public static void main(String[] args) {}\n}',
+        });
+        try {
+            const index = idx(dir);
+            const eps = execute(index, 'entrypoints', {});
+            assert.ok(eps.result.some(e => e.name === 'main' && e.type === 'runtime'));
+        } finally { rm(dir); }
+    });
+});

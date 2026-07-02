@@ -1749,8 +1749,12 @@ function findUsagesInCode(code, name, parser, tree) {
  */
 function getEntryPointKind(symbol) {
     const { name } = symbol;
+    // Test* stays receiver-agnostic — testify suite METHODS (func (s *Suite)
+    // TestFoo) are genuinely harness-invoked.
     if (/^(Test|Benchmark|Example|Fuzz)[A-Z_]/.test(name)) return 'test';
-    if (name === 'main' || name === 'init') return 'main';
+    // Only FREE functions main/init are runtime entries — a method named
+    // main/init on a receiver is an ordinary method (fix #243).
+    if ((name === 'main' || name === 'init') && !symbol.className && !symbol.receiver) return 'main';
     return null;
 }
 
