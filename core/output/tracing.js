@@ -527,7 +527,7 @@ function formatAffectedTests(result, options = {}) {
     lines.push(`affected-tests: ${result.root}`);
     lines.push('═'.repeat(60));
     lines.push(`${result.file}:${result.line}`);
-    lines.push(`1 function changed → ${summary.totalAffected} functions affected (depth ${result.depth})`);
+    lines.push(`1 function changed → ${summary.totalAffected} function${summary.totalAffected !== 1 ? 's' : ''} affected (depth ${result.depth})`);
     lines.push('');
 
     if (result.testFiles.length === 0) {

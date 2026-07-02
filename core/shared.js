@@ -215,11 +215,40 @@ function countTextBlindspots(content, language) {
     };
 }
 
+/**
+ * Line ranges of INLINE test symbols in a source file — Rust #[test] fns and
+ * #[cfg(test)] module members. A production file promoted to "test file"
+ * because it CONTAINS an inline test module is test code only within these
+ * ranges; counting its production lines as test matches claimed false
+ * coverage (fix #244: `let url = self.build_url(path)` in a production
+ * method body was credited as a test of build_url).
+ * @returns {Array<[number, number]>}
+ */
+function inlineTestRanges(fileEntry) {
+    const ranges = [];
+    for (const s of fileEntry.symbols || []) {
+        if (s.modifiers?.includes('test') || s.modifiers?.includes('cfg_test_module')) {
+            ranges.push([s.startLine, s.endLine ?? s.startLine]);
+        }
+    }
+    return ranges;
+}
+
+/** True when a line number falls inside any of the given [start, end] ranges. */
+function lineInRanges(line, ranges) {
+    for (const [s, e] of ranges) {
+        if (line >= s && line <= e) return true;
+    }
+    return false;
+}
+
 module.exports = {
     pickBestDefinition,
     addTestExclusions,
     escapeRegExp,
     codeUnitCompare,
+    inlineTestRanges,
+    lineInRanges,
     NON_CALLABLE_TYPES,
     formatSymbolHandle,
     parseSymbolHandle,

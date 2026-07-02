@@ -2973,3 +2973,34 @@ describe('fix #243 (Java): same-name dead methods reported; static main kept as 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #244 (Java): same-package test discovery and shadow discipline', () => {
+    it('tests --file keeps same-package test files that need no import statement', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/app/Calculator.java': 'package app;\npublic class Calculator {\n    public static int square(int x) { return x * x; }\n}',
+            'src/app/MathIntegrationTest.java': 'package app;\npublic class MathIntegrationTest {\n    public void testMath() {\n        int r = Calculator.square(5);\n    }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const t = execute(index, 'tests', { name: 'square', file: 'Calculator.java' });
+            assert.ok(t.result.some(f => f.file.endsWith('MathIntegrationTest.java')),
+                'same-package Java tests idiomatically have no import');
+        } finally { rm(dir); }
+    });
+
+    it('a bare call of a test-local same-name method is never coverage of the pinned symbol', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'src/app/Calculator.java': 'package app;\npublic class Calculator {\n    public static int square(int x) { return x * x; }\n}',
+            'src/app/HelperTest.java': 'package app;\npublic class HelperTest {\n    private static int square(int x) { return x + 1; }\n    public void testLocal() {\n        int r = square(7);\n    }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const at = execute(index, 'affectedTests', { name: 'square', file: 'Calculator.java' });
+            assert.strictEqual(at.result.testFiles.length, 0,
+                'the bare call binds HelperTest.square — the account excludes the site, the coverage band must agree');
+            assert.ok(at.result.uncovered.includes('square'));
+        } finally { rm(dir); }
+    });
+});

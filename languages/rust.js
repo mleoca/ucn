@@ -1980,12 +1980,41 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Scoped call: Type::method() — only the LAST segment is the callee;
             // the path qualifier (Type in Type::method()) is a type reference,
-            // not a call of Type
+            // not a call of Type. The qualifier IS the receiver — without it,
+            // --class-name scoping could never match associated-function calls
+            // (fix #244: `Kit::make()` invisible to `tests make --class-name Kit`).
             else if (parent.type === 'scoped_identifier') {
                 const grandparent = parent.parent;
-                if (grandparent && grandparent.type === 'call_expression' &&
-                    sameNode(grandparent.childForFieldName('function'), parent) &&
+                const isDirectCall = grandparent && grandparent.type === 'call_expression' &&
+                    sameNode(grandparent.childForFieldName('function'), parent);
+                // Turbofish on a scoped path: Type::<T>::m() wraps the path in
+                // generic_function before the call_expression.
+                const isTurbofishCall = grandparent && grandparent.type === 'generic_function' &&
+                    grandparent.parent && grandparent.parent.type === 'call_expression' &&
+                    sameNode(grandparent.parent.childForFieldName('function'), grandparent);
+                if ((isDirectCall || isTurbofishCall) &&
                     sameNode(parent.childForFieldName('name'), node)) {
+                    usageType = 'call';
+                    const pathNode = parent.childForFieldName('path');
+                    if (pathNode) {
+                        const segs = pathNode.text.split('::');
+                        const receiver = segs[segs.length - 1];
+                        if (receiver) {
+                            usages.push({ line, column, usageType, receiver });
+                            return true;
+                        }
+                    }
+                }
+            }
+            // Turbofish call on a bare name: f::<T>() — the identifier's parent
+            // is generic_function, the call wraps that (fix #244: classified
+            // 'reference', so the account confirmed the edge while the
+            // coverage scan reported the function uncovered).
+            else if (parent.type === 'generic_function' &&
+                     sameNode(parent.childForFieldName('function'), node)) {
+                const gp = parent.parent;
+                if (gp && gp.type === 'call_expression' &&
+                    sameNode(gp.childForFieldName('function'), parent)) {
                     usageType = 'call';
                 }
             }

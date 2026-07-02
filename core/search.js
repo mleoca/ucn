@@ -8,7 +8,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare } = require('./shared');
+const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { getCachedCalls } = require('./callers');
@@ -1024,12 +1024,13 @@ function tests(index, nameOrFile, options = {}) {
         if (isTestFile(fileEntry.relativePath, fileEntry.language)) {
             testFiles.push({ path: filePath, entry: fileEntry });
         } else if (fileEntry.language === 'rust') {
-            // Rust idiomatically puts tests in #[cfg(test)] modules inside source files.
-            const hasInlineTests = fileEntry.symbols?.some(s =>
-                s.modifiers?.includes('test')
-            );
-            if (hasInlineTests) {
-                testFiles.push({ path: filePath, entry: fileEntry });
+            // Rust idiomatically puts tests in #[cfg(test)] modules inside
+            // source files. Such a file is test code ONLY within its inline
+            // test ranges — matching its production lines claimed false
+            // coverage (fix #244).
+            const ranges = inlineTestRanges(fileEntry);
+            if (ranges.length > 0) {
+                testFiles.push({ path: filePath, entry: fileEntry, testRanges: ranges });
             }
         }
     }
@@ -1045,7 +1046,7 @@ function tests(index, nameOrFile, options = {}) {
     // --exclude filtering
     const excludeArr = options.exclude ? (Array.isArray(options.exclude) ? options.exclude : [options.exclude]) : [];
 
-    for (const { path: testPath, entry } of testFiles) {
+    for (const { path: testPath, entry, testRanges } of testFiles) {
         try {
             // Apply exclude filters
             if (excludeArr.length > 0 && !index.matchesFilters(entry.relativePath, { exclude: excludeArr })) continue;
@@ -1081,6 +1082,9 @@ function tests(index, nameOrFile, options = {}) {
 
             for (const usage of astUsages) {
                 if (usage.usageType === 'definition') continue; // not relevant in test files
+                // Inline-test-promoted file: only lines inside the test
+                // ranges are test code (fix #244).
+                if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
 
                 const lineKey = `${usage.line}:${usage.usageType}`;
                 if (seenLines.has(lineKey)) continue;
@@ -1253,6 +1257,25 @@ function _buildSourceFileImporters(index, defs) {
 
             // Go: same-directory tests (package-scoped, no imports needed)
             if (traits.packageScope === 'directory' && testDir === srcDir) {
+                importers.add(absPath);
+                continue;
+            }
+
+            // Java: same-package tests need no import statement either — a
+            // test file in the same directory sees the source's package
+            // members directly (fix #244: tests --file silently dropped
+            // MathIntegrationTest.java while affected-tests found it).
+            if (srcEntry.language === 'java' && testDir === srcDir) {
+                importers.add(absPath);
+                continue;
+            }
+
+            // Rust: Cargo integration tests live in <crate-root>/tests/ and
+            // import via the crate's PACKAGE name, which the import resolver
+            // does not map to project files (fix #244).
+            if (srcEntry.language === 'rust' &&
+                path.basename(testDir) === 'tests' &&
+                srcPath.startsWith(path.dirname(testDir) + path.sep)) {
                 importers.add(absPath);
                 continue;
             }

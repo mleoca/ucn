@@ -3680,3 +3680,39 @@ describe('fix #243 (Python): bare dotted decorators keep the decorating method a
         } finally { rm(dir); }
     });
 });
+
+describe('fix #244 (Python): setUp self.attr receivers and interior-node class scoping', () => {
+    it('the unittest setUp idiom produces coverage — self.w.render() matches under --class-name', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'mod.py': 'class Widget:\n    def __init__(self, n):\n        self.n = n\n    def render(self):\n        return self.n\n',
+            'test_mod.py': 'import unittest\nfrom mod import Widget\n\nclass WidgetCase(unittest.TestCase):\n    def setUp(self):\n        self.w = Widget(3)\n    def test_render(self):\n        self.assertEqual(self.w.render(), 3)\n',
+        });
+        try {
+            const index = idx(dir);
+            const t = execute(index, 'tests', { name: 'render', className: 'Widget' });
+            assert.ok(t.result.some(f => f.matches.some(m => m.line === 8)),
+                'self.w.render() kept under class scoping');
+            const at = execute(index, 'affectedTests', { name: 'render', className: 'Widget' });
+            const inSomeBand = at.result.testFiles.some(f => f.file === 'test_mod.py') ||
+                at.result.possiblyAffectedTests.some(f => f.file === 'test_mod.py');
+            assert.ok(inSomeBand, 'the only test exercising render appears in a band');
+        } finally { rm(dir); }
+    });
+
+    it('a test of a different class\'s same-named method is not interior coverage', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'lib.py': 'def util_fn():\n    return 1\n',
+            'app.py': 'from lib import util_fn\n\nclass Manager:\n    def save(self):\n        return util_fn()\n\nclass Service:\n    def save(self):\n        return 2\n',
+            'test_app.py': 'from app import Service\n\ndef test_service_save():\n    s = Service()\n    assert s.save() == 2\n',
+        });
+        try {
+            const index = idx(dir);
+            const at = execute(index, 'affectedTests', { name: 'util_fn' });
+            const credited = at.result.testFiles.flatMap(f => f.coveredFunctions);
+            assert.ok(!credited.includes('save'),
+                'Service.save cannot reach util_fn — the tree itself excludes that site');
+        } finally { rm(dir); }
+    });
+});

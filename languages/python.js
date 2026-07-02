@@ -1428,6 +1428,19 @@ function findUsagesInCode(code, name, parser, tree) {
                     usages.push({ line, column, usageType, receiver: object.text });
                     return true;
                 }
+                // self.attr receiver (unittest setUp idiom: self.w = Widget(3);
+                // self.w.render()) — record the ATTR name so the instance-type
+                // map built from the assignment line ('w' → Widget) matches
+                // (fix #244: class-scoped tests dropped these calls entirely).
+                if (object && object.type === 'attribute') {
+                    const innerObj = object.childForFieldName('object');
+                    const innerAttr = object.childForFieldName('attribute');
+                    if (innerObj && innerObj.type === 'identifier' &&
+                        ['self', 'cls'].includes(innerObj.text) && innerAttr) {
+                        usages.push({ line, column, usageType, receiver: innerAttr.text });
+                        return true;
+                    }
+                }
             }
         }
 

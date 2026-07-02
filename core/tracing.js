@@ -20,7 +20,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare } = require('./shared');
+const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
 const { detectLanguage, getLanguageModule } = require('../languages');
@@ -798,14 +798,24 @@ function affectedTests(index, name, options = {}) {
         });
         if (!blastResult) return null;
 
-        // Step 2: Collect confirmed-affected function names (and node keys)
+        // Step 2: Collect confirmed-affected function names (and node keys).
+        // Also record each name's CLASS identity from the tree — interior
+        // names were scanned bare (post-#239), so a test of a DIFFERENT
+        // class's same-named method got credited as coverage (fix #244:
+        // `asyncio.run(...)` credited as covering Mgr.run).
         const affectedNames = new Set();
         const confirmedKeys = new Set();
+        const nameToClasses = new Map(); // name → Set(className|null)
         affectedNames.add(name);
         const collectNames = (node) => {
             if (!node) return;
             affectedNames.add(node.name);
             confirmedKeys.add(`${node.file}:${node.line}`);
+            const defs = index.symbols.get(node.name);
+            const d = defs?.find(x => x.relativePath === node.file && x.startLine === node.line);
+            let set = nameToClasses.get(node.name);
+            if (!set) { set = new Set(); nameToClasses.set(node.name, set); }
+            set.add(d?.className || null);
             for (const child of node.children || []) collectNames(child);
         };
         collectNames(blastResult.tree);
@@ -817,6 +827,10 @@ function affectedTests(index, name, options = {}) {
         const excludeArr = exclude ? (Array.isArray(exclude) ? exclude : [exclude]) : [];
         const includeMethods = options.includeMethods ?? true;
         const possiblyNames = new Set();
+        // Test FILES containing an unverified call site of an affected name
+        // (relativePath → funcName → Set(lines)) — merged into
+        // possiblyAffectedTests after the scan (fix #244).
+        const frontierTestHits = new Map();
         {
             const callerCache = new Map();
             const possibleVisited = new Set();
@@ -840,6 +854,35 @@ function affectedTests(index, name, options = {}) {
             };
             for (const fe of blastResult.unverifiedFrontier || []) {
                 enqueueCaller(fe, fe.hop);
+                // A frontier caller that is ITSELF a test function landed in
+                // neither band (fix #244, the unittest setUp idiom):
+                // isProductionName filters it from possiblyAffected, and the
+                // test scan greps for calls OF it — tests are never called.
+                // Route its FILE into possiblyAffectedTests directly.
+                if (fe.callerFile && fe.callerName) {
+                    const cfe = index.files.get(fe.callerFile);
+                    if (cfe) {
+                        let isTestCaller = isTestFile(cfe.relativePath, cfe.language);
+                        if (!isTestCaller) {
+                            const defs = index.symbols.get(fe.callerName);
+                            const d = defs?.find(x => x.file === fe.callerFile && x.startLine === fe.callerStartLine);
+                            const kindOf = getLanguageModule(cfe.language)?.getEntryPointKind;
+                            if (d && kindOf && kindOf(d) === 'test') isTestCaller = true;
+                        }
+                        if (isTestCaller &&
+                            (excludeArr.length === 0 || index.matchesFilters(cfe.relativePath, { exclude: excludeArr }))) {
+                            const affName = fe.atNode?.name || name;
+                            let entry = frontierTestHits.get(fe.callerFile);
+                            if (!entry) {
+                                entry = { rel: cfe.relativePath, byName: new Map() };
+                                frontierTestHits.set(fe.callerFile, entry);
+                            }
+                            let hitLines = entry.byName.get(affName);
+                            if (!hitLines) { hitLines = new Set(); entry.byName.set(affName, hitLines); }
+                            if (fe.line != null) hitLines.add(fe.line);
+                        }
+                    }
+                }
             }
             while (queue.length > 0) {
                 const { def: d, depth } = queue.shift();
@@ -869,11 +912,16 @@ function affectedTests(index, name, options = {}) {
         for (const [filePath, fileEntry] of index.files) {
             let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
             // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
-            // or symbols inside a #[cfg(test)] mod block (BUG-CY).
+            // or symbols inside a #[cfg(test)] mod block (BUG-CY). Such files
+            // are test code ONLY within the inline test ranges — production
+            // lines were counted as test matches (fix #244, false coverage).
+            let testRanges = null;
             if (!isTest && fileEntry.language === 'rust') {
-                isTest = fileEntry.symbols?.some(s =>
-                    s.modifiers?.includes('test') || s.modifiers?.includes('cfg_test_module')
-                );
+                const ranges = inlineTestRanges(fileEntry);
+                if (ranges.length > 0) {
+                    isTest = true;
+                    testRanges = ranges;
+                }
             }
             if (!isTest) continue;
             if (excludeArr.length > 0 && !index.matchesFilters(fileEntry.relativePath, { exclude: excludeArr })) continue;
@@ -889,14 +937,37 @@ function affectedTests(index, name, options = {}) {
                     const astUsages = index._getCachedUsages(filePath, funcName);
                     if (!astUsages || astUsages.length === 0) continue;
 
-                    // className scoping applies to the ROOT symbol's own name
-                    // only (fix #239, G3-go-measured): downstream names in the
-                    // closure are DIFFERENT symbols the blast tree already
-                    // resolved with full receiver physics — a bare call to a
-                    // standalone wrapper (SaveAll) can never carry the root's
-                    // class receiver, so filtering it lost real coverage
-                    // ("No test files found" while TestSaveAll exists).
-                    const scopeToClass = className && funcName === name ? className : null;
+                    // className scoping: the user's pin applies to the ROOT
+                    // symbol's own name only (fix #239, G3-go-measured) — a
+                    // bare call to a standalone wrapper (SaveAll) can never
+                    // carry the root's class receiver. INTERIOR names with a
+                    // single unambiguous class identity in the blast tree
+                    // scope to it (fix #244): a test of a different class's
+                    // same-named method is not coverage of THIS closure.
+                    // Standalone/mixed-identity names keep the bare scan.
+                    let scopeToClass = null;
+                    if (funcName === name) {
+                        scopeToClass = className || null;
+                    } else {
+                        const classes = nameToClasses.get(funcName);
+                        if (classes && classes.size === 1) {
+                            const only = classes.values().next().value;
+                            if (only) scopeToClass = only;
+                        }
+                    }
+
+                    // A test file that DEFINES funcName itself owns bare-name
+                    // calls of it (#215/#222(3) scope physics — fix #244: a
+                    // private same-name helper let the coverage band claim
+                    // 100% while the same payload's account excluded the
+                    // site as other-definition). Exception: when the local
+                    // def IS part of the blast closure (Rust inline-test
+                    // files define the symbol AND test it), bare calls bind
+                    // the affected symbol — genuine coverage.
+                    const localDefs = (fileEntry.symbols || []).filter(s => s.name === funcName);
+                    const localShadow = localDefs.length > 0 &&
+                        localDefs.every(s => !confirmedKeys.has(`${fileEntry.relativePath}:${s.startLine}`)) &&
+                        !(fileEntry.importBindings || []).some(b => b.name === funcName);
 
                     // Build instance type map for className scoping (if applicable)
                     let instanceTypeMap = null;
@@ -907,6 +978,12 @@ function affectedTests(index, name, options = {}) {
                     const seenLines = new Set();
                     for (const usage of astUsages) {
                         if (usage.usageType === 'definition') continue;
+                        // Inline-test-promoted file: only lines inside the
+                        // test ranges are test code (fix #244).
+                        if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
+                        // Local same-name shadow: bare calls bind the test
+                        // file's OWN definition, never the affected symbol.
+                        if (localShadow && !usage.receiver && usage.usageType !== 'import') continue;
                         const lineKey = `${usage.line}:${usage.usageType}`;
                         if (seenLines.has(lineKey)) continue;
                         seenLines.add(lineKey);
@@ -1002,6 +1079,33 @@ function affectedTests(index, name, options = {}) {
                     }
                 }
             } catch (e) { /* skip unreadable */ }
+        }
+
+        // Merge frontier test hits: a test file whose own test function IS
+        // the unverified caller never surfaces via the scan (the scan greps
+        // for calls of scanNames; the test's name is not among them) — add
+        // it to the possible band with its unverified call sites (fix #244).
+        for (const [absFile, entry] of frontierTestHits) {
+            if (results.some(r => r.file === entry.rel) ||
+                possibleResults.some(r => r.file === entry.rel)) continue;
+            const covered = [...entry.byName.keys()].sort(codeUnitCompare);
+            const matches = [];
+            for (const fn of covered) {
+                for (const ln of [...entry.byName.get(fn)].sort((a, b) => a - b)) {
+                    matches.push({
+                        line: ln,
+                        content: (index.getLineContent(absFile, ln) || '').trim(),
+                        matchType: 'call',
+                        functionName: fn,
+                    });
+                }
+            }
+            possibleResults.push({
+                file: entry.rel,
+                coveredFunctions: covered,
+                matchCount: matches.length,
+                matches,
+            });
         }
 
         // Sort by coverage breadth then alphabetically

@@ -3558,3 +3558,66 @@ describe('fix #243 (Rust): same-name suppression, main-name guard, actix entry t
         } finally { rm(dir); }
     });
 });
+
+describe('fix #244 (Rust): test-discovery physics', () => {
+    it('Kit::make() is visible to --class-name scoping and Class.method syntax', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub struct Kit { pub v: i32 }\nimpl Kit {\n    pub fn make() -> Kit { Kit { v: 1 } }\n    pub fn run(&self) -> i32 { self.v }\n}\n',
+            'src/lib_test.rs': '#[test]\nfn test_make() {\n    let k = Kit::make();\n    assert_eq!(k.run(), 1);\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const t1 = execute(index, 'tests', { name: 'make', className: 'Kit' });
+            assert.ok(t1.result.length > 0 && t1.result[0].matches.some(m => m.line === 3),
+                'the path qualifier IS the receiver');
+            const at = execute(index, 'affectedTests', { name: 'make', className: 'Kit' });
+            assert.ok(!at.result.uncovered.includes('make'), 'make covered by its direct #[test] caller');
+        } finally { rm(dir); }
+    });
+
+    it('turbofish calls classify as calls on the usages path', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub fn make_container<T>() -> Vec<T> { Vec::new() }\n',
+            'src/lib_test.rs': '#[test]\nfn test_mc() {\n    let mut c = make_container::<i32>();\n    c.push(1);\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const t = execute(index, 'tests', { name: 'make_container', callsOnly: true });
+            assert.ok(t.result.some(f => f.matches.some(m => m.line === 3 && m.matchType === 'call')),
+                'f::<T>() is a call, not a reference');
+            const at = execute(index, 'affectedTests', { name: 'make_container' });
+            assert.ok(!at.result.uncovered.includes('make_container'),
+                'coverage agrees with the account');
+        } finally { rm(dir); }
+    });
+
+    it('production lines of inline #[cfg(test)] files are never test matches', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/svc.rs': 'pub struct Api;\nimpl Api {\n    pub fn build_url(&self) -> String { String::new() }\n    pub fn get(&self) -> String {\n        let url = self.build_url();\n        url\n    }\n}\n\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn test_get() {\n        let a = Api;\n        assert_eq!(a.get(), "");\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const t = execute(index, 'tests', { name: 'build_url' });
+            assert.ok(!(t.result || []).some(f => f.matches.some(m => m.line === 5)),
+                'the production body of get() is not a test of build_url');
+        } finally { rm(dir); }
+    });
+
+    it('Cargo tests/ integration files survive --file scoping', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="re"',
+            'src/inner.rs': 'pub fn helper() -> i32 { 7 }',
+            'src/lib.rs': 'pub mod inner;\npub use inner::helper;',
+            'tests/re_test.rs': 'use re::helper;\n#[test]\nfn test_helper() { assert_eq!(helper(), 7); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const t = execute(index, 'tests', { name: 'helper', file: 'inner.rs' });
+            assert.ok(t.result.some(f => f.file === 'tests/re_test.rs'),
+                'crate-name imports do not resolve — the tests/ dir is the standard layout');
+        } finally { rm(dir); }
+    });
+});
