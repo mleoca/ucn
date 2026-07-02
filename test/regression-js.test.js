@@ -6489,3 +6489,85 @@ describe('fix #230 (TS): param properties/decorators are not defaults; overload 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #231 (TS): callee-side this-rooted field-hop typing', () => {
+    // Callee parity with the caller side's #219: this.service.save() resolves
+    // save through the field's declared type (this-rooted hop → enclosing
+    // class at query time); this._map.has() on a WeakMap-typed field is an
+    // external builtin call, not an unverified callee.
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'app.ts': `class Registry {
+  private _map: WeakMap<object, string> = new WeakMap();
+  service: Store;
+  add(schema: object): void {
+    this._map.has(schema);
+    this.service.save(schema);
+  }
+}
+class Store {
+  save(x: object): void {}
+}
+class Vault {
+  save(x: object): void {}
+}
+`,
+    };
+
+    it('confirms this.service.save via the declared field type, both modes', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('add') || []).find(d => d.className === 'Registry');
+            assert.ok(def, 'Registry.add def');
+            const account = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            const legacy = index.findCallees(def, { includeMethods: true });
+            for (const [label, r] of [['account', account], ['legacy', legacy]]) {
+                const save = r.filter(c => c.name === 'save');
+                assert.strictEqual(save.length, 1, `${label}: exactly one save edge`);
+                assert.strictEqual(save[0].className, 'Store',
+                    `${label}: field type Store must pick Store.save over Vault.save`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('routes builtin-typed field-hop calls to the external bucket', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('add') || []).find(d => d.className === 'Registry');
+            const r = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            assert.ok(!(r.unverifiedCallees || []).some(u => u.name === 'has'),
+                'WeakMap.has must not surface as an unverified callee');
+            assert.ok(r.calleeAccount.external.count >= 1,
+                `expected external bucket to hold WeakMap.has: ${JSON.stringify(r.calleeAccount)}`);
+            assert.ok(r.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: untyped fields never exclude — this.cb = cb is a real edge shape', () => {
+        // #218c member-alias family: an unannotated field can hold a
+        // same-named project function; exclusion requires a TRUSTED
+        // non-callable declared type.
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': `function cb() { return 1; }
+class Holder {
+  constructor() { this.cb = cb; }
+  fire() {
+    return foreign(this.cb);
+  }
+}
+module.exports = { cb, Holder };
+`,
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('fire') || [])[0];
+            const r = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            assert.strictEqual(r.calleeAccount.excluded.byReason['member-reference'] || 0, 0,
+                'untyped field reference must not be excluded as member-reference');
+            assert.ok(r.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

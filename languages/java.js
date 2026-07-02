@@ -1239,6 +1239,26 @@ function findCallsInCode(code, parser) {
             }
         }
 
+        // Try-with-resources declarations are declared-type locals too (fix
+        // #231): `try (Res r = new Res())` types r exactly like `Res r = ...`
+        // — the resource node carries type/name/value fields directly.
+        if (node.type === 'resource' && functionStack.length > 0) {
+            const resTypeNode = node.childForFieldName('type');
+            const resNameNode = node.childForFieldName('name');
+            const resValueNode = node.childForFieldName('value');
+            let typeName = resValueNode?.type === 'object_creation_expression'
+                ? extractTypeName(resValueNode.childForFieldName('type'))
+                : null;
+            if (!typeName && resTypeNode && resTypeNode.text !== 'var') {
+                typeName = extractTypeName(resTypeNode);
+            }
+            if (resNameNode && typeName) {
+                const scopeKey = functionStack[functionStack.length - 1].startLine;
+                const typeMap = scopeTypes.get(scopeKey);
+                if (typeMap) typeMap.set(resNameNode.text, typeName);
+            }
+        }
+
         return true;
     }, {
         onLeave: (node) => {

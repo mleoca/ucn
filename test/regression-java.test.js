@@ -2726,3 +2726,77 @@ describe('fix #230 (Java): enum constructors carry paramsStructured', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #231 (Java): try-with-resources declarations type receivers', () => {
+    // G1-understand-java BUG-4: `try (Res r = new Res()) { r.use(); }` routed
+    // method-ambiguous for BOTH Res.use and a same-named Other.use, while the
+    // identical plain declaration confirmed and excluded correctly — the
+    // resource node was not a typing source (#220(7) family).
+    const FILES = {
+        'Res.java': `public class Res implements AutoCloseable {
+    public void use() {}
+    public void close() {}
+}
+`,
+        'Other.java': `public class Other {
+    public void use() {}
+}
+`,
+        'Consumer.java': `public class Consumer {
+    public void run() {
+        try (Res r = new Res()) {
+            r.use();
+        }
+        Res r2 = new Res();
+        r2.use();
+    }
+}
+`,
+    };
+
+    it('confirms the resource receiver against its declared class', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'use', className: 'Res' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            assert.ok(r.result.callers.some(c => c.relativePath === 'Consumer.java' && c.line === 4),
+                'try-resource call r.use() must be a confirmed caller of Res.use');
+            assert.ok(!(r.result.unverifiedCallers || []).some(u => u.line === 4),
+                'r.use() must not sit in the unverified band');
+        } finally { rm(dir); }
+    });
+
+    it('excludes the resource receiver against the sibling class', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'use', className: 'Other' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.callers.length, 0, 'Other.use has no callers');
+            assert.ok(!(r.result.unverifiedCallers || []).some(u => u.line === 4),
+                'r.use() is provably Res.use — excluded, not unverified, for Other.use');
+        } finally { rm(dir); }
+    });
+
+    it('types `var` resources from the new Type() value', () => {
+        const dir = tmp({
+            ...FILES,
+            'Consumer.java': `public class Consumer {
+    public void run() throws Exception {
+        try (var r = new Res()) {
+            r.use();
+        }
+    }
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'use', className: 'Res' });
+            assert.ok(r.ok);
+            assert.ok(r.result.callers.some(c => c.relativePath === 'Consumer.java' && c.line === 4),
+                'var resource typed from new Res() must confirm');
+        } finally { rm(dir); }
+    });
+});

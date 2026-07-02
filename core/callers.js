@@ -2625,6 +2625,26 @@ function findCallees(index, def, options = {}) {
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
 
+            // Declared-field receiver hop (fix #231 — callee-side parity
+            // with the caller side's #202/#219): `tm.service.Save()` /
+            // `this._map.has()` records carry receiverRoot/receiverField —
+            // resolve the field's DECLARED type and treat it exactly like a
+            // parser-inferred receiverType. this-rooted structural hops
+            // resolve the root at query time (the enclosing class — arrows
+            // keep lexical `this`; nested function declarations are their
+            // own symbols without className, so dynamic-this shapes resolve
+            // to nothing). _declaredFieldType's guards apply: interface/
+            // trait-typed and generic-param fields return null.
+            let fieldHopType = null;
+            if (call.isMethod && !call.receiverType && call.receiverField) {
+                let hopRoot = call.receiverRootType;
+                if (!hopRoot && call.receiverRoot === 'this' &&
+                    langTraits(language)?.typeSystem === 'structural') {
+                    hopRoot = index.findEnclosingFunction(def.file, call.line, true)?.className;
+                }
+                if (hopRoot) fieldHopType = _declaredFieldType(index, hopRoot, call.receiverField, language);
+            }
+
             // Smart method call handling:
             // - Go: include all method calls (Go doesn't use this/self/cls)
             // - self/this.method(): resolve to same-class method (handled below)
@@ -2672,18 +2692,29 @@ function findCallees(index, def, options = {}) {
                             callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
                                 ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                         }
+                    } else if (_nonCallableFieldMember(index, typeName, call.name, language)) {
+                        // The known receiver type declares the name as its own
+                        // non-callable FIELD — a member reference, never a
+                        // callee (fix #231: `delete(cs.cache, key)` captured
+                        // cs.cache as a method-value callee; cache is
+                        // CacheService's map-typed field, which shadows any
+                        // same-named project function through this receiver).
+                        noteSite(siteId, 'excluded', 'member-reference', call);
                     } else if (collectAccount) {
                         // Locally-typed receiver, but the type defines no such
                         // method in the index — visible, never silently dropped.
                         noteUnverified(siteId, call, 'uncertain-receiver');
                     }
                     continue;
-                } else if (call.receiverType) {
+                } else if (call.receiverType || fieldHopType) {
                     // Use parser-inferred receiverType for method resolution
                     // Go/Java/Rust: from param/receiver type declarations
                     // JS/TS: from `new Foo()` assignments or TypeScript type annotations
                     // Python: from constructor calls or type annotations
-                    const typeName = call.receiverType;
+                    // fieldHopType: the declared type of a one-hop field
+                    // receiver (fix #231 — tm.service.Save() resolves Save
+                    // through the `service *DataService` declaration)
+                    const typeName = call.receiverType || fieldHopType;
                     const symbols = index.symbols.get(call.name);
                     const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
@@ -2714,6 +2745,19 @@ function findCallees(index, def, options = {}) {
                             callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
                                 ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                         }
+                        continue;
+                    }
+                    // No match on the typed receiver. A name the type declares
+                    // as its own non-callable FIELD is a member reference,
+                    // never a callee (fix #231); a builtin hop type with no
+                    // project match is an external call (this._map.has on
+                    // `_map: WeakMap<...>` — the #219 caller-side analog).
+                    if (_nonCallableFieldMember(index, typeName, call.name, language)) {
+                        noteSite(siteId, 'excluded', 'member-reference', call);
+                        continue;
+                    }
+                    if (fieldHopType && BUILTIN_RECEIVER_TYPES.has(typeName)) {
+                        noteSite(siteId, 'external', null, call);
                         continue;
                     }
                     // No match found with inferred type — fall through to include as unresolved
@@ -2880,7 +2924,7 @@ function findCallees(index, def, options = {}) {
                         if (defs && defs.length > 1) {
                             // Go: if receiverType is known, check if it matches exactly one def
                             // This resolves ambiguity like Framework.Run vs Scheduler.Run
-                            const rType = call.receiverType || localTypes?.get(call.receiver);
+                            const rType = call.receiverType || fieldHopType || localTypes?.get(call.receiver);
                             if (rType && langTraits(language)?.typeSystem === 'nominal') {
                                 const matchingDef = defs.find(d =>
                                     d.className === rType ||
@@ -4339,6 +4383,45 @@ function _declaredFieldType(index, rootType, fieldName, language) {
     const typeDefs = index.symbols.get(typeName);
     if (typeDefs && typeDefs.some(d => d.type === 'trait' || d.type === 'interface')) return null;
     return typeName;
+}
+
+/**
+ * Is a member reference `<recv>.name` on a KNOWN receiver type provably a
+ * non-callable FIELD — never an edge to any project callable? (fix #231:
+ * `delete(cs.cache, key)` captures cs.cache as a potential method-value
+ * callee, but `cache` is CacheService's own map-typed field.) The member
+ * access resolves to the MEMBER — a same-named function elsewhere in the
+ * project is unreachable through this receiver (Go field names shadow
+ * promoted methods; Java field/method namespaces are separate but a
+ * paren-less member access is always the field). Only certainty excludes:
+ * every same-type member of the name must be a field whose declared type is
+ * present, not a function type (Go `func(...)`, Rust fn/Fn*, structural
+ * arrow/Callable/Function — the #219 callable-owner shapes), and — for
+ * structural languages — trusted for exclusion (#198: builtin or project
+ * class; `any`/alias/interface heads prove nothing, and an untyped JS field
+ * could hold a same-named function via `this.cb = cb`, the #218c
+ * member-alias family).
+ */
+function _nonCallableFieldMember(index, typeName, name, language) {
+    const defs = index.symbols.get(name);
+    if (!defs || defs.length === 0) return false;
+    const onType = defs.filter(d => d.className === typeName ||
+        (d.receiver && d.receiver.replace(/^\*/, '') === typeName));
+    if (onType.length === 0) return false;
+    for (const d of onType) {
+        if (d.type !== 'field' && d.memberType !== 'field' && d.memberType !== 'private field') return false;
+        if (!d.fieldType) return false;
+        if (_callableFieldDef(index, d)) return false;
+        const raw = String(d.fieldType).trim();
+        if (/^func\b/.test(raw)) return false;
+        if (/\bfn\s*\(|\b(?:Fn|FnMut|FnOnce)\s*[(<]/.test(raw)) return false;
+        if (langTraits(language)?.typeSystem === 'structural') {
+            const head = _normalizeFieldTypeName(raw, language);
+            if (!head || _STRUCTURAL_FLOW_REJECT.has(head) ||
+                !_receiverTypeTrustedForExclusion(index, head)) return false;
+        }
+    }
+    return true;
 }
 
 /**

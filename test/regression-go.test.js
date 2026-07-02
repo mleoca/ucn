@@ -5613,3 +5613,129 @@ func direct() error {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #231 (Go): callee-side field-hop typing + phantom field-callee exclusion', () => {
+    // G1-understand-go BUG-2: `delete(cs.cache, key)` captured cs.cache as a
+    // potential method-value callee — trace grew phantom unverified callees
+    // named after map-typed struct fields, with the factually wrong reason
+    // 'uncertain-receiver' (the receiver is the method's own typed receiver).
+    // And the callee side never hopped declared field types: tm.service.Save()
+    // routed binding-ambiguous while the caller side confirmed the same edge
+    // through `service *DataService` (#202).
+    const FILES = {
+        'go.mod': 'module example.com/m\ngo 1.21\n',
+        'types.go': `package m
+
+type Store struct {
+	items map[string]int
+}
+
+func (s *Store) Save(k string) error {
+	return persist(k)
+}
+
+func persist(k string) error {
+	return nil
+}
+
+// same-named standalone function — the field must shadow it
+func items() int {
+	return 0
+}
+`,
+        'svc.go': `package m
+
+type Manager struct {
+	store *Store
+	cache map[string]string
+}
+
+func (mg *Manager) Flush(k string) error {
+	delete(mg.cache, k)
+	return mg.store.Save(k)
+}
+`,
+    };
+
+    it('excludes map-typed field references as member-reference, not unverified', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('Flush') || [])[0];
+            assert.ok(def, 'Flush def');
+            const r = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            assert.ok(!(r.unverifiedCallees || []).some(u => u.name === 'cache'),
+                'map field must not surface as an unverified callee');
+            assert.ok((r.calleeAccount.excluded.byReason['member-reference'] || 0) >= 1,
+                `expected member-reference exclusion, got: ${JSON.stringify(r.calleeAccount.excluded)}`);
+            assert.ok(r.calleeAccount.conserved, 'account must conserve');
+        } finally { rm(dir); }
+    });
+
+    it('confirms method callees through the declared field type (hop), both modes', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('Flush') || [])[0];
+            const account = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            const legacy = index.findCallees(def, { includeMethods: true });
+            for (const [label, r] of [['account', account], ['legacy', legacy]]) {
+                assert.ok(r.some(c => c.name === 'Save' && c.className === 'Store'),
+                    `${label}: mg.store.Save must resolve to Store.Save via the field's declared type`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: func-typed fields are callable — never member-reference excluded', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'a.go': `package m
+
+type Runner struct {
+	Run func() error
+}
+
+func Run() error { return nil }
+
+func drive(r *Runner) error {
+	return r.Run()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('drive') || [])[0];
+            const r = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            assert.strictEqual(r.calleeAccount.excluded.byReason['member-reference'] || 0, 0,
+                'func-typed field call must not be excluded as member-reference');
+            assert.ok(r.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: field on an UNRELATED type never excludes', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\ngo 1.21\n',
+            'a.go': `package m
+
+type Other struct {
+	handle map[string]int
+}
+
+type Widget struct{}
+
+func (w *Widget) handle() error { return nil }
+
+func use(w *Widget) error {
+	return w.handle()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('use') || [])[0];
+            const r = index.findCallees(def, { includeMethods: true, collectAccount: true });
+            assert.ok(r.some(c => c.name === 'handle' && c.className === 'Widget'),
+                'Widget.handle must stay a confirmed callee — Other.handle field is not evidence');
+        } finally { rm(dir); }
+    });
+});

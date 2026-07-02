@@ -140,9 +140,21 @@ function classifyCallContext(callNode, language) {
 /**
  * Find a call expression node at the target line matching funcName
  */
-function findCallNode(node, callTypes, targetRow, funcName) {
+function findCallNode(node, callTypes, targetRow, funcName, occurrence = 0) {
+    // Several same-name calls can share one line (`greet("a") + greet("b")`,
+    // f-strings) — fix #231: callers pass the site's per-line ordinal so each
+    // record is arg-checked against ITS OWN node, not the line's first.
+    // Records and this walk are both pre-order, so ordinals align; an
+    // out-of-range ordinal falls back to the first match (never worse than
+    // the pre-fix behavior when a parse shape hides a node).
+    const matches = _collectCallNodes(node, callTypes, targetRow, funcName, occurrence + 1);
+    return matches[occurrence] || matches[0] || null;
+}
+
+function _collectCallNodes(node, callTypes, targetRow, funcName, limit, out = []) {
+    if (out.length >= limit) return out;
     if (node.startPosition.row > targetRow || node.endPosition.row < targetRow) {
-        return null; // Skip nodes that don't contain the target line
+        return out; // Skip nodes that don't contain the target line
     }
 
     if (callTypes.has(node.type) && node.startPosition.row <= targetRow && node.endPosition.row >= targetRow) {
@@ -152,7 +164,7 @@ function findCallNode(node, callTypes, targetRow, funcName) {
             if (typeNode) {
                 // Strip generics and package qualifiers: com.foo.Bar<T> -> Bar
                 const typeName = typeNode.text.replace(/<.*>$/, '').split('.').pop();
-                if (typeName === funcName) return node;
+                if (typeName === funcName) out.push(node);
             }
         } else if (node.type === 'new_expression') {
             // JS/TS constructor: new ClassName(args) — class is in 'constructor'
@@ -161,7 +173,7 @@ function findCallNode(node, callTypes, targetRow, funcName) {
             const ctorNode = node.childForFieldName('constructor');
             if (ctorNode) {
                 const typeName = ctorNode.text.replace(/<.*>$/, '').split('.').pop();
-                if (typeName === funcName) return node;
+                if (typeName === funcName) out.push(node);
             }
         } else {
             // Check if this call is for our target function
@@ -177,17 +189,19 @@ function findCallNode(node, callTypes, targetRow, funcName) {
                     : funcNode.type === 'scoped_identifier'
                     ? (funcNode.childForFieldName('name') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
                     : funcNode.text;
-                if (funcText === funcName) return node;
+                if (funcText === funcName) out.push(node);
             }
         }
+        if (out.length >= limit) return out;
     }
 
-    // Recurse into children
+    // Recurse into children — nested same-name calls (`greet(greet(x))`)
+    // are separate records, so a match's children are still scanned.
     for (let i = 0; i < node.childCount; i++) {
-        const result = findCallNode(node.child(i), callTypes, targetRow, funcName);
-        if (result) return result;
+        _collectCallNodes(node.child(i), callTypes, targetRow, funcName, limit, out);
+        if (out.length >= limit) return out;
     }
-    return null;
+    return out;
 }
 
 /**
@@ -658,6 +672,7 @@ function computePlanCallSites(index, name, def) {
     const { confirmed, unverified, account } = contractedCallerSweep(index, name, def);
 
     const sites = [];
+    const planLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
     for (const c of confirmed) {
         const call = {
             file: c.file,
@@ -667,7 +682,10 @@ function computePlanCallSites(index, name, def) {
             usageType: 'call',
             receiver: c.receiver,
         };
-        const analysis = analyzeCallSite(index, call, name);
+        const siteKey = `${c.file}:${c.line}`;
+        const occurrence = planLineSeen.get(siteKey) || 0;
+        planLineSeen.set(siteKey, occurrence + 1);
+        const analysis = analyzeCallSite(index, call, name, occurrence);
         sites.push({
             file: call.relativePath,
             line: call.line,
@@ -718,7 +736,7 @@ function computePlanScopeWarning(index, name, def, options) {
  * @param {string} funcName - Function name to find
  * @returns {object} { args, argCount, hasSpread, hasVariable }
  */
-function analyzeCallSite(index, call, funcName) {
+function analyzeCallSite(index, call, funcName, occurrence = 0) {
     try {
         const language = detectLanguage(call.file);
         if (!language) return { args: null, argCount: 0 };
@@ -753,7 +771,7 @@ function analyzeCallSite(index, call, funcName) {
         const targetRow = call.line - 1; // tree-sitter is 0-indexed
 
         // Find the call expression at the target line matching funcName
-        const callNode = findCallNode(tree.rootNode, callTypes, targetRow, funcName);
+        const callNode = findCallNode(tree.rootNode, callTypes, targetRow, funcName, occurrence);
         if (!callNode) return { args: null, argCount: 0 };
 
         // Check if this is a method call (obj.func()) vs a direct call (func())
@@ -1079,8 +1097,12 @@ function verify(index, name, options = {}) {
         };
     }
 
+    const verifyLineSeen = new Map(); // 'file:line' -> per-line ordinal (fix #231)
     for (const call of calls) {
-        const analysis = analyzeCallSite(index, call, name);
+        const siteKey = `${call.file}:${call.line}`;
+        const occurrence = verifyLineSeen.get(siteKey) || 0;
+        verifyLineSeen.set(siteKey, occurrence + 1);
+        const analysis = analyzeCallSite(index, call, name, occurrence);
 
         // Carry callerFile/callerStartLine so tagInTestCase can resolve the
         // enclosing function in a later pass.

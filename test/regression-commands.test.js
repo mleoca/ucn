@@ -4650,3 +4650,61 @@ describe('fix #230: output surface polish (campaign F-family)', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #231: verify arg-checks each same-line call against its OWN node', () => {
+    // G7-refactor-python BUG-2: findCallNode returned the FIRST same-name
+    // call on the line, so `greet("a") + greet("b", 42)` counted both calls
+    // valid and `greet("a", 42) + greet("b")` flagged both with the first
+    // call's args. Records and the AST walk are both pre-order — the site's
+    // per-line ordinal picks the matching node.
+    it('python: one valid + one mismatch per mixed line, own args in details', () => {
+        const dir = tmp({
+            'm.py': 'def greet(name):\n    return name\n',
+            'u.py': 'from m import greet\n\n\ndef a():\n    return greet("a") + greet("b", 42)\n\n\ndef b():\n    return greet("a", 42) + greet("b")\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'verify', { name: 'greet' });
+            assert.ok(r.ok, `verify failed: ${r.error}`);
+            assert.strictEqual(r.result.valid, 2, 'one valid call per line');
+            assert.strictEqual(r.result.mismatches, 2, 'one mismatch per line');
+            const m5 = r.result.mismatchDetails.find(m => m.line === 5);
+            const m9 = r.result.mismatchDetails.find(m => m.line === 9);
+            assert.ok(m5 && m9, 'both lines carry exactly one mismatch');
+            assert.deepStrictEqual(m5.args, ['"b"', '42'], 'line 5 mismatch is the SECOND call');
+            assert.deepStrictEqual(m9.args, ['"a"', '42'], 'line 9 mismatch is the FIRST call');
+        } finally { rm(dir); }
+    });
+
+    it('js: nested same-name call arg-checks outer and inner separately', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'n.js': 'function wrap(x) { return x; }\nfunction nested() { return wrap(wrap(1, 2)); }\nmodule.exports = { wrap, nested };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'verify', { name: 'wrap' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.valid, 1, 'outer wrap(...) is valid');
+            assert.strictEqual(r.result.mismatches, 1, 'inner wrap(1,2) is a mismatch');
+            assert.deepStrictEqual(r.result.mismatchDetails[0].args, ['1', '2']);
+        } finally { rm(dir); }
+    });
+
+    it('plan removeParam rewrites each same-line site with its own args', () => {
+        const dir = tmp({
+            'm.py': 'def greet(name, extra):\n    return name\n',
+            'u.py': 'from m import greet\n\n\ndef a():\n    return greet("a", 1) + greet("b", 2)\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'plan', { name: 'greet', removeParam: 'extra' });
+            assert.ok(r.ok, `plan failed: ${r.error}`);
+            const line5 = (r.result.changes || []).filter(c => c.line === 5);
+            assert.strictEqual(line5.length, 2, 'one change entry per call');
+            const suggestions = line5.map(c => c.suggestion).join('|');
+            assert.ok(suggestions.includes('Remove argument 2: 1'), `first call's own arg: ${suggestions}`);
+            assert.ok(suggestions.includes('Remove argument 2: 2'), `second call's own arg: ${suggestions}`);
+        } finally { rm(dir); }
+    });
+});

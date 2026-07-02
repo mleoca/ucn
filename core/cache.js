@@ -67,7 +67,10 @@ const UCN_VERSION = require('../package.json').version;
 // v30 (fix #230): TS parameter-property modifiers (protected/readonly/...)
 // and parameter decorators are no longer recorded as parameter DEFAULTS in
 // paramsStructured.
-const CACHE_FORMAT_VERSION = 30;
+// v31 (fix #231): Java try-with-resources declarations type receivers —
+// `try (Res r = new Res())` records receiverType on r.use() like a plain
+// declared-type local (#220(7) typing-sources family).
+const CACHE_FORMAT_VERSION = 31;
 
 /**
  * Save index to cache file

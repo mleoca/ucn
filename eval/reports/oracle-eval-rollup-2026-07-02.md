@@ -16,7 +16,7 @@ lie the tiered caller contract forbids. Target: 0.
 | grpc-go | gopls | 50 | 840 | 100.0% | 14.9% | 0.8509 | **0** | 100.0% (13) | 100.0% |
 | ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.0% | 0.8301 | **0** | 100.0% (1) | 100.0% |
 | cursive | rust-analyzer | 50 | 637 | 98.9% | 51.0% | 0.4785 | **0** | 100.0% (6) | 100.0% |
-| gson | jdtls | 50 | 649 | 96.2% | 33.3% | 0.629 | **0** | 100.0% (9) | 100.0% |
+| gson | jdtls | 50 | 649 | 96.2% | 33.3% | 0.6295 | **0** | 100.0% (9) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -51,7 +51,7 @@ evidence confirms the file but not the receiver type.
 | cursive | function | 6 | 101 | 98.1% (101/103) | 0.0% (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | method | 39 | 519 | 99.4% (155/156) | 51.5% (352/683) | 0.4782 | {"confirmed":155,"unverified":352,"reportedNonCall":12,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | class | 5 | 17 | 100.0% (3/3) | 31.6% (6/19) | 0.6842 | {"confirmed":3,"unverified":6,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":8,"missingUnexplained":0} |
-| gson | method | 40 | 615 | 96.1% (273/284) | 30.7% (199/649) | 0.6547 | {"confirmed":273,"unverified":197,"reportedNonCall":13,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
+| gson | method | 40 | 615 | 96.1% (273/284) | 30.6% (199/650) | 0.6551 | {"confirmed":273,"unverified":197,"reportedNonCall":13,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (8/8) | 100.0% (26/26) | 0 | {"confirmed":8,"unverified":26,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)
@@ -64,13 +64,13 @@ the site (confirmed edge / unverified entry) or account for it
 
 | repo | callee precision | confirmed | other-def | unverified | accounted | module-level | beyond-text | **missing-unexplained** |
 |---|---|---|---|---|---|---|---|---|
-| zod | 100.0% (74/74) | 74 | 24 | 60 | 0 | 1703 | 0 | **0** |
+| zod | 100.0% (75/75) | 75 | 24 | 59 | 0 | 1703 | 0 | **0** |
 | preact-signals | 100.0% (15/15) | 15 | 0 | 4 | 1 | 4 | 0 | **0** |
 | express | 100.0% (4/4) | 4 | 0 | 0 | 0 | 258 | 0 | **0** |
 | httpx | 100.0% (303/303) | 302 | 1 | 540 | 36 | 0 | 0 | **0** |
 | rich | 98.6% (216/219) | 215 | 27 | 99 | 38 | 122 | 0 | **0** |
 | cobra | 99.9% (1537/1538) | 1536 | 0 | 8 | 0 | 7 | 0 | **0** |
 | grpc-go | 98.1% (356/363) | 356 | 372 | 100 | 0 | 12 | 0 | **0** |
-| ripgrep | 100.0% (709/709) | 709 | 9 | 43 | 4 | 0 | 0 | **0** |
-| cursive | 100.0% (322/322) | 321 | 9 | 299 | 0 | 0 | 8 | **0** |
-| gson | 96.1% (270/281) | 270 | 136 | 73 | 0 | 38 | 0 | **0** |
+| ripgrep | 100.0% (720/720) | 720 | 0 | 41 | 4 | 0 | 0 | **0** |
+| cursive | 100.0% (333/333) | 331 | 8 | 290 | 0 | 0 | 8 | **0** |
+| gson | 96.1% (269/280) | 269 | 142 | 68 | 0 | 38 | 0 | **0** |
