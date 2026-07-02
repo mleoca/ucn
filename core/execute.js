@@ -1138,6 +1138,11 @@ const HANDLERS = {
         const result = index.verify(p.name, {
             file: p.file,
             className: p.className,
+            // Pin to an exact definition (stable-handle roundtrip: `verify
+            // lib.js:4:save`). resolveSymbol filters by startLine — without
+            // this passthrough the pin was silently dropped and scoring picked
+            // among same-name defs (fix #227).
+            ...(p.line && { line: p.line }),
             // BUG-H3: pass through user-supplied flags. Verify defaults to including
             // method calls (current behavior) so call-arity checks reach all forms,
             // including obj.method() invocations. User can disable with
@@ -1166,6 +1171,8 @@ const HANDLERS = {
             defaultValue: p.defaultValue,
             file: p.file,
             className: p.className,
+            // Exact-definition pin (stable-handle roundtrip) — see verify.
+            ...(p.line && { line: p.line }),
         });
         return { ok: true, result };
     },

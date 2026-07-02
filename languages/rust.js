@@ -1916,6 +1916,7 @@ function findExportsInCode(code, parser) {
  * @param {string} code - Source code
  * @param {string} name - Symbol name to find
  * @param {object} parser - Tree-sitter parser instance
+ * @param {object} [tree] - Pre-parsed tree (per-operation cache); parsed here when absent
  * @returns {Array<{line: number, column: number, usageType: string}>}
  */
 function _indexInParent(node, parent) {
@@ -1925,8 +1926,8 @@ function _indexInParent(node, parent) {
     return -1;
 }
 
-function findUsagesInCode(code, name, parser) {
-    const tree = parseTree(parser, code);
+function findUsagesInCode(code, name, parser, tree) {
+    tree = tree || parseTree(parser, code);
     const usages = [];
 
     visitNameNodes(tree, code, name, (node) => {

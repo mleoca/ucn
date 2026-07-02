@@ -8,10 +8,10 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
+const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES, compareNames } = require('./discovery');
 const { extractImports, extractExports, resolveImport } = require('./imports');
 const { parse, cleanHtmlScriptTags } = require('./parser');
-const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
+const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 const { escapeRegExp, NON_CALLABLE_TYPES } = require('./shared');
 const stacktrace = require('./stacktrace');
@@ -52,6 +52,8 @@ class ProjectIndex {
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
         this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
+        this._opTreeCache = null;        // per-operation parsed-tree cache (Map<filePath, tree|null>, bounded FIFO)
+        this._opLinesCache = null;       // per-operation split-lines cache (Map<filePath, string[]>, bounded FIFO)
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -78,6 +80,8 @@ class ProjectIndex {
             this._opUsagesCache = new Map();
             this._opCallsCountCache = new Map();
             this._opEnclosingFnCache = new Map();
+            this._opTreeCache = new Map();
+            this._opLinesCache = new Map();
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -91,6 +95,8 @@ class ProjectIndex {
             this._opUsagesCache = null;
             this._opCallsCountCache = null;
             this._opEnclosingFnCache = null;
+            this._opTreeCache = null;
+            this._opLinesCache = null;
             // Free cached file content from callsCache entries (retained during
             // operation for _readFile caching, not needed between operations)
             for (const entry of this.callsCache.values()) {
@@ -98,6 +104,50 @@ class ProjectIndex {
             }
             this._opDepth = 0;
         }
+    }
+
+    /**
+     * Parse a file once per operation and reuse the tree across symbol names.
+     * Multi-symbol commands (diff-impact, check) classify ground lines for MANY
+     * names against the SAME files; without this, each (file, name) pair costs a
+     * full tree-sitter parse. Bounded FIFO (trees hold native memory).
+     * Returns null when parsing fails or no operation cache is active — callers
+     * fall back to parsing themselves.
+     */
+    _getParsedTree(filePath, content, language) {
+        if (!this._opTreeCache) return null;
+        const cached = this._opTreeCache.get(filePath);
+        if (cached !== undefined) return cached;
+        let tree = null;
+        try {
+            const parser = getParser(language);
+            tree = parser ? safeParse(parser, content, undefined, PARSE_OPTIONS) : null;
+        } catch (e) {
+            tree = null;
+        }
+        if (this._opTreeCache.size >= 512) {
+            this._opTreeCache.delete(this._opTreeCache.keys().next().value);
+        }
+        this._opTreeCache.set(filePath, tree);
+        return tree;
+    }
+
+    /**
+     * Split a file into lines once per operation. Callers must treat the
+     * returned array as read-only — it is shared across the whole operation.
+     */
+    _getFileLines(filePath) {
+        if (this._opLinesCache) {
+            const cached = this._opLinesCache.get(filePath);
+            if (cached !== undefined) return cached;
+            const lines = this._readFile(filePath).split('\n');
+            if (this._opLinesCache.size >= 2048) {
+                this._opLinesCache.delete(this._opLinesCache.keys().next().value);
+            }
+            this._opLinesCache.set(filePath, lines);
+            return lines;
+        }
+        return this._readFile(filePath).split('\n');
     }
 
     /**
@@ -132,7 +182,12 @@ class ProjectIndex {
 
             const parser = getParser(lang);
             if (!parser) return null;
-            const usages = langModule.findUsagesInCode(content, name, parser);
+            // Language modules that accept a pre-parsed tree (4th param) reuse
+            // the per-operation tree cache; others (html) parse internally.
+            const tree = langModule.findUsagesInCode.length >= 4
+                ? this._getParsedTree(filePath, content, lang)
+                : null;
+            const usages = langModule.findUsagesInCode(content, name, parser, tree);
             if (this._opUsagesCache) {
                 this._opUsagesCache.set(cacheKey, usages);
             }
@@ -204,6 +259,18 @@ class ProjectIndex {
             console.error(`Indexing ${files.length} files in ${this.root}...`);
         }
 
+        // Materialize a lazily-prepared calls cache BEFORE any indexing: the
+        // stale-file path (indexFile → removeFileSymbols) and the deleted-file
+        // cleanup below both delete callsCache entries, but with shards still
+        // unloaded those deletes are no-ops on an empty map — and the later
+        // ensureCallsCacheLoaded() (buildCalleeIndex) RESURRECTED the stale
+        // entries, so queries in this process ran against the pre-edit call
+        // records (fix #227). Cost-neutral: buildCalleeIndex loads all shards
+        // at the end of build() anyway.
+        if (this._callsCachePrepared && !this._callsCacheLoaded) {
+            indexCache.ensureCallsCacheLoaded(this);
+        }
+
         let deletedInRebuild = 0;
         if (options.forceRebuild) {
             // Incremental rebuild: only remove files that no longer exist on disk.
@@ -271,6 +338,11 @@ class ProjectIndex {
             }
         }
 
+        // Canonical order BEFORE derived indexes, so graphs / dir index /
+        // callee index inherit it. This is what makes incremental rebuilds
+        // byte-equivalent to fresh builds (see _canonicalizeOrder).
+        this._canonicalizeOrder();
+
         // Skip graph rebuild when incremental rebuild found no changes
         if (changed > 0 || deletedInRebuild > 0 || !options.forceRebuild) {
             this.buildImportGraph();
@@ -283,6 +355,11 @@ class ProjectIndex {
         // Build callee index eagerly: leverages warm parse cache from indexFile() above,
         // avoiding the 2+ minute deferred cost when the first analysis command runs later.
         this.buildCalleeIndex();
+
+        // buildCalleeIndex re-parses changed files via getCachedCalls, which
+        // appends their entries at the callsCache TAIL — restore canonical
+        // key order so iteration-order consumers match a fresh build.
+        this.callsCache = new Map([...this.callsCache.entries()].sort((a, b) => compareNames(a[0], b[0])));
 
         this.buildTime = Date.now() - startTime;
 
@@ -526,6 +603,64 @@ class ProjectIndex {
         this._javaFileIndex = null;
         // Endpoints cache is project-wide; safest to clear on any file removal.
         this._endpointsCache = null;
+    }
+
+    /**
+     * Put every order-bearing index structure into ONE canonical order, so the
+     * same repository content produces the same index state — and therefore
+     * byte-identical command output — no matter how the state was reached
+     * (fresh build, cache load, incremental rebuild, parallel build).
+     *
+     * Without this, three paths diverge: build fills fileEntry.symbols/bindings
+     * in parse-emission order while loadCache rebuilds them from the name map
+     * (name-grouped order); an incremental rebuild re-appends a changed file's
+     * defs at the TAIL of each symbols.get(name) array; and calleeIndex sets
+     * grow by tail-append. First-match resolution and account sampling then
+     * give different answers on consecutive runs over identical content.
+     *
+     * Canonical orders: files/callsCache by path (discovery's compareNames, so
+     * a fresh sequential build is already canonical); per-file symbols/bindings
+     * by (startLine, type, className, name); symbols map by name with defs
+     * sorted by (relativePath, startLine, type, className, endLine); calleeIndex
+     * by name with file sets in path order.
+     */
+    _canonicalizeOrder() {
+        // Plain code-unit comparison — canonical order must not depend on the
+        // host ICU locale (localeCompare does).
+        const cmpStr = (a, b) => (a < b ? -1 : a > b ? 1 : 0);
+
+        this.files = new Map([...this.files.entries()].sort((a, b) => compareNames(a[0], b[0])));
+
+        const feCmp = (a, b) => (a.startLine - b.startLine)
+            || cmpStr(String(a.type), String(b.type))
+            || cmpStr(String(a.className || ''), String(b.className || ''))
+            || cmpStr(String(a.name), String(b.name));
+        for (const fe of this.files.values()) {
+            if (Array.isArray(fe.symbols)) fe.symbols.sort(feCmp);
+            if (Array.isArray(fe.bindings)) fe.bindings.sort(feCmp);
+        }
+
+        const defCmp = (a, b) => compareNames(a.relativePath || '', b.relativePath || '')
+            || (a.startLine - b.startLine)
+            || cmpStr(String(a.type), String(b.type))
+            || cmpStr(String(a.className || ''), String(b.className || ''))
+            || ((a.endLine || 0) - (b.endLine || 0));
+        const sortedNames = [...this.symbols.keys()].sort();
+        const canonicalSymbols = new Map();
+        for (const name of sortedNames) {
+            canonicalSymbols.set(name, this.symbols.get(name).sort(defCmp));
+        }
+        this.symbols = canonicalSymbols;
+
+        this.callsCache = new Map([...this.callsCache.entries()].sort((a, b) => compareNames(a[0], b[0])));
+
+        if (this.calleeIndex) {
+            const rebuilt = new Map();
+            for (const name of [...this.calleeIndex.keys()].sort()) {
+                rebuilt.set(name, new Set([...this.calleeIndex.get(name)].sort(compareNames)));
+            }
+            this.calleeIndex = rebuilt;
+        }
     }
 
     /**

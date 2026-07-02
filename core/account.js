@@ -72,7 +72,9 @@ function computeGroundSet(index, name) {
             continue; // deleted since indexing; not part of the universe anymore
         }
         if (!content.includes(name)) continue;
-        const lines = content.split('\n');
+        // Shared read-only lines array — split once per file per operation,
+        // reused across the symbols of a multi-symbol command (diff-impact).
+        const lines = index._getFileLines(filePath);
         const matched = [];
         for (let i = 0; i < lines.length; i++) {
             if (wordRe.test(lines[i])) matched.push(i + 1);

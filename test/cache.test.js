@@ -2273,3 +2273,136 @@ describe('index reliability: cache round-trip and incremental rebuild identity',
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// fix #227: index state must be CANONICAL — same repository content produces
+// the same in-memory order (and therefore byte-identical command output) no
+// matter how the state was reached. indexSnapshot above is normalized (sorted)
+// so it cannot see these bugs; orderSnapshot is order-SENSITIVE.
+//
+// Two bug families this guards:
+//   (a) order divergence — build filled fileEntry.symbols/bindings in parse
+//       order while loadCache rebuilt them from the name map; an incremental
+//       rebuild re-appended a changed file's defs at each name's array TAIL.
+//       First-match resolution and account sampling then flipped between
+//       consecutive runs over identical content.
+//   (b) stale-calls resurrection — with shards lazily prepared, the
+//       removeFileSymbols() callsCache.delete during incremental rebuild was
+//       a no-op on the empty map, and the later ensureCallsCacheLoaded()
+//       reinstated the PRE-EDIT call records for the changed file.
+// ============================================================================
+
+describe('fix #227: canonical index order and no stale-calls resurrection', () => {
+    const { ensureCallsCacheLoaded } = require('../core/cache');
+    const crypto = require('crypto');
+
+    function orderSnapshot(index) {
+        ensureCallsCacheLoaded(index);
+        const rel = f => path.relative(index.root, f);
+        return JSON.stringify({
+            fileOrder: [...index.files.keys()].map(rel),
+            perFile: [...index.files.values()].map(fe => [fe.relativePath,
+                (fe.symbols || []).map(s => `${s.name}:${s.startLine}:${s.type}`),
+                (fe.bindings || []).map(b => `${b.name}:${b.startLine}:${b.type}`)]),
+            symbolNames: [...index.symbols.keys()],
+            defs: [...index.symbols.entries()].map(([n, ds]) =>
+                [n, ds.map(d => `${d.relativePath}:${d.startLine}:${d.type}`)]),
+            callsMeta: [...index.callsCache.entries()].map(([f, e]) => [rel(f), e.hash]),
+        });
+    }
+
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        // class BEFORE a same-named standalone shape and interleaved members so
+        // parse-emission order (functions first, then classes) differs from
+        // line order — the case where canonical ordering must decide.
+        'a.ts': [
+            'export class Widget {',
+            '  render() { return paint(1); }',
+            '}',
+            'export function paint(x: number) { return x; }',
+            'export function render(y: number) { return paint(y); }',
+        ].join('\n'),
+        'b.ts': [
+            'import { render } from "./a";',
+            'export function screen() { return render(2); }',
+        ].join('\n'),
+    };
+
+    it('loaded index state is order-identical to the freshly built one', () => {
+        const dir = tmp(FILES);
+        try {
+            const fresh = new ProjectIndex(dir);
+            fresh.build(null, { quiet: true });
+            const expected = orderSnapshot(fresh);
+            fresh.saveCache();
+
+            const loaded = new ProjectIndex(dir);
+            assert.ok(loaded.loadCache(), 'cache should load');
+            assert.strictEqual(orderSnapshot(loaded), expected,
+                'loadCache must reproduce canonical order (fileEntry.symbols/bindings were rebuilt in name-map order before fix #227)');
+        } finally { rm(dir); }
+    });
+
+    it('incremental rebuild state is order-identical to a fresh build of the same content', () => {
+        const dir = tmp(FILES);
+        try {
+            const initial = new ProjectIndex(dir);
+            initial.build(null, { quiet: true });
+            initial.saveCache();
+
+            // Modify a.ts: shift lines so defs move, keeping the same names.
+            fs.writeFileSync(path.join(dir, 'a.ts'), [
+                '// header comment',
+                'export class Widget {',
+                '  render() { return paint(1); }',
+                '}',
+                'export function paint(x: number) { return x + 1; }',
+                'export function render(y: number) { return paint(y); }',
+            ].join('\n'));
+
+            const incremental = new ProjectIndex(dir);
+            incremental.loadCache();
+            incremental.build(null, { quiet: true, forceRebuild: true });
+            // NO saveCache — the CLI/MCP query runs on exactly this state.
+
+            const fresh = new ProjectIndex(dir);
+            fresh.build(null, { quiet: true });
+
+            assert.strictEqual(orderSnapshot(incremental), orderSnapshot(fresh),
+                'the state a query sees after an incremental rebuild must be order-identical to a fresh build (defs were tail-appended before fix #227)');
+        } finally { rm(dir); }
+    });
+
+    it('incremental rebuild refreshes the changed file\'s calls — lazy shards must not resurrect pre-edit records', () => {
+        const dir = tmp(FILES);
+        try {
+            const initial = new ProjectIndex(dir);
+            initial.build(null, { quiet: true });
+            initial.saveCache();
+
+            // New call to a NEW callee at a shifted line.
+            const newB = [
+                'import { render, paint } from "./a";',
+                '// pushed down',
+                'export function screen() { return render(2) + paint(7); }',
+            ].join('\n');
+            fs.writeFileSync(path.join(dir, 'b.ts'), newB);
+
+            const incremental = new ProjectIndex(dir);
+            incremental.loadCache();
+            incremental.build(null, { quiet: true, forceRebuild: true });
+            // NO saveCache — this is the state the command runs against.
+
+            const entry = incremental.callsCache.get(path.join(dir, 'b.ts'));
+            assert.ok(entry, 'calls entry for the changed file must exist');
+            const currentHash = crypto.createHash('md5').update(newB).digest('hex');
+            assert.strictEqual(entry.hash, currentHash,
+                'calls entry must reflect CURRENT content (stale shard entry was resurrected before fix #227)');
+            assert.ok(entry.calls.some(c => c.name === 'paint' && c.line === 3),
+                'the new paint() call site must be present at its real line');
+            assert.ok(incremental.calleeIndex.get('paint')?.has(path.join(dir, 'b.ts')),
+                'calleeIndex must know the changed file calls paint');
+        } finally { rm(dir); }
+    });
+});

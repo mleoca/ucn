@@ -589,5 +589,6 @@ module.exports = {
     PROJECT_MARKERS,
     TEST_PATTERNS,
     ALL_SUPPORTED_EXTENSIONS,
-    MANIFEST_HINTS
+    MANIFEST_HINTS,
+    compareNames
 };

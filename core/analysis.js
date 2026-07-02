@@ -255,7 +255,7 @@ function callNotResolvedEntries(index, account, options = {}) {
     return entries.map(e => {
         let content = '';
         try {
-            content = (index._readFile(e.file).split('\n')[e.line - 1] || '').trim();
+            content = (index._getFileLines(e.file)[e.line - 1] || '').trim();
         } catch { /* unreadable since scan — keep bare */ }
         return {
             file: e.file,

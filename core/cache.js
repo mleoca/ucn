@@ -56,7 +56,12 @@ const UCN_VERSION = require('../package.json').version;
 // specifier ('.jobs') into fileEntry.moduleResolved and adds the import edge,
 // so submodule receivers behave like `import jobs` module receivers
 // (persisted moduleResolved/importGraph shapes gain entries).
-const CACHE_FORMAT_VERSION = 27;
+// v28 (fix #227): canonical index order — everything persisted is written from
+// a canonicalized state (_canonicalizeOrder: files/callsCache by path, defs
+// arrays by (relativePath, startLine, type, className), calleeIndex sorted),
+// so fresh-build, cache-load, and incremental-rebuild states are
+// byte-equivalent and command output no longer depends on cache history.
+const CACHE_FORMAT_VERSION = 28;
 
 /**
  * Save index to cache file
@@ -330,6 +335,12 @@ function loadCache(index, cachePath) {
             }
         }
 
+        // Canonical order (see ProjectIndex._canonicalizeOrder): the loop above
+        // rebuilds fileEntry.symbols/bindings in NAME-MAP order, which differs
+        // from build's parse order — canonicalize so a loaded index is
+        // byte-equivalent to a freshly built one before anything derives from it.
+        index._canonicalizeOrder();
+
         // Reconstruct graphs: relative paths → absolute paths (as Sets)
         // Uses string concat (toAbs) instead of path.join — 70x faster on 464K edges
         const absGraph = (data) => {
@@ -524,13 +535,14 @@ function _prepareCallsCache(index) {
 
 /**
  * Load callsCache from separate file on demand.
- * Only loads if callsCache is empty (not already populated from inline or prior load).
+ * Merges under existing entries (first writer wins) — anything already in
+ * memory came from a fresh parse of current disk content, so persisted data
+ * must never replace it (fix #227).
  * @param {object} index - ProjectIndex instance
- * @returns {boolean} - True if loaded successfully
+ * @returns {boolean} - True if entries are available after the load
  */
 function loadCallsCache(index) {
-    if (index.callsCache.size > 0) return true; // Already populated
-    if (index._callsCacheLoaded) return false;   // Already attempted, file didn't exist
+    if (index._callsCacheLoaded) return index.callsCache.size > 0;
     index._callsCacheLoaded = true;
 
     // If manifest was prepared lazily, load all shards now
@@ -544,22 +556,24 @@ function loadCallsCache(index) {
     // Legacy format: single calls-cache.json
     const callsCacheFile = index._callsCacheLegacyFile ||
         path.join(index.root, '.ucn-cache', 'calls-cache.json');
-    if (!fs.existsSync(callsCacheFile)) return false;
+    if (!fs.existsSync(callsCacheFile)) return index.callsCache.size > 0;
 
     try {
         const data = JSON.parse(fs.readFileSync(callsCacheFile, 'utf-8'));
         if (Array.isArray(data)) {
-            const absData = data.map(([relPath, entry]) => {
+            for (const [relPath, entry] of data) {
+                if (!relPath || !entry) continue;
                 const absPath = path.isAbsolute(relPath) ? relPath : path.join(index.root, relPath);
-                return [absPath, entry];
-            });
-            index.callsCache = new Map(absData);
-            return true;
+                if (!index.callsCache.has(absPath)) {
+                    index.callsCache.set(absPath, entry);
+                }
+            }
+            return index.callsCache.size > 0;
         }
     } catch (e) {
         // Corrupted file — ignore
     }
-    return false;
+    return index.callsCache.size > 0;
 }
 
 /**
@@ -590,7 +604,12 @@ function _loadCallsShard(index, hash) {
         for (const [relPath, entry] of data) {
             if (!relPath || !entry) continue;
             const absPath = path.isAbsolute(relPath) ? relPath : toAbsShard(relPath);
-            index.callsCache.set(absPath, entry);
+            // First writer wins: an entry already in memory came from a fresh
+            // parse of current disk content (or an earlier load) — never
+            // clobber it with persisted shard data (fix #227).
+            if (!index.callsCache.has(absPath)) {
+                index.callsCache.set(absPath, entry);
+            }
         }
     } catch (e) {
         // Corrupted shard — skip

@@ -4249,3 +4249,53 @@ describe('call-not-resolved entries render as bare unverified one-liners', () =>
         } finally { rm(dir); }
     });
 });
+
+describe('fix #227: verify/plan honor the exact-line pin (incl. stable handles)', () => {
+    const FILES = {
+        'package.json': '{"name":"pin"}',
+        'lib.js': [
+            'class Store {',
+            '  save(x) { return x; }',
+            '}',
+            'function save(a, b) { return a + b; }',
+            'module.exports = { Store, save };',
+        ].join('\n'),
+        'app.js': [
+            'const { save } = require("./lib");',
+            'function main() { return save(1, 2); }',
+        ].join('\n'),
+    };
+
+    it('verify --line pins the standalone function, not the same-name method', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'save', file: 'lib.js', line: 4 });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.startLine, 4,
+                'line pin must select the def at line 4 (was dropped by the execute handler)');
+            assert.strictEqual(v.result.expectedArgs.max, 2, 'two-param function, not the one-param method');
+        } finally { rm(dir); }
+    });
+
+    it('stable handle lib.js:4:save roundtrips into the same pin', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'lib.js:4:save' });
+            assert.ok(v.ok);
+            assert.strictEqual(v.result.startLine, 4, 'handle syntax must pin by file+line');
+        } finally { rm(dir); }
+    });
+
+    it('plan --line pins the same definition as verify', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const p = execute(index, 'plan', { name: 'save', file: 'lib.js', line: 4, addParam: 'opt' });
+            assert.ok(p.ok);
+            assert.strictEqual(p.result.file, 'lib.js');
+            assert.strictEqual(p.result.startLine, 4, 'plan must operate on the pinned def');
+        } finally { rm(dir); }
+    });
+});
