@@ -5004,3 +5004,51 @@ describe('fix #240: exporters uses parsed import records for line attribution (J
         } finally { rm(dir); }
     });
 });
+
+describe('fix #242: surface polish — deadcode JSON truncation, graph grammar, imports (none)', () => {
+    it('deadcode --json with --limit carries total + truncated in the payload', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function d1() {}\nfunction d2() {}\nfunction d3() {}\nmodule.exports = {};',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', { limit: 2 });
+            assert.ok(r.ok);
+            const json = JSON.parse(output.formatDeadcodeJson(r.result));
+            assert.strictEqual(json.meta.count, 2, 'shown count');
+            assert.strictEqual(json.meta.total, 3, 'full-set total');
+            assert.strictEqual(json.meta.truncated, true, 'truncation visible in payload');
+            assert.strictEqual(json.data.total, 3);
+        } finally { rm(dir); }
+    });
+
+    it('graph header uses singular "file" for a single dependency', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'require("./b");',
+            'b.js': 'module.exports = 1;',
+        });
+        try {
+            const index = idx(dir);
+            const g = execute(index, 'graph', { file: 'a.js' });
+            const text = output.formatGraph(g.result, {});
+            assert.ok(text.includes('IMPORTS (what this file depends on): 1 file\n'),
+                'singular file: ' + text.split('\n').find(l => l.includes('IMPORTS')));
+        } finally { rm(dir); }
+    });
+
+    it('imports renders (none) for a file with no imports', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'plain.js': 'module.exports = { x: 1 };',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'imports', { file: 'plain.js' });
+            assert.ok(r.ok);
+            const text = output.formatImports(r.result, 'plain.js');
+            assert.ok(text.includes('(none)'), 'explicit empty marker: ' + text);
+        } finally { rm(dir); }
+    });
+});

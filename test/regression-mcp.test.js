@@ -582,3 +582,25 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
         assert.ok(isError, `should error on min_confidence=2.0, got: ${JSON.stringify(res).slice(0, 300)}`);
     });
 });
+
+describe('fix #242: MCP notes use param syntax, never CLI flag syntax', () => {
+    let client;
+    let dir;
+    before(async () => {
+        dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function d1() {}\nfunction d2() {}\nfunction d3() {}\nmodule.exports = {};',
+        });
+        client = new McpClient();
+        await client.start();
+        await client.initialize();
+    });
+    after(() => { client.stop(); rm(dir); });
+
+    it('deadcode limit note says limit=<n>, not --limit N', async () => {
+        const res = await client.callTool({ command: 'deadcode', project_dir: dir, limit: 2 });
+        assert.ok(res.text.includes('Showing 2 of 3'), 'truncation note present: ' + res.text.slice(-300));
+        assert.ok(!res.text.includes('--limit'), 'no CLI flag syntax at the MCP surface');
+        assert.ok(res.text.includes('limit=<n>'), 'param-styled hint');
+    });
+});

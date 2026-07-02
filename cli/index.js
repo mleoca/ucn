@@ -666,7 +666,7 @@ function runProjectCommand(rootDir, command, arg) {
             if (flags.includeUncertain) {
                 console.error(`Note: --include-uncertain has no effect on '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
             }
-            if (['impact', 'verify'].includes(canonical) && flags.includeMethods) {
+            if (['impact', 'verify', 'blast', 'reverseTrace', 'affectedTests'].includes(canonical) && flags.includeMethods) {
                 console.error(`Note: --include-methods has no effect on '${toCliName(canonical)}' — method calls are always tiered by receiver evidence.`);
             }
             if (['about', 'context', 'smart'].includes(canonical) && flags.includeMethods) {
@@ -1544,9 +1544,9 @@ Common Flags:
   --include-tests     Include test files in usage counts (about) and results (find, usages, deadcode)
   --exclude-tests     Exclude test files (entrypoints — tests are included by default)
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
-  --include-methods   Include method-call (obj.fn) callee expansion in trace/blast/smart/affected-tests
-                        (no effect on about/context/impact/verify — method calls are always
-                        tiered by receiver evidence)
+  --include-methods   Include method-call (obj.fn) callee expansion in trace/smart
+                        (no effect on caller-direction commands — about/context/impact/verify/
+                        blast/reverse-trace/affected-tests always tier method calls by evidence)
   --include-uncertain No effect on tiered commands — unverified candidates are always
                         shown in their own section with reasons
   --expand-unverified Follow unverified caller edges in blast/reverse-trace trees

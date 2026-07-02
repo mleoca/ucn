@@ -292,7 +292,7 @@ ucn [target] <command> [name] [--flags]
 | `--expand-unverified` | `blast`/`reverse-trace`: follow unverified caller edges in the tree. Downstream nodes are marked as unverified chains — possible, not confirmed, impact |
 | `--include-tests` | Include test files in usage counts (`about`) and results (`find`, `usages`, `deadcode`). Callers always include tests. |
 | `--exclude-tests` | Exclude test entries from `entrypoints` (tests are included by default since they ARE entry points). |
-| `--include-methods` | Include `obj.method()` callee expansion in `trace`/`blast`/`smart`/`affected-tests`. No effect on `about`/`context`/`impact`/`verify` — method calls are always analyzed and tiered by receiver evidence |
+| `--include-methods` | Include `obj.method()` callee expansion in `trace`/`smart`. No effect on caller-direction commands (`about`/`context`/`impact`/`verify`/`blast`/`reverse-trace`/`affected-tests`) — method calls are always analyzed and tiered by receiver evidence |
 | `--base=<ref>` | Git ref for diff-impact (default: HEAD) |
 | `--staged` | Analyze staged changes (diff-impact) |
 | `--no-cache` | Force re-index after editing files |

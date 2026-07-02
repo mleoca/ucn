@@ -859,6 +859,13 @@ const HANDLERS = {
             if (result.excludedExported != null) sliced.excludedExported = result.excludedExported;
             if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
             if (result.excludedExternalContract != null) sliced.excludedExternalContract = result.excludedExternalContract;
+            // Truncation must be visible IN the JSON payload, not only in the
+            // stderr note (fix #242) — the formatter reads this to emit
+            // meta.total + truncated.
+            Object.defineProperty(sliced, 'limitInfo', {
+                value: { total: result.length, shown: limit },
+                enumerable: false, writable: true, configurable: true,
+            });
             result = sliced;
         }
         const tNote = truncationNote(index);

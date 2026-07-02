@@ -53,6 +53,10 @@ function formatImports(imports, filePath) {
         }
     }
 
+    if (internal.length === 0 && external.length === 0 && dynamic.length === 0) {
+        lines.push('  (none)');
+    }
+
     return lines.join('\n');
 }
 
@@ -318,7 +322,7 @@ function formatGraph(graph, options = {}) {
         let totalTruncated = 0;
         let anyDepthLimited = false;
 
-        lines.push(`\nIMPORTS (what this file depends on): ${importCount} files`);
+        lines.push(`\nIMPORTS (what this file depends on): ${importCount} file${importCount === 1 ? '' : 's'}`);
         if (importCount > 0) {
             const r = printTree(graph.imports.nodes, graph.imports.edges, graph.root);
             totalTruncated += r.truncatedNodes;
@@ -327,7 +331,7 @@ function formatGraph(graph, options = {}) {
             lines.push('  (none)');
         }
 
-        lines.push(`\nIMPORTERS (what depends on this file): ${importerCount} files`);
+        lines.push(`\nIMPORTERS (what depends on this file): ${importerCount} file${importerCount === 1 ? '' : 's'}`);
         if (importerCount > 0) {
             const r = printTree(graph.importers.nodes, graph.importers.edges, graph.root);
             totalTruncated += r.truncatedNodes;

@@ -272,10 +272,18 @@ function formatDeadcode(results, options = {}) {
  */
 function formatDeadcodeJson(results) {
     const { formatSymbolHandle } = require('../shared');
+    // Under --limit the handler slices the array and attaches the full-set
+    // size (fix #242) — the payload itself must say it is truncated.
+    const li = results.limitInfo;
     return JSON.stringify({
-        meta: { command: 'deadcode', count: results.length },
+        meta: {
+            command: 'deadcode',
+            count: results.length,
+            ...(li && { total: li.total, truncated: true }),
+        },
         data: {
             count: results.length,
+            ...(li && { total: li.total, truncated: true }),
             ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
             ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
             ...(results.excludedExternalContract > 0 && { excludedExternalContract: results.excludedExternalContract }),

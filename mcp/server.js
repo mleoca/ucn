@@ -384,6 +384,19 @@ server.registerTool(
         const te = strippedNote
             ? (msg) => toolError(msg + strippedNote)
             : toolError;
+        // Translate CLI flag syntax in execute-layer notes to MCP param
+        // syntax — the deadcode exported/decorated hints were already
+        // param-styled, but limit/depth/truncation notes leaked
+        // '--limit N' / '--max-files N' / '--all' at this surface.
+        const mn = (note) => note && note
+            .replace(/--limit N\b/g, 'limit=<n>')
+            .replace(/--max-files N\b/g, 'max_files=<n>')
+            .replace(/--depth=N\b/g, 'depth=<n>')
+            .replace(/--detailed\b/g, 'detailed=true')
+            .replace(/--all\b/g, 'all=true')
+            .replace(/--expand-unverified\b/g, 'expand_unverified=true')
+            .replace(/--include-uncertain\b/g, 'include_uncertain=true')
+            .replace(/--(\w[\w-]*)/g, (_m, f) => f.replace(/-/g, '_'));
 
         let index = null; // Track for post-command cache save
         try {
@@ -403,7 +416,7 @@ server.registerTool(
                     allHint: 'Repeat with all=true to show all.',
                     showConfidence: ep.showConfidence !== false,
                 });
-                if (note) aboutText += '\n\n' + note;
+                if (note) aboutText += '\n\n' + mn(note);
                 return tr(aboutText);
             }
 
@@ -417,7 +430,7 @@ server.registerTool(
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
                 let ctxText = text;
-                if (note) ctxText += '\n\n' + note;
+                if (note) ctxText += '\n\n' + mn(note);
                 return tr(ctxText);
             }
 
@@ -426,7 +439,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'impact', ep);
                 if (!ok) return te(error);
                 let impactText = output.formatImpact(result);
-                if (note) impactText += '\n\n' + note;
+                if (note) impactText += '\n\n' + mn(note);
                 return tr(impactText);
             }
 
@@ -437,7 +450,7 @@ server.registerTool(
                 let blastText = output.formatBlast(result, {
                     allHint: 'Set depth to expand all children.',
                 });
-                if (note) blastText += '\n\n' + note;
+                if (note) blastText += '\n\n' + mn(note);
                 return tr(blastText);
             }
 
@@ -446,7 +459,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'smart', ep);
                 if (!ok) return te(error);
                 let smartText = output.formatSmart(result);
-                if (note) smartText += '\n\n' + note;
+                if (note) smartText += '\n\n' + mn(note);
                 return tr(smartText);
             }
 
@@ -458,7 +471,7 @@ server.registerTool(
                     allHint: 'Set depth to expand all children.',
                     methodsHint: 'Note: obj.method() calls excluded. Use include_methods=true to include them.'
                 });
-                if (note) traceText += '\n\n' + note;
+                if (note) traceText += '\n\n' + mn(note);
                 return tr(traceText);
             }
 
@@ -469,7 +482,7 @@ server.registerTool(
                 let rtText = output.formatReverseTrace(result, {
                     allHint: 'Set depth to expand all children.',
                 });
-                if (note) rtText += '\n\n' + note;
+                if (note) rtText += '\n\n' + mn(note);
                 return tr(rtText);
             }
 
@@ -488,7 +501,7 @@ server.registerTool(
                     all: ep.all || false, top: ep.top,
                     allHint: 'Repeat with all=true to show all.'
                 });
-                if (note) relText += '\n\n' + note;
+                if (note) relText += '\n\n' + mn(note);
                 return tr(relText);
             }
 
@@ -520,7 +533,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'find', ep);
                 if (!ok) return te(error);
                 let text = output.formatFind(result, ep.name, ep.top);
-                if (note) text += '\n\n' + note;
+                if (note) text += '\n\n' + mn(note);
                 return tr(text);
             }
 
@@ -529,7 +542,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'usages', ep);
                 if (!ok) return te(error);
                 let text = output.formatUsages(result, ep.name);
-                if (note) text += '\n\n' + note;
+                if (note) text += '\n\n' + mn(note);
                 return tr(text);
             }
 
@@ -540,7 +553,7 @@ server.registerTool(
                 let text = output.formatToc(result, {
                     topHint: 'Set top=N or use detailed=false for compact view.'
                 });
-                if (note) text += '\n\n' + note;
+                if (note) text += '\n\n' + mn(note);
                 return tr(text);
             }
 
@@ -554,7 +567,7 @@ server.registerTool(
                 } else {
                     searchText = output.formatSearch(result, ep.term);
                 }
-                if (note) searchText += '\n\n' + note;
+                if (note) searchText += '\n\n' + mn(note);
                 return tr(searchText);
             }
 
@@ -563,7 +576,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'tests', ep);
                 if (!ok) return te(error);
                 let testsText = output.formatTests(result, ep.name);
-                if (note) testsText += '\n\n' + note;
+                if (note) testsText += '\n\n' + mn(note);
                 return tr(testsText);
             }
 
@@ -572,7 +585,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'affectedTests', ep);
                 if (!ok) return te(error);
                 let atText = output.formatAffectedTests(result, { all: ep.all });
-                if (note) atText += '\n\n' + note;
+                if (note) atText += '\n\n' + mn(note);
                 return tr(atText);
             }
 
@@ -587,7 +600,7 @@ server.registerTool(
                     exportedHint: !ep.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded from the audit (public API may have external callers). Use include_exported=true to audit them.` : undefined,
                     externalContractHint: !ep.includeExported && result.excludedExternalContract > 0 ? `${result.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use include_exported=true to include them.` : undefined
                 });
-                if (dcNote) dcText += '\n\n' + dcNote;
+                if (dcNote) dcText += '\n\n' + mn(dcNote);
                 return tr(dcText);
             }
 
@@ -596,7 +609,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'entrypoints', ep);
                 if (!ok) return te(error);
                 let epText = output.formatEntrypoints(result);
-                if (note) epText += '\n\n' + note;
+                if (note) epText += '\n\n' + mn(note);
                 return tr(epText);
             }
 
@@ -605,7 +618,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'endpoints', ep);
                 if (!ok) return te(error);
                 let endText = output.formatEndpoints(result, { bridge: result._bridge, unmatched: result._unmatched });
-                if (note) endText += '\n\n' + note;
+                if (note) endText += '\n\n' + mn(note);
                 return tr(endText);
             }
 
@@ -672,7 +685,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'diffImpact', ep);
                 if (!ok) return te(error);
                 let diText = output.formatDiffImpact(result, { all: ep.all });
-                if (note) diText += '\n\n' + note;
+                if (note) diText += '\n\n' + mn(note);
                 return tr(diText);
             }
 
@@ -697,7 +710,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'api', ep);
                 if (!ok) return te(error);
                 let apiText = output.formatApi(result, ep.file || '.');
-                if (note) apiText += '\n\n' + note;
+                if (note) apiText += '\n\n' + mn(note);
                 return tr(apiText);
             }
 
@@ -706,7 +719,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'stats', ep);
                 if (!ok) return te(error);
                 let statsText = output.formatStats(result, { top: ep.top || 0 });
-                if (note) statsText += '\n\n' + note;
+                if (note) statsText += '\n\n' + mn(note);
                 return tr(statsText);
             }
 
@@ -715,7 +728,7 @@ server.registerTool(
                 const { ok, result, error, note } = execute(index, 'auditAsync', ep);
                 if (!ok) return te(error);
                 let text = output.formatAuditAsync(result);
-                if (note) text += '\n\n' + note;
+                if (note) text += '\n\n' + mn(note);
                 return tr(text);
             }
 
