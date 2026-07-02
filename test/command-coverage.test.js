@@ -1731,3 +1731,82 @@ module.exports = { work, Store, Cache, helperOne };
         } finally { rm(d); }
     });
 });
+
+// fix #228 (bug-hunt campaign 2026-07-02): diffImpact old-side symbol identity.
+// extractCallableSymbols must normalize like indexFile (receiver-derived
+// className for Go/Rust methods, NON_CALLABLE_TYPES filter for fields) and
+// deleted lines must be attributed via the OLD parse's ranges — three cells
+// (go/java/rust) independently hit modified-method-misclassified-as-new,
+// phantom-deleted fields, and untouched-function-marked-modified.
+describe('fix #228: diffImpact old-side identity and deletion attribution', () => {
+    function gitInit(dir) {
+        execFileSync('git', ['init'], { cwd: dir, stdio: 'pipe' });
+        execFileSync('git', ['add', '.'], { cwd: dir, stdio: 'pipe' });
+        execFileSync('git', ['-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-m', 'init'], { cwd: dir, stdio: 'pipe' });
+    }
+
+    it('a modified Go method is MODIFIED (with callers), never new or deleted', () => {
+        const dir = tmp({
+            'go.mod': 'module scratch',
+            'lib.go': [
+                'package main', '',
+                'type Server struct {', '\tn int', '}', '',
+                'func (s *Server) Run(x int) error {', '\t_ = x', '\treturn nil', '}',
+            ].join('\n'),
+            'app.go': [
+                'package main', '',
+                'func main() {', '\ts := &Server{}', '\t_ = s.Run(3)', '}',
+            ].join('\n'),
+        });
+        try {
+            gitInit(dir);
+            const libPath = path.join(dir, 'lib.go');
+            fs.writeFileSync(libPath, fs.readFileSync(libPath, 'utf-8').replace('\t_ = x', '\t_ = x // touched'));
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'diffImpact', { base: 'HEAD' });
+            assert.ok(ok);
+            assert.ok(result.functions.some(f => f.name === 'Run'), 'Run must be in MODIFIED functions');
+            const run = result.functions.find(f => f.name === 'Run');
+            assert.ok(run.callers.some(c => c.relativePath === 'app.go'), 'the s.Run(3) caller must be found');
+            assert.strictEqual(result.newFunctions.length, 0, 'no phantom new functions');
+            assert.strictEqual(result.deletedFunctions.length, 0, 'no phantom deleted functions (fields/methods)');
+        } finally { rm(dir); }
+    });
+
+    it('deleting one function does not mark its neighbor modified nor delete fields', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'd.py': 'def keeper(x):\n    return x\n\ndef goner(y):\n    return y\n',
+        });
+        try {
+            gitInit(dir);
+            fs.writeFileSync(path.join(dir, 'd.py'), 'def keeper(x):\n    return x\n');
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'diffImpact', { base: 'HEAD' });
+            assert.ok(ok);
+            assert.strictEqual(result.functions.length, 0, 'keeper untouched — not modified');
+            assert.deepStrictEqual(result.deletedFunctions.map(f => f.name), ['goner']);
+        } finally { rm(dir); }
+    });
+
+    it('deleted-but-still-called functions carry remainingCallSites (check counts them)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': 'function keeper(x) { return x; }\nfunction victim(a, b) { return a + b; }\nmodule.exports = { keeper, victim };',
+            'app.js': 'const { keeper, victim } = require("./lib");\nfunction main() { return keeper(victim(1, 2)); }',
+        });
+        try {
+            gitInit(dir);
+            fs.writeFileSync(path.join(dir, 'lib.js'),
+                'function keeper(x) { return x; }\nmodule.exports = { keeper };');
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'diffImpact', { base: 'HEAD' });
+            assert.ok(ok);
+            const victim = result.deletedFunctions.find(f => f.name === 'victim');
+            assert.ok(victim, 'victim reported deleted');
+            assert.strictEqual(victim.remainingCallSites.length, 1, 'the remaining app.js call site is surfaced');
+            assert.strictEqual(victim.remainingCallSites[0].relativePath, 'app.js');
+            assert.strictEqual(victim.remainingCallSites[0].line, 2);
+        } finally { rm(dir); }
+    });
+});

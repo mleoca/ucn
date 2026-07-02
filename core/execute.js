@@ -231,6 +231,47 @@ function checkFilePatternMatch(index, filePattern) {
     return `No files matched pattern '${filePattern}'.`;
 }
 
+/**
+ * Definition-pin validation for commands that analyze ONE symbol: when
+ * `file`/`line` are given, some definition of the symbol must actually match
+ * them. Without this, resolution silently falls back to the full definition
+ * set and the command answers about a DIFFERENT definition than the one the
+ * user pinned. Returns an error string, or null when the pin is satisfiable
+ * (or when the symbol has no definitions at all — the not-found path
+ * downstream owns that case).
+ */
+function checkDefinitionPin(index, p) {
+    if (!p.name || (!p.file && !p.line)) return null;
+    const defs = index.symbols.get(p.name) || [];
+    if (defs.length === 0) return null;
+    let candidates = defs;
+    if (p.className) {
+        const byClass = candidates.filter(d => d.className === p.className);
+        if (byClass.length > 0) candidates = byClass;
+    }
+    const describe = (list) => {
+        const shown = list.slice(0, 10)
+            .map(d => `  ${d.relativePath}:${d.startLine}${d.className ? ` (${d.className})` : ''}`)
+            .join('\n');
+        return list.length > 10 ? `${shown}\n  ... and ${list.length - 10} more` : shown;
+    };
+    if (p.file) {
+        const byFile = candidates.filter(d => d.relativePath && d.relativePath.includes(p.file));
+        if (byFile.length === 0) {
+            return `Symbol "${p.name}" not found in files matching "${p.file}". Found ${candidates.length} definition(s) elsewhere:\n${describe(candidates)}\nUse file= with a path fragment from the list above to disambiguate.`;
+        }
+        candidates = byFile;
+    }
+    const line = Number(p.line);
+    if (p.line && Number.isFinite(line)) {
+        const atLine = candidates.filter(d => d.startLine === line);
+        if (atLine.length === 0) {
+            return `No definition of "${p.name}" at line ${line}${p.file ? ` in files matching "${p.file}"` : ''}. Definitions:\n${describe(candidates)}`;
+        }
+    }
+    return null;
+}
+
 /** Read a file and extract lines for a symbol match, applying HTML cleanup. */
 function readAndExtract(match) {
     const content = fs.readFileSync(match.file, 'utf-8');
@@ -289,6 +330,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const result = index.context(p.name, {
             ...buildCallerOptions(p),
             unreachableOnly: !!p.unreachableOnly,
@@ -307,6 +350,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const result = index.impact(p.name, {
             file: p.file,
             className: p.className,
@@ -333,6 +378,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const depthVal = num(p.depth, undefined);
         const result = index.blast(p.name, {
             ...buildCallerOptions(p),
@@ -355,6 +402,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const depthVal = num(p.depth, undefined);
         const result = index.reverseTrace(p.name, {
             ...buildCallerOptions(p),
@@ -377,6 +426,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const result = index.smart(p.name, {
             ...buildCallerOptions(p),
             withTypes: p.withTypes || false,
@@ -394,6 +445,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const depthVal = num(p.depth, undefined);
         const result = index.trace(p.name, {
             ...buildCallerOptions(p),
@@ -472,6 +525,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const { brief } = require('./brief');
         const result = brief(index, p.name, { file: p.file, className: p.className, git: !!p.git });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
@@ -722,6 +777,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const depthVal = num(p.depth, undefined);
         const result = index.affectedTests(p.name, {
             ...buildCallerOptions(p),
@@ -1135,6 +1192,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         const result = index.verify(p.name, {
             file: p.file,
             className: p.className,
@@ -1161,6 +1220,8 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
+        const pinErr = checkDefinitionPin(index, p);
+        if (pinErr) return { ok: false, error: pinErr };
         if (!p.addParam && !p.removeParam && !p.renameTo) {
             return { ok: false, error: 'Plan requires an operation: add_param, remove_param, or rename_to.' };
         }

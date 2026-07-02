@@ -269,11 +269,22 @@ function formatDiffImpact(result, options = {}) {
         }
     }
 
-    // Deleted functions
+    // Deleted functions — with any call sites that still reference the name
+    // (likely breaks; name-level candidates, the definition is gone)
     if (result.deletedFunctions.length > 0) {
         lines.push('\nDELETED FUNCTIONS:');
         for (const fn of result.deletedFunctions) {
             lines.push(`  ${fn.name} — ${fn.relativePath}:${fn.startLine}`);
+            const remaining = fn.remainingCallSites || [];
+            if (remaining.length > 0) {
+                lines.push(`  ⚠ still called from ${remaining.length} site(s) — name-level matches:`);
+                for (const site of remaining.slice(0, 10)) {
+                    lines.push(`    ${site.relativePath}:${site.line}  ${site.content}`);
+                }
+                if (remaining.length > 10) {
+                    lines.push(`    ... and ${remaining.length - 10} more`);
+                }
+            }
         }
     }
 

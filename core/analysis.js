@@ -1845,6 +1845,7 @@ function diffImpact(index, options = {}) {
         // line-arithmetic guess that was wrong for tightly-packed 1-line functions.
         // The identity key is `name\0className` (matches deletion-detection below).
         let oldSymbolIdentities = null; // null = unknown (file untracked or git failed)
+        let oldCallables = null;        // old symbols WITH ranges — deleted lines are old-file coordinates
         if (change.deletedLines.length > 0 || change.addedLines.length > 0) {
             const ref = staged ? 'HEAD' : base;
             try {
@@ -1856,7 +1857,8 @@ function diffImpact(index, options = {}) {
                 if (fileLang) {
                     const oldParsed = parse(oldContent, fileLang);
                     oldSymbolIdentities = new Set();
-                    for (const oldFn of extractCallableSymbols(oldParsed)) {
+                    oldCallables = extractCallableSymbols(oldParsed);
+                    for (const oldFn of oldCallables) {
                         oldSymbolIdentities.add(`${oldFn.name}\0${oldFn.className || ''}`);
                     }
                 }
@@ -1889,46 +1891,81 @@ function diffImpact(index, options = {}) {
             }
         }
 
+        // Current callable symbols by identity — used to map an OLD symbol that
+        // still exists to its CURRENT definition for modification attribution.
+        const currentByIdentity = new Map();
+        for (const s of fileEntry.symbols) {
+            if (NON_CALLABLE_TYPES.has(s.type)) continue;
+            const k = `${s.name}\0${s.className || ''}`;
+            if (!currentByIdentity.has(k)) currentByIdentity.set(k, []);
+            currentByIdentity.get(k).push(s);
+        }
+
         for (const line of change.deletedLines) {
-            // For deleted lines, we can't use findEnclosingFunction on the current file
-            // since those lines no longer exist. Track as module-level unless they map
-            // to a function that still exists (the function was modified, not deleted).
-            // We approximate: if a deleted line is within the range of a known symbol, it's a modification.
-            // Pick the MOST-SPECIFIC match: prefer exact-contained over tolerance-contained,
-            // and among ties prefer the smallest range (innermost). This avoids an earlier
-            // symbol's expanded ±2 range claiming a line that actually belongs to a later
-            // 1-line function in tightly-packed files (BUG-F).
-            let bestSymbol = null;
-            let bestExact = false;
-            let bestRange = Infinity;
-            for (const symbol of fileEntry.symbols) {
-                if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
-                const exact = line >= symbol.startLine && line <= symbol.endLine;
-                const tolerant = line >= symbol.startLine - 2 && line <= symbol.endLine + 2;
-                if (!exact && !tolerant) continue;
-                const range = symbol.endLine - symbol.startLine;
-                // Prefer exact-contained over tolerance-contained; among same kind, smaller range wins.
-                const better = bestSymbol === null
-                    || (exact && !bestExact)
-                    || (exact === bestExact && range < bestRange);
-                if (better) {
-                    bestSymbol = symbol;
-                    bestExact = exact;
-                    bestRange = range;
-                }
-            }
+            // Deleted line numbers are OLD-file coordinates. Matching them
+            // against CURRENT symbol ranges mis-attributes whenever the file
+            // shifted (an untouched function reported modified because it now
+            // occupies a deleted function's old lines). When the old parse is
+            // available, attribute by the OLD symbol's range and map its
+            // identity to the current definition; fall back to the old
+            // current-range heuristic only when git couldn't produce the base.
             let matched = false;
-            if (bestSymbol) {
-                // Only attribute to a symbol that ALSO existed in the old file. If we
-                // know the old identities and this symbol wasn't there, it's a brand-new
-                // function — its "deleted line" is really a neighboring line that gets
-                // pushed up by the diff hunk header. Treat as module-level so the new
-                // symbol stays cleanly in newFunctions[] (BUG-F).
-                const identityKey = `${bestSymbol.name}\0${bestSymbol.className || ''}`;
-                const existedBefore = oldSymbolIdentities === null
-                    ? true
-                    : oldSymbolIdentities.has(identityKey);
-                if (existedBefore) {
+            if (oldCallables !== null) {
+                let bestOld = null;
+                let bestRange = Infinity;
+                for (const oldFn of oldCallables) {
+                    const end = oldFn.endLine || oldFn.startLine;
+                    if (line < oldFn.startLine || line > end) continue;
+                    const range = end - oldFn.startLine;
+                    if (bestOld === null || range < bestRange) {
+                        bestOld = oldFn;
+                        bestRange = range;
+                    }
+                }
+                if (bestOld) {
+                    const identityKey = `${bestOld.name}\0${bestOld.className || ''}`;
+                    const candidates = currentByIdentity.get(identityKey);
+                    if (candidates && candidates.length > 0) {
+                        // Function still exists — a modification. Nearest
+                        // startLine disambiguates same-identity overloads.
+                        let cur = candidates[0];
+                        for (const c of candidates) {
+                            if (Math.abs(c.startLine - bestOld.startLine) < Math.abs(cur.startLine - bestOld.startLine)) cur = c;
+                        }
+                        const key = `${cur.name}:${cur.startLine}`;
+                        if (!affectedSymbols.has(key)) {
+                            affectedSymbols.set(key, { symbol: cur, addedLines: [], deletedLines: [] });
+                        }
+                        affectedSymbols.get(key).deletedLines.push(line);
+                    }
+                    // Identity gone → the whole function was deleted; the
+                    // deletion detection below reports it. Its body lines are
+                    // neither a modification nor a module-level change.
+                    matched = true;
+                }
+            } else {
+                // Fallback (old file unreachable): current-range heuristic.
+                // Pick the MOST-SPECIFIC match: prefer exact-contained over
+                // tolerance-contained, then smallest range (BUG-F).
+                let bestSymbol = null;
+                let bestExact = false;
+                let bestRange = Infinity;
+                for (const symbol of fileEntry.symbols) {
+                    if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
+                    const exact = line >= symbol.startLine && line <= symbol.endLine;
+                    const tolerant = line >= symbol.startLine - 2 && line <= symbol.endLine + 2;
+                    if (!exact && !tolerant) continue;
+                    const range = symbol.endLine - symbol.startLine;
+                    const better = bestSymbol === null
+                        || (exact && !bestExact)
+                        || (exact === bestExact && range < bestRange);
+                    if (better) {
+                        bestSymbol = symbol;
+                        bestExact = exact;
+                        bestRange = range;
+                    }
+                }
+                if (bestSymbol) {
                     const key = `${bestSymbol.name}:${bestSymbol.startLine}`;
                     if (!affectedSymbols.has(key)) {
                         affectedSymbols.set(key, { symbol: bestSymbol, addedLines: [], deletedLines: [] });
@@ -1982,51 +2019,37 @@ function diffImpact(index, options = {}) {
 
         // Detect deleted functions: compare old file symbols with current by identity.
         // Uses name+className counts to handle overloads (e.g. Java method overloading).
-        if (change.deletedLines.length > 0) {
-            const ref = staged ? 'HEAD' : base;
-            try {
-                const oldContent = execFileSync(
-                    'git', ['show', `${ref}:${change.gitRelativePath}`],
-                    { cwd: index.root, encoding: 'utf-8', maxBuffer: 10 * 1024 * 1024, stdio: ['ignore', 'pipe', 'ignore'] }
-                );
-                const fileLang = detectLanguage(change.filePath);
-                if (fileLang) {
-                    const oldParsed = parse(oldContent, fileLang);
-                    // Count current symbols by identity (name + className)
-                    const currentCounts = new Map();
-                    for (const s of fileEntry.symbols) {
-                        if (NON_CALLABLE_TYPES.has(s.type)) continue;
-                        const key = `${s.name}\0${s.className || ''}`;
-                        currentCounts.set(key, (currentCounts.get(key) || 0) + 1);
-                    }
-                    // Count old symbols by identity and detect deletions
-                    const oldCounts = new Map();
-                    const oldSymbols = extractCallableSymbols(oldParsed);
-                    for (const oldFn of oldSymbols) {
-                        const key = `${oldFn.name}\0${oldFn.className || ''}`;
-                        oldCounts.set(key, (oldCounts.get(key) || 0) + 1);
-                    }
-                    // For each identity, if old count > current count, the difference are deletions
-                    for (const [key, oldCount] of oldCounts) {
-                        const curCount = currentCounts.get(key) || 0;
-                        if (oldCount > curCount) {
-                            // Find the specific old symbols with this identity that were deleted
-                            const matching = oldSymbols.filter(s => `${s.name}\0${s.className || ''}` === key);
-                            // Report the extra ones (by startLine descending — later ones more likely deleted)
-                            const toReport = matching.slice(curCount);
-                            for (const oldFn of toReport) {
-                                deletedFunctions.push({
-                                    name: oldFn.name,
-                                    filePath: change.filePath,
-                                    relativePath: change.relativePath,
-                                    startLine: oldFn.startLine
-                                });
-                            }
-                        }
+        // oldCallables was parsed from the same base revision above.
+        if (change.deletedLines.length > 0 && oldCallables !== null) {
+            const currentCounts = new Map();
+            for (const s of fileEntry.symbols) {
+                if (NON_CALLABLE_TYPES.has(s.type)) continue;
+                const key = `${s.name}\0${s.className || ''}`;
+                currentCounts.set(key, (currentCounts.get(key) || 0) + 1);
+            }
+            // Count old symbols by identity and detect deletions
+            const oldCounts = new Map();
+            for (const oldFn of oldCallables) {
+                const key = `${oldFn.name}\0${oldFn.className || ''}`;
+                oldCounts.set(key, (oldCounts.get(key) || 0) + 1);
+            }
+            // For each identity, if old count > current count, the difference are deletions
+            for (const [key, oldCount] of oldCounts) {
+                const curCount = currentCounts.get(key) || 0;
+                if (oldCount > curCount) {
+                    // Find the specific old symbols with this identity that were deleted
+                    const matching = oldCallables.filter(s => `${s.name}\0${s.className || ''}` === key);
+                    // Report the extra ones (by startLine descending — later ones more likely deleted)
+                    const toReport = matching.slice(curCount);
+                    for (const oldFn of toReport) {
+                        deletedFunctions.push({
+                            name: oldFn.name,
+                            filePath: change.filePath,
+                            relativePath: change.relativePath,
+                            startLine: oldFn.startLine
+                        });
                     }
                 }
-            } catch (e) {
-                // File didn't exist in base, or git error — skip
             }
         }
 
@@ -2108,6 +2131,42 @@ function diffImpact(index, options = {}) {
         }
     }
 
+    // Deleted-but-still-called: a deleted function whose NAME still has call
+    // sites in the current tree is a likely runtime/compile break. The def is
+    // gone, so no receiver physics can pin these — they are name-level
+    // candidates and are labeled as such (same epistemic tier as `usages`).
+    if (deletedFunctions.length > 0) {
+        const { getCachedCalls } = require('./callers');
+        for (const del of deletedFunctions) {
+            const remaining = [];
+            const calleeFiles = index.getCalleeFiles(del.name);
+            if (calleeFiles) {
+                for (const f of calleeFiles) {
+                    const calls = getCachedCalls(index, f);
+                    if (!Array.isArray(calls)) continue;
+                    const fe = index.files.get(f);
+                    let lines = null;
+                    for (const c of calls) {
+                        if (c.name !== del.name && c.resolvedName !== del.name) continue;
+                        if (lines === null) {
+                            try { lines = index._getFileLines(f); } catch { lines = []; }
+                        }
+                        remaining.push({
+                            file: f,
+                            relativePath: fe ? fe.relativePath : path.relative(index.root, f),
+                            line: c.line,
+                            content: (lines[c.line - 1] || '').trim(),
+                        });
+                    }
+                }
+            }
+            remaining.sort((a, b) => a.relativePath === b.relativePath
+                ? a.line - b.line
+                : a.relativePath.localeCompare(b.relativePath));
+            del.remainingCallSites = remaining;
+        }
+    }
+
     return {
         base: staged ? '(staged)' : base,
         functions,
@@ -2132,19 +2191,28 @@ function diffImpact(index, options = {}) {
 
 /**
  * Extract all callable symbols (functions + class methods) from a parse result,
- * matching how indexFile builds the symbol list. Methods get className added.
+ * matching how indexFile builds the symbol list — the identity keys
+ * (`name\0className`) derived here are compared against INDEXED symbols, so
+ * both normalizations indexFile applies must happen here too:
+ * - Go/Rust methods are standalone functions with a `receiver`; indexFile
+ *   derives className from it. Without this, every modified method's identity
+ *   misses the old set and it reads as new + phantom-deleted.
+ * - Class members include FIELDS; the indexed side filters NON_CALLABLE_TYPES,
+ *   so the old side must too or every field in a changed file reads deleted.
  * @param {object} parsed - Result from parse()
  * @returns {Array<{name, className, startLine}>}
  */
 function extractCallableSymbols(parsed) {
     const symbols = [];
     for (const fn of parsed.functions) {
-        symbols.push({ name: fn.name, className: fn.className || '', startLine: fn.startLine });
+        const className = fn.className || (fn.receiver ? fn.receiver.replace(/^\*/, '') : '');
+        symbols.push({ name: fn.name, className, startLine: fn.startLine, endLine: fn.endLine });
     }
     for (const cls of parsed.classes) {
         if (cls.members) {
             for (const m of cls.members) {
-                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine });
+                if (NON_CALLABLE_TYPES.has(m.memberType || 'method')) continue;
+                symbols.push({ name: m.name, className: cls.name, startLine: m.startLine, endLine: m.endLine });
             }
         }
     }

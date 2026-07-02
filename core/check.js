@@ -122,7 +122,9 @@ function check(index, options = {}) {
         items.push(item);
     }
 
-    // Surface deleted functions inline — they don't have line/file but still matter
+    // Surface deleted functions inline. remainingCallSites are name-level
+    // matches still present in the tree — a deleted function that is still
+    // called is a likely break, so they count as unverified callers here.
     for (const d of deleted) {
         items.push({
             name: d.name || '(unnamed)',
@@ -130,7 +132,7 @@ function check(index, options = {}) {
             line: d.startLine || 0,
             kind: 'deleted',
             callerCount: 0,
-            unverifiedCallerCount: 0,
+            unverifiedCallerCount: (d.remainingCallSites || []).length,
             signatureMismatches: 0,
         });
     }

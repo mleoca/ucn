@@ -4299,3 +4299,36 @@ describe('fix #227: verify/plan honor the exact-line pin (incl. stable handles)'
         } finally { rm(dir); }
     });
 });
+
+describe('fix #228: unsatisfiable definition pins error instead of silently falling back', () => {
+    const FILES = {
+        'package.json': '{"name":"pin2"}',
+        'utils.js': 'function camelToSnake(s) { return s; }\nmodule.exports = { camelToSnake };',
+        'data.js': 'const { camelToSnake } = require("./utils");\nfunction use() { return camelToSnake("x"); }',
+    };
+
+    it('context/verify with a --file pin matching no definition error with locations', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            for (const cmd of ['context', 'verify', 'impact', 'trace', 'blast']) {
+                const r = execute(index, cmd, { name: 'camelToSnake', file: 'data.js' });
+                assert.strictEqual(r.ok, false, `${cmd} must reject the wrong-file pin`);
+                assert.ok(r.error.includes('utils.js'), `${cmd} error lists the real location`);
+            }
+            // the correct pin still resolves
+            const ok = execute(index, 'verify', { name: 'camelToSnake', file: 'utils.js' });
+            assert.ok(ok.ok && ok.result.found);
+        } finally { rm(dir); }
+    });
+
+    it('a stale line pin errors instead of analyzing a different definition', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'verify', { name: 'camelToSnake', file: 'utils.js', line: 99 });
+            assert.strictEqual(r.ok, false, 'stale handle line must not silently resolve elsewhere');
+            assert.ok(r.error.includes('utils.js:1'), 'error lists the real definition line');
+        } finally { rm(dir); }
+    });
+});

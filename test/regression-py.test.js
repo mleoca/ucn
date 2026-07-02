@@ -2826,7 +2826,7 @@ def drive(o):
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
-            const res = contract(index, 'mine.py:5:compute');
+            const res = contract(index, 'mine.py:6:compute');
             assert.ok(!res.confirmed.includes('user.py:6'),
                 `o.compute() could be Base's: ${res.confirmed}`);
             const entry = res.unverified.find(u => u.key === 'user.py:6');
@@ -3376,7 +3376,7 @@ describe('fix #222: a bare Python call never binds a class-scoped member', () =>
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
-            const res = contract(index, 'text.py:6:cell_len');
+            const res = contract(index, 'text.py:5:cell_len');
             assert.strictEqual(res.confirmed.length, 0,
                 `bare cell_len(...) binds the import, never Text.cell_len: ${res.confirmed}`);
             assert.strictEqual(res.conserved, true);
