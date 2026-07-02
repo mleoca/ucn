@@ -12,6 +12,7 @@ const {
     parseStructuredParams,
     extractJavaDocstring,
     visitNameNodes,
+    sameNode,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1440,7 +1441,7 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Call: method_invocation with name field
             else if (parent.type === 'method_invocation' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'call';
                 // Track receiver for method invocations (obj.name() → receiver = 'obj')
                 const object = parent.childForFieldName('object');
@@ -1451,50 +1452,50 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Definition: method name
             else if (parent.type === 'method_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: class name
             else if (parent.type === 'class_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: interface name
             else if (parent.type === 'interface_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: enum name
             else if (parent.type === 'enum_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: constructor
             else if (parent.type === 'constructor_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: local variable
             else if (parent.type === 'variable_declarator' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: parameter (name field only, not the type)
             else if ((parent.type === 'formal_parameter' ||
                      parent.type === 'spread_parameter') &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: field (declarator name only, not the type)
             else if (parent.type === 'field_declaration' &&
                      node.type === 'identifier' &&
-                     parent.descendantsOfType('variable_declarator').some(d => d.childForFieldName('name') === node)) {
+                     parent.descendantsOfType('variable_declarator').some(d => sameNode(d.childForFieldName('name'), node))) {
                 usageType = 'definition';
             }
             // Object creation: new ClassName()
             else if (parent.type === 'object_creation_expression') {
                 const typeNode = parent.childForFieldName('type');
-                if (typeNode === node || typeNode?.text === name) {
+                if (sameNode(typeNode, node) || typeNode?.text === name) {
                     usageType = 'call';
                 }
             }
@@ -1502,12 +1503,12 @@ function findUsagesInCode(code, name, parser, tree) {
             // (variable or ClassName), referenced, not called. The call belongs
             // to the name field, handled above.
             else if (parent.type === 'method_invocation' &&
-                     parent.childForFieldName('object') === node) {
+                     sameNode(parent.childForFieldName('object'), node)) {
                 usageType = 'reference';
             }
             // Field access: obj.field
             else if (parent.type === 'field_access' &&
-                     parent.childForFieldName('field') === node) {
+                     sameNode(parent.childForFieldName('field'), node)) {
                 usageType = 'reference';
                 // Track receiver for field access (obj.field → receiver = 'obj')
                 const object = parent.childForFieldName('object');

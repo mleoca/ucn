@@ -958,7 +958,22 @@ function extractSprintfPrefix(callNode) {
     return { value: hasFmt ? (literal + '*') : literal, interp: hasFmt };
 }
 
+
+/**
+ * Stable node equality (fix #233): tree-sitter node WRAPPERS are not
+ * reference-stable — `parent.child(i) === node` can return false for the
+ * same underlying node once a tree has been walked by an earlier operation
+ * (the CI macro-flake root cause: assert_eq!-wrapped calls flipped
+ * 'call'→'reference' on the second index build in a process because
+ * _indexInParent returned -1). `.id` is node-tree-sitter's stable native
+ * node identity — compare that, never the wrapper reference.
+ */
+function sameNode(a, b) {
+    return !!a && !!b && (a === b || a.id === b.id);
+}
+
 module.exports = {
+    sameNode,
     traverseTree,
     traverseTreeCached,
     visitNameNodes,

@@ -14,6 +14,7 @@ const {
     extractJSDocstring,
     buildTypeAnnotations,
     visitNameNodes,
+    sameNode,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -2631,38 +2632,38 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Call: identifier is function in call_expression
             else if (parent.type === 'call_expression' &&
-                     parent.childForFieldName('function') === node) {
+                     sameNode(parent.childForFieldName('function'), node)) {
                 usageType = 'call';
             }
             // New expression: identifier is constructor
             else if (parent.type === 'new_expression' &&
-                     parent.childForFieldName('constructor') === node) {
+                     sameNode(parent.childForFieldName('constructor'), node)) {
                 usageType = 'call';
             }
             // Definition: function name in declaration
             else if ((parent.type === 'function_declaration' ||
                       parent.type === 'generator_function_declaration') &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: variable name in declarator (left side of =)
             else if (parent.type === 'variable_declarator' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: class name
             else if (parent.type === 'class_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: method name
             else if (parent.type === 'method_definition' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: function expression name (named function expressions)
             else if (parent.type === 'function' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Require: identifier is the name in require('...')
@@ -2694,7 +2695,7 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Property access (method call): a.name() - the name after dot
             else if (parent.type === 'member_expression' &&
-                     parent.childForFieldName('property') === node) {
+                     sameNode(parent.childForFieldName('property'), node)) {
                 // Skip built-in objects and common module names (JSON.parse, path.parse, etc.)
                 const object = parent.childForFieldName('object');
                 const builtins = [

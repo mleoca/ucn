@@ -12,6 +12,7 @@ const {
     parseStructuredParams,
     extractRustDocstring,
     visitNameNodes,
+    sameNode,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1925,7 +1926,7 @@ function findExportsInCode(code, parser) {
  */
 function _indexInParent(node, parent) {
     for (let i = 0; i < parent.childCount; i++) {
-        if (parent.child(i) === node) return i;
+        if (sameNode(parent.child(i), node)) return i;
     }
     return -1;
 }
@@ -1966,7 +1967,7 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Call: name()
             else if (parent.type === 'call_expression' &&
-                     parent.childForFieldName('function') === node) {
+                     sameNode(parent.childForFieldName('function'), node)) {
                 usageType = 'call';
             }
             // Scoped call: Type::method() — only the LAST segment is the callee;
@@ -1976,30 +1977,30 @@ function findUsagesInCode(code, name, parser, tree) {
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call_expression' &&
                     grandparent.childForFieldName('function') === parent &&
-                    parent.childForFieldName('name') === node) {
+                    sameNode(parent.childForFieldName('name'), node)) {
                     usageType = 'call';
                 }
             }
             // Macro invocation: name!
             else if (parent.type === 'macro_invocation') {
                 const macroNode = parent.childForFieldName('macro');
-                if (macroNode === node) {
+                if (sameNode(macroNode, node)) {
                     usageType = 'call';
                 }
             }
             // Definition: fn name
             else if (parent.type === 'function_item' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: struct name
             else if (parent.type === 'struct_item' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: enum name
             else if (parent.type === 'enum_item' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: impl for Type
@@ -2008,7 +2009,7 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Definition: type alias
             else if (parent.type === 'type_item' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: let binding
@@ -2018,22 +2019,22 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Definition: const/static
             else if ((parent.type === 'const_item' || parent.type === 'static_item') &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: parameter name (not the type)
             else if (parent.type === 'parameter' &&
-                     parent.childForFieldName('pattern') === node) {
+                     sameNode(parent.childForFieldName('pattern'), node)) {
                 usageType = 'definition';
             }
             // Struct expression: Type { field: value }
             else if (parent.type === 'struct_expression' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'call';
             }
             // Method call: obj.name()
             else if (parent.type === 'field_expression' &&
-                     parent.childForFieldName('field') === node) {
+                     sameNode(parent.childForFieldName('field'), node)) {
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call_expression') {
                     usageType = 'call';
@@ -2088,7 +2089,7 @@ function findUsagesInCode(code, name, parser, tree) {
         if (parent && (parent.type === 'scoped_identifier' || parent.type === 'scoped_type_identifier')) {
             const nameField = parent.childForFieldName('name');
             const pathField = parent.childForFieldName('path');
-            if (nameField === node && pathField) {
+            if (sameNode(nameField, node) && pathField) {
                 const pathText = pathField.text;
                 // If path is a Capitalized identifier different from our target, it's Type::Variant
                 // Skip module paths (lowercase), self/Self/super/crate keywords

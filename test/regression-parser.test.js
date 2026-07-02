@@ -1383,3 +1383,58 @@ describe('Cross-feature: Go embedded struct + method callers', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #233: usage classification is deterministic across index generations', () => {
+    // Campaign G1-rust BUG-4 (the CI macro-flake root cause): tree-sitter
+    // node WRAPPERS are not reference-stable — after a second ProjectIndex
+    // build in the same process, `parent.child(i) === node` returned false
+    // for the same underlying node inside macro token_trees, so
+    // assert_eq!-wrapped calls flipped 'call'→'reference' and example
+    // returned 'No examples found' deterministically. All parser
+    // classification sites now compare node.id (sameNode in utils.js).
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+        'src/lib.rs': `pub fn camel_to_snake(s: &str) -> String {
+    s.to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn works() {
+        assert_eq!(camel_to_snake("helloWorld"), "hello_world");
+    }
+}
+`,
+    };
+
+    it('example finds macro-wrapped call sites on every index generation', () => {
+        const dir = tmp(FILES);
+        try {
+            for (let gen = 1; gen <= 3; gen++) {
+                const index = idx(dir);
+                execute(index, 'about', { name: 'camel_to_snake' });
+                const r = execute(index, 'example', { name: 'camel_to_snake', includeTests: true });
+                assert.ok(r.ok, `generation ${gen}: example must find the assert_eq! call site (${r.error})`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('usages keeps macro call sites classified as calls across generations', () => {
+        const dir = tmp(FILES);
+        try {
+            for (let gen = 1; gen <= 3; gen++) {
+                const index = idx(dir);
+                execute(index, 'about', { name: 'camel_to_snake' });
+                const r = execute(index, 'usages', { name: 'camel_to_snake', includeTests: true });
+                assert.ok(r.ok);
+                const call = r.result.find(u => u.line === 11);
+                assert.ok(call, `generation ${gen}: line 11 present`);
+                assert.strictEqual(call.usageType, 'call',
+                    `generation ${gen}: assert_eq!-wrapped call must classify as call, got ${call.usageType}`);
+            }
+        } finally { rm(dir); }
+    });
+});

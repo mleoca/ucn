@@ -12,6 +12,7 @@ const {
     parseStructuredParams,
     extractGoDocstring,
     visitNameNodes,
+    sameNode,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1663,28 +1664,28 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Call: identifier is function in call_expression
             else if (parent.type === 'call_expression' &&
-                     parent.childForFieldName('function') === node) {
+                     sameNode(parent.childForFieldName('function'), node)) {
                 usageType = 'call';
             }
             // Definition: function name
             else if (parent.type === 'function_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: method name
             else if (parent.type === 'method_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: type name
             else if (parent.type === 'type_spec' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: variable name in short var declaration
             else if (parent.type === 'short_var_declaration') {
                 const left = parent.childForFieldName('left');
-                if (left && (left === node || left.namedChildren?.some(c => c === node))) {
+                if (left && (sameNode(left, node) || left.namedChildren?.some(c => sameNode(c, node)))) {
                     usageType = 'definition';
                 }
             }
@@ -1697,18 +1698,18 @@ function findUsagesInCode(code, name, parser, tree) {
             // Definition: const/var spec
             else if (parent.type === 'const_spec' || parent.type === 'var_spec') {
                 const nameNode = parent.childForFieldName('name');
-                if (nameNode === node) {
+                if (sameNode(nameNode, node)) {
                     usageType = 'definition';
                 }
             }
             // Definition: parameter name (not the type)
             else if (parent.type === 'parameter_declaration' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Composite literal: Type{} — type_identifier is the type of composite_literal
             else if (parent.type === 'composite_literal' &&
-                     parent.childForFieldName('type') === node) {
+                     sameNode(parent.childForFieldName('type'), node)) {
                 usageType = 'call';
             }
             // Method call: selector_expression followed by call (field_identifier case)

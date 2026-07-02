@@ -13,6 +13,7 @@ const {
     extractPythonDocstring,
     paramTypesFromStructured,
     visitNameNodes,
+    sameNode,
 } = require('./utils');
 const { PARSE_OPTIONS, safeParse } = require('./index');
 
@@ -1379,17 +1380,17 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Call: name()
             else if (parent.type === 'call' &&
-                     parent.childForFieldName('function') === node) {
+                     sameNode(parent.childForFieldName('function'), node)) {
                 usageType = 'call';
             }
             // Definition: def name(...):
             else if (parent.type === 'function_definition' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: class name:
             else if (parent.type === 'class_definition' &&
-                     parent.childForFieldName('name') === node) {
+                     sameNode(parent.childForFieldName('name'), node)) {
                 usageType = 'definition';
             }
             // Definition: parameter
@@ -1401,17 +1402,17 @@ function findUsagesInCode(code, name, parser, tree) {
             }
             // Definition: assignment target (x = ...)
             else if (parent.type === 'assignment' &&
-                     parent.childForFieldName('left') === node) {
+                     sameNode(parent.childForFieldName('left'), node)) {
                 usageType = 'definition';
             }
             // Definition: for loop variable
             else if (parent.type === 'for_statement' &&
-                     parent.childForFieldName('left') === node) {
+                     sameNode(parent.childForFieldName('left'), node)) {
                 usageType = 'definition';
             }
             // Method call: obj.name()
             else if (parent.type === 'attribute' &&
-                     parent.childForFieldName('attribute') === node) {
+                     sameNode(parent.childForFieldName('attribute'), node)) {
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call') {
                     usageType = 'call';
