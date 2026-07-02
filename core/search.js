@@ -563,6 +563,7 @@ function structuralSearch(index, options = {}) {
     index._beginOp();
     try {
         const { term, param, receiver, returns: returnType, decorator, exported, unused } = options;
+        let unusedDecoratorNames = null; // lazy — built once per --unused search (fix #234)
         // Auto-infer type: --receiver implies type=call
         const type = options.type || (receiver ? 'call' : undefined);
         const results = [];
@@ -699,6 +700,27 @@ function structuralSearch(index, options = {}) {
                     if (unused) {
                         index.buildCalleeIndex();
                         if (index.calleeIndex.has(symbolName)) continue;
+                        // Runtime-invoked entry points are never unused (fix
+                        // #234, campaign G2 ×4 languages: Go main/init, Java
+                        // main, Rust main/#[test] all listed — the deadcode
+                        // protection, applied here).
+                        const langModule = fileEntry && getLanguageModule(fileEntry.language);
+                        if (langModule?.isEntryPoint?.(def)) continue;
+                        // A bare decorator application (@with_logging) invokes
+                        // the decorator at import time but is recorded as a
+                        // reference, not a call — a name decorating any def is
+                        // used (G2-python BUG-1).
+                        if (!unusedDecoratorNames) {
+                            unusedDecoratorNames = new Set();
+                            for (const [, dDefs] of index.symbols) {
+                                for (const d of dDefs) {
+                                    for (const dec of d.decorators || []) {
+                                        unusedDecoratorNames.add(String(dec).replace(/^@/, '').split('(')[0].trim());
+                                    }
+                                }
+                            }
+                        }
+                        if (unusedDecoratorNames.has(symbolName)) continue;
                     }
 
                     // Merge decorators from both Python-style decorators and Java-style modifiers

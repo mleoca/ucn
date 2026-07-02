@@ -3097,3 +3097,49 @@ impl Bar {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #234 (Rust): usages classifies Type::method() path calls', () => {
+    // Campaign G2-rust BUG-1: the enum-variant filter swallowed sites the
+    // scoped-call branch had already classified as CALLS — usages reported
+    // '0 calls' for every path-qualified invocation of a live function.
+    it('counts path-qualified calls and keeps enum-variant refs filtered', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': `pub struct Svc;
+
+impl Svc {
+    pub fn with_defaults() -> Self {
+        Svc
+    }
+}
+
+pub enum Boundary {
+    Grid,
+}
+
+pub struct Grid;
+
+pub fn make() -> Svc {
+    Svc::with_defaults()
+}
+
+pub fn pick() -> Boundary {
+    Boundary::Grid
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'usages', { name: 'with_defaults' });
+            assert.ok(r.ok);
+            const call = r.result.find(u => u.line === 16 && !u.isDefinition);
+            assert.ok(call, 'Svc::with_defaults() call site present');
+            assert.strictEqual(call.usageType, 'call');
+            // counter-probe: Boundary::Grid must stay filtered for struct Grid
+            const g = execute(index, 'usages', { name: 'Grid' });
+            assert.ok(g.ok);
+            assert.ok(!g.result.some(u => u.line === 20 && !u.isDefinition),
+                'enum variant reference must stay filtered from struct usages');
+        } finally { rm(dir); }
+    });
+});

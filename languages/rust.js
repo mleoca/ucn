@@ -2085,8 +2085,14 @@ function findUsagesInCode(code, name, parser, tree) {
 
         // Filter out enum variant references: Boundary::Grid is NOT a usage of Grid struct
         // If our node is the NAME (right side) of a scoped_identifier/scoped_type_identifier,
-        // and the PATH (left side) is a different Capitalized type, it's likely an enum variant
-        if (parent && (parent.type === 'scoped_identifier' || parent.type === 'scoped_type_identifier')) {
+        // and the PATH (left side) is a different Capitalized type, it's likely an enum variant.
+        // Never a CALL site (fix #234, campaign G2-rust BUG-1): the scoped-call
+        // branch classified `DataService::with_defaults()` as a call, and this
+        // filter then swallowed it — usages reported '0 calls' for every
+        // path-qualified Type::method() invocation, the exact answer that
+        // invites deleting a live function.
+        if (usageType !== 'call' &&
+            parent && (parent.type === 'scoped_identifier' || parent.type === 'scoped_type_identifier')) {
             const nameField = parent.childForFieldName('name');
             const pathField = parent.childForFieldName('path');
             if (sameNode(nameField, node) && pathField) {

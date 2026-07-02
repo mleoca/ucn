@@ -286,6 +286,13 @@ function context(index, name, options = {}) {
         return null;
     }
 
+    // Default includeMethods like about/impact (fix #234, campaign-measured:
+    // the same pinned method was confirmed in about but unverified in
+    // context — the tier depended on which command asked): true for method
+    // targets, where method calls are the primary invocation form.
+    const includeMethods = options.includeMethods ??
+        !!(def.isMethod || def.type === 'method' || def.className);
+
     // Special handling for class/struct/interface types
     if (['class', 'struct', 'interface', 'type'].includes(def.type)) {
         const methods = index.findMethodsForType(name);
@@ -293,7 +300,7 @@ function context(index, name, options = {}) {
         // Pin caller resolution to the resolved class definition — same as the
         // function path below. Without this, same-name classes in other files
         // conflate (their usages attribute to whichever def displays).
-        let typeCallers = index.findCallers(name, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, collectAccount: true, targetDefinitions: [def] });
+        let typeCallers = index.findCallers(name, { includeMethods, includeUncertain: options.includeUncertain, collectAccount: true, targetDefinitions: [def] });
         const rawTypeCallers = typeCallers;
         const typeFilteredByFlag = { exclude: 0, minConfidence: 0, unreachableOnly: 0 };
         // Tier partition — same contract as the function path: constructor/usage
@@ -352,7 +359,7 @@ function context(index, name, options = {}) {
 
     const stats = { uncertain: 0 };
     let callers = index.findCallers(name, {
-        includeMethods: options.includeMethods,
+        includeMethods,
         includeUncertain: options.includeUncertain,
         stats,
         targetDefinitions: [def],
@@ -363,7 +370,7 @@ function context(index, name, options = {}) {
     // Callee side runs the contract too (v4): uncertain/unresolved calls in
     // the def's scope become VISIBLE unverifiedCallees entries + a conserved
     // per-node calleeAccount instead of silently dropping (#223 machinery).
-    let callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, collectAccount: true });
+    let callees = index.findCallees(def, { includeMethods, includeUncertain: options.includeUncertain, stats, collectAccount: true });
     const rawCallees = callees;
     // Pre-display-filter result for the conservation account (filters below
     // build new arrays and would lose the non-enumerable accountRaw).
@@ -483,7 +490,7 @@ function context(index, name, options = {}) {
             dynamicImports,
             uncertain: stats.uncertain,
             confidenceFiltered,
-            includeMethods: !!options.includeMethods,
+            includeMethods: !!includeMethods,
             projectLanguage: index._getPredominantLanguage(),
             account,
             calleeAccount: rawCallees.calleeAccount,
@@ -523,9 +530,12 @@ function smart(index, name, options = {}) {
     }
     const code = index.extractCode(def);
     const stats = { uncertain: 0 };
+    // Method-target default like about/impact/context (fix #234).
+    const includeMethods = options.includeMethods ??
+        !!(def.isMethod || def.type === 'method' || def.className);
     // Callee contract (v4): uncertain/unresolved calls surface as visible
     // unverifiedCallees + a conserved calleeAccount, never a silent drop.
-    const callees = index.findCallees(def, { includeMethods: options.includeMethods, includeUncertain: options.includeUncertain, stats, collectAccount: true });
+    const callees = index.findCallees(def, { includeMethods, includeUncertain: options.includeUncertain, stats, collectAccount: true });
 
     const filesInScope = new Set([def.file]);
     callees.forEach(c => filesInScope.add(c.file));

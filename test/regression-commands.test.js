@@ -4708,3 +4708,31 @@ describe('fix #231: verify arg-checks each same-line call against its OWN node',
         } finally { rm(dir); }
     });
 });
+
+describe('fix #234: context/smart default includeMethods for method targets like about', () => {
+    // Campaign G1-python BUG-1: the same pinned method site was confirmed in
+    // about (method-target default true) but unverified method-no-evidence in
+    // context (raw flag passthrough) — the tier depended on which command
+    // asked, and --include-methods visibly changed context despite the
+    // no-effect note.
+    it('context confirms a field-hop method caller without any flag, same as about', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\n',
+            'models.py': 'class Engine:\n    def start(self) -> str:\n        return "started"\n\nclass Car:\n    engine: Engine\n\n    def drive(self) -> str:\n        return self.engine.start()\n',
+        });
+        try {
+            const index = idx(dir);
+            const ctx = execute(index, 'context', { name: 'start', className: 'Engine' });
+            assert.ok(ctx.ok, `context failed: ${ctx.error}`);
+            assert.ok(ctx.result.callers.some(c => c.line === 9),
+                'self.engine.start() must be a confirmed caller under context defaults');
+            assert.ok(!(ctx.result.unverifiedCallers || []).some(u => u.line === 9),
+                'the site must not sit in the unverified band');
+            const withFlag = execute(index, 'context', { name: 'start', className: 'Engine', includeMethods: true });
+            assert.strictEqual(
+                JSON.stringify(ctx.result.callers.map(c => `${c.relativePath}:${c.line}:${c.tier}`)),
+                JSON.stringify(withFlag.result.callers.map(c => `${c.relativePath}:${c.line}:${c.tier}`)),
+                '--include-methods is a true no-op for method targets');
+        } finally { rm(dir); }
+    });
+});

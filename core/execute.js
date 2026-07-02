@@ -618,23 +618,33 @@ const HANDLERS = {
             const classErr = validateClassName(index, p.name, p.className);
             if (classErr) return { ok: false, error: classErr };
         }
-        const result = index.usages(p.name, {
+        // Scan once WITHOUT the default test exclusion, then filter in the
+        // handler — the hidden count must be VISIBLE (fix #234, campaign
+        // G2-java: usages silently hid test-file usages while search noted
+        // them — a silently incomplete answer from the raw escape hatch).
+        const unfiltered = index.usages(p.name, {
             codeOnly: p.codeOnly || false,
             context: num(p.context, 0),
             className: p.className,
             file: p.file,
-            exclude,
+            exclude: p.exclude,
             in: p.in,
         });
+        const notes = [];
+        let result = unfiltered;
+        if (exclude !== p.exclude && Array.isArray(unfiltered)) {
+            result = unfiltered.filter(u => index.matchesFilters(u.relativePath, { exclude }));
+            const hidden = unfiltered.length - result.length;
+            if (hidden > 0) notes.push(`${hidden} test-file usage(s) hidden by default — pass --include-tests to include them.`);
+        }
         // Apply limit to total usages (result is a flat array)
         const limit = num(p.limit, undefined);
-        let note;
         let limited = result;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
-            note = limitNote(limit, result.length);
+            notes.push(limitNote(limit, result.length));
             limited = result.slice(0, limit);
         }
-        return { ok: true, result: limited, note };
+        return { ok: true, result: limited, note: notes.length ? notes.join(' ') : undefined };
     },
 
     toc: (index, p) => {
@@ -652,6 +662,13 @@ const HANDLERS = {
         // Apply limit to detailed toc entries (symbols are in f.symbols.functions/classes arrays)
         const limit = num(p.limit, undefined);
         let note;
+        if (limit && limit > 0 && !p.detailed) {
+            // --limit only bounds the per-symbol listing, which compact mode
+            // doesn't render (fix #234 — three campaign cells hit the silent
+            // no-op; FLAG_APPLICABILITY lists limit for toc, so no
+            // inapplicable-flag warning fires either).
+            note = '--limit applies to the symbol listing — combine it with --detailed.';
+        }
         if (limit && limit > 0 && p.detailed && result.files) {
             let totalEntries = result.files.reduce((s, f) => {
                 const syms = f.symbols || {};

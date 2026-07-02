@@ -9,13 +9,17 @@ const fs = require('fs');
 const { langTraits } = require('../../languages');
 
 /**
- * Format dynamic imports note with language-appropriate terminology.
- * Go doesn't have "dynamic imports" — uses "blank/dot imports" instead.
+ * Format dynamic imports note with language-appropriate terminology:
+ * Go marks blank/dot imports, Rust marks glob imports (use foo::*) — both
+ * are name-resolution blind spots, neither is a "dynamic import".
  */
 function dynamicImportsNote(count, meta) {
     if (!count) return null;
-    if (meta?.projectLanguage && !langTraits(meta.projectLanguage)?.hasDynamicImports) {
-        return `${count} blank/dot import(s)`;
+    const lang = meta?.projectLanguage;
+    if (lang && !langTraits(lang)?.hasDynamicImports) {
+        return lang === 'rust'
+            ? `${count} glob import(s)`
+            : `${count} blank/dot import(s)`;
     }
     return `${count} dynamic import(s)`;
 }

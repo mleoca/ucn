@@ -5603,3 +5603,39 @@ describe('fix #229: generic-param receivers are never type identity (Rust/Java/G
         } finally { rm(dir); }
     });
 });
+
+describe('fix #234: search --unused excludes entry points and decorator names', () => {
+    // Campaign G2 ×4 languages: main/init/#[test] listed as unused (no
+    // entry-point exclusion), and Python bare-decorator names flagged
+    // (decorator applications are references, not calleeIndex entries).
+    it('go: main and init are never unused', () => {
+        const dir = tmp({
+            'go.mod': 'module m\ngo 1.21\n',
+            'main.go': 'package main\n\nimport "fmt"\n\nfunc init() { fmt.Println(1) }\n\nfunc dead() int { return 2 }\n\nfunc main() { fmt.Println(3) }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'search', { type: 'function', unused: true });
+            assert.ok(r.ok);
+            const names = r.result.results.map(x => x.name);
+            assert.ok(names.includes('dead'), 'dead stays flagged');
+            assert.ok(!names.includes('main') && !names.includes('init'),
+                `entry points excluded, got: ${names.join(',')}`);
+        } finally { rm(dir); }
+    });
+
+    it('python: a name applied as a bare decorator is used', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\n',
+            'app.py': 'def with_logging(func):\n    return func\n\n\n@with_logging\ndef work(x):\n    return x\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'search', { type: 'function', unused: true });
+            assert.ok(r.ok);
+            const names = r.result.results.map(x => x.name);
+            assert.ok(!names.includes('with_logging'),
+                `decorator name must not be unused, got: ${names.join(',')}`);
+        } finally { rm(dir); }
+    });
+});

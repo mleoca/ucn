@@ -666,8 +666,11 @@ function runProjectCommand(rootDir, command, arg) {
             if (flags.includeUncertain) {
                 console.error(`Note: --include-uncertain has no effect on '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
             }
-            if (['about', 'context', 'impact', 'verify'].includes(canonical) && flags.includeMethods) {
+            if (['impact', 'verify'].includes(canonical) && flags.includeMethods) {
                 console.error(`Note: --include-methods has no effect on '${toCliName(canonical)}' — method calls are always tiered by receiver evidence.`);
+            }
+            if (['about', 'context', 'smart'].includes(canonical) && flags.includeMethods) {
+                console.error(`Note: --include-methods on '${toCliName(canonical)}' affects only method-callee display for standalone-function targets — caller tiers are always evidence-based, and method targets analyze method calls by default.`);
             }
         }
     }
