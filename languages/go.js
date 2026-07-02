@@ -35,11 +35,13 @@ function extractReturnType(node) {
  * Extract Go parameters
  */
 function extractGoParams(paramsNode) {
+    // Distinguish "we have no node" (genuinely unknown) from "node is empty".
+    // Returning '...' for empty parens conflated zero-param functions with
+    // unknown signatures in JSON output (fix #238; the shared
+    // utils.extractParams already had this fix).
     if (!paramsNode) return '...';
     const text = paramsNode.text;
-    let params = text.replace(/^\(|\)$/g, '').trim();
-    if (!params) return '...';
-    return params;
+    return text.replace(/^\(|\)$/g, '').trim();
 }
 
 /**
@@ -1692,7 +1694,7 @@ function findUsagesInCode(code, name, parser, tree) {
             // Multi-var: x, err := foo() — identifier parent is expression_list
             else if (parent.type === 'expression_list' &&
                      parent.parent?.type === 'short_var_declaration' &&
-                     parent.parent.childForFieldName('left') === parent) {
+                     sameNode(parent.parent.childForFieldName('left'), parent)) {
                 usageType = 'definition';
             }
             // Definition: const/var spec

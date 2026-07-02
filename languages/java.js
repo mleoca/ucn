@@ -1154,6 +1154,80 @@ function findCallsInCode(code, parser) {
         }
 
         // Handle constructor calls: new Foo(), new pkg.Bar()
+        // super(x) / this(x) — constructor delegation (fix #238: these
+        // sites were invisible to every command). Resolve to the parent
+        // class's constructor (super) or a same-class overload (this);
+        // Java constructors are indexed under the CLASS name, so the
+        // record carries the target class as its name.
+        if (node.type === 'explicit_constructor_invocation') {
+            let cls = node.parent;
+            while (cls && cls.type !== 'class_declaration' && cls.type !== 'enum_declaration') {
+                cls = cls.parent;
+            }
+            const isSuperCall = node.children.some(c => c.type === 'super');
+            let targetClass = null;
+            if (cls) {
+                if (isSuperCall) {
+                    const sup = cls.childForFieldName('superclass');
+                    targetClass = sup?.namedChild(0)?.text || null;
+                } else {
+                    targetClass = cls.childForFieldName('name')?.text || null;
+                }
+            }
+            if (targetClass) {
+                const genericIdx = targetClass.indexOf('<');
+                if (genericIdx > 0) targetClass = targetClass.substring(0, genericIdx);
+                const dotIdx = targetClass.lastIndexOf('.');
+                if (dotIdx > 0) targetClass = targetClass.substring(dotIdx + 1);
+                const enclosingFunction = getCurrentEnclosingFunction();
+                const ctorArgs = getCallArgs(node);
+                calls.push({
+                    name: targetClass,
+                    line: node.startPosition.row + 1,
+                    isMethod: false,
+                    isConstructor: true,
+                    // 'this' delegation names the ENCLOSING class by
+                    // construction — an intra-class mechanism, never a
+                    // caller edge for the class (jdtls-measured, fix #238).
+                    ctorDelegation: isSuperCall ? 'super' : 'this',
+                    argCount: ctorArgs.argCount,
+                    ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
+                    enclosingFunction
+                });
+            }
+            return true;
+        }
+
+        // Enum constants with arguments (RED(1)) invoke the enum's own
+        // constructor (fix #238: the constructor had no call records, so
+        // search --unused / deadcode flagged it dead in every enum).
+        // Argument-less constants still construct — they call the implicit
+        // or 0-arg constructor.
+        if (node.type === 'enum_constant') {
+            let enclosingEnum = node.parent;
+            while (enclosingEnum && enclosingEnum.type !== 'enum_declaration') {
+                enclosingEnum = enclosingEnum.parent;
+            }
+            const enumName = enclosingEnum?.childForFieldName('name')?.text;
+            if (enumName) {
+                const ctorArgs = getCallArgs(node);
+                calls.push({
+                    name: enumName,
+                    line: node.startPosition.row + 1,
+                    isMethod: false,
+                    isConstructor: true,
+                    // Part of the enum's own declaration — keeps the
+                    // constructor alive for deadcode/--unused, but never a
+                    // caller edge for the enum (jdtls-measured, fix #238).
+                    enumConstant: true,
+                    argCount: ctorArgs.argCount,
+                    ...(ctorArgs.argKinds && { argKinds: ctorArgs.argKinds }),
+                    enclosingFunction: getCurrentEnclosingFunction()
+                });
+            }
+            return true;
+        }
+
         if (node.type === 'object_creation_expression') {
             const typeNode = node.childForFieldName('type');
             if (typeNode) {

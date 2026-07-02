@@ -2839,3 +2839,41 @@ describe('fix #236 (Java): callee-side static-style type-qualified receivers', (
         } finally { rm(dir); }
     });
 });
+
+describe('fix #238 (Java): constructor delegation and enum constants record calls', () => {
+    it('super(x) surfaces as a caller of the parent class', () => {
+        // Java constructors are not indexed as standalone symbols —
+        // constructor invocations (new X(), super(x), this(x)) resolve to
+        // the CLASS def, so the class pin is where the edge surfaces.
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Base.java': 'public class Base {\n    public Base(int x) {}\n}\n',
+            'Child.java': 'public class Child extends Base {\n    public Child(int x) {\n        super(x);\n    }\n    public Child() {\n        this(1);\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const r = execute(index, 'context', { name: 'Base' });
+            assert.ok(r.ok);
+            assert.ok((r.result.callers || []).some(c => c.line === 3),
+                `super(x) at Child.java:3 is a confirmed caller of Base: ${JSON.stringify(r.result.callers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('enum constants invoke the enum constructor — search --unused stays quiet', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Color.java': 'public enum Color {\n    RED(1), GREEN(2);\n    private final int v;\n    Color(int v) { this.v = v; }\n    public int value() { return v; }\n}\n',
+            'App.java': 'public class App {\n    public int main() {\n        return Color.RED.value();\n    }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const r = execute(index, 'search', { unused: true });
+            assert.ok(r.ok);
+            const names = r.result.results.map(s => `${s.className || ''}.${s.name}`);
+            assert.ok(!names.some(n => n === 'Color.Color'),
+                `enum constructor is invoked by its constants: ${JSON.stringify(names)}`);
+        } finally { rm(dir); }
+    });
+});

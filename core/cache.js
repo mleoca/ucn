@@ -70,7 +70,11 @@ const UCN_VERSION = require('../package.json').version;
 // v31 (fix #231): Java try-with-resources declarations type receivers —
 // `try (Res r = new Res())` records receiverType on r.use() like a plain
 // declared-type local (#220(7) typing-sources family).
-const CACHE_FORMAT_VERSION = 31;
+// v32 (fix #238): super(...)/this(...) constructor-delegation call records
+// (JS/TS 'constructor' with receiver 'super'; Java under the target class
+// name), Java enum-constant constructor invocations (RED(1)), and Go/Rust
+// zero-param signatures record '' instead of the '...' unknown sentinel.
+const CACHE_FORMAT_VERSION = 32;
 
 /**
  * Save index to cache file

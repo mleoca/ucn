@@ -3548,3 +3548,21 @@ describe('fix #236 (Python): callee-side class-qualified and single-owner receiv
         } finally { rm(dir); }
     });
 });
+
+describe('fix #238 (Python): super().__init__ is a resolvable callee, not a builtin', () => {
+    it('resolves through the parent class instead of routing external', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'base.py': 'class Base:\n    def __init__(self, x):\n        self.x = x\n',
+            'child.py': 'from base import Base\n\nclass Child(Base):\n    def __init__(self, x):\n        super().__init__(x)\n',
+        });
+        try {
+            const index = idx(dir);
+            const ctor = index.symbols.get('__init__').find(s => s.className === 'Child');
+            const acct = index.findCallees(ctor, { collectAccount: true, includeMethods: true });
+            assert.ok(acct.some(c => c.name === '__init__' && c.className === 'Base'),
+                `super().__init__ resolves to Base.__init__: ${JSON.stringify(acct.map(c => c.className))}`);
+            assert.ok(acct.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+});

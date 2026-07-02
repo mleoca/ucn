@@ -39,11 +39,13 @@ function extractReturnType(node) {
  * Extract Rust parameters
  */
 function extractRustParams(paramsNode) {
+    // Distinguish "we have no node" (genuinely unknown) from "node is empty".
+    // Returning '...' for empty parens conflated zero-param functions with
+    // unknown signatures in JSON output (fix #238; the shared
+    // utils.extractParams already had this fix).
     if (!paramsNode) return '...';
     const text = paramsNode.text;
-    let params = text.replace(/^\(|\)$/g, '').trim();
-    if (!params) return '...';
-    return params;
+    return text.replace(/^\(|\)$/g, '').trim();
 }
 
 /**
@@ -1976,7 +1978,7 @@ function findUsagesInCode(code, name, parser, tree) {
             else if (parent.type === 'scoped_identifier') {
                 const grandparent = parent.parent;
                 if (grandparent && grandparent.type === 'call_expression' &&
-                    grandparent.childForFieldName('function') === parent &&
+                    sameNode(grandparent.childForFieldName('function'), parent) &&
                     sameNode(parent.childForFieldName('name'), node)) {
                     usageType = 'call';
                 }

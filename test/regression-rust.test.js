@@ -3354,3 +3354,19 @@ impl ApiClient {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #238 (Rust): zero-param functions record empty params, not the unknown sentinel', () => {
+    it("params is '' for fn run() {}", () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': 'pub fn run() {\n}\n\npub fn with_args(x: i32) -> i32 {\n    x\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const run = index.symbols.get('run')[0];
+            assert.strictEqual(run.params, '', `zero-param → '' (got ${JSON.stringify(run.params)})`);
+            const withArgs = index.symbols.get('with_args')[0];
+            assert.strictEqual(withArgs.params, 'x: i32');
+        } finally { rm(dir); }
+    });
+});

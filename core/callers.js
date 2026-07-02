@@ -460,6 +460,17 @@ function findCallers(index, name, options = {}) {
                     }
                 }
 
+                // Intra-class constructor mechanics are never caller edges
+                // (fix #238, jdtls-measured): an enum CONSTANT is part of the
+                // enum's own declaration (JsonToken's 10 constants confirmed
+                // 10 self-callers), and a `this(...)` delegation names the
+                // ENCLOSING class by construction. Both stay in the calls
+                // cache for deadcode/--unused reachability; `super(...)`
+                // names a DIFFERENT class and keeps its caller edge.
+                if (call.enumConstant || call.ctorDelegation === 'this') {
+                    continue;
+                }
+
                 // For potential callbacks (function passed as arg), validate against symbol table
                 // and skip complex binding resolution — just check the name exists
                 if (call.isPotentialCallback) {
@@ -701,7 +712,12 @@ function findCallers(index, name, options = {}) {
                 // e.g., analyzer.analyze_instrument() should NOT resolve to a local
                 // standalone function def `analyze_instrument` — they're different symbols.
                 // Also skip for Go package-qualified calls (isMethod:false but has receiver like 'cli')
-                const selfReceivers = new Set(['self', 'cls', 'this', 'super']);
+                // `super` skips too (fix #238): a super call targets the PARENT
+                // class's member by definition — the local binding of the name
+                // is the enclosing class's own member, provably the wrong def
+                // (super(config) bound to the subclass's OWN constructor).
+                // Super records resolve only through the parent-chain walk.
+                const selfReceivers = new Set(['self', 'cls', 'this']);
                 const skipLocalBinding = call.receiver && !selfReceivers.has(call.receiver);
                 if (!bindingId && !skipLocalBinding) {
                     // A bare call cannot bind to a METHOD def where bare names
@@ -953,10 +969,16 @@ function findCallers(index, name, options = {}) {
                                     fileEntry.language === 'python') {
                                     const tDefs = options.targetDefinitions || definitions;
                                     const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
+                                    // `super` dispatches statically UP the chain — the
+                                    // ancestor/descendant dynamic-dispatch exemptions
+                                    // are inverted for it: a super call can never bind
+                                    // a def below the matched parent (fix #238).
+                                    const superSkipsExemptions = call.receiver === 'super';
                                     if (!targetClasses.has(matchedClass) &&
-                                        !_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
-                                        !(fileEntry.language === 'python' &&
-                                            _shareProjectDescendant(index, matchedClass, targetClasses))) {
+                                        (superSkipsExemptions ||
+                                         (!_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
+                                          !(fileEntry.language === 'python' &&
+                                            _shareProjectDescendant(index, matchedClass, targetClasses))))) {
                                         recordExcluded(filePath, call.line, 'other-definition');
                                         continue;
                                     }
@@ -989,9 +1011,14 @@ function findCallers(index, name, options = {}) {
                                     // Legacy keeps confirming (drop-vs-route asymmetry).
                                     const tDefs = options.targetDefinitions || definitions;
                                     const targetClasses = new Set(tDefs.map(d => d.className).filter(Boolean));
+                                    // super: static upward dispatch — no ancestor/
+                                    // descendant exemptions (fix #238), routed visible
+                                    // like the rest of the #213 branch (TS declare-class
+                                    // merging can hide the true parent edge).
                                     if (!targetClasses.has(matchedClass) &&
-                                        !_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
-                                        !_shareProjectDescendant(index, matchedClass, targetClasses)) {
+                                        (call.receiver === 'super' ||
+                                         (!_isAncestorOfTargetClass(index, matchedClass, tDefs) &&
+                                          !_shareProjectDescendant(index, matchedClass, targetClasses)))) {
                                         routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs);
                                         continue;
                                     }
@@ -2917,8 +2944,15 @@ function findCallees(index, def, options = {}) {
                 }
             }
 
-            // Skip keywords and built-ins
-            if (index.isKeyword(call.name, language)) {
+            // Skip keywords and built-ins — EXCEPT self/super-received method
+            // calls, which the same-class/super passes below resolve to real
+            // definitions (fix #238: `super().__init__(x)` and the JS/TS
+            // `super(...)` 'constructor' record were routed external here
+            // because __init__/constructor sit in the builtin name sets).
+            const selfShaped = call.isMethod &&
+                (['self', 'cls', 'this', 'super'].includes(call.receiver) ||
+                 (call.receiver === 'Self' && language === 'rust'));
+            if (!selfShaped && index.isKeyword(call.name, language)) {
                 noteSite(siteId, 'external', null, call);
                 continue;
             }

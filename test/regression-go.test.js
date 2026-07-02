@@ -5739,3 +5739,19 @@ func use(w *Widget) error {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #238 (Go): zero-param functions record empty params, not the unknown sentinel', () => {
+    it("params is '' for func main() {}", () => {
+        const dir = tmp({
+            'go.mod': 'module t\n',
+            'main.go': 'package main\n\nfunc main() {\n}\n\nfunc withArgs(x int) {\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const main = index.symbols.get('main')[0];
+            assert.strictEqual(main.params, '', `zero-param → '' (got ${JSON.stringify(main.params)})`);
+            const withArgs = index.symbols.get('withArgs')[0];
+            assert.strictEqual(withArgs.params, 'x int');
+        } finally { rm(dir); }
+    });
+});

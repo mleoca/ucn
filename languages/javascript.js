@@ -1699,6 +1699,21 @@ function findCallsInCode(code, parser) {
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp }),
                     ...(optionsMethod && { optionsMethod })
                 });
+            } else if (funcNode.type === 'super') {
+                // super(config) — the subclass constructor invoking the
+                // parent class's constructor (fix #238; these sites were
+                // invisible to every command). Recorded as a super-received
+                // 'constructor' method call so the super walk resolves it to
+                // the parent class's constructor definition.
+                calls.push({
+                    name: 'constructor',
+                    line: node.startPosition.row + 1,
+                    isMethod: true,
+                    receiver: 'super',
+                    argCount: node.childForFieldName('arguments')?.namedChildCount ?? 0,
+                    enclosingFunction,
+                    uncertain: false,
+                });
             } else if (funcNode.type === 'member_expression') {
                 // Method call: obj.foo() or foo.call/apply/bind()
                 const propNode = funcNode.childForFieldName('property');

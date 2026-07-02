@@ -6771,3 +6771,46 @@ describe('fix #236 (JS): callee-side type-qualified and single-owner confirmatio
         } finally { rm(dir); }
     });
 });
+
+describe('fix #238 (TS): super(config) constructor delegation surfaces in both directions', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'base.ts': 'export class BaseRepository {\n  constructor(protected config: object) {}\n}\n',
+        'repo.ts': 'import { BaseRepository } from "./base";\nexport class Repository extends BaseRepository {\n  constructor(config: object) {\n    super(config);\n  }\n}\n',
+    };
+
+    it('the parent constructor pin shows the super site (accounted beyondText)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'constructor', className: 'BaseRepository' });
+            assert.ok(r.ok);
+            assert.ok((r.result.callers || []).some(c => c.line === 4),
+                `super(config) at repo.ts:4 is a confirmed caller: ${JSON.stringify(r.result.callers)}`);
+            assert.ok(r.result.meta?.account?.beyondText?.count >= 1,
+                'the super line carries no pin-name token — accounted beyondText');
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: the SUBCLASS constructor pin never claims the super site', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'constructor', className: 'Repository' });
+            assert.ok(r.ok);
+            assert.ok(!(r.result.callers || []).some(c => c.line === 4),
+                `super dispatches UP — never to the subclass's own ctor: ${JSON.stringify(r.result.callers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('trace expands through super into the parent constructor', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const ctor = index.symbols.get('constructor').find(s => s.className === 'Repository');
+            const acct = index.findCallees(ctor, { collectAccount: true, includeMethods: true });
+            assert.ok(acct.some(c => c.name === 'constructor' && c.className === 'BaseRepository'),
+                `super(config) is a callee edge to BaseRepository.constructor: ${JSON.stringify(acct.map(c => c.className))}`);
+        } finally { rm(dir); }
+    });
+});
