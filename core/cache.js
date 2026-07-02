@@ -64,7 +64,10 @@ const UCN_VERSION = require('../package.json').version;
 // v29 (fix #229): Rust impl members and Java class methods carry method-level
 // `generics` — generic-param receiver types (t.wipe() on TStore: Wipe) resolve
 // against the enclosing declaration instead of excluding as type mismatches.
-const CACHE_FORMAT_VERSION = 29;
+// v30 (fix #230): TS parameter-property modifiers (protected/readonly/...)
+// and parameter decorators are no longer recorded as parameter DEFAULTS in
+// paramsStructured.
+const CACHE_FORMAT_VERSION = 30;
 
 /**
  * Save index to cache file

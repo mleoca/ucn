@@ -489,16 +489,22 @@ function isNamespaceContainerFor(index, receiver, funcName, defFile) {
  * @returns {Array<Array<object>>|null}
  */
 function _constructorParamLists(index, def, lang) {
-    if (!def || def.type !== 'class' || !def.file) return null;
+    if (!def || !def.file || !['class', 'enum', 'record'].includes(def.type)) return null;
     const lists = [];
     const endLine = def.endLine != null ? def.endLine : Infinity;
+    const inRange = (d) => d.file === def.file &&
+        d.startLine >= def.startLine && d.startLine <= endLine &&
+        Array.isArray(d.paramsStructured);
     for (const ctorName of ['constructor', '__init__']) {
         for (const d of (index.symbols.get(ctorName) || [])) {
-            if (d.className === def.name && d.file === def.file &&
-                d.startLine >= def.startLine && d.startLine <= endLine &&
-                Array.isArray(d.paramsStructured)) {
-                lists.push(d.paramsStructured);
-            }
+            if (d.className === def.name && inRange(d)) lists.push(d.paramsStructured);
+        }
+    }
+    // Java constructor members are named after the CLASS (enum-body
+    // constructors carry paramsStructured since fix #230).
+    for (const d of (index.symbols.get(def.name) || [])) {
+        if (d.type === 'constructor' && d.className === def.name && inRange(d)) {
+            lists.push(d.paramsStructured);
         }
     }
     if (lists.length > 0) return lists;
@@ -1298,12 +1304,22 @@ function plan(index, name, options = {}) {
     const def = resolved.def || definitions[0];
     // BUG-BY: enrich types for typed-arrow-fn declarations.
     const arrowTypes = extractArrowTypesFromVarDecl(index, def);
-    const currentParams = (arrowTypes?.paramsStructured) || def.paramsStructured || [];
+    // Class target: the signature being planned is the CONSTRUCTOR's
+    // (fix #230, same rule as verify) — single-ctor classes only; with
+    // overloads the class def's own (empty) list stays, since plan cannot
+    // know which overload the user means.
+    const planLang = index.files.get(def.file)?.language;
+    const planCtorLists = _constructorParamLists(index, def, planLang);
+    const currentParams = (planCtorLists && planCtorLists.length === 1 && planCtorLists[0]) ||
+        (arrowTypes?.paramsStructured) || def.paramsStructured || [];
     // BUG-BV: render with TS-correct param formatting (`opt?: number`).
-    const currentSignature = formatTypedSignature(def, arrowTypes ? {
-        paramsStructured: arrowTypes.paramsStructured,
-        returnType: arrowTypes.returnType
-    } : {});
+    const currentSignature = formatTypedSignature(def,
+        (planCtorLists && planCtorLists.length === 1)
+            ? { paramsStructured: currentParams }
+            : arrowTypes ? {
+                paramsStructured: arrowTypes.paramsStructured,
+                returnType: arrowTypes.returnType
+            } : {});
 
     // BUG-BW: plan must discover call sites the same way verify does — both
     // run contractedCallerSweep (v4 tiered contract), so plan and verify stay

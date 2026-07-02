@@ -608,6 +608,7 @@ function extractEnumConstants(enumNode, codeOrLines) {
                             constants.push({
                                 name: nameNode.text,
                                 params: extractJavaParams(paramsNode),
+                                paramsStructured: parseStructuredParams(paramsNode, 'java'),
                                 startLine,
                                 endLine,
                                 memberType: modifiers.includes('static') ? 'static' : 'method',
@@ -625,6 +626,10 @@ function extractEnumConstants(enumNode, codeOrLines) {
                             constants.push({
                                 name: nameNode.text,
                                 params: extractJavaParams(paramsNode),
+                                // paramsStructured drives verify's arg-check
+                                // (fix #230 — enum constant args LOW(1) were
+                                // checked against an empty list).
+                                paramsStructured: parseStructuredParams(paramsNode, 'java'),
                                 startLine,
                                 endLine,
                                 memberType: 'constructor',

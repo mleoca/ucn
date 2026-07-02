@@ -969,6 +969,10 @@ function extractClassMembers(classNode, codeOrLines) {
                     isAsync,
                     isGenerator: isGen,
                     isMethod: true,  // Mark as method for context() lookups
+                    // TS method OVERLOAD signatures (body-less method_signature
+                    // in a class body) mirror the standalone-function marker
+                    // (fix #230) — pickBestDefinition prefers the implementation.
+                    ...(child.type === 'method_signature' && { isSignature: true }),
                     ...typeAnno,
                     ...(docstring && { docstring }),
                     ...(decorators.length > 0 && { decorators }),

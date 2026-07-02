@@ -123,12 +123,20 @@ function parseJSParam(param, info) {
             info.default = valueNode.text;
             info.optional = true;
         } else if (!info.rest) {
-            // Also check for bare number/string/etc. children as defaults
+            // Also check for bare number/string/etc. children as defaults.
+            // TS parameter-property modifiers (private/protected/public/
+            // readonly/override) and parameter decorators (@Inject()) are
+            // NOT defaults (fix #230 — `constructor(protected config:
+            // Config)` used to report default 'protected', optional true,
+            // wrecking expectedArgs.min and the signature display).
+            const NON_DEFAULT_PARAM_CHILDREN = new Set([
+                'identifier', 'type_annotation', 'rest_pattern',
+                'accessibility_modifier', 'override_modifier', 'readonly', 'decorator',
+            ]);
             for (let i = 0; i < param.namedChildCount; i++) {
                 const child = param.namedChild(i);
                 if (child !== patternNode && child !== (typeNode && typeNode.parent === param ? typeNode : null) &&
-                    child.type !== 'type_annotation' && child.type !== 'rest_pattern' &&
-                    !['identifier', 'type_annotation'].includes(child.type)) {
+                    !NON_DEFAULT_PARAM_CHILDREN.has(child.type)) {
                     // This is likely a default value node
                     info.default = child.text;
                     info.optional = true;

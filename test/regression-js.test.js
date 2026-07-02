@@ -6449,3 +6449,43 @@ describe('fix #229 (TS): cross-file declared-field receiver hop confirms at rece
         } finally { rm(dir); }
     });
 });
+
+describe('fix #230 (TS): param properties/decorators are not defaults; overload sigs marked', () => {
+    it('parameter-property modifiers and decorators are not parameter defaults', () => {
+        const { parse } = require('../core/parser');
+        const r = parse('class Svc {\n  constructor(protected config: string, @Inject() dep: number, plain: boolean, opt = 5) {}\n}\n', 'typescript');
+        const ctor = r.classes[0].members.find(m => m.name === 'constructor');
+        const byName = Object.fromEntries(ctor.paramsStructured.map(p => [p.name, p]));
+        assert.strictEqual(byName.config.default, undefined, 'protected is a modifier, not a default');
+        assert.strictEqual(byName.config.optional, undefined);
+        assert.strictEqual(byName.dep.default, undefined, '@Inject() is a decorator, not a default');
+        assert.strictEqual(byName.opt.default, '5', 'real defaults still detected');
+    });
+
+    it('verify with a parameter-property constructor gets the right minimum', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': 'export class Svc {\n  constructor(protected config: string) {}\n}\nexport function make() { return new Svc("x"); }\n',
+        });
+        try {
+            const v = execute(idx(dir), 'verify', { name: 'Svc' });
+            assert.ok(v.ok);
+            assert.deepStrictEqual(v.result.expectedArgs, { min: 1, max: 1 });
+            assert.strictEqual(v.result.valid, 1);
+        } finally { rm(dir); }
+    });
+
+    it('class method overload signatures carry isSignature; find resolves to the implementation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'p.ts': 'export class P {\n  parse(s: string): number;\n  parse(n: number): number;\n  parse(x: any): number { return +x; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('parse');
+            assert.strictEqual(defs.filter(d => d.isSignature).length, 2, 'two overload sigs marked');
+            const impl = defs.find(d => !d.isSignature);
+            assert.strictEqual(impl.startLine, 4, 'implementation unmarked');
+        } finally { rm(dir); }
+    });
+});

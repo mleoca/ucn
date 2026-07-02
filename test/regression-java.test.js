@@ -2705,3 +2705,24 @@ describe('fix #229 (Java): wrong-arity evidence-backed calls reach the mismatch 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #230 (Java): enum constructors carry paramsStructured', () => {
+    it('verify and plan use the enum constructor signature', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Level.java': 'public enum Level {\n    LOW(1), HIGH(2);\n    private final int val;\n    Level(int val) { this.val = val; }\n    public int getVal() { return val; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const v = execute(index, 'verify', { name: 'Level' });
+            assert.ok(v.ok);
+            assert.deepStrictEqual(v.result.expectedArgs, { min: 1, max: 1 },
+                'enum ctor takes one int, not zero args');
+            const p = execute(index, 'plan', { name: 'Level', addParam: 'tag' });
+            assert.ok(p.ok);
+            assert.ok(p.result.after.params.includes('tag'));
+            assert.ok(p.result.after.params.some(x => /val/.test(x)),
+                `existing ctor param preserved: ${JSON.stringify(p.result.after.params)}`);
+        } finally { rm(dir); }
+    });
+});
