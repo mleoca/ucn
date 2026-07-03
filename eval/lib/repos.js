@@ -162,6 +162,20 @@ const REPOS = [
         language: 'typescript',
         targetCandidates: ['.'],
     },
+    {
+        // Config-heavy Go (graduated from FRESH_POOL 2026-07-03 — used to
+        // tune fix #266). Motivated the caller-side member-reference
+        // exclusion (delete(v.override, alias) on Viper's map field claimed
+        // the test-file function 'override') and the New*-prefix guess
+        // discipline (registry := NewCodecRegistry() guessed the INTERFACE
+        // 'CodecRegistry' against the *DefaultCodecRegistry annotation —
+        // a false zero-caller answer for RegisterCodec).
+        name: 'viper',
+        url: 'https://github.com/spf13/viper',
+        commit: '528f7416c4b56a4948673984b190bf8713f0c3c4',
+        language: 'go',
+        targetCandidates: ['.'],
+    },
 ];
 
 // ============================================================================
@@ -188,7 +202,6 @@ const FRESH_POOL = [
     { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
     { name: 'click', url: 'https://github.com/pallets/click', language: 'python', targetCandidates: ['.'] },
     { name: 'chi', url: 'https://github.com/go-chi/chi', language: 'go', targetCandidates: ['.'] },
-    { name: 'viper', url: 'https://github.com/spf13/viper', language: 'go', targetCandidates: ['.'] },
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
     { name: 'javapoet', url: 'https://github.com/square/javapoet', language: 'java', targetCandidates: ['javapoet/src/main/java', 'src/main/java'] },
     { name: 'jsoup', url: 'https://github.com/jhy/jsoup', language: 'java', targetCandidates: ['src/main/java'] },
