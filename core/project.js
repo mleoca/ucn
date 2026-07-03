@@ -79,6 +79,7 @@ class ProjectIndex {
             this._opContentCache = new Map();
             this._opUsagesCache = new Map();
             this._opCallsCountCache = new Map();
+            this._opUsageTotalsCache = new Map();
             this._opEnclosingFnCache = new Map();
             this._opTreeCache = new Map();
             this._opLinesCache = new Map();
@@ -94,6 +95,7 @@ class ProjectIndex {
             this._opContentCache = null;
             this._opUsagesCache = null;
             this._opCallsCountCache = null;
+            this._opUsageTotalsCache = null;
             this._opEnclosingFnCache = null;
             this._opTreeCache = null;
             this._opLinesCache = null;
@@ -1158,6 +1160,17 @@ class ProjectIndex {
             if (!this.calleeIndex) this.buildCalleeIndex();
             const hasFilters = options.exclude && options.exclude.length > 0;
 
+            // Per-operation memo of the whole fast-path result: the callee
+            // tiebreaker (findCallees priority 6) and reachability BFS ask
+            // for the same (name, defFile) totals thousands of times per
+            // walk. Result objects are read-only by contract.
+            const memoKey = !hasFilters && this._opUsageTotalsCache
+                ? `${name}\0${defFile}` : null;
+            if (memoKey) {
+                const hit = this._opUsageTotalsCache.get(memoKey);
+                if (hit) return hit;
+            }
+
             // Pre-compute which files can reference THIS specific definition
             const importersSet = this.exportGraph.get(defFile) || new Set();
             const defEntry = this.files.get(defFile);
@@ -1231,11 +1244,15 @@ class ProjectIndex {
                     imports++;
                 }
             }
-            // Same-package: files in same directory don't need imports to reference symbols
+            // Same-package: files in same directory don't need imports to
+            // reference symbols. dirToFiles is canonical-ordered — same
+            // iteration order as the full index scan it replaces.
             if (isDirectoryScope) {
                 const pkgDir = defDir;
-                for (const [fp, fe] of this.files) {
-                    if (fp === defFile || !fp.endsWith('.go') || path.dirname(fp) !== pkgDir) continue;
+                for (const fp of this.dirToFiles?.get(pkgDir) || []) {
+                    if (fp === defFile || !fp.endsWith('.go')) continue;
+                    const fe = this.files.get(fp);
+                    if (!fe) continue;
                     if (hasFilters && !this.matchesFilters(fe.relativePath, { exclude: options.exclude })) continue;
                     // Check if already counted as importer
                     if (importersSet.has(fp)) continue;
@@ -1252,7 +1269,9 @@ class ProjectIndex {
             }
 
             const total = calls + definitions + imports;
-            return { total, calls, definitions, imports, references: 0 };
+            const result = { total, calls, definitions, imports, references: 0 };
+            if (memoKey) this._opUsageTotalsCache.set(memoKey, result);
+            return result;
         }
 
         // Detailed path: full AST-based counting (original algorithm)

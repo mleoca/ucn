@@ -1104,6 +1104,12 @@ function computeReachability(index) {
         }
     }
 
+    // The BFS runs thousands of findCallees calls — the per-operation caches
+    // (call counts, usage totals, content) halve its cost. Wrap so callers
+    // outside a command op (evals, direct API use) get the same warm path;
+    // _beginOp nests, so command-op callers are unaffected.
+    index._beginOp?.();
+    try {
     const reachable = new Set();
     const entryPoints = detectEntrypoints(index);
 
@@ -1208,8 +1214,10 @@ function computeReachability(index) {
 
     // BFS: walk callees of every reachable symbol.
     // findCallees returns full symbol objects for every callee with file/startLine.
-    while (queue.length > 0) {
-        const sym = queue.shift();
+    // Index-based traversal — queue.shift() is O(n) per dequeue and the
+    // queue reaches thousands of entries; same FIFO order.
+    for (let qi = 0; qi < queue.length; qi++) {
+        const sym = queue[qi];
         if (!sym.file || sym.startLine == null) continue;
 
         let callees;
@@ -1242,6 +1250,9 @@ function computeReachability(index) {
     // Cleared in saveCache after a successful write.
     index.reachabilityDirty = true;
     return reachable;
+    } finally {
+        index._endOp?.();
+    }
 }
 
 /**

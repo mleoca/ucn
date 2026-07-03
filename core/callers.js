@@ -3168,14 +3168,19 @@ function findCallees(index, def, options = {}) {
             let uncertainReason = null; // account-mode reason for the unverified bucket
             if (!call.bindingId && fileEntry?.bindings) {
                 let bindings = fileEntry.bindings.filter(b => b.name === call.name);
-                // For Go, also check sibling files in same directory (same package scope)
+                // For Go, also check sibling files in same directory (same
+                // package scope). dirToFiles is rebuilt on every build and
+                // cache load in canonical path order — the same iteration
+                // order as the full index.files scan it replaces (this loop
+                // runs per zero-binding call record, so the full scan was
+                // quadratic on large repos — 1037-file grpc-go measured).
                 if (bindings.length === 0 && langTraits(language)?.packageScope === 'directory') {
                     const dir = path.dirname(def.file);
-                    for (const [fp, fe] of index.files) {
-                        if (fp !== def.file && path.dirname(fp) === dir) {
-                            const sibling = (fe.bindings || []).filter(b => b.name === call.name);
-                            bindings = bindings.concat(sibling);
-                        }
+                    for (const fp of index.dirToFiles?.get(dir) || []) {
+                        if (fp === def.file) continue;
+                        const fe = index.files.get(fp);
+                        const sibling = (fe?.bindings || []).filter(b => b.name === call.name);
+                        if (sibling.length > 0) bindings = bindings.concat(sibling);
                     }
                 }
                 // Method call with no binding for the method name:
