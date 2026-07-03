@@ -109,7 +109,10 @@ const UCN_VERSION = require('../package.json').version;
 // function properties (module.exports = { doThing(x){} }) and list them in
 // exports; member-expression assignments record RHS identifier function
 // references (window.onload = handler).
-const CACHE_FORMAT_VERSION = 43;
+// v44 (fix #262): JS/TS literal ASSIGNMENTS type the variable (const lines
+// = [] → Array), and untyped reassignment deletes inferred types — call
+// records carry receiverType on literal-assigned receivers.
+const CACHE_FORMAT_VERSION = 44;
 
 /**
  * Save index to cache file

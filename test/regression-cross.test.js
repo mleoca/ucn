@@ -5769,3 +5769,121 @@ describe('fix #257: callee receiver-type routing and single-owner defeaters', ()
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// fix #261: zero-candidate method calls route external, not unverified
+// (a method name with ZERO project definitions cannot be a project call —
+// `parts.push(...)` / `names.join(...)` sat as [unverified] uncertain-receiver
+// noise in every trace; dynamic property assignment indexes a def under the
+// property name, so any project that defines the method keeps its calls
+// visible)
+// ============================================================================
+
+describe('fix #261: zero-candidate method calls route external', () => {
+    function calleesFor(index, defName, opts = {}) {
+        const def = (index.symbols.get(defName) || [])[0];
+        assert.ok(def, `def ${defName} must exist`);
+        return index.findCallees(def, { includeMethods: true, ...opts });
+    }
+
+    it('zero-def method names go external, not unverified (JS untyped receiver)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'main.js': 'function work(bag) {\n  bag.enqueue(1);\n  bag.dequeue();\n  return bag;\n}\nmodule.exports = { work };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            const unv = (account.unverifiedCallees || []).map(u => u.name);
+            assert.ok(!unv.includes('enqueue') && !unv.includes('dequeue'),
+                `zero-def names must not be unverified: ${unv}`);
+            assert.strictEqual(account.calleeAccount.external.count, 2,
+                `both zero-def calls external: ${JSON.stringify(account.calleeAccount)}`);
+            assert.ok(account.calleeAccount.conserved, 'account conserved');
+        } finally { rm(dir); }
+    });
+
+    it('a project-defined name keeps the visible unverified routing (counter-probe)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'queues.js': 'class TaskQueue { enqueue(x) { return x; } }\nclass JobQueue { enqueue(x) { return x; } }\nmodule.exports = { TaskQueue, JobQueue };',
+            'main.js': 'function work(bag) {\n  bag.enqueue(1);\n  return bag;\n}\nmodule.exports = { work };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            assert.ok((account.unverifiedCallees || []).some(u => u.name === 'enqueue'),
+                'multi-owner project name must stay visible unverified');
+        } finally { rm(dir); }
+    });
+
+    it('Python self.attr.method() with a zero-def name goes external', () => {
+        const dir = tmp({
+            'setup.py': '',
+            'w.py': 'class Worker:\n    def __init__(self):\n        self.items = []\n    def add(self, x):\n        self.items.append(x)\n',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'add', { collectAccount: true });
+            const unv = (account.unverifiedCallees || []).map(u => u.name);
+            assert.ok(!unv.includes('append'), `append must not be unverified: ${unv}`);
+            assert.ok(account.calleeAccount.external.count >= 1,
+                `append external: ${JSON.stringify(account.calleeAccount)}`);
+        } finally { rm(dir); }
+    });
+
+    it('Python self.attr.method() with project owners stays visible (counter-probe)', () => {
+        const dir = tmp({
+            'setup.py': '',
+            'sinks.py': 'class LogSink:\n    def emit(self, x):\n        pass\nclass NetSink:\n    def emit(self, x):\n        pass\n',
+            'w.py': 'class Worker:\n    def __init__(self):\n        self.sink = None\n    def add(self, x):\n        self.sink.emit(x)\n',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'add', { collectAccount: true });
+            assert.ok((account.unverifiedCallees || []).some(u => u.name === 'emit'),
+                'two-owner emit must stay visible self-attr-unresolved');
+        } finally { rm(dir); }
+    });
+
+    it('this.method() inherited from a builtin base goes external', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lines.js': 'class Lines extends Array {\n  add(x) {\n    this.push(x);\n    return this;\n  }\n}\nmodule.exports = { Lines };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'add', { collectAccount: true });
+            const unv = (account.unverifiedCallees || []).map(u => u.name);
+            assert.ok(!unv.includes('push'), `builtin-inherited push must not be unverified: ${unv}`);
+            assert.ok(account.calleeAccount.external.count >= 1,
+                `push external: ${JSON.stringify(account.calleeAccount)}`);
+        } finally { rm(dir); }
+    });
+
+    it('this.method() resolving to a project ancestor still confirms (counter-probe)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.js': 'class Base {\n  flush() { return 1; }\n}\nclass Impl extends Base {\n  add(x) {\n    this.flush();\n    return x;\n  }\n}\nmodule.exports = { Base, Impl };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'add', { collectAccount: true });
+            assert.ok(account.some(c => c.name === 'flush'),
+                'inherited project method must still confirm');
+        } finally { rm(dir); }
+    });
+
+    it('legacy mode gains no new edges from the external routing', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'main.js': 'function work(bag) {\n  bag.enqueue(1);\n  return bag;\n}\nmodule.exports = { work };',
+        });
+        try {
+            const index = idx(dir);
+            const legacy = calleesFor(index, 'work');
+            assert.ok(!legacy.some(c => c.name === 'enqueue'),
+                'legacy mode must not surface a zero-def edge');
+        } finally { rm(dir); }
+    });
+});

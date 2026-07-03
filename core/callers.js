@@ -2949,6 +2949,10 @@ function findCallees(index, def, options = {}) {
                         // CacheService's map-typed field, which shadows any
                         // same-named project function through this receiver).
                         noteSite(siteId, 'excluded', 'member-reference', call);
+                    } else if (_calleeZeroCandidateName(index, call)) {
+                        // fix #261: the type defines no such method AND the
+                        // name has zero project defs anywhere — external.
+                        noteSite(siteId, 'external', null, call);
                     } else if (collectAccount) {
                         // Locally-typed receiver, but the type defines no such
                         // method in the index — visible, never silently dropped.
@@ -3386,6 +3390,14 @@ function findCallees(index, def, options = {}) {
             }
 
             if (isUncertain) {
+                if (_calleeZeroCandidateName(index, call)) {
+                    // fix #261: zero project definitions of the name — the
+                    // unverified band exists to keep POSSIBLE project edges
+                    // visible, and with no def anywhere no edge is possible.
+                    // Same verdict the symbol-table check gives bare names.
+                    noteSite(siteId, 'external', null, call);
+                    continue;
+                }
                 if (collectAccount) {
                     // Contract mode: uncertain callee edges are never silently
                     // dropped NOR silently confirmed — visible unverified
@@ -3429,6 +3441,13 @@ function findCallees(index, def, options = {}) {
         if (selfAttrCalls && def.className && options.includeMethods !== false) {
             const attrTypes = getInstanceAttributeTypes(index, def.file, def.className);
             for (const { call, siteId } of selfAttrCalls) {
+                    // fix #261: `self.items.append(x)` — a method name with
+                    // zero project defs cannot resolve to project code no
+                    // matter what the attribute's type turns out to be.
+                    if (_calleeZeroCandidateName(index, call)) {
+                        noteSite(siteId, 'external', null, call);
+                        continue;
+                    }
                     let targetClass = attrTypes ? attrTypes.get(call.selfAttribute) : null;
                     // Unique method heuristic: if attr type unknown but method exists on exactly one class
                     if (!targetClass) {
@@ -3471,6 +3490,7 @@ function findCallees(index, def, options = {}) {
             // claim the sites so the account stays conserved.
             for (const { call, siteId } of selfAttrCalls) {
                 if (options.includeMethods === false) noteSite(siteId, 'filtered', 'method-calls-excluded', call);
+                else if (_calleeZeroCandidateName(index, call)) noteSite(siteId, 'external', null, call);
                 else noteUnverified(siteId, call, 'self-attr-unresolved');
             }
         }
@@ -3481,7 +3501,13 @@ function findCallees(index, def, options = {}) {
         if (selfMethodCalls && def.className && options.includeMethods !== false) {
             for (const { call, siteId } of selfMethodCalls) {
                 const symbols = index.symbols.get(call.name);
-                if (!symbols) { noteUnverified(siteId, call, 'inherited-unresolved'); continue; }
+                if (!symbols || symbols.length === 0) {
+                    // fix #261: `this.push(x)` in a class extending a builtin
+                    // (or an external base) — zero project defs of the name
+                    // means the inherited method is external, not unresolved.
+                    noteSite(siteId, 'external', null, call);
+                    continue;
+                }
 
                 // For super().method(), skip same-class — start from parent
                 let match = call.receiver === 'super'
@@ -3528,6 +3554,7 @@ function findCallees(index, def, options = {}) {
         } else if (selfMethodCalls && collectAccount) {
             for (const { call, siteId } of selfMethodCalls) {
                 if (options.includeMethods === false) noteSite(siteId, 'filtered', 'method-calls-excluded', call);
+                else if (_calleeZeroCandidateName(index, call)) noteSite(siteId, 'external', null, call);
                 else noteUnverified(siteId, call, 'inherited-unresolved');
             }
         }
@@ -5055,6 +5082,34 @@ function _calleeReceiverTypeRoute(index, call, localTypes, language) {
     if (matches.length > 1) return { uncertain: true }; // same-name classes — identity unresolvable (#206)
     if (BUILTIN_RECEIVER_TYPES.has(norm)) return { external: true };
     return { uncertain: true }; // known non-builtin type with no project method
+}
+
+/**
+ * Zero-candidate call names (fix #261): a call whose name has ZERO
+ * definitions anywhere in the index cannot be a project call — there is no
+ * def an edge could land on. The confirmed path already gives bare names
+ * this exact verdict (the symbol-table check routes them external); method
+ * calls were diverted to the unverified band by receiver uncertainty FIRST,
+ * so `parts.push(...)` / `names.join(...)` sat as [unverified]
+ * uncertain-receiver noise in every trace. Dynamic property assignment does
+ * not defeat this: `obj.push = function() {...}` indexes a def named `push`
+ * (property-assignment naming, all shapes — probed), so any project that
+ * dynamically defines the method keeps its calls visible; a monkey-patched
+ * alias of an EXISTING function (`Foo.push = helper`) surfaces its edge at
+ * the assignment site as a function reference of `helper` (fix #221/#252),
+ * never at the invocation. Checks every name the call could resolve to
+ * (parser alias resolution).
+ */
+function _calleeZeroCandidateName(index, call) {
+    const names = [call.name];
+    if (call.resolvedName) names.push(call.resolvedName);
+    if (call.resolvedNames) names.push(...call.resolvedNames);
+    for (const n of names) {
+        if (!n) continue;
+        const defs = index.symbols.get(n);
+        if (defs && defs.length > 0) return false;
+    }
+    return true;
 }
 
 function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, flowEntry) {

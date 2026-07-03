@@ -1280,6 +1280,21 @@ const JS_LITERAL_RECEIVER_TYPES = {
     number: 'Number',
 };
 
+// Literal ASSIGNMENTS type the variable (fix #262, the #218d Python rule):
+// `const lines = []` → lines is Array, so lines.push() is Array.push. Object
+// literals are deliberately absent — `const obj = {}` is the mutable
+// property-bag / namespace idiom (obj.render = fn happens later), so typing
+// it 'Object' would falsely externalize its assigned methods. A DIRECT
+// literal receiver (`{}.hasOwnProperty()`) has no such future, hence the
+// separate map above.
+const JS_LITERAL_ASSIGN_TYPES = {
+    array: 'Array',
+    string: 'String',
+    template_string: 'String',
+    regex: 'RegExp',
+    number: 'Number',
+};
+
 // Predefined TS types that pin a receiver; any/unknown/object say nothing.
 const TS_PREDEFINED_RECEIVER_TYPES = new Set(['string', 'number', 'boolean', 'bigint', 'symbol']);
 
@@ -1367,6 +1382,12 @@ function findCallsInCode(code, parser) {
     const aliases = new Map();  // Track local aliases: aliasName -> originalName (string or string[])
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    // Names whose type came from a DECLARED annotation (TS `x: Foo` / typed
+    // params). The compiler enforces assignability for these, so reassignment
+    // never stales them; inferred types (literal/new) DO stale and are
+    // deleted on untyped reassignment (fix #262, #218d semantics).
+    const declaredTypeVars = new Set();
+    const declaredTypeVarsStack = [];
     const moduleAliases = new Set();  // Names bound to MODULES (import * as ns / const pkg = require(...))
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
 
@@ -1642,6 +1663,7 @@ function findCallsInCode(code, parser) {
             });
             // Save localVarTypes so inner declarations don't leak to sibling functions
             localVarTypesStack.push(new Map(localVarTypes));
+            declaredTypeVarsStack.push(new Set(declaredTypeVars));
         }
 
         // Track local aliases: const myParse = parse, const { parse: csvParse } = ...
@@ -1706,7 +1728,13 @@ function findCallsInCode(code, parser) {
                     const typeName = tsTypeName(typeId);
                     if (typeName) {
                         localVarTypes.set(nameNode.text, typeName);
+                        declaredTypeVars.add(nameNode.text);
                     }
+                } else if (initNode && JS_LITERAL_ASSIGN_TYPES[initNode.type]) {
+                    // Literal declaration types the variable (fix #262):
+                    // `const lines = []` → Array. Annotation, when present,
+                    // wins (the branch above).
+                    localVarTypes.set(nameNode.text, JS_LITERAL_ASSIGN_TYPES[initNode.type]);
                 }
             }
         }
@@ -1720,6 +1748,7 @@ function findCallsInCode(code, parser) {
                 const typeName = tsTypeName(inner);
                 if (typeName) {
                     localVarTypes.set(pat.text, typeName);
+                    declaredTypeVars.add(pat.text);
                 }
             }
         }
@@ -1728,11 +1757,26 @@ function findCallsInCode(code, parser) {
         if (node.type === 'assignment_expression') {
             const left = node.childForFieldName('left');
             const right = node.childForFieldName('right');
-            if (left?.type === 'identifier' && right?.type === 'new_expression') {
-                nonCallableNames.add(left.text);
-                const ctorName = jsConstructorTypeName(right.childForFieldName('constructor'));
-                if (ctorName) {
-                    localVarTypes.set(left.text, ctorName);
+            if (left?.type === 'identifier') {
+                if (right?.type === 'new_expression') {
+                    nonCallableNames.add(left.text);
+                    const ctorName = jsConstructorTypeName(right.childForFieldName('constructor'));
+                    if (ctorName) {
+                        localVarTypes.set(left.text, ctorName);
+                    } else if (!declaredTypeVars.has(left.text)) {
+                        localVarTypes.delete(left.text);
+                    }
+                } else if (right && JS_LITERAL_ASSIGN_TYPES[right.type]) {
+                    // Literal reassignment re-types the variable (fix #262)
+                    if (!declaredTypeVars.has(left.text)) {
+                        localVarTypes.set(left.text, JS_LITERAL_ASSIGN_TYPES[right.type]);
+                    }
+                } else if (localVarTypes.has(left.text) && !declaredTypeVars.has(left.text)) {
+                    // Rebinding without a known type makes any previously
+                    // INFERRED type stale — nearest-preceding-assignment
+                    // semantics (#218d). Annotation-declared types survive:
+                    // the TS compiler enforces assignability for those.
+                    localVarTypes.delete(left.text);
                 }
             }
             // Handler-registration references (fix #252, the #221 family's
@@ -2171,6 +2215,11 @@ function findCallsInCode(code, parser) {
                 if (saved) {
                     localVarTypes.clear();
                     for (const [k, v] of saved) localVarTypes.set(k, v);
+                }
+                const savedDeclared = declaredTypeVarsStack.pop();
+                if (savedDeclared) {
+                    declaredTypeVars.clear();
+                    for (const k of savedDeclared) declaredTypeVars.add(k);
                 }
             }
         }

@@ -3315,7 +3315,7 @@ describe('fix: JS reassignment tracking', () => {
         } finally { rm(dir); }
     });
 
-    it('reassignment without new does not clear existing type', () => {
+    it('untyped reassignment deletes the inferred type (fix #262, #218d semantics)', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'app.js': [
@@ -3332,9 +3332,10 @@ describe('fix: JS reassignment tracking', () => {
             const calls = findCallsInCode(code, parser);
             const runCall = calls.find(c => c.name === 'run' && c.isMethod);
             assert.ok(runCall);
-            // Reassignment to function call doesn't update localVarTypes,
-            // so the original Foo type persists (acceptable: conservative behavior)
-            assert.strictEqual(runCall.receiverType, 'Foo');
+            // A stale Foo type here would falsely exclude the true receiver's
+            // methods (the #218d Python failure, verbatim) — nearest-preceding-
+            // assignment semantics delete inferred types on untyped rebinding.
+            assert.strictEqual(runCall.receiverType, undefined);
         } finally { rm(dir); }
     });
 });
@@ -7150,6 +7151,133 @@ export function other(): number {
             const index = idx(dir);
             const res = contract(index, 'builder.ts:4:done');
             assert.ok(res.confirmed.includes('user.ts:7'), `terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// fix #262: JS/TS literal ASSIGNMENTS type the variable (#218d parity) —
+// `const lines = []` → Array, so lines.push() routes external/excluded via
+// the builtin-receiver physics instead of confirming through the
+// single-owner rule or sitting unverified. Object literals deliberately
+// never type (mutable property-bag idiom); untyped reassignment deletes
+// INFERRED types; TS annotation-declared types survive reassignment
+// (compiler-enforced).
+// ============================================================================
+
+describe('fix #262: literal-assignment receiver typing', () => {
+    function calleesFor(index, defName, opts = {}) {
+        const def = (index.symbols.get(defName) || [])[0];
+        assert.ok(def, `def ${defName} must exist`);
+        return index.findCallees(def, { includeMethods: true, ...opts });
+    }
+    function contextOf(index, name) {
+        const r = execute(index, 'context', { name });
+        assert.ok(r.ok, JSON.stringify(r.error));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+            excluded: ((json.meta.account || {}).excluded || {}).byReason || {},
+        };
+    }
+
+    it('array-literal declaration routes the call external despite a single project owner', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'stack.js': 'class Stack {\n  push(x) { return x; }\n}\nmodule.exports = { Stack };',
+            'main.js': 'function work() {\n  const lines = [];\n  lines.push("a");\n  return lines;\n}\nmodule.exports = { work };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            assert.ok(!account.some(c => c.name === 'push'),
+                'Array-typed receiver must not confirm Stack.push (single-owner defeated)');
+            assert.ok(!(account.unverifiedCallees || []).some(u => u.name === 'push'),
+                'Array-typed receiver must not sit unverified');
+            assert.ok(account.calleeAccount.external.count >= 1,
+                `push external: ${JSON.stringify(account.calleeAccount)}`);
+            // Caller side of the same physics: the site is excluded-with-reason
+            const ctx = contextOf(index, 'push');
+            assert.ok(!ctx.confirmed.includes('main.js:3') && !ctx.unverified.includes('main.js:3'),
+                `Array-typed site is not a Stack.push caller: ${JSON.stringify(ctx)}`);
+            assert.ok(ctx.excluded['receiver-type-mismatch'],
+                `expected receiver-type-mismatch: ${JSON.stringify(ctx.excluded)}`);
+        } finally { rm(dir); }
+    });
+
+    it('string/template literals type the receiver on the call record', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': 'function work() {\n  const s = "x";\n  s.trim();\n  const q = `a${s}b`;\n  q.split(",");\n}\nmodule.exports = { work };',
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const calls = findCallsInCode(code, getParser('javascript'));
+            assert.strictEqual(calls.find(c => c.name === 'trim')?.receiverType, 'String');
+            assert.strictEqual(calls.find(c => c.name === 'split')?.receiverType, 'String');
+        } finally { rm(dir); }
+    });
+
+    it('object literals never type — the property-bag stays linkable (counter-probe)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'const renderer = {};',
+                'renderer.render = function() { return 1; };',
+                'function work() {',
+                '  const obj = {};',
+                '  obj.render();',
+                '  return obj;',
+                '}',
+                'module.exports = { work, renderer };',
+            ].join('\n'),
+        });
+        try {
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.js'), 'utf8');
+            const calls = findCallsInCode(code, getParser('javascript'));
+            const render = calls.find(c => c.name === 'render' && c.isMethod);
+            assert.strictEqual(render?.receiverType, undefined,
+                'object-literal locals must stay untyped');
+            // And with a project def named render, the call stays VISIBLE
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            const visible = account.some(c => c.name === 'render') ||
+                (account.unverifiedCallees || []).some(u => u.name === 'render');
+            assert.ok(visible, 'property-bag method call must stay visible');
+        } finally { rm(dir); }
+    });
+
+    it('literal reassignment re-types; declared TS annotation survives reassignment', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.ts': [
+                'class Store { save(): void {} }',
+                'function getStore(): Store { return new Store(); }',
+                'function work(x: Store) {',
+                '  x = getStore();',
+                '  x.save();',
+                '  let v;',
+                '  v = [];',
+                '  v.push(1);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            const save = account.find(c => c.name === 'save');
+            assert.ok(save, 'declared Store annotation survives reassignment → save confirms');
+            const { getParser } = require('../languages');
+            const { findCallsInCode } = require('../languages/javascript');
+            const code = fs.readFileSync(path.join(dir, 'app.ts'), 'utf8');
+            const calls = findCallsInCode(code, getParser('typescript'));
+            assert.strictEqual(calls.find(c => c.name === 'push')?.receiverType, 'Array',
+                'literal reassignment types the variable');
         } finally { rm(dir); }
     });
 });
