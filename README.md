@@ -39,7 +39,7 @@ And it's built to be **trusted**: every "who calls this?" splits into what UCN c
 ---
 
 ```bash
-npm install -g ucn
+npm install -g ucn             # Node.js 20+
 
 ucn trace main --depth=3       # full execution flow
 ucn about handleRequest        # definition + callers + callees + tests
@@ -161,8 +161,8 @@ This isn't a promise — it's a gate. CI re-derives UCN's caller answers from re
 | TypeScript / JavaScript | ts-morph | 99.4–100% |
 | Python | pyright (LSP) | 97.7–99.9% |
 | Go | gopls | 99.9–100% |
-| Rust | rust-analyzer | 98.9–100% |
-| Java | jdtls | 96.2% |
+| Rust | rust-analyzer | 99.0–100% |
+| Java | jdtls | 96.6% |
 
 Ten pinned real-world repos (zod, express, httpx, rich, cobra, grpc-go, ripgrep, cursive, gson, preact-signals), three sampling seeds, every run gated at `missing-unexplained = 0`. The tree commands — `trace`, `blast`, `reverse-trace`, `affected-tests` — follow the same rule: confirmed trunk, uncertain branches flagged (`--expand-unverified` to follow). Run `ucn doctor` for the trust report on *your* repo.
 
@@ -300,16 +300,23 @@ The confirmed closure is what you run; `POSSIBLY AFFECTED` lists functions reach
 ## Find unused code
 
 ```
-$ ucn deadcode --exclude=test
+$ ucn deadcode --exclude=test        # run on ripgrep
 
-Dead code: 2 unused symbol(s)
+Dead code: 8 unused symbol(s)
 
-core/output/analysis.js
-  [  29-  32] formatHistogramLine (function)
-  [  41-  44] shouldShowReachability (function)
+crates/globset/src/serde_impl.rs
+  [  38-  42] Glob.deserialize (method)
+  [  70-  74] GlobSet.deserialize (method)
+crates/matcher/src/lib.rs
+  [ 397- 399] Captures.as_match (method)
+  [ 669- 678] Matcher.try_find_iter (method) [only self-references — recursive]
+  [ 796- 806] Matcher.try_captures_iter (method) [only self-references — recursive]
+  ...
 
-353 exported symbol(s) excluded (all have callers). Use --include-exported to audit them.
+921 exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.
 ```
+
+Classes, structs, traits, and enums are audited alongside functions. Symbols whose only call sites live inside their own definitions are claimed too, marked `[only self-references — recursive]`. Every claim class is checked against compiler/LSP ground truth in CI — a claim with an oracle-visible reference fails the build.
 
 Find missing-await bugs:
 
