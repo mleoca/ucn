@@ -121,7 +121,10 @@ const UCN_VERSION = require('../package.json').version;
 // exclusions never trust them. (fix #267) String-named TS module
 // declarations (`declare module '../x'` augmentations) no longer index as
 // namespace symbols — they declare no nameable identifier.
-const CACHE_FORMAT_VERSION = 46;
+// v47 (fix #269): Python absolute imports resolve through the PEP-517 src
+// layout (`import click` → src/click/__init__.py) — persisted
+// importGraph/exportGraph/moduleResolved content changed.
+const CACHE_FORMAT_VERSION = 47;
 
 /**
  * Save index to cache file

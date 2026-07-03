@@ -1259,7 +1259,23 @@ function findCallers(index, name, options = {}) {
                 if (!bindingId && !call.isMethod && !calledAs &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
-                    const nameBindings = fileEntry.importBindings.filter(b => b.name === call.name);
+                    // Renamed destructures look up by the RESOLVED name (fix
+                    // #269, fastify-measured): `const { validate:
+                    // validateSchema } = require('./validation')` stores the
+                    // binding under 'validate' while the record's name is the
+                    // local alias — the empty lookup skipped the whole
+                    // ownership chase and the call scope-confirmed against
+                    // hooks.js's unrelated validate.
+                    const lookupName = call.resolvedName || call.name;
+                    let nameBindings = fileEntry.importBindings.filter(b => b.name === lookupName);
+                    // Exact alias pairing (fix #269): two renames of one
+                    // source name from DIFFERENT modules — the record's local
+                    // alias (call.name) picks its own binding; source-name
+                    // matching alone over-follows into the other module.
+                    if (call.resolvedName && nameBindings.some(b => b.alias)) {
+                        const paired = nameBindings.filter(b => b.alias === call.name);
+                        if (paired.length > 0) nameBindings = paired;
+                    }
                     const tFiles = new Set(targetDefs.map(d => d.file).filter(Boolean));
                     // fix #215 (rich-measured: 225 builtin `print(...)` calls
                     // confirmed against rich's def via file-level import edges):
@@ -1330,6 +1346,20 @@ function findCallers(index, name, options = {}) {
                             // bare name is rebound away from the target
                             // (compiler-checked module semantics).
                             recordExcluded(filePath, call.line, 'other-definition-import');
+                            continue;
+                        }
+                        // Paired-rename records (fix #269, fastify-measured):
+                        // `{ validate: validateSchema } = require('./validation')`
+                        // pins the alias to ONE module. An un-modelable chain
+                        // (CJS export surface) blocks exclusion but is not
+                        // confirmation evidence either — the call routes
+                        // visible instead of scope-confirming a pin its own
+                        // module never provably reaches (hooks.js's unrelated
+                        // validate confirmed at scope-match 0.65).
+                        if (!reaches && undetermined && collectAccount &&
+                            call.resolvedName && nameBindings.length > 0 &&
+                            nameBindings.every(b => b.alias === call.name)) {
+                            routeUnverified(filePath, fileEntry, call, 'ambiguous-binding', calledAs);
                             continue;
                         }
                     }
@@ -4866,11 +4896,22 @@ function _projectTopLevelNames(index) {
     if (index._projectTopLevelNames) return index._projectTopLevelNames;
     const names = new Set();
     for (const [, fe] of index.files) {
-        const seg = (fe.relativePath || '').split(/[\\/]/)[0];
+        const segs = (fe.relativePath || '').split(/[\\/]/);
+        const seg = segs[0];
         if (!seg) continue;
         names.add(seg);
         const dot = seg.lastIndexOf('.');
         if (dot > 0) names.add(seg.slice(0, dot)); // utils.py → utils
+        // PEP-517 src layout (fix #269): packages under a top-level src/
+        // are importable by their SECOND segment — `import click` names
+        // src/click. Without this, the externality test proved the
+        // project's own package external (a resolver gap is not exclusion
+        // evidence, #209).
+        if (seg === 'src' && segs[1]) {
+            names.add(segs[1]);
+            const d2 = segs[1].lastIndexOf('.');
+            if (d2 > 0) names.add(segs[1].slice(0, d2));
+        }
     }
     index._projectTopLevelNames = names;
     return names;

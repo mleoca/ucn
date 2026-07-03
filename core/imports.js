@@ -145,6 +145,15 @@ function resolveImport(importPath, fromFile, config = {}) {
             const fullPath = path.join(config.root, modulePath);
             const resolved = resolveFilePath(fullPath, getExtensions('python'));
             if (resolved) return resolved;
+            // PEP-517 src layout (fix #269, click-measured): the installed
+            // package lives under src/ — `import click` from tests/ resolves
+            // to src/click/__init__.py. Without this, the module-ownership
+            // discipline judged the project's OWN package provably external
+            // (excluded every `click.get_binary_stream(...)` test caller —
+            // a false zero-caller answer).
+            const srcPath = path.join(config.root, 'src', modulePath);
+            const srcResolved = resolveFilePath(srcPath, getExtensions('python'));
+            if (srcResolved) return srcResolved;
         }
 
         return null;  // External package

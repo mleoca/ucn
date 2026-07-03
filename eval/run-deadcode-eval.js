@@ -45,6 +45,7 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { isTestFile } = require('../core/discovery');
 const { DEF_NAME_LINE_KINDS } = require('../core/deadcode');
+const { maskBlockComments, escapeRegExp } = require('../core/shared');
 const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
@@ -156,6 +157,7 @@ async function evaluateRepo(repo, oracle) {
 
         const perClaim = [];
         const totals = { claims: claims.length, verified: 0, agreedDead: 0, falseDead: 0, outsideUniverse: 0, unpinnable: 0 };
+        const maskedLineCache = new Map(); // rel → masked lines (fix #269 doc-ref classification)
 
         for (const claim of sampled) {
             const symbol = findClaimSymbol(index, claim);
@@ -197,8 +199,29 @@ async function evaluateRepo(repo, oracle) {
             const inSelfRange = (file, line) => selfRanges &&
                 selfRanges.some(r => r.file === file && line >= r.start && line <= r.end);
 
+            // Comment-interior refs are documentation, not liveness (fix
+            // #269, jsoup-measured: jdtls resolves Javadoc `@see #deselect(int)`
+            // links as references — the engine masks block comments BY DESIGN
+            // (#253), so a claim whose only refs sit inside comments is
+            // agreed-dead with docRefs noted). Uses the engine's own masker,
+            // so eval and engine judge comment interiors identically.
+            const refInComment = (rel, line, name) => {
+                const absF = path.join(index.root, rel);
+                const lang = index.files.get(absF)?.language;
+                if (!lang || lang === 'python') return false; // #253: Python never masked
+                let masked = maskedLineCache.get(rel);
+                if (masked === undefined) {
+                    try { masked = maskBlockComments(fs.readFileSync(absF, 'utf8'), lang).split('\n'); }
+                    catch { masked = null; }
+                    maskedLineCache.set(rel, masked);
+                }
+                if (!masked || line < 1 || line > masked.length) return false;
+                return !new RegExp(`\\b${escapeRegExp(name)}\\b`).test(masked[line - 1]);
+            };
+
             const seen = new Set();
             const usageRefs = [];
+            let docRefs = 0;
             for (const ref of res.refs) {
                 if (ref.kind === 'definition') continue;
                 const ucnRel = toUcnRel(ref.file);
@@ -206,12 +229,13 @@ async function evaluateRepo(repo, oracle) {
                 if (defKeys.has(k) || seen.has(k)) continue;
                 if (inSelfRange(ucnRel, ref.line)) continue;
                 seen.add(k);
+                if (refInComment(ucnRel, ref.line, claim.name)) { docRefs++; continue; }
                 usageRefs.push({ file: ucnRel, line: ref.line, kind: ref.kind, indexed: indexedFiles.has(ucnRel) });
             }
 
             if (usageRefs.length === 0) {
                 totals.agreedDead++;
-                perClaim.push({ ...record, verdict: 'agreed-dead' });
+                perClaim.push({ ...record, verdict: 'agreed-dead', ...(docRefs > 0 && { docRefs }) });
                 continue;
             }
             const indexedRefs = usageRefs.filter(r => r.indexed);

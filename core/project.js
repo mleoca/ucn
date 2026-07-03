@@ -484,7 +484,13 @@ class ProjectIndex {
             // the bare name for the whole file).
             importBindings: imports.flatMap(i => (i.names || [])
                 .filter(n => n && n !== '*' && n !== '_' && n !== '.')
-                .map(n => ({ name: n, module: i.module }))),
+                .map(n => {
+                    // Rename pairing (fix #269): `{ validate: validateSchema }
+                    // = require('./validation')` — the record's local alias
+                    // pins to ITS module, not any module exporting the name.
+                    const rn = (i.renames || []).find(r => r.original === n);
+                    return { name: n, module: i.module, ...(rn && { alias: rn.local }) };
+                })),
             exports: exports.map(e => e.name),
             exportDetails: exports,
             symbols: [],
@@ -543,15 +549,22 @@ class ProjectIndex {
                 // members) — external-contract detection needs the NAME, not
                 // just the traitImpl flag (fix #210).
                 ...(item.traitName && { traitName: item.traitName }),
-                ...(item.isSignature && { isSignature: true })
+                ...(item.isSignature && { isSignature: true }),
+                ...(item.memberAssigned && { memberAssigned: true })
             };
             fileEntry.symbols.push(symbol);
-            fileEntry.bindings.push({
-                id: symbol.bindingId,
-                name: symbol.name,
-                type: symbol.type,
-                startLine: symbol.startLine
-            });
+            // Property-assignment defs (fix #269: Reply.prototype.serialize
+            // = function) declare no lexical name — a bare reference in the
+            // file can never bind them, so they never enter the bindings
+            // table (the symbol stays indexed and method-reachable).
+            if (!item.memberAssigned) {
+                fileEntry.bindings.push({
+                    id: symbol.bindingId,
+                    name: symbol.name,
+                    type: symbol.type,
+                    startLine: symbol.startLine
+                });
+            }
 
             if (!this.symbols.has(item.name)) {
                 this.symbols.set(item.name, []);

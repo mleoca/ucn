@@ -7615,3 +7615,94 @@ describe('fix #267: deadcode false-dead families from the hono/zustand graduatio
         } finally { rm(dir); }
     });
 });
+
+describe('fix #269: property-assignment defs never bind bare names', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'lib.js': [
+            'function Thing () {}',
+            'Thing.prototype.helper = function (payload) {',   // 2
+            '  return helper(this, payload)',                  // 3
+            '}',
+            'function helper (ctx, payload) {',                // 5
+            '  return payload',
+            '}',
+            'module.exports = { Thing, helper }',
+        ].join('\n'),
+    };
+
+    function callersOf(index, handle) {
+        const { execute } = require('../core/execute');
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error || {}));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+    }
+
+    it('bare call binds the free function, never the prototype def', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            assert.ok(callersOf(index, 'lib.js:5:helper').includes('lib.js:3'),
+                'the free function owns the module-scope name');
+            assert.ok(!callersOf(index, 'lib.js:2:helper').includes('lib.js:3'),
+                'the prototype-assigned def is not a lexical name');
+        } finally { rm(dir); }
+    });
+
+    it('counter: the prototype def stays reachable as a method', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'function Thing () {}',
+                'Thing.prototype.run = function () { return 1 }',  // 2
+                'module.exports = Thing',
+            ].join('\n'),
+            'app.js': [
+                'const Thing = require("./lib")',
+                'const t = new Thing()',
+                't.run()',   // 3
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(callersOf(index, 'lib.js:2:run').includes('app.js:3'),
+                'typed-receiver method calls keep confirming');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #269: renamed destructure pins by the paired import module', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'validation.js': 'function validate (ctx, req) { return true }\nmodule.exports = { validate }',
+        'hooks.js': 'function validate (hook, fn) { return fn }\nmodule.exports = { validate }',
+        'handler.js': [
+            'const { validate: validateSchema } = require("./validation")',
+            'const { validate: validateHook } = require("./hooks")',
+            'function preHandler (ctx, req) {',
+            '  return validateSchema(ctx, req)',   // 4
+            '}',
+            'module.exports = preHandler',
+        ].join('\n'),
+    };
+
+    it('the rename call confirms its own module and is excluded for the other', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const output = require('../core/output');
+            const get = (handle) => {
+                const r = execute(index, 'context', { name: handle });
+                const json = JSON.parse(output.formatContextJson(r.result));
+                return (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            };
+            assert.ok(get('validation.js:1:validate').includes('handler.js:4'),
+                'validateSchema(...) is validation.js validate');
+            assert.ok(!get('hooks.js:1:validate').includes('handler.js:4'),
+                'never the unrelated same-name def from another import');
+        } finally { rm(dir); }
+    });
+});

@@ -35,3 +35,9 @@ false-dead = 0.
 | zustand | ts-morph | exported | 0 | 0 | 0 | **0** | 0 | 0 |
 | viper | gopls | default | 2 | 2 | 2 | **0** | 0 | 0 |
 | viper | gopls | exported | 45 | 45 | 45 | **0** | 0 | 0 |
+| chi | gopls | default | 0 | 0 | 0 | **0** | 0 | 0 |
+| chi | gopls | exported | 29 | 29 | 29 | **0** | 0 | 0 |
+| javapoet | jdtls | default | 1 | 1 | 1 | **0** | 0 | 0 |
+| javapoet | jdtls | exported | 6 | 6 | 6 | **0** | 0 | 0 |
+| jsoup | jdtls | default | 1 | 1 | 1 | **0** | 0 | 0 |
+| jsoup | jdtls | exported | 29 | 29 | 29 | **0** | 0 | 0 |

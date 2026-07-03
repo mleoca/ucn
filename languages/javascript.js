@@ -528,6 +528,18 @@ function _processFunction(node, functions, processedRanges, lines) {
                         isArrow,
                         isGenerator: isGen,
                         modifiers: [],
+                        // A property-assignment def (Reply.prototype.serialize
+                        // = function, exports.h = () => ...) creates NO
+                        // lexical name — a bare call in the file can never
+                        // bind it (fix #269, fastify-measured: the prototype
+                        // def stole the module-scope binding from the free
+                        // `function serialize(...)` below it). Prototype
+                        // assignments carry their class so typed-receiver
+                        // method resolution reaches them.
+                        ...(leftNode.type === 'member_expression' && { memberAssigned: true }),
+                        ...(leftNode.type === 'member_expression' &&
+                            /^([A-Za-z_$][\w$]*)\.prototype\.[A-Za-z_$][\w$]*$/.test(leftNode.text) &&
+                            { className: leftNode.text.split('.')[0], isMethod: true }),
                         ...typeAnno,
                         ...(generics && { generics }),
                         ...(docstring && { docstring })
@@ -2403,6 +2415,7 @@ function findImportsInCode(code, parser) {
             const line = node.startPosition.row + 1;
             let modulePath = null;
             const names = [];
+            const esmRenames = [];
             let importType = 'named';
 
             // Find the module path (string node)
@@ -2448,6 +2461,7 @@ function findImportsInCode(code, parser) {
                                     if (nameNode && aliasNode && aliasNode.text !== nameNode.text) {
                                         if (!importAliases) importAliases = [];
                                         importAliases.push({ original: nameNode.text, local: aliasNode.text });
+                                        esmRenames.push({ original: nameNode.text, local: aliasNode.text });
                                     }
                                 }
                             }
@@ -2468,7 +2482,8 @@ function findImportsInCode(code, parser) {
                     // Side-effect import: import 'x'
                     importType = 'side-effect';
                 }
-                imports.push({ module: modulePath, names, type: importType, line });
+                imports.push({ module: modulePath, names, type: importType, line,
+                    ...(esmRenames.length > 0 && { renames: esmRenames }) });
             }
             return true;
         }
@@ -2514,6 +2529,7 @@ function findImportsInCode(code, parser) {
                     const firstArg = argsNode.namedChild(0);
                     const line = node.startPosition.row + 1;
                     const names = [];
+                    const renames = [];
                     let modulePath;
                     let dynamic = false;
 
@@ -2545,6 +2561,7 @@ function findImportsInCode(code, parser) {
                                         if (key && val && val.text !== key.text) {
                                             if (!importAliases) importAliases = [];
                                             importAliases.push({ original: key.text, local: val.text });
+                                            renames.push({ original: key.text, local: val.text });
                                         }
                                     }
                                 }
@@ -2553,7 +2570,13 @@ function findImportsInCode(code, parser) {
                     }
 
                     if (modulePath) {
-                        imports.push({ module: modulePath, names, type: 'require', line, dynamic });
+                        imports.push({ module: modulePath, names, type: 'require', line, dynamic,
+                            // Per-import rename pairing (fix #269): the flat
+                            // importAliases list loses WHICH module a renamed
+                            // name came from — `{ validate: validateSchema }`
+                            // must pin to its own require, not any module
+                            // exporting the source name.
+                            ...(renames.length > 0 && { renames }) });
                     }
                 }
             }

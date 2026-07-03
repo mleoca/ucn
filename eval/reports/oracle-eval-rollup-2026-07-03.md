@@ -8,7 +8,7 @@ lie the tiered caller contract forbids. Target: 0.
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|
 | zod | ts-morph | 50 | 1861 | 99.5% | 30.7% | 0.6871 | **0** | 100.0% (9) | 100.0% |
-| preact-signals | ts-morph | 24 | 24 | 100.0% | 8.3% | 0.9167 | **0** | 66.7% (3) | 100.0% |
+| preact-signals | ts-morph | 24 | 24 | 100.0% | 4.4% | 0.9556 | **0** | 75.0% (4) | 100.0% |
 | express | ts-morph | 39 | 262 | 100.0% | 0.3% | 0.9975 | **0** | 100.0% (1) | 100.0% |
 | httpx | pyright | 50 | 879 | 99.9% | 37.3% | 0.6256 | **0** | 100.0% (7) | 100.0% |
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
@@ -21,6 +21,9 @@ lie the tiered caller contract forbids. Target: 0.
 | hono | ts-morph | 50 | 1213 | 99.7% | 60.4% | 0.393 | **0** | 100.0% (6) | 100.0% |
 | zustand | ts-morph | 17 | 208 | 100.0% | 0.0% | 1 | **0** | 100.0% (1) | 100.0% |
 | viper | gopls | 50 | 668 | 100.0% | 70.1% | 0.299 | **0** | 100.0% (7) | 100.0% |
+| chi | gopls | 50 | 926 | 98.8% | 57.1% | 0.4165 | **0** | 100.0% (11) | 100.0% |
+| javapoet | jdtls | 50 | 836 | 100.0% | 16.7% | 0.8335 | **0** | 100.0% (6) | 100.0% |
+| jsoup | jdtls | 50 | 667 | 100.0% | 46.5% | 0.5354 | **0** | 100.0% (3) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -33,8 +36,8 @@ evidence confirms the file but not the receiver type.
 | zod | function | 36 | 1655 | 100.0% (145/145) | 29.9% (1510/5050) | 0.701 | {"confirmed":145,"unverified":1510,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | method | 10 | 199 | 96.8% (30/31) | 40.8% (171/419) | 0.5596 | {"confirmed":28,"unverified":171,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | class | 4 | 7 | 100.0% (7/7) | n/a (0/0) | n/a | {"confirmed":7,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| preact-signals | function | 13 | 17 | 100.0% (15/15) | 0.0% (0/3) | 1 | {"confirmed":14,"unverified":0,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| preact-signals | method | 10 | 5 | 100.0% (3/3) | 9.3% (4/43) | 0.907 | {"confirmed":3,"unverified":2,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| preact-signals | function | 13 | 17 | 100.0% (15/15) | 0.0% (0/2) | 1 | {"confirmed":14,"unverified":0,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| preact-signals | method | 10 | 5 | 100.0% (5/5) | 4.9% (2/41) | 0.9512 | {"confirmed":3,"unverified":2,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | class | 1 | 2 | 100.0% (3/3) | 0.0% (0/2) | 1 | {"confirmed":2,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | express | function | 37 | 262 | 100.0% (274/274) | 0.3% (2/802) | 0.9975 | {"confirmed":259,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":2,"missingUnexplained":0} |
 | httpx | function | 8 | 38 | 100.0% (38/38) | n/a (0/0) | n/a | {"confirmed":38,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -67,6 +70,13 @@ evidence confirms the file but not the receiver type.
 | viper | function | 20 | 158 | 100.0% (158/158) | 0.0% (0/6) | 1 | {"confirmed":158,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | viper | method | 29 | 506 | 100.0% (434/434) | 74.7% (68/91) | 0.2527 | {"confirmed":434,"unverified":66,"reportedNonCall":6,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | viper | class | 1 | 4 | 100.0% (4/4) | n/a (0/0) | n/a | {"confirmed":4,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| chi | function | 22 | 293 | 98.0% (295/301) | n/a (0/0) | n/a | {"confirmed":293,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| chi | method | 23 | 608 | 100.0% (154/154) | 57.1% (197/345) | 0.429 | {"confirmed":154,"unverified":196,"reportedNonCall":258,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| chi | class | 5 | 25 | 100.0% (25/25) | n/a (0/0) | n/a | {"confirmed":25,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| javapoet | method | 48 | 836 | 100.0% (429/429) | 16.7% (384/2306) | 0.8335 | {"confirmed":427,"unverified":378,"reportedNonCall":31,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| javapoet | class | 2 | 0 | n/a (0/0) | n/a (0/0) | n/a | {"confirmed":0,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| jsoup | method | 39 | 627 | 100.0% (355/355) | 46.5% (236/508) | 0.5354 | {"confirmed":355,"unverified":235,"reportedNonCall":37,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| jsoup | class | 11 | 40 | 100.0% (61/61) | n/a (0/0) | n/a | {"confirmed":40,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)
 
@@ -79,7 +89,7 @@ the site (confirmed edge / unverified entry) or account for it
 | repo | callee precision | confirmed | other-def | unverified | accounted | module-level | beyond-text | **missing-unexplained** |
 |---|---|---|---|---|---|---|---|---|
 | zod | 100.0% (41/41) | 41 | 22 | 95 | 0 | 1703 | 0 | **0** |
-| preact-signals | 100.0% (15/15) | 15 | 0 | 4 | 1 | 4 | 0 | **0** |
+| preact-signals | 100.0% (14/14) | 14 | 0 | 5 | 1 | 4 | 0 | **0** |
 | express | 100.0% (4/4) | 4 | 0 | 0 | 0 | 258 | 0 | **0** |
 | httpx | 100.0% (380/380) | 379 | 1 | 466 | 33 | 0 | 0 | **0** |
 | rich | 98.8% (237/240) | 236 | 27 | 76 | 40 | 122 | 0 | **0** |
@@ -92,3 +102,6 @@ the site (confirmed edge / unverified entry) or account for it
 | hono | 100.0% (54/54) | 54 | 306 | 36 | 0 | 817 | 0 | **0** |
 | zustand | 100.0% (17/17) | 17 | 0 | 2 | 0 | 189 | 0 | **0** |
 | viper | 100.0% (238/238) | 236 | 26 | 406 | 0 | 0 | 0 | **0** |
+| chi | 100.0% (355/355) | 354 | 327 | 240 | 0 | 5 | 0 | **0** |
+| javapoet | 99.1% (344/347) | 340 | 277 | 170 | 0 | 49 | 0 | **0** |
+| jsoup | 99.8% (418/419) | 418 | 143 | 83 | 4 | 19 | 0 | **0** |

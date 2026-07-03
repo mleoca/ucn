@@ -61,14 +61,19 @@ function addSymbol(fileEntry, item, type) {
     if (item.traitImpl) symbol.traitImpl = true;
     if (item.traitName) symbol.traitName = item.traitName;
     if (item.isSignature) symbol.isSignature = true;
+    if (item.memberAssigned) symbol.memberAssigned = true;
 
     fileEntry.symbols.push(symbol);
-    fileEntry.bindings.push({
-        id: symbol.bindingId,
-        name: symbol.name,
-        type: symbol.type,
-        startLine: symbol.startLine,
-    });
+    // Property-assignment defs declare no lexical name (fix #269) — kept in
+    // lockstep with project.js addSymbol (the parallel≡sequential guard).
+    if (!item.memberAssigned) {
+        fileEntry.bindings.push({
+            id: symbol.bindingId,
+            name: symbol.name,
+            type: symbol.type,
+            startLine: symbol.startLine,
+        });
+    }
 }
 
 function processFile(filePath) {
@@ -153,7 +158,11 @@ function processFile(filePath) {
         // the name-level scope/ownership discipline (found during fix #217).
         importBindings: imports.flatMap(i => (i.names || [])
             .filter(n => n && n !== '*' && n !== '_' && n !== '.')
-            .map(n => ({ name: n, module: i.module }))),
+            .map(n => {
+                // Rename pairing (fix #269) — lockstep with project.js.
+                const rn = (i.renames || []).find(r => r.original === n);
+                return { name: n, module: i.module, ...(rn && { alias: rn.local }) };
+            })),
         exports: exports.map(e => e.name),
         exportDetails: exports,
         symbols: [],

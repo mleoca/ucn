@@ -3929,3 +3929,70 @@ describe('fix #265: @overload signature identity + dunder universal names', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #269: PEP-517 src layout resolves project imports', () => {
+    const FILES = {
+        'pyproject.toml': '[project]\nname = "pkg"',
+        'src/pkg/__init__.py': 'from .utils import helper as helper\n',
+        'src/pkg/utils.py': 'def helper(name):\n    return name\n',
+        'tests/test_pkg.py': [
+            'import pkg',
+            'from pkg.utils import helper',
+            '',
+            'def test_module_receiver():',
+            '    return pkg.helper("x")',       // 5
+            '',
+            'def test_bare_import():',
+            '    return helper("y")',           // 8
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const { execute } = require('../core/execute');
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error || {}));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            excluded: json.meta.account?.excluded?.byReason || {},
+        };
+    }
+
+    it('module-qualified and renamed-import test callers confirm through src/', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/pkg/utils.py:1:helper');
+            assert.ok(res.confirmed.includes('tests/test_pkg.py:5'),
+                `pkg.helper("x") resolves via src layout: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('tests/test_pkg.py:8'),
+                `from pkg.utils import helper binds the src def: ${res.confirmed}`);
+            assert.ok(!res.excluded['external-package'],
+                'the project package is never provably external');
+        } finally { rm(dir); }
+    });
+
+    it('counter: a genuinely external module stays external', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"',
+            'src/pkg/utils.py': 'def get(url):\n    return url\n',
+            'tests/test_ext.py': [
+                'import requests',
+                '',
+                'def test_ext():',
+                '    return requests.get("http://x")',  // 4
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'src/pkg/utils.py:1:get' });
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confirmed.includes('tests/test_ext.py:4'),
+                'requests.get is external, never the project get');
+        } finally { rm(dir); }
+    });
+});
