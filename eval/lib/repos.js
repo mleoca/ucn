@@ -133,6 +133,35 @@ const REPOS = [
         language: 'rust',
         targetCandidates: ['.'],
     },
+    {
+        // Handler-callback-heavy TypeScript (graduated from FRESH_POOL
+        // 2026-07-03 — used to tune fix #265, so it joins the pinned board
+        // per the fresh-repo protocol). Motivated the field-hop hardening
+        // (this.store.keys() on a Map-aliased field confirmed 'exact-binding'
+        // against MockCache.keys), the Object.prototype universal-name rule
+        // (183 untyped x.toString() single-owner confirms, 6 oracle-false),
+        // and the getter-hop extension (Context.req). Residual: the big
+        // c.req.param() band has UNANNOTATED callback roots — typing them
+        // needs tsc-grade generic inference, not grep-reliability evidence;
+        // stays honestly visible.
+        name: 'hono',
+        url: 'https://github.com/honojs/hono',
+        commit: '82b321b5b0e7a57cdaab45f2f90671ec0737795b',
+        language: 'typescript',
+        targetCandidates: ['.'],
+    },
+    {
+        // Overload-heavy TypeScript (graduated from FRESH_POOL 2026-07-03 —
+        // used to tune fix #265). Motivated the overload-signature identity
+        // (useStore's only true caller excluded other-definition under the
+        // implementation pin — a false ZERO-caller answer, zeroTrust 33.3%)
+        // and the JSX functionReference labeling (<App />, <Counter />).
+        name: 'zustand',
+        url: 'https://github.com/pmndrs/zustand',
+        commit: 'a1f685ca744e56a982b1c5029620e0925c3ee996',
+        language: 'typescript',
+        targetCandidates: ['.'],
+    },
 ];
 
 // ============================================================================
@@ -154,8 +183,6 @@ const REPOS = [
 // to 2.1% by universe mismatch, not engine physics). Default '.'; narrower
 // only where the language server needs a specific project-model root (Java).
 const FRESH_POOL = [
-    { name: 'hono', url: 'https://github.com/honojs/hono', language: 'typescript', targetCandidates: ['.'] },
-    { name: 'zustand', url: 'https://github.com/pmndrs/zustand', language: 'typescript', targetCandidates: ['.'] },
     { name: 'fastify', url: 'https://github.com/fastify/fastify', language: 'javascript', targetCandidates: ['.'] },
     { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['.'] },
     { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
