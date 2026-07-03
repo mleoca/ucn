@@ -36,7 +36,9 @@ jobs:
       - name: Set version from tag
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          npm version "$VERSION" --no-git-tag-version
+          # --allow-same-version: the release flow (npm version + push --follow-tags)
+          # commits the real version, so the tag usually EQUALS package.json already
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
           sed -i "s/\"version\": \".*\"/\"version\": \"$VERSION\"/" server.json
 
       - uses: actions/setup-node@v5
