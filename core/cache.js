@@ -109,7 +109,7 @@ const UCN_VERSION = require('../package.json').version;
 // function properties (module.exports = { doThing(x){} }) and list them in
 // exports; member-expression assignments record RHS identifier function
 // references (window.onload = handler).
-const CACHE_FORMAT_VERSION = 42;
+const CACHE_FORMAT_VERSION = 43;
 
 /**
  * Save index to cache file

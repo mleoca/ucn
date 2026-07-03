@@ -3990,3 +3990,75 @@ pub fn stray() -> u32 {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #260b: crate:: resolution under manifest-declared target roots', () => {
+    // ripgrep-measured: `[[bin]] path = "app/main.rs"` roots the module tree
+    // at app/, so crate::util from app/sub/x.rs resolves at app/util.rs —
+    // findCargoRoot's src/-or-flat rule alone never finds it.
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n\n[[bin]]\nname = "t"\npath = "app/main.rs"\n',
+        'app/main.rs': 'mod util;\nmod sub;\n\nfn main() { sub::caller::go(); }\n',
+        'app/util.rs': 'pub fn helper() -> u32 { 1 }\n',
+        'app/sub.rs': 'pub mod caller;\n',
+        'app/sub/caller.rs': `pub fn go() -> u32 {
+    crate::util::helper()
+}
+`,
+    };
+
+    it('a crate:: qualified call confirms through the bin target root', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'app/util.rs:1:helper' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('app/sub/caller.rs:2'),
+                `crate::util::helper resolves via the [[bin]] root: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #260b: inline-module qualified calls (containment ownership)', () => {
+    // ripgrep-measured: `convert::string(...)` where `mod convert { pub fn
+    // string }` lives in the SAME file — containment is identity evidence,
+    // and unrelated `string` METHOD owners elsewhere must not demote it.
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/lib.rs': `mod convert {
+    pub fn string(v: u32) -> String { v.to_string() }
+}
+
+pub struct Other;
+
+impl Other {
+    pub fn string(&self) -> String { String::new() }
+}
+
+pub fn go() -> String {
+    convert::string(7)
+}
+`,
+    };
+
+    it('the contained pin confirms; the unrelated method owner never claims it', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/lib.rs:2:string' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('src/lib.rs:12'), `containment confirms: ${confirmed}`);
+
+            const r2 = execute(index, 'context', { name: 'src/lib.rs:8:string' });
+            const json2 = JSON.parse(output.formatContextJson(r2.result));
+            const confirmed2 = (json2.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(!confirmed2.includes('src/lib.rs:12'),
+                `the method pin never claims the module's call: ${confirmed2}`);
+        } finally { rm(dir); }
+    });
+});

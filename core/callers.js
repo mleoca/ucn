@@ -12,7 +12,7 @@ const { detectLanguage, getParser, getLanguageModule, langTraits } = require('..
 const { isTestFile } = require('./discovery');
 const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath } = require('./shared');
 const { scoreEdge, tierForResolution, TIER } = require('./confidence');
-const { findGoModule } = require('./imports');
+const { findGoModule, resolveRustImport } = require('./imports');
 
 /** Set.some() helper — like Array.some() but for Sets */
 function setSome(set, predicate) {
@@ -2124,47 +2124,88 @@ function findCallers(index, name, options = {}) {
                             const _modSeg = String(call.receiver).split('::').pop();
                             if (_modSeg && !/^[A-Z]/.test(_modSeg) &&
                                 !['crate', 'self', 'super'].includes(_modSeg)) {
-                                const _edges = index.importGraph.get(filePath);
-                                const _modFiles = [];
-                                if (_edges) {
-                                    for (const e of _edges) {
-                                        const base = path.basename(e).replace(/\.rs$/, '');
-                                        if (base === _modSeg ||
-                                            (base === 'mod' && path.basename(path.dirname(e)) === _modSeg)) {
-                                            _modFiles.push(e);
+                                // Inline module container first (fix #260b —
+                                // the #254 machinery): `convert::string(...)`
+                                // where `mod convert { pub fn string }` lives
+                                // in the SAME file (ripgrep defs.rs).
+                                // Containment is identity evidence: the pin
+                                // inside the module confirms; a same-name def
+                                // inside it that ISN'T the pin excludes.
+                                const _nsPin = _namespaceContainedDef(index, fileEntry, filePath,
+                                    _modSeg, name, targetDefs2);
+                                if (_nsPin) {
+                                    call = { ...call, moduleOwnedPath: true };
+                                } else if (_namespaceContainedDef(index, fileEntry, filePath,
+                                    _modSeg, name, null)) {
+                                    recordExcluded(filePath, call.line, 'other-definition');
+                                    continue;
+                                } else {
+                                    const _edges = index.importGraph.get(filePath);
+                                    const _modFiles = [];
+                                    if (_edges) {
+                                        for (const e of _edges) {
+                                            const base = path.basename(e).replace(/\.rs$/, '');
+                                            if (base === _modSeg ||
+                                                (base === 'mod' && path.basename(path.dirname(e)) === _modSeg)) {
+                                                _modFiles.push(e);
+                                            }
                                         }
                                     }
-                                }
-                                const _pinnedIn = _modFiles.length > 0 &&
-                                    targetDefs2.some(d => _modFiles.includes(d.file));
-                                if (!_pinnedIn) {
-                                    const _ownsName = _modFiles.some(f => {
-                                        const fe2 = index.files.get(f);
-                                        return fe2 && fe2.symbols && fe2.symbols.some(s =>
-                                            s.name === name && !NON_CALLABLE_TYPES.has(s.type));
-                                    });
-                                    if (_ownsName) {
-                                        recordExcluded(filePath, call.line, 'other-definition');
+                                    // Scope-rooted qualifiers (fix #260b,
+                                    // ripgrep-measured): crate::messages::
+                                    // set_errored() needs no use statement, so
+                                    // there is no import edge — resolve the full
+                                    // module path with the machinery imports use
+                                    // (crate::/super::/self::, own-package names,
+                                    // mod siblings, manifest target roots).
+                                    if (_modFiles.length === 0) {
+                                        try {
+                                            const r = resolveRustImport(String(call.receiver), filePath, index.root);
+                                            if (r && index.files.has(r)) _modFiles.push(r);
+                                        } catch { /* resolver gap — never exclusion evidence */ }
+                                    }
+                                    const _pinnedIn = _modFiles.length > 0 &&
+                                        targetDefs2.some(d => _modFiles.includes(d.file));
+                                    if (!_pinnedIn) {
+                                        const _ownsName = _modFiles.some(f => {
+                                            const fe2 = index.files.get(f);
+                                            return fe2 && fe2.symbols && fe2.symbols.some(s =>
+                                                s.name === name && !NON_CALLABLE_TYPES.has(s.type));
+                                        });
+                                        if (_ownsName) {
+                                            recordExcluded(filePath, call.line, 'other-definition');
+                                            continue;
+                                        }
+                                        routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                            dispatchCandidates: methodOwnerKeys().size,
+                                        });
                                         continue;
                                     }
-                                    routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
-                                        dispatchCandidates: methodOwnerKeys().size,
-                                    });
-                                    continue;
+                                    // Pinned target lives in the qualifier's
+                                    // module — ownership is compiler-grade
+                                    // name-level evidence (Rust resolves
+                                    // crate::util::helper to util.rs's helper,
+                                    // period): carry it as import-grade
+                                    // evidence so a pure path-only usage
+                                    // confirms even with no use-statement edge.
+                                    call = { ...call, moduleOwnedPath: true };
                                 }
-                                // pinned target lives in the qualifier's module —
-                                // ownership consistent, normal confirmation proceeds
                             }
                         }
                         const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
-                        if (knownDispatchType && !tTypes.has(knownDispatchType)) {
+                        // Module-owned qualified calls (fix #260b) are resolved
+                        // by OWNERSHIP — the dispatch-ambiguity routing below is
+                        // receiver physics for method calls and must not demote
+                        // them (ripgrep: `convert::string(...)` tripped the
+                        // multi-owner check via unrelated `string` methods).
+                        if (!call.moduleOwnedPath && knownDispatchType && !tTypes.has(knownDispatchType)) {
                             routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                 dispatchVia: knownDispatchType,
                                 dispatchCandidates: countDispatchCandidates(knownDispatchType),
                             });
                             continue;
                         }
-                        if (!knownDispatchType && methodOwnerKeys().size > 1) {
+                        if (!call.moduleOwnedPath && !knownDispatchType && methodOwnerKeys().size > 1) {
                             routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
                                 dispatchCandidates: methodOwnerKeys().size,
                             });
@@ -2487,7 +2528,7 @@ function findCallers(index, name, options = {}) {
                             : !!call.receiverType,
                         hasReceiverEvidence: !!(call.receiver &&
                             (fileEntry.bindings || []).some(b => b.name === call.receiver)),
-                        hasImportEvidence: !!bindingId || hasImportLink,
+                        hasImportEvidence: !!bindingId || hasImportLink || !!call.moduleOwnedPath,
                         ...(typeMismatch && { typeMismatch: true }),
                     }
                 });

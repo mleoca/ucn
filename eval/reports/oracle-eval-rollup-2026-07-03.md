@@ -14,10 +14,10 @@ lie the tiered caller contract forbids. Target: 0.
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.9% | 6.0% | 0.9394 | **0** | 100.0% (13) | 100.0% |
 | grpc-go | gopls | 50 | 840 | 100.0% | 14.2% | 0.8582 | **0** | 100.0% (13) | 100.0% |
-| ripgrep | rust-analyzer | 41 | 765 | 100.0% | 25.7% | 0.7427 | **0** | 100.0% (1) | 100.0% |
+| ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.0% | 0.8301 | **0** | 100.0% (1) | 100.0% |
 | cursive | rust-analyzer | 50 | 637 | 99.3% | 40.5% | 0.5883 | **0** | 100.0% (6) | 100.0% |
 | gson | jdtls | 50 | 649 | 96.6% | 30.4% | 0.6611 | **0** | 100.0% (9) | 100.0% |
-| clap | rust-analyzer | 50 | 2602 | 92.4% | 35.0% | 0.5741 | **0** | 100.0% (13) | 100.0% |
+| clap | rust-analyzer | 50 | 2602 | 92.4% | 35.1% | 0.5732 | **0** | 100.0% (13) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -46,7 +46,7 @@ evidence confirms the file but not the receiver type.
 | grpc-go | function | 12 | 101 | 100.0% (101/101) | n/a (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | method | 30 | 351 | 100.0% (7/7) | 14.2% (204/1432) | 0.8575 | {"confirmed":7,"unverified":204,"reportedNonCall":140,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | class | 8 | 388 | 100.0% (388/388) | 0.0% (0/7) | 1 | {"confirmed":388,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| ripgrep | function | 6 | 568 | 100.0% (550/550) | 100.0% (18/18) | 0 | {"confirmed":550,"unverified":18,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| ripgrep | function | 6 | 568 | 100.0% (568/568) | n/a (0/0) | n/a | {"confirmed":568,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | method | 31 | 186 | 100.0% (161/161) | 14.2% (21/148) | 0.8581 | {"confirmed":161,"unverified":21,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | class | 4 | 11 | 100.0% (6/6) | 100.0% (5/5) | 0 | {"confirmed":6,"unverified":5,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | function | 6 | 101 | 98.1% (101/103) | n/a (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -54,8 +54,8 @@ evidence confirms the file but not the receiver type.
 | cursive | class | 5 | 17 | 100.0% (3/3) | 31.6% (6/19) | 0.6842 | {"confirmed":3,"unverified":6,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":8,"missingUnexplained":0} |
 | gson | method | 40 | 615 | 96.2% (275/286) | 30.4% (197/647) | 0.657 | {"confirmed":275,"unverified":195,"reportedNonCall":13,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (34/34) | n/a (0/0) | n/a | {"confirmed":34,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| clap | function | 14 | 244 | 96.7% (234/242) | 100.0% (9/9) | -0.0331 | {"confirmed":234,"unverified":9,"reportedNonCall":1,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| clap | method | 33 | 2358 | 91.8% (1743/1898) | 34.6% (617/1781) | 0.5719 | {"confirmed":1743,"unverified":615,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| clap | function | 14 | 244 | 96.8% (243/251) | n/a (0/0) | n/a | {"confirmed":243,"unverified":0,"reportedNonCall":1,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| clap | method | 33 | 2358 | 91.8% (1743/1898) | 35.1% (617/1758) | 0.5673 | {"confirmed":1743,"unverified":615,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | clap | class | 3 | 0 | n/a (0/0) | n/a (0/0) | n/a | {"confirmed":0,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)

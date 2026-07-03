@@ -347,13 +347,24 @@ function findCargoRoot(startDir) {
             // integration tests/benches/examples (`use mypkg::...` in
             // tests/*.rs — fix #246); `-` normalizes to `_` in code.
             let packageName = null;
+            const targetDirs = [];
             try {
                 const toml = fs.readFileSync(cargoPath, 'utf-8');
                 const pkgSection = toml.split(/^\s*\[/m).find(s => s.startsWith('package]'));
                 const m = pkgSection && pkgSection.match(/^\s*name\s*=\s*"([^"]+)"/m);
                 if (m) packageName = m[1].replace(/-/g, '_');
+                // Explicit target roots (fix #260b, ripgrep-measured): a
+                // manifest may root its targets OUTSIDE src/ — ripgrep's
+                // `[[bin]] path = "crates/core/main.rs"` puts the whole bin
+                // module tree under crates/core, so `crate::messages` from
+                // crates/core/flags/parse.rs resolves THERE, never at src/.
+                // Collect every declared .rs target path's directory.
+                for (const tm of toml.matchAll(/^\s*path\s*=\s*"([^"]+\.rs)"/gm)) {
+                    const tDir = path.dirname(path.resolve(dir, tm[1]));
+                    if (!targetDirs.includes(tDir)) targetDirs.push(tDir);
+                }
             } catch { /* unreadable Cargo.toml — no package identity */ }
-            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir, packageName };
+            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir, packageName, targetDirs };
             cargoCache.set(startDir, result);
             return result;
         }
@@ -425,17 +436,30 @@ function resolveRustModulePath(dir, segments) {
 function resolveRustImport(importPath, fromFile, projectRoot) {
     const fromDir = path.dirname(fromFile);
 
-    // crate:: paths - resolve from the crate's src/ directory
+    // crate:: paths - resolve from the crate's src/ directory, or from a
+    // manifest-declared target root (fix #260b): a `[[bin]] path =
+    // "crates/core/main.rs"` roots the module tree at crates/core — the
+    // importing file's crate root dir is the DEEPEST declared target dir
+    // that is an ancestor of the file (module files live under their crate
+    // root; integration tests are separate crates and can't use crate::).
     if (importPath.startsWith('crate::')) {
         const cargo = findCargoRoot(fromDir);
         if (!cargo) return null;
 
         const rest = importPath.slice('crate::'.length);
         const segments = rest.split('::');
-        // `use crate::ITEM` where ITEM is declared in the crate root file has
-        // no ITEM.rs — the import points at lib.rs/main.rs itself.
-        return resolveRustModulePath(cargo.srcDir, segments) ||
-            rustModuleOwnFile(cargo.srcDir, fromFile);
+        const candidates = [cargo.srcDir, ...(cargo.targetDirs || [])]
+            .filter(d => fromDir === d || fromDir.startsWith(d + path.sep))
+            .sort((a, b) => b.length - a.length);
+        if (candidates.length === 0) candidates.push(cargo.srcDir);
+        for (const cand of candidates) {
+            // `use crate::ITEM` where ITEM is declared in the crate root file
+            // has no ITEM.rs — the import points at lib.rs/main.rs itself.
+            const hit = resolveRustModulePath(cand, segments) ||
+                rustModuleOwnFile(cand, fromFile);
+            if (hit) return hit;
+        }
+        return null;
     }
 
     // Own-package-name paths (fix #246): integration tests, benches, and
@@ -877,5 +901,6 @@ module.exports = {
     extractExports,
     resolveImport,
     resolveFilePath,
+    resolveRustImport,
     findGoModule
 };
