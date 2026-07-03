@@ -33,3 +33,5 @@ false-dead = 0.
 | hono | ts-morph | exported | 5 | 5 | 4 | **0** | 0 | 1 |
 | zustand | ts-morph | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | zustand | ts-morph | exported | 0 | 0 | 0 | **0** | 0 | 0 |
+| viper | gopls | default | 2 | 2 | 2 | **0** | 0 | 0 |
+| viper | gopls | exported | 45 | 45 | 45 | **0** | 0 | 0 |

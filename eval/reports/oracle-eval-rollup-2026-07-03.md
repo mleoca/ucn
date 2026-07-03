@@ -20,6 +20,7 @@ lie the tiered caller contract forbids. Target: 0.
 | clap | rust-analyzer | 50 | 2602 | 92.4% | 35.1% | 0.5732 | **0** | 100.0% (13) | 100.0% |
 | hono | ts-morph | 50 | 1213 | 99.7% | 60.4% | 0.393 | **0** | 100.0% (6) | 100.0% |
 | zustand | ts-morph | 17 | 208 | 100.0% | 0.0% | 1 | **0** | 100.0% (1) | 100.0% |
+| viper | gopls | 50 | 668 | 100.0% | 78.2% | 0.2184 | **0** | 100.0% (7) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -63,6 +64,9 @@ evidence confirms the file but not the receiver type.
 | hono | method | 18 | 935 | 100.0% (109/109) | 62.6% (440/703) | 0.3741 | {"confirmed":109,"unverified":440,"reportedNonCall":386,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | hono | class | 14 | 187 | 100.0% (188/188) | n/a (0/0) | n/a | {"confirmed":187,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zustand | function | 17 | 208 | 100.0% (213/213) | 0.0% (0/18) | 1 | {"confirmed":208,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | function | 20 | 158 | 100.0% (158/158) | 0.0% (0/6) | 1 | {"confirmed":158,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | method | 29 | 506 | 100.0% (434/434) | 84.0% (68/81) | 0.1605 | {"confirmed":434,"unverified":66,"reportedNonCall":6,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | class | 1 | 4 | 100.0% (4/4) | n/a (0/0) | n/a | {"confirmed":4,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)
 
@@ -87,3 +91,4 @@ the site (confirmed edge / unverified entry) or account for it
 | clap | 99.8% (589/590) | 589 | 398 | 1615 | 0 | 0 | 0 | **0** |
 | hono | 100.0% (54/54) | 54 | 309 | 33 | 0 | 817 | 0 | **0** |
 | zustand | 100.0% (17/17) | 17 | 0 | 2 | 0 | 189 | 0 | **0** |
+| viper | 100.0% (239/239) | 237 | 33 | 398 | 0 | 0 | 0 | **0** |
