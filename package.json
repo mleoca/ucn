@@ -59,6 +59,9 @@
   },
   "homepage": "https://github.com/mleoca/ucn#readme",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "tree-sitter": "^0.21.0",
     "tree-sitter-go": "^0.21.0",
