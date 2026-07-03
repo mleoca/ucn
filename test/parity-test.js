@@ -965,6 +965,8 @@ describe('Architecture Guards', () => {
             'staged', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported',
             'unused', 'functions', 'framework', 'detailed', 'deep', 'compact',
             'hot', 'diverse', 'git',
+            // definition line pin (fix #249 — the file:line:name handle's middle component)
+            'line',
             // endpoints command
             'bridge', 'unmatched', 'method', 'prefix',
         ];

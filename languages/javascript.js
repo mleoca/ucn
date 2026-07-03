@@ -100,14 +100,37 @@ function getAssignmentName(leftNode) {
 }
 
 /**
- * Extract modifiers from function text
+ * Extract modifiers from a declaration NODE — AST tokens, never text
+ * (fix #249: the first-line regex fabricated export/async/default from
+ * string literals, comments, and `m?.default?.()` on one-line functions,
+ * leaking fake exports into api/fileExports and corrupting isAsync).
+ * Accepts the declaration or its export_statement wrapper.
  */
-function extractModifiers(text) {
+function extractModifiers(node) {
     const mods = [];
-    const firstLine = text.split('\n')[0];
-    if (/\bexport\b/.test(firstLine)) mods.push('export');
-    if (/\basync\b/.test(firstLine)) mods.push('async');
-    if (/\bdefault\b/.test(firstLine)) mods.push('default');
+    if (!node) return mods;
+    let decl = node;
+    if (node.type === 'export_statement') {
+        mods.push('export');
+        decl = node.childForFieldName('declaration') || node;
+    }
+    // Resolve to the actual function-shaped node: `const x = async () => {}`
+    // keeps its async token on the arrow, not the declaration.
+    if (decl.type === 'lexical_declaration' || decl.type === 'variable_declaration') {
+        const declarator = decl.namedChildren.find(c => c.type === 'variable_declarator');
+        const value = declarator && declarator.childForFieldName('value');
+        if (value) decl = value;
+    }
+    let isAsync = false;
+    for (let i = 0; i < decl.childCount; i++) {
+        if (decl.child(i).type === 'async') { isAsync = true; break; }
+    }
+    if (isAsync) mods.push('async');
+    if (node.type === 'export_statement') {
+        for (let i = 0; i < node.childCount; i++) {
+            if (node.child(i).type === 'default') { mods.push('default'); break; }
+        }
+    }
     return mods;
 }
 
@@ -278,8 +301,8 @@ function _processFunction(node, functions, processedRanges, lines) {
             const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
             // Check parent for export status (function_declaration inside export_statement)
             const modifiers = node.parent && node.parent.type === 'export_statement'
-                ? extractModifiers(node.parent.text)
-                : extractModifiers(node.text);
+                ? extractModifiers(node.parent)
+                : extractModifiers(node);
             // Feature B: explicit isAsync flag (auditAsync needs to know whether
             // the fn was declared `async function`).
             const isAsync = modifiers.includes('async');
@@ -365,8 +388,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                         const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
                         // Check parent for export status (lexical_declaration inside export_statement)
                         const modifiers = node.parent && node.parent.type === 'export_statement'
-                            ? extractModifiers(node.parent.text)
-                            : extractModifiers(node.text);
+                            ? extractModifiers(node.parent)
+                            : extractModifiers(node);
                         // Feature B: detect async — for arrow/fn-expressions the `async`
                         // keyword precedes the parameter list on the value node, NOT on
                         // the lexical_declaration text. extractModifiers walked the full
@@ -418,8 +441,8 @@ function _processFunction(node, functions, processedRanges, lines) {
                                         const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
                                         const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
                                         const modifiers = node.parent && node.parent.type === 'export_statement'
-                                            ? extractModifiers(node.parent.text)
-                                            : extractModifiers(node.text);
+                                            ? extractModifiers(node.parent)
+                                            : extractModifiers(node);
 
                                         functions.push({
                                             name: nameNode.text,

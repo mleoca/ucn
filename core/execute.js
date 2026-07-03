@@ -550,7 +550,9 @@ const HANDLERS = {
         const pinErr = checkDefinitionPin(index, p);
         if (pinErr) return { ok: false, error: pinErr };
         const { brief } = require('./brief');
-        const result = brief(index, p.name, { file: p.file, className: p.className, git: !!p.git });
+        // Thread the line pin (fix #249: a `lib.js:5:run` handle silently
+        // resolved the OTHER same-name def — the pin's whole point).
+        const result = brief(index, p.name, { file: p.file, className: p.className, line: p.line, git: !!p.git });
         if (!result) return { ok: false, error: `Symbol "${p.name}" not found.` };
         return { ok: true, result };
     },
@@ -1064,8 +1066,22 @@ const HANDLERS = {
             const fnSplit = splitClassMethod(fnName);
             const actualName = fnSplit ? fnSplit.methodName : fnName;
             const fnClassName = fnSplit ? fnSplit.className : p.className;
-            const matches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
+            let matches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
                 .filter(m => m.type === 'function' || m.params !== undefined);
+
+            // Line pin from a stable handle or explicit line= (fix #249:
+            // `fn both.js:5:run` returned the OTHER same-name def — the
+            // pin's whole point is exactness, so a non-matching line errors
+            // instead of falling back).
+            const pinLine = num(p.line, null);
+            if (pinLine != null && matches.length > 0) {
+                const atLine = matches.filter(m => m.startLine === pinLine || m.nameLine === pinLine);
+                if (atLine.length === 0) {
+                    notes.push(`No definition of "${fnName}" at line ${pinLine}. Found: ${matches.map(m => `${m.relativePath}:${m.startLine}`).join(', ')}.`);
+                    continue;
+                }
+                matches = atLine;
+            }
 
             if (matches.length === 0) {
                 // Check if it's a class — suggest `class` command instead
@@ -1125,11 +1141,23 @@ const HANDLERS = {
     class: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        // Stable handles roundtrip here too (fix #249: `class svc.js:7:Service`
+        // errored "not found" — find→class was the one broken hop).
+        applyHandleSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
 
-        const matches = index.find(p.name, { file: p.file, skipCounts: true })
+        let matches = index.find(p.name, { file: p.file, skipCounts: true })
             .filter(m => CLASS_KIND_TYPES.includes(m.type));
+
+        const classPinLine = num(p.line, null);
+        if (classPinLine != null && matches.length > 0) {
+            const atLine = matches.filter(m => m.startLine === classPinLine || m.nameLine === classPinLine);
+            if (atLine.length === 0) {
+                return { ok: false, error: `No definition of "${p.name}" at line ${classPinLine}. Found: ${matches.map(m => `${m.relativePath}:${m.startLine}`).join(', ')}.` };
+            }
+            matches = atLine;
+        }
 
         if (matches.length === 0) {
             return { ok: false, error: `Class "${p.name}" not found.` };

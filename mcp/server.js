@@ -310,6 +310,7 @@ server.registerTool(
             all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
             top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
             class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
+            line: z.number().int().positive().optional().describe('Definition line pin — resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.'),
             limit: z.number().int().positive().max(1000000).optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed. Must be a positive integer.'),
             max_files: z.number().int().positive().max(10000000).optional().describe('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.'),
             max_chars: z.number().int().positive().max(10000000).optional().describe('Max output chars before truncation. Targeted commands (about, context, smart, etc.): 10K default. Broad commands (toc, entrypoints, deadcode, etc.): 3K default. Max: 100K. Use all=true to bypass all caps.'),

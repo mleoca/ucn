@@ -8,6 +8,7 @@
 const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
+const path = require('path');
 
 const output = require('../core/output');
 const { execute } = require('../core/execute');
@@ -5539,6 +5540,56 @@ describe('fix #248: extraction surface', () => {
             assert.ok(ping.modifiers.includes('pub') && !ping.modifiers.includes('public'), JSON.stringify(ping.modifiers));
             const pong = (index.symbols.get('pong') || [])[0];
             assert.ok(!pong.modifiers.includes('pub') && !pong.modifiers.includes('public'), JSON.stringify(pong.modifiers));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #249: wave-6 urgent correctness', () => {
+    it('fn/class/brief honor the LINE component of stable handles', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'both.js': 'class A { run() { return 1; } }\nfunction helper() {}\nclass B { run() { return 2; } }\nmodule.exports = { A, B };\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.strictEqual(execute(index, 'fn', { name: 'both.js:3:run' }).result.entries[0].match.startLine, 3);
+            assert.strictEqual(execute(index, 'fn', { name: 'both.js:1:run' }).result.entries[0].match.startLine, 1);
+            const cls = execute(index, 'class', { name: 'both.js:3:B' });
+            assert.ok(cls.ok && cls.result.entries[0].match.startLine === 3, 'class accepts handles');
+            const b = execute(index, 'brief', { name: 'both.js:3:run' });
+            assert.strictEqual(b.result.symbol.startLine, 3, 'brief pins the handle line');
+            const bad = execute(index, 'fn', { name: 'run', line: 99 });
+            assert.strictEqual(bad.ok, false, 'a non-matching pin errors, never falls back');
+        } finally { rm(dir); }
+    });
+
+    it('extractModifiers never fabricates modifiers from string content', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function sneaky() { return "export default async"; }\nexport async function realAsync() { return 3; }\nexport const exportedArrow = async () => 5;\nmodule.exports = { sneaky };\n',
+        });
+        try {
+            const index = idx(dir);
+            const sneaky = (index.symbols.get('sneaky') || [])[0];
+            assert.deepStrictEqual(sneaky.modifiers, [], 'string content is not a modifier');
+            assert.ok(!sneaky.isAsync);
+            const real = (index.symbols.get('realAsync') || [])[0];
+            assert.deepStrictEqual(real.modifiers, ['export', 'async']);
+            const arrow = (index.symbols.get('exportedArrow') || [])[0];
+            assert.deepStrictEqual(arrow.modifiers, ['export', 'async'], 'async on the arrow value is seen');
+        } finally { rm(dir); }
+    });
+
+    it('file-mode errors print a message, not a stack trace', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function x() { return 1; }\nmodule.exports = { x };\n',
+        });
+        try {
+            // FILE-mode target: pass the file path where the dir would go.
+            const out = runCli(path.join(dir, 'a.js'), 'fn', ['nosuchfn']);
+            assert.ok(!/\n\s+at /.test(out), 'no stack frames in output: ' + out.slice(0, 300));
+            assert.ok(out.includes('not found') || out.includes('Function'), 'error message present: ' + out.slice(0, 200));
         } finally { rm(dir); }
     });
 });

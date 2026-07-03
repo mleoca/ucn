@@ -99,7 +99,10 @@ const UCN_VERSION = require('../package.json').version;
 // (`Pair[K, V]` → `Pair` in receiver/className); Rust trait members carry
 // the trait's own visibility instead of the non-Rust 'public', and Rust
 // impl methods record async/unsafe/const/extern qualifiers in modifiers.
-const CACHE_FORMAT_VERSION = 38;
+// v39 (fix #249): JS/TS modifiers come from AST tokens, not first-line
+// text — cached symbols may carry export/async/default fabricated from
+// string literals and comments.
+const CACHE_FORMAT_VERSION = 39;
 
 /**
  * Save index to cache file
@@ -329,7 +332,16 @@ function loadCache(index, cachePath) {
             return false;
         }
 
-        const root = cacheData.root || index.root;
+        // Rehydrate against the CURRENT root, never cacheData.root — the
+        // cache stores relative paths precisely so a moved/copied project
+        // keeps its cache. Using the recorded root re-attached every path to
+        // the ORIGINAL directory: the staleness check then forced a rebuild
+        // of files/symbols, but _reachableSymbols survived with old-root
+        // keys (the fingerprint is path-blind), poisoning reachability notes
+        // and --unreachable-only permanently (fix #249, G9-parity P1 —
+        // repro: cp -r projA projB). The calls-shard loader already used
+        // index.root.
+        const root = index.root;
         // Fast path conversion: string concat is ~70x faster than path.join for
         // cache-stored relative paths (no '..' segments). On Windows, path.relative
         // produces backslash paths, so rootPrefix uses the native separator.

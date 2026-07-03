@@ -222,6 +222,16 @@ class ProjectIndex {
         const startTime = Date.now();
         const quiet = options.quiet !== false;
 
+        // A (re)build invalidates any cache-loaded reachability set — the
+        // fingerprint guard in computeReachability is content-shaped and
+        // cannot see every rebuild (fix #249: a stale loaded set survived
+        // the rebuild and poisoned "unreachable" notes). Recomputed lazily
+        // on the next reachability query.
+        if (this._reachableSymbols) {
+            this._reachableSymbols = null;
+            this._reachableFingerprint = null;
+        }
+
         // Accept pre-expanded file array (glob mode) or a pattern string
         let files;
         if (Array.isArray(pattern)) {

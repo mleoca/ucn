@@ -234,6 +234,9 @@ function parseFlags(tokens) {
         diverse: tokens.includes('--diverse') || undefined,
         git: tokens.includes('--git') || undefined,
         className: getValueFlag('--class-name'),
+        // Explicit line pin (fix #249: our own disambiguation notes advertise
+        // line= but no surface accepted it).
+        line: parseInt(getValueFlag('--line') || '0', 10) || undefined,
         limit: parseInt(getValueFlag('--limit') || '0') || undefined,
         limitRaw: getValueFlag('--limit'),
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
@@ -290,7 +293,7 @@ const knownFlags = new Set([
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions', '--hot', '--diverse', '--git',
-    '--max-lines', '--class-name', '--limit', '--max-files',
+    '--max-lines', '--class-name', '--line', '--limit', '--max-files',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
     '--hide-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
     '--framework', '--workers', '--deep', '--compact',
@@ -345,7 +348,7 @@ try {
 const VALUE_FLAGS = new Set([
     '--file', '--depth', '--top', '--context', '--direction',
     '--add-param', '--remove-param', '--rename-to', '--default', '--default-value',
-    '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name',
+    '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name', '--line',
     '--type', '--param', '--receiver', '--returns', '--decorator',
     '--limit', '--max-files', '--min-confidence', '--stack', '--framework',
     '--workers', '--method', '--prefix'
@@ -462,19 +465,29 @@ function main() {
         arg = positionalArgs[2];
     }
 
-    // Determine mode: single file, glob pattern, or project
-    if (target === '.' || (fs.existsSync(target) && fs.statSync(target).isDirectory())) {
-        // Project mode
-        runProjectCommand(target, command, arg);
-    } else if (target.includes('*') || target.includes('{')) {
-        // Glob pattern mode
-        runGlobCommand(target, command, arg);
-    } else if (fs.existsSync(target)) {
-        // Single file mode
-        runFileCommand(target, command, arg);
-    } else {
-        console.error(`Error: "${target}" not found`);
-        process.exit(1);
+    // Determine mode: single file, glob pattern, or project.
+    // CommandError is the fail() control-flow signal — project mode catches
+    // it internally, but file/glob mode errors used to escape main() and
+    // dump a raw stack trace after the message (fix #249).
+    try {
+        if (target === '.' || (fs.existsSync(target) && fs.statSync(target).isDirectory())) {
+            // Project mode
+            runProjectCommand(target, command, arg);
+        } else if (target.includes('*') || target.includes('{')) {
+            // Glob pattern mode
+            runGlobCommand(target, command, arg);
+        } else if (fs.existsSync(target)) {
+            // Single file mode
+            runFileCommand(target, command, arg);
+        } else {
+            console.error(`Error: "${target}" not found`);
+            process.exit(1);
+        }
+    } catch (e) {
+        if (!(e instanceof CommandError)) {
+            console.error(`Error: ${e.message}`);
+        }
+        process.exitCode = 1;
     }
 }
 
@@ -881,7 +894,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'brief': {
             requireArg(arg, 'Usage: ucn . brief <name>');
-            const { ok, result, error } = execute(index, 'brief', { name: arg, file: flags.file, className: flags.className, git: flags.git });
+            const { ok, result, error } = execute(index, 'brief', { name: arg, file: flags.file, className: flags.className, line: flags.line, git: flags.git });
             if (!ok) fail(error);
             printOutput(result, output.formatBriefJson, output.formatBrief);
             break;
@@ -911,7 +924,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'fn': {
             requireArg(arg, 'Usage: ucn . fn <name>');
-            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all, className: flags.className });
+            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: flags.file, all: flags.all, className: flags.className, line: flags.line });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatFnResultJson, output.formatFnResult);
@@ -920,7 +933,7 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'class': {
             requireArg(arg, 'Usage: ucn . class <name>');
-            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines });
+            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: flags.file, all: flags.all, maxLines: flags.maxLines, line: flags.line });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatClassResultJson, output.formatClassResult);
@@ -1830,7 +1843,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
 
         case 'fn': {
             if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>] [--class-name=<class>]'); return; }
-            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all, className: iflags.className });
+            const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all, className: iflags.className, line: iflags.line });
             if (!ok) { console.log(error); return; }
             if (note) console.log(note);
             console.log(output.formatFnResult(result));
@@ -1839,7 +1852,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
 
         case 'class': {
             if (!arg) { console.log('Usage: class <name> [--file=<pattern>]'); return; }
-            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: iflags.file, all: iflags.all, maxLines: iflags.maxLines });
+            const { ok, result, error, note } = execute(index, 'class', { name: arg, file: iflags.file, all: iflags.all, maxLines: iflags.maxLines, line: iflags.line });
             if (!ok) { console.log(error); return; }
             if (note) console.log(note);
             console.log(output.formatClassResult(result));

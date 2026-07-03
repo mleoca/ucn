@@ -2406,3 +2406,73 @@ describe('fix #227: canonical index order and no stale-calls resurrection', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #249: relocated project cache stays portable', () => {
+    it('a copied project directory rehydrates every path under the NEW root', () => {
+        const { computeReachability } = require('../core/entrypoints');
+        const dirA = tmp({
+            'package.json': '{"name":"test"}',
+            'cli.js': '#!/usr/bin/env node\nconst { helper } = require("./lib");\nfunction main() { helper(); }\nmain();\n',
+            'lib.js': 'function helper() { return 1; }\nfunction orphan() { return 2; }\nmodule.exports = { helper };\n',
+        });
+        const dirB = dirA + '-copy';
+        try {
+            const indexA = idx(dirA);
+            computeReachability(indexA);
+            assert.ok(indexA._reachableSymbols && indexA._reachableSymbols.size > 0, 'reachability computed');
+            indexA.saveCache();
+
+            fs.cpSync(dirA, dirB, { recursive: true });
+            const indexB = new ProjectIndex(dirB, { quiet: true });
+            const loaded = indexB.loadCache();
+            assert.ok(loaded, 'copied cache loads');
+
+            for (const abs of indexB.files.keys()) {
+                assert.ok(abs.startsWith(dirB + path.sep), `file key under new root: ${abs}`);
+            }
+            if (indexB._reachableSymbols) {
+                for (const k of indexB._reachableSymbols) {
+                    assert.ok(k.startsWith(dirB + path.sep), `reachability key under new root: ${k}`);
+                }
+            }
+            // The reachability answers must match a fresh compute in B.
+            const freshB = new ProjectIndex(dirB, { quiet: true });
+            freshB.build(null, { quiet: true });
+            computeReachability(freshB);
+            const rehydrated = computeReachability(indexB);
+            const relKeys = (s, root) => [...s].map(k => path.relative(root, k)).sort();
+            assert.deepStrictEqual(relKeys(rehydrated, dirB), relKeys(freshB._reachableSymbols, dirB),
+                'loaded reachability answers agree with a fresh compute');
+        } finally {
+            rm(dirA);
+            fs.rmSync(dirB, { recursive: true, force: true });
+        }
+    });
+
+    it('build() after a stale cache load drops the loaded reachability set', () => {
+        const { computeReachability } = require('../core/entrypoints');
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cli.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }\nmain();\n',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };\n',
+        });
+        try {
+            const index1 = idx(dir);
+            computeReachability(index1);
+            index1.saveCache();
+
+            // Make the cache stale: add a new entry-point file.
+            fs.writeFileSync(path.join(dir, 'extra.js'),
+                'function fresh() { return 3; }\nfresh();\nmodule.exports = { fresh };\n');
+
+            const index2 = new ProjectIndex(dir, { quiet: true });
+            assert.ok(index2.loadCache());
+            assert.ok(index2.isCacheStale(), 'new file makes the cache stale');
+            index2.build(null, { quiet: true, forceRebuild: true });
+            assert.ok(!index2._reachableSymbols, 'rebuild cleared the loaded set');
+            const recomputed = computeReachability(index2);
+            assert.ok([...recomputed].some(k => k.includes('extra.js')),
+                'recomputed reachability sees the new file');
+        } finally { rm(dir); }
+    });
+});

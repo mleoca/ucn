@@ -107,40 +107,40 @@ const PARAM_MAP = {
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
     // Understanding code
-    about:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git'],
+    about:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git'],
     // Note: includeMethods/includeUncertain are deprecated no-ops for
     // about/context/impact since the tiered-output contract (unverified
     // callers are always shown in their own section); kept in the matrix so
     // legacy invocations don't warn as "inapplicable". `all` lifts the
     // unverified display cap.
-    context:      ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'all'],
-    impact:       ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'top', 'unreachableOnly', 'compact'],
+    context:      ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'all'],
+    impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'top', 'unreachableOnly', 'compact'],
     // trace/blast/reverseTrace/affectedTests run the tiered tree contract:
     // includeUncertain is an implied no-op (unverified edges are always
     // visible — frontier/possible band); expandUnverified follows unverified
     // CALLER edges, marking downstream nodes chainUnverified (blast/
     // reverseTrace only — surface trace is down-direction, where unresolved
     // callees have no definition to expand into).
-    blast:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
-    reverseTrace: ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
-    smart:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
-    trace:        ['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
+    blast:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
+    reverseTrace: ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
+    smart:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
+    trace:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
     example:      ['name', 'file', 'className', 'diverse', 'top', 'includeTests'],
-    related:      ['name', 'file', 'className', 'top', 'all'],
-    brief:        ['name', 'file', 'className', 'git'],
+    related:      ['name', 'file', 'className', 'line', 'top', 'all'],
+    brief:        ['name', 'file', 'className', 'line', 'git'],
     // Finding code
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth', 'compact'],
     usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact'],
     toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
     search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
     tests:        ['name', 'file', 'exclude', 'className', 'callsOnly'],
-    affectedTests:['name', 'file', 'exclude', 'className', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
+    affectedTests:['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
     entrypoints:  ['file', 'exclude', 'includeTests', 'excludeTests', 'limit', 'type', 'framework'],
     endpoints:    ['file', 'exclude', 'limit', 'framework', 'bridge', 'serverOnly', 'clientOnly', 'unmatched', 'method', 'prefix', 'hideUncertain'],
     // Extracting code
-    fn:           ['name', 'file', 'className', 'all'],
-    class:        ['name', 'file', 'all', 'maxLines'],
+    fn:           ['name', 'file', 'className', 'line', 'all'],
+    class:        ['name', 'file', 'line', 'all', 'maxLines'],
     lines:        ['file', 'range'],
     expand:       ['item'],
     // File dependencies
@@ -153,8 +153,8 @@ const FLAG_APPLICABILITY = {
     // verify runs the tiered caller contract (v4): includeMethods/
     // includeUncertain are implied no-ops (unverified sites always visible in
     // their own band); kept in the matrix so legacy invocations don't warn.
-    verify:       ['name', 'file', 'className', 'includeMethods', 'includeUncertain'],
-    plan:         ['name', 'file', 'className', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
+    verify:       ['name', 'file', 'className', 'line', 'includeMethods', 'includeUncertain'],
+    plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
     diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],
     check:        ['file', 'base', 'staged', 'limit'],
     // Other
