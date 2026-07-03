@@ -8,10 +8,11 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges } = require('./shared');
+const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { getCachedCalls } = require('./callers');
+const { extractImports } = require('./imports');
 
 /**
  * Build a glob-style matcher: * matches any sequence, ? matches one char.
@@ -1039,7 +1040,28 @@ function tests(index, nameOrFile, options = {}) {
         ? path.basename(nameOrFile, path.extname(nameOrFile))
         : nameOrFile;
 
+    // File-path target: module specifiers are string literals, so the
+    // basename usage scan is blind to import-linked tests in JS/TS
+    // (fix #246). Resolve the target file(s) so each test file's resolved
+    // imports can be checked against them.
+    let targetRels = null;
+    if (isFilePath) {
+        const norm = nameOrFile.replace(/\\/g, '/');
+        targetRels = new Set();
+        for (const [, fe] of index.files) {
+            const rp = fe.relativePath;
+            if (rp === norm || rp.endsWith('/' + norm) || path.basename(rp) === norm) {
+                targetRels.add(rp);
+            }
+        }
+        if (targetRels.size === 0) targetRels = null;
+    }
+
     const className = options.className || null;
+    // className scoping accepts the class plus its non-overriding
+    // descendants — a subclass instance without its own override dispatches
+    // to the target class's method (fix #246).
+    const dispatchNames = className ? classDispatchNames(index, className, searchTerm) : null;
     // Pre-compile string-ref pattern (only regex left — used on single AST-identified lines)
     const strPattern = new RegExp("['\"`]" + escapeRegExp(searchTerm) + "['\"`]");
 
@@ -1053,10 +1075,27 @@ function tests(index, nameOrFile, options = {}) {
 
             const content = index._readFile(testPath);
 
+            // File-path target: import records resolving to the target file
+            // link this test regardless of what the basename scan sees.
+            let linkedRecords = null;
+            if (targetRels && entry.moduleResolved) {
+                const linkedModules = new Set();
+                for (const [mod, rel] of Object.entries(entry.moduleResolved)) {
+                    if (targetRels.has(rel)) linkedModules.add(mod);
+                }
+                if (linkedModules.size > 0) {
+                    const { imports: recs } = extractImports(content, entry.language);
+                    const hits = (recs || []).filter(r => linkedModules.has(r.module));
+                    if (hits.length > 0) linkedRecords = hits;
+                }
+            }
+
             // Fast pre-check: skip if searchTerm doesn't appear in file
-            if (!content.includes(searchTerm)) continue;
-            // className scoping: skip test files that don't reference the class at all
-            if (className && !content.includes(className)) continue;
+            if (!content.includes(searchTerm) && !linkedRecords) continue;
+            // className scoping: skip test files that reference neither the
+            // class nor any non-overriding subclass (fix #246 — a test
+            // holding only a Circle exercises Shape.describe).
+            if (className && ![...dispatchNames].some(dn => content.includes(dn))) continue;
 
             // --file scoping: only include test files that import from the target source
             if (sourceFileFilter && !sourceFileFilter.has(testPath)) {
@@ -1064,17 +1103,37 @@ function tests(index, nameOrFile, options = {}) {
             }
 
             // AST-based usage detection
-            const astUsages = index._getCachedUsages(testPath, searchTerm);
-            if (astUsages === null) continue; // no parser available — skip
+            const astUsages = index._getCachedUsages(testPath, searchTerm) || [];
+            if (astUsages.length === 0 && !linkedRecords) continue;
 
-            if (astUsages.length === 0) continue;
+            // A test file that DEFINES searchTerm itself owns bare-name
+            // calls of it (fix #246 — the #244 affectedTests rule, tests()
+            // twin): such calls bind the test's own helper, not the project
+            // symbol. Exception: inline-test-promoted files whose PRODUCTION
+            // ranges define the symbol — the file defines AND tests it, so
+            // bare calls in test ranges bind the project symbol.
+            let localShadow = false;
+            if (!isFilePath) {
+                const localDefs = (entry.symbols || []).filter(s => s.name === searchTerm);
+                if (localDefs.length > 0 &&
+                    !(entry.importBindings || []).some(b => b.name === searchTerm)) {
+                    localShadow = testRanges
+                        ? localDefs.every(s => lineInRanges(s.startLine, testRanges))
+                        : true;
+                }
+            }
 
             // Build instance variable → className map from getCachedCalls()
             // for receiver-precise className scoping.
             // e.g., `const svc = new B()` → svc maps to 'B'
             let instanceTypeMap = null; // lazily built
             if (className) {
-                instanceTypeMap = _buildInstanceTypeMap(index, testPath, content, className);
+                instanceTypeMap = new Map();
+                for (const dn of dispatchNames) {
+                    for (const [recv, cls] of _buildInstanceTypeMap(index, testPath, content, dn)) {
+                        if (!instanceTypeMap.has(recv)) instanceTypeMap.set(recv, cls);
+                    }
+                }
             }
 
             const matches = [];
@@ -1085,6 +1144,9 @@ function tests(index, nameOrFile, options = {}) {
                 // Inline-test-promoted file: only lines inside the test
                 // ranges are test code (fix #244).
                 if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
+                // Local same-name shadow: bare usages bind the test file's
+                // own definition (fix #246).
+                if (localShadow && !usage.receiver && usage.usageType !== 'import') continue;
 
                 const lineKey = `${usage.line}:${usage.usageType}`;
                 if (seenLines.has(lineKey)) continue;
@@ -1104,7 +1166,7 @@ function tests(index, nameOrFile, options = {}) {
 
                 // className scoping for calls: check receiver
                 if (className && matchType === 'call') {
-                    if (!_receiverMatchesClass(usage, className, instanceTypeMap, lineContent, searchTerm)) continue;
+                    if (!_receiverMatchesClass(usage, dispatchNames, instanceTypeMap, lineContent, searchTerm)) continue;
                 }
 
                 // className scoping for references: require class-associated receiver
@@ -1113,8 +1175,8 @@ function tests(index, nameOrFile, options = {}) {
                     // association — skip them. Only keep member-access references
                     // where the receiver matches the target class.
                     if (!usage.receiver) continue;
-                    if (usage.receiver !== className &&
-                        !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === className)) {
+                    if (!dispatchNames.has(usage.receiver) &&
+                        !(instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver)))) {
                         continue;
                     }
                 }
@@ -1126,8 +1188,47 @@ function tests(index, nameOrFile, options = {}) {
                 });
             }
 
-            // Language-aware test-case detection
-            _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
+            // File-path target: surface the linking import lines and usages
+            // of each name imported from the target file (fix #246).
+            if (linkedRecords) {
+                for (const rec of linkedRecords) {
+                    if (rec.line != null && !(testRanges && !lineInRanges(rec.line, testRanges))) {
+                        const lineKey = `${rec.line}:import`;
+                        if (!seenLines.has(lineKey)) {
+                            seenLines.add(lineKey);
+                            matches.push({
+                                line: rec.line,
+                                content: (index.getLineContent(testPath, rec.line) || '').trim(),
+                                matchType: 'import'
+                            });
+                        }
+                    }
+                    for (const nm of rec.names || []) {
+                        if (nm === searchTerm) continue; // basename scan covered it
+                        const nmUsages = index._getCachedUsages(testPath, nm) || [];
+                        for (const u of nmUsages) {
+                            if (u.usageType === 'definition' || u.usageType === 'import') continue;
+                            if (testRanges && !lineInRanges(u.line, testRanges)) continue;
+                            const lineKey = `${u.line}:${u.usageType}:${nm}`;
+                            if (seenLines.has(lineKey)) continue;
+                            seenLines.add(lineKey);
+                            const lc = index.getLineContent(testPath, u.line);
+                            matches.push({
+                                line: u.line,
+                                content: lc.trim(),
+                                matchType: u.usageType === 'call' ? 'call' : 'reference'
+                            });
+                        }
+                    }
+                }
+            }
+
+            // Language-aware test-case detection. Under a local same-name
+            // shadow the term on a test line is the file's OWN helper —
+            // only anchor test cases to matches that survived the shadow.
+            if (!localShadow || matches.some(m => m.matchType !== 'import')) {
+                _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
+            }
 
             // Deduplicate: if a line already has a 'call' or 'import', don't also add 'test-case'
             let finalMatches = _deduplicateMatches(matches);
@@ -1380,25 +1481,30 @@ function _buildInstanceTypeMap(index, filePath, content, targetClassName) {
  * @param {Map} instanceTypeMap - varName → className map
  * @param {string} [lineContent] - Line content for fallback checks
  */
-function _receiverMatchesClass(usage, className, instanceTypeMap, lineContent, searchTerm) {
-    // Direct receiver: ClassName.method() or ClassName.staticMethod()
-    if (usage.receiver === className) return true;
-    // Instance variable: check if receiver is bound to the target class
-    if (usage.receiver && instanceTypeMap && instanceTypeMap.get(usage.receiver) === className) return true;
+function _receiverMatchesClass(usage, dispatchNames, instanceTypeMap, lineContent, searchTerm) {
+    // Direct receiver: ClassName.method() or ClassName.staticMethod().
+    // dispatchNames is the target class plus its non-overriding descendants
+    // (fix #246) — an instance of such a subclass runs the target's method.
+    if (usage.receiver && dispatchNames.has(usage.receiver)) return true;
+    // Instance variable: check if receiver is bound to a dispatching class
+    if (usage.receiver && instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver))) return true;
     // Receiver is some other known identifier — doesn't match
     if (usage.receiver) return false;
-    // No receiver: bare function call. Only match if className is the direct
-    // receiver expression — e.g., `new B().save()`, `B().save()`, `B{}.save()`.
-    // Reject cases like `svc = B(); save()` where className is elsewhere on the line.
+    // No receiver: bare function call. Only match if a dispatching class is
+    // the direct receiver expression — e.g., `new B().save()`, `B().save()`,
+    // `B{}.save()`. Reject cases like `svc = B(); save()` where the class
+    // name is elsewhere on the line.
     if (lineContent && searchTerm) {
-        // Check for chained call: ClassName followed by constructor/call then .methodName(
-        const pat = new RegExp(
-            '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
-            escapeRegExp(searchTerm) + '\\s*\\(|' +
-            'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
-            escapeRegExp(searchTerm) + '\\s*\\()'
-        );
-        if (pat.test(lineContent)) return true;
+        for (const className of dispatchNames) {
+            // Check for chained call: ClassName followed by constructor/call then .methodName(
+            const pat = new RegExp(
+                '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
+                escapeRegExp(searchTerm) + '\\s*\\(|' +
+                'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
+                escapeRegExp(searchTerm) + '\\s*\\()'
+            );
+            if (pat.test(lineContent)) return true;
+        }
     }
     return false;
 }
@@ -1421,11 +1527,14 @@ function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, 
         const calls = getCachedCalls(index, filePath);
         if (!calls) return;
         const testFrameworkCalls = new Set(['describe', 'it', 'test', 'spec']);
+        // Word-boundary match: `describe("untargeted zone")` is not a test
+        // case for `target` (fix #246 — raw substring matched mid-word).
+        const termPattern = new RegExp('(^|[^\\w$])' + escapeRegExp(searchTerm) + '([^\\w$]|$)');
         for (const call of calls) {
             if (!testFrameworkCalls.has(call.name)) continue;
             const lineContent = index.getLineContent(filePath, call.line);
             // Check if searchTerm appears in the description string on this line
-            if (lineContent.includes(searchTerm) && !matchLines.has(call.line)) {
+            if (termPattern.test(lineContent) && !matchLines.has(call.line)) {
                 // className scoping: only add test-case if the test body has a
                 // class-scoped match (call or class-receiver reference) — not just
                 // any mention of className.

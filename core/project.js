@@ -1100,9 +1100,16 @@ class ProjectIndex {
             const extra = others.length - shown.length;
             const alsoIn = shown.map(d => `${d.relativePath}:${d.startLine}`).join(', ');
             const suffix = extra > 0 ? `, and ${extra} more` : '';
+            // file= can only disambiguate when the alternatives live in other
+            // files (fix #246: same-file collisions — a standalone fn and a
+            // same-name method — need a line or class pin instead).
+            const allSameFile = others.every(d => d.relativePath === def.relativePath);
+            const hint = allSameFile
+                ? 'Use line= or class_name= to disambiguate.'
+                : 'Use file= to disambiguate.';
             warnings.push({
                 type: 'ambiguous',
-                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${alsoIn}${suffix}. Use file= to disambiguate.`,
+                message: `Found ${definitions.length} definitions for "${name}". Using ${def.relativePath}:${def.startLine}. Also in: ${alsoIn}${suffix}. ${hint}`,
                 alternatives: others.map(d => ({
                     file: d.relativePath,
                     line: d.startLine

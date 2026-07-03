@@ -3621,3 +3621,39 @@ describe('fix #244 (Rust): test-discovery physics', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #246: Cargo package-name imports from integration tests', () => {
+    it('use <pkg>::item in tests/ resolves to the lib tree and confirms the caller', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "my-crate"\n',
+            'src/lib.rs': 'pub fn helper() -> i32 { 1 }\n',
+            'tests/integration_test.rs': 'use my_crate::helper;\n#[test]\nfn test_helper() {\n    helper();\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('helper', { collectAccount: true, includeTests: true });
+            const edge = callers.find(c => c.relativePath.includes('integration_test'));
+            assert.ok(edge, 'integration-test edge present');
+            assert.strictEqual(edge.tier, 'confirmed',
+                `the [package] name IS the crate under test, got ${edge.tier}/${edge.resolution}`);
+        } finally { rm(dir); }
+    });
+
+    it('inside src/, a path starting with the package name stays a child module', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "app"\n',
+            'src/lib.rs': 'mod app;\nuse app::inner;\npub fn top() { inner(); }\n',
+            'src/app.rs': 'pub fn inner() {}\n',
+            'src/inner.rs': 'pub fn decoy() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            // The import edge from lib.rs must land on src/app.rs (the child
+            // module), not resolve app:: as the crate root.
+            const libAbs = [...index.files.keys()].find(f => f.endsWith('src/lib.rs'));
+            const appAbs = [...index.files.keys()].find(f => f.endsWith('src/app.rs'));
+            const edges = index.importGraph.get(libAbs) || new Set();
+            assert.ok(edges.has(appAbs), 'lib.rs -> src/app.rs child-module edge kept');
+        } finally { rm(dir); }
+    });
+});

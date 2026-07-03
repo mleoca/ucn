@@ -307,7 +307,17 @@ function findCargoRoot(startDir) {
             // root their module tree at the Cargo.toml directory — requiring
             // src/ left every crate:: path in such crates unresolved.
             const srcDir = path.join(dir, 'src');
-            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir };
+            // The [package] name is the crate's import identity for its OWN
+            // integration tests/benches/examples (`use mypkg::...` in
+            // tests/*.rs — fix #246); `-` normalizes to `_` in code.
+            let packageName = null;
+            try {
+                const toml = fs.readFileSync(cargoPath, 'utf-8');
+                const pkgSection = toml.split(/^\s*\[/m).find(s => s.startsWith('package]'));
+                const m = pkgSection && pkgSection.match(/^\s*name\s*=\s*"([^"]+)"/m);
+                if (m) packageName = m[1].replace(/-/g, '_');
+            } catch { /* unreadable Cargo.toml — no package identity */ }
+            const result = { root: dir, srcDir: fs.existsSync(srcDir) ? srcDir : dir, packageName };
             cargoCache.set(startDir, result);
             return result;
         }
@@ -390,6 +400,30 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
         // no ITEM.rs — the import points at lib.rs/main.rs itself.
         return resolveRustModulePath(cargo.srcDir, segments) ||
             rustModuleOwnFile(cargo.srcDir, fromFile);
+    }
+
+    // Own-package-name paths (fix #246): integration tests, benches, and
+    // examples are separate crates that import the lib target by its Cargo
+    // [package] name — `use mypkg::helper;` in tests/*.rs is the crate under
+    // test, resolved exactly like crate:: into the package's source tree.
+    // Only fires for files OUTSIDE the package's own module tree (inside
+    // src/, a path starting with the package name is a 2015-edition CHILD
+    // module, never the crate itself). Cross-crate workspace imports keep
+    // their own package names and never match this file's Cargo.toml.
+    {
+        const firstSeg = importPath.split('::')[0].replace(/-/g, '_');
+        const cargo = findCargoRoot(fromDir);
+        if (cargo && cargo.packageName && firstSeg === cargo.packageName) {
+            const topDir = path.relative(cargo.root, fromFile).split(path.sep)[0];
+            const externalTarget = topDir === 'tests' || topDir === 'benches' || topDir === 'examples' ||
+                !fromFile.startsWith(cargo.srcDir + path.sep);
+            if (externalTarget) {
+                const restSegs = importPath.split('::').slice(1);
+                const resolved = restSegs.length > 0 ? resolveRustModulePath(cargo.srcDir, restSegs) : null;
+                const fallback = resolved || rustModuleOwnFile(cargo.srcDir, fromFile);
+                if (fallback) return fallback;
+            }
+        }
     }
 
     // super:: paths - resolve relative to parent module

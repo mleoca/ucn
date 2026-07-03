@@ -5079,3 +5079,193 @@ describe('fix #243: deadcode --in and entrypoints --framework validation', () =>
         } finally { rm(dir); }
     });
 });
+
+describe('fix #246: affectedTests coverage bands agree with the engine account', () => {
+    it('excluded receiver-type-mismatch site is not confirmed coverage', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save(data){return data;}\nclass Store { save(data){return 1;} }\nmodule.exports={save,Store};\n',
+            '__tests__/x.test.js': 'const {Store}=require("../lib");\nit("t",()=>{ const s=new Store(); s.save({b:2}); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'affectedTests', { name: 'save', file: 'lib.js', line: 1 });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.testFiles.length, 0, 's.save() on a typed Store is excluded, never coverage');
+            assert.ok(r.result.uncovered.includes('save'));
+        } finally { rm(dir); }
+    });
+
+    it('renamed destructured import edge IS coverage (text scan cannot see it)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save(data){return data;}\nmodule.exports={save};\n',
+            '__tests__/r.test.js': 'const { save: persist } = require("../lib");\nit("t",()=>{ persist({a:1}); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'affectedTests', { name: 'save' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.uncovered.length, 0, 'persist() is a confirmed edge of save');
+            const tf = r.result.testFiles.find(t => t.file.includes('r.test.js'));
+            assert.ok(tf && tf.coveredFunctions.includes('save'));
+            assert.ok(tf.matches.some(m => m.matchType === 'call' && m.line === 2));
+        } finally { rm(dir); }
+    });
+
+    it('callback function-reference edge IS coverage', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function formatItem(item){return item;}\nmodule.exports={formatItem};\n',
+            '__tests__/d.test.js': 'const {formatItem}=require("../lib");\nit("cb",()=>{ const out=[1,2].map(formatItem); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'affectedTests', { name: 'formatItem' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.uncovered.length, 0);
+            const tf = r.result.testFiles.find(t => t.file.includes('d.test.js'));
+            assert.ok(tf && tf.matches.some(m => m.matchType === 'call'), 'usage-style edge counts as call coverage');
+        } finally { rm(dir); }
+    });
+
+    it('--file pin: a test importing the OTHER same-name def is not coverage', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function util(x){return x+1;}\nmodule.exports={util};\n',
+            'b.js': 'function util(x){return x+2;}\nmodule.exports={util};\n',
+            '__tests__/a.test.js': 'const {util}=require("../a");\nit("a",()=>{ util(1); });\n',
+            '__tests__/b.test.js': 'const {util}=require("../b");\nit("b",()=>{ util(1); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'affectedTests', { name: 'util', file: 'a.js' });
+            assert.ok(r.ok);
+            const files = r.result.testFiles.map(t => t.file);
+            assert.ok(files.some(f => f.includes('a.test.js')), 'own test covers');
+            assert.ok(!files.some(f => f.includes('b.test.js')), "b's test imports b.js — excluded other-definition-import");
+        } finally { rm(dir); }
+    });
+
+    it('anonymous it() arrow frontier site routes into possiblyAffectedTests', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/store.ts': 'export class Store { fetch(): number { return 1; } }\nexport class Api { fetch(): number { return 2; } }\n',
+            'src/frontier.test.ts': 'import { Store, Api } from "./store";\nfunction pick(): any { return new Store(); }\nit("fetches", () => {\n  const s = pick();\n  expect(s.fetch()).toBe(1);\n});\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'affectedTests', { name: 'fetch', className: 'Store' });
+            assert.ok(r.ok);
+            const poss = r.result.possiblyAffectedTests.map(t => t.file);
+            assert.ok(poss.some(f => f.includes('frontier.test.ts')),
+                'unverified site in an anonymous test callback must reach the possible band');
+        } finally { rm(dir); }
+    });
+
+    it('same-file ambiguity suggests line=/class_name=, not file=', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function save(data){return data;}\nclass Store { save(data){return 1;} }\nmodule.exports={save,Store};\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'affectedTests', { name: 'save', file: 'lib.js' });
+            assert.ok(r.ok);
+            const warn = (r.result.warnings || []).find(w => w.type === 'ambiguous');
+            assert.ok(warn, 'ambiguity warning expected');
+            assert.ok(warn.message.includes('line=') && !warn.message.includes('Use file='),
+                'file= cannot disambiguate same-file collisions: ' + warn.message);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #246: tests command discipline', () => {
+    it('a test file defining its OWN same-name helper is not a match', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x){return x;}\nmodule.exports={helper};\n',
+            '__tests__/h.test.js': 'function helper(){return 42;}\nit("t",()=>{ expect(helper()).toBe(42); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'helper' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.length, 0, 'bare calls bind the local shadow');
+        } finally { rm(dir); }
+    });
+
+    it('a test file that IMPORTS the symbol still matches (no shadow)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper(x){return x;}\nmodule.exports={helper};\n',
+            '__tests__/i.test.js': 'const {helper}=require("../lib");\nit("t",()=>{ helper(1); });\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'helper' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(f => f.file.includes('i.test.js')));
+        } finally { rm(dir); }
+    });
+
+    it('file-path targets find import-linked JS/TS tests', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'src/lib.ts': 'export function target(): number { return 1; }\n',
+            'src/lib.test.ts': 'import { target } from "./lib";\nit("returns one", () => {\n  expect(target()).toBe(1);\n});\n',
+        });
+        try {
+            const index = idx(dir);
+            for (const t of ['src/lib.ts', 'lib.ts']) {
+                const r = execute(index, 'tests', { name: t });
+                assert.ok(r.ok, t);
+                const f = r.result.find(x => x.file.includes('lib.test.ts'));
+                assert.ok(f, `${t}: importing test file found`);
+                assert.ok(f.matches.some(m => m.matchType === 'import'), 'import line listed');
+                assert.ok(f.matches.some(m => m.matchType === 'call'), 'call of imported name listed');
+            }
+        } finally { rm(dir); }
+    });
+
+    it('className scoping accepts non-overriding subclass receivers, rejects overriding ones', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'src/box.ts': 'export abstract class Shape {\n  abstract area(): number;\n  describe(): string { return "area=" + this.area(); }\n}\nexport class Circle extends Shape {\n  constructor(private r: number) { super(); }\n  area(): number { return 3.14 * this.r * this.r; }\n}\nexport class Square extends Shape {\n  constructor(private s: number) { super(); }\n  area(): number { return this.s * this.s; }\n  describe(): string { return "square"; }\n}\n',
+            'src/box.test.ts': 'import { Circle, Square } from "./box";\nit("describes", () => {\n  const c = new Circle(2);\n  expect(c.describe()).toContain("area=");\n});\nit("sq", () => {\n  const q = new Square(3);\n  expect(q.describe()).toBe("square");\n});\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'describe', className: 'Shape' });
+            assert.ok(r.ok);
+            const f = r.result.find(x => x.file.includes('box.test.ts'));
+            assert.ok(f, 'Circle (non-overriding) dispatches Shape.describe');
+            assert.ok(f.matches.some(m => m.matchType === 'call' && m.content.includes('c.describe')));
+            assert.ok(!f.matches.some(m => m.content.includes('q.describe')),
+                'Square overrides describe — its receiver is not Shape coverage');
+            const at = execute(index, 'affectedTests', { name: 'describe', className: 'Shape' });
+            assert.ok(at.ok);
+            assert.ok(at.result.testFiles.some(t => t.file.includes('box.test.ts')),
+                'affectedTests agrees via the engine edge');
+        } finally { rm(dir); }
+    });
+
+    it('test-case titles match on word boundaries only', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'src/lib.ts': 'export function target(): number { return 1; }\nexport function other(): number { return 2; }\n',
+            'src/lib.test.ts': 'import { target, other } from "./lib";\ndescribe("untargeted zone", () => {\n  it("checks other", () => {\n    expect(other()).toBe(2);\n  });\n});\nit("real coverage", () => {\n  expect(target()).toBe(1);\n});\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'target' });
+            assert.ok(r.ok);
+            const f = r.result.find(x => x.file.includes('lib.test.ts'));
+            assert.ok(f);
+            assert.ok(!f.matches.some(m => m.line === 2), '"untargeted" must not match target');
+        } finally { rm(dir); }
+    });
+});

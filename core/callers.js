@@ -634,7 +634,8 @@ function findCallers(index, name, options = {}) {
                     const cbSameFile = cbTargetFiles.has(filePath);
                     const cbSamePackage = !cbSameFile &&
                         langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
-                        cbTargetDefs.some(d => d.file && path.dirname(d.file) === path.dirname(filePath));
+                        cbTargetDefs.some(d => d.file &&
+                            _sameNominalPackageDir(path.dirname(d.file), path.dirname(filePath), fileEntry.language));
                     let cbImportLink = false;
                     if (!cbSameFile && !cbSamePackage) {
                         const cbImports = index.importGraph.get(filePath);
@@ -1911,7 +1912,8 @@ function findCallers(index, name, options = {}) {
                 // evidence, not a bare name match.
                 const hasSamePackageEvidence = !hasImportLink &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
-                    targetDefs2.some(d => d.file && path.dirname(d.file) === path.dirname(filePath));
+                    targetDefs2.some(d => d.file &&
+                        _sameNominalPackageDir(path.dirname(d.file), path.dirname(filePath), fileEntry.language));
 
                 // Possible-dispatch tiering (nominal languages, contract surface
                 // only): methodCallInclusion='auto' confirms method calls with
@@ -4432,6 +4434,28 @@ function _isGenericParamReceiverType(index, filePath, line, typeName) {
     if (/^[A-Z][A-Z0-9]?$/.test(typeName) &&
         !(index.symbols.get(typeName) || []).some(d => IDENTITY_TYPE_KINDS.has(d.type))) return true;
     return _isEnclosingGenericParam(index, filePath, line, typeName);
+}
+
+/**
+ * Java same-package check across Maven/Gradle source roots (fix #246):
+ * src/main/java/<pkg> and src/test/java/<pkg> hold the SAME package —
+ * javac compiles both source sets onto one classpath, so a test file sees
+ * the main tree's package members without an import. Two dirs are
+ * same-package when equal, or (Java only) when both sit under a
+ * `src/<set>/java/` source root with the same module prefix and the same
+ * package-relative path. Different modules keep distinct prefixes, so
+ * same-named packages across a monorepo stay separate.
+ */
+function _sameNominalPackageDir(dirA, dirB, language) {
+    if (dirA === dirB) return true;
+    if (language !== 'java') return false;
+    const norm = (d) => {
+        const m = d.match(/^(.*?)[\/\\]src[\/\\][^\/\\]+[\/\\]java(?:[\/\\](.*))?$/);
+        return m ? `${m[1]} ${m[2] || ''}` : null;
+    };
+    const a = norm(dirA);
+    if (a === null) return false;
+    return a === norm(dirB);
 }
 
 function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs) {

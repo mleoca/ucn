@@ -88,7 +88,11 @@ const UCN_VERSION = require('../package.json').version;
 // wrappers, and `export namespace` (the namespace is the importable name),
 // and TS import-equals (`import x = require('./y')`) produces an import
 // record (the dependency edge was invisible to all filedeps commands).
-const CACHE_FORMAT_VERSION = 35;
+// v36 (fix #246): persisted importGraph/moduleResolved content changed —
+// Rust own-package-name imports (`use my_crate::helper` in tests/, benches/,
+// examples/) resolve into the package's source tree via the Cargo [package]
+// name, so integration-test dependency edges exist.
+const CACHE_FORMAT_VERSION = 36;
 
 /**
  * Save index to cache file

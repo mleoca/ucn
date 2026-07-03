@@ -3004,3 +3004,38 @@ describe('fix #244 (Java): same-package test discovery and shadow discipline', (
         } finally { rm(dir); }
     });
 });
+
+describe('fix #246: Maven/Gradle source roots are one package', () => {
+    it('src/test/java caller of a src/main/java static method confirms via same-package scope', () => {
+        const dir = tmp({
+            'src/main/java/App.java': 'public class App {\n    public static int helper() { return 1; }\n}',
+            'src/test/java/AppTest.java': 'public class AppTest {\n    public void testHelper() { App.helper(); }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('helper', { collectAccount: true, includeMethods: true, includeTests: true });
+            const testEdge = callers.find(c => c.relativePath.includes('AppTest'));
+            assert.ok(testEdge, 'edge present');
+            assert.strictEqual(testEdge.tier, 'confirmed',
+                `same declared package across source sets is scope evidence, got ${testEdge.tier}/${testEdge.resolution}`);
+        } finally { rm(dir); }
+    });
+
+    it('same-named packages in DIFFERENT modules stay separate', () => {
+        const dir = tmp({
+            'svc-a/src/main/java/com/util/App.java': 'package com.util;\npublic class App {\n    public static int helper() { return 1; }\n    public static int caller() { return helper(); }\n}',
+            'svc-b/src/main/java/com/util/Other.java': 'package com.util;\npublic class Other {\n    public void run() { App.helper(); }\n}',
+        });
+        try {
+            const index = idx(dir);
+            const callers = index.findCallers('helper', { collectAccount: true, includeMethods: true });
+            const crossModule = callers.find(c => c.relativePath.includes('svc-b'));
+            // svc-b has no import edge and a different module prefix — the
+            // edge may surface, but never via same-package scope confirmation.
+            if (crossModule) {
+                assert.notStrictEqual(crossModule.resolution, 'scope-match',
+                    'different module prefixes must not create package identity');
+            }
+        } finally { rm(dir); }
+    });
+});

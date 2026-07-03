@@ -20,7 +20,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges } = require('./shared');
+const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
 const { detectLanguage, getLanguageModule } = require('../languages');
@@ -330,6 +330,10 @@ function blast(index, name, options = {}) {
         const includeMethods = options.includeMethods ?? true;
         const exclude = options.exclude || [];
         const expandUnverified = !!options.expandUnverified;
+        // Internal (affectedTests): observe which names had their callers
+        // searched and where the confirmed trunk edges sit, without changing
+        // the blast result shape (fix #246).
+        const collect = options._collect || null;
 
         const { def, definitions, warnings } = index.resolveSymbol(name, { file: options.file, className: options.className, line: options.line });
         if (!def) return null;
@@ -393,6 +397,7 @@ function blast(index, name, options = {}) {
                 treeAccount.nodesExpanded++;
                 _aggregateExcluded(treeAccount, raw);
                 if (currentDepth === 0) rootRaw = raw;
+                if (collect && !chainUnverified) collect.onExpand?.(funcDef);
 
                 // Confirmed-tier call sites form the trunk
                 let callers = confirmed;
@@ -403,6 +408,9 @@ function blast(index, name, options = {}) {
                     if (currentDepth === 0) rootFiltered += before - callers.length;
                 }
                 treeAccount.confirmedEdges += callers.length;
+                if (collect && !chainUnverified) {
+                    for (const c of callers) collect.onConfirmed?.(funcDef, c);
+                }
 
                 // Unverified-tier candidates: visible frontier entries,
                 // expanded only under expandUnverified.
@@ -787,7 +795,15 @@ function affectedTests(index, name, options = {}) {
     index._beginOp();
     try {
         const maxDepth = Math.max(0, options.depth ?? 3);
-        // Step 1: confirmed closure via blast (contract mode, no truncation)
+        // Step 1: confirmed closure via blast (contract mode, no truncation).
+        // The collector records, per trunk name, (a) whether the engine
+        // searched its callers and (b) where the confirmed edges sit — the
+        // coverage bands below must agree with that answer instead of
+        // re-deciding it with a text scan (fix #246: the scan credited call
+        // sites the same payload's account excluded, and missed confirmed
+        // edges text can't see — renamed destructure aliases, callback refs).
+        const expandedNames = new Set();
+        const confirmedSitesByName = new Map(); // name → Map(relPath → Set(line))
         const blastResult = index.blast(name, {
             depth: maxDepth,
             file: options.file,
@@ -795,6 +811,16 @@ function affectedTests(index, name, options = {}) {
             all: true,
             exclude: options.exclude,
             includeMethods: options.includeMethods,
+            _collect: {
+                onExpand: (funcDef) => expandedNames.add(funcDef.name),
+                onConfirmed: (funcDef, c) => {
+                    let byFile = confirmedSitesByName.get(funcDef.name);
+                    if (!byFile) { byFile = new Map(); confirmedSitesByName.set(funcDef.name, byFile); }
+                    let lines = byFile.get(c.relativePath);
+                    if (!lines) { lines = new Set(); byFile.set(c.relativePath, lines); }
+                    lines.add(c.line);
+                },
+            },
         });
         if (!blastResult) return null;
 
@@ -859,23 +885,35 @@ function affectedTests(index, name, options = {}) {
                 // isProductionName filters it from possiblyAffected, and the
                 // test scan greps for calls OF it — tests are never called.
                 // Route its FILE into possiblyAffectedTests directly.
-                if (fe.callerFile && fe.callerName) {
-                    const cfe = index.files.get(fe.callerFile);
+                // Anonymous test callbacks (`it('...', () => { x.save() })`)
+                // have no enclosing NAMED caller at all — the site's file is
+                // still test evidence, so route by the site file whenever it
+                // is a test file (fix #246; the caller-file and site file are
+                // the same file by construction when both exist).
+                const siteFile = fe.callerFile || fe.file;
+                if (siteFile) {
+                    const cfe = index.files.get(siteFile);
                     if (cfe) {
                         let isTestCaller = isTestFile(cfe.relativePath, cfe.language);
-                        if (!isTestCaller) {
+                        if (!isTestCaller && fe.callerName) {
                             const defs = index.symbols.get(fe.callerName);
                             const d = defs?.find(x => x.file === fe.callerFile && x.startLine === fe.callerStartLine);
                             const kindOf = getLanguageModule(cfe.language)?.getEntryPointKind;
                             if (d && kindOf && kindOf(d) === 'test') isTestCaller = true;
                         }
+                        if (!isTestCaller && fe.line != null) {
+                            // Inline #[cfg(test)] regions of production files
+                            // are test code too — but only within the ranges.
+                            const ranges = inlineTestRanges(cfe);
+                            if (ranges.length > 0 && lineInRanges(fe.line, ranges)) isTestCaller = true;
+                        }
                         if (isTestCaller &&
                             (excludeArr.length === 0 || index.matchesFilters(cfe.relativePath, { exclude: excludeArr }))) {
                             const affName = fe.atNode?.name || name;
-                            let entry = frontierTestHits.get(fe.callerFile);
+                            let entry = frontierTestHits.get(siteFile);
                             if (!entry) {
                                 entry = { rel: cfe.relativePath, byName: new Map() };
-                                frontierTestHits.set(fe.callerFile, entry);
+                                frontierTestHits.set(siteFile, entry);
                             }
                             let hitLines = entry.byName.get(affName);
                             if (!hitLines) { hitLines = new Set(); entry.byName.set(affName, hitLines); }
@@ -909,6 +947,7 @@ function affectedTests(index, name, options = {}) {
         const results = [];
         const possibleResults = [];
         const scanNames = [...affectedNames, ...possiblyNames];
+        const dispatchNamesCache = new Map(); // `${class}:${name}` → Set(classNames)
         for (const [filePath, fileEntry] of index.files) {
             let isTest = isTestFile(fileEntry.relativePath, fileEntry.language);
             // Rust inline #[cfg(test)] modules: source files with #[test]-marked symbols
@@ -930,12 +969,21 @@ function affectedTests(index, name, options = {}) {
                 const fileMatches = new Map();
 
                 for (const funcName of scanNames) {
+                    // Confirmed trunk edges of this name in THIS file — the
+                    // engine's answer for the sites the text scan is about
+                    // to re-derive (fix #246).
+                    const engineFileSites = confirmedSitesByName.get(funcName)?.get(fileEntry.relativePath) || null;
+                    // Whether the engine searched this name's callers at all
+                    // (depth-limit nodes were never adjudicated — the text
+                    // scan remains their best-effort fallback).
+                    const engineAdjudicated = expandedNames.has(funcName);
+
                     // Fast pre-check
-                    if (!content.includes(funcName)) continue;
+                    if (!content.includes(funcName) && !engineFileSites) continue;
 
                     // AST-based usage detection
-                    const astUsages = index._getCachedUsages(filePath, funcName);
-                    if (!astUsages || astUsages.length === 0) continue;
+                    const astUsages = index._getCachedUsages(filePath, funcName) || [];
+                    if (astUsages.length === 0 && !engineFileSites) continue;
 
                     // className scoping: the user's pin applies to the ROOT
                     // symbol's own name only (fix #239, G3-go-measured) — a
@@ -969,10 +1017,25 @@ function affectedTests(index, name, options = {}) {
                         localDefs.every(s => !confirmedKeys.has(`${fileEntry.relativePath}:${s.startLine}`)) &&
                         !(fileEntry.importBindings || []).some(b => b.name === funcName);
 
-                    // Build instance type map for className scoping (if applicable)
+                    // Build instance type map for className scoping (if applicable).
+                    // Scoping accepts the class plus its non-overriding
+                    // descendants — instances of a subclass that doesn't
+                    // override funcName dispatch to the target (fix #246).
                     let instanceTypeMap = null;
+                    let dispatchNames = null;
                     if (scopeToClass) {
-                        instanceTypeMap = _buildInstanceTypeMapForTracing(index, filePath, content, scopeToClass);
+                        const dnKey = `${scopeToClass}:${funcName}`;
+                        dispatchNames = dispatchNamesCache.get(dnKey);
+                        if (!dispatchNames) {
+                            dispatchNames = classDispatchNames(index, scopeToClass, funcName);
+                            dispatchNamesCache.set(dnKey, dispatchNames);
+                        }
+                        instanceTypeMap = new Map();
+                        for (const dn of dispatchNames) {
+                            for (const [recv, cls] of _buildInstanceTypeMapForTracing(index, filePath, content, dn)) {
+                                if (!instanceTypeMap.has(recv)) instanceTypeMap.set(recv, cls);
+                            }
+                        }
                     }
 
                     const seenLines = new Set();
@@ -981,9 +1044,15 @@ function affectedTests(index, name, options = {}) {
                         // Inline-test-promoted file: only lines inside the
                         // test ranges are test code (fix #244).
                         if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
+                        // The engine confirmed this exact site as a caller
+                        // edge — its receiver physics subsume every text
+                        // heuristic below (fix #246: exact-class scoping
+                        // rejected a non-overriding subclass receiver the
+                        // engine had confirmed).
+                        const engineConfirmedHere = engineFileSites ? engineFileSites.has(usage.line) : false;
                         // Local same-name shadow: bare calls bind the test
                         // file's OWN definition, never the affected symbol.
-                        if (localShadow && !usage.receiver && usage.usageType !== 'import') continue;
+                        if (localShadow && !engineConfirmedHere && !usage.receiver && usage.usageType !== 'import') continue;
                         const lineKey = `${usage.line}:${usage.usageType}`;
                         if (seenLines.has(lineKey)) continue;
                         seenLines.add(lineKey);
@@ -996,18 +1065,34 @@ function affectedTests(index, name, options = {}) {
                         } else {
                             matchType = 'reference';
                         }
+                        // A confirmed usage-style edge (callback reference,
+                        // method value — fix #221) IS coverage: the test
+                        // executes the symbol through the reference.
+                        if (engineConfirmedHere && matchType === 'reference') matchType = 'call';
 
-                        // className scoping for calls: check receiver
-                        if (scopeToClass && matchType === 'call') {
-                            if (!_receiverMatchesClassTracing(usage, scopeToClass, instanceTypeMap,
+                        if (matchType === 'call' && !engineConfirmedHere && engineAdjudicated) {
+                            // The engine searched this name's callers and did
+                            // NOT confirm this site — the same payload's
+                            // account holds it excluded-with-reason or
+                            // unverified. Crediting it as confirmed coverage
+                            // would contradict the account (fix #246);
+                            // unverified sites surface in
+                            // possiblyAffectedTests via the frontier.
+                            continue;
+                        }
+
+                        // className scoping for calls (text physics — only
+                        // depth-limit names reach this un-adjudicated)
+                        if (scopeToClass && matchType === 'call' && !engineConfirmedHere) {
+                            if (!_receiverMatchesClassTracing(usage, dispatchNames, instanceTypeMap,
                                 index.getLineContent(filePath, usage.line), funcName)) continue;
                         }
 
                         // className scoping for references: require class-associated receiver
                         if (scopeToClass && matchType === 'reference') {
                             if (!usage.receiver) continue;
-                            if (usage.receiver !== scopeToClass &&
-                                !(instanceTypeMap && instanceTypeMap.get(usage.receiver) === scopeToClass)) {
+                            if (!dispatchNames.has(usage.receiver) &&
+                                !(instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver)))) {
                                 continue;
                             }
                         }
@@ -1018,6 +1103,26 @@ function affectedTests(index, name, options = {}) {
                             line: usage.line, content: lineContent.trim(),
                             matchType, functionName: funcName
                         });
+                    }
+
+                    // Confirmed engine sites the text scan could not see —
+                    // renamed destructure aliases (`{ save: persist }`),
+                    // beyondText lines — are coverage too (fix #246). The
+                    // dedup map below collapses any line the loop already
+                    // matched (call outranks reference).
+                    if (engineFileSites) {
+                        for (const ln of [...engineFileSites].sort((a, b) => a - b)) {
+                            if (testRanges && !lineInRanges(ln, testRanges)) continue;
+                            const lineKey = `${ln}:call`;
+                            if (seenLines.has(lineKey)) continue;
+                            seenLines.add(lineKey);
+                            if (!fileMatches.has(funcName)) fileMatches.set(funcName, []);
+                            fileMatches.get(funcName).push({
+                                line: ln,
+                                content: (index.getLineContent(filePath, ln) || '').trim(),
+                                matchType: 'call', functionName: funcName
+                            });
+                        }
                     }
 
                     // Language-aware test-case detection
@@ -1085,9 +1190,28 @@ function affectedTests(index, name, options = {}) {
         // the unverified caller never surfaces via the scan (the scan greps
         // for calls of scanNames; the test's name is not among them) — add
         // it to the possible band with its unverified call sites (fix #244).
+        // A file already present for OTHER names still gets this name listed
+        // as possibly covered (fix #246 — the file-level dedup silently
+        // dropped per-name possible coverage).
         for (const [absFile, entry] of frontierTestHits) {
-            if (results.some(r => r.file === entry.rel) ||
-                possibleResults.some(r => r.file === entry.rel)) continue;
+            const inResults = results.find(r => r.file === entry.rel);
+            const inPossible = possibleResults.find(r => r.file === entry.rel);
+            if (inResults || inPossible) {
+                const existing = inResults || inPossible;
+                const have = new Set([
+                    ...existing.coveredFunctions,
+                    ...(existing.possiblyCovered || []),
+                ]);
+                const extra = [...entry.byName.keys()].filter(n => !have.has(n)).sort(codeUnitCompare);
+                if (extra.length > 0) {
+                    if (inResults) {
+                        existing.possiblyCovered = [...(existing.possiblyCovered || []), ...extra].sort(codeUnitCompare);
+                    } else {
+                        existing.coveredFunctions = [...existing.coveredFunctions, ...extra].sort(codeUnitCompare);
+                    }
+                }
+                continue;
+            }
             const covered = [...entry.byName.keys()].sort(codeUnitCompare);
             const matches = [];
             for (const fn of covered) {
@@ -1181,10 +1305,12 @@ function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches
         const calls = getCachedCalls(index, filePath);
         if (!calls) return;
         const testFrameworkCalls = new Set(['describe', 'it', 'test', 'spec']);
+        // Word-boundary match (fix #246): substring matched mid-word titles.
+        const termPattern = new RegExp('(^|[^\\w$])' + escapeRegExp(funcName) + '([^\\w$]|$)');
         for (const call of calls) {
             if (!testFrameworkCalls.has(call.name)) continue;
             const lineContent = index.getLineContent(filePath, call.line);
-            if (lineContent.includes(funcName) && !existingLines.has(call.line)) {
+            if (termPattern.test(lineContent) && !existingLines.has(call.line)) {
                 // Only add test-case if a call match exists in the test body
                 const endLine = _estimateTestBlockEndTracing(index, filePath, call.line);
                 const hasCallMatch = existingMatches.some(m =>
@@ -1272,21 +1398,24 @@ function _buildInstanceTypeMapForTracing(index, filePath, content, targetClassNa
 }
 
 /**
- * Check if a usage's receiver matches the target className (for affectedTests).
+ * Check if a usage's receiver matches any of the target dispatch class names
+ * (the class + its non-overriding descendants — fix #246) for affectedTests.
  * Same logic as _receiverMatchesClass in search.js.
  */
-function _receiverMatchesClassTracing(usage, className, instanceTypeMap, lineContent, searchTerm) {
-    if (usage.receiver === className) return true;
-    if (usage.receiver && instanceTypeMap && instanceTypeMap.get(usage.receiver) === className) return true;
+function _receiverMatchesClassTracing(usage, dispatchNames, instanceTypeMap, lineContent, searchTerm) {
+    if (usage.receiver && dispatchNames.has(usage.receiver)) return true;
+    if (usage.receiver && instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver))) return true;
     if (usage.receiver) return false;
     if (lineContent && searchTerm) {
-        const pat = new RegExp(
-            '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
-            escapeRegExp(searchTerm) + '\\s*\\(|' +
-            'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
-            escapeRegExp(searchTerm) + '\\s*\\()'
-        );
-        if (pat.test(lineContent)) return true;
+        for (const className of dispatchNames) {
+            const pat = new RegExp(
+                '\\b' + escapeRegExp(className) + '\\s*(?:(?:\\([^)]*\\)|\\{[^}]*\\})\\s*\\.\\s*' +
+                escapeRegExp(searchTerm) + '\\s*\\(|' +
+                'new\\s+' + escapeRegExp(className) + '\\s*\\([^)]*\\)\\s*\\.\\s*' +
+                escapeRegExp(searchTerm) + '\\s*\\()'
+            );
+            if (pat.test(lineContent)) return true;
+        }
     }
     return false;
 }

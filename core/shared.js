@@ -242,6 +242,34 @@ function lineInRanges(line, ranges) {
     return false;
 }
 
+/**
+ * Class names whose instances dispatch `methodName` to className's own
+ * definition: the class itself plus its transitive NON-overriding
+ * descendants (fix #246 — the #198 subtype rule brought to the test-scan
+ * className scoping: `c.describe()` on `Circle extends Shape` runs
+ * Shape.describe when Circle doesn't override it). Descent stops at an
+ * overriding child — its subtree binds the override, not the target.
+ * @returns {Set<string>}
+ */
+function classDispatchNames(index, className, methodName, cap = 256) {
+    const out = new Set([className]);
+    if (!index?.extendedByGraph || !methodName) return out;
+    const methodDefs = index.symbols?.get(methodName) || [];
+    const queue = [className];
+    while (queue.length > 0 && out.size < cap) {
+        const children = index.extendedByGraph.get(queue.pop());
+        if (!children) continue;
+        for (const child of children) {
+            const cName = typeof child === 'string' ? child : child.name;
+            if (!cName || out.has(cName)) continue;
+            if (methodDefs.some(d => d.className === cName)) continue; // overrides
+            out.add(cName);
+            queue.push(cName);
+        }
+    }
+    return out;
+}
+
 module.exports = {
     pickBestDefinition,
     addTestExclusions,
@@ -249,6 +277,7 @@ module.exports = {
     codeUnitCompare,
     inlineTestRanges,
     lineInRanges,
+    classDispatchNames,
     NON_CALLABLE_TYPES,
     formatSymbolHandle,
     parseSymbolHandle,

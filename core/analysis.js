@@ -1261,9 +1261,14 @@ function about(index, name, options = {}) {
             const extra = visibleOthers.length - shown.length;
             const alsoIn = shown.map(d => `${d.relativePath}:${d.startLine}`).join(', ');
             const suffix = extra > 0 ? `, and ${extra} more` : '';
+            // Same-file collisions can't be resolved with file= (fix #246).
+            const allSameFile = visibleOthers.every(d => d.relativePath === primary.relativePath);
+            const hint = allSameFile
+                ? 'Use line= or class_name= to disambiguate.'
+                : 'Use file= to disambiguate.';
             aboutWarnings.push({
                 type: 'ambiguous',
-                message: `Found ${visible.length} definitions for "${name}". Using ${primary.relativePath}:${primary.startLine}. Also in: ${alsoIn}${suffix}. Use file= to disambiguate.`,
+                message: `Found ${visible.length} definitions for "${name}". Using ${primary.relativePath}:${primary.startLine}. Also in: ${alsoIn}${suffix}. ${hint}`,
                 alternatives: visibleOthers.map(d => ({ file: d.relativePath, line: d.startLine })),
             });
         }
