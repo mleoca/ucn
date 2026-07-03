@@ -338,10 +338,13 @@ function formatStackTrace(result) {
     }
 
     const lines = [];
-    lines.push(`Stack trace: ${result.frameCount} frames`);
+    lines.push(`Stack trace: ${result.frameCount} frame${result.frameCount === 1 ? '' : 's'}`);
     lines.push('═'.repeat(60));
     const stAdvisory = advisoryLine(result.advisory);
     if (stAdvisory) lines.push(stAdvisory);
+    if (result.skippedFrames > 0) {
+        lines.push(`(${result.skippedFrames} frame(s) without file:line — Unknown Source, native — skipped)`);
+    }
 
     for (let i = 0; i < result.frames.length; i++) {
         const frame = result.frames[i];
@@ -367,6 +370,12 @@ function formatStackTrace(result) {
                 lines.push('');
                 lines.push(`  In: ${frame.functionInfo.name}(${frame.functionInfo.params || ''})`);
                 lines.push(`  Range: ${frame.functionInfo.startLine}-${frame.functionInfo.endLine}`);
+                // The engine computed this and both surfaces dropped it —
+                // an out-of-range line got an unqualified attribution
+                // (fix #251).
+                if (frame.functionInfo.lineMismatch) {
+                    lines.push(`  ⚠ line ${frame.line} is outside this range — nearest same-name definition shown`);
+                }
             }
         } else {
             lines.push(`  ${frame.file}:${frame.line} (file not found in project)`);
@@ -382,16 +391,26 @@ function formatStackTrace(result) {
  */
 function formatStackTraceJson(result) {
     if (!result || result.frameCount === 0) {
-        return JSON.stringify({ frameCount: 0, frames: [] }, null, 2);
+        return JSON.stringify({
+            frameCount: 0,
+            frames: [],
+            ...(result && result.advisory && { advisory: result.advisory }),
+        }, null, 2);
     }
 
     return JSON.stringify({
         frameCount: result.frameCount,
+        // The v4 two-tier surface: advisory commands self-label in JSON too
+        // (fix #251 — the result carried this and the text rendered it, but
+        // the JSON rebuild dropped it in every language cell).
+        ...(result.advisory && { advisory: result.advisory }),
+        ...(result.skippedFrames > 0 && { skippedFrames: result.skippedFrames }),
         frames: result.frames.map(f => ({
             function: f.function || null,
             file: f.file,
             line: f.line,
             found: !!f.found,
+            ...(f.confidence !== undefined && { confidence: f.confidence }),
             ...(f.resolvedFile && { resolvedFile: f.resolvedFile }),
             ...(f.context && { context: f.context.map(c => ({
                 line: c.line,
@@ -402,7 +421,8 @@ function formatStackTraceJson(result) {
                 name: f.functionInfo.name,
                 params: f.functionInfo.params || null,
                 startLine: f.functionInfo.startLine,
-                endLine: f.functionInfo.endLine
+                endLine: f.functionInfo.endLine,
+                ...(f.functionInfo.lineMismatch && { lineMismatch: true }),
             } }),
             ...(f.raw && { raw: f.raw })
         }))

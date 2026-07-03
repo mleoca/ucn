@@ -443,6 +443,11 @@ class ProjectIndex {
         }
         // Handle last line (no trailing newline)
         if (content.length - lineStart > 1000) longLineCount++;
+        // A trailing newline TERMINATES the last line rather than opening a
+        // new one (fix #251: stats reported wc -l + 1 for newline-terminated
+        // files); an empty file has 0 lines.
+        if (content.length === 0) lineCount = 0;
+        else if (content.charCodeAt(content.length - 1) === 10) lineCount--;
 
         const isBundled = (() => {
             // Webpack bundles contain __webpack_require__ or __webpack_modules__

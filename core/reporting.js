@@ -8,7 +8,8 @@
 'use strict';
 
 const fs = require('fs');
-const { codeUnitCompare } = require('./shared');
+const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
+const { _declaredFieldType } = require('./callers');
 const path = require('path');
 const { isTestFile } = require('./discovery');
 
@@ -68,9 +69,7 @@ function getStats(index, options = {}) {
         const functions = [];
         for (const [name, symbols] of index.symbols) {
             for (const sym of symbols) {
-                if (sym.type === 'function' || sym.type === 'method' || sym.type === 'static' ||
-                    sym.type === 'constructor' || sym.type === 'public' || sym.type === 'abstract' ||
-                    sym.type === 'classmethod') {
+                if (CALLABLE_SYMBOL_KINDS.has(sym.type)) {
                     const lineCount = sym.endLine - sym.startLine + 1;
                     const relativePath = sym.relativePath || (sym.file ? path.relative(index.root, sym.file) : '');
                     functions.push({
@@ -98,10 +97,7 @@ function getStats(index, options = {}) {
         const top = options.top === 0
             ? 0
             : ((options.top != null && Number(options.top) > 0) ? Number(options.top) : 10);
-        const FUNCTION_TYPES = new Set([
-            'function', 'method', 'static', 'constructor',
-            'public', 'abstract', 'classmethod'
-        ]);
+        const FUNCTION_TYPES = CALLABLE_SYMBOL_KINDS;
 
         // Ensure the calls cache is fully populated before counting.
         // First-time stats --hot may need to parse files to extract calls;
@@ -136,6 +132,7 @@ function getStats(index, options = {}) {
         // Pre-compute import-alias sets per file. Used to distinguish `mod.foo()`
         // (resolves to top-level foo) from `obj.foo()` on a local variable.
         const fileImportAliases = new Map();         // filePath -> Set<string> of alias names
+        const fieldHopCache = new Map();             // rootType\0field -> declared type|null
         for (const [filePath, fileEntry] of index.files) {
             const aliases = new Set();
             // importNames are the named imports/exports brought into this file.
@@ -179,11 +176,26 @@ function getStats(index, options = {}) {
                         importedReceiverCounts.set(c.name,
                             (importedReceiverCounts.get(c.name) || 0) + 1);
                     }
-                    if (c.receiverType) {
-                        let inner = methodByReceiverType.get(c.receiverType);
+                    // Field-access receivers (fix #251): `tm.service.Save()`
+                    // carries receiverRootType, not receiverType — the same
+                    // #202/#231 declared-field hop the caller/callee engine
+                    // uses. Without it, edges `context` confirms were
+                    // invisible to the hot leaderboard.
+                    let recvType = c.receiverType;
+                    if (!recvType && c.receiverField && c.receiverRootType) {
+                        const hopKey = `${c.receiverRootType}\u0000${c.receiverField}`;
+                        if (!fieldHopCache.has(hopKey)) {
+                            const lang = index.files.get(filePath)?.language;
+                            fieldHopCache.set(hopKey,
+                                lang ? _declaredFieldType(index, c.receiverRootType, c.receiverField, lang) : null);
+                        }
+                        recvType = fieldHopCache.get(hopKey);
+                    }
+                    if (recvType) {
+                        let inner = methodByReceiverType.get(recvType);
                         if (!inner) {
                             inner = new Map();
-                            methodByReceiverType.set(c.receiverType, inner);
+                            methodByReceiverType.set(recvType, inner);
                         }
                         inner.set(c.name, (inner.get(c.name) || 0) + 1);
                     }

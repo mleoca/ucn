@@ -5593,3 +5593,134 @@ describe('fix #249: wave-6 urgent correctness', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #251: G8 command surface', () => {
+    it('stats rankings cover accessor/private/dunder kinds', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.py': 'class ApiClient:\n    def _request(self, a, b):\n        x = 1\n        y = 2\n        z = 3\n        return a + b\n    def go(self):\n        self._request(1, 2)\n        self._request(3, 4)\n        return 1\n\nc = ApiClient()\nc.go()\n',
+        });
+        try {
+            const index = idx(dir);
+            const f = execute(index, 'stats', { functions: true }).result;
+            assert.strictEqual(f.functions[0].name, 'ApiClient._request', 'private method tops the length ranking');
+            const h = execute(index, 'stats', { hot: true }).result;
+            assert.strictEqual(h.hot.items[0].name, 'ApiClient._request', 'private method tops the hot list');
+            assert.strictEqual(h.hot.items[0].callCount, 2);
+        } finally { rm(dir); }
+    });
+
+    it('stats --hot attributes field-access receivers via the declared-field hop', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'a.go': 'package t\n\ntype DataService struct{}\nfunc (d DataService) Save() {}\n\ntype TaskManager struct {\n\tservice DataService\n}\nfunc (tm TaskManager) Run() {\n\ttm.service.Save()\n\ttm.service.Save()\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const h = execute(index, 'stats', { hot: true }).result;
+            const save = h.hot.items.find(x => x.name === 'DataService.Save');
+            assert.ok(save && save.callCount === 2, JSON.stringify(h.hot.items));
+        } finally { rm(dir); }
+    });
+
+    it('stats line counts treat a trailing newline as a terminator', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function x() {}\nmodule.exports = { x };\n',
+        });
+        try {
+            const index = idx(dir);
+            const s = execute(index, 'stats', {}).result;
+            assert.strictEqual(s.byLanguage.javascript.lines, 2, JSON.stringify(s.byLanguage));
+        } finally { rm(dir); }
+    });
+
+    it('api matches fileExports on aliases and clause exports; --limit carries meta', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'm.js': 'const LocalCls = class { run() { return 1; } };\nfunction helperFn() { return 2; }\nexport { LocalCls, helperFn as util };\n',
+        });
+        try {
+            const index = idx(dir);
+            const api = execute(index, 'api', {}).result;
+            assert.ok(api.some(s => s.name === 'util' && s.sourceName === 'helperFn'), 'alias shown');
+            assert.ok(api.some(s => s.name === 'LocalCls'), 'clause-exported class expression listed');
+            const limited = execute(index, 'api', { limit: 1 });
+            const j = JSON.parse(output.formatApiJson(limited.result));
+            assert.strictEqual(j.meta.truncated, true);
+            assert.ok(j.meta.total >= 2, JSON.stringify(j.meta));
+        } finally { rm(dir); }
+    });
+
+    it('typedef reaches namespaces and renders honest usage breakdowns', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'g.ts': 'export namespace Geometry {\n  export function area(r: number): number { return r * r; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'typedef', { name: 'Geometry' });
+            assert.ok(r.ok && r.result.length > 0, 'namespace found by typedef');
+            const s = execute(index, 'search', { term: 'Geometry', type: 'type' });
+            assert.ok(s.ok && s.result.matches?.length !== 0, 'namespace reachable via search --type type');
+            const text = output.formatTypedef(r.result, 'Geometry');
+            assert.ok(!/\(\d+ usages\)$/m.test(text) || text.includes('def'),
+                'usage numbers carry their breakdown: ' + text);
+        } finally { rm(dir); }
+    });
+
+    it('stacktrace: pre-1.65 Rust panics, Go generic frames, skipped frames, advisory JSON', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/main.rs': Array.from({ length: 160 }, (_, i) => `// line ${i + 1}`).join('\n') + '\nfn main() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'stacktrace', { stack: "thread 'main' panicked at 'index out of bounds', src/main.rs:150:9" }).result;
+            assert.strictEqual(r1.frames[0].file, 'src/main.rs', 'message not glued into the file');
+            assert.ok(r1.frames[0].found);
+            const r2 = execute(index, 'stacktrace', { stack: 'main.MapKeys[...](0x14000110000)\n\tsrc/main.go:12 +0x1c' }).result;
+            assert.strictEqual(r2.frames[0].function, 'MapKeys', 'generic marker stripped');
+            const r3 = execute(index, 'stacktrace', { stack: 'at com.example.Main.run(Main.java:99)\nat com.example.Main.main(Unknown Source)' }).result;
+            assert.strictEqual(r3.skippedFrames, 1);
+            const j = JSON.parse(output.formatStackTraceJson(r3));
+            assert.strictEqual(j.advisory, 'best-effort-frame-matching', 'advisory self-label in JSON');
+            assert.strictEqual(j.skippedFrames, 1);
+            const text = output.formatStackTrace({ advisory: 'best-effort-frame-matching', frameCount: 1, frames: [{ function: 'x', file: 'a.js', line: 1, found: false, raw: 'at x (a.js:1:1)' }] });
+            assert.ok(text.includes('1 frame\n') || text.startsWith('Stack trace: 1 frame'), text.split('\n')[0]);
+        } finally { rm(dir); }
+    });
+
+    it('member visibility: Java public fields/enum constants and Rust trait-impl methods in api', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub struct Config { pub name: String }\nimpl Default for Config {\n    fn default() -> Self { Config { name: String::new() } }\n}\nstruct Hidden;\nimpl Default for Hidden {\n    fn default() -> Self { Hidden }\n}\n',
+            'App.java': 'public class App {\n    public int counter;\n    private int secret;\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const api = execute(index, 'api', {}).result;
+            const names = api.map(s => (s.className ? s.className + '.' : '') + s.name);
+            assert.ok(names.includes('App.counter'), 'public Java field listed');
+            assert.ok(!names.includes('App.secret'), 'private Java field not listed');
+            assert.ok(names.includes('Config.default'), 'trait impl of a pub type listed');
+            assert.ok(!names.includes('Hidden.default'), 'trait impl of a private type not listed');
+        } finally { rm(dir); }
+    });
+
+    it('Python type aliases are indexed and typedef finds them', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            't.py': 'from typing import TypeAlias\n\ntype UserId = int\nVector: TypeAlias = list[float]\nnormal = 5\n',
+        });
+        try {
+            const index = idx(dir);
+            const r1 = execute(index, 'typedef', { name: 'UserId' });
+            assert.ok(r1.ok && r1.result[0]?.type === 'type', 'PEP 695 alias indexed');
+            const r2 = execute(index, 'typedef', { name: 'Vector' });
+            assert.ok(r2.ok && r2.result[0]?.aliasOf === 'list[float]', 'TypeAlias annotation indexed with aliasOf');
+            assert.ok(!(index.symbols.get('normal') || []).some(s => s.type === 'type'), 'plain assignments stay out');
+        } finally { rm(dir); }
+    });
+});

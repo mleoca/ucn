@@ -664,7 +664,7 @@ function structuralSearch(index, options = {}) {
             // classes, and records are types too.
             const functionTypes = new Set(['function', 'constructor', 'method', 'arrow', 'static', 'classmethod', 'abstract', 'private', 'property']);
             const classTypes = new Set(['class', 'struct', 'interface', 'impl', 'trait', 'record', 'enum']);
-            const typeTypes = new Set(['type', 'enum', 'interface', 'trait', 'record']);
+            const typeTypes = new Set(['type', 'enum', 'interface', 'trait', 'record', 'namespace']);
             const methodTypes = new Set(['method', 'constructor']);
 
             for (const [symbolName, definitions] of index.symbols) {
@@ -974,7 +974,7 @@ function example(index, name, options = {}) {
  * @returns {Array} Matching type definitions
  */
 function typedef(index, name, options = {}) {
-    const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class', 'record'];
+    const typeKinds = ['type', 'interface', 'enum', 'struct', 'trait', 'class', 'record', 'namespace'];
     const matches = find(index, name, options);
 
     return matches.filter(m => typeKinds.includes(m.type)).map(m => ({

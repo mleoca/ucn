@@ -1453,7 +1453,15 @@ const HANDLERS = {
         let note;
         if (limit && limit > 0 && Array.isArray(result)) {
             const { items, total, limited } = applyLimit(result, limit);
-            if (limited) note = limitNote(limit, total);
+            if (limited) {
+                note = limitNote(limit, total);
+                // Full-set size travels with the payload for --json
+                // (fix #251 — the deadcode/entrypoints #242/#247 shape).
+                Object.defineProperty(items, 'limitInfo', {
+                    value: { total, shown: limit },
+                    enumerable: false, writable: true, configurable: true,
+                });
+            }
             result = items;
         }
         return { ok: true, result, note };
@@ -1495,6 +1503,12 @@ const HANDLERS = {
             } else {
                 top = n;
             }
+        }
+        // --top only shapes the --hot leaderboard (fix #251: validated then
+        // silently ignored without it).
+        if (p.top != null && !p.hot) {
+            const depNote = 'Note: --top applies to the --hot leaderboard — add --hot to rank functions by call count.';
+            note = note ? `${note}\n${depNote}` : depNote;
         }
         const result = index.getStats({
             functions: p.functions || false,

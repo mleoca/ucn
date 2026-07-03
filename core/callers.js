@@ -5564,4 +5564,4 @@ function findCallbackUsages(index, name) {
     return usages;
 }
 
-module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches };
+module.exports = { getCachedCalls, findCallers, findCallees, getInstanceAttributeTypes, findCallbackUsages, _nameBindingReaches, _declaredFieldType };

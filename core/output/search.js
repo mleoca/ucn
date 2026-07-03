@@ -316,7 +316,20 @@ function formatTypedef(types, name) {
     } else {
         for (const t of types) {
             lines.push(`${t.relativePath}:${t.startLine}  ${t.type} ${t.name}`);
-            if (t.usageCount !== undefined) {
+            // Honest breakdown (fix #251): the fast-path count sees calls/
+            // defs/imports only — for TYPE symbols, reference-kind usage
+            // dominates and is NOT counted here; say what the number is.
+            if (t.usageCounts !== undefined) {
+                const c = t.usageCounts;
+                const parts = [];
+                if (c.calls > 0) parts.push(`${c.calls} calls`);
+                if (c.definitions > 0) parts.push(`${c.definitions} def`);
+                if (c.imports > 0) parts.push(`${c.imports} imports`);
+                if (c.references > 0) parts.push(`${c.references} refs`);
+                lines.push(parts.length > 0
+                    ? `  (${c.total} usages: ${parts.join(', ')} — type references not counted; use \`usages ${t.name}\`)`
+                    : `  (${c.total} usages)`);
+            } else if (t.usageCount !== undefined) {
                 lines.push(`  (${t.usageCount} usages)`);
             }
             if (t.code) {

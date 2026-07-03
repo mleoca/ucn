@@ -204,8 +204,15 @@ function formatApi(symbols, filePath) {
 function formatApiJson(symbols, filePath) {
     const { formatSymbolHandle } = require('../shared');
     const deduped = dedupExportSymbols(symbols);
+    // Under --limit the handler slices and attaches the full-set size
+    // (fix #251, the #242/#247 shape) — meta.total describes the FULL set.
+    const li = symbols.limitInfo;
     return JSON.stringify({
-        meta: { command: 'api', count: deduped.length },
+        meta: {
+            command: 'api',
+            count: deduped.length,
+            ...(li && { total: li.total, truncated: true }),
+        },
         ...(filePath && { file: filePath }),
         data: {
             exportCount: deduped.length,

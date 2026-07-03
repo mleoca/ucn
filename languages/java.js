@@ -589,6 +589,9 @@ function extractEnumConstants(enumNode, codeOrLines) {
                     startLine,
                     endLine,
                     memberType: 'constant',
+                    // JLS: enum constants are implicitly public static final
+                    // (fix #251 — api omitted them for lack of a modifier).
+                    modifiers: ['public', 'static', 'final'],
                     ...(argsNode && { params: argsNode.text.slice(1, -1) })
                 });
             }
@@ -724,6 +727,11 @@ function extractClassMembers(classNode, codeOrLines) {
         if (child.type === 'field_declaration') {
             const typeNode = child.childForFieldName('type');
             const fieldTypeText = typeNode ? typeNode.text : null;
+            // Visibility travels with the member (fix #251 — public
+            // instance fields were invisible to api/fileExports because
+            // the member had no modifiers for the #240 discipline to read;
+            // the #241 Rust-field twin).
+            const fieldModifiers = extractModifiers(child);
             for (let j = 0; j < child.namedChildCount; j++) {
                 const decl = child.namedChild(j);
                 if (decl.type === 'variable_declarator') {
@@ -735,6 +743,7 @@ function extractClassMembers(classNode, codeOrLines) {
                             startLine,
                             endLine,
                             memberType: 'field',
+                            ...(fieldModifiers.length > 0 && { modifiers: fieldModifiers }),
                             fieldType: fieldTypeText
                         });
                     }

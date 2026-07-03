@@ -1644,7 +1644,7 @@ function runInteractive(rootDir) {
         index.build(null, { quiet: true, workers: flags.workers });
     }
     const iExpandCache = new ExpandCache({ maxSize: 20 });
-    console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
+    console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} unique symbol names`);
     console.log('Type commands (e.g., "find parseFile", "about main", "toc")');
     console.log('Type "help" for commands, "quit" to exit\n');
 
@@ -1719,7 +1719,7 @@ Flags can be added per-command: context myFunc --include-methods
             index.build(null, { quiet: true, forceRebuild: true, workers: flags.workers });
             // Clear expand cache — stale line ranges after rebuild
             if (iExpandCache) iExpandCache.clearForRoot(index.root);
-            console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
+            console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} unique symbol names`);
             rl.prompt();
             return;
         }
@@ -1835,7 +1835,7 @@ const INTERACTIVE_DISPATCH = {
     endpoints:    { params: (a, f) => ({ file: f.file, exclude: f.exclude, limit: f.limit, framework: f.framework, bridge: f.bridge, serverOnly: f.serverOnly, clientOnly: f.clientOnly, unmatched: f.unmatched, method: f.method, prefix: f.prefix, hideUncertain: f.hideUncertain }), format: (r) => output.formatEndpoints(r, { bridge: r._bridge, unmatched: r._unmatched }) },
 
     // ── Other ────────────────────────────────────────────────────────
-    api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file || '.') },
+    api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file) },
     stacktrace:   { params: (a, f) => ({ stack: f.stack || a }), format: (r) => output.formatStackTrace(r) },
     doctor:       { params: (a, f) => ({ file: f.file, in: f.in, limit: f.limit, deep: f.deep }), format: (r) => output.formatDoctor(r) },
     // MED-2: stats handler in execute.js rejects top<=0; without explicit

@@ -301,6 +301,52 @@ function extractDecorators(node) {
     return decorators;
 }
 
+
+/**
+ * Type aliases (fix #251 — rule 7: TS/Rust/Go aliases are indexed, Python's
+ * were invisible to typedef/find): PEP 695 `type X = int` and annotated
+ * `X: TypeAlias = ...` assignments become 'type' symbols with aliasOf.
+ */
+function _processTypeAlias(node, classes, processedRanges, lines) {
+    let name = null;
+    let valueText = null;
+    if (node.type === 'type_alias_statement') {
+        // grammar shape: type <left> = <right>
+        const left = node.namedChild(0);
+        const right = node.namedChild(1);
+        if (!left) return false;
+        name = left.text.replace(/\[.*\]$/, ''); // strip PEP 695 type params
+        valueText = right ? right.text : null;
+    } else if (node.type === 'expression_statement') {
+        const child = node.namedChild(0);
+        if (!child || child.type !== 'assignment') return false;
+        const typeNode = child.childForFieldName('type');
+        if (!typeNode || !/\bTypeAlias\b/.test(typeNode.text)) return false;
+        const leftNode = child.childForFieldName('left');
+        const rightNode = child.childForFieldName('right');
+        if (!leftNode || leftNode.type !== 'identifier') return false;
+        name = leftNode.text;
+        valueText = rightNode ? rightNode.text : null;
+    } else {
+        return false;
+    }
+    if (!name) return false;
+    const rangeKey = `${node.startIndex}-${node.endIndex}`;
+    if (processedRanges.has(rangeKey)) return true;
+    processedRanges.add(rangeKey);
+    const { startLine, endLine } = nodeToLocation(node, lines);
+    classes.push({
+        name,
+        type: 'type',
+        startLine,
+        endLine,
+        methods: [],
+        members: [],
+        ...(valueText && { aliasOf: valueText.trim() }),
+    });
+    return true;
+}
+
 /**
  * Find all classes in Python code using tree-sitter
  */
@@ -310,7 +356,8 @@ function findClasses(code, parser) {
     const classes = [];
     const processedRanges = new Set();
     traverseTreeCached(tree.rootNode, (node) => {
-        _processClass(node, classes, processedRanges, lines);
+        _processClass(node, classes, processedRanges, lines) ||
+            _processTypeAlias(node, classes, processedRanges, lines);
         return true;
     });
     classes.sort((a, b) => a.startLine - b.startLine);
@@ -464,7 +511,8 @@ function parse(code, parser) {
 
     traverseTreeCached(tree.rootNode, (node) => {
         _processFunction(node, functions, processedFn, lines, code);
-        _processClass(node, classes, processedCls, lines);
+        _processClass(node, classes, processedCls, lines) ||
+            _processTypeAlias(node, classes, processedCls, lines);
         _processState(node, stateObjects, lines);
         _processModuleAssign(node, moduleAssigned);
         return true;

@@ -276,6 +276,15 @@ function parseStackTrace(index, stackText) {
     // Stack trace patterns for different languages/runtimes
     // Order matters - more specific patterns first
     const patterns = [
+        // Rust pre-1.65 panic header: "panicked at 'message', src/main.rs:150:9"
+        // MUST precede the Node pattern — its [^():]+ file group has no
+        // space/comma guard, so the quoted message glued into the file field
+        // and the panic-location frame never resolved (fix #251).
+        { regex: /panicked at '(?:[^'\\]|\\.)*',\s+([^\s:]+):(\d+)(?::(\d+))?/, extract: (m) => ({ file: m[1], line: parseInt(m[2]), col: m[3] ? parseInt(m[3]) : null, funcName: null }) },
+        // V8 nested eval: "at eval (eval at createProcessor (file.js:10:5), <anonymous>:1:20)"
+        // Attribute to the outer function — the inner <anonymous> position
+        // has no project file (fix #251: the name parsed as "eval (eval at …").
+        { regex: /at\s+.*?\beval at\s+(.+?)\s+\(([^():]+):(\d+)(?::(\d+))?\)/, extract: (m) => ({ funcName: m[1], file: m[2], line: parseInt(m[3]), col: m[4] ? parseInt(m[4]) : null }) },
         // JavaScript Node.js: "at functionName (file.js:line:col)" or "at file.js:line:col"
         { regex: /at\s+(?:async\s+)?(?:(.+?)\s+\()?([^():]+):(\d+)(?::(\d+))?\)?/, extract: (m) => ({ funcName: m[1] || null, file: m[2], line: parseInt(m[3]), col: m[4] ? parseInt(m[4]) : null }) },
         // Deno: "at functionName (file:///path/to/file.ts:line:col)"
@@ -305,6 +314,7 @@ function parseStackTrace(index, stackText) {
 
     // Track Go function names that appear on a line before the file:line
     let pendingGoFuncName = null;
+    let skippedFrames = 0;
 
     for (const line of lines) {
         const trimmed = line.trim();
@@ -318,7 +328,10 @@ function parseStackTrace(index, stackText) {
                 if (pattern.extract === null) {
                     // Go function-only line (e.g. "package.FunctionName()")
                     // Extract the function name and carry it forward to the next file:line
-                    const fullName = match[1];
+                    // Generic instantiation markers first: "pkg.MapKeys[...]"
+                    // — lastIndexOf('.') landed inside the brackets and the
+                    // frame name parsed as "]" (fix #251).
+                    const fullName = match[1].replace(/\[[^\]]*\]$/, '');
                     // Go uses fully-qualified names: pkg/path.FuncName or pkg/path.(*Type).Method
                     const lastDot = fullName.lastIndexOf('.');
                     pendingGoFuncName = lastDot >= 0 ? fullName.slice(lastDot + 1) : fullName;
@@ -351,6 +364,11 @@ function parseStackTrace(index, stackText) {
             }
         }
         if (!matched) {
+            // Frame-shaped lines without a resolvable file:line — Java
+            // "(Unknown Source)"/"(Native Method)", zero-position frames —
+            // used to vanish without a trace (fix #251: inconsistent with
+            // unfound-file frames, which render found=false).
+            if (/^at\s/.test(trimmed)) skippedFrames++;
             pendingGoFuncName = null; // Reset if line doesn't match any pattern
         }
     }
@@ -360,6 +378,7 @@ function parseStackTrace(index, stackText) {
         // similarity scoring, not verified identity.
         advisory: 'best-effort-frame-matching',
         frameCount: frames.length,
+        ...(skippedFrames > 0 && { skippedFrames }),
         frames
     };
 }

@@ -102,7 +102,10 @@ const UCN_VERSION = require('../package.json').version;
 // v39 (fix #249): JS/TS modifiers come from AST tokens, not first-line
 // text — cached symbols may carry export/async/default fabricated from
 // string literals and comments.
-const CACHE_FORMAT_VERSION = 39;
+// v40 (fix #251): Java field members carry visibility modifiers, enum
+// constants carry their implicit public/static/final, and Python type
+// aliases (PEP 695 + TypeAlias annotations) are indexed as 'type' symbols.
+const CACHE_FORMAT_VERSION = 40;
 
 /**
  * Save index to cache file

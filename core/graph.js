@@ -111,6 +111,19 @@ function symbolIsExported(symbol, fileEntry, exportedNames) {
     if (modifiers.some(m => typeof m === 'string' && /^pub\b/.test(m))) return true;
     if (langTraits(fileEntry.language)?.exportVisibility === 'capitalization' &&
         /^[A-Z]/.test(symbol.name || '')) return true;
+    // Rust trait-impl members cannot carry `pub` (the compiler forbids it) —
+    // their visibility IS the implementing type's (fix #251:
+    // `impl Default for Config` methods of a pub Config are publicly
+    // callable but were listed nowhere).
+    if (symbol.traitImpl && symbol.className && fileEntry.language === 'rust') {
+        for (const s of fileEntry.symbols || []) {
+            if (s.name === symbol.className &&
+                ['struct', 'enum', 'class', 'type'].includes(s.type)) {
+                return (s.modifiers || []).some(m => typeof m === 'string' && /^pub\b/.test(m));
+            }
+        }
+        return exportedNames.has(symbol.className);
+    }
     if (symbol.className) return false;
     return exportedNames.has(symbol.name);
 }
@@ -570,11 +583,52 @@ function api(index, filePath, options = {}) {
                         returnType: exp.typeAnnotation || null,
                         signature: sig
                     });
+                    matchedNames.add(exp.name);
+                }
+            }
+            // The fix #245 fileExports discipline, api side (fix #251 — the
+            // two commands diverged on the same file): consumers import the
+            // ALIAS, and clause-exported names with no indexed symbol
+            // (class/function expressions) are still API surface.
+            for (const exp of fileEntry.exportDetails) {
+                if (!exp || !exp.name || exp.module) continue;
+                if (exp.alias && exp.alias !== exp.name) {
+                    const entry = results.find(r =>
+                        r.file === fileEntry.relativePath && r.name === exp.name && !r.sourceName);
+                    if (entry) {
+                        entry.sourceName = exp.name;
+                        entry.name = exp.alias;
+                        if (entry.signature) {
+                            entry.signature = entry.signature.replace(exp.name, exp.alias);
+                        }
+                        matchedNames.add(exp.alias);
+                        continue;
+                    }
+                }
+                const shown = exp.alias || exp.name;
+                if (!matchedNames.has(shown) && !matchedNames.has(exp.name) &&
+                    exportedNames.has(exp.name)) {
+                    results.push({
+                        name: shown,
+                        ...(exp.alias && exp.alias !== exp.name && { sourceName: exp.name }),
+                        type: 'export',
+                        file: fileEntry.relativePath,
+                        startLine: exp.line || 1,
+                        endLine: exp.line || 1,
+                        params: undefined,
+                        returnType: null,
+                        signature: shown,
+                    });
+                    matchedNames.add(shown);
                 }
             }
         }
     }
 
+    // Rule 11: (file, line) ordering regardless of parse order — file mode
+    // used to emit symbols in extraction order (fix #251).
+    results.sort((a, b) => codeUnitCompare(a.file, b.file) ||
+        (a.startLine - b.startLine) || codeUnitCompare(a.name, b.name));
     return results;
 }
 

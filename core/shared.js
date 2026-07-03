@@ -98,6 +98,21 @@ function escapeRegExp(text) {
 const NON_CALLABLE_TYPES = new Set(['class', 'struct', 'interface', 'type', 'enum', 'trait', 'state', 'impl', 'field']);
 
 /**
+ * Every function-shaped symbol kind across the parsers (fix #251 — stats
+ * ranked "longest/hottest functions" from a 7-kind subset, so private
+ * methods, accessors, and dunders were invisible to the rankings while the
+ * same command's "By Type" counted them). deadcode keeps its own narrower
+ * list: dunders ('special') stay out of the audit — protocol dispatch is
+ * invisible to the usage scan.
+ */
+const CALLABLE_SYMBOL_KINDS = new Set([
+    'function', 'method', 'static', 'public', 'abstract', 'constructor',
+    'private', 'get', 'set', 'property', 'setter', 'deleter', 'classmethod',
+    'special', 'override', 'static get', 'static set', 'override get',
+    'override set', 'static override', 'static override get', 'static override set',
+]);
+
+/**
  * Stable symbol handle: `relativePath:line` or `relativePath:line:name`.
  *
  * Handles let multi-step workflows roundtrip without name disambiguation —
@@ -279,6 +294,7 @@ module.exports = {
     lineInRanges,
     classDispatchNames,
     NON_CALLABLE_TYPES,
+    CALLABLE_SYMBOL_KINDS,
     formatSymbolHandle,
     parseSymbolHandle,
     looksLikeHandle,
