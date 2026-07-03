@@ -758,10 +758,12 @@ function runProjectCommand(rootDir, command, arg) {
 
         case 'expand': {
             requireArg(arg, 'Usage: ucn . expand <N>\nFirst run "ucn . context <name>" to get numbered items');
-            const expandNum = parseInt(arg);
-            if (isNaN(expandNum)) {
+            // Whole-token integers only (fix #248: parseInt truncation made
+            // `expand 1abc` and `expand 2.5` silently expand items 1 and 2).
+            if (!/^\d+$/.test(String(arg).trim())) {
                 fail(`Invalid item number: "${arg}"`);
             }
+            const expandNum = parseInt(arg, 10);
             const cached = loadExpandableItems(index.root);
             const items = cached?.items || [];
             const match = items.find(i => i.num === expandNum);
@@ -1857,11 +1859,12 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 console.log('Usage: expand <number>');
                 return;
             }
-            const expandNum = parseInt(arg, 10);
-            if (isNaN(expandNum)) {
+            // Whole-token integers only (fix #248: parseInt truncation).
+            if (!/^\d+$/.test(String(arg).trim())) {
                 console.log(`Invalid item number: "${arg}"`);
                 return;
             }
+            const expandNum = parseInt(arg, 10);
             let match, itemCount, symbolName;
             if (cache) {
                 const lookup = cache.lookup(index.root, expandNum);

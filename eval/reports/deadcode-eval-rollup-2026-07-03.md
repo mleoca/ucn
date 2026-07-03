@@ -21,9 +21,9 @@ false-dead = 0.
 | cobra | gopls | exported | 25 | 25 | 25 | **0** | 0 | 0 |
 | grpc-go | gopls | default | 84 | 60 | 60 | **0** | 0 | 0 |
 | grpc-go | gopls | exported | 842 | 60 | 59 | **0** | 0 | 1 |
-| ripgrep | rust-analyzer | default | 2 | 2 | 2 | **0** | 0 | 0 |
-| ripgrep | rust-analyzer | exported | 16 | 16 | 16 | **0** | 0 | 0 |
-| cursive | rust-analyzer | default | 0 | 0 | 0 | **0** | 0 | 0 |
-| cursive | rust-analyzer | exported | 147 | 60 | 60 | **0** | 0 | 0 |
+| ripgrep | rust-analyzer | default | 3 | 3 | 3 | **0** | 0 | 0 |
+| ripgrep | rust-analyzer | exported | 15 | 15 | 15 | **0** | 0 | 0 |
+| cursive | rust-analyzer | default | 5 | 5 | 5 | **0** | 0 | 0 |
+| cursive | rust-analyzer | exported | 142 | 60 | 60 | **0** | 0 | 0 |
 | gson | jdtls | default | 2 | 2 | 2 | **0** | 0 | 0 |
 | gson | jdtls | exported | 0 | 0 | 0 | **0** | 0 | 0 |

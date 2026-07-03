@@ -95,7 +95,11 @@ const UCN_VERSION = require('../package.json').version;
 // v37 (fix #247): JS/TS class members carry `private`/`protected`
 // accessibility keywords in `modifiers` (deadcode's exported-member check
 // treated every TS member as implicitly public).
-const CACHE_FORMAT_VERSION = 37;
+// v38 (fix #248): Go generic receivers normalize to the type name
+// (`Pair[K, V]` → `Pair` in receiver/className); Rust trait members carry
+// the trait's own visibility instead of the non-Rust 'public', and Rust
+// impl methods record async/unsafe/const/extern qualifiers in modifiers.
+const CACHE_FORMAT_VERSION = 38;
 
 /**
  * Save index to cache file

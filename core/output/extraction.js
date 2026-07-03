@@ -15,7 +15,13 @@ const {
 function formatFn(match, fnCode) {
     const lines = [];
     lines.push(`${match.relativePath}:${match.startLine}`);
-    lines.push(`${lineRange(match.startLine, match.endLine)} ${formatFunctionSignature(match)}`);
+    // Class attribution: three same-name `clear` methods under --all were
+    // indistinguishable without their owning class (fix #248).
+    const sig = formatFunctionSignature(match);
+    const attributed = match.className && !sig.includes(`${match.className}.`)
+        ? `${match.className}.${sig}`
+        : sig;
+    lines.push(`${lineRange(match.startLine, match.endLine)} ${attributed}`);
     lines.push('─'.repeat(60));
     lines.push(fnCode);
     return lines.join('\n');
@@ -43,6 +49,10 @@ function formatFunctionJson(fn, code) {
         paramsStructured: fn.paramsStructured || [],
         startLine: fn.startLine,
         endLine: fn.endLine,
+        // Location + class attribution (fix #248: single-entry fn --json
+        // said neither WHERE the function lives nor WHOSE method it is).
+        file: fn.relativePath || fn.file,
+        ...(fn.className && { className: fn.className }),
         modifiers: fn.modifiers || [],
         ...(fn.returnType && { returnType: fn.returnType }),
         ...(fn.paramTypes && { paramTypes: fn.paramTypes }),
@@ -81,6 +91,7 @@ function formatFnResultJson(result) {
         paramsStructured: match.paramsStructured || [],
         startLine: match.startLine,
         endLine: match.endLine,
+        ...(match.className && { className: match.className }),
         modifiers: match.modifiers || [],
         ...(match.returnType && { returnType: match.returnType }),
         ...(match.paramTypes && { paramTypes: match.paramTypes }),

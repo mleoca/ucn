@@ -52,11 +52,15 @@ function extractReceiver(receiverNode) {
     // receiverNode is a parameter_list: (r *Router)
     // Find the parameter_declaration child
     const param = receiverNode.namedChildren.find(c => c.type === 'parameter_declaration');
-    if (!param) return receiverNode.text.replace(/^\(|\)$/g, '').trim();
+    if (!param) return receiverNode.text.replace(/^\(|\)$/g, '').trim().replace(/\[.*\]$/, '');
     // The type is the last named child (name is first for named receivers)
     const typeNode = param.namedChildren[param.namedChildren.length - 1];
     if (!typeNode) return null;
-    return typeNode.text;
+    // Strip generic type parameters: `(p *Pair[K, V])` receives on the TYPE
+    // Pair — the bracket spelling made fn Pair.First/--class-name/
+    // findMethodsForType all miss (fix #248; Rust/Java already normalize,
+    // and a Go receiver type is a defined type, never a slice/map literal).
+    return typeNode.text.replace(/\[.*\]$/, '');
 }
 
 // --- Single-pass helpers: extracted from find* callbacks ---

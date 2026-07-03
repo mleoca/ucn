@@ -778,13 +778,17 @@ function extractTraitMembers(traitNode, codeOrLines) {
                 const returnType = extractReturnType(child);
                 const hasSelf = paramsNode && paramsNode.text.includes('self');
 
+                // Rust vocabulary (fix #248): trait members carry the trait's
+                // OWN visibility — a method of a private trait is not `pub`,
+                // and 'public' is not a Rust modifier ('pub'/'pub(crate)'/...).
+                const traitVisibility = extractVisibility(traitNode.text);
                 members.push({
                     name: nameNode.text,
                     startLine,
                     endLine,
                     memberType: 'method',
                     isMethod: true,
-                    modifiers: ['public'], // Trait methods are implicitly public
+                    modifiers: traitVisibility ? [traitVisibility] : [],
                     ...(paramsNode && { params: extractRustParams(paramsNode) }),
                     ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'rust') }),
                     ...(returnType && { returnType }),
@@ -831,6 +835,13 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 const inCfgTest = _isInsideCfgTestModule(child, Array.isArray(codeOrLines) ? codeOrLines : codeOrLines.split('\n'));
                 const modifiers = [];
                 if (visibility) modifiers.push(visibility);
+                // Function qualifiers, same vocabulary as free functions
+                // (fix #248: `pub async fn get` rendered as `pub get(...)`;
+                // const/unsafe methods had no machine-readable qualifier).
+                if (firstLine.includes('async ')) modifiers.push('async');
+                if (firstLine.includes('unsafe ')) modifiers.push('unsafe');
+                if (firstLine.includes('const fn')) modifiers.push('const');
+                if (firstLine.includes('extern ')) modifiers.push('extern');
                 for (const attr of attributes) modifiers.push(attr);
                 if (inCfgTest) modifiers.push('cfg_test_module');
 

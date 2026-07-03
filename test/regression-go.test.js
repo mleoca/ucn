@@ -663,8 +663,11 @@ func (r Cache[K, V]) Get() {}
         const get = fns.find(f => f.name === 'Get');
         assert.ok(post, 'Post should be found');
         assert.ok(get, 'Get should be found');
-        assert.strictEqual(post.receiver, '*Router[T]', 'generic pointer receiver should be *Router[T]');
-        assert.strictEqual(get.receiver, 'Cache[K, V]', 'generic receiver should be Cache[K, V]');
+        // Type parameters normalize away (fix #248): the receiver is the
+        // DEFINED type — `Router[T]` as a receiver spelling made
+        // fn Router.Post / --class-name / findMethodsForType all miss.
+        assert.strictEqual(post.receiver, '*Router', 'generic pointer receiver normalizes to *Router');
+        assert.strictEqual(get.receiver, 'Cache', 'generic receiver normalizes to Cache');
     });
 
     it('should associate unnamed receiver methods with their struct', () => {

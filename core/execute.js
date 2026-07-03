@@ -129,6 +129,27 @@ function buildCallerOptions(p) {
     };
 }
 
+/** Kinds the `class` command extracts (fix #248: Java records and their
+ *  fn-side suggestion were unreachable — indexed as type 'record'). */
+const CLASS_KIND_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'record'];
+
+/**
+ * Disambiguation advice that can actually work (fix #248): --file cannot
+ * split same-file matches, and repeating it when already given is circular.
+ * Class.method (or --class-name) splits same-name methods across classes.
+ */
+function disambiguationHint(matches, chosen, fileGiven) {
+    const sameFile = matches.every(m => m.relativePath === chosen.relativePath);
+    if (sameFile || fileGiven) {
+        const classes = new Set(matches.map(m => m.className).filter(Boolean));
+        if (classes.size > 1) {
+            return 'Use Class.method syntax (or --class-name) to disambiguate, or --all to show all.';
+        }
+        return 'Use --all to show all.';
+    }
+    return 'Use --file to disambiguate or --all to show all.';
+}
+
 /** Check if a file-based result has a file error. */
 function checkFileError(result, file) {
     if (!result) return null;
@@ -1048,18 +1069,31 @@ const HANDLERS = {
 
             if (matches.length === 0) {
                 // Check if it's a class — suggest `class` command instead
-                const CLASS_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait'];
                 const classMatches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
-                    .filter(m => CLASS_TYPES.includes(m.type));
+                    .filter(m => CLASS_KIND_TYPES.includes(m.type));
                 if (classMatches.length > 0) {
                     notes.push(`"${fnName}" is a ${classMatches[0].type}, not a function. Use \`class ${fnName}\` instead.`);
+                } else if ((index.symbols.get(actualName) || []).some(s => s.type === 'macro')) {
+                    notes.push(`"${fnName}" is a macro. fn/class extract functions and classes — use \`lines <file>:<start>-<end>\` for macro bodies.`);
                 } else {
                     notes.push(`Function "${fnName}" not found.`);
                 }
                 continue;
             }
 
-            if (matches.length > 1 && !p.file && p.all) {
+            // Fuzzy substitution is never silent (fix #248: `fn run`
+            // returned runAll with no indication).
+            const isFuzzy = !matches.some(m => m.name === actualName);
+            if (isFuzzy) {
+                const shown = [...new Set(matches.map(m => m.name))].join('", "');
+                notes.push(`No exact match for "${fnName}" — showing closest match: "${shown}".`);
+            }
+
+            // --all and the disambiguation note apply whenever the pattern
+            // matched several definitions — a --file filter narrows the set
+            // but does not make it single (fix #248: with --file, extra
+            // in-file matches were silently dropped in three languages).
+            if (matches.length > 1 && p.all) {
                 for (const m of matches) {
                     const code = readAndExtract(m);
                     entries.push({ match: m, code });
@@ -1067,14 +1101,15 @@ const HANDLERS = {
                 continue;
             }
 
-            const match = matches.length > 1 && !p.file
+            const match = matches.length > 1
                 ? pickBestDefinition(matches)
                 : matches[0];
 
-            if (matches.length > 1 && !p.file) {
+            if (matches.length > 1) {
                 const others = matches.filter(m => m !== match)
                     .map(m => `${m.relativePath}:${m.startLine}`).join(', ');
-                notes.push(`Found ${matches.length} definitions for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
+                const what = isFuzzy ? 'fuzzy matches' : 'definitions';
+                notes.push(`Found ${matches.length} ${what} for "${fnName}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. ${disambiguationHint(matches, match, p.file)}`);
             }
 
             const code = readAndExtract(match);
@@ -1093,9 +1128,8 @@ const HANDLERS = {
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
 
-        const CLASS_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait'];
         const matches = index.find(p.name, { file: p.file, skipCounts: true })
-            .filter(m => CLASS_TYPES.includes(m.type));
+            .filter(m => CLASS_KIND_TYPES.includes(m.type));
 
         if (matches.length === 0) {
             return { ok: false, error: `Class "${p.name}" not found.` };
@@ -1109,7 +1143,14 @@ const HANDLERS = {
             return { ok: false, error: '--max-lines must be a positive integer.' };
         }
 
-        if (matches.length > 1 && !p.file && p.all) {
+        // Fuzzy substitution is never silent (fix #248).
+        const classFuzzy = !matches.some(m => m.name === p.name);
+        if (classFuzzy) {
+            const shown = [...new Set(matches.map(m => m.name))].join('", "');
+            notes.push(`No exact match for "${p.name}" — showing closest match: "${shown}".`);
+        }
+
+        if (matches.length > 1 && p.all) {
             for (const m of matches) {
                 const code = readAndExtract(m);
                 const totalLines = m.endLine - m.startLine + 1;
@@ -1118,14 +1159,15 @@ const HANDLERS = {
             return { ok: true, result: { entries }, note: notes.length ? notes.map(n => 'Note: ' + n).join('\n') : undefined };
         }
 
-        const match = matches.length > 1 && !p.file
+        const match = matches.length > 1
             ? pickBestDefinition(matches)
             : matches[0];
 
-        if (matches.length > 1 && !p.file) {
+        if (matches.length > 1) {
             const others = matches.filter(m => m !== match)
                 .map(m => `${m.relativePath}:${m.startLine}`).join(', ');
-            notes.push(`Found ${matches.length} definitions for "${p.name}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. Use --file to disambiguate or --all to show all.`);
+            const what = classFuzzy ? 'fuzzy matches' : 'definitions';
+            notes.push(`Found ${matches.length} ${what} for "${p.name}". Showing ${match.relativePath}:${match.startLine}. Also in: ${others}. ${disambiguationHint(matches, match, p.file)}`);
         }
 
         const totalLines = match.endLine - match.startLine + 1;
@@ -1176,13 +1218,22 @@ const HANDLERS = {
         const startLine = Math.min(rawStart, rawEnd);
         const endLine = Math.max(rawStart, rawEnd);
 
-        const filePath = index.findFile(p.file);
-        if (!filePath) {
-            return { ok: false, error: `File not found in project: ${p.file}` };
-        }
+        // Ambiguity-aware resolution (fix #248: an ambiguous basename
+        // reported "File not found" — factually wrong; imports/exporters
+        // list the candidates for the same input).
+        const resolved = index.resolveFilePathForQuery(p.file);
+        const resolveErr = checkFileError(typeof resolved === 'string' ? null : resolved, p.file);
+        if (resolveErr) return { ok: false, error: resolveErr };
+        const filePath = resolved;
 
         const content = fs.readFileSync(filePath, 'utf-8');
         const fileLines = content.split('\n');
+        // A trailing newline is a line TERMINATOR, not a phantom last line
+        // (fix #248: a 279-line file counted as 280 — the empty split tail
+        // was retrievable and skewed the bounds error).
+        if (fileLines.length > 1 && fileLines[fileLines.length - 1] === '') {
+            fileLines.pop();
+        }
 
         if (startLine > fileLines.length) {
             return { ok: false, error: `Line ${startLine} is out of bounds. File has ${fileLines.length} lines.` };

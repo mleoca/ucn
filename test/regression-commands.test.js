@@ -5413,3 +5413,132 @@ describe('fix #247: deadcode/entrypoints batch', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #248: extraction surface', () => {
+    it('--all and the disambiguation note fire with --file present', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'service.go': 'package t\ntype Repository struct{}\nfunc (r Repository) Delete() {}\ntype CacheService struct{}\nfunc (c CacheService) Delete() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const all = execute(index, 'fn', { name: 'Delete', file: 'service.go', all: true });
+            assert.strictEqual(all.result.entries.length, 2, '--all shows both in-file definitions');
+            const one = execute(index, 'fn', { name: 'Delete', file: 'service.go' });
+            assert.ok(one.note && one.note.includes('Found 2 definitions'), 'silent first-match is gone');
+            assert.ok(one.note.includes('Class.method'), 'same-file collision suggests a class pin, not --file');
+        } finally { rm(dir); }
+    });
+
+    it('Go generic receivers normalize so Class.method resolves', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'p.go': 'package t\n\ntype Pair[K comparable, V any] struct { k K }\n\nfunc (p Pair[K, V]) First() K { return p.k }\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(execute(index, 'fn', { name: 'Pair.First' }).ok, 'bracket spelling no longer required');
+            assert.ok(index.findMethodsForType('Pair').some(m => m.name === 'First'));
+        } finally { rm(dir); }
+    });
+
+    it('Java records extract via the class command', () => {
+        const dir = tmp({
+            'App.java': 'public record Point(int x, int y) {}\npublic class Use { Point p; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'class', { name: 'Point' });
+            assert.ok(r.ok, r.error);
+            assert.strictEqual(r.result.entries[0].match.type, 'record');
+        } finally { rm(dir); }
+    });
+
+    it('fuzzy substitution carries a note', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function runAll(){return 1;}\nmodule.exports={runAll};\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'fn', { name: 'run' });
+            assert.ok(r.ok);
+            assert.ok(r.note && r.note.includes('No exact match'), 'silent fuzzy substitution: ' + (r.note || 'no note'));
+        } finally { rm(dir); }
+    });
+
+    it('lines reports file ambiguity with candidates, not "not found"', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/a/util.rs': 'pub fn a() {}\n',
+            'src/b/util.rs': 'pub fn b() {}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'lines', { file: 'util.rs', range: '1' });
+            assert.strictEqual(r.ok, false);
+            assert.ok(r.error.includes('Ambiguous') && r.error.includes('a/util.rs'), r.error);
+        } finally { rm(dir); }
+    });
+
+    it('lines: a trailing newline is a terminator, not a phantom line', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'f.js': 'line1\nline2\nline3\n',
+        });
+        try {
+            const index = idx(dir);
+            const bad = execute(index, 'lines', { file: 'f.js', range: '4' });
+            assert.strictEqual(bad.ok, false);
+            assert.ok(bad.error.includes('3 lines'), bad.error);
+            const ok = execute(index, 'lines', { file: 'f.js', range: '1-9' });
+            assert.ok(ok.ok);
+            assert.strictEqual(ok.result.endLine, 3, 'clamp lands on the real last line');
+        } finally { rm(dir); }
+    });
+
+    it('single-entry fn --json carries file and className', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'm.py': 'class TaskManager:\n    def __init__(self):\n        self.x = 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'fn', { name: 'TaskManager.__init__' });
+            const j = JSON.parse(output.formatFnResultJson(r.result));
+            assert.strictEqual(j.file, 'm.py');
+            assert.strictEqual(j.className, 'TaskManager');
+        } finally { rm(dir); }
+    });
+
+    it('macro-kind names get a pointed fn error', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'macro_rules! my_macro {\n    () => {};\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'fn', { name: 'my_macro' });
+            assert.strictEqual(r.ok, false);
+            assert.ok(r.error.includes('macro'), r.error);
+        } finally { rm(dir); }
+    });
+
+    it('Rust impl methods carry async/const/unsafe; trait members use Rust visibility vocabulary', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname="t"',
+            'src/lib.rs': 'pub struct S;\nimpl S {\n    pub async fn get(&self) -> i32 { 1 }\n    pub const fn size() -> usize { 8 }\n}\npub trait Pub { fn ping(&self); }\ntrait Priv { fn pong(&self); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const get = (index.symbols.get('get') || [])[0];
+            assert.ok(get.modifiers.includes('async'), JSON.stringify(get.modifiers));
+            const size = (index.symbols.get('size') || [])[0];
+            assert.ok(size.modifiers.includes('const'), JSON.stringify(size.modifiers));
+            const ping = (index.symbols.get('ping') || [])[0];
+            assert.ok(ping.modifiers.includes('pub') && !ping.modifiers.includes('public'), JSON.stringify(ping.modifiers));
+            const pong = (index.symbols.get('pong') || [])[0];
+            assert.ok(!pong.modifiers.includes('pub') && !pong.modifiers.includes('public'), JSON.stringify(pong.modifiers));
+        } finally { rm(dir); }
+    });
+});
