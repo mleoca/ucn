@@ -212,12 +212,43 @@ const REPOS = [
         // overload arity selection (all 71 tb.process(...) sites confirmed
         // to the 1-arg overload) and the eval's super-constructor
         // by-construction verification (LeafNode's subclass super(data)
-        // sites — jdtls emits no type reference at those lines).
+        // sites — jdtls emits no type reference at those lines). Its first
+        // deadcode gate run motivated the eval's doc-ref classification
+        // (jdtls resolves Javadoc @see links as references — fix #269).
         name: 'jsoup',
         url: 'https://github.com/jhy/jsoup',
         commit: 'd8c49e5ec72a08ca1ac4e08740e70dc0f47ad911',
         language: 'java',
         targetCandidates: ['src/main/java'],
+    },
+    {
+        // PEP-517 src-layout Python (graduated from FRESH_POOL 2026-07-03 —
+        // used to tune fix #269). Motivated src-layout import resolution:
+        // `import click` from tests/ resolves src/click/__init__.py, and
+        // src/* packages join the top-level never-exclude names — the
+        // module-ownership machinery had judged the project's OWN package
+        // provably external (two false zero-caller answers).
+        name: 'click',
+        url: 'https://github.com/pallets/click',
+        commit: '16fc00e2f4a2717a521084f193709a6058afc693',
+        language: 'python',
+        targetCandidates: ['.'],
+    },
+    {
+        // CJS prototype-idiom JavaScript (graduated from FRESH_POOL
+        // 2026-07-03 — used to tune fix #269). Motivated the
+        // property-assignment binding discipline (Reply.prototype.serialize
+        // stole the module-scope binding from the free serialize below it)
+        // and the renamed-destructure module pairing ({ validate:
+        // validateSchema } = require('./validation') scope-confirmed
+        // hooks.js's unrelated validate). Known honest residual:
+        // conditional self-coercion retyping (ContentType.toString —
+        // classified, deferred).
+        name: 'fastify',
+        url: 'https://github.com/fastify/fastify',
+        commit: '44e4c970fe379eedf954877c9f9634bd2e95a2b8',
+        language: 'javascript',
+        targetCandidates: ['.'],
     },
 ];
 
@@ -240,10 +271,8 @@ const REPOS = [
 // to 2.1% by universe mismatch, not engine physics). Default '.'; narrower
 // only where the language server needs a specific project-model root (Java).
 const FRESH_POOL = [
-    { name: 'fastify', url: 'https://github.com/fastify/fastify', language: 'javascript', targetCandidates: ['.'] },
     { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['.'] },
     { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
-    { name: 'click', url: 'https://github.com/pallets/click', language: 'python', targetCandidates: ['.'] },
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
 ];
 
