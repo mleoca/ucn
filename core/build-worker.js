@@ -119,6 +119,11 @@ function processFile(filePath) {
         }
     }
     if (content.length - lineStart > 1000) longLineCount++;
+    // A trailing newline TERMINATES the last line rather than opening a new
+    // one; an empty file has 0 lines (fix #251 — adjusted in indexFile only,
+    // so parallel-built stats reported +1 line per newline-terminated file).
+    if (content.length === 0) lineCount = 0;
+    else if (content.charCodeAt(content.length - 1) === 10) lineCount--;
 
     const isBundled = (
         content.includes('__webpack_require__') || content.includes('__webpack_modules__') ||

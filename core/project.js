@@ -316,7 +316,7 @@ class ProjectIndex {
         const disableParallel = workersSetting === 0 || envWorkers === 0;
         let usedParallel = false;
 
-        if (!disableParallel && files.length > 500) {
+        if (!disableParallel && files.length > 150) {
             try {
                 const { parallelBuild } = require('./parallel-build');
                 const result = parallelBuild(this, files, {

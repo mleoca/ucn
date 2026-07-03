@@ -258,6 +258,9 @@ function indexSnapshot(index) {
         .map(fe => ({
             relativePath: fe.relativePath,
             language: fe.language,
+            // stats reads this — the worker once counted +1 line per
+            // newline-terminated file (fix #251 synced to indexFile only).
+            lines: fe.lines,
             exports: [...(fe.exports || [])].sort(),
             importCount: (fe.imports || []).length,
             // Name-level scope/ownership inputs (#209/#215/#217): these MUST
