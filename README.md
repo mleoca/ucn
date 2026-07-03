@@ -34,7 +34,7 @@ UCN is deliberately lightweight:
 - **No language servers** - tree-sitter does the parsing, no compilation needed
 - **MCP is optional** - only needed if you connect UCN to an AI agent, the CLI and Skill work on their own
 
-And it's built to be **trusted**. grep hands you raw text matches to verify yourself; UCN splits every "who calls this?" into what it can prove and what it can't — each flagged with a reason, nothing silently dropped. That claim is measured, not promised: CI re-derives UCN's answers from the real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls) across ten production repos — **96.6–100% confirmed-tier precision, zero unexplained call edges, [or the build fails](#answers-you-can-trust)**.
+And it's built to be **trusted**. grep hands you raw text matches to verify yourself; UCN splits every "who calls this?" into what it can prove and what it can't — each flagged with a reason, nothing silently dropped. That claim is measured, not promised: CI re-derives UCN's answers from the real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls) across nineteen production repos — **96.6–100% confirmed-tier precision on eighteen of them, zero unexplained call edges, [or the build fails](#answers-you-can-trust)**.
 
 ---
 
@@ -152,7 +152,7 @@ UCN sorts every one of the 55 places the name appears:
 - **11 non-call** — imports, the definition, plain text.
 - **`0 unaccounted`** — the partition is complete. Nothing was dropped on the floor.
 
-The payoff: a **confirmed** answer is safe to refactor against, and a clean zero — no confirmed, no unverified, `0 unaccounted` — is a trustworthy zero (measured: 68 of 69 clean-zero samples across the 10-repo board agree with the compiler oracles; the one disagreement is a `new X()` on an old-style constructor function, which lands in the non-call counts, still visible). One caveat before deleting anything: callers aren't the only usages — if the NON-CALL counts are nonzero, run `ucn usages` to see what they are.
+The payoff: a **confirmed** answer is safe to refactor against, and a clean zero — no confirmed, no unverified, `0 unaccounted` — is a trustworthy zero (measured: 68 of 69 clean-zero samples across the pinned-repo board agree with the compiler oracles; the one disagreement is a `new X()` on an old-style constructor function, which lands in the non-call counts, still visible). One caveat before deleting anything: callers aren't the only usages — if the NON-CALL counts are nonzero, run `ucn usages` to see what they are.
 
 ### Measured against ground truth
 
@@ -160,13 +160,15 @@ This isn't a promise — it's a gate. CI re-derives UCN's caller answers from re
 
 | Language | Oracle | Confirmed-tier precision |
 |---|---|---|
-| TypeScript / JavaScript | ts-morph | 99.4–100% |
+| TypeScript / JavaScript | ts-morph | 99.5–100% |
 | Python | pyright (LSP) | 97.7–99.9% |
-| Go | gopls | 99.9–100% |
-| Rust | rust-analyzer | 99.0–100% |
-| Java | jdtls | 96.6% |
+| Go | gopls | 98.8–100% |
+| Rust | rust-analyzer | 99.3–100%* |
+| Java | jdtls | 96.6–100% |
 
-Ten pinned real-world repos (zod, express, httpx, rich, cobra, grpc-go, ripgrep, cursive, gson, preact-signals), three sampling seeds, every run gated at `missing-unexplained = 0` — plus a weekly fresh-repo arm: two unpinned repos the engine was never tuned on, same gate. The tree commands — `trace`, `blast`, `reverse-trace`, `affected-tests` — follow the same rule: confirmed trunk, uncertain branches flagged (`--expand-unverified` to follow). Run `ucn doctor` for the trust report on *your* repo.
+\* clap reads 92.4% — its callers live behind cargo feature gates the oracle compiles out; UCN sees the text, rust-analyzer doesn't.
+
+Nineteen pinned real-world repos (zod, preact-signals, express, hono, zustand, fastify, httpx, rich, click, cobra, grpc-go, viper, chi, ripgrep, cursive, clap, gson, javapoet, jsoup), three sampling seeds, every run gated at `missing-unexplained = 0` — plus a weekly fresh-repo arm: two unpinned repos the engine was never tuned on, same gate. The tree commands — `trace`, `blast`, `reverse-trace`, `affected-tests` — follow the same rule: confirmed trunk, uncertain branches flagged (`--expand-unverified` to follow). Run `ucn doctor` for the trust report on *your* repo.
 
 ## Change code without breaking things
 
@@ -401,7 +403,7 @@ function compareNames(a, b) {
 - **Coverage** - every command, every supported language, every surface (CLI, MCP, interactive)
 - **Systematic** - a harness exercises all command and flag combinations against real multi-language fixtures
 - **Test types** - unit, integration, per-language regression, formatter, cache, MCP edge cases, architecture parity guards
-- **Ground truth** - caller accuracy is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls on 10 pinned real repos, gated on zero unexplained edges (see [Answers you can trust](#answers-you-can-trust))
+- **Ground truth** - caller accuracy is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls on 19 pinned real repos, gated on zero unexplained edges (see [Answers you can trust](#answers-you-can-trust))
 
 ---
 
