@@ -261,8 +261,47 @@ function loadTreeSitter() {
                 { cause: e }
             );
         }
+        _installNodeTypeCache(TreeSitter);
     }
     return TreeSitter;
+}
+
+/**
+ * Make SyntaxNode#type a cheap data-property read.
+ *
+ * The binding generates one node subclass per grammar type id and intends
+ * `nodeSubclass.prototype.type = typeName` to shadow the base getter — but
+ * SyntaxNode.prototype.type is a getter-only accessor, so that plain
+ * assignment silently no-ops and EVERY `.type` read marshals into native
+ * code. Hot walks read `.type` many times per node; on a ~300-file build
+ * this getter alone costs seconds.
+ *
+ * A node's type is immutable and each generated subclass maps to exactly
+ * one grammar type, so the first native read per CLASS plants the string as
+ * a data property on that class's prototype — all later reads on any node
+ * of that type are plain property hits. Nodes using the base class itself
+ * (anonymous tokens, ERROR) keep the native getter.
+ */
+function _installNodeTypeCache(TS) {
+    try {
+        const base = TS?.SyntaxNode?.prototype;
+        const desc = base && Object.getOwnPropertyDescriptor(base, 'type');
+        if (!desc?.get || desc.set) return; // shape changed upstream — leave it alone
+        const nativeGet = desc.get;
+        Object.defineProperty(base, 'type', {
+            configurable: true,
+            get() {
+                const t = nativeGet.call(this);
+                const ctor = this.constructor;
+                if (ctor && ctor !== TS.SyntaxNode && ctor.prototype instanceof TS.SyntaxNode) {
+                    Object.defineProperty(ctor.prototype, 'type', {
+                        value: t, configurable: true
+                    });
+                }
+                return t;
+            }
+        });
+    } catch { /* stock getter keeps working */ }
 }
 
 /**

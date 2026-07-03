@@ -11,8 +11,11 @@
  */
 function traverseTree(node, callback, options) {
     if (callback(node) === false) return;
-    for (let i = 0; i < node.namedChildCount; i++) {
-        traverseTree(node.namedChild(i), callback, options);
+    // Single batched native call per node — namedChildCount + N × namedChild(i)
+    // costs N+1 native round-trips for the same children.
+    const children = node.namedChildren;
+    for (let i = 0; i < children.length; i++) {
+        traverseTree(children[i], callback, options);
     }
     if (options?.onLeave) {
         options.onLeave(node);
@@ -691,8 +694,10 @@ function _buildNodeList(rootNode) {
         const idx = nodes.length;
         nodes.push(node);
         subtreeEnds.push(0);
-        for (let i = 0; i < node.namedChildCount; i++) {
-            collect(node.namedChild(i));
+        // Batched children read — one native call instead of N+1 (see traverseTree)
+        const children = node.namedChildren;
+        for (let i = 0; i < children.length; i++) {
+            collect(children[i]);
         }
         subtreeEnds[idx] = nodes.length;
     }
