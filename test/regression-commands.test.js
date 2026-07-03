@@ -5269,3 +5269,147 @@ describe('fix #246: tests command discipline', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #247: deadcode/entrypoints batch', () => {
+    it('multi-line export blocks do not hide dead exports (--include-exported)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'esm.ts': 'export function anchor(){return 1;}\nfunction createTask(){return 1;}\nfunction taskGen(){return 2;}\nexport {\n  createTask,\n  taskGen,\n};\n',
+            'cjs.js': 'function dataGen(){return 1;}\nfunction alive(){return 2;}\nmodule.exports = {\n  dataGen,\n  alive,\n};\nalive();\n',
+        });
+        try {
+            const index = idx(dir);
+            const names = execute(index, 'deadcode', { includeExported: true }).result.map(x => x.name);
+            for (const n of ['createTask', 'taskGen', 'dataGen']) {
+                assert.ok(names.includes(n), `${n} exported via a multi-line block is dead`);
+            }
+            assert.ok(!names.includes('alive'), 'alive() has a real call');
+        } finally { rm(dir); }
+    });
+
+    it('renaming export surfaces are consumption, never filtered (eval-measured)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'express.js': 'function createApplication(){ return 1; }\nexports = module.exports = createApplication;\n',
+            't.ts': 'function instanceOfType(){ return 1; }\nfunction plainDead(){ return 2; }\nexport {\n  instanceOfType as instanceOf,\n  plainDead,\n};\n',
+        });
+        try {
+            const index = idx(dir);
+            const names = execute(index, 'deadcode', { includeExported: true }).result.map(x => x.name);
+            assert.ok(!names.includes('createApplication'), 'module.exports = X is the consumption wiring');
+            assert.ok(!names.includes('instanceOfType'), 'aliased specifier: consumers use the alias');
+            assert.ok(names.includes('plainDead'), 'un-aliased clause entry still claimable');
+        } finally { rm(dir); }
+    });
+
+    it('property reads on unresolvable receivers keep accessors alive (eval-measured)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'm.py': 'class Client:\n    @property\n    def is_closed(self):\n        return True\n    @property\n    def dead_prop(self):\n        return False\n',
+            // The `if client.is_closed:` shape also probes the block-colon
+            // case — the object-literal-key skip must never fire on a
+            // DOTTED access (eval-measured: httpx is_relative_url).
+            'use.py': 'from m import Client\n\ndef check():\n    client = Client()\n    if client.is_closed:\n        return 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const names = execute(index, 'deadcode', {}).result.map(x => x.name);
+            assert.ok(!names.includes('is_closed'), 'client.is_closed IS the consumption of a property');
+            assert.ok(names.includes('dead_prop'), 'unread property still claimable');
+        } finally { rm(dir); }
+    });
+
+    it('a function body inside an export assignment still counts as consumption', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'w.js': 'function helper(){return 1;}\nmodule.exports = {\n  run: () => helper(),\n};\n',
+        });
+        try {
+            const index = idx(dir);
+            const names = execute(index, 'deadcode', { includeExported: true }).result.map(x => x.name);
+            assert.ok(!names.includes('helper'), 'the arrow wrapper consumes helper');
+        } finally { rm(dir); }
+    });
+
+    it('accessor and private member kinds are audited; used ones stay alive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'w.js': 'class W {\n  #never(){return 1;}\n  #used(){return 2;}\n  get unusedGet(){return 3;}\n  get usedGet(){return 4;}\n  set unusedSet(v){this.v=v;}\n  run(){ this.#used(); return this.usedGet; }\n}\nconst w = new W();\nw.run();\n',
+            's.py': 'class S:\n    def _hidden(self):\n        return 1\n    def _called(self):\n        return 2\n    @property\n    def dead_prop(self):\n        return 3\n    @property\n    def live_prop(self):\n        return 4\n    @classmethod\n    def dead_cm(cls):\n        return 5\n    def go(self):\n        return self._called() + self.live_prop\n\ns = S()\ns.go()\n',
+        });
+        try {
+            const index = idx(dir);
+            const names = execute(index, 'deadcode', {}).result.map(x => x.name);
+            for (const n of ['#never', 'unusedGet', 'unusedSet', '_hidden', 'dead_prop', 'dead_cm']) {
+                assert.ok(names.includes(n), `${n} should be claimed dead`);
+            }
+            for (const n of ['#used', 'usedGet', '_called', 'live_prop', 'go', 'run']) {
+                assert.ok(!names.includes(n), `${n} is used — never claim it`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('TS private-keyword methods of an exported class are claimable in default mode', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'k.ts': 'export class K {\n  private secret(): number { return 1; }\n  private usedSecret(): number { return 2; }\n  public open(): number { return 3; }\n  run(): number { return this.usedSecret(); }\n}\nnew K().run();\n',
+        });
+        try {
+            const index = idx(dir);
+            const sym = (index.symbols.get('secret') || [])[0];
+            assert.ok(sym && (sym.modifiers || []).includes('private'), 'parser records the accessibility keyword');
+            const names = execute(index, 'deadcode', {}).result.map(x => x.name);
+            assert.ok(names.includes('secret'), 'private member is not public API');
+            assert.ok(!names.includes('open'), 'public member of exported class stays excluded');
+            assert.ok(!names.includes('usedSecret'), 'called private member is alive');
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints file-level sweep skips non-callable kinds', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'src/types.spec.ts': 'export enum Color { Red, Green }\nexport interface Cfg { url: string; }\nexport type Alias = string;\nexport function realTest(){ return 1; }\nit("t", () => realTest());\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'entrypoints', {}).result;
+            assert.ok(r.some(e => e.name === 'realTest'), 'callable entry kept');
+            for (const n of ['Color', 'Red', 'Cfg', 'url', 'Alias']) {
+                assert.ok(!r.some(e => e.name === n), `${n} is a declaration, not a runtime entry`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('entrypoints --limit --json reports full total + truncated', () => {
+        const dir = tmp({
+            'go.mod': 'module t',
+            'a_test.go': 'package t\nimport "testing"\nfunc TestA(t *testing.T){}\nfunc TestB(t *testing.T){}\nfunc TestC(t *testing.T){}\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'entrypoints', { limit: 2 });
+            assert.ok(r.ok);
+            const j = JSON.parse(output.formatEntrypointsJson(r.result));
+            assert.strictEqual(j.meta.count, 2);
+            assert.strictEqual(j.meta.total, 3);
+            assert.strictEqual(j.meta.truncated, true);
+        } finally { rm(dir); }
+    });
+
+    it('dead methods render with their class name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'w.js': 'class A { helper(){return 1;} }\nclass B { helper(){return 2;} }\nnew A(); new B();\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            const text = output.formatDeadcode(r.result);
+            assert.ok(text.includes('A.helper') && text.includes('B.helper'), text);
+            const j = JSON.parse(output.formatDeadcodeJson(r.result));
+            assert.ok(j.data.symbols.every(s => s.className === 'A' || s.className === 'B'));
+        } finally { rm(dir); }
+    });
+});

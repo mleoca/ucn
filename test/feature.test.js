@@ -2877,12 +2877,11 @@ module.exports = handleRequest;
         } finally { rm(dir); }
     });
 
-    it('JS: app.get("/path", function handleRequest(req, res) {}) — named function expression is a false negative', () => {
-        // A named function expression defined inline as a route handler argument
-        // is parsed as a function_expression node, not an identifier. The callback
-        // detection only looks for identifier and member_expression nodes, so it
-        // misses the inline named function.
-        // The function IS parsed by findFunctions, but there's no callback link.
+    it('JS: app.get("/path", function handleRequest(req, res) {}) — inline named handler detected', () => {
+        // A named function expression defined inline in argument position has
+        // no function-reference record and no indexed symbol — the name is
+        // only visible as the enclosingFunction of the handler body's own
+        // calls, anchored at the registration line (fix #247).
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'routes.js': `
@@ -2896,9 +2895,9 @@ app.get('/path', function handleRequest(req, res) { res.json({}); });
             const index = idx(dir);
             const { ok, result } = execute(index, 'entrypoints', {});
             assert.ok(ok);
-            // False negative: named function expressions in route args are not detected.
-            assert.strictEqual(result.length, 0,
-                'named function expressions in route args are a known false negative');
+            const entry = result.find(e => e.name === 'handleRequest');
+            assert.ok(entry, 'inline named function-expression handler is an entry point');
+            assert.strictEqual(entry.framework, 'express');
         } finally { rm(dir); }
     });
 

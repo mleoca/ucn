@@ -8,14 +8,14 @@ false-dead = 0.
 | repo | oracle | arm | claims | sampled | agreed-dead | false-dead | outside-universe | unpinnable |
 |---|---|---|---|---|---|---|---|---|
 | zod | ts-morph | default | 0 | 0 | 0 | **0** | 0 | 0 |
-| zod | ts-morph | exported | 36 | 36 | 36 | **0** | 0 | 0 |
+| zod | ts-morph | exported | 48 | 48 | 36 | **0** | 0 | 12 |
 | preact-signals | ts-morph | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | preact-signals | ts-morph | exported | 0 | 0 | 0 | **0** | 0 | 0 |
 | express | ts-morph | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | express | ts-morph | exported | 2 | 2 | 2 | **0** | 0 | 0 |
 | httpx | pyright | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | httpx | pyright | exported | 0 | 0 | 0 | **0** | 0 | 0 |
-| rich | pyright | default | 32 | 32 | 32 | **0** | 0 | 0 |
+| rich | pyright | default | 34 | 34 | 34 | **0** | 0 | 0 |
 | rich | pyright | exported | 0 | 0 | 0 | **0** | 0 | 0 |
 | cobra | gopls | default | 0 | 0 | 0 | **0** | 0 | 0 |
 | cobra | gopls | exported | 25 | 25 | 25 | **0** | 0 | 0 |

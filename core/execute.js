@@ -912,7 +912,15 @@ const HANDLERS = {
         let note;
         if (limit && limit > 0 && Array.isArray(result) && result.length > limit) {
             note = limitNote(limit, result.length);
-            result = result.slice(0, limit);
+            const sliced = result.slice(0, limit);
+            // Full-set size travels with the payload so --json can carry
+            // meta.total + truncated (fix #247 — mirrors deadcode's #242
+            // shape; the stderr note alone loses the signal).
+            Object.defineProperty(sliced, 'limitInfo', {
+                value: { total: result.length, shown: limit },
+                enumerable: false, writable: true, configurable: true,
+            });
+            result = sliced;
         }
         return { ok: true, result, note };
     },

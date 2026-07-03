@@ -9,7 +9,7 @@ const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = 
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
-const { isOverrideMarked, codeUnitCompare } = require('./shared');
+const { isOverrideMarked, codeUnitCompare, lineInRanges } = require('./shared');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -319,8 +319,16 @@ function deadcode(index, options = {}) {
         index.buildCalleeIndex();
     }
 
-    // Collect callable symbol names to reduce usage index scope
-    const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor'];
+    // Collect callable symbol names to reduce usage index scope.
+    // Accessor and visibility kinds joined in fix #247 — #private methods,
+    // getters/setters, Python underscore/@property/@classmethod/@x.setter/
+    // @x.deleter members were silently unaudited in BOTH modes (no exclusion
+    // counter said so). Property accessors count reads/writes as usage: the
+    // scan totals ALL usage types, so `obj.value` keeps a getter alive.
+    const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor',
+        'private', 'get', 'set', 'property', 'setter', 'deleter', 'classmethod',
+        'override', 'static get', 'static set', 'override get', 'override set',
+        'static override', 'static override get', 'static override set'];
     const callableNames = new Set();
     for (const [symbolName, symbols] of index.symbols) {
         if (symbols.some(s => callableTypes.includes(s.type))) {
@@ -364,11 +372,101 @@ function deadcode(index, options = {}) {
         potentiallyDeadNames = filteredNames;
     }
 
+    // Export-site line ranges per file (lazy, --include-exported only): the
+    // precise AST regions where a name's appearance is a re-statement of the
+    // export, not consumption (fix #247 — the line-prefix check missed
+    // multi-line `export { a,\n b }` blocks, so every symbol exported that
+    // way was silently absent from the audit). Ranges are identifier-pure by
+    // construction: export clauses, `export default <identifier>`, and
+    // identifier/shorthand values of module.exports/exports.* object maps —
+    // a function body inside an export assignment still counts as usage.
+    const exportRangeCache = new Map();
+    const exportSiteRanges = (filePath) => {
+        let ranges = exportRangeCache.get(filePath);
+        if (ranges) return ranges;
+        ranges = [];
+        exportRangeCache.set(filePath, ranges);
+        const fe = index.files.get(filePath);
+        if (!fe || !['javascript', 'typescript', 'tsx'].includes(fe.language)) return ranges;
+        let content;
+        try { content = index._readFile(filePath); } catch { return ranges; }
+        const tree = index._getParsedTree(filePath, content, fe.language);
+        if (!tree) return ranges;
+        const push = (node) => ranges.push([node.startPosition.row + 1, node.endPosition.row + 1]);
+        // A re-statement is filterable only when consumers reach the symbol
+        // under ITS OWN NAME (text-visible elsewhere). Renaming surfaces are
+        // consumption wiring, never filtered: `export { x as y }` (consumers
+        // use y), `module.exports = x` and `export default x` (consumers
+        // rename at require/import) — the eval measured all three as
+        // FALSE-DEAD when filtered (express createApplication, zod
+        // instanceOfType).
+        const visit = (node) => {
+            if (node.type === 'export_statement') {
+                for (const child of node.namedChildren) {
+                    if (child.type === 'export_clause') {
+                        for (const spec of child.namedChildren) {
+                            if (spec.type !== 'export_specifier') continue;
+                            if (spec.childForFieldName('alias')) continue;
+                            push(spec);
+                        }
+                    }
+                }
+                return; // never descend into exported declarations
+            }
+            if (node.type === 'assignment_expression') {
+                const lhs = node.childForFieldName('left');
+                const rhs = node.childForFieldName('right');
+                const lhsText = lhs ? lhs.text : '';
+                const wholeModule = lhsText === 'module.exports' || lhsText === 'exports';
+                const namedExport = lhsText.startsWith('module.exports.') || lhsText.startsWith('exports.');
+                if (rhs && (wholeModule || namedExport)) {
+                    if (rhs.type === 'identifier') {
+                        if (namedExport) push(rhs); // exports.helper = helper — name-preserving
+                    } else if (rhs.type === 'object') {
+                        for (const prop of rhs.namedChildren) {
+                            if (prop.type === 'shorthand_property_identifier') push(prop);
+                            else if (prop.type === 'pair') {
+                                const v = prop.childForFieldName('value');
+                                const k = prop.childForFieldName('key');
+                                // `{ helper: helper }` filters; `{ other: helper }`
+                                // renames — consumption wiring.
+                                if (v && v.type === 'identifier' && k && k.text === v.text) push(v);
+                            }
+                        }
+                    }
+                    if (!wholeModule) return;
+                    // exports = module.exports = X chains: descend the RHS.
+                }
+            }
+            for (const child of node.namedChildren) visit(child);
+        };
+        try { visit(tree.rootNode); } catch { /* partial ranges are fine */ }
+        return ranges;
+    };
+
     // Build usage index for potentially dead names using text scan (no tree-sitter reparsing).
     // The callee index already covers all call-based usages. For remaining names, a word-boundary
     // text scan catches imports, exports, shorthand properties, type refs, and variable refs.
     // Trade-off: may match names in comments/strings (false "used" → fewer dead code reports),
     // but avoids ~1.9s of tree-sitter re-parsing. buildUsageIndex() is kept for direct callers.
+    // Names owned by an ACCESSOR-kind definition (getter/setter/@property):
+    // their entire consumption form is a paren-less attribute read
+    // (`response.num_bytes_downloaded`), whose receiver is usually a local
+    // the #123/#216 dotted discipline can't resolve. Dropping those reads
+    // claimed 15 live properties dead across httpx/rich (fix #247, eval-
+    // measured) — for these names the read keeps the usage UNSCOPED
+    // (conservative: keeps every same-name symbol alive), exactly the #243
+    // decorator rule. Non-accessor names keep the strict discipline.
+    const ACCESSOR_KINDS = new Set(['property', 'setter', 'deleter', 'get', 'set',
+        'static get', 'static set', 'override get', 'override set',
+        'static override get', 'static override set']);
+    const accessorNames = new Set();
+    for (const name of potentiallyDeadNames) {
+        if ((index.symbols.get(name) || []).some(s => ACCESSOR_KINDS.has(s.type))) {
+            accessorNames.add(name);
+        }
+    }
+
     const usageIndex = new Map();
     if (potentiallyDeadNames.size > 0) {
         for (const [filePath, fileEntry] of index.files) {
@@ -455,18 +553,26 @@ function deadcode(index, options = {}) {
                                         fileEntry.moduleResolved[binding.module];
                                     if (resolved) {
                                         dottedScope = resolved;
-                                    } else if (!isDecoratorRef) {
+                                    } else if (!isDecoratorRef && !accessorNames.has(name)) {
                                         continue;
                                     }
-                                    // decorator with unresolvable receiver:
-                                    // keep the usage UNSCOPED (conservative —
+                                    // decorator with unresolvable receiver, or
+                                    // an attribute read of an ACCESSOR-kind
+                                    // name (fix #247 — the read IS how
+                                    // getters/properties are consumed): keep
+                                    // the usage UNSCOPED (conservative —
                                     // keeps every same-name symbol alive)
                                 }
                             }
-                            // Skip object literal key: name followed by ':' (not '::' for Rust paths)
+                            // Skip object literal key: name followed by ':' (not '::' for Rust paths).
+                            // A DOTTED access is never a literal key — object keys are bare
+                            // (fix #247, eval-measured: Python's block colon made
+                            // `if merge_url.is_relative_url:` read as a key, dropping the
+                            // property's only consumption).
                             const afterChar = pos + nameLen < line.length ? line[pos + nameLen] : '';
                             const afterChar2 = pos + nameLen + 1 < line.length ? line[pos + nameLen + 1] : '';
-                            if (afterChar === ':' && afterChar2 !== ':') continue;
+                            if (afterChar === ':' && afterChar2 !== ':' &&
+                                !(pos > 0 && line[pos - 1] === '.')) continue;
                             // Valid reference found
                             if (!usageIndex.has(name)) usageIndex.set(name, []);
                             usageIndex.get(name).push({
@@ -489,7 +595,9 @@ function deadcode(index, options = {}) {
     // Java `int helper = Other.helper();` genuinely reference the name.
     const DEF_NAME_LINE_KINDS = new Set([
         'function', 'method', 'static', 'public', 'abstract', 'constructor',
-        'private', 'classmethod', 'property', 'setter', 'deleter',
+        'private', 'classmethod', 'property', 'setter', 'deleter', 'get', 'set',
+        'override', 'static get', 'static set', 'override get', 'override set',
+        'static override', 'static override get', 'static override set',
         'class', 'struct', 'interface', 'trait', 'record', 'enum', 'namespace', 'impl',
     ]);
 
@@ -608,21 +716,14 @@ function deadcode(index, options = {}) {
             // For exported symbols in --include-exported mode, also filter out export-site
             // references (e.g., `module.exports = { helperC }` or `export { helperC }`).
             // These are just re-statements of the export, not actual consumption.
+            // AST ranges, not line prefixes (fix #247): a multi-line
+            // `export { a,\n b }` block's continuation lines counted as
+            // consumption, silently hiding every symbol exported that way.
             if (isExported && options.includeExported) {
                 nonDefUsages = nonDefUsages.filter(u => {
                     if (u.file !== symbol.file) return true; // cross-file usage always counts
-                    // Check if same-file usage is on an export line
-                    let content;
-                    try { content = index._readFile(u.file); } catch { return true; }
-                    if (!content) return true;
-                    const lines = content.split('\n');
-                    const line = lines[u.line - 1] || '';
-                    const trimmed = line.trim();
-                    // CJS: module.exports = { ... } or exports.name = ...
-                    if (trimmed.startsWith('module.exports') || /^exports\.\w+\s*=/.test(trimmed)) return false;
-                    // ESM: export { ... } or export default
-                    if (/^export\s*\{/.test(trimmed) || /^export\s+default\s/.test(trimmed)) return false;
-                    return true;
+                    const ranges = exportSiteRanges(u.file);
+                    return !lineInRanges(u.line, ranges);
                 });
             }
 
@@ -678,6 +779,9 @@ function deadcode(index, options = {}) {
                     file: symbol.relativePath,
                     startLine: symbol.startLine,
                     endLine: symbol.endLine,
+                    // Two dead constructors in one file rendered identically
+                    // without their class (fix #247).
+                    ...(symbol.className && { className: symbol.className }),
                     isExported,
                     usageCount: 0,
                     ...(decorators.length > 0 && { decorators }),

@@ -13,7 +13,7 @@
 'use strict';
 
 const fs = require('fs');
-const { codeUnitCompare } = require('./shared');
+const { codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
 const { getLanguageModule } = require('../languages');
@@ -597,11 +597,19 @@ function buildCallbackEntrypointMap(index) {
             }
 
             if (routeLines.size > 0) {
+                // Pass 2b prep: routes whose handler is an inline NAMED
+                // function expression (`app.post('/x', function createUser()
+                // {...})`) have no function-reference record — the name is
+                // only visible as the enclosingFunction of the handler
+                // body's own calls (fix #247; the route vanished entirely).
+                const handledLines = new Set();
+
                 // Pass 2: find callbacks on route-registration lines
                 for (const call of calls) {
                     if (!call.isFunctionReference && !call.isPotentialCallback) continue;
                     const route = routeLines.get(call.line);
                     if (!route) continue;
+                    handledLines.add(call.line);
 
                     // BUG M2: only treat as a handler if the name resolves to a
                     // project-defined symbol. Library code like gin's
@@ -623,6 +631,30 @@ function buildCallbackEntrypointMap(index) {
                             line: def ? def.startLine : call.line,
                             registrationFile: filePath,
                             registrationLine: call.line,
+                        });
+                    }
+                }
+
+                // Pass 2b: inline NAMED function-expression handlers. The
+                // function is defined IN argument position, so the only
+                // evidence is the enclosingFunction of calls inside its body,
+                // anchored at the registration line (fix #247).
+                for (const call of calls) {
+                    const enc = call.enclosingFunction;
+                    if (!enc || !enc.name || enc.name === '<anonymous>') continue;
+                    const route = routeLines.get(enc.startLine);
+                    if (!route || handledLines.has(enc.startLine)) continue;
+                    if (index.symbols.has(enc.name)) continue; // real defs took pass 2
+                    if (!result.has(enc.name)) {
+                        result.set(enc.name, {
+                            framework: route.pattern.framework,
+                            type: route.pattern.type,
+                            patternId: route.pattern.id,
+                            method: route.call.name.toUpperCase(),
+                            file: filePath,
+                            line: enc.startLine,
+                            registrationFile: filePath,
+                            registrationLine: enc.startLine,
                         });
                     }
                 }
@@ -951,6 +983,14 @@ function detectEntrypoints(index, options = {}) {
             for (const symbol of symbols) {
                 const fmatches = fileMatches.get(symbol.file);
                 if (!fmatches || fmatches.length === 0) continue;
+
+                // Entry points are executable: enum members, interface
+                // property signatures, type aliases, and fields in a matched
+                // file are declarations, not runtime entries (fix #247 — a
+                // spec file listed its enum members as test entry points).
+                // Callable members carry their own symbols, so reachability
+                // seeding loses nothing.
+                if (NON_CALLABLE_TYPES.has(symbol.type)) continue;
 
                 // Apply narrow filter: for shebang/cli-main files, only allow
                 // identified entry symbols.

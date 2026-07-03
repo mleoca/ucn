@@ -236,7 +236,8 @@ function formatDeadcode(results, options = {}) {
         const extStr = item.externalContract
             ? ' [reachable via out-of-tree base — external contract, not dead]'
             : '';
-        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${item.name} (${item.type})${exported}${hintStr}${declStr}${extStr}`);
+        const displayName = item.className ? `${item.className}.${item.name}` : item.name;
+        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${displayName} (${item.type})${exported}${hintStr}${declStr}${extStr}`);
     }
 
     if (hidden > 0) {
@@ -296,6 +297,7 @@ function formatDeadcodeJson(results) {
                     file: item.file,
                     startLine: item.startLine,
                     endLine: item.endLine,
+                    ...(item.className && { className: item.className }),
                     ...(handle && { handle }),
                     ...(item.isExported && { isExported: true }),
                     ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
@@ -362,8 +364,16 @@ function formatEntrypoints(results, options = {}) {
  * Format entrypoints command output (JSON)
  */
 function formatEntrypointsJson(results) {
+    // Under --limit the handler slices the array and attaches the full-set
+    // size (fix #247, the deadcode #242 shape) — meta.total must describe
+    // the FULL set, with `truncated` saying the list below is a prefix.
+    const li = results.limitInfo;
     return JSON.stringify({
-        meta: { total: results.length },
+        meta: {
+            count: results.length,
+            total: li ? li.total : results.length,
+            ...(li && { truncated: true }),
+        },
         data: {
             entrypoints: results.map(ep => {
                 const handle = ep.line && ep.name ? `${ep.file}:${ep.line}:${ep.name}` : null;

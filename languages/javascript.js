@@ -960,6 +960,13 @@ function extractClassMembers(classNode, codeOrLines) {
                 const typeAnno = buildTypeAnnotations(paramsStructured, returnType, code, startLine, true);
 
                 const decoratorsWithArgs = extractDecoratorsWithArgs(child);
+                // TS accessibility keywords (fix #247): `private`/`protected`
+                // members are not public API — without this, deadcode's
+                // exported-member check treated them as implicitly public and
+                // hid them from the default audit. `public` is the default
+                // and stays unrecorded (recording it would read as an export
+                // marker in symbolIsExported).
+                const accessMatch = text.match(/^\s*(private|protected)\s/);
                 members.push({
                     name,
                     params: extractParams(paramsNode),
@@ -967,6 +974,7 @@ function extractClassMembers(classNode, codeOrLines) {
                     startLine,
                     endLine,
                     memberType,
+                    ...(accessMatch && { modifiers: [accessMatch[1]] }),
                     isAsync,
                     isGenerator: isGen,
                     isMethod: true,  // Mark as method for context() lookups
