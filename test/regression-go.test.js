@@ -5847,3 +5847,86 @@ describe('fix #253 (Go): package-qualified dotted usage scopes to the package DI
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #258: chained-receiver fold — builder chains typed hop-by-hop from the
+// producer link (the clap family, Go shape: NewCfg().Opt(1).Opt(2)).
+// ============================================================================
+
+describe('fix #258: chained-receiver fold (Go)', () => {
+    const FILES = {
+        'go.mod': 'module example.com/t\n\ngo 1.21\n',
+        'cfg.go': `package t
+
+type Cfg struct{ N int }
+
+func NewCfg() *Cfg { return &Cfg{} }
+
+func (c *Cfg) Opt(v int) *Cfg { c.N += v; return c }
+
+func (c *Cfg) Done() int { return c.N }
+
+type Grp struct{ N int }
+
+func NewGrp() *Grp { return &Grp{} }
+
+func (g *Grp) Opt(v int) *Grp { g.N += v; return g }
+`,
+        'user.go': `package t
+
+func Build() int {
+	return NewCfg().
+		Opt(1).
+		Opt(2).
+		Done()
+}
+
+func Group() int {
+	return NewGrp().Opt(9).N
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('deep chain confirms both hops on the right owner and excludes the sibling', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'cfg.go:7:Opt');
+            assert.ok(res.confirmed.includes('user.go:5'), `hop 1: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('user.go:6'), `hop 2: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('user.go:11'), 'Grp chain never confirms on Cfg.Opt');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: the sibling owner claims its own chain', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'cfg.go:15:Opt');
+            assert.ok(res.confirmed.includes('user.go:11'), `Grp chain: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('user.go:5'), 'Cfg hops stay off the Grp pin');
+        } finally { rm(dir); }
+    });
+
+    it('chain terminal resolves through folded hops', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'cfg.go:9:Done');
+            assert.ok(res.confirmed.includes('user.go:7'), `terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

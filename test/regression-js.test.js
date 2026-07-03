@@ -7075,3 +7075,81 @@ describe('fix #254: constructor-pin cross-references the class pin', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #258: chained-receiver fold — builder chains typed hop-by-hop from the
+// producer link (the clap family, TS shape: makeBuilder().opt(1).opt(2) with
+// `this` return annotations resolving to the CURRENT chain type).
+// ============================================================================
+
+describe('fix #258: chained-receiver fold (TS)', () => {
+    const FILES = {
+        'package.json': '{"name":"t"}',
+        'builder.ts': `export class Builder {
+    n = 0;
+    opt(v: number): this { this.n += v; return this; }
+    done(): number { return this.n; }
+}
+export class Other {
+    n = 0;
+    opt(v: number): this { this.n += v; return this; }
+}
+export function makeBuilder(): Builder { return new Builder(); }
+export function makeOther(): Other { return new Other(); }
+`,
+        'user.ts': `import { makeBuilder, makeOther } from './builder';
+
+export function build(): number {
+    return makeBuilder()
+        .opt(1)
+        .opt(2)
+        .done();
+}
+
+export function other(): number {
+    return makeOther().opt(9).n;
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('`this`-returning chain confirms both hops on the right owner', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'builder.ts:3:opt');
+            assert.ok(res.confirmed.includes('user.ts:5'), `hop 1: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('user.ts:6'), `hop 2: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('user.ts:11'), 'Other chain never confirms on Builder.opt');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: the sibling owner claims its own chain', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'builder.ts:8:opt');
+            assert.ok(res.confirmed.includes('user.ts:11'), `Other chain: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('user.ts:5'), 'Builder hops stay off the Other pin');
+        } finally { rm(dir); }
+    });
+
+    it('chain terminal resolves through folded hops', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'builder.ts:4:done');
+            assert.ok(res.confirmed.includes('user.ts:7'), `terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

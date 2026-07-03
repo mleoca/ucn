@@ -161,14 +161,29 @@ function nameOnlySelfRecursive(index, name) {
     return true;
 }
 
-/** Check if a position in a line is inside a string literal (quotes/backticks) */
-function isInsideString(line, pos) {
+/** Check if a position in a line is inside a string literal (quotes/backticks).
+ *  Language-aware (fix #259, clap-measured): a Rust apostrophe is a LIFETIME
+ *  unless it closes as a char literal within a few chars — `impl<E: Send +
+ *  'static> MyTrait` read everything after 'static as "inside a string" and
+ *  dropped the line's only reference to MyTrait (FALSE-DEAD on clap's
+ *  autoref-specialization traits). */
+function isInsideString(line, pos, language) {
     let inSingle = false, inDouble = false, inBacktick = false;
     for (let j = 0; j < pos; j++) {
         const ch = line[j];
         if (ch === '\\') { j++; continue; }
         if (ch === '"' && !inSingle && !inBacktick) inDouble = !inDouble;
-        if (ch === "'" && !inDouble && !inBacktick) inSingle = !inSingle;
+        if (ch === "'" && !inDouble && !inBacktick) {
+            if (language === 'rust') {
+                // Char literal ('x', '\n', '\u{1F600}') — skip past it; a
+                // non-closing apostrophe is a lifetime and never opens a
+                // string (Rust strings are double-quoted only).
+                const m = line.slice(j).match(/^'(?:\\u\{[0-9a-fA-F_]+\}|\\.|[^'\\])'/);
+                if (m) j += m[0].length - 1;
+            } else {
+                inSingle = !inSingle;
+            }
+        }
         if (ch === '`' && !inDouble && !inSingle) inBacktick = !inBacktick;
     }
     return inSingle || inDouble || inBacktick;
@@ -591,9 +606,16 @@ function deadcode(index, options = {}) {
                     for (let i = 0; i < lines.length; i++) {
                         const line = lines[i];
                         if (!line.includes(name)) continue;
-                        // Skip line if entirely inside a line comment (// or #)
-                        const commentIdx = line.indexOf('//');
-                        const hashIdx = line.indexOf('#');
+                        // Skip line if entirely inside a line comment — the
+                        // markers are language-shaped (fix #259, clap-measured):
+                        // `#` comments PYTHON ONLY (a Rust attribute line
+                        // `#[arg(value_parser = helper)]` is code, and the old
+                        // skip dropped every reference on it — clap's derive-
+                        // attribute callbacks claimed FALSE-DEAD); `//` comments
+                        // everywhere EXCEPT Python, where it is floor division.
+                        const isPython = fileEntry.language === 'python';
+                        const commentIdx = isPython ? -1 : line.indexOf('//');
+                        const hashIdx = isPython ? line.indexOf('#') : -1;
                         let searchFrom = 0;
                         while (searchFrom < line.length) {
                             const pos = line.indexOf(name, searchFrom);
@@ -611,7 +633,7 @@ function deadcode(index, options = {}) {
                             // Skip if inside a string literal — EXCEPT class-
                             // kind names in Python (fix #253a): `x: "Foo"`
                             // forward references are real type references.
-                            if (isInsideString(line, pos) &&
+                            if (isInsideString(line, pos, fileEntry.language) &&
                                 !(fileEntry.language === 'python' && classKindNames.has(name))) continue;
                             // Property/field access (preceded by '.'), not a
                             // call: resolve the RECEIVER (fix #216, express-

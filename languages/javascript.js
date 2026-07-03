@@ -1878,7 +1878,7 @@ function findCallsInCode(code, parser) {
                         // parseAsync(args).catch(...) — record the producer so
                         // findCallers can type the receiver from its declared
                         // return annotation (Promise<...> → Promise).
-                        let receiverCall, receiverCallIsMethod, receiverCallAwaited;
+                        let receiverCall, receiverCallIsMethod, receiverCallAwaited, receiverCallLine;
                         {
                             let recvNode = objNode;
                             if (recvNode && recvNode.type === 'parenthesized_expression') {
@@ -1892,11 +1892,17 @@ function findCallsInCode(code, parser) {
                                 const prodFunc = recvNode.childForFieldName('function');
                                 if (prodFunc?.type === 'identifier') {
                                     receiverCall = prodFunc.text;
+                                    // Producer link (fix #258): plain-call
+                                    // records carry the call node's start line
+                                    receiverCallLine = recvNode.startPosition.row + 1;
                                 } else if (prodFunc?.type === 'member_expression') {
                                     const prodProp = prodFunc.childForFieldName('property');
                                     if (prodProp) {
                                         receiverCall = prodProp.text;
                                         receiverCallIsMethod = true;
+                                        // Method records report the property
+                                        // node's own line
+                                        receiverCallLine = prodProp.startPosition.row + 1;
                                     }
                                 }
                             }
@@ -1930,6 +1936,7 @@ function findCallsInCode(code, parser) {
                             ...(receiverCall && { receiverCall }),
                             ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                             ...(receiverCallAwaited && { receiverCallAwaited: true }),
+                            ...(receiverCallLine && { receiverCallLine }),
                             ...(assignedTo && { assignedTo }),
                             enclosingFunction,
                             uncertain,

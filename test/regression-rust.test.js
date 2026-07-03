@@ -2497,12 +2497,18 @@ impl Mine {
     pub fn fresh() -> Mine { Mine { v: 0 } }
     pub fn bump(&self) -> u32 { self.v + 1 }
 }
+
+pub fn make() -> impl Iterator<Item = u32> { Mine { v: 0 } }
 `,
-        'src/user.rs': `use crate::mine::Mine;
+        'src/user.rs': `use crate::mine::{make, Mine};
 
 pub fn drive() -> u32 {
-    let _n = Mine::fresh().next();
+    let _n = make().next();
     Mine::fresh().bump()
+}
+
+pub fn drive_typed() -> u32 {
+    match Mine::fresh().next() { Some(v) => v, None => 0 }
 }
 `,
     };
@@ -2534,17 +2540,33 @@ pub fn drive() -> u32 {
     });
 
     it('external-trait method routes chained receiver-blind calls possible-dispatch via the trait', () => {
+        // make() returns `impl Iterator<Item = u32>` — an opaque type the
+        // chain fold (fix #258) cannot pin, so the receiver stays blind and
+        // the #210 external-contract routing decides.
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'src/mine.rs:5:next');
             assert.ok(!res.confirmed.includes('src/user.rs:4'),
-                `Mine::fresh().next() could be any Iterator's: ${res.confirmed}`);
+                `make().next() could be any Iterator's: ${res.confirmed}`);
             const entry = res.unverified.find(u => u.key === 'src/user.rs:4');
             assert.ok(entry, `chained call stays visible: ${JSON.stringify(res.unverified)}`);
             assert.strictEqual(entry.reason, 'possible-dispatch');
             assert.strictEqual(entry.dispatchVia, 'Iterator');
             assert.strictEqual(entry.externalContract, true);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('fold-typed chained receiver keeps confirming an external-contract method (fix #258)', () => {
+        // Mine::fresh() -> Mine is compiler-checked receiver evidence — the
+        // #210 rule demotes only receiver-evidence-FREE calls.
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/mine.rs:5:next');
+            assert.ok(res.confirmed.includes('src/user.rs:9'),
+                `Mine::fresh().next() is receiver-evidenced via the chain fold: ${res.confirmed}`);
             assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
@@ -3654,6 +3676,317 @@ describe('fix #246: Cargo package-name imports from integration tests', () => {
             const appAbs = [...index.files.keys()].find(f => f.endsWith('src/app.rs'));
             const edges = index.importGraph.get(libAbs) || new Set();
             assert.ok(edges.has(appAbs), 'lib.rs -> src/app.rs child-module edge kept');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #258: chained-receiver fold — builder chains typed hop-by-hop from the
+// producer link (clap-measured: Command::new("x").author(a).arg(b).arg(c) had
+// 1686 method-ambiguous callers because `arg` has two owners both returning
+// Self, which resolves to DIFFERENT types and kills project-wide agreement).
+// ============================================================================
+
+describe('fix #258: chained-receiver fold (Rust)', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/lib.rs': 'pub mod cfg;\npub mod grp;\npub mod user;\n',
+        'src/cfg.rs': `pub struct Cfg { pub n: u32 }
+
+impl Cfg {
+    pub fn new() -> Self { Cfg { n: 0 } }
+    pub fn opt(mut self, v: u32) -> Self { self.n += v; self }
+    pub fn done(self) -> u32 { self.n }
+}
+`,
+        'src/grp.rs': `pub struct Grp { pub n: u32 }
+
+impl Grp {
+    pub fn new() -> Self { Grp { n: 0 } }
+    pub fn opt(mut self, v: u32) -> Self { self.n += v; self }
+}
+`,
+        'src/user.rs': `use crate::cfg::Cfg;
+use crate::grp::Grp;
+
+pub fn build() -> u32 {
+    Cfg::new()
+        .opt(1)
+        .opt(2)
+        .done()
+}
+
+pub fn group() -> u32 {
+    Grp::new().opt(9).n
+}
+
+pub fn from_param(c: Cfg) -> u32 {
+    c.opt(3).opt(4).done()
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('path-rooted chain confirms every hop against the right owner', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/cfg.rs:5:opt');
+            assert.ok(res.confirmed.includes('src/user.rs:6'), `hop 1: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('src/user.rs:7'), `hop 2: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('src/user.rs:12'), 'Grp chain never confirms on Cfg.opt');
+            assert.ok(!res.unverified.includes('src/user.rs:12'), 'Grp chain is excluded, not ambiguous');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: the sibling owner claims its own chain', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/grp.rs:5:opt');
+            assert.ok(res.confirmed.includes('src/user.rs:12'), `Grp chain: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('src/user.rs:6'), 'Cfg hops stay off the Grp pin');
+            assert.ok(!res.confirmed.includes('src/user.rs:7'), 'Cfg hops stay off the Grp pin');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('annotated-param-rooted chain folds through Self returns', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/cfg.rs:5:opt');
+            assert.ok(res.confirmed.includes('src/user.rs:16'), `param root: ${res.confirmed}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('chain terminal resolves through folded hops (done after two opts)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/cfg.rs:6:done');
+            assert.ok(res.confirmed.includes('src/user.rs:8'), `terminal: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('src/user.rs:16'), `param terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #258: cross-crate workspace imports (Rust)', () => {
+    const FILES = {
+        'wa/Cargo.toml': '[package]\nname = "wa"\nversion = "0.1.0"\n',
+        'wa/src/lib.rs': `pub struct Widget { pub n: u32 }
+
+impl Widget {
+    pub fn create() -> Self { Widget { n: 0 } }
+    pub fn run(self) -> u32 { self.n }
+}
+`,
+        'wb/Cargo.toml': '[package]\nname = "wb"\nversion = "0.1.0"\n',
+        'wb/src/lib.rs': `use wa::Widget;
+
+pub fn go() -> u32 {
+    Widget::create().run()
+}
+`,
+    };
+
+    it('a sibling workspace member import resolves and the chain confirms', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'wa/src/lib.rs:5:run' });
+            assert.ok(r.ok, `context failed: ${r.error}`);
+            const output = require('../core/output');
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('wb/src/lib.rs:4'), `cross-crate chain: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('a local child module of the same name outranks the workspace crate', () => {
+        const dir = tmp({
+            'wa/Cargo.toml': '[package]\nname = "wa"\nversion = "0.1.0"\n',
+            'wa/src/lib.rs': 'pub fn helper() -> u32 { 1 }\n',
+            'wb/Cargo.toml': '[package]\nname = "wb"\nversion = "0.1.0"\n',
+            'wb/src/lib.rs': 'mod wa;\npub fn go() -> u32 { wa::local() }\n',
+            'wb/src/wa.rs': 'pub fn local() -> u32 { 2 }\n',
+        });
+        try {
+            const index = idx(dir);
+            const abs = path.join(dir, 'wb/src/lib.rs');
+            const edges = index.importGraph.get(abs);
+            const rels = edges ? [...edges].map(e => path.relative(dir, e)) : [];
+            assert.ok(rels.includes(path.join('wb', 'src', 'wa.rs')),
+                `local module wins: ${rels}`);
+            assert.ok(!rels.includes(path.join('wa', 'src', 'lib.rs')),
+                `workspace crate must not shadow the local module: ${rels}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #259: deadcode line-scan — language-shaped comment markers and Rust
+// lifetimes (clap deadcode gate, first pinned run). `#` comments Python only:
+// a Rust attribute line `#[arg(value_parser = helper)]` is CODE, and the old
+// skip dropped every reference on it. A lone apostrophe is a LIFETIME, not an
+// open string: `impl<E: Send + 'static> MyTrait` dropped the line's only
+// MyTrait reference.
+// ============================================================================
+
+describe('fix #259: deadcode scan — Rust attributes and lifetimes', () => {
+    it('a reference inside a derive-attribute argument keeps the function alive', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Opts {',
+                '    #[arg(value_parser = parse_pair::<String>)]',
+                '    defines: Vec<String>,',
+                '}',
+                '',
+                'fn parse_pair<T>(s: &str) -> T { todo!() }',
+                '',
+                'fn truly_dead_helper() -> u32 { 7 }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'parse_pair'),
+                `attribute-argument reference is a usage: ${dead.map(d => d.name)}`);
+            // Counter-probe: the scan still claims genuinely dead symbols
+            assert.ok(dead.some(d => d.name === 'truly_dead_helper'),
+                `unreferenced helper stays claimable: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a trait referenced on a lifetime-bearing impl line stays alive', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub trait Marker {',
+                '    fn tag(&self) -> u32;',
+                '}',
+                '',
+                "impl<E: Send + Sync + 'static> Marker for Vec<E> {",
+                '    fn tag(&self) -> u32 { 1 }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            assert.ok(!dead.some(d => d.name === 'Marker' && d.type === 'trait'),
+                `the impl line references Marker after 'static: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+
+    it('char literals still count as strings (counter-probe)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'fn keep_me() -> u32 { 3 }',
+                '',
+                'pub fn caller() -> u32 {',
+                '    keep_me()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'keep_me'), 'called fn is alive');
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #260: module-qualified path calls own their name (clap-measured — the
+// one engine FP in clap's first pinned run): `render::version(&self.cmd)` is
+// render.rs's FUNCTION, never Command::version, yet bare-name scope evidence
+// confirmed it against the method pin.
+// ============================================================================
+
+describe('fix #260: Rust module-qualified path-call ownership', () => {
+    const FILES = {
+        'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+        'src/lib.rs': 'pub mod cmdty;\npub mod render;\npub mod user;\n',
+        'src/cmdty.rs': `pub struct Cmd { pub v: u32 }
+
+impl Cmd {
+    pub fn version(&self) -> u32 { self.v }
+}
+`,
+        'src/render.rs': `pub fn version() -> u32 { 2 }
+`,
+        'src/user.rs': `use crate::render;
+
+pub fn go() -> u32 {
+    render::version()
+}
+
+pub fn stray() -> u32 {
+    mystery::version()
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(u => `${u.file}:${u.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('a module-qualified call never confirms against a foreign method pin', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/cmdty.rs:4:version');
+            assert.ok(!res.confirmed.includes('src/user.rs:4'),
+                `render::version is the module's function: ${res.confirmed}`);
+            assert.ok(!res.unverified.includes('src/user.rs:4'),
+                'module ownership is exclusion-grade, not ambiguity');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: the module\'s own function keeps its caller', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/render.rs:1:version');
+            assert.ok(res.confirmed.includes('src/user.rs:4'),
+                `ownership-consistent pin confirms: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('an unresolvable qualifier routes visible, never scope-confirms', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'src/cmdty.rs:4:version');
+            assert.ok(!res.confirmed.includes('src/user.rs:8'),
+                `mystery::version has no scope evidence for the pin: ${res.confirmed}`);
+            assert.ok(res.unverified.includes('src/user.rs:8'),
+                `unresolvable qualifier stays visible: ${res.unverified}`);
         } finally { rm(dir); }
     });
 });

@@ -24,6 +24,8 @@ false-dead = 0.
 | ripgrep | rust-analyzer | default | 8 | 8 | 8 | **0** | 0 | 0 |
 | ripgrep | rust-analyzer | exported | 28 | 28 | 28 | **0** | 0 | 0 |
 | cursive | rust-analyzer | default | 7 | 7 | 7 | **0** | 0 | 0 |
-| cursive | rust-analyzer | exported | 154 | 60 | 60 | **0** | 0 | 0 |
+| cursive | rust-analyzer | exported | 152 | 60 | 60 | **0** | 0 | 0 |
 | gson | jdtls | default | 2 | 2 | 2 | **0** | 0 | 0 |
 | gson | jdtls | exported | 1 | 1 | 1 | **0** | 0 | 0 |
+| clap | rust-analyzer | default | 7 | 7 | 7 | **0** | 0 | 0 |
+| clap | rust-analyzer | exported | 42 | 42 | 42 | **0** | 0 | 0 |

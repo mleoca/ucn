@@ -1311,13 +1311,18 @@ function findCallsInCode(code, parser) {
                     // chain to its root: if the chain originates at Router::new() or
                     // any Router-typed call, set a synthetic receiver string so the
                     // bridge layer can recognize this as a Router method invocation.
+                    let receiverIsChainRoot;
                     if (!receiver && valueNode?.type === 'call_expression') {
                         const rootType = _findRustChainRootType(valueNode);
                         if (rootType) {
                             // Synthetic marker — ROUTER_CHAIN:<RootTypeName>. The
                             // <RootTypeName> portion lets the bridge match
-                            // /^router/i case-insensitively.
+                            // /^router/i case-insensitively. receiverIsChainRoot
+                            // tells caller physics this is NOT an identifier in
+                            // the code (fix #258) — the chain fold types it from
+                            // the producer link instead.
                             receiver = rootType;
+                            receiverIsChainRoot = true;
                         }
                     }
                     // fix #202: one-hop declared-field receivers — self.dent.path(),
@@ -1354,16 +1359,43 @@ function findCallsInCode(code, parser) {
                     // Chained receiver (fix #220): the receiver IS a call —
                     // self.as_u8().as_color() — record the producer so
                     // findCallers can type it from the declared return.
-                    // Path producers (Config::load().x()) stay uncaptured
-                    // until a measured family justifies the path branch.
-                    let receiverCall, receiverCallIsMethod;
-                    if (!receiver && !receiverField && valueNode?.type === 'call_expression') {
-                        const prodFunc = valueNode.childForFieldName('function');
+                    // Fix #258 (clap-measured): receiverCallLine links to the
+                    // producer's OWN record (per-record line convention:
+                    // field identifier for method producers, call-node start
+                    // for plain/path producers) so the chain fold can walk
+                    // Command::new("x").a(...).b(...) hop by hop; path
+                    // producers (Config::load().x()) are captured now, and
+                    // rooted chains keep their synthetic receiver marker for
+                    // the bridge but get the link too.
+                    let receiverCall, receiverCallIsMethod, receiverCallLine;
+                    if ((!receiver || receiverIsChainRoot) && !receiverField &&
+                        valueNode?.type === 'call_expression') {
+                        let prodFunc = valueNode.childForFieldName('function');
+                        if (prodFunc?.type === 'generic_function') {
+                            prodFunc = prodFunc.childForFieldName('function') || prodFunc;
+                        }
                         if (prodFunc?.type === 'identifier') {
                             receiverCall = prodFunc.text;
+                            receiverCallLine = valueNode.startPosition.row + 1;
                         } else if (prodFunc?.type === 'field_expression') {
                             const pf = prodFunc.childForFieldName('field');
-                            if (pf) { receiverCall = pf.text; receiverCallIsMethod = true; }
+                            if (pf) {
+                                receiverCall = pf.text;
+                                receiverCallIsMethod = true;
+                                receiverCallLine = pf.startPosition.row + 1;
+                            }
+                        } else if (prodFunc?.type === 'scoped_identifier') {
+                            // Path producer: Command::new(...).arg(...) — the
+                            // producer record's name is the last path segment
+                            // (turbofish segments dropped, matching the path
+                            // record's own derivation) at the call node's line.
+                            const segs = prodFunc.text.split('::');
+                            const prodName = segs[segs.length - 1];
+                            if (prodName && !prodName.startsWith('<')) {
+                                receiverCall = prodName;
+                                receiverCallIsMethod = true;
+                                receiverCallLine = valueNode.startPosition.row + 1;
+                            }
                         }
                     }
                     // Literal receivers carry their builtin type (fix #220,
@@ -1374,7 +1406,7 @@ function findCallsInCode(code, parser) {
                         ? ({ string_literal: 'str', raw_string_literal: 'str',
                             char_literal: 'char', boolean_literal: 'bool' })[valueNode.type]
                         : undefined;
-                    const receiverType = (receiver && receiver !== 'self')
+                    const receiverType = (receiver && receiver !== 'self' && !receiverIsChainRoot)
                         ? getReceiverType(receiver)
                         : literalReceiverType;
                     const firstArg = getFirstStringArg(node);
@@ -1389,10 +1421,12 @@ function findCallsInCode(code, parser) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverIsChainRoot && { receiverIsChainRoot: true }),
                         ...(receiverField && { receiverRoot, receiverField }),
                         ...(receiverField && receiverRootType && { receiverRootType }),
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+                        ...(receiverCallLine && { receiverCallLine }),
                         argCount,
                         ...(assigned && { assignedTo: assigned.assignedTo }),
                         ...(assigned?.unwrapped && { assignedUnwrap: true }),

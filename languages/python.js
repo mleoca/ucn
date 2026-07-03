@@ -1073,7 +1073,7 @@ function findCallsInCode(code, parser) {
                     // annotation. `(await f()).m()` unwraps to the call and
                     // marks awaited (an un-awaited async producer's value is a
                     // coroutine, not the annotation's type).
-                    let receiverCall, receiverCallIsMethod, receiverCallAwaited;
+                    let receiverCall, receiverCallIsMethod, receiverCallAwaited, receiverCallLine;
 
                     // Detect super().method() pattern
                     if (objNode?.type === 'call') {
@@ -1093,11 +1093,17 @@ function findCallsInCode(code, parser) {
                             const prodFunc = recvNode.childForFieldName('function');
                             if (prodFunc?.type === 'identifier') {
                                 receiverCall = prodFunc.text;
+                                // Producer link (fix #258): plain-call records
+                                // carry the call node's start line
+                                receiverCallLine = recvNode.startPosition.row + 1;
                             } else if (prodFunc?.type === 'attribute') {
                                 const prodAttr = prodFunc.childForFieldName('attribute');
                                 if (prodAttr) {
                                     receiverCall = prodAttr.text;
                                     receiverCallIsMethod = true;
+                                    // Method records report the attribute
+                                    // node's own line
+                                    receiverCallLine = prodAttr.startPosition.row + 1;
                                 }
                             }
                         }
@@ -1140,6 +1146,7 @@ function findCallsInCode(code, parser) {
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                         ...(receiverCallAwaited && { receiverCallAwaited: true }),
+                        ...(receiverCallLine && { receiverCallLine }),
                         ...(assignedTo && { assignedTo }),
                         argCount,
                         ...(argSpread && { argSpread: true }),

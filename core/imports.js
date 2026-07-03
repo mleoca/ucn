@@ -289,6 +289,42 @@ function resolveGoImport(importPath, fromFile, projectRoot) {
 // Cache for Rust crate roots (Cargo.toml locations)
 const cargoCache = new Map();
 
+// Workspace crate registry (fix #258): Cargo [package] name → crate source
+// root for EVERY crate in the project tree, so cross-crate workspace imports
+// (`use clap::Command` from clap_bench/) resolve like own-package imports.
+// One bounded scan per project root, cached.
+const workspaceCrateCache = new Map();
+const _WORKSPACE_SCAN_PRUNE = new Set([
+    'node_modules', '.git', 'target', 'vendor', 'dist', 'build', '.ucn-cache',
+]);
+
+function workspaceCrateRegistry(projectRoot) {
+    if (workspaceCrateCache.has(projectRoot)) {
+        return workspaceCrateCache.get(projectRoot);
+    }
+    const registry = new Map();
+    const walk = (dir, depth) => {
+        if (depth > 6) return;
+        let entries;
+        try { entries = fs.readdirSync(dir, { withFileTypes: true }); }
+        catch { return; }
+        for (const e of entries) {
+            if (e.isDirectory()) {
+                if (_WORKSPACE_SCAN_PRUNE.has(e.name) || e.name.startsWith('.')) continue;
+                walk(path.join(dir, e.name), depth + 1);
+            } else if (e.name === 'Cargo.toml') {
+                const info = findCargoRoot(dir);
+                if (info && info.packageName && !registry.has(info.packageName)) {
+                    registry.set(info.packageName, info);
+                }
+            }
+        }
+    };
+    walk(projectRoot, 0);
+    workspaceCrateCache.set(projectRoot, registry);
+    return registry;
+}
+
 /**
  * Find the nearest Cargo.toml and return the crate's source root
  * @param {string} startDir - Directory to start searching from
@@ -422,6 +458,28 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
                 const resolved = restSegs.length > 0 ? resolveRustModulePath(cargo.srcDir, restSegs) : null;
                 const fallback = resolved || rustModuleOwnFile(cargo.srcDir, fromFile);
                 if (fallback) return fallback;
+            }
+        }
+        // Cross-crate WORKSPACE imports (fix #258, clap-measured): a sibling
+        // workspace member's [package] name resolves into that crate's source
+        // tree (`use clap::Command` from clap_bench/, ripgrep's grep-* crates
+        // importing each other). Own-package and 2015-edition child-module
+        // cases are handled above; a name matching this crate's own package
+        // inside src/ never reaches here as a workspace lookup.
+        if (firstSeg && (!cargo || firstSeg !== cargo.packageName)) {
+            // A local child module of the same name wins over a workspace
+            // crate (mod declarations resolve in the plain branch below).
+            const localChild = fs.existsSync(path.join(fromDir, firstSeg + '.rs')) ||
+                fs.existsSync(path.join(fromDir, firstSeg, 'mod.rs'));
+            if (!localChild) {
+                const registry = workspaceCrateRegistry(projectRoot);
+                const member = registry.get(firstSeg);
+                if (member && (!cargo || member.root !== cargo.root)) {
+                    const restSegs = importPath.split('::').slice(1);
+                    const resolved = restSegs.length > 0 ? resolveRustModulePath(member.srcDir, restSegs) : null;
+                    const fallback = resolved || rustModuleOwnFile(member.srcDir, fromFile);
+                    if (fallback) return fallback;
+                }
             }
         }
     }

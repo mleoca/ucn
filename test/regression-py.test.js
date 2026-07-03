@@ -3731,3 +3731,143 @@ describe('fix #245 (Python): flask route shortcuts stay flask', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #258: chained-receiver fold — builder chains typed hop-by-hop from the
+// producer link (the clap family, Python shape: make().opt(1).opt(2).done()
+// with forward-ref string annotations).
+// ============================================================================
+
+describe('fix #258: chained-receiver fold (Python)', () => {
+    const FILES = {
+        'builder.py': `class Builder:
+    def __init__(self):
+        self.n = 0
+
+    def opt(self, v: int) -> "Builder":
+        self.n += v
+        return self
+
+    def done(self) -> int:
+        return self.n
+
+
+class Other:
+    def opt(self, v: int) -> "Other":
+        return self
+
+
+def make() -> "Builder":
+    return Builder()
+
+
+def make_other() -> "Other":
+    return Other()
+`,
+        'user.py': `from builder import make, make_other
+
+
+def build() -> int:
+    return make().opt(1).opt(2).done()
+
+
+def other() -> int:
+    make_other().opt(9)
+    return 0
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('annotation-rooted chain confirms hops on the right owner (one-line chain)', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'builder.py:5:opt');
+            assert.ok(res.confirmed.includes('user.py:5'), `hops: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('user.py:9'), 'Other chain never confirms on Builder.opt');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: the sibling owner claims its own chain', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'builder.py:14:opt');
+            assert.ok(res.confirmed.includes('user.py:9'), `Other chain: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('user.py:5'), 'Builder hops stay off the Other pin');
+        } finally { rm(dir); }
+    });
+
+    it('chain terminal resolves through folded hops', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'builder.py:9:done');
+            assert.ok(res.confirmed.includes('user.py:5'), `terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #259: deadcode line-scan — `//` is floor DIVISION in Python, never a
+// comment; a name whose only reference sits after `//` on a line was dropped.
+// (`#` keeps commenting Python — counter-probed.)
+// ============================================================================
+
+describe('fix #259: deadcode scan — Python floor division vs // comment', () => {
+    it('a reference after // (floor division) counts as a usage', () => {
+        const dir = tmp({
+            'lib.py': [
+                'BUCKET_SIZE = 0',
+                '',
+                '',
+                'def bucket_of(n):',
+                '    return n // bucket_size_helper()',
+                '',
+                '',
+                'def bucket_size_helper():',
+                '    return 10',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'bucket_size_helper'),
+                `floor-division operand is a usage: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter: a name mentioned only in a # comment stays dead', () => {
+        const dir = tmp({
+            'lib.py': [
+                'def commented_only():',
+                '    return 1',
+                '',
+                '',
+                'def live():',
+                '    # commented_only() is not really called here',
+                '    return 2',
+                '',
+                '',
+                'print(live())',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(dead.some(d => d.name === 'commented_only'),
+                `# comment mention is not a usage: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+});

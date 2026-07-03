@@ -1167,16 +1167,22 @@ function findCallsInCode(code, parser, options = {}) {
                     // declared return (*pflag.FlagSet → external → routed).
                     // Package-qualified producers (os.CreateTemp().Name())
                     // carry the qualifier for strict import-package resolution.
-                    let receiverCall, receiverCallIsMethod, receiverCallReceiver;
+                    let receiverCall, receiverCallIsMethod, receiverCallReceiver, receiverCallLine;
                     if (!receiver && !receiverFieldName && operandNode?.type === 'call_expression') {
                         const prodFunc = operandNode.childForFieldName('function');
                         if (prodFunc?.type === 'identifier') {
                             receiverCall = prodFunc.text;
+                            // Producer link (fix #258): plain-call records carry
+                            // the call node's start line
+                            receiverCallLine = operandNode.startPosition.row + 1;
                         } else if (prodFunc?.type === 'selector_expression') {
                             const pf = prodFunc.childForFieldName('field');
                             const po = prodFunc.childForFieldName('operand');
                             if (pf) {
                                 receiverCall = pf.text;
+                                // Selector records report the FIELD's own line
+                                // (fix #223 name-node convention)
+                                receiverCallLine = pf.startPosition.row + 1;
                                 if (po?.type === 'identifier' && importAliases.has(po.text)) {
                                     receiverCallReceiver = po.text;
                                 } else {
@@ -1203,6 +1209,7 @@ function findCallsInCode(code, parser, options = {}) {
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                         ...(receiverCallReceiver && { receiverCallReceiver }),
+                        ...(receiverCallLine && { receiverCallLine }),
                         argCount,
                         ...(argSpread && { argSpread: true }),
                         ...(assigned && { assignedTo: assigned.assignedTo }),

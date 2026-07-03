@@ -1131,11 +1131,14 @@ function findCallsInCode(code, parser) {
                 // Chained receiver (fix #220): the receiver IS a call —
                 // getConfig().validate() — record the producer so findCallers
                 // can type it from the declared return annotation.
-                let receiverCall, receiverCallIsMethod;
+                let receiverCall, receiverCallIsMethod, receiverCallLine;
                 if (!receiver && !receiverFieldName && objNode?.type === 'method_invocation') {
                     const prodName = objNode.childForFieldName('name');
                     if (prodName) {
                         receiverCall = prodName.text;
+                        // Producer link (fix #258): records report the name
+                        // node's own line
+                        receiverCallLine = prodName.startPosition.row + 1;
                         if (objNode.childForFieldName('object')) receiverCallIsMethod = true;
                     }
                 }
@@ -1155,6 +1158,7 @@ function findCallsInCode(code, parser) {
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),
                     ...(receiverCall && { receiverCall }),
                     ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+                    ...(receiverCallLine && { receiverCallLine }),
                     argCount: callArgs.argCount,
                     ...(callArgs.argKinds && { argKinds: callArgs.argKinds }),
                     ...(assignedTo && { assignedTo }),

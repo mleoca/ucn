@@ -3039,3 +3039,80 @@ describe('fix #246: Maven/Gradle source roots are one package', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// Fix #258: chained-receiver fold — builder chains typed hop-by-hop from the
+// producer link (the clap family, Java shape: Cfg.builder().opt(1).opt(2)).
+// ============================================================================
+
+describe('fix #258: chained-receiver fold (Java)', () => {
+    const FILES = {
+        'Cfg.java': `public class Cfg {
+    private int n;
+    public static Cfg builder() { return new Cfg(); }
+    public Cfg opt(int v) { this.n += v; return this; }
+    public int done() { return n; }
+}
+`,
+        'Grp.java': `public class Grp {
+    private int n;
+    public static Grp builder() { return new Grp(); }
+    public Grp opt(int v) { this.n += v; return this; }
+}
+`,
+        'User.java': `public class User {
+    public int build() {
+        return Cfg.builder()
+            .opt(1)
+            .opt(2)
+            .done();
+    }
+    public void group() {
+        Grp g = Grp.builder().opt(9);
+    }
+}
+`,
+    };
+
+    function contract(index, handle) {
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, `context ${handle} failed: ${r.error}`);
+        const output = require('../core/output');
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('static-factory-rooted chain confirms both hops on the right owner', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Cfg.java:4:opt');
+            assert.ok(res.confirmed.includes('User.java:4'), `hop 1: ${res.confirmed}`);
+            assert.ok(res.confirmed.includes('User.java:5'), `hop 2: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('User.java:9'), 'Grp chain never confirms on Cfg.opt');
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: the sibling owner claims its own chain', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Grp.java:4:opt');
+            assert.ok(res.confirmed.includes('User.java:9'), `Grp chain: ${res.confirmed}`);
+            assert.ok(!res.confirmed.includes('User.java:4'), 'Cfg hops stay off the Grp pin');
+        } finally { rm(dir); }
+    });
+
+    it('chain terminal resolves through folded hops', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Cfg.java:5:done');
+            assert.ok(res.confirmed.includes('User.java:6'), `terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+});

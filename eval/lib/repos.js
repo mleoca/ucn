@@ -119,6 +119,20 @@ const REPOS = [
         language: 'java',
         targetCandidates: ['gson/src/main/java'],
     },
+    {
+        // Builder-chain-heavy Rust (graduated from FRESH_POOL 2026-07-03 —
+        // used to tune fix #258, so it joins the pinned board per the
+        // fresh-repo protocol). Command::new("x").author(a).arg(b).arg(c)
+        // chains dominate the caller population: before the chained-receiver
+        // fold, Command::arg had 1686 method-ambiguous callers (1524
+        // oracle-true); the fold + workspace crate-name imports confirm them.
+        // Whole workspace (clap_builder + clap_bench + tests + examples).
+        name: 'clap',
+        url: 'https://github.com/clap-rs/clap',
+        commit: 'd3e59a9ab214910b9dad02921b7ef42c6400de9b',
+        language: 'rust',
+        targetCandidates: ['.'],
+    },
 ];
 
 // ============================================================================
@@ -149,7 +163,6 @@ const FRESH_POOL = [
     { name: 'chi', url: 'https://github.com/go-chi/chi', language: 'go', targetCandidates: ['.'] },
     { name: 'viper', url: 'https://github.com/spf13/viper', language: 'go', targetCandidates: ['.'] },
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
-    { name: 'clap', url: 'https://github.com/clap-rs/clap', language: 'rust', targetCandidates: ['.'] },
     { name: 'javapoet', url: 'https://github.com/square/javapoet', language: 'java', targetCandidates: ['javapoet/src/main/java', 'src/main/java'] },
     { name: 'jsoup', url: 'https://github.com/jhy/jsoup', language: 'java', targetCandidates: ['src/main/java'] },
 ];

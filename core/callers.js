@@ -357,6 +357,7 @@ function findCallers(index, name, options = {}) {
     const needsTotal = !!options.needsTotal;
     const localTypeCache = new Map(); // `${filePath}:${startLine}` -> localTypes Map or null
     const returnFlowCache = new Map(); // filePath -> return-type-flow map (see _buildReturnTypeFlowMap)
+    const foldCtxCache = new Map(); // filePath -> chained-receiver fold context (fix #258)
 
     // Use inverted callee index to skip files that don't contain calls to this name
     let calleeFiles = index.getCalleeFiles(name);
@@ -410,6 +411,7 @@ function findCallers(index, name, options = {}) {
                 // type derives from OTHER files' annotations, so it must never be
                 // persisted with this file's calls.
                 if (call.isMethod && call.receiver && !call.receiverType &&
+                    !call.receiverIsChainRoot &&
                     (langTraits(fileEntry.language)?.typeSystem === 'structural' ||
                         (collectAccount && !call.isPotentialCallback && !call.isPathCall &&
                             langTraits(fileEntry.language)?.typeSystem === 'nominal'))) {
@@ -441,17 +443,58 @@ function findCallers(index, name, options = {}) {
                 // their chained calls stay under the #204 dispatch tiering
                 // (visible, honest) until a measured family justifies the
                 // #207 origin-pinning rails there.
-                if (call.isMethod && !call.receiver && !call.receiverType && call.receiverCall &&
+                if (call.isMethod && (!call.receiver || call.receiverIsChainRoot) &&
+                    !call.receiverType && call.receiverCall &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural') {
-                    const chainedType = _chainedReceiverType(index, call, fileEntry.language);
-                    if (chainedType) call = { ...call, receiverType: chainedType };
-                } else if (call.isMethod && !call.receiver && !call.receiverType && call.receiverCall &&
+                    // Fold first (fix #258 — multi-hop builder chains typed
+                    // from the producer link), one-hop agreement as fallback.
+                    let foldCtx = foldCtxCache.get(filePath);
+                    if (!foldCtx) {
+                        foldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                            getFlowMap: () => {
+                                let fm = returnFlowCache.get(filePath);
+                                if (fm === undefined) {
+                                    fm = _buildReturnTypeFlowMap(index, filePath, calls);
+                                    returnFlowCache.set(filePath, fm);
+                                }
+                                return fm;
+                            } };
+                        foldCtxCache.set(filePath, foldCtx);
+                    }
+                    const folded = _foldChainedReceiverType(index, fileEntry, filePath, call, foldCtx);
+                    if (folded && folded.type) {
+                        call = { ...call, receiverType: folded.type };
+                    } else if (folded && folded.externalVia) {
+                        call = { ...call, receiverExternalFlow: folded.externalVia };
+                    } else {
+                        const chainedType = _chainedReceiverType(index, call, fileEntry.language);
+                        if (chainedType) call = { ...call, receiverType: chainedType };
+                    }
+                } else if (call.isMethod && (!call.receiver || call.receiverIsChainRoot) &&
+                    !call.receiverType && call.receiverCall &&
                     collectAccount && !call.isPotentialCallback &&
                     langTraits(fileEntry.language)?.typeSystem === 'nominal') {
                     // Nominal chained receivers (fix #220, cobra-measured):
                     // account-gated like the #207 nominal flow — mismatch
                     // reroutes are account-only; legacy would silently drop.
-                    const flowEntry = _nominalChainedReceiverType(index, call, fileEntry, filePath);
+                    // The fold (fix #258) runs first — Command::new("x")
+                    // .author(a).arg(b) types hop-by-hop where the one-hop
+                    // agreement rule dies on multi-owner `Self` returns.
+                    let foldCtx = foldCtxCache.get(filePath);
+                    if (!foldCtx) {
+                        foldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                            getFlowMap: () => {
+                                let fm = returnFlowCache.get(filePath);
+                                if (fm === undefined) {
+                                    fm = _buildReturnTypeFlowMap(index, filePath, calls);
+                                    returnFlowCache.set(filePath, fm);
+                                }
+                                return fm;
+                            } };
+                        foldCtxCache.set(filePath, foldCtx);
+                    }
+                    const flowEntry = _foldChainedReceiverType(index, fileEntry, filePath, call, foldCtx)
+                        || _nominalChainedReceiverType(index, call, fileEntry, filePath);
                     if (flowEntry && flowEntry.externalVia) {
                         call = { ...call, receiverExternalFlow: flowEntry.externalVia };
                     } else if (flowEntry) {
@@ -2062,6 +2105,56 @@ function findCallers(index, name, options = {}) {
                             }
                             recordExcluded(filePath, call.line, 'path-type-mismatch');
                             continue;
+                        }
+                        // Module-qualified path calls (fix #260, clap-measured):
+                        // a LOWERCASE path qualifier names a MODULE, and the
+                        // module owns the name (#206 ownership) — clap_mangen's
+                        // `render::version(&self.cmd)` is render.rs's function,
+                        // never Command::version, yet bare-name scope evidence
+                        // confirmed it against the method pin. The qualifier's
+                        // last segment resolves through this file's import/mod
+                        // edges (basename match, mod.rs-aware): pin inside the
+                        // module → normal confirmation; module defines the name
+                        // elsewhere → excluded other-definition; resolver gap or
+                        // unresolvable qualifier → visible, never scope-confirmed
+                        // (#206(4): a qualified call never earns the target's
+                        // bare-identifier scope evidence). crate/self/super are
+                        // scope keywords, not module names — exempt.
+                        if (call.isPathCall && call.receiver) {
+                            const _modSeg = String(call.receiver).split('::').pop();
+                            if (_modSeg && !/^[A-Z]/.test(_modSeg) &&
+                                !['crate', 'self', 'super'].includes(_modSeg)) {
+                                const _edges = index.importGraph.get(filePath);
+                                const _modFiles = [];
+                                if (_edges) {
+                                    for (const e of _edges) {
+                                        const base = path.basename(e).replace(/\.rs$/, '');
+                                        if (base === _modSeg ||
+                                            (base === 'mod' && path.basename(path.dirname(e)) === _modSeg)) {
+                                            _modFiles.push(e);
+                                        }
+                                    }
+                                }
+                                const _pinnedIn = _modFiles.length > 0 &&
+                                    targetDefs2.some(d => _modFiles.includes(d.file));
+                                if (!_pinnedIn) {
+                                    const _ownsName = _modFiles.some(f => {
+                                        const fe2 = index.files.get(f);
+                                        return fe2 && fe2.symbols && fe2.symbols.some(s =>
+                                            s.name === name && !NON_CALLABLE_TYPES.has(s.type));
+                                    });
+                                    if (_ownsName) {
+                                        recordExcluded(filePath, call.line, 'other-definition');
+                                        continue;
+                                    }
+                                    routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                        dispatchCandidates: methodOwnerKeys().size,
+                                    });
+                                    continue;
+                                }
+                                // pinned target lives in the qualifier's module —
+                                // ownership consistent, normal confirmation proceeds
+                            }
                         }
                         const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
                         if (knownDispatchType && !tTypes.has(knownDispatchType)) {
@@ -4073,6 +4166,13 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
         const imported = typeDefs.filter(d => imports.has(d.file));
         if (imported.length === 1) return { fromFile: imported[0].file };
     }
+    // Re-export chains (fix #258, the #209 lesson brought to identity
+    // resolution): `use clap::Command` lands the import edge on the crate's
+    // lib.rs, not the type's defining file — chase bounded re-export hops
+    // (depth 4) and pin only when exactly ONE same-name type is reachable.
+    const reachable = typeDefs.filter(d =>
+        _importReaches(index, producerFile, new Set([d.file])));
+    if (reachable.length === 1) return { fromFile: reachable[0].file };
     return null;
 }
 
@@ -5624,6 +5724,348 @@ function _chainedReceiverType(index, call, language) {
     if (/^[A-Z][A-Z0-9]?$/.test(head)) return null; // generic type param (T, K, V1)
     if (_STRUCTURAL_FLOW_REJECT.has(head)) return null;
     return head;
+}
+
+// ── Chained-receiver fold (fix #258, clap-measured) ─────────────────────────
+// Builder chains (`Command::new("x").author(a).arg(b).arg(c)`) defeat the
+// one-hop agreement rules: `arg` has two owners (Command and ArgGroup), both
+// returning `Self` — which resolves to DIFFERENT types, so project-wide
+// agreement fails and 1600+ oracle-true clap edges sat method-ambiguous.
+// The fold types the chain hop by hop from a typed root instead: the parser
+// links each chained call to its producer's OWN record (receiverCallLine),
+// the root types via the existing #207 producer rails (path/static/package-
+// qualified producers, annotated variables, module-qualified roots), and each
+// hop resolves the producer method ON THE CURRENT TYPE — `Self`/`this` map to
+// that type, a hop returning a different type re-roots the chain there, and
+// any unresolvable hop (missing annotation, foreign same-name type, sibling
+// disagreement) stops the fold: untyped, visible, honest. Per-hop identity
+// keeps the #206/#207 discipline (owner defs co-located with the pinned type
+// when the type name is ambiguous project-wide; origins re-pinned from the
+// defining file). Results feed the existing receiverType machinery — the
+// fold adds evidence, never new routing.
+
+const _FOLD_TYPE_KINDS = new Set(['class', 'struct', 'enum', 'trait', 'interface', 'record', 'type', 'namespace']);
+
+/**
+ * Resolve method `methodName` on type `typeName` (identity-pinned to
+ * `fromFile` when known) and return its resolved return-type head as
+ * { type, fromFile } — or null when the resolution is not compiler-grade.
+ * Walks declared ancestors (bounded) when the type itself doesn't define the
+ * method; `Self`/`this` return annotations resolve to the RECEIVER's type
+ * (dynamic-Self semantics — sound because the chain's static type is T).
+ */
+function _methodReturnOnType(index, typeName, fromFile, methodName, language, opts = {}) {
+    const nominal = langTraits(language)?.typeSystem === 'nominal';
+    const norm = s => (s || '').replace(/^\*/, '').replace(/\[.*$/, '').replace(/<.*$/, '');
+    const depth = opts.depth || 0;
+    if (depth > 8) return null;
+    const all = (index.symbols.get(methodName) || [])
+        .filter(d => !NON_CALLABLE_TYPES.has(d.type));
+    let owned = all.filter(d =>
+        (d.className && norm(d.className) === typeName) ||
+        (!d.className && d.receiver && norm(d.receiver) === typeName));
+    // Identity discipline (#206c): with several same-name TYPES in the
+    // project, an owner-name match is only THE type when co-located with the
+    // pinned defining file; with no pin, refuse.
+    const typeDefs = (index.symbols.get(typeName) || []).filter(d => _FOLD_TYPE_KINDS.has(d.type));
+    if (typeDefs.length > 1 && owned.length > 0) {
+        if (!fromFile) return null;
+        const dir = path.dirname(fromFile);
+        owned = owned.filter(d => d.file === fromFile || (d.file && path.dirname(d.file) === dir));
+    }
+    if (owned.length === 0) {
+        // Inheritance walk: resolve on a declared ancestor; Self/this still
+        // resolve to the RECEIVER's type (passed through selfType).
+        const ctxFile = fromFile || opts.filePath;
+        const parents = index._getInheritanceParents
+            ? (index._getInheritanceParents(typeName, ctxFile) || []) : [];
+        for (const parent of parents) {
+            const pFile = index._resolveClassFile
+                ? (index._resolveClassFile(parent, ctxFile) || undefined) : undefined;
+            const up = _methodReturnOnType(index, norm(parent), pFile, methodName, language, {
+                ...opts, depth: depth + 1, selfType: opts.selfType || typeName,
+            });
+            if (up) return up;
+        }
+        return null;
+    }
+    const selfType = opts.selfType || typeName;
+    if (nominal) {
+        if (!owned.every(d => d.returnType)) return null;
+        if (new Set(owned.map(d => d.returnType)).size !== 1) return null;
+        const def = owned[0];
+        const parsed = _returnTypeNameNominal(def.returnType, language, { selfClass: selfType });
+        if (!parsed) return null;
+        const origin = _resolveFlowTypeOrigin(index, def.file || opts.filePath, parsed.name, parsed.qualifier);
+        if (!origin) return null;
+        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+    }
+    // Structural: heads must agree; `this`/`Self` are the receiver's type
+    // (checked BEFORE the reject set — with a known owner they ARE identity);
+    // un-awaited async producers stay untyped (the value is a coroutine).
+    if (language === 'python' && !opts.consumerAwaited && owned.some(d => d.isAsync)) return null;
+    const heads = new Set();
+    for (const d of owned) {
+        if (!d.returnType) return null;
+        let h = _structuralTypeHead(d.returnType, { unwrapAsync: opts.consumerAwaited });
+        if (h === 'this' || h === 'Self') h = selfType;
+        if (!h) return null;
+        heads.add(h);
+        if (heads.size > 1) return null;
+    }
+    const head = [...heads][0];
+    if (/^[A-Z][A-Z0-9]?$/.test(head)) return null; // generic type param
+    if (_STRUCTURAL_FLOW_REJECT.has(head)) return null;
+    return { type: head };
+}
+
+/**
+ * Type of the VALUE a call record produces — { type, fromFile },
+ * { externalVia } (compiler-grade evidence the value was typed outside the
+ * project), or null. Mirrors the #207 flow-map producer rails per shape, and
+ * recurses through the producer link for chained producers (memoized,
+ * cycle-guarded).
+ */
+function _typeOfCallResultFold(index, fileEntry, filePath, record, ctx, consumerAwaited) {
+    if (ctx.memo.has(record)) return ctx.memo.get(record);
+    if (ctx.visiting.has(record) || ctx.visiting.size > 64) return null;
+    ctx.visiting.add(record);
+    let out = null;
+    try {
+        out = _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, consumerAwaited);
+    } finally {
+        ctx.visiting.delete(record);
+    }
+    ctx.memo.set(record, out);
+    return out;
+}
+
+function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, consumerAwaited) {
+    if (record.isMacro || record.inMacro) return null; // token-tree records carry no chain physics
+    const language = fileEntry.language;
+    const traits = langTraits(language);
+    const nominal = traits?.typeSystem === 'nominal';
+    const name = record.name;
+
+    // Path producer (Rust): Command::new(...) — the last path segment names
+    // the impl type (flow-map rails: module-path producers stay untyped);
+    // Self::new() resolves through the enclosing impl. The type's identity
+    // is pinned from THIS file's scope (#206 discipline — clap's derive
+    // tests define dozens of local `struct Command` fixtures; the pin keeps
+    // the fold on the imported one).
+    if (nominal && record.isPathCall && record.receiver) {
+        const segs = String(record.receiver).split('::');
+        let seg = segs.pop();
+        if (seg === 'Self') {
+            const enclosing = index.findEnclosingFunction(filePath, record.line, true);
+            seg = enclosing && enclosing.className;
+            if (!seg) return null;
+        }
+        if (!seg || !/^[A-Z]/.test(seg)) return null;
+        if (/^[A-Z][A-Z0-9]?$/.test(seg)) return null; // generic-param convention (#220)
+        const qual = segs.length > 0 ? segs[segs.length - 1] : undefined;
+        const origin = _resolveFlowTypeOrigin(index, filePath, seg,
+            qual && !['crate', 'self', 'super'].includes(qual) ? qual : undefined);
+        if (!origin) return null;
+        return _methodReturnOnType(index, seg, origin.fromFile, name, language,
+            { filePath, consumerAwaited });
+    }
+    // Java static factory: Config.parse(...) — static call style only (#206:
+    // a Go receiver named like a type is a VARIABLE).
+    if (nominal && record.isMethod && record.receiver && !record.receiverIsChainRoot &&
+        traits?.typeQualifiedCallStyle === 'static' && /^[A-Z]/.test(record.receiver) &&
+        !/^[A-Z][A-Z0-9]?$/.test(record.receiver)) {
+        const r = _methodReturnOnType(index, record.receiver, undefined, name, language,
+            { filePath, consumerAwaited });
+        if (r) return r;
+        // fall through: a capitalized Java receiver may still be a variable
+    }
+    // Go package-qualified plain producer: pkg.Get(...) — strict import
+    // resolution; unresolved packages typed the value OUTSIDE the project.
+    if (nominal && !record.isMethod && record.receiver && traits?.hasReceiverPackageCalls) {
+        const cands = (index.symbols.get(name) || [])
+            .filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.returnType);
+        const inPkg = _qualifiedProducerDefs(index, fileEntry, record.receiver, cands);
+        if (!inPkg || inPkg.length === 0 || new Set(inPkg.map(d => d.returnType)).size !== 1) {
+            return { externalVia: `${record.receiver}.${name}` };
+        }
+        const def = inPkg[0];
+        const parsed = _returnTypeNameNominal(def.returnType, language, {});
+        if (!parsed) return null;
+        const origin = _resolveFlowTypeOrigin(index, def.file || filePath, parsed.name, parsed.qualifier);
+        if (!origin) return null;
+        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+    }
+    // Structural module-qualified producer: z.string() — resolve through the
+    // file's import bindings (flow-map rails, incl. the #222 externality test).
+    if (!nominal && record.isMethod && record.receiver && record.receiverIsModule) {
+        const binding = (fileEntry?.importBindings || []).find(b => b.name === record.receiver);
+        const rel = binding && fileEntry.moduleResolved && fileEntry.moduleResolved[binding.module];
+        if (binding && !rel) {
+            const mod = String(binding.module);
+            const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+            if (!mod.startsWith('.') &&
+                !(firstSeg && _projectTopLevelNames(index).has(firstSeg))) {
+                return { externalVia: `${record.receiver}.${name}` };
+            }
+            return null;
+        }
+        if (!rel) return null;
+        const modFile = path.join(index.root, rel);
+        const cands = (index.symbols.get(name) || [])
+            .filter(d => !NON_CALLABLE_TYPES.has(d.type) && d.returnType && !d.className);
+        let matches = cands.filter(d => d.file === modFile);
+        if (matches.length === 0) {
+            const hop = index.importGraph.get(modFile);
+            if (hop) matches = cands.filter(d => hop.has(d.file));
+        }
+        if (matches.length === 0) return null;
+        if (language === 'python' && !consumerAwaited && matches.some(d => d.isAsync)) return null;
+        const heads = new Set();
+        for (const d of matches) {
+            const h = _structuralTypeHead(d.returnType, { unwrapAsync: consumerAwaited });
+            if (!h) return null;
+            heads.add(h);
+        }
+        if (heads.size !== 1) return null;
+        const head = [...heads][0];
+        if (/^[A-Z][A-Z0-9]?$/.test(head) || _STRUCTURAL_FLOW_REJECT.has(head)) return null;
+        return { type: head };
+    }
+    // self/this/cls receiver: resolve through the enclosing class (+ walk).
+    if (record.isMethod && ['self', 'this', 'cls'].includes(record.receiver)) {
+        const enclosing = index.findEnclosingFunction(filePath, record.line, true);
+        let cls = enclosing && enclosing.className;
+        let ctxFile = filePath;
+        const visited = new Set();
+        while (cls && !visited.has(cls)) {
+            visited.add(cls);
+            const r = _methodReturnOnType(index, cls, ctxFile, name, language,
+                { filePath, consumerAwaited, selfType: enclosing.className });
+            if (r) return r;
+            const parents = index._getInheritanceParents(cls, ctxFile) || [];
+            const next = parents[0];
+            if (next && index._resolveClassFile) {
+                ctxFile = index._resolveClassFile(next, ctxFile) || ctxFile;
+            }
+            cls = next;
+        }
+        return null;
+    }
+    // Method producer: type its OWN receiver (parser annotation → chain
+    // recursion → flow map), then resolve the method on that type. Falls back
+    // to the one-hop project-wide agreement rule when the receiver stays
+    // untyped.
+    if (record.isMethod) {
+        let rt = null;
+        if (record.receiverType && !record.receiverIsChainRoot) {
+            rt = { type: record.receiverType };
+        }
+        if (!rt && record.receiverCall && (!record.receiver || record.receiverIsChainRoot)) {
+            rt = _foldChainedReceiverType(index, fileEntry, filePath, record, ctx);
+        }
+        if (!rt && record.receiver && !record.receiverIsChainRoot) {
+            const flowMap = ctx.getFlowMap();
+            const fe = flowMap && _lookupReturnTypeFlow(flowMap, record);
+            if (fe && fe.externalVia) return { externalVia: fe.externalVia };
+            if (fe && fe.type) rt = { type: fe.type, ...(fe.fromFile && { fromFile: fe.fromFile }) };
+        }
+        if (rt && rt.externalVia) return rt;
+        if (rt && rt.type) {
+            return _methodReturnOnType(index, rt.type, rt.fromFile, name, language,
+                { filePath, consumerAwaited });
+        }
+        // One-hop agreement (the #207/#219 discipline, one level deeper):
+        // every method owner project-wide annotated and agreeing.
+        const methodDefs = (index.symbols.get(name) || [])
+            .filter(d => !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver));
+        if (methodDefs.length === 0) return null;
+        if (!methodDefs.every(d => d.returnType)) return null;
+        if (nominal) {
+            if (new Set(methodDefs.map(d => d.returnType)).size !== 1) return null;
+            const classes = new Set(methodDefs.map(d =>
+                d.className || (d.receiver || '').replace(/^\*/, '')));
+            const selfClass = classes.size === 1 ? [...classes][0] : undefined;
+            const parsed = _returnTypeNameNominal(methodDefs[0].returnType, language, { selfClass });
+            if (!parsed) return null;
+            const origin = _resolveFlowTypeOrigin(index, methodDefs[0].file || filePath, parsed.name, parsed.qualifier);
+            if (!origin) return null;
+            return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+        }
+        if (language === 'python' && !consumerAwaited && methodDefs.some(d => d.isAsync)) return null;
+        const heads = new Set();
+        for (const d of methodDefs) {
+            const h = _structuralTypeHead(d.returnType, { unwrapAsync: consumerAwaited });
+            if (!h) return null;
+            heads.add(h);
+            if (heads.size > 1) return null;
+        }
+        const head = [...heads][0];
+        if (/^[A-Z][A-Z0-9]?$/.test(head) || _STRUCTURAL_FLOW_REJECT.has(head)) return null;
+        return { type: head };
+    }
+    // Plain producer: Go same-package only; others unique-project-def with
+    // same-file narrowing; Java bare calls reach the enclosing class first.
+    if (traits?.bareCallReachesMethods) {
+        const enclosing = index.findEnclosingFunction(filePath, record.line, true);
+        if (enclosing?.className) {
+            const r = _methodReturnOnType(index, enclosing.className, filePath, name, language,
+                { filePath, consumerAwaited });
+            if (r) return r;
+        }
+    }
+    const defs = (index.symbols.get(name) || [])
+        .filter(d => !NON_CALLABLE_TYPES.has(d.type) && !(d.className || d.receiver));
+    let chosen = null;
+    if (traits?.packageScope === 'directory') {
+        const dir = path.dirname(filePath);
+        const samePkg = defs.filter(d => d.file && path.dirname(d.file) === dir);
+        if (samePkg.length === 1) chosen = samePkg[0];
+    } else if (defs.length === 1) {
+        chosen = defs[0];
+    } else {
+        const sameFile = defs.filter(d => d.file === filePath);
+        if (sameFile.length === 1) chosen = sameFile[0];
+    }
+    if (!chosen || !chosen.returnType) return null;
+    if (nominal) {
+        const parsed = _returnTypeNameNominal(chosen.returnType, language, {});
+        if (!parsed) return null;
+        const origin = _resolveFlowTypeOrigin(index, chosen.file || filePath, parsed.name, parsed.qualifier);
+        if (!origin) return null;
+        return { type: parsed.name, ...(origin.fromFile && { fromFile: origin.fromFile }) };
+    }
+    if (language === 'python' && !consumerAwaited && chosen.isAsync) return null;
+    let head = _structuralTypeHead(chosen.returnType, { unwrapAsync: consumerAwaited });
+    if (!head || /^[A-Z][A-Z0-9]?$/.test(head) || _STRUCTURAL_FLOW_REJECT.has(head)) return null;
+    return { type: head };
+}
+
+/**
+ * Type the RECEIVER of a chained call from its producer's own record
+ * (fix #258). Producer records are matched by (receiverCallLine, name) —
+ * when several match (one-line chains like `a.arg(1).arg(2)`), ALL must fold
+ * to the same type or the receiver stays untyped. Returns { type, fromFile },
+ * { externalVia }, or null (fall back to the legacy one-hop helpers).
+ */
+function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
+    if (!call.receiverCall || !call.receiverCallLine || !ctx.records) return null;
+    const prods = ctx.records.filter(r =>
+        r !== call && r.line === call.receiverCallLine && r.name === call.receiverCall &&
+        !r.isMacro && !r.inMacro &&
+        // Kind match: the consumer knows whether its producer was a method-
+        // shaped call — `.arg(arg("x"))` has both a chained method `arg` and
+        // a plain closure call `arg` on one line; only the right kind folds.
+        !!r.isMethod === !!call.receiverCallIsMethod);
+    if (prods.length === 0) return null;
+    const results = prods.map(r =>
+        _typeOfCallResultFold(index, fileEntry, filePath, r, ctx, call.receiverCallAwaited));
+    if (!results.every(Boolean)) return null;
+    if (results.every(r => r.externalVia)) return { externalVia: results[0].externalVia };
+    if (results.some(r => r.externalVia)) return null;
+    if (new Set(results.map(r => r.type)).size !== 1) return null;
+    const fromFiles = new Set(results.map(r => r.fromFile));
+    return { type: results[0].type, ...(fromFiles.size === 1 && results[0].fromFile && { fromFile: results[0].fromFile }) };
 }
 
 /**
