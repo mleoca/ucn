@@ -752,7 +752,14 @@ function _processClass(node, classes, processedRanges, lines) {
     // TypeScript namespace/module declarations
     if (node.type === 'internal_module' || node.type === 'module') {
         const nameNode = node.childForFieldName('name');
-        if (nameNode) {
+        // A STRING-named module declaration (`declare module '../vanilla'`)
+        // is a module AUGMENTATION/shape declaration, not a nameable symbol
+        // (fix #267, zustand-measured): it declares no identifier project
+        // code can reference, so indexing it as a namespace made deadcode
+        // claim every augmentation block dead (5 FALSE-DEADs on zustand's
+        // StoreMutators augmentations). The compiler merges it into the
+        // TARGET module — never claimable, never importable by this "name".
+        if (nameNode && nameNode.type !== 'string') {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
 

@@ -169,9 +169,29 @@ function nameOnlySelfRecursive(index, name) {
  *  autoref-specialization traits). */
 function isInsideString(line, pos, language) {
     let inSingle = false, inDouble = false, inBacktick = false;
+    // Template-literal interpolations are CODE (fix #267, hono-measured:
+    // `${this.activeRouter.name}` was the getter's ONLY read — masked as
+    // string interior, the symbol claimed FALSE-DEAD). JS family only: Go
+    // backtick strings are raw, no interpolation. Brace-depth tracked so
+    // `${ {a: 1} }` closes at the right brace; quotes inside interpolations
+    // are not tracked — the misjudgment direction is UNMASK (counting a
+    // usage keeps the symbol alive), never masking code (#253 rule).
+    let interpDepth = 0;
+    const jsTemplates = language === 'javascript' || language === 'typescript' ||
+        language === 'tsx' || language === 'html';
     for (let j = 0; j < pos; j++) {
         const ch = line[j];
         if (ch === '\\') { j++; continue; }
+        if (inBacktick && jsTemplates) {
+            if (interpDepth === 0) {
+                if (ch === '$' && line[j + 1] === '{') { interpDepth = 1; j++; }
+                else if (ch === '`') inBacktick = false;
+                continue;
+            }
+            if (ch === '{') interpDepth++;
+            else if (ch === '}') interpDepth--;
+            continue;
+        }
         if (ch === '"' && !inSingle && !inBacktick) inDouble = !inDouble;
         if (ch === "'" && !inDouble && !inBacktick) {
             if (language === 'rust') {
@@ -186,7 +206,7 @@ function isInsideString(line, pos, language) {
         }
         if (ch === '`' && !inDouble && !inSingle) inBacktick = !inBacktick;
     }
-    return inSingle || inDouble || inBacktick;
+    return inSingle || inDouble || (inBacktick && interpDepth === 0);
 }
 
 /**
@@ -799,6 +819,15 @@ function deadcode(index, options = {}) {
             }
 
             const mods = symbol.modifiers || [];
+
+            // Ambient declaration files are never dead CODE (fix #267,
+            // zustand-measured: `interface ImportMeta` in src/types.d.ts —
+            // global lib merging UCN cannot see): .d.ts content is erased at
+            // compile time and describes external/global shapes — nothing in
+            // it is deletable code, so nothing in it is claimable.
+            if (symbol.relativePath.endsWith('.d.ts')) {
+                continue;
+            }
 
             // Language-specific entry points (called by runtime/test runner, not user code)
             // Each language module declares its own isEntryPoint() rules.

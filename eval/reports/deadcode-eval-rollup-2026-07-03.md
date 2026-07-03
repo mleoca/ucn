@@ -29,3 +29,7 @@ false-dead = 0.
 | gson | jdtls | exported | 1 | 1 | 1 | **0** | 0 | 0 |
 | clap | rust-analyzer | default | 7 | 7 | 7 | **0** | 0 | 0 |
 | clap | rust-analyzer | exported | 42 | 42 | 42 | **0** | 0 | 0 |
+| hono | ts-morph | default | 0 | 0 | 0 | **0** | 0 | 0 |
+| hono | ts-morph | exported | 5 | 5 | 4 | **0** | 0 | 1 |
+| zustand | ts-morph | default | 0 | 0 | 0 | **0** | 0 | 0 |
+| zustand | ts-morph | exported | 0 | 0 | 0 | **0** | 0 | 0 |

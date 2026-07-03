@@ -7,8 +7,8 @@ lie the tiered caller contract forbids. Target: 0.
 
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|
-| hono | ts-morph | 50 | 1213 | 99.7% | 60.4% | 0.393 | **0** | 100.0% (6) | 100.0% |
-| zustand | ts-morph | 17 | 208 | 100.0% | 0.0% | 1 | **0** | 100.0% (1) | 100.0% |
+| viper | gopls | 50 | 668 | 98.8% | 80.0% | 0.1878 | **0** | 87.5% (8) | 100.0% |
+| serde_json | rust-analyzer | 50 | 586 | 93.6% | 44.0% | 0.4956 | **0** | 100.0% (8) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -18,10 +18,12 @@ evidence confirms the file but not the receiver type.
 
 | repo | kind | sampled | oracle edges | tier1 precision | unverified precision | separation | placement |
 |---|---|---|---|---|---|---|---|
-| hono | function | 15 | 91 | 98.9% (92/93) | 0.0% (0/25) | 0.9892 | {"confirmed":91,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| hono | method | 18 | 935 | 100.0% (109/109) | 62.6% (440/703) | 0.3741 | {"confirmed":109,"unverified":440,"reportedNonCall":386,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| hono | class | 14 | 187 | 100.0% (188/188) | n/a (0/0) | n/a | {"confirmed":187,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| zustand | function | 17 | 208 | 100.0% (213/213) | 0.0% (0/18) | 1 | {"confirmed":208,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | function | 20 | 158 | 95.8% (158/165) | 0.0% (0/6) | 0.9576 | {"confirmed":158,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | method | 29 | 506 | 100.0% (406/406) | 87.0% (60/69) | 0.1304 | {"confirmed":406,"unverified":58,"reportedNonCall":42,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | class | 1 | 4 | 100.0% (4/4) | n/a (0/0) | n/a | {"confirmed":4,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| serde_json | function | 21 | 246 | 99.6% (232/233) | 73.7% (14/19) | 0.2589 | {"confirmed":232,"unverified":14,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| serde_json | method | 27 | 231 | 80.5% (128/159) | 41.7% (103/247) | 0.388 | {"confirmed":128,"unverified":103,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| serde_json | class | 2 | 109 | 100.0% (107/107) | 50.0% (1/2) | 0.5 | {"confirmed":107,"unverified":1,"reportedNonCall":1,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)
 
@@ -33,5 +35,5 @@ the site (confirmed edge / unverified entry) or account for it
 
 | repo | callee precision | confirmed | other-def | unverified | accounted | module-level | beyond-text | **missing-unexplained** |
 |---|---|---|---|---|---|---|---|---|
-| hono | 100.0% (54/54) | 54 | 309 | 33 | 0 | 817 | 0 | **0** |
-| zustand | 100.0% (17/17) | 17 | 0 | 2 | 0 | 189 | 0 | **0** |
+| viper | 100.0% (239/239) | 237 | 33 | 398 | 0 | 0 | 0 | **0** |
+| serde_json | 99.4% (471/474) | 471 | 1 | 114 | 0 | 0 | 0 | **0** |

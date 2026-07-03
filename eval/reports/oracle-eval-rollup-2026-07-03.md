@@ -13,11 +13,13 @@ lie the tiered caller contract forbids. Target: 0.
 | httpx | pyright | 50 | 879 | 99.9% | 37.3% | 0.6256 | **0** | 100.0% (7) | 100.0% |
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.9% | 6.0% | 0.9394 | **0** | 100.0% (13) | 100.0% |
-| grpc-go | gopls | 50 | 840 | 100.0% | 14.2% | 0.8582 | **0** | 100.0% (13) | 100.0% |
+| grpc-go | gopls | 50 | 840 | 100.0% | 13.3% | 0.8671 | **0** | 100.0% (13) | 100.0% |
 | ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.0% | 0.8301 | **0** | 100.0% (1) | 100.0% |
 | cursive | rust-analyzer | 50 | 637 | 99.3% | 40.5% | 0.5883 | **0** | 100.0% (6) | 100.0% |
 | gson | jdtls | 50 | 649 | 96.6% | 30.4% | 0.6611 | **0** | 100.0% (9) | 100.0% |
 | clap | rust-analyzer | 50 | 2602 | 92.4% | 35.1% | 0.5732 | **0** | 100.0% (13) | 100.0% |
+| hono | ts-morph | 50 | 1213 | 99.7% | 60.4% | 0.393 | **0** | 100.0% (6) | 100.0% |
+| zustand | ts-morph | 17 | 208 | 100.0% | 0.0% | 1 | **0** | 100.0% (1) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -44,8 +46,8 @@ evidence confirms the file but not the receiver type.
 | cobra | method | 18 | 567 | 99.8% (557/558) | 6.0% (3/50) | 0.9382 | {"confirmed":557,"unverified":2,"reportedNonCall":8,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cobra | class | 3 | 409 | 100.0% (409/409) | n/a (0/0) | n/a | {"confirmed":409,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | function | 12 | 101 | 100.0% (101/101) | n/a (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| grpc-go | method | 30 | 351 | 100.0% (7/7) | 14.2% (204/1432) | 0.8575 | {"confirmed":7,"unverified":204,"reportedNonCall":140,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| grpc-go | class | 8 | 388 | 100.0% (388/388) | 0.0% (0/7) | 1 | {"confirmed":388,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| grpc-go | method | 30 | 351 | 100.0% (7/7) | 13.3% (205/1537) | 0.8666 | {"confirmed":7,"unverified":205,"reportedNonCall":139,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| grpc-go | class | 8 | 388 | 100.0% (388/388) | 0.0% (0/5) | 1 | {"confirmed":388,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | function | 6 | 568 | 100.0% (568/568) | n/a (0/0) | n/a | {"confirmed":568,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | method | 31 | 186 | 100.0% (161/161) | 14.2% (21/148) | 0.8581 | {"confirmed":161,"unverified":21,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | class | 4 | 11 | 100.0% (6/6) | 100.0% (5/5) | 0 | {"confirmed":6,"unverified":5,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -57,6 +59,10 @@ evidence confirms the file but not the receiver type.
 | clap | function | 14 | 244 | 96.8% (243/251) | n/a (0/0) | n/a | {"confirmed":243,"unverified":0,"reportedNonCall":1,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | clap | method | 33 | 2358 | 91.8% (1743/1898) | 35.1% (617/1758) | 0.5673 | {"confirmed":1743,"unverified":615,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | clap | class | 3 | 0 | n/a (0/0) | n/a (0/0) | n/a | {"confirmed":0,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| hono | function | 15 | 91 | 98.9% (92/93) | 0.0% (0/25) | 0.9892 | {"confirmed":91,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| hono | method | 18 | 935 | 100.0% (109/109) | 62.6% (440/703) | 0.3741 | {"confirmed":109,"unverified":440,"reportedNonCall":386,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| hono | class | 14 | 187 | 100.0% (188/188) | n/a (0/0) | n/a | {"confirmed":187,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| zustand | function | 17 | 208 | 100.0% (213/213) | 0.0% (0/18) | 1 | {"confirmed":208,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)
 
@@ -79,3 +85,5 @@ the site (confirmed edge / unverified entry) or account for it
 | cursive | 100.0% (387/387) | 383 | 2 | 244 | 0 | 0 | 8 | **0** |
 | gson | 97.1% (271/279) | 271 | 141 | 67 | 0 | 38 | 0 | **0** |
 | clap | 99.8% (589/590) | 589 | 398 | 1615 | 0 | 0 | 0 | **0** |
+| hono | 100.0% (54/54) | 54 | 309 | 33 | 0 | 817 | 0 | **0** |
+| zustand | 100.0% (17/17) | 17 | 0 | 2 | 0 | 189 | 0 | **0** |

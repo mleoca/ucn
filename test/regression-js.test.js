@@ -7506,3 +7506,112 @@ describe('fix #265: fresh-arm caller physics (zustand/hono families)', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #267: deadcode false-dead families from the hono/zustand graduation gate', () => {
+    it('a usage inside a template-literal interpolation keeps the symbol alive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'router.ts': [
+                'export class SmartRouter {',
+                '  name: string = "smart";',
+                '  match() {',
+                '    this.name = `Smart + ${this.activeRouter.name}`;',
+                '  }',
+                '  get activeRouter(): object {',
+                '    return {};',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            assert.ok(!dead.some(d => d.name === 'activeRouter'),
+                `interpolation read is CODE, not string interior: ${JSON.stringify(dead.map(d => d.name))}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter: a name that only appears in plain string content stays claimable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export class Box {',
+                '  get unusedThing(): number {',
+                '    return 1;',
+                '  }',
+                '  label() {',
+                '    return `the unusedThing label` + "unusedThing";',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            assert.ok(dead.some(d => d.name === 'unusedThing'),
+                'string-interior mentions are not usages');
+        } finally { rm(dir); }
+    });
+
+    it("declare module 'string' augmentations are not indexed symbols and never claimed dead", () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'vanilla.ts': 'export interface StoreMutators<S, A> { base: S; a: A }\nexport const create = () => ({});',
+            'middleware.ts': [
+                "import './vanilla'",
+                '',
+                "declare module './vanilla' {",
+                '  interface StoreMutators<S, A> {',
+                '    extra: S',
+                '  }',
+                '}',
+                '',
+                'export const mw = () => 1;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const augment = (index.symbols.get("'./vanilla'") || []);
+            assert.strictEqual(augment.length, 0, 'string-named module declares no symbol');
+            const dead = index.deadcode({});
+            assert.ok(!dead.some(d => /vanilla/.test(d.name)),
+                `augmentation blocks are never claimable: ${JSON.stringify(dead.map(d => d.name))}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter: identifier-named namespaces stay indexed and claimable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'ns.ts': [
+                'namespace UnusedUtils {',
+                '  export function slug(s: string) { return s; }',
+                '}',
+                'export const keep = 1;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok((index.symbols.get('UnusedUtils') || []).some(d => d.type === 'namespace'),
+                'identifier namespace is still a symbol');
+            const dead = index.deadcode({ includeExported: true });
+            assert.ok(dead.some(d => d.name === 'UnusedUtils'),
+                'genuinely-unused identifier namespace stays claimable');
+        } finally { rm(dir); }
+    });
+
+    it('.d.ts declarations are never dead-code claims; the same shape in .ts stays claimable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'types.d.ts': 'interface ImportMeta {\n  env?: Record<string, string>\n}\n',
+            'plain.ts': 'interface Unreferenced {\n  x: number\n}\nexport const keep = 1;',
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            assert.ok(!dead.some(d => d.file && d.file.endsWith('.d.ts')),
+                'ambient declaration files are type surface, not deletable code');
+            assert.ok(dead.some(d => d.name === 'Unreferenced'),
+                'a genuinely-unreferenced .ts interface stays claimable');
+        } finally { rm(dir); }
+    });
+});
