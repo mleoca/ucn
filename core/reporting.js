@@ -770,4 +770,88 @@ function computeCoverageSample(index, { sampleSize, inFilter, matchInFilter }) {
     return buckets;
 }
 
-module.exports = { getStats, getToc, doctor };
+/**
+ * orient — one-call cold-repo orientation: size + language mix, densest
+ * directories, most-called functions, entry-point counts, and the doctor
+ * trust verdict. Composes existing engine reads; counts and pointers only
+ * (no caller claims, so no account — the toc/stats category).
+ */
+function orient(index, options = {}) {
+    const top = options.top || 8;
+    // Fetch a deeper hot list so production functions survive the filter
+    // below even when test helpers dominate raw call counts.
+    const stats = getStats(index, { hot: true, top: Math.min(top * 5, 200) });
+    const health = doctor(index, {});
+
+    // Densest directories (leaf dirname rollup — "where does the code live")
+    const dirMap = new Map();
+    for (const [, fe] of index.files) {
+        const rp = fe.relativePath;
+        if (!rp) continue;
+        const slash = rp.lastIndexOf('/');
+        const dir = slash === -1 ? '.' : rp.slice(0, slash);
+        const e = dirMap.get(dir) || { dir, files: 0, symbols: 0 };
+        e.files += 1;
+        e.symbols += (fe.symbols || []).length;
+        dirMap.set(dir, e);
+    }
+    const dirs = [...dirMap.values()]
+        .sort((a, b) => b.symbols - a.symbols || codeUnitCompare(a.dir, b.dir))
+        .slice(0, top);
+
+    // Entry-point counts by type — orientation must not fail on detection
+    let entrypoints = null;
+    try {
+        const { detectEntrypoints } = require('./entrypoints');
+        const eps = detectEntrypoints(index, {});
+        if (Array.isArray(eps)) {
+            const byType = new Map();
+            for (const e of eps) byType.set(e.type, (byType.get(e.type) || 0) + 1);
+            entrypoints = {
+                total: eps.length,
+                byType: [...byType.entries()]
+                    .map(([type, count]) => ({ type, count }))
+                    .sort((a, b) => b.count - a.count || codeUnitCompare(a.type, b.type)),
+            };
+        }
+    } catch { /* detection error → entrypoints stays null, rendered as unavailable */ }
+
+    // Orientation wants the ENGINE's hot functions, not fixture helpers —
+    // prefer production-path entries (labeled as such by the formatter);
+    // an all-test project falls back to the raw ranking.
+    const { isTestPath } = require('./shared');
+    const allHot = (stats.hot?.items || []).map(i => ({
+        name: i.name,
+        file: i.file,
+        line: i.startLine,
+        callCount: i.callCount,
+        ...(i.className ? { className: i.className } : {}),
+    }));
+    const prodHot = allHot.filter(i => i.file && !isTestPath(i.file));
+    const production = prodHot.length > 0;
+    const hotItems = (production ? prodHot : allHot).slice(0, top);
+    const hottestProd = hotItems[0] || null;
+
+    return {
+        root: stats.root,
+        files: stats.files,
+        symbols: stats.symbols,
+        buildTime: stats.buildTime,
+        byLanguage: stats.byLanguage,
+        dirs,
+        hot: { total: stats.hot?.total ?? 0, top, production, items: hotItems },
+        entrypoints,
+        trust: {
+            level: health.trust,
+            blindSpots: {
+                dynamicImports: health.blindSpots?.dynamicImports?.count ?? 0,
+                evalCalls: health.blindSpots?.evalCalls?.count ?? 0,
+                reflection: health.blindSpots?.reflection?.count ?? 0,
+                parseFailures: health.blindSpots?.parseFailures?.count ?? 0,
+            },
+        },
+        suggest: hottestProd ? hottestProd.name : null,
+    };
+}
+
+module.exports = { getStats, getToc, doctor, orient };

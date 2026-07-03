@@ -952,6 +952,14 @@ function runProjectCommand(rootDir, command, arg) {
             break;
         }
 
+        case 'orient': {
+            const topVal = flags.topRaw != null ? flags.topRaw : (flags.top || undefined);
+            const { ok, result, error } = execute(index, 'orient', { top: topVal });
+            if (!ok) fail(error);
+            printOutput(result, output.formatOrientJson, output.formatOrient);
+            break;
+        }
+
         case 'check': {
             const { ok, result, error } = execute(index, 'check', {
                 base: flags.base, staged: flags.staged,
@@ -1580,6 +1588,7 @@ OTHER
   typedef <name>      Find type definitions
   stats               Project statistics (--functions for per-function line counts, --hot for top callers)
   doctor              Project trust report (counts, blind spots, parse failures, verdict; --deep for resolution coverage)
+  orient              One-screen repo orientation: size, top dirs, hot functions, entry points, trust verdict (--top=N)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
   audit-async         Find calls in async functions that are likely missing await (JS/TS/Python)
 
@@ -1874,6 +1883,7 @@ const INTERACTIVE_DISPATCH = {
     api:          { params: (a, f) => ({ file: a || f.file, limit: f.limit }), format: (r, a, f) => output.formatApi(r, a || f.file) },
     stacktrace:   { params: (a, f) => ({ stack: f.stack || a }), format: (r) => output.formatStackTrace(r) },
     doctor:       { params: (a, f) => ({ file: f.file, in: f.in, limit: f.limit, deep: f.deep }), format: (r) => output.formatDoctor(r) },
+    orient:       { params: (a, f) => ({ top: f.topRaw != null ? f.topRaw : (f.top || undefined) }), format: (r) => output.formatOrient(r) },
     // MED-2: stats handler in execute.js rejects top<=0; without explicit
     // coercion, parseFlags's `top: 0` default would surface as
     // "Invalid --top value" on bare `stats`. Mirror the project-mode top

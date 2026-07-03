@@ -241,6 +241,7 @@ REFACTORING:
 
 DIAGNOSTICS:
 - doctor: Index health/coverage report — file/symbol counts, language breakdown, dynamic-import / eval / reflection blind spots, parse failures, and a verdict (HIGH/MEDIUM/LOW trust). Use deep=true to also sample resolution coverage and bucket edges by confidence. Use in= to scope to a subtree.
+- orient: One-screen repo orientation for a codebase you just entered: size + language mix, densest directories, most-called functions, entry-point counts, and the trust verdict. Best FIRST command in a new repo.
 
 OTHER:
 - typedef <name>: Find type definitions matching a name: interfaces, enums, structs, traits, type aliases. See field shapes, required methods, or enum values.
@@ -520,6 +521,13 @@ server.registerTool(
                 const { ok, result, error } = execute(index, 'doctor', ep);
                 if (!ok) return te(error);
                 return tr(output.formatDoctor(result));
+            }
+
+            case 'orient': {
+                index = getIndex(project_dir, ep);
+                const { ok, result, error } = execute(index, 'orient', ep);
+                if (!ok) return te(error);
+                return tr(output.formatOrient(result));
             }
 
             case 'check': {

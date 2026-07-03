@@ -149,6 +149,17 @@ ucn entrypoints --file=routes/           # Scoped to files
 ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pytest, Rust #[test], etc.)
 ```
 
+### 11. `orient` — First command in a new repo
+
+One screen: size + language mix, densest directories, most-called production functions, entry-point counts, and the trust verdict. Composes what would otherwise take four calls (`toc` + `stats --hot` + `entrypoints` + `doctor`).
+
+```bash
+ucn orient            # run this before anything else in an unfamiliar codebase
+ucn orient --top=15   # longer dir/hot lists
+```
+
+The `Next:` line suggests concrete follow-ups, starting with `about` on the hottest production function.
+
 ## When to Use the Other Commands
 
 | Situation | Command | What it does |
@@ -164,6 +175,7 @@ ucn entrypoints --exclude-tests          # Hide test fixtures (JUnit @Test, pyte
 | Understanding who depends on a file | `ucn exporters <file>` | Which files import it |
 | See what a file exports | `ucn file-exports <file>` | All exported functions, classes, variables with signatures |
 | Quick project overview | `ucn toc` | Every file with function/class counts and line counts |
+| Just entered an unfamiliar repo | `ucn orient` | One screen: size, top dirs, hot functions, entry points, trust verdict. Run it first |
 | Project complexity stats | `ucn stats` | File counts, symbol counts, lines by language. `--functions` for per-function line counts. `--hot --top=N` for the most-called functions (orientation primitive on a new repo) |
 | Find by glob pattern | `ucn find "handle*"` | Locate definitions matching a glob (supports * and ?) |
 | Text search with context | `ucn search term --context=3` | Like grep -C 3, shows surrounding lines |

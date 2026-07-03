@@ -397,9 +397,86 @@ function formatEntrypointsJson(results) {
     }, null, 2);
 }
 
+/**
+ * formatOrient — one-screen cold-repo orientation.
+ */
+function formatOrient(result) {
+    const lines = [];
+    lines.push(`PROJECT ORIENTATION — ${result.root}`);
+    lines.push('═'.repeat(60));
+
+    // Size + language mix (percent by symbols, largest first)
+    const langs = Object.entries(result.byLanguage || {})
+        .map(([lang, v]) => ({ lang, symbols: v.symbols || 0 }))
+        .sort((a, b) => b.symbols - a.symbols || (a.lang < b.lang ? -1 : a.lang > b.lang ? 1 : 0));
+    const totalSym = result.symbols || 1;
+    const langStr = langs
+        .map(l => `${l.lang} ${Math.round((l.symbols / totalSym) * 100)}%`)
+        .join(', ');
+    lines.push(`${result.files} files · ${result.symbols} symbols · ${langStr}`);
+    lines.push('');
+
+    if (result.dirs?.length) {
+        lines.push('TOP DIRS (by symbols):');
+        const width = Math.max(...result.dirs.map(d => d.dir.length));
+        for (const d of result.dirs) {
+            lines.push(`  ${d.dir.padEnd(width)}  ${d.symbols} symbols · ${d.files} file(s)`);
+        }
+        lines.push('');
+    }
+
+    if (result.hot?.items?.length) {
+        const scope = result.hot.production ? 'production functions' : 'functions';
+        lines.push(`HOT (most-called ${scope}, top ${result.hot.items.length} of ${result.hot.total}):`);
+        for (const h of result.hot.items) {
+            const label = h.className ? `${h.className}.${h.name}` : h.name;
+            lines.push(`  ${label} — ${h.callCount} call(s) · ${h.file}:${h.line}`);
+        }
+        lines.push('');
+    }
+
+    if (result.entrypoints) {
+        const byType = result.entrypoints.byType
+            .map(t => `${t.type} ${t.count}`).join(', ');
+        lines.push(`ENTRY POINTS: ${result.entrypoints.total} — ${byType}`);
+    } else {
+        lines.push('ENTRY POINTS: (detection unavailable)');
+    }
+
+    const bs = result.trust?.blindSpots || {};
+    const bsParts = [];
+    if (bs.dynamicImports) bsParts.push(`${bs.dynamicImports} dynamic import(s)`);
+    if (bs.evalCalls) bsParts.push(`${bs.evalCalls} eval`);
+    if (bs.reflection) bsParts.push(`${bs.reflection} reflection`);
+    if (bs.parseFailures) bsParts.push(`${bs.parseFailures} parse failure(s)`);
+    lines.push(`TRUST: ${result.trust?.level || 'UNKNOWN'}${bsParts.length ? ' — ' + bsParts.join(', ') : ''}  (ucn doctor for detail)`);
+    lines.push('');
+
+    const next = [];
+    if (result.suggest) next.push(`ucn about ${result.suggest}`);
+    next.push('ucn toc --detailed', 'ucn stats --hot --top=20', 'ucn doctor --deep');
+    lines.push(`Next: ${next.join(' · ')}`);
+
+    return lines.join('\n');
+}
+
+function formatOrientJson(result) {
+    return JSON.stringify({
+        meta: {
+            command: 'orient',
+            files: result.files,
+            symbols: result.symbols,
+            trust: result.trust?.level ?? null,
+        },
+        data: result,
+    }, null, 2);
+}
+
 module.exports = {
     formatToc,
     formatTocJson,
+    formatOrient,
+    formatOrientJson,
     formatStats,
     formatStatsJson,
     formatDeadcode,

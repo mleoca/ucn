@@ -25,7 +25,7 @@ const CANONICAL_COMMANDS = [
     // Refactoring
     'verify', 'plan', 'diffImpact', 'check',
     // Other
-    'typedef', 'stacktrace', 'api', 'stats', 'doctor', 'auditAsync',
+    'typedef', 'stacktrace', 'api', 'stats', 'doctor', 'auditAsync', 'orient',
 ];
 
 // ============================================================================
@@ -163,6 +163,7 @@ const FLAG_APPLICABILITY = {
     api:          ['file', 'limit'],
     stats:        ['functions', 'hot', 'top'],
     doctor:       ['file', 'in', 'limit', 'deep'],
+    orient:       ['top'],
     auditAsync:   ['file', 'exclude', 'limit'],
 };
 
@@ -171,7 +172,7 @@ const FLAG_APPLICABILITY = {
 const BROAD_COMMANDS = new Set([
     'toc', 'entrypoints', 'endpoints', 'diffImpact', 'affectedTests',
     'deadcode', 'usages', 'reverseTrace', 'circularDeps',
-    'doctor', 'check', 'auditAsync',
+    'doctor', 'check', 'auditAsync', 'orient',
 ]);
 
 // Commands that can operate on a single file without a project index.

@@ -1860,3 +1860,90 @@ describe('K8s Bug Hunt: output limiting', () => {
         } finally { rm(dir); }
     });
 });
+
+// ============================================================================
+// orient command — one-call cold-repo orientation
+// ============================================================================
+
+describe('orient command', () => {
+    const { execute } = require('../core/execute');
+
+    it('returns size, dirs, hot, entrypoints, and trust in one call', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'src/core.js': 'function engine() { return helper() + helper(); }\nfunction helper() { return 1; }\nmodule.exports = { engine };',
+            'src/util.js': 'const { engine } = require("./core");\nfunction run() { return engine(); }\nmodule.exports = { run };',
+            'test/core.test.js': 'const { engine } = require("../src/core");\nfunction testEngine() { return engine(); }\nmodule.exports = { testEngine };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'orient', {});
+            assert.ok(ok, 'orient must succeed');
+            assert.ok(result.files > 0 && result.symbols > 0, 'has size counts');
+            assert.ok(Array.isArray(result.dirs) && result.dirs.length > 0, 'has dir rollup');
+            assert.ok(result.dirs.some(d => d.dir === 'src'), 'src dir present');
+            assert.ok(Array.isArray(result.hot.items), 'has hot list');
+            assert.ok(result.hot.items.some(h => h.name === 'engine' || h.name === 'helper'),
+                'hot list ranks called functions');
+            assert.ok(result.hot.production === true,
+                'production entries preferred when they exist');
+            assert.ok(result.hot.items.every(h => !h.file.startsWith('test/')),
+                'production hot list excludes test paths');
+            assert.ok(result.trust && typeof result.trust.level === 'string', 'has trust verdict');
+            assert.ok(result.entrypoints === null || typeof result.entrypoints.total === 'number',
+                'entrypoints counted or explicitly unavailable');
+            assert.ok(typeof result.suggest === 'string', 'suggests a follow-up symbol');
+        } finally { rm(dir); }
+    });
+
+    it('rejects an invalid --top and clamps oversized values', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function f() { return 1; }\nmodule.exports = { f };',
+        });
+        try {
+            const index = idx(dir);
+            const bad = execute(index, 'orient', { top: 'abc' });
+            assert.strictEqual(bad.ok, false);
+            assert.ok(bad.error.includes('--top'), 'names the flag in the error');
+            const zero = execute(index, 'orient', { top: 0 });
+            assert.strictEqual(zero.ok, false);
+            const big = execute(index, 'orient', { top: 5000 });
+            assert.ok(big.ok, 'oversized --top clamps instead of failing');
+        } finally { rm(dir); }
+    });
+
+    it('is deterministic across repeated runs (rule 11)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.js': 'function f() { return g(); }\nfunction g() { return 1; }\nmodule.exports = { f };',
+            'b.js': 'const { f } = require("./a");\nfunction h() { return f(); }\nmodule.exports = { h };',
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const r1 = execute(index, 'orient', {});
+            const r2 = execute(index, 'orient', {});
+            assert.strictEqual(
+                output.formatOrient(r1.result), output.formatOrient(r2.result),
+                'byte-identical text across runs');
+            const j1 = JSON.parse(output.formatOrientJson(r1.result));
+            assert.strictEqual(j1.meta.command, 'orient');
+            assert.ok(j1.data.dirs, 'json wraps in {meta, data}');
+        } finally { rm(dir); }
+    });
+
+    it('falls back to the raw hot ranking in an all-test project', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'test/only.test.js': 'function util() { return 1; }\nfunction t1() { return util(); }\nfunction t2() { return util(); }\nmodule.exports = { t1, t2 };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'orient', {});
+            assert.ok(ok);
+            assert.strictEqual(result.hot.production, false, 'no production entries → raw ranking');
+            assert.ok(result.hot.items.some(h => h.name === 'util'), 'test-path entries shown');
+        } finally { rm(dir); }
+    });
+});

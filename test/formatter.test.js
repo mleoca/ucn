@@ -2602,3 +2602,45 @@ func directCall() {
         }
     });
 });
+
+describe('formatOrient', () => {
+    const { formatOrient, formatOrientJson } = require('../core/output');
+
+    it('renders all sections and survives null entrypoints', () => {
+        const mock = {
+            root: '/p', files: 3, symbols: 12, buildTime: 5,
+            byLanguage: { javascript: { files: 2, lines: 100, symbols: 10 }, python: { files: 1, lines: 20, symbols: 2 } },
+            dirs: [{ dir: 'src', files: 2, symbols: 10 }, { dir: '.', files: 1, symbols: 2 }],
+            hot: { total: 4, top: 8, production: true, items: [{ name: 'run', file: 'src/a.js', line: 3, callCount: 7 }] },
+            entrypoints: null,
+            trust: { level: 'HIGH', blindSpots: { dynamicImports: 0, evalCalls: 0, reflection: 0, parseFailures: 0 } },
+            suggest: 'run',
+        };
+        const text = formatOrient(mock);
+        assert.ok(text.includes('PROJECT ORIENTATION — /p'));
+        assert.ok(text.includes('3 files · 12 symbols · javascript 83%, python 17%'));
+        assert.ok(text.includes('TOP DIRS'));
+        assert.ok(text.includes('HOT (most-called production functions, top 1 of 4):'));
+        assert.ok(text.includes('run — 7 call(s) · src/a.js:3'));
+        assert.ok(text.includes('ENTRY POINTS: (detection unavailable)'));
+        assert.ok(text.includes('TRUST: HIGH'));
+        assert.ok(text.includes('Next: ucn about run'));
+        const j = JSON.parse(formatOrientJson(mock));
+        assert.strictEqual(j.meta.trust, 'HIGH');
+        assert.strictEqual(j.data.suggest, 'run');
+    });
+
+    it('renders entrypoint type counts and blind-spot summary', () => {
+        const mock = {
+            root: '/p', files: 1, symbols: 1, byLanguage: { go: { files: 1, lines: 10, symbols: 1 } },
+            dirs: [], hot: { total: 0, top: 8, production: false, items: [] },
+            entrypoints: { total: 5, byType: [{ type: 'test', count: 3 }, { type: 'http', count: 2 }] },
+            trust: { level: 'MEDIUM', blindSpots: { dynamicImports: 4, evalCalls: 1, reflection: 0, parseFailures: 2 } },
+            suggest: null,
+        };
+        const text = formatOrient(mock);
+        assert.ok(text.includes('ENTRY POINTS: 5 — test 3, http 2'));
+        assert.ok(text.includes('TRUST: MEDIUM — 4 dynamic import(s), 1 eval, 2 parse failure(s)'));
+        assert.ok(!text.includes('ucn about null'), 'no suggestion when none available');
+    });
+});

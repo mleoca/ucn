@@ -563,6 +563,20 @@ const HANDLERS = {
         return { ok: true, result };
     },
 
+    orient: (index, p) => {
+        let top;
+        if (p.top != null) {
+            const n = Number(String(p.top).trim());
+            if (!Number.isInteger(n) || n <= 0) {
+                return { ok: false, error: `Invalid --top value: must be a positive integer (got "${p.top}")` };
+            }
+            top = Math.min(n, 100);
+        }
+        const { orient } = require('./reporting');
+        const result = orient(index, { top });
+        return { ok: true, result };
+    },
+
     doctor: (index, p) => {
         const { doctor } = require('./reporting');
         const result = doctor(index, {
