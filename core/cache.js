@@ -105,7 +105,11 @@ const UCN_VERSION = require('../package.json').version;
 // v40 (fix #251): Java field members carry visibility modifiers, enum
 // constants carry their implicit public/static/final, and Python type
 // aliases (PEP 695 + TypeAlias annotations) are indexed as 'type' symbols.
-const CACHE_FORMAT_VERSION = 40;
+// v41 (fix #252): CJS export object maps index their shorthand/pair
+// function properties (module.exports = { doThing(x){} }) and list them in
+// exports; member-expression assignments record RHS identifier function
+// references (window.onload = handler).
+const CACHE_FORMAT_VERSION = 41;
 
 /**
  * Save index to cache file

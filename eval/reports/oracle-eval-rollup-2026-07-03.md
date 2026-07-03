@@ -9,7 +9,7 @@ lie the tiered caller contract forbids. Target: 0.
 |---|---|---|---|---|---|---|---|---|---|
 | zod | ts-morph | 50 | 1861 | 99.4% | 30.7% | 0.687 | **0** | 100.0% (9) | 100.0% |
 | preact-signals | ts-morph | 24 | 24 | 100.0% | 8.3% | 0.9167 | **0** | 66.7% (3) | 100.0% |
-| express | ts-morph | 39 | 262 | 100.0% | 0.3% | 0.9975 | **0** | 50.0% (2) | 100.0% |
+| express | ts-morph | 39 | 262 | 100.0% | 0.3% | 0.9975 | **0** | 100.0% (1) | 100.0% |
 | httpx | pyright | 50 | 879 | 99.9% | 37.3% | 0.6256 | **0** | 100.0% (7) | 100.0% |
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.9% | 6.0% | 0.9394 | **0** | 100.0% (13) | 100.0% |
@@ -32,7 +32,7 @@ evidence confirms the file but not the receiver type.
 | preact-signals | function | 13 | 17 | 100.0% (15/15) | 0.0% (0/3) | 1 | {"confirmed":14,"unverified":0,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | method | 10 | 5 | 100.0% (3/3) | 9.3% (4/43) | 0.907 | {"confirmed":3,"unverified":2,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | class | 1 | 2 | 100.0% (3/3) | 0.0% (0/2) | 1 | {"confirmed":2,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| express | function | 37 | 262 | 100.0% (273/273) | 0.3% (2/802) | 0.9975 | {"confirmed":259,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":2,"missingUnexplained":0} |
+| express | function | 37 | 262 | 100.0% (274/274) | 0.3% (2/802) | 0.9975 | {"confirmed":259,"unverified":1,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":2,"missingUnexplained":0} |
 | httpx | function | 8 | 38 | 100.0% (38/38) | 0.0% (0/0) | n/a | {"confirmed":38,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | httpx | method | 30 | 365 | 99.7% (357/358) | 3.8% (8/213) | 0.9596 | {"confirmed":357,"unverified":8,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | httpx | class | 12 | 476 | 100.0% (364/364) | 100.0% (114/114) | 0 | {"confirmed":362,"unverified":114,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

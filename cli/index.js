@@ -401,30 +401,40 @@ function printOutput(result, jsonFn, textFn) {
 }
 
 /**
- * Print inline 3-line code previews for each callee (--expand support).
- * Used by context in project, interactive, and glob modes.
+ * Print inline 3-line code previews for context items (--expand support).
+ * Used by context in project, interactive, and glob modes. Previews both
+ * directions with attribution headers (fix #252: callees only — the flag
+ * was a silent no-op for caller-only contexts, and the unlabeled preview
+ * rendered detached from the item it expanded).
  */
 function printInlineExpand(ctx, root) {
-    if (!root || !ctx || !ctx.callees) return;
-    for (const c of ctx.callees) {
-        if (c.relativePath && c.startLine) {
-            try {
-                const filePath = path.join(root, c.relativePath);
-                const content = fs.readFileSync(filePath, 'utf-8');
-                const codeLines = content.split('\n');
-                const endLine = c.endLine || c.startLine + 5;
-                const previewLines = Math.min(3, endLine - c.startLine + 1);
-                for (let i = 0; i < previewLines && c.startLine - 1 + i < codeLines.length; i++) {
-                    console.log(`      │ ${codeLines[c.startLine - 1 + i]}`);
-                }
-                if (endLine - c.startLine + 1 > 3) {
-                    console.log(`      │ ... (${endLine - c.startLine - 2} more lines)`);
-                }
-            } catch (e) {
-                // Skip on error
+    if (!root || !ctx) return;
+    const preview = (c, label) => {
+        // Caller entries locate the enclosing FUNCTION via callerStartLine;
+        // callee entries are definitions with startLine.
+        const startLine = label === 'caller' ? c.callerStartLine : c.startLine;
+        const endLine = label === 'caller'
+            ? (c.callerEndLine || (startLine ? startLine + 5 : null))
+            : (c.endLine || (startLine ? startLine + 5 : null));
+        if (!c.relativePath || !startLine) return;
+        try {
+            const filePath = path.join(root, c.relativePath);
+            const content = fs.readFileSync(filePath, 'utf-8');
+            const codeLines = content.split('\n');
+            console.log(`      ┌ ${label}: ${c.name || c.callerName || '(anonymous)'} — ${c.relativePath}:${startLine}`);
+            const previewLines = Math.min(3, endLine - startLine + 1);
+            for (let i = 0; i < previewLines && startLine - 1 + i < codeLines.length; i++) {
+                console.log(`      │ ${codeLines[startLine - 1 + i]}`);
             }
+            if (endLine - startLine + 1 > 3) {
+                console.log(`      │ ... (${endLine - startLine - 2} more lines)`);
+            }
+        } catch (e) {
+            // Skip on error
         }
-    }
+    };
+    for (const c of ctx.callers || []) preview(c, 'caller');
+    for (const c of ctx.callees || []) preview(c, 'callee');
 }
 
 // ============================================================================
@@ -463,6 +473,12 @@ function main() {
         target = positionalArgs[0];
         command = positionalArgs[1] || 'toc';
         arg = positionalArgs[2];
+        // lines takes `<file> <range>` as two positionals (fix #252 —
+        // the extra token was silently dropped and the command then
+        // demanded a --file the user had plainly given).
+        if (command === 'lines' && positionalArgs.length > 3) {
+            arg = positionalArgs.slice(2).join(' ');
+        }
     }
 
     // Determine mode: single file, glob pattern, or project.
@@ -489,6 +505,25 @@ function main() {
         }
         process.exitCode = 1;
     }
+}
+
+/**
+ * Parse the lines command's target forms (fix #252: `lines main.ts 1-10`
+ * silently dropped the second positional and demanded a --file that was
+ * plainly given): `<range>` (+ --file), `<file> <range>`, `<file>:<range>`.
+ */
+function parseLinesTarget(arg, fileFlag) {
+    let file = fileFlag;
+    let range = arg;
+    const parts = String(arg || '').trim().split(/\s+/);
+    if (parts.length === 2 && /^\d+(-\d+)?$/.test(parts[1])) {
+        file = parts[0];
+        range = parts[1];
+    } else if (!/^\d+(-\d+)?$/.test(range)) {
+        const m = String(range).match(/^(.+):(\d+(?:-\d+)?)$/);
+        if (m) { file = m[1]; range = m[2]; }
+    }
+    return { file, range };
 }
 
 /**
@@ -948,8 +983,9 @@ function runProjectCommand(rootDir, command, arg) {
         }
 
         case 'lines': {
-            requireArg(arg, 'Usage: ucn . lines <range> --file <path>');
-            const { ok, result, error, note } = execute(index, 'lines', { file: flags.file, range: arg });
+            requireArg(arg, 'Usage: ucn . lines <range> --file <path> (or: lines <file> <range>)');
+            const linesTarget = parseLinesTarget(arg, flags.file);
+            const { ok, result, error, note } = execute(index, 'lines', { file: linesTarget.file, range: linesTarget.range });
             if (!ok) fail(error);
             if (note) console.error(note);
             printOutput(result, output.formatLinesJson, r => output.formatLines(r));
@@ -1903,8 +1939,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         }
 
         case 'lines': {
-            if (!arg) { console.log('Usage: lines <range> --file=<file>'); return; }
-            const { ok, result, error } = execute(index, 'lines', { file: iflags.file, range: arg });
+            if (!arg) { console.log('Usage: lines <range> --file=<file> (or: lines <file> <range>)'); return; }
+            const iLinesTarget = parseLinesTarget(arg, iflags.file);
+            const { ok, result, error } = execute(index, 'lines', { file: iLinesTarget.file, range: iLinesTarget.range });
             if (!ok) { console.log(error); return; }
             console.log(output.formatLines(result));
             break;

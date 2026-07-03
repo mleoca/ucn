@@ -131,7 +131,7 @@ function buildCallerOptions(p) {
 
 /** Kinds the `class` command extracts (fix #248: Java records and their
  *  fn-side suggestion were unreachable — indexed as type 'record'). */
-const CLASS_KIND_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'record'];
+const CLASS_KIND_TYPES = ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'record', 'namespace'];
 
 /**
  * Disambiguation advice that can actually work (fix #248): --file cannot
@@ -173,6 +173,12 @@ function validateClassName(index, name, className) {
     if (!allDefs || allDefs.length === 0) return null; // no defs at all — let the command handle "not found"
     const matching = allDefs.filter(d => d.className === className);
     if (matching.length > 0) return null; // className matched
+    // Namespace-qualified names (fix #252): namespace members are indexed
+    // at top level, so "Geometry.area" must not misdirect to an unrelated
+    // class that happens to define an `area` method.
+    if ((index.symbols.get(className) || []).some(d => d.type === 'namespace')) {
+        return `"${className}" is a namespace — its members are indexed at top level. Use \`${name}\` directly (with --file to scope).`;
+    }
     // className specified but no definitions match
     const available = [...new Set(allDefs.filter(d => d.className).map(d => d.className))];
     if (available.length > 0) {
@@ -1046,7 +1052,11 @@ const HANDLERS = {
     fn: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
-        applyClassMethodSyntax(p);
+        // Comma lists split Class.method PER ITEM below — the whole-string
+        // splitter mangled "helper,Service.buildUrl" into className
+        // "helper,Service" (fix #252). Handles contain no commas.
+        if (p.name.includes(',')) applyHandleSyntax(p);
+        else applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
         if (p.className) {
@@ -1088,7 +1098,11 @@ const HANDLERS = {
                 const classMatches = index.find(actualName, { file: p.file, className: fnClassName, skipCounts: true })
                     .filter(m => CLASS_KIND_TYPES.includes(m.type));
                 if (classMatches.length > 0) {
-                    notes.push(`"${fnName}" is a ${classMatches[0].type}, not a function. Use \`class ${fnName}\` instead.`);
+                    {
+                    const kind = classMatches[0].type;
+                    const article = /^[aeiou]/.test(kind) ? 'an' : 'a';
+                    notes.push(`"${fnName}" is ${article} ${kind}, not a function. Use \`class ${fnName}\` instead.`);
+                }
                 } else if ((index.symbols.get(actualName) || []).some(s => s.type === 'macro')) {
                     notes.push(`"${fnName}" is a macro. fn/class extract functions and classes — use \`lines <file>:<start>-<end>\` for macro bodies.`);
                 } else {
@@ -1160,6 +1174,13 @@ const HANDLERS = {
         }
 
         if (matches.length === 0) {
+            // Cross-kind hint parity with fn (fix #252): a function by this
+            // name deserves a redirect, not a bare "not found".
+            const fnMatches = index.find(p.name, { file: p.file, skipCounts: true })
+                .filter(m => m.type === 'function' || (m.params !== undefined && !CLASS_KIND_TYPES.includes(m.type)));
+            if (fnMatches.length > 0) {
+                return { ok: false, error: `Class "${p.name}" not found — "${p.name}" is a ${fnMatches[0].type}. Use \`fn ${p.name}\` instead.` };
+            }
             return { ok: false, error: `Class "${p.name}" not found.` };
         }
 

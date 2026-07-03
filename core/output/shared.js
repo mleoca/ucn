@@ -89,6 +89,11 @@ function formatFunctionSignature(fn) {
         prefix.push(fn.modifiers.join(' '));
     }
 
+    // Methods carry isAsync without an 'async' modifier entry (fix #252:
+    // `pub async fn get` and TS async methods rendered without the
+    // qualifier while standalone functions kept it).
+    if (fn.isAsync && !(fn.modifiers || []).includes('async')) prefix.push('async');
+
     // Generator marker
     if (fn.isGenerator) prefix.push('*');
 

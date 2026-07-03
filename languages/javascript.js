@@ -533,6 +533,48 @@ function _processFunction(node, functions, processedRanges, lines) {
                         ...(docstring && { docstring })
                     });
                 }
+            } else if (rightNode.type === 'object') {
+                // CJS export object maps (fix #252): the functions in
+                // `module.exports = { doThing(x) {...}, h: function() {...} }`
+                // are the module's public API — prototype and exports.h
+                // assignments were indexed while this shape was invisible
+                // to fn/find/toc.
+                const lhsText = leftNode.text;
+                if (lhsText === 'module.exports' || lhsText === 'exports' ||
+                    lhsText.startsWith('module.exports.') || lhsText.startsWith('exports.')) {
+                    processedRanges.add(rangeKey);
+                    for (let pi = 0; pi < rightNode.namedChildCount; pi++) {
+                        const prop = rightNode.namedChild(pi);
+                        let nameNode = null;
+                        let fnNode = null;
+                        if (prop.type === 'method_definition') {
+                            nameNode = prop.childForFieldName('name');
+                            fnNode = prop;
+                        } else if (prop.type === 'pair') {
+                            const v = prop.childForFieldName('value');
+                            if (v && (v.type === 'function_expression' ||
+                                v.type === 'arrow_function' || v.type === 'generator_function')) {
+                                nameNode = prop.childForFieldName('key');
+                                fnNode = v;
+                            }
+                        }
+                        if (!nameNode || !fnNode) continue;
+                        const paramsNode = fnNode.childForFieldName('parameters');
+                        const { startLine, endLine, indent } = nodeToLocation(prop, lines);
+                        const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+                        functions.push({
+                            name: nameNode.text,
+                            params: extractParams(paramsNode),
+                            paramsStructured,
+                            startLine,
+                            endLine,
+                            indent,
+                            isArrow: fnNode.type === 'arrow_function',
+                            isGenerator: isGenerator(fnNode),
+                            modifiers: [],
+                        });
+                    }
+                }
             }
         }
         return true;
@@ -1693,6 +1735,25 @@ function findCallsInCode(code, parser) {
                     localVarTypes.set(left.text, ctorName);
                 }
             }
+            // Handler-registration references (fix #252, the #221 family's
+            // missing shape): `window.onload = secondPageInit` /
+            // `element.onclick = handler` establish the call relationship
+            // through property assignment — plain assignment RHS and
+            // argument-position references were captured, the
+            // member-expression LHS shape recorded nothing, so search
+            // --unused claimed live handlers dead.
+            if (left?.type === 'member_expression' && right?.type === 'identifier' &&
+                !SKIP_IDENTS.has(right.text) && !nonCallableNames.has(right.text)) {
+                calls.push({
+                    name: right.text,
+                    line: right.startPosition.row + 1,
+                    isMethod: false,
+                    isFunctionReference: true,
+                    isPotentialCallback: true,
+                    ...(isShadowedByLocal(right, right.text) && { localShadow: true }),
+                    enclosingFunction: getCurrentEnclosingFunction(),
+                });
+            }
         }
 
         // Handle regular function calls: foo(), obj.foo(), foo.call()
@@ -2651,6 +2712,14 @@ function findExportsInCode(code, parser) {
                                 } else if (prop.type === 'pair') {
                                     const key = prop.childForFieldName('key');
                                     if (key) exports.push({ name: key.text, type: 'module.exports', line });
+                                } else if (prop.type === 'method_definition') {
+                                    // Shorthand methods are exports too
+                                    // (fix #252 — `module.exports =
+                                    // { doThing(x) {} }` was invisible to the
+                                    // export list, so deadcode audited a
+                                    // require()-reachable function).
+                                    const mName = prop.childForFieldName('name');
+                                    if (mName) exports.push({ name: mName.text, type: 'module.exports', line });
                                 }
                             }
                         } else if (rightNode && rightNode.type === 'identifier') {

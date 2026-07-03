@@ -5724,3 +5724,104 @@ describe('fix #251: G8 command surface', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #252: extraction/search leftovers', () => {
+    it('namespaces extract via class; namespace-qualified fn errors point at top level', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'tsconfig.json': '{}',
+            'g.ts': 'export namespace Geometry {\n  export function area(r: number): number { return r * r; }\n}\nexport class Shape {\n  area(): number { return 1; }\n}\n',
+        });
+        try {
+            const index = idx(dir);
+            const cls = execute(index, 'class', { name: 'Geometry' });
+            assert.ok(cls.ok, cls.error);
+            assert.strictEqual(cls.result.entries[0].match.type, 'namespace');
+            const r = execute(index, 'fn', { name: 'Geometry.area' });
+            assert.strictEqual(r.ok, false);
+            assert.ok(r.error.includes('namespace'), 'no misdirect to class Shape: ' + r.error);
+        } finally { rm(dir); }
+    });
+
+    it('fn comma lists parse Class.method per item', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            's.js': 'function helper() { return 1; }\nclass Service {\n  buildUrl() { return "/x"; }\n}\nmodule.exports = { helper, Service };\n',
+        });
+        try {
+            const index = idx(dir);
+            for (const list of ['helper,Service.buildUrl', 'Service.buildUrl,helper']) {
+                const r = execute(index, 'fn', { name: list });
+                assert.ok(r.ok, `${list}: ${r.error}`);
+                const names = r.result.entries.map(e => e.match.name).sort();
+                assert.deepStrictEqual(names, ['buildUrl', 'helper'], list);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('CJS export object maps: functions indexed, exported, and never claimed dead', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'm.js': 'module.exports = {\n  doThing(x) { return x + 1; },\n  helper: function(y) { return y * 2; },\n};\n',
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(execute(index, 'fn', { name: 'doThing' }).ok, 'shorthand method extractable');
+            assert.ok(execute(index, 'fn', { name: 'helper' }).ok, 'pair function extractable');
+            const dead = execute(index, 'deadcode', {}).result.map(x => x.name);
+            assert.deepStrictEqual(dead, [], 'export-map functions are exported surface');
+        } finally { rm(dir); }
+    });
+
+    it('handler-registration assignments keep functions alive in search --unused', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function secondPageInit() { return 1; }\nfunction orphan() { return 2; }\nwindow.onload = secondPageInit;\nmodule.exports = {};\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'search', { term: '*', type: 'function', unused: true });
+            const names = r.result.results.map(m => m.name);
+            assert.ok(!names.includes('secondPageInit'), 'registered handler is live');
+            assert.ok(names.includes('orphan'));
+        } finally { rm(dir); }
+    });
+
+    it('lines accepts <file> <range> and <file>:<range> forms', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'f.js': 'line1\nline2\nline3\n',
+        });
+        try {
+            const out1 = runCli(dir, 'lines', ['f.js', '1-2']);
+            assert.ok(out1.includes('line1') && out1.includes('line2'), out1.slice(0, 200));
+            const out2 = runCli(dir, 'lines', ['f.js:2']);
+            assert.ok(out2.includes('line2'), out2.slice(0, 200));
+        } finally { rm(dir); }
+    });
+
+    it('async methods render the qualifier in signature headers', () => {
+        const sig = output.formatFunctionSignature({ name: 'get', params: '', paramsStructured: [], isAsync: true, modifiers: ['pub'] });
+        assert.ok(sig.includes('async'), sig);
+    });
+
+    it('class not-found redirects to fn when a function owns the name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function widget() { return 1; }\nmodule.exports = { widget };\n',
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'class', { name: 'widget' });
+            assert.strictEqual(r.ok, false);
+            assert.ok(r.error.includes('fn widget'), r.error);
+        } finally { rm(dir); }
+    });
+
+    it('HTML extraction strips same-line surrounding markup', () => {
+        const { cleanHtmlScriptTags } = require('../core/parser');
+        const lines = ['<div><script>function foo() { return 1; }</script></div></body>'];
+        cleanHtmlScriptTags(lines, 'html');
+        assert.strictEqual(lines[0], 'function foo() { return 1; }');
+    });
+});

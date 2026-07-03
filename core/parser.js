@@ -282,13 +282,15 @@ function getExportedSymbols(result) {
  */
 function cleanHtmlScriptTags(lines, language) {
     if (language === 'html' && lines.length > 0) {
-        // Strip opening <script ...> tag wherever it appears on the first line
-        // (may be preceded by other HTML on the same line, e.g. <p>x</p><script>...).
-        lines[0] = lines[0].replace(/<script\b[^>]*>/i, '');
-        // Strip closing </script> tag wherever it appears on the last line
-        // (may be followed by other HTML on the same line, e.g. ...</script><p>x</p>).
+        // Strip everything up to and including the opening <script ...> tag
+        // on the first line — surrounding same-line markup is not code
+        // (fix #252: `<div><script>function foo()...` leaked `<div>` into
+        // the extraction). Indentation before the tag is kept.
+        lines[0] = lines[0].replace(/^(\s*).*<script\b[^>]*>/i, '$1');
+        // Strip the closing </script> tag and everything after it on the
+        // last line (`...</script></body></html>` leaked trailing markup).
         const last = lines.length - 1;
-        lines[last] = lines[last].replace(/<\/script\s*>/i, '');
+        lines[last] = lines[last].replace(/<\/script\s*>.*$/i, '');
     }
     return lines;
 }
