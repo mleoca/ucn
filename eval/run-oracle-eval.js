@@ -237,8 +237,18 @@ async function evaluateRepo(repo, oracle) {
         const hitKeys = sym.kind === 'class' ? anyRefKeys : oracleKeys;
         // usage-style edges (calledAs:'bound', functionReference) verify against
         // any oracle ref at the line — see the mapping comment above.
+        // Super-constructor sites (fix #268, jsoup-measured): `super(data)`
+        // in a direct subclass invokes the pinned class's constructor —
+        // compiler-true by the extends clause the parser resolved (#238
+        // emits the record naming the extends target) — but the line holds
+        // no type name, so reference oracles have NOTHING there (jdtls
+        // attributes super() to the constructor declaration, which the
+        // symbol universe excludes). Verified by construction.
+        const superCtorSite = c => sym.kind === 'class' &&
+            lineMatchesText(index.root, c.file, c.line, /(^|[^.\w])super\s*\(/);
         const edgeHit = c => hitKeys.has(key(c.file, c.line)) ||
-            (c.usageStyle && anyRefKeys.has(key(c.file, c.line)));
+            (c.usageStyle && anyRefKeys.has(key(c.file, c.line))) ||
+            superCtorSite(c);
         const confirmedHits = confirmed.filter(edgeHit).length;
         const unverifiedHits = unverified.filter(edgeHit).length;
 
@@ -307,7 +317,9 @@ async function evaluateRepo(repo, oracle) {
                             calleeSites++;
                             const k = key(oc.file, siteLine);
                             if (oracleKeys.has(k) ||
-                                ((e.functionReference || sym.kind === 'class') && anyRefKeys.has(k))) {
+                                ((e.functionReference || sym.kind === 'class') && anyRefKeys.has(k)) ||
+                                (sym.kind === 'class' &&
+                                    lineMatchesText(index.root, oc.file, siteLine, /(^|[^.\w])super\s*\(/))) {
                                 calleeHits++;
                             }
                         }
@@ -467,6 +479,11 @@ async function evaluateRepo(repo, oracle) {
 const _lineCache = new Map();
 /** Does (file, line) word-boundary match the symbol name? (= ground-set membership) */
 function lineMatchesSymbol(root, relFile, line, name) {
+    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return lineMatchesText(root, relFile, line, new RegExp(`\\b${esc}\\b`));
+}
+
+function lineMatchesText(root, relFile, line, regex) {
     const abs = path.join(root, relFile);
     let lines = _lineCache.get(abs);
     if (lines === undefined) {
@@ -475,8 +492,7 @@ function lineMatchesSymbol(root, relFile, line, name) {
         _lineCache.set(abs, lines);
     }
     if (!lines || line < 1 || line > lines.length) return false;
-    const esc = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-    return new RegExp(`\\b${esc}\\b`).test(lines[line - 1]);
+    return regex.test(lines[line - 1]);
 }
 
 function dedupe(edges) {

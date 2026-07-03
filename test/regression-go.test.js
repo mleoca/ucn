@@ -6112,3 +6112,191 @@ describe('fix #266b: guessed-type mismatch routes visible, never falls to arity 
         } finally { rm(dir); }
     });
 });
+
+describe('fix #268: callee-side external identity (Go)', () => {
+    it('external package qualifier never confirms a same-name project def (context.WithValue)', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'import "context"',
+                'func handle() {',
+                '    ctx := context.Background()',
+                '    _ = context.WithValue(ctx, "k", "v")',   // 5
+                '}',
+            ].join('\n'),
+            'util/util.go': [
+                'package util',
+                'func WithValue(a, b, c any) any { return nil }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const handle = (index.symbols.get('handle') || [])[0];
+            const res = index.findCallees(handle, { includeMethods: true, collectAccount: true });
+            assert.ok(!res.some(e => e.name === 'WithValue'),
+                `stdlib context.WithValue never confirms util.WithValue: ${JSON.stringify(res.map(e => e.name))}`);
+            assert.strictEqual(res.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: project package qualifier keeps confirming', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'import "example.com/m/util"',
+                'func handle() {',
+                '    util.Helper()',
+                '}',
+            ].join('\n'),
+            'util/util.go': [
+                'package util',
+                'func Helper() {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const handle = (index.symbols.get('handle') || [])[0];
+            const res = index.findCallees(handle, { includeMethods: true, collectAccount: true });
+            assert.ok(res.some(e => e.name === 'Helper'), 'project package call confirms');
+        } finally { rm(dir); }
+    });
+
+    it('external-typed field hop never falls through to name scope (mx.pool.Get)', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'import "sync"',
+                'type Mux struct { pool *sync.Pool }',
+                'func (m *Mux) Get(k string) string { return k }',  // 4 — unrelated same-name
+                'func (m *Mux) serve() {',
+                '    v := m.pool.Get()',   // 6
+                '    _ = v',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const serve = (index.symbols.get('serve') || [])[0];
+            const res = index.findCallees(serve, { includeMethods: true, collectAccount: true });
+            const getEdge = res.find(e => e.name === 'Get');
+            assert.ok(!getEdge || !(getEdge.sites || []).includes(6),
+                `sync.Pool Get is external, never Mux.Get: ${JSON.stringify(getEdge)}`);
+            assert.strictEqual(res.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: project-typed field hop keeps confirming (#231)', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'type Store struct{}',
+                'func (s *Store) Get(k string) string { return k }',   // 3
+                'type Mux struct { store *Store }',
+                'func (m *Mux) serve() string {',
+                '    return m.store.Get("x")',   // 6
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const serve = (index.symbols.get('serve') || [])[0];
+            const res = index.findCallees(serve, { includeMethods: true, collectAccount: true });
+            const getEdge = res.find(e => e.name === 'Get' && e.startLine === 3);
+            assert.ok(getEdge && (getEdge.sites || []).includes(6),
+                `declared project field type confirms Store.Get: ${JSON.stringify(res.map(e => ({ n: e.name, l: e.startLine })))}`);
+        } finally { rm(dir); }
+    });
+
+    it('external-interface field type never confirms a project impl in either direction', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'h/h.go': [
+                'package h',
+                'import "net/http"',
+                'type Wrap struct { inner http.Handler }',
+                'func (w2 *Wrap) do(rw http.ResponseWriter, r *http.Request) {',
+                '    w2.inner.ServeHTTP(rw, r)',   // 5
+                '}',
+            ].join('\n'),
+            'custom/custom.go': [
+                'package custom',
+                'type Handler struct{}',
+                'func (h Handler) ServeHTTP(a, b int) {}',   // 3
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // callee direction: never confirmed to custom.Handler.ServeHTTP
+            const doDef = (index.symbols.get('do') || [])[0];
+            const res = index.findCallees(doDef, { includeMethods: true, collectAccount: true });
+            const edge = res.find(e => e.name === 'ServeHTTP');
+            assert.ok(!edge || edge.relativePath !== 'custom/custom.go',
+                `http.Handler is not the custom package's Handler: ${JSON.stringify(edge)}`);
+            assert.strictEqual(res.calleeAccount?.conserved, true);
+            // caller direction: the pin on custom.Handler.ServeHTTP never confirms the h.go site
+            const pin = (index.symbols.get('ServeHTTP') || []).find(d => d.relativePath === 'custom/custom.go');
+            const callers = index.findCallers('ServeHTTP', {
+                targetDefinitions: [pin], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'h/h.go'),
+                'qualified-external field type is never bare-name identity for the caller side');
+        } finally { rm(dir); }
+    });
+
+    it('chained call on an external-returning producer never confirms a project def', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'import "net/http"',
+                'type M struct{}',
+                'func (m *M) NotFound() http.Handler { return nil }',
+                'func (m *M) serve(rw http.ResponseWriter, r *http.Request) {',
+                '    m.NotFound().ServeHTTP(rw, r)',   // 6
+                '}',
+            ].join('\n'),
+            'other/other.go': [
+                'package other',
+                'type Other struct{}',
+                'func (o Other) ServeHTTP(a, b int) {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const serve = (index.symbols.get('serve') || [])[0];
+            const res = index.findCallees(serve, { includeMethods: true, collectAccount: true });
+            const edge = res.find(e => e.name === 'ServeHTTP');
+            assert.ok(!edge || edge.relativePath !== 'other/other.go',
+                `http.Handler-returning chain never confirms other.Other.ServeHTTP: ${JSON.stringify(edge)}`);
+            assert.strictEqual(res.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: chained call on a project-returning producer confirms on the right class', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'type Kit struct{}',
+                'func (k *Kit) Run() {}',            // 3
+                'type M struct{}',
+                'func (m *M) Sub() *Kit { return nil }',
+                'func (m *M) serve() {',
+                '    m.Sub().Run()',   // 7
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const serve = (index.symbols.get('serve') || [])[0];
+            const res = index.findCallees(serve, { includeMethods: true, collectAccount: true });
+            const edge = res.find(e => e.name === 'Run' && e.startLine === 3);
+            assert.ok(edge && (edge.sites || []).includes(7),
+                `project return type resolves the chained callee: ${JSON.stringify(res.map(e => ({ n: e.name, l: e.startLine })))}`);
+        } finally { rm(dir); }
+    });
+});

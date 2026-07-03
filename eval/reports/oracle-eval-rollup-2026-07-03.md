@@ -13,14 +13,14 @@ lie the tiered caller contract forbids. Target: 0.
 | httpx | pyright | 50 | 879 | 99.9% | 37.3% | 0.6256 | **0** | 100.0% (7) | 100.0% |
 | rich | pyright | 50 | 501 | 97.7% | 17.5% | 0.8013 | **0** | 100.0% (7) | 100.0% |
 | cobra | gopls | 50 | 1551 | 99.9% | 6.0% | 0.9394 | **0** | 100.0% (13) | 100.0% |
-| grpc-go | gopls | 50 | 840 | 100.0% | 13.3% | 0.8671 | **0** | 100.0% (13) | 100.0% |
+| grpc-go | gopls | 50 | 840 | 100.0% | 12.9% | 0.8712 | **0** | 100.0% (13) | 100.0% |
 | ripgrep | rust-analyzer | 41 | 765 | 100.0% | 17.0% | 0.8301 | **0** | 100.0% (1) | 100.0% |
 | cursive | rust-analyzer | 50 | 637 | 99.3% | 40.5% | 0.5883 | **0** | 100.0% (6) | 100.0% |
-| gson | jdtls | 50 | 649 | 96.6% | 30.4% | 0.6611 | **0** | 100.0% (9) | 100.0% |
+| gson | jdtls | 50 | 649 | 96.6% | 30.4% | 0.6618 | **0** | 100.0% (9) | 100.0% |
 | clap | rust-analyzer | 50 | 2602 | 92.4% | 35.1% | 0.5732 | **0** | 100.0% (13) | 100.0% |
 | hono | ts-morph | 50 | 1213 | 99.7% | 60.4% | 0.393 | **0** | 100.0% (6) | 100.0% |
 | zustand | ts-morph | 17 | 208 | 100.0% | 0.0% | 1 | **0** | 100.0% (1) | 100.0% |
-| viper | gopls | 50 | 668 | 100.0% | 78.2% | 0.2184 | **0** | 100.0% (7) | 100.0% |
+| viper | gopls | 50 | 668 | 100.0% | 70.1% | 0.299 | **0** | 100.0% (7) | 100.0% |
 
 ## Per-kind breakdown
 
@@ -47,7 +47,7 @@ evidence confirms the file but not the receiver type.
 | cobra | method | 18 | 567 | 99.8% (557/558) | 6.0% (3/50) | 0.9382 | {"confirmed":557,"unverified":2,"reportedNonCall":8,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cobra | class | 3 | 409 | 100.0% (409/409) | n/a (0/0) | n/a | {"confirmed":409,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | function | 12 | 101 | 100.0% (101/101) | n/a (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| grpc-go | method | 30 | 351 | 100.0% (7/7) | 13.3% (205/1537) | 0.8666 | {"confirmed":7,"unverified":205,"reportedNonCall":139,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| grpc-go | method | 30 | 351 | 100.0% (7/7) | 12.9% (205/1586) | 0.8707 | {"confirmed":7,"unverified":205,"reportedNonCall":139,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | grpc-go | class | 8 | 388 | 100.0% (388/388) | 0.0% (0/5) | 1 | {"confirmed":388,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | function | 6 | 568 | 100.0% (568/568) | n/a (0/0) | n/a | {"confirmed":568,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | ripgrep | method | 31 | 186 | 100.0% (161/161) | 14.2% (21/148) | 0.8581 | {"confirmed":161,"unverified":21,"reportedNonCall":4,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -55,7 +55,7 @@ evidence confirms the file but not the receiver type.
 | cursive | function | 6 | 101 | 98.1% (101/103) | n/a (0/0) | n/a | {"confirmed":101,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | method | 39 | 519 | 99.7% (309/310) | 40.8% (208/510) | 0.589 | {"confirmed":309,"unverified":208,"reportedNonCall":2,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | cursive | class | 5 | 17 | 100.0% (3/3) | 31.6% (6/19) | 0.6842 | {"confirmed":3,"unverified":6,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":8,"missingUnexplained":0} |
-| gson | method | 40 | 615 | 96.2% (275/286) | 30.4% (197/647) | 0.657 | {"confirmed":275,"unverified":195,"reportedNonCall":13,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
+| gson | method | 40 | 615 | 96.2% (281/292) | 30.4% (197/647) | 0.6578 | {"confirmed":281,"unverified":195,"reportedNonCall":7,"missingExplained":132,"missingBeyondText":0,"missingUnexplained":0} |
 | gson | class | 10 | 34 | 100.0% (34/34) | n/a (0/0) | n/a | {"confirmed":34,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | clap | function | 14 | 244 | 96.8% (243/251) | n/a (0/0) | n/a | {"confirmed":243,"unverified":0,"reportedNonCall":1,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | clap | method | 33 | 2358 | 91.8% (1743/1898) | 35.1% (617/1758) | 0.5673 | {"confirmed":1743,"unverified":615,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
@@ -65,7 +65,7 @@ evidence confirms the file but not the receiver type.
 | hono | class | 14 | 187 | 100.0% (188/188) | n/a (0/0) | n/a | {"confirmed":187,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zustand | function | 17 | 208 | 100.0% (213/213) | 0.0% (0/18) | 1 | {"confirmed":208,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | viper | function | 20 | 158 | 100.0% (158/158) | 0.0% (0/6) | 1 | {"confirmed":158,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
-| viper | method | 29 | 506 | 100.0% (434/434) | 84.0% (68/81) | 0.1605 | {"confirmed":434,"unverified":66,"reportedNonCall":6,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| viper | method | 29 | 506 | 100.0% (434/434) | 74.7% (68/91) | 0.2527 | {"confirmed":434,"unverified":66,"reportedNonCall":6,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | viper | class | 1 | 4 | 100.0% (4/4) | n/a (0/0) | n/a | {"confirmed":4,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 
 ## Callee arm (trace-down contract)
@@ -83,12 +83,12 @@ the site (confirmed edge / unverified entry) or account for it
 | express | 100.0% (4/4) | 4 | 0 | 0 | 0 | 258 | 0 | **0** |
 | httpx | 100.0% (380/380) | 379 | 1 | 466 | 33 | 0 | 0 | **0** |
 | rich | 98.8% (237/240) | 236 | 27 | 76 | 40 | 122 | 0 | **0** |
-| cobra | 99.9% (1537/1538) | 1536 | 0 | 8 | 0 | 7 | 0 | **0** |
-| grpc-go | 98.1% (356/363) | 356 | 372 | 100 | 0 | 12 | 0 | **0** |
+| cobra | 100.0% (1537/1537) | 1536 | 0 | 8 | 0 | 7 | 0 | **0** |
+| grpc-go | 97.8% (310/317) | 310 | 408 | 110 | 0 | 12 | 0 | **0** |
 | ripgrep | 100.0% (729/729) | 729 | 0 | 32 | 4 | 0 | 0 | **0** |
 | cursive | 100.0% (387/387) | 383 | 2 | 244 | 0 | 0 | 8 | **0** |
-| gson | 97.1% (271/279) | 271 | 141 | 67 | 0 | 38 | 0 | **0** |
-| clap | 99.8% (589/590) | 589 | 398 | 1615 | 0 | 0 | 0 | **0** |
-| hono | 100.0% (54/54) | 54 | 309 | 33 | 0 | 817 | 0 | **0** |
+| gson | 97.5% (307/315) | 307 | 69 | 103 | 0 | 38 | 0 | **0** |
+| clap | 99.8% (594/595) | 594 | 397 | 1611 | 0 | 0 | 0 | **0** |
+| hono | 100.0% (54/54) | 54 | 306 | 36 | 0 | 817 | 0 | **0** |
 | zustand | 100.0% (17/17) | 17 | 0 | 2 | 0 | 189 | 0 | **0** |
-| viper | 100.0% (239/239) | 237 | 33 | 398 | 0 | 0 | 0 | **0** |
+| viper | 100.0% (238/238) | 236 | 26 | 406 | 0 | 0 | 0 | **0** |

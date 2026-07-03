@@ -1155,7 +1155,16 @@ function findCallers(index, name, options = {}) {
                 }
                 if (call.isMethod && !call.receiverType && call.receiverField && fieldHopRootType &&
                     !resolvedBySameClass) {
-                    fieldHopType = _declaredFieldType(index, fieldHopRootType, call.receiverField, fileEntry.language);
+                    const hopInfo = {};
+                    fieldHopType = _declaredFieldType(index, fieldHopRootType, call.receiverField, fileEntry.language, hopInfo);
+                    // Provably-external declared field type (fix #268,
+                    // chi-measured: `inner http.Handler` on a pin named
+                    // Handler elsewhere in the project) — rides the #220(6)
+                    // external-flow rail: defeats single-owner confirmation,
+                    // routes possible-dispatch, never excludes.
+                    if (!fieldHopType && hopInfo.externalVia && !call.receiverExternalFlow) {
+                        call = { ...call, receiverExternalFlow: hopInfo.externalVia };
+                    }
                 }
                 // Dispatch attribution (contract surface only): a field DECLARED
                 // as a project interface/trait carries no exclusion evidence
@@ -1209,7 +1218,26 @@ function findCallers(index, name, options = {}) {
                     // receiver-class disambiguation below).
                     const fieldHopMatchesTarget = fieldHopType && targetDefs.some(d =>
                         (d.className || (d.receiver || '').replace(/^\*/, '')) === fieldHopType);
-                    if (!fieldHopMatchesTarget) {
+                    // Java arity-overload groups are ONE bindable name (fix
+                    // #268, javapoet-measured): the bare delegation
+                    // `defaultValue(Code.of(...))` inside Builder name-bound
+                    // the same-class FIELD (or the sibling overload) and was
+                    // excluded other-definition — a false zero-caller answer.
+                    // When the resolved binding's def sits in the pin's
+                    // same-class callable overload family, binding identity
+                    // proves nothing; the #205 overload discipline below
+                    // adjudicates (fits/sibling/ambiguous). Fields never
+                    // receive Java calls (separate namespaces), so a
+                    // field-binding hit is treated the same way.
+                    let overloadGroupBinding = false;
+                    if (!fieldHopMatchesTarget &&
+                        langTraits(fileEntry.language)?.hasArityOverloads && !call.receiver) {
+                        const boundDef = definitions.find(d => d.bindingId === bindingId);
+                        overloadGroupBinding = !!(boundDef && boundDef.className &&
+                            targetDefs.some(d => d.className === boundDef.className &&
+                                d.file === boundDef.file));
+                    }
+                    if (!fieldHopMatchesTarget && !overloadGroupBinding) {
                         recordExcluded(filePath, call.line, 'other-definition');
                         continue;
                     }
@@ -2957,6 +2985,16 @@ function findCallees(index, def, options = {}) {
             if (_flowMap === undefined) _flowMap = _buildReturnTypeFlowMap(index, def.file, calls);
             return _flowMap;
         };
+        // Chained-receiver fold context (fix #268 — the #258 rails, callee
+        // direction): built lazily, shared across this def's records.
+        let calleeFoldCtx = null;
+        const foldCtx = () => {
+            if (!calleeFoldCtx) {
+                calleeFoldCtx = { memo: new Map(), visiting: new Set(), records: calls,
+                    getFlowMap: () => flowMap() };
+            }
+            return calleeFoldCtx;
+        };
 
         let siteOrdinal = -1;
         for (const call of calls) {
@@ -2987,13 +3025,17 @@ function findCallees(index, def, options = {}) {
             // to nothing). _declaredFieldType's guards apply: interface/
             // trait-typed and generic-param fields return null.
             let fieldHopType = null;
+            let fieldHopInfo = null;
             if (call.isMethod && !call.receiverType && call.receiverField) {
                 let hopRoot = call.receiverRootType;
                 if (!hopRoot && call.receiverRoot === 'this' &&
                     langTraits(language)?.typeSystem === 'structural') {
                     hopRoot = index.findEnclosingFunction(def.file, call.line, true)?.className;
                 }
-                if (hopRoot) fieldHopType = _declaredFieldType(index, hopRoot, call.receiverField, language);
+                if (hopRoot) {
+                    fieldHopInfo = {};
+                    fieldHopType = _declaredFieldType(index, hopRoot, call.receiverField, language, fieldHopInfo);
+                }
             }
 
             // Go package-qualified receiver: resolve the import module up
@@ -3001,9 +3043,14 @@ function findCallees(index, def, options = {}) {
             // type-qualified method expressions (fix #236 — a receiver that
             // is neither stays eligible for type-qualified resolution below).
             let goImportModule = null;
-            if (call.isMethod && call.receiver && langTraits(language)?.hasReceiverPackageCalls) {
+            if (call.receiver && langTraits(language)?.hasReceiverPackageCalls) {
                 const goImports = fileEntry?.imports || [];
                 // Handle Go version suffixes: k8s.io/klog/v2 → klog, not v2
+                // fix #268 (chi-measured): computed for NON-method records
+                // too — the parser marks `context.WithValue(...)` isMethod:
+                // false, which used to skip the whole package-ownership
+                // dispatch and confirm the bare name against the project's
+                // only WithValue def (middleware/value.go).
                 goImportModule = goImports.find(mod => {
                     const parts = mod.split('/');
                     const last = parts[parts.length - 1];
@@ -3023,6 +3070,30 @@ function findCallees(index, def, options = {}) {
                 !['self', 'cls', 'this', 'super', 'Self'].includes(call.receiver) &&
                 !(localTypes && localTypes.has(call.receiver))) {
                 typeQual = _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language);
+            }
+
+            // Package-qualified NON-method records (fix #268, chi-measured):
+            // the parser marks `context.WithValue(...)` isMethod:false, so it
+            // used to skip the package-ownership dispatch entirely and
+            // confirm as a bare name (the project's only WithValue def).
+            // The qualifier owns the name (#206/#209): resolve into the
+            // imported package or route external — never bare-name scope.
+            if (!call.isMethod && goImportModule && !call.isFunctionReference) {
+                const match = _calleeGoPackageMatch(index, call, goImportModule);
+                if (match) {
+                    const key = match.bindingId || `${call.receiver}.${call.name}`;
+                    const existing = callees.get(key);
+                    if (existing) {
+                        existing.count += 1;
+                        if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                    } else {
+                        callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                            ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                    }
+                } else {
+                    noteSite(siteId, 'external', null, call);
+                }
+                continue;
             }
 
             // Smart method call handling:
@@ -3047,23 +3118,29 @@ function findCallees(index, def, options = {}) {
                     const symbols = index.symbols.get(call.name);
                     const isCallable = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
-                    let match = symbols?.find(s =>
+                    const onClass = (cls) => (symbols || []).filter(s =>
                         isCallable(s) && (
-                        s.className === typeName ||
-                        (s.receiver && s.receiver.replace(/^\*/, '') === typeName)));
+                        s.className === cls ||
+                        (s.receiver && s.receiver.replace(/^\*/, '') === cls)));
+                    // Same-class overloads select by static call shape —
+                    // arity, then Java argKinds (fix #268); an undecidable
+                    // family routes visible instead of binding defs[0].
+                    let sel = _calleeOverloadSelect(index, call, onClass(typeName), language);
                     // Walk embedding/inheritance chain if no direct match (nominal type systems)
-                    if (!match && langTraits(language)?.typeSystem === 'nominal') {
+                    if (!sel.match && !sel.ambiguous && langTraits(language)?.typeSystem === 'nominal') {
                         const parentNames = index._getInheritanceParents?.(typeName, def.file);
                         if (parentNames) {
                             for (const pName of parentNames) {
-                                match = symbols?.find(s =>
-                                    isCallable(s) && (
-                                    s.className === pName ||
-                                    (s.receiver && s.receiver.replace(/^\*/, '') === pName)));
-                                if (match) break;
+                                sel = _calleeOverloadSelect(index, call, onClass(pName), language);
+                                if (sel.match || sel.ambiguous) break;
                             }
                         }
                     }
+                    if (sel.ambiguous) {
+                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        continue;
+                    }
+                    const match = sel.match;
                     if (match) {
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
@@ -3092,7 +3169,7 @@ function findCallees(index, def, options = {}) {
                         noteUnverified(siteId, call, 'uncertain-receiver');
                     }
                     continue;
-                } else if (call.receiverType || fieldHopType) {
+                } else if (call.receiverType || fieldHopType || fieldHopInfo?.externalVia) {
                     // Use parser-inferred receiverType for method resolution
                     // Go/Java/Rust: from param/receiver type declarations
                     // JS/TS: from `new Foo()` assignments or TypeScript type annotations
@@ -3100,27 +3177,45 @@ function findCallees(index, def, options = {}) {
                     // fieldHopType: the declared type of a one-hop field
                     // receiver (fix #231 — tm.service.Save() resolves Save
                     // through the `service *DataService` declaration)
+                    if (!call.receiverType && !fieldHopType && fieldHopInfo?.externalVia) {
+                        // Provably-external declared field type (fix #268,
+                        // chi-measured: `pool *sync.Pool`, `inner
+                        // http.Handler`) — never bare-name identity. Visible
+                        // when project owners of the name exist (an external
+                        // interface may dispatch into a project impl),
+                        // external otherwise.
+                        if ((index.symbols.get(call.name) || []).some(s => !NON_CALLABLE_TYPES.has(s.type))) {
+                            noteUnverified(siteId, call, 'possible-dispatch');
+                        } else {
+                            noteSite(siteId, 'external', null, call);
+                        }
+                        continue;
+                    }
                     const typeName = call.receiverType || fieldHopType;
                     const symbols = index.symbols.get(call.name);
                     const isCallableRT = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
                         (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
-                    let match = symbols?.find(s =>
+                    const onClassRT = (cls) => (symbols || []).filter(s =>
                         isCallableRT(s) && (
-                        (s.receiver && s.receiver.replace(/^\*/, '') === typeName) ||
-                        s.className === typeName));
+                        (s.receiver && s.receiver.replace(/^\*/, '') === cls) ||
+                        s.className === cls));
+                    // Same-class overload selection by static call shape (fix #268)
+                    let sel = _calleeOverloadSelect(index, call, onClassRT(typeName), language);
                     // Walk embedding/inheritance chain if no direct match (nominal type systems)
-                    if (!match && langTraits(language)?.typeSystem === 'nominal') {
+                    if (!sel.match && !sel.ambiguous && langTraits(language)?.typeSystem === 'nominal') {
                         const parentNames = index._getInheritanceParents?.(typeName, def.file);
                         if (parentNames) {
                             for (const pName of parentNames) {
-                                match = symbols?.find(s =>
-                                    isCallableRT(s) && (
-                                    (s.receiver && s.receiver.replace(/^\*/, '') === pName) ||
-                                    s.className === pName));
-                                if (match) break;
+                                sel = _calleeOverloadSelect(index, call, onClassRT(pName), language);
+                                if (sel.match || sel.ambiguous) break;
                             }
                         }
                     }
+                    if (sel.ambiguous) {
+                        noteUnverified(siteId, call, 'overload-ambiguous');
+                        continue;
+                    }
+                    const match = sel.match;
                     if (match) {
                         const key = match.bindingId || `${typeName}.${call.name}`;
                         const existing = callees.get(key);
@@ -3146,55 +3241,99 @@ function findCallees(index, def, options = {}) {
                         noteSite(siteId, 'external', null, call);
                         continue;
                     }
+                    // An ATTEMPTED field hop that resolves to a type defining
+                    // no such member never falls through to name/binding
+                    // resolution (fix #268 — the #265(C) rule, callee
+                    // direction: `mx.pool.Get()` hop-missed and the same-file
+                    // Mux.Get binding confirmed it). Zero-candidate names are
+                    // external (#261); anything else stays visible.
+                    if (fieldHopType) {
+                        if (_calleeZeroCandidateName(index, call)) {
+                            noteSite(siteId, 'external', null, call);
+                        } else {
+                            noteUnverified(siteId, call, 'uncertain-receiver');
+                        }
+                        continue;
+                    }
                     // No match found with inferred type — fall through to include as unresolved
+                } else if (call.receiverCall && !call.receiver && !call.isConstructor &&
+                    langTraits(language)?.typeSystem === 'nominal') {
+                    // Chained receiver, nominal callee direction (fix #268,
+                    // chi-measured): `m.NotFound().ServeHTTP(w, r)` /
+                    // `r.Context().Value(k)` — the producer's compiler-checked
+                    // return annotation types the receiver (#207 rails), and
+                    // an untypable chain routes visible — never bare-name or
+                    // binding resolution (the same-file Mux.ServeHTTP binding
+                    // confirmed a self-edge; a single-def project `Value`
+                    // confirmed for context.Context's).
+                    let chained = _foldChainedReceiverType(index, fileEntry, def.file, call, foldCtx());
+                    if (!chained || (!chained.type && !chained.externalVia)) {
+                        chained = _nominalChainedReceiverType(index, call, fileEntry, def.file);
+                    }
+                    if (chained?.type) {
+                        const symbols = index.symbols.get(call.name);
+                        const isCallableCh = (s) => !NON_CALLABLE_TYPES.has(s.type) ||
+                            (s.type === 'field' && s.fieldType && /^func\b/.test(s.fieldType));
+                        const onClassCh = (cls) => (symbols || []).filter(s =>
+                            isCallableCh(s) && (
+                            (s.receiver && s.receiver.replace(/^\*/, '') === cls) ||
+                            s.className === cls));
+                        let sel = _calleeOverloadSelect(index, call, onClassCh(chained.type), language);
+                        if (!sel.match && !sel.ambiguous) {
+                            const parentNames = index._getInheritanceParents?.(chained.type, def.file);
+                            if (parentNames) {
+                                for (const pName of parentNames) {
+                                    sel = _calleeOverloadSelect(index, call, onClassCh(pName), language);
+                                    if (sel.match || sel.ambiguous) break;
+                                }
+                            }
+                        }
+                        if (sel.match) {
+                            const match = sel.match;
+                            const key = match.bindingId || `${chained.type}.${call.name}`;
+                            const existing = callees.get(key);
+                            if (existing) {
+                                existing.count += 1;
+                                if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                            } else {
+                                callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                                    ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
+                            }
+                            continue;
+                        }
+                        if (sel.ambiguous) {
+                            noteUnverified(siteId, call, 'overload-ambiguous');
+                            continue;
+                        }
+                    }
+                    if (_calleeZeroCandidateName(index, call)) {
+                        noteSite(siteId, 'external', null, call);
+                    } else if (chained?.externalVia) {
+                        noteUnverified(siteId, call, 'possible-dispatch');
+                    } else {
+                        noteUnverified(siteId, call, 'uncertain-receiver');
+                    }
+                    continue;
                 } else if (goImportModule) {
                     // Go package-qualified calls: klog.Infof(), wait.UntilWithContext()
                     // The receiver is an import alias (resolved above) — find
                     // definitions from that package.
-                    const importModule = goImportModule;
-                    {
-                        // Receiver is an import alias — resolve to definitions from that package
-                        const symbols = index.symbols.get(call.name);
-                        if (symbols) {
-                            // Match by checking if the definition's directory path matches the import path suffix.
-                            // Pick the symbol with the LONGEST suffix match to avoid false positives
-                            // (e.g., import "k8s.io/client-go/kubernetes/scheme" should prefer a definition
-                            // in .../client-go/kubernetes/scheme/ over one in .../kubeadm/scheme/).
-                            const importParts = importModule.split('/');
-                            let bestMatch = null;
-                            let bestMatchLen = 0;
-                            for (const s of symbols) {
-                                const sDir = path.dirname(s.relativePath || path.relative(index.root, s.file));
-                                for (let i = 0; i < importParts.length; i++) {
-                                    const suffix = importParts.slice(i).join('/');
-                                    if (sDir === suffix || sDir.endsWith('/' + suffix)) {
-                                        const matchLen = importParts.length - i;
-                                        if (matchLen > bestMatchLen) {
-                                            bestMatchLen = matchLen;
-                                            bestMatch = s;
-                                        }
-                                        break; // this symbol's best suffix found, try next
-                                    }
-                                }
-                            }
-                            const match = bestMatch;
-                            if (match) {
-                                const key = match.bindingId || `${call.receiver}.${call.name}`;
-                                const existing = callees.get(key);
-                                if (existing) {
-                                    existing.count += 1;
-                                    if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
-                                } else {
-                                    callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
-                                        ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
-                                }
-                                continue;
-                            }
+                    const match = _calleeGoPackageMatch(index, call, goImportModule);
+                    if (match) {
+                        const key = match.bindingId || `${call.receiver}.${call.name}`;
+                        const existing = callees.get(key);
+                        if (existing) {
+                            existing.count += 1;
+                            if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
+                        } else {
+                            callees.set(key, { name: call.name, bindingId: match.bindingId, count: 1,
+                                ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                         }
-                        // Import resolved but no project definition matches — external call, skip
-                        noteSite(siteId, 'external', null, call);
                         continue;
                     }
+                    // Import resolved but no project definition matches — external call, skip
+                    noteSite(siteId, 'external', null, call);
+                    continue;
                 } else if (typeQual) {
                     // Type-qualified receiver (fix #236): the receiver NAMES a
                     // type, so the type owns the call — Foo::new() is Foo's
@@ -4991,7 +5130,82 @@ function _pureAliasBase(index, typeName) {
     return current;
 }
 
-function _declaredFieldType(index, rootType, fieldName, language) {
+// Does the qualifier of a Go pkg.Type field annotation name one of the
+// declaring file's imports? (last-segment match, version-suffix aware —
+// the goImportModule convention.) Presence + no project resolution above
+// makes the field's type provably external (fix #268).
+function _goQualifierNamesImport(index, fieldFile, qualifier) {
+    const fe = index.files.get(fieldFile);
+    if (!fe || !Array.isArray(fe.imports)) return false;
+    return fe.imports.some(mod => {
+        const parts = String(mod).split('/');
+        const last = parts[parts.length - 1];
+        const pkgName = (/^v\d+$/.test(last) && parts.length > 1) ? parts[parts.length - 2] : last;
+        return pkgName === qualifier;
+    });
+}
+
+// Same-class overload selection, callee direction (fix #268, jsoup-measured:
+// all 71 tb.process sites confirmed to the 1-arg overload — the .find()
+// pick was defs[0] in canonical order). Arity narrows first; Java argKinds
+// refine same-arity families; exactly one survivor binds, anything else is
+// statically undecidable and routes visible.
+// Resolve a Go package-qualified call to a definition in the imported
+// package (dir-path suffix match against the import path; LONGEST suffix
+// wins so import "k8s.io/client-go/kubernetes/scheme" prefers a def in
+// .../kubernetes/scheme/ over .../kubeadm/scheme/). Extracted for reuse:
+// the parser marks some package calls isMethod:false (fix #268).
+function _calleeGoPackageMatch(index, call, importModule) {
+    const symbols = index.symbols.get(call.name);
+    if (!symbols) return null;
+    // Self-module imports (fix #268, cobra-measured — the #220(8) go.mod
+    // identity): `import "github.com/spf13/cobra"` from doc/ names the
+    // module's ROOT package, whose relative dir is '.' and can never
+    // path-suffix-match the import string. Compose the effective package
+    // dir from the module line (nested subpackage paths compose too).
+    const goMod = findGoModule(index.root);
+    if (goMod && goMod.modulePath &&
+        (importModule === goMod.modulePath || importModule.startsWith(goMod.modulePath + '/'))) {
+        const sub = importModule === goMod.modulePath ? '.' :
+            importModule.slice(goMod.modulePath.length + 1);
+        const selfMatch = symbols.find(s => {
+            const sDir = path.dirname(s.relativePath || path.relative(index.root, s.file));
+            return sDir === sub;
+        });
+        if (selfMatch) return selfMatch;
+    }
+    const importParts = importModule.split('/');
+    let bestMatch = null;
+    let bestMatchLen = 0;
+    for (const s of symbols) {
+        const sDir = path.dirname(s.relativePath || path.relative(index.root, s.file));
+        for (let i = 0; i < importParts.length; i++) {
+            const suffix = importParts.slice(i).join('/');
+            if (sDir === suffix || sDir.endsWith('/' + suffix)) {
+                const matchLen = importParts.length - i;
+                if (matchLen > bestMatchLen) {
+                    bestMatchLen = matchLen;
+                    bestMatch = s;
+                }
+                break; // this symbol's best suffix found, try next
+            }
+        }
+    }
+    return bestMatch;
+}
+
+function _calleeOverloadSelect(index, call, matches, language) {
+    if (matches.length <= 1) return { match: matches[0] || null };
+    if (call.argCount == null || call.argSpread) return { ambiguous: true };
+    const fits = matches.filter(d => _callArityCompatible(call, [d], language));
+    if (fits.length === 1) return { match: fits[0] };
+    if (fits.length === 0) return { match: null }; // fits nothing we model — no claim
+    const applicable = fits.filter(d => _overloadApplicable(index, call, d));
+    if (applicable.length === 1) return { match: applicable[0] };
+    return { ambiguous: true };
+}
+
+function _declaredFieldType(index, rootType, fieldName, language, info) {
     const defs = index.symbols.get(fieldName);
     if (!defs) return null;
     // 'private field' (JS #-fields, fix #219): equally compiler-true, and
@@ -5009,7 +5223,35 @@ function _declaredFieldType(index, rootType, fieldName, language) {
     if (onType.length === 0) return null;
     const normalized = new Set();
     for (const f of onType) {
-        const t = _normalizeFieldTypeName(isAccessor(f) ? f.returnType : f.fieldType, language);
+        const rawText = isAccessor(f) ? f.returnType : f.fieldType;
+        // Qualified declared types resolve through the FIELD-DECLARING file's
+        // imports or not at all (fix #268, chi-measured — the #206 identity
+        // discipline): `inner http.Handler` is net/http's Handler, never a
+        // project class that happens to share the bare name (an _examples
+        // type named Handler confirmed mx.handler.ServeHTTP). Go only —
+        // its pkg.Type field shape carries a checkable qualifier; Rust/Java
+        // qualified heads keep their current physics (no measured family).
+        if (language === 'go' && f.file) {
+            const qm = String(rawText).trim().replace(/^\*+/, '')
+                .match(/^([A-Za-z_]\w*)\.([A-Za-z_]\w*)$/);
+            if (qm) {
+                const [, qualifier, bare] = qm;
+                const hasProjectType = (index.symbols.get(bare) || [])
+                    .some(d => IDENTITY_TYPE_KINDS.has(d.type));
+                const origin = hasProjectType &&
+                    _resolveFlowTypeOrigin(index, f.file, bare, qualifier);
+                if (origin && origin.fromFile) { normalized.add(bare); continue; }
+                // The qualifier names an import that resolves to no project
+                // type — the field's type is provably external. Surfaced via
+                // `info` so the callee side can route external/visible; the
+                // head stays null (never bare-name identity, demote-only).
+                if (info && _goQualifierNamesImport(index, f.file, qualifier)) {
+                    info.externalVia = `${qualifier}.${bare}`;
+                }
+                return null;
+            }
+        }
+        const t = _normalizeFieldTypeName(rawText, language);
         if (t) normalized.add(t);
         else return null; // any un-normalizable declaration → no evidence
     }
@@ -5536,6 +5778,38 @@ function _overloadDiscipline(index, call, targetDefs, definitions) {
     if (targetOwners.size === 0) return null;
     const family = definitions.filter(d => !NON_CALLABLE_TYPES.has(d.type) &&
         d.className && targetOwners.has(d.className));
+    // Inherited sibling overloads (fix #268, javapoet-measured): the pin's
+    // dispatch surface includes ancestor same-name methods — ClassName's
+    // annotated(List) coexists with TypeName's FINAL annotated(Spec...), and
+    // a 1-arg call may bind either; receiver-hint evidence said "some
+    // annotated overload", not the pinned one (the #205 jdtls lesson).
+    // Identical type signatures in an ancestor are the OVERRIDE SLOT the pin
+    // occupies — the same virtual method, never a sibling.
+    const typeSig = (d) => Array.isArray(d.paramsStructured)
+        ? d.paramsStructured.map(p => String(p?.type ?? '').replace(/\s+/g, '')).join(',')
+        : null;
+    const pinSigs = new Set(targetDefs.map(typeSig).filter(s => s !== null));
+    const pinFile = targetDefs.find(d => d.file)?.file;
+    const seenCls = new Set(targetOwners);
+    const queue = [...targetOwners];
+    let hops = 0;
+    while (queue.length > 0 && hops++ < 32) {
+        const cls = queue.pop();
+        const parents = index._getInheritanceParents?.(cls, pinFile);
+        if (!parents) continue;
+        for (const p of parents) {
+            const pName = typeof p === 'string' ? p : p?.name;
+            if (!pName || seenCls.has(pName)) continue;
+            seenCls.add(pName);
+            queue.push(pName);
+            for (const d of definitions) {
+                if (NON_CALLABLE_TYPES.has(d.type) || d.className !== pName) continue;
+                const sig = typeSig(d);
+                if (sig !== null && pinSigs.has(sig)) continue; // override slot
+                family.push(d);
+            }
+        }
+    }
     if (family.length <= 1) return null;
     const pinnedKeys = new Set(targetDefs.map(d => `${d.file}:${d.startLine}`));
     if (family.every(d => pinnedKeys.has(`${d.file}:${d.startLine}`))) return null;

@@ -3150,3 +3150,212 @@ describe('fix #265: java.lang.Object universal names defeat single-owner', () =>
         } finally { rm(dir); }
     });
 });
+
+describe('fix #268: Java bare same-class overload calls route through the overload discipline', () => {
+    const FILES = {
+        'Spec.java': [
+            'public class Spec {',                                        // 1
+            '    private Code defaultValue;',                             // 2
+            '    public Spec defaultValue(String format, Object... args) {', // 3
+            '        return defaultValue(Code.of(format, args));',        // 4
+            '    }',                                                      // 5
+            '    public Spec defaultValue(Code codeBlock) {',             // 6
+            '        this.defaultValue = codeBlock;',                     // 7
+            '        return this;',                                       // 8
+            '    }',                                                      // 9
+            '    public Spec both() {',                                   // 10
+            '        return defaultValue("x", 1, 2);',                    // 11
+            '    }',                                                      // 12
+            '}',                                                          // 13
+        ].join('\n'),
+        'Code.java': [
+            'public class Code {',
+            '    public static Code of(String format, Object... args) { return new Code(); }',
+            '}',
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const { execute } = require('../core/execute');
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error || {}));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}:${c.reason}`),
+            conserved: json.meta.account?.conserved,
+        };
+    }
+
+    it('bare 1-expr-arg delegation is never a false zero: visible, not other-definition', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Spec.java:6:defaultValue');
+            const claimed = res.confirmed.includes('Spec.java:4') ||
+                res.unverified.some(u => u.startsWith('Spec.java:4:'));
+            assert.ok(claimed,
+                `delegation site must be confirmed or visible, got conf=${res.confirmed} unv=${res.unverified}`);
+            assert.strictEqual(res.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('counter: bare 3-arg call proves the varargs sibling — excluded for the 1-param pin', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Spec.java:6:defaultValue');
+            assert.ok(!res.confirmed.includes('Spec.java:11'),
+                '3-arg call binds the varargs overload, never the Code one');
+            assert.ok(!res.unverified.some(u => u.startsWith('Spec.java:11:')),
+                'sibling-proving call is excluded, not visible');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #268: inherited sibling overloads join the Java overload discipline', () => {
+    const FILES = {
+        'Base.java': [
+            'import java.util.List;',
+            'public class Base {',
+            '    public final Base annotated(Spec... specs) { return this; }',   // 3
+            '    public Base annotated(List<Spec> specs) { return this; }',      // 4
+            '}',
+        ].join('\n'),
+        'Child.java': [
+            'import java.util.List;',
+            'public class Child extends Base {',
+            '    @Override public Base annotated(List<Spec> specs) { return new Child(); }', // 3
+            '}',
+        ].join('\n'),
+        'Spec.java': 'public class Spec {}',
+        'Use.java': [
+            'public class Use {',
+            '    void go(Spec spec) {',
+            '        Child c = new Child();',
+            '        c.annotated(spec);',      // 4
+            '    }',
+            '    void many(Spec a, Spec b) {',
+            '        Child c = new Child();',
+            '        c.annotated(a, b);',      // 8
+            '    }',
+            '}',
+        ].join('\n'),
+    };
+
+    function contract(index, handle) {
+        const { execute } = require('../core/execute');
+        const output = require('../core/output');
+        const r = execute(index, 'context', { name: handle });
+        assert.ok(r.ok, JSON.stringify(r.error || {}));
+        const json = JSON.parse(output.formatContextJson(r.result));
+        return {
+            confirmed: (json.data.callers || []).map(c => `${c.file}:${c.line}`),
+            unverified: (json.data.unverifiedCallers || []).map(c => `${c.file}:${c.line}`),
+        };
+    }
+
+    it('1-arg call undecidable vs the inherited final varargs sibling — visible, not confirmed', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Child.java:3:annotated');
+            assert.ok(!res.confirmed.includes('Use.java:4'),
+                `annotated(spec) may bind the inherited varargs overload: ${res.confirmed}`);
+            assert.ok(res.unverified.includes('Use.java:4'),
+                `undecidable overload routes visible: ${res.unverified}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter: 2-arg call proves the inherited varargs sibling — excluded for the List pin', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const res = contract(index, 'Child.java:3:annotated');
+            assert.ok(!res.confirmed.includes('Use.java:8'), 'proves the sibling');
+            assert.ok(!res.unverified.includes('Use.java:8'), 'excluded, not visible');
+        } finally { rm(dir); }
+    });
+
+    it('counter: identical-signature ancestor is the override slot, not a sibling', () => {
+        const dir = tmp({
+            'P.java': 'public class P { public void run(String s) {} }',
+            'Q.java': 'public class Q extends P { @Override public void run(String s) {} }',
+            'UseQ.java': [
+                'public class UseQ {',
+                '    void go() {',
+                '        Q q = new Q();',
+                '        q.run("x");',   // 4
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const output = require('../core/output');
+            const r = execute(index, 'context', { name: 'Q.java:1:run' });
+            const json = JSON.parse(output.formatContextJson(r.result));
+            const confirmed = (json.data.callers || []).map(c => `${c.file}:${c.line}`);
+            assert.ok(confirmed.includes('UseQ.java:4'),
+                `plain override keeps confirming: ${confirmed}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #268: callee-side same-class overload arity selection', () => {
+    const FILES = {
+        'K.java': [
+            'public class K {',
+            '    public void run(A a) {}',        // 2
+            '    public void run(A a, B b) {}',   // 3
+            '    public void set(A a) {}',        // 4
+            '    public void set(B b) {}',        // 5
+            '}',
+        ].join('\n'),
+        'A.java': 'public class A {}',
+        'B.java': 'public class B {}',
+        'Use.java': [
+            'public class Use {',
+            '    void go(K k, A a, B b) {',
+            '        k.run(a);',        // 3
+            '        k.run(a, b);',     // 4
+            '        k.set(a);',        // 5
+            '    }',
+            '}',
+        ].join('\n'),
+    };
+
+    it('each site attaches to the arity-matching overload, not defs[0]', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const go = (index.symbols.get('go') || [])[0];
+            assert.ok(go);
+            const res = index.findCallees(go, { includeMethods: true, collectAccount: true });
+            const runEdges = res.filter(e => e.name === 'run');
+            const siteToDef = {};
+            for (const e of runEdges) for (const s of e.sites || []) siteToDef[s] = e.startLine;
+            assert.strictEqual(siteToDef[3], 2, `k.run(a) binds the 1-param overload: ${JSON.stringify(siteToDef)}`);
+            assert.strictEqual(siteToDef[4], 3, `k.run(a, b) binds the 2-param overload: ${JSON.stringify(siteToDef)}`);
+        } finally { rm(dir); }
+    });
+
+    it('same-arity type overloads are statically undecidable — visible, not defs[0]', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const go = (index.symbols.get('go') || [])[0];
+            const res = index.findCallees(go, { includeMethods: true, collectAccount: true });
+            const setEdges = res.filter(e => e.name === 'set');
+            const confirmedSites = setEdges.flatMap(e => e.sites || []);
+            assert.ok(!confirmedSites.includes(5),
+                `k.set(a) cannot statically pick between set(A)/set(B): ${JSON.stringify(setEdges)}`);
+            const unv = (res.unverifiedCallees || []).find(u => u.name === 'set');
+            assert.ok(unv && (unv.sites || []).includes(5),
+                `undecidable overload visible in the unverified band: ${JSON.stringify(res.unverifiedCallees)}`);
+            assert.strictEqual(res.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
