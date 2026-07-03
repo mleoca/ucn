@@ -1596,6 +1596,13 @@ function execute(index, command, params = {}) {
     if (!handler) {
         return { ok: false, error: `Unknown command: ${command}` };
     }
+    // Handlers normalize params in place (handle syntax, Class.method
+    // splitting) — dispatch on a shallow copy so the caller's object
+    // survives reuse (fix #255: `execute(index, 'fn', p)` rewrote p.name
+    // 'Service.buildUrl' → 'buildUrl' + className, corrupting a reused or
+    // logged params object; a frozen object silently no-oped the
+    // normalizers and returned wrong not-found answers).
+    params = { ...params };
     try {
         // Resolve name-less handles (e.g. `lib.js:42`) via index lookup before dispatch.
         // Handles WITH a name suffix are handled later by applyClassMethodSyntax.

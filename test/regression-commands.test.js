@@ -6084,3 +6084,26 @@ describe('fix #253: accessor reads on chained-call receivers are consumption', (
         } finally { rm(dir); }
     });
 });
+
+describe('fix #255: execute() never mutates the caller params object', () => {
+    it('handle/Class.method normalization happens on a copy; frozen params work', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'class Service { buildUrl() { return 1; } }\nfunction helper() { return 1; }\nmodule.exports = { helper };'
+        });
+        try {
+            const index = idx(dir);
+            const params = Object.freeze({ name: 'Service.buildUrl' });
+            const r1 = execute(index, 'fn', params);
+            assert.ok(r1.ok, `frozen params must not degrade to not-found: ${r1.error}`);
+            assert.strictEqual(params.name, 'Service.buildUrl', 'caller object untouched');
+            // Reuse across commands: the second command sees the original name
+            const reused = { name: 'Service.buildUrl' };
+            execute(index, 'fn', reused);
+            assert.strictEqual(reused.name, 'Service.buildUrl');
+            assert.strictEqual(reused.className, undefined);
+            const r2 = execute(index, 'about', reused);
+            assert.ok(r2.ok);
+        } finally { rm(dir); }
+    });
+});
