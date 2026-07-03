@@ -678,6 +678,8 @@ function findCallsInCode(code, parser, options = {}) {
     const closureScopes = new Map();
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
+    // Names whose scope type is a New*-prefix GUESS (fix #266) — per scope
+    const scopeGuesses = new Map();
     // Track function-typed parameter names per scope (scopeStartLine -> Set<name>)
     const funcParamScopes = new Map();
 
@@ -822,6 +824,21 @@ function findCallsInCode(code, parser, options = {}) {
         }
         return undefined;
     };
+    // Is the FIRST scope-chain hit for this variable a New*-prefix GUESS
+    // (fix #266, viper-measured)? `registry := NewCodecRegistry()` types
+    // registry as 'CodecRegistry' by NAME CONVENTION — the actual return
+    // annotation says *DefaultCodecRegistry. Guess-grade types help
+    // resolution but must never be exclusion evidence; findCallers lets
+    // the compiler-checked return-type flow map override them.
+    const isGuessedType = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) {
+                return !!scopeGuesses.get(functionStack[i].startLine)?.has(varName);
+            }
+        }
+        return false;
+    };
 
     // fix #203 (Go): is a bare-identifier function REFERENCE shadowed by an
     // enclosing func-literal/function parameter, method receiver, range/init
@@ -957,6 +974,7 @@ function findCallsInCode(code, parser, options = {}) {
                     for (let vi = 0; vi < Math.min(names.length, values.length); vi++) {
                         const val = values[vi];
                         let typeName = null;
+                        let typeGuessed = false;
                         // &Type{...} or Type{...}
                         if (val.type === 'composite_literal') {
                             typeName = extractTypeName(val.childForFieldName('type'));
@@ -978,8 +996,14 @@ function findCallsInCode(code, parser, options = {}) {
                                         ? callFuncNode.childForFieldName('field')?.text
                                         : null;
                                 if (callName && /^New[A-Z]/.test(callName)) {
+                                    // NAME CONVENTION, not compiler truth (fix
+                                    // #266): NewCodecRegistry() returns
+                                    // *DefaultCodecRegistry. Marked a guess so
+                                    // the return-type flow map can override it
+                                    // and exclusions never trust it.
                                     typeName = callName.slice(3);
                                     if (!typeName || !/^[A-Z]/.test(typeName)) typeName = null;
+                                    if (typeName) typeGuessed = true;
                                 } else if (callFuncNode.type === 'identifier' &&
                                     callFuncNode.text === 'new') {
                                     // buf := new(bytes.Buffer) — the builtin
@@ -1000,7 +1024,16 @@ function findCallsInCode(code, parser, options = {}) {
                                 }
                             }
                         }
-                        if (typeName) typeMap.set(names[vi], typeName);
+                        if (typeName) {
+                            typeMap.set(names[vi], typeName);
+                            let gset = scopeGuesses.get(scopeKey);
+                            if (typeGuessed) {
+                                if (!gset) { gset = new Set(); scopeGuesses.set(scopeKey, gset); }
+                                gset.add(names[vi]);
+                            } else if (gset) {
+                                gset.delete(names[vi]); // compiler-true retype clears the guess
+                            }
+                        }
                     }
                 }
             }
@@ -1021,7 +1054,10 @@ function findCallsInCode(code, parser, options = {}) {
                     if (!typeName) return;
                     for (let j = 0; j < spec.namedChildCount; j++) {
                         const id = spec.namedChild(j);
-                        if (id.type === 'identifier') varTypeMap.set(id.text, typeName);
+                        if (id.type === 'identifier') {
+                            varTypeMap.set(id.text, typeName);
+                            scopeGuesses.get(scopeKey)?.delete(id.text); // declared type clears any guess
+                        }
                     }
                 };
                 for (let i = 0; i < node.namedChildCount; i++) {
@@ -1150,7 +1186,7 @@ function findCallsInCode(code, parser, options = {}) {
                     // fix #202: one-hop declared-field receivers — h.inner.Run().
                     // receiverRoot/Field/RootType let findCallers hop to the
                     // field's declared struct-field type cross-file.
-                    let receiverRoot, receiverFieldName, receiverRootType;
+                    let receiverRoot, receiverFieldName, receiverRootType, receiverRootTypeGuessed;
                     if (!receiver && operandNode?.type === 'selector_expression') {
                         const rootNode = operandNode.childForFieldName('operand');
                         const fldNode = operandNode.childForFieldName('field');
@@ -1159,6 +1195,9 @@ function findCallsInCode(code, parser, options = {}) {
                             receiverRoot = rootNode.text;
                             receiverFieldName = fldNode.text;
                             receiverRootType = getReceiverType(rootNode.text);
+                            if (receiverRootType && isGuessedType(rootNode.text)) {
+                                receiverRootTypeGuessed = true;
+                            }
                         }
                     }
                     // Chained receiver (fix #220, cobra-measured): the receiver
@@ -1204,8 +1243,10 @@ function findCallsInCode(code, parser, options = {}) {
                         isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                        ...(receiverFieldName && receiverRootType && receiverRootTypeGuessed && { receiverRootTypeGuessed: true }),
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                         ...(receiverCallReceiver && { receiverCallReceiver }),
@@ -1289,6 +1330,7 @@ function findCallsInCode(code, parser, options = {}) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         enclosingFunction,
                         isPotentialCallback: true,
                         uncertain: false
@@ -1344,6 +1386,7 @@ function findCallsInCode(code, parser, options = {}) {
                                 isMethod: true,
                                 receiver,
                                 ...(receiverType && { receiverType }),
+                                ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                                 enclosingFunction,
                                 isPotentialCallback: true,
                                 uncertain: false
@@ -1438,6 +1481,7 @@ function findCallsInCode(code, parser, options = {}) {
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),
+                            ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                             enclosingFunction,
                             isPotentialCallback: true,
                             uncertain: false,
@@ -1476,6 +1520,7 @@ function findCallsInCode(code, parser, options = {}) {
                 if (leaving) {
                     closureScopes.delete(leaving.startLine);
                     scopeTypes.delete(leaving.startLine);
+                    scopeGuesses.delete(leaving.startLine);
                 }
             }
         }

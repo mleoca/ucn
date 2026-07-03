@@ -115,7 +115,13 @@ const UCN_VERSION = require('../package.json').version;
 // v45 (fix #265): Python typing @overload-decorated defs carry isSignature
 // (TS overload parity — pin identity closes over the overload group, and
 // pickBestDefinition prefers the implementation).
-const CACHE_FORMAT_VERSION = 45;
+// v46 (fix #266): Go call records mark New*-prefix-derived receiver types
+// as guesses (receiverTypeGuessed / receiverRootTypeGuessed) — convention,
+// not compiler truth; the return-type flow map overrides them and
+// exclusions never trust them. (fix #267) String-named TS module
+// declarations (`declare module '../x'` augmentations) no longer index as
+// namespace symbols — they declare no nameable identifier.
+const CACHE_FORMAT_VERSION = 46;
 
 /**
  * Save index to cache file

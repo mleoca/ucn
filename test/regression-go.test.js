@@ -5930,3 +5930,185 @@ func Group() int {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #266: viper fresh-arm families (member-reference + New*-guess discipline)', () => {
+    function pinnedCallers(index, name, relPath, startLine) {
+        const def = (index.symbols.get(name) || [])
+            .find(d => d.relativePath === relPath && d.startLine === startLine);
+        assert.ok(def, `pinned def ${relPath}:${startLine}:${name} must exist`);
+        return index.findCallers(name, { targetDefinitions: [def], collectAccount: true });
+    }
+
+    it('argument-position access of a non-callable field never claims a same-name function', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'store.go': [
+                'package t',
+                '',
+                'type Store struct {',
+                '\toverride map[string]any',
+                '}',
+                '',
+                'func (s *Store) find(key string) any {',
+                '\tdelete(s.override, key)',
+                '\treturn searchMap(s.override, key)',
+                '}',
+                '',
+                'func searchMap(m map[string]any, k string) any { return m[k] }',
+            ].join('\n'),
+            'helper.go': [
+                'package t',
+                '',
+                'func override(k string, v any) any {',
+                '\treturn v',
+                '}',
+                '',
+                'func use() any {',
+                '\treturn override("a", 1)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = pinnedCallers(index, 'override', 'helper.go', 3);
+            assert.ok(res.some(c => c.relativePath === 'helper.go' && c.line === 8),
+                'the real call stays confirmed');
+            assert.ok(!res.some(c => c.relativePath === 'store.go'),
+                `s.override field accesses never claim the function: ${JSON.stringify(res.map(c => `${c.relativePath}:${c.line}`))}`);
+            assert.ok(!(res.unverifiedEntries || []).some(u => /store/.test(u.file || '')),
+                'field accesses are excluded member-reference, not visible candidates');
+        } finally { rm(dir); }
+    });
+
+    it('counter: a genuine method value passed as argument keeps resolving', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'runner.go': [
+                'package t',
+                '',
+                'type Runner struct{}',
+                '',
+                'func (r *Runner) Work() {}',
+                '',
+                'func dispatch(f func()) { f() }',
+                '',
+                'func use(r *Runner) {',
+                '\tdispatch(r.Work)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = pinnedCallers(index, 'Work', 'runner.go', 5);
+            const seen = res.some(c => c.line === 10) ||
+                (res.unverifiedEntries || []).some(u => u.line === 10);
+            assert.ok(seen, 'method-value reference is never excluded member-reference');
+        } finally { rm(dir); }
+    });
+
+    it('compiler-checked return annotation overrides the New*-prefix guess', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'encoding.go': [
+                'package t',
+                '',
+                'type Registry interface {',
+                '\tLookup(format string) string',
+                '}',
+                '',
+                'type DefaultRegistry struct{}',
+                '',
+                'func (r *DefaultRegistry) Register(format string) error {',
+                '\treturn nil',
+                '}',
+                '',
+                'func NewRegistry() *DefaultRegistry {',
+                '\treturn &DefaultRegistry{}',
+                '}',
+            ].join('\n'),
+            'encoding_use.go': [
+                'package t',
+                '',
+                'func wire() error {',
+                '\tregistry := NewRegistry()',
+                '\treturn registry.Register("json")',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = pinnedCallers(index, 'Register', 'encoding.go', 9);
+            assert.ok(res.some(c => c.relativePath === 'encoding_use.go' && c.line === 5),
+                `the guess 'Registry' must yield to the annotation *DefaultRegistry: ${JSON.stringify(res.map(c => `${c.relativePath}:${c.line}`))}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter: an agreeing New*-guess keeps confirming; an unresolvable guess routes visible', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'kit.go': [
+                'package t',
+                '',
+                'type Kit struct{}',
+                '',
+                'func (k *Kit) Run() error { return nil }',
+                '',
+                'func NewKit() *Kit { return &Kit{} }',
+                '',
+                'func useKit() error {',
+                '\tk := NewKit()',
+                '\treturn k.Run()',
+                '}',
+                '',
+                'func useExternal() error {',
+                '\tb := NewExternalThing()',
+                '\treturn b.Run()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const res = pinnedCallers(index, 'Run', 'kit.go', 5);
+            assert.ok(res.some(c => c.line === 11),
+                'agreeing guess (NewKit → Kit) keeps confirming');
+            assert.ok(!res.some(c => c.line === 16),
+                'unresolvable guess (ExternalThing) never confirms');
+            assert.ok((res.unverifiedEntries || []).some(u => u.line === 16),
+                'unresolvable guess routes visible — a guess is never exclusion evidence');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #266b: guessed-type mismatch routes visible, never falls to arity exclusion', () => {
+    it('a guessed receiver with non-fitting arity stays a visible candidate', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n\ngo 1.21\n',
+            'w.go': [
+                'package t',
+                '',
+                'type Wrapper struct{}',
+                '',
+                'func (w *Wrapper) SendMsg(m any) error { return nil }',
+                '',
+                'func use() {',
+                '\tstream, _ := NewStream("x", 1, true)',
+                '\t_ = stream.SendMsg(1, 2, 3)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('SendMsg') || [])[0];
+            assert.ok(def);
+            const res = index.findCallers('SendMsg', {
+                targetDefinitions: [def], collectAccount: true,
+            });
+            // The guess 'Stream' mismatches Wrapper AND the arg count (3) fits
+            // no project def — before the routing fix this fell through the
+            // skipped exclusion branch into arity-mismatch (invisible).
+            assert.ok(!res.some(c => c.line === 9), 'never confirmed');
+            assert.ok((res.unverifiedEntries || []).some(u => u.line === 9),
+                'guessed mismatch routes possible-dispatch, not arity-mismatch');
+        } finally { rm(dir); }
+    });
+});

@@ -424,7 +424,8 @@ function findCallers(index, name, options = {}) {
                 // Copy-on-enrich: cached call objects stay parser-pure — the flow
                 // type derives from OTHER files' annotations, so it must never be
                 // persisted with this file's calls.
-                if (call.isMethod && call.receiver && !call.receiverType &&
+                if (call.isMethod && call.receiver &&
+                    (!call.receiverType || call.receiverTypeGuessed) &&
                     !call.receiverIsChainRoot &&
                     (langTraits(fileEntry.language)?.typeSystem === 'structural' ||
                         (collectAccount && !call.isPotentialCallback && !call.isPathCall &&
@@ -439,9 +440,21 @@ function findCallers(index, name, options = {}) {
                         // External producer (fix #220) — typed outside the
                         // project; blocks single-owner confirmation, routes
                         // possible-dispatch in the gate. Nominal-only entries.
+                        // A parser GUESS for the same variable (fix #266) is
+                        // noise next to the flow verdict — dropped with it.
                         call = { ...call, receiverExternalFlow: flowEntry.externalVia };
+                        if (call.receiverTypeGuessed) {
+                            call = { ...call, receiverType: undefined, receiverTypeGuessed: undefined };
+                        }
                     } else if (flowEntry) {
+                        // Compiler-checked return annotation outranks the
+                        // parser's New*-prefix name guess (fix #266,
+                        // viper-measured: registry := NewCodecRegistry()
+                        // guessed 'CodecRegistry' — the interface — while the
+                        // annotation says *DefaultCodecRegistry; the guess
+                        // excluded all three true RegisterCodec callers).
                         call = { ...call, receiverType: flowEntry.type,
+                            receiverTypeGuessed: undefined,
                             ...(flowEntry.fromFile && { receiverTypeFlowFile: flowEntry.fromFile }) };
                     }
                 }
@@ -580,6 +593,22 @@ function findCallers(index, name, options = {}) {
                         }
                     }
 
+                    // A member access on a typed receiver whose member of this
+                    // name is a provably non-callable FIELD denotes the field,
+                    // never a same-name symbol elsewhere (fix #266,
+                    // viper-measured: `delete(v.override, alias)` on Viper's
+                    // map field scope-confirmed against the test-file function
+                    // `override` — the #231(2) callee physics, caller side).
+                    // Only certainty excludes: _nonCallableFieldMember demands
+                    // every same-type member be a field with a present
+                    // non-function type. Guess-grade receiver types (#266)
+                    // never carry it.
+                    if (call.isMethod && call.receiverType && !call.receiverTypeGuessed &&
+                        _nonCallableFieldMember(index, call.receiverType, call.name, fileEntry.language)) {
+                        recordExcluded(filePath, call.line, 'member-reference');
+                        continue;
+                    }
+
                     // A bare identifier can never denote a METHOD where bare
                     // names don't reach methods (fix #220, grpc-go-measured:
                     // `balancer.Get(Name)` references each package's const
@@ -637,7 +666,10 @@ function findCallers(index, name, options = {}) {
                                 // the ground line surfaced as call-not-resolved
                                 // (grpc-go/cursive-measured).
                                 if (collectAccount) {
-                                    if (_dispatchCapableSupertype(index, fileEntry.language, call.receiverType, cbTargetDefs, definitions)) {
+                                    // Guess-grade types (fix #266) route, never
+                                    // exclude — convention is not compiler truth.
+                                    if (call.receiverTypeGuessed ||
+                                        _dispatchCapableSupertype(index, fileEntry.language, call.receiverType, cbTargetDefs, definitions)) {
                                         routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
                                             dispatchVia: call.receiverType,
                                             dispatchCandidates: countDispatchCandidates(call.receiverType),
@@ -1664,9 +1696,17 @@ function findCallers(index, name, options = {}) {
                                     !(index.symbols.get(knownType) || []).some(d =>
                                         d.type === 'class' || d.type === 'struct' || d.type === 'interface' || d.type === 'trait') &&
                                     _targetAncestryFullyResolved(index, targetDefs));
+                            // A New*-prefix name GUESS (fix #266) is convention,
+                            // not compiler truth — never exclusion evidence.
+                            // Account mode routes the mismatch visible through
+                            // the dispatch gate below; legacy keeps its drop
+                            // (drop-vs-route asymmetry, the #213 pattern).
+                            const receiverGuessGrade = !!(call.receiverTypeGuessed ||
+                                (viaFieldHop && call.receiverRootTypeGuessed));
                             const exclusionTrusted = (!structural ||
                                 _receiverTypeTrustedForExclusion(index, knownType)) && fieldHopDefinesMethod &&
-                                !receiverTypeUnresolved; // unresolvable identity is not positive evidence either way
+                                !receiverTypeUnresolved && // unresolvable identity is not positive evidence either way
+                                !(collectAccount && receiverGuessGrade);
                             if (!matchesTarget && exclusionTrusted) {
                                 // Known type doesn't match target — positive evidence the
                                 // call targets a DIFFERENT symbol. Under the account contract
@@ -1695,6 +1735,23 @@ function findCallers(index, name, options = {}) {
                                     if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
                                     continue;
                                 }
+                            }
+                            // A guessed type that mismatches ROUTES visible
+                            // (fix #266): the pre-guard flow reached the
+                            // dispatch-capable reroute INSIDE the exclusion
+                            // branch, so denying exclusionTrusted alone let
+                            // the call fall through to the arity/scope
+                            // machinery below (grpc-go: stream.SendMsg on a
+                            // guessed 'Stream' fell to arity-mismatch — a
+                            // harsher wrong exclusion). Convention-grade
+                            // evidence attributes dispatch; it never excludes
+                            // and never confirms a mismatch.
+                            if (!matchesTarget && !exclusionTrusted && collectAccount && receiverGuessGrade) {
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: knownType,
+                                    dispatchCandidates: countDispatchCandidates(knownType),
+                                });
+                                continue;
                             }
                             // Unmatched-but-untrusted field-hop type (fix #265,
                             // hono-measured): the hop PROVED the receiver is the
@@ -1747,6 +1804,12 @@ function findCallers(index, name, options = {}) {
                                         let inferredType = localTypes.get(call.receiver);
                                         if (inferredType && _isGenericParamReceiverType(
                                             index, filePath, call.line, inferredType)) inferredType = null;
+                                        // New*-guess entries (fix #266) may confirm
+                                        // but never exclude: a mismatch routes as
+                                        // unresolved under the account contract
+                                        // (legacy keeps the drop — #213 asymmetry).
+                                        const inferredGuessed = !!(inferredType &&
+                                            localTypes.guessedVars?.has(call.receiver));
                                         if (inferredType) {
                                             if (targetTypes.has(inferredType)) {
                                                 // Identity discipline (fix #206) — same as the
@@ -1761,12 +1824,14 @@ function findCallers(index, name, options = {}) {
                                                     inferredMatch = true;
                                                     nominalInferredMatch = true;
                                                 } else if (identity === 'other') {
-                                                    inferredMismatch = true;
+                                                    if (collectAccount && inferredGuessed) receiverTypeUnresolved = true;
+                                                    else inferredMismatch = true;
                                                 } else {
                                                     receiverTypeUnresolved = true;
                                                 }
                                             } else {
-                                                inferredMismatch = true;
+                                                if (collectAccount && inferredGuessed) receiverTypeUnresolved = true;
+                                                else inferredMismatch = true;
                                             }
                                         }
                                     }
@@ -6371,6 +6436,9 @@ function _callableFieldDef(index, d) {
 
 function _buildTypedLocalTypeMap(index, def, calls) {
     const localTypes = new Map();
+    // Vars whose entry is a New*-prefix name GUESS (fix #266) — consumers may
+    // confirm through them but never exclude (convention, not compiler truth).
+    const guessedVars = new Set();
     let _cachedLines = null;
 
     for (const call of calls) {
@@ -6379,6 +6447,8 @@ function _buildTypedLocalTypeMap(index, def, calls) {
         // Collect receiverType from method calls (inferred by parser from params/receivers)
         if (call.isMethod && call.receiver && call.receiverType) {
             localTypes.set(call.receiver, call.receiverType);
+            if (call.receiverTypeGuessed) guessedVars.add(call.receiver);
+            else guessedVars.delete(call.receiver);
         }
 
         // Collect types from constructor calls: x := NewFoo() → x maps to Foo
@@ -6402,12 +6472,15 @@ function _buildTypedLocalTypeMap(index, def, calls) {
                 const typeName = assignMatch[2].slice(3);
                 if (typeName && /^[A-Z]/.test(typeName)) {
                     localTypes.set(assignMatch[1], typeName);
+                    guessedVars.add(assignMatch[1]); // name convention, not compiler truth (fix #266)
                 }
             }
         }
     }
 
-    return localTypes.size > 0 ? localTypes : null;
+    if (localTypes.size === 0) return null;
+    localTypes.guessedVars = guessedVars;
+    return localTypes;
 }
 
 /**
