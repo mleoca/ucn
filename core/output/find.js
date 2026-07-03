@@ -100,7 +100,10 @@ function formatFindJson(items) {
  * @param {object} options - { depth, top, all }
  */
 function formatFindDetailed(symbols, query, options = {}) {
-    const { depth, top, all, compact } = options;
+    const { top, all, compact } = options;
+    // Surfaces pass validated NUMBERS; the string comparisons below made
+    // --depth 0/2 dead code everywhere (fix #250). Normalize once.
+    const depth = options.depth != null ? String(options.depth) : undefined;
     const DEFAULT_LIMIT = 5;
 
     if (symbols.length === 0) {

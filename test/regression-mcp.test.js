@@ -604,3 +604,44 @@ describe('fix #242: MCP notes use param syntax, never CLI flag syntax', () => {
         assert.ok(res.text.includes('limit=<n>'), 'param-styled hint');
     });
 });
+
+describe('fix #250: MCP find parity + compact + fn notes', () => {
+    let client;
+    let dir;
+    before(async () => {
+        dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function taskOne() { return 1; }\nfunction taskTwo() { return taskOne(); }\nfunction taskThree() { return 2; }\nfunction taskFour() { return 3; }\nfunction taskFive() { return 4; }\nfunction taskSix() { return 5; }\nmodule.exports = { taskOne, taskTwo, taskThree, taskFour, taskFive, taskSix };\n',
+        });
+        client = new McpClient();
+        await client.start();
+        await client.initialize();
+    });
+    after(() => { client.stop(); rm(dir); });
+
+    it('find renders detailed output with stable handles and honors all=true', async () => {
+        const res = await client.callTool({ command: 'find', project_dir: dir, name: 'task' });
+        assert.ok(/a\.js:\d+:task/.test(res.text), 'stable file:line:name handles present: ' + res.text.slice(0, 300));
+        const all = await client.callTool({ command: 'find', project_dir: dir, name: 'task', all: true });
+        for (const n of ['taskOne', 'taskTwo', 'taskThree', 'taskFour', 'taskFive', 'taskSix']) {
+            assert.ok(all.text.includes(n), `all=true shows ${n}`);
+        }
+    });
+
+    it('compact=true changes about output shape', async () => {
+        const full = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne' });
+        const compact = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne', compact: true });
+        assert.ok(compact.text.length < full.text.length, `compact is smaller (${compact.text.length} vs ${full.text.length})`);
+    });
+
+    it('fn multi-definition notes use param syntax, not --flags', async () => {
+        const d2 = tmp({
+            'package.json': '{"name":"test"}',
+            'x.js': 'class A { run() { return 1; } }\nclass B { run() { return 2; } }\nmodule.exports = { A, B };\n',
+        });
+        try {
+            const res = await client.callTool({ command: 'fn', project_dir: d2, name: 'run' });
+            assert.ok(!res.text.includes('--all'), 'no CLI flag syntax: ' + res.text.slice(0, 300));
+        } finally { rm(d2); }
+    });
+});

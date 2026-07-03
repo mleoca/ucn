@@ -10,7 +10,7 @@ const assert = require('node:assert');
 const { execFileSync } = require('child_process');
 const path = require('path');
 
-const { CLI_PATH, PROJECT_DIR } = require('./helpers');
+const { CLI_PATH, PROJECT_DIR, tmp, rm, runInteractive } = require('./helpers');
 
 describe('Interactive Mode', () => {
     it('supports all commands without errors', () => {
@@ -143,5 +143,56 @@ describe('Interactive Mode', () => {
         });
         assert.ok(result.includes('Invalid --limit'),
             `interactive should reject --limit=0, got: ${result.slice(0, 500)}`);
+    });
+});
+
+describe('fix #250: interactive flag discipline', () => {
+    it('unknown flags error instead of folding values into the name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function addTask() { return 1; }\nmodule.exports = { addTask };\n',
+        });
+        try {
+            const out = runInteractive(dir, ['about addTask --bogus 5']);
+            assert.ok(out.includes('Unknown flag(s): --bogus'), out.slice(0, 400));
+            assert.ok(!out.includes('addTask 5'), 'value not folded into the symbol name');
+        } finally { rm(dir); }
+    });
+
+    it('--json prints a note about one-shot JSON instead of silence', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function addTask() { return 1; }\nmodule.exports = { addTask };\n',
+        });
+        try {
+            const out = runInteractive(dir, ['find addTask --json']);
+            assert.ok(out.includes('--json'), 'note mentions the flag: ' + out.slice(0, 400));
+            assert.ok(out.includes('one-shot'), 'note points at the working alternative');
+        } finally { rm(dir); }
+    });
+
+    it('tiered no-op notes print in interactive mode too', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function addTask() { return 1; }\nfunction caller() { return addTask(); }\nmodule.exports = { addTask, caller };\n',
+        });
+        try {
+            const out = runInteractive(dir, ['impact addTask --include-methods']);
+            assert.ok(out.includes('--include-methods has no effect'), out.slice(0, 500));
+        } finally { rm(dir); }
+    });
+
+    it('truncation notes render after the output, not before', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function u1() {}\nfunction u2() {}\nfunction u3() {}\nmodule.exports = {};\n',
+        });
+        try {
+            const out = runInteractive(dir, ['deadcode --limit 2']);
+            const noteIdx = out.indexOf('Showing 2 of');
+            const listIdx = out.indexOf('u1');
+            assert.ok(noteIdx > 0 && listIdx > 0, 'both present: ' + out.slice(0, 500));
+            assert.ok(noteIdx > listIdx, 'note follows the data it describes');
+        } finally { rm(dir); }
     });
 });

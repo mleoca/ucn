@@ -416,6 +416,7 @@ server.registerTool(
                 let aboutText = output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     showConfidence: ep.showConfidence !== false,
+                    compact: ep.compact,
                 });
                 if (note) aboutText += '\n\n' + mn(note);
                 return tr(aboutText);
@@ -428,6 +429,7 @@ server.registerTool(
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
                     showConfidence: ep.showConfidence !== false,
+                    compact: ep.compact,
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
                 let ctxText = text;
@@ -439,7 +441,7 @@ server.registerTool(
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'impact', ep);
                 if (!ok) return te(error);
-                let impactText = output.formatImpact(result);
+                let impactText = output.formatImpact(result, { compact: ep.compact });
                 if (note) impactText += '\n\n' + mn(note);
                 return tr(impactText);
             }
@@ -533,7 +535,13 @@ server.registerTool(
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'find', ep);
                 if (!ok) return te(error);
-                let text = output.formatFind(result, ep.name, ep.top);
+                // Same formatter as every other surface (fix #250 — the
+                // legacy formatFind had a different default limit, no stable
+                // file:line:name handles, no confidence markers, and
+                // silently ignored all/depth/compact).
+                let text = output.formatFindDetailed(result, ep.name, {
+                    depth: ep.depth, top: ep.top, all: ep.all, compact: ep.compact,
+                });
                 if (note) text += '\n\n' + mn(note);
                 return tr(text);
             }
@@ -542,7 +550,7 @@ server.registerTool(
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'usages', ep);
                 if (!ok) return te(error);
-                let text = output.formatUsages(result, ep.name);
+                let text = output.formatUsages(result, ep.name, { compact: ep.compact });
                 if (note) text += '\n\n' + mn(note);
                 return tr(text);
             }
@@ -744,7 +752,7 @@ server.registerTool(
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
                     if (typeof check !== 'string') return check;
                 }
-                const fnText = (note ? note + '\n\n' : '') + output.formatFnResult(result);
+                const fnText = (note ? mn(note) + '\n\n' : '') + output.formatFnResult(result);
                 return tr(fnText);
             }
 
@@ -757,7 +765,7 @@ server.registerTool(
                     const check = resolveAndValidatePath(index, entry.match.relativePath || path.relative(index.root, entry.match.file));
                     if (typeof check !== 'string') return check;
                 }
-                const classText = (note ? note + '\n\n' : '') + output.formatClassResult(result);
+                const classText = (note ? mn(note) + '\n\n' : '') + output.formatClassResult(result);
                 return tr(classText);
             }
 

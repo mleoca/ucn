@@ -491,6 +491,24 @@ function main() {
     }
 }
 
+/**
+ * Tiered-output contract notes: unverified callers are always shown for
+ * these commands, so the legacy reveal flags are implied no-ops. Shared by
+ * one-shot and interactive mode (fix #250 — interactive printed nothing).
+ */
+function printTieredNoOpNotes(canonical, flags, print) {
+    if (!['about', 'context', 'impact', 'trace', 'blast', 'reverseTrace', 'affectedTests', 'verify', 'smart'].includes(canonical)) return;
+    if (flags.includeUncertain) {
+        print(`Note: --include-uncertain has no effect on '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
+    }
+    if (['impact', 'verify', 'blast', 'reverseTrace', 'affectedTests'].includes(canonical) && flags.includeMethods) {
+        print(`Note: --include-methods has no effect on '${toCliName(canonical)}' — method calls are always tiered by receiver evidence.`);
+    }
+    if (['about', 'context', 'smart'].includes(canonical) && flags.includeMethods) {
+        print(`Note: --include-methods on '${toCliName(canonical)}' affects only method-callee display for standalone-function targets — caller tiers are always evidence-based, and method targets analyze method calls by default.`);
+    }
+}
+
 // ============================================================================
 // FILE MODE
 // ============================================================================
@@ -673,19 +691,8 @@ function runProjectCommand(rootDir, command, arg) {
                 console.error(`Warning: ${flagToCli(key)} has no effect on '${toCliName(canonical)}'.`);
             }
         }
-        // Tiered-output contract: unverified callers are always shown for
-        // these commands, so the legacy reveal flags are implied no-ops.
-        if (['about', 'context', 'impact', 'trace', 'blast', 'reverseTrace', 'affectedTests', 'verify', 'smart'].includes(canonical)) {
-            if (flags.includeUncertain) {
-                console.error(`Note: --include-uncertain has no effect on '${toCliName(canonical)}' — unverified candidates are always shown (tiered).`);
-            }
-            if (['impact', 'verify', 'blast', 'reverseTrace', 'affectedTests'].includes(canonical) && flags.includeMethods) {
-                console.error(`Note: --include-methods has no effect on '${toCliName(canonical)}' — method calls are always tiered by receiver evidence.`);
-            }
-            if (['about', 'context', 'smart'].includes(canonical) && flags.includeMethods) {
-                console.error(`Note: --include-methods on '${toCliName(canonical)}' affects only method-callee display for standalone-function targets — caller tiers are always evidence-based, and method targets analyze method calls by default.`);
-            }
-        }
+        // Tiered-output contract notes (shared with interactive mode).
+        printTieredNoOpNotes(canonical, flags, (m) => console.error(m));
     }
 
     switch (canonical) {
@@ -1618,7 +1625,24 @@ function runInteractive(rootDir) {
 
     console.log('Building index...');
     const index = new ProjectIndex(rootDir);
-    index.build(null, { quiet: true, workers: flags.workers });
+    // Same cache discipline as one-shot mode (fix #250: the REPL fully
+    // re-parsed every session and never consumed cache-persisted state —
+    // the divergence mechanism behind the relocation P1).
+    let iCacheFresh = false;
+    if (flags.cache && !flags.clearCache) {
+        const loaded = index.loadCache();
+        iCacheFresh = loaded && !index.isCacheStale();
+        if (!iCacheFresh && loaded) {
+            index.build(null, { quiet: true, forceRebuild: true, workers: flags.workers });
+        } else if (!iCacheFresh) {
+            index.build(null, { quiet: true, workers: flags.workers });
+        }
+        if (!iCacheFresh) {
+            try { index.saveCache(); } catch (_) { /* best-effort */ }
+        }
+    } else {
+        index.build(null, { quiet: true, workers: flags.workers });
+    }
     const iExpandCache = new ExpandCache({ maxSize: 20 });
     console.log(`Index ready: ${index.files.size} files, ${index.symbols.size} symbols`);
     console.log('Type commands (e.g., "find parseFile", "about main", "toc")');
@@ -1704,7 +1728,7 @@ Flags can be added per-command: context myFunc --include-methods
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name', '--framework', '--method', '--prefix']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name', '--line', '--framework', '--method', '--prefix']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -1722,7 +1746,23 @@ Flags can be added per-command: context myFunc --include-methods
             }
         }
         const arg = argTokens.join(' ');
+
+        // Unknown flags error instead of folding their VALUE into the
+        // symbol name (fix #250: `about AddTask --bogus 5` searched for
+        // "AddTask 5"). Same vocabulary as one-shot mode.
+        const unknown = flagTokens.filter(t =>
+            t.startsWith('--') && !knownFlags.has(t.split('=')[0]));
+        if (unknown.length > 0) {
+            console.log(`Unknown flag(s): ${unknown.join(', ')}`);
+            rl.prompt();
+            return;
+        }
         const iflags = parseFlags(flagTokens);
+        // parseFlags never extracts --json (it is a global-argv flag), so
+        // check the raw tokens.
+        if (flagTokens.includes('--json')) {
+            console.log('Note: interactive mode prints text output — run `ucn . <command> --json` one-shot for JSON.');
+        }
 
         try {
             // Validate numeric flags (--top, --limit, etc) — same rules as
@@ -1761,9 +1801,9 @@ Flags can be added per-command: context myFunc --include-methods
 
 const INTERACTIVE_DISPATCH = {
     // ── Understanding Code ───────────────────────────────────────────
-    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence !== false, git: !!f.git }) },
+    about:        { params: 'name', format: (r, _a, f, idx) => output.formatAbout(r, { expand: f.expand, root: idx.root, showAll: f.all, depth: f.depth, showConfidence: f.showConfidence !== false, compact: !!f.compact, git: !!f.git }) },
     smart:        { params: 'name', format: (r) => output.formatSmart(r, { uncertainHint: 'unverified callees are listed below with reasons' }) },
-    impact:       { params: 'name', format: (r) => output.formatImpact(r) },
+    impact:       { params: 'name', format: (r, _a, f) => output.formatImpact(r, { compact: !!f.compact }) },
     blast:        { params: 'name', format: (r) => output.formatBlast(r) },
     trace:        { params: 'name', format: (r) => output.formatTrace(r) },
     reverseTrace: { params: 'name', format: (r) => output.formatReverseTrace(r) },
@@ -1773,7 +1813,7 @@ const INTERACTIVE_DISPATCH = {
 
     // ── Finding Code ─────────────────────────────────────────────────
     find:          { params: 'name', format: (r, a, f) => output.formatFindDetailed(r, a, { depth: f.depth, top: f.top, all: f.all }) },
-    usages:        { params: 'name', format: (r, a) => output.formatUsages(r, a) },
+    usages:        { params: 'name', format: (r, a, f) => output.formatUsages(r, a, { compact: !!f.compact }) },
     toc:           { params: 'flags', format: (r) => output.formatToc(r, { detailedHint: 'Add --detailed to list all functions, or "about <name>" for full details on a symbol', uncertainHint: 'run "about <name>" for tiered detail on a specific symbol' }) },
     tests:         { params: 'name', format: (r, a) => output.formatTests(r, a) },
     affectedTests: { params: 'name', format: (r, _a, f) => output.formatAffectedTests(r, { all: f.all }) },
@@ -1836,6 +1876,9 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
                 console.log(`Warning: ${flagToCli(key)} has no effect on '${command}'.`);
             }
         }
+        // Tiered-output contract notes (fix #250 — one-shot mode printed
+        // these; interactive silently accepted the flags).
+        printTieredNoOpNotes(command, iflags, (m) => console.log(m));
     }
 
     // ── Commands with unique behavior (not data-driven) ──────────────
@@ -1845,8 +1888,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             if (!arg) { console.log('Usage: fn <name>[,name2,...] [--file=<pattern>] [--class-name=<class>]'); return; }
             const { ok, result, error, note } = execute(index, 'fn', { name: arg, file: iflags.file, all: iflags.all, className: iflags.className, line: iflags.line });
             if (!ok) { console.log(error); return; }
-            if (note) console.log(note);
             console.log(output.formatFnResult(result));
+            if (note) console.log(note);
             break;
         }
 
@@ -1854,8 +1897,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             if (!arg) { console.log('Usage: class <name> [--file=<pattern>]'); return; }
             const { ok, result, error, note } = execute(index, 'class', { name: arg, file: iflags.file, all: iflags.all, maxLines: iflags.maxLines, line: iflags.line });
             if (!ok) { console.log(error); return; }
-            if (note) console.log(note);
             console.log(output.formatClassResult(result));
+            if (note) console.log(note);
             break;
         }
 
@@ -1904,6 +1947,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             const { text, expandable } = output.formatContext(result, {
                 expandHint: 'Use "expand <N>" to see code for item N',
                 showConfidence: iflags.showConfidence !== false,
+                compact: !!iflags.compact,
             });
             console.log(text);
             if (iflags.expand) {
@@ -1921,25 +1965,25 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
         case 'deadcode': {
             const { ok, result, error, note } = execute(index, 'deadcode', iflags);
             if (!ok) { console.log(error); return; }
-            if (note) console.log(note);
             console.log(output.formatDeadcode(result, {
                 top: iflags.top,
                 decoratedHint: !iflags.includeDecorated && result.excludedDecorated > 0 ? `${result.excludedDecorated} decorated/annotated symbol(s) hidden (framework-registered). Use --include-decorated to include them.` : undefined,
                 exportedHint: !iflags.includeExported && result.excludedExported > 0 ? `${result.excludedExported} exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.` : undefined,
                 externalContractHint: !iflags.includeExported && result.excludedExternalContract > 0 ? `${result.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use --include-exported to include them.` : undefined
             }));
+            if (note) console.log(note);
             break;
         }
 
         case 'search': {
             const { ok, result, error, structural, note } = execute(index, 'search', { term: arg, ...iflags });
             if (!ok) { console.log(error); return; }
-            if (note) console.log(note);
             if (structural) {
                 console.log(output.formatStructuralSearch(result));
             } else {
                 console.log(output.formatSearch(result, arg));
             }
+            if (note) console.log(note);
             break;
         }
 
@@ -1953,8 +1997,8 @@ function executeInteractiveCommand(index, command, arg, iflags = {}, cache = nul
             const params = buildInteractiveParams(entry.params, arg, iflags);
             const { ok, result, error, note } = execute(index, command, params);
             if (!ok) { console.log(error); return; }
-            if (note) console.log(note);
             console.log(entry.format(result, arg, iflags, index));
+            if (note) console.log(note);
         }
     }
 }
