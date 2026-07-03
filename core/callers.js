@@ -10,7 +10,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { isTestFile } = require('./discovery');
-const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare } = require('./shared');
+const { NON_CALLABLE_TYPES, isOverrideMarked, codeUnitCompare, isTestPath } = require('./shared');
 const { scoreEdge, tierForResolution, TIER } = require('./confidence');
 const { findGoModule } = require('./imports');
 
@@ -3044,6 +3044,25 @@ function findCallees(index, def, options = {}) {
                 // Different strategies by language family:
                 if (bindings.length === 0 && call.isMethod) {
                     if (langTraits(language)?.typeSystem === 'structural') {
+                        // A KNOWN receiver type routes before any name heuristic
+                        // (fix #257 — the caller side's #198 trust rule brought to
+                        // findCallees): `canonicalSymbols.set(...)` on a `new Map()`
+                        // local resolved exact-binding into a test fixture's
+                        // CacheService.set. Builtin-typed receivers are host calls;
+                        // a receiver typed to a project class resolves to that class
+                        // (or an ancestor defining the method), never by bare name.
+                        const route = _calleeReceiverTypeRoute(index, call, localTypes, language);
+                        if (route?.external) {
+                            noteSite(siteId, 'external', null, call);
+                            continue;
+                        } else if (route?.resolve) {
+                            bindingResolved = route.resolve.bindingId;
+                            calleeKey = bindingResolved ||
+                                `${route.resolve.className}.${effectiveName}`;
+                        } else if (route?.uncertain) {
+                            isUncertain = true;
+                            uncertainReason = 'uncertain-receiver';
+                        } else {
                         // JS/TS/Python: mark uncertain unless receiver has import/binding
                         // evidence in file scope AND that binding can plausibly have this method.
                         // Prevents false positives like m.get() → repository.get() when m is
@@ -3059,6 +3078,7 @@ function findCallees(index, def, options = {}) {
                             // Functions don't have user-defined methods (return value is unknown)
                             isUncertain = true;
                         }
+                        }
                     } else {
                         // Go/Java/Rust: nominal type systems make single-def method links
                         // reliable. Only mark uncertain when multiple definitions exist
@@ -3070,8 +3090,9 @@ function findCallees(index, def, options = {}) {
                             const rType = call.receiverType || fieldHopType || localTypes?.get(call.receiver);
                             if (rType && langTraits(language)?.typeSystem === 'nominal') {
                                 const matchingDef = defs.find(d =>
-                                    d.className === rType ||
-                                    (d.receiver && d.receiver.replace(/^\*/, '') === rType));
+                                    (d.className === rType ||
+                                    (d.receiver && d.receiver.replace(/^\*/, '') === rType)) &&
+                                    _calleeLanguageCompatible(index, d, language));
                                 if (matchingDef) {
                                     // Resolved to specific type — not uncertain
                                     calleeKey = matchingDef.bindingId || `${rType}.${call.name}`;
@@ -4830,6 +4851,71 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
  * owner (#199/#207/#222(4)), nominal arity mismatch (#205), and a test-file
  * owner for a production caller. Returns the owner's definition or null.
  */
+// Languages whose symbols are mutually callable — a JS/TS call site can bind
+// a symbol defined in any of these; every other language only binds its own
+// (fix #257: java/python/rust fixture defs of CacheService.set counted as ONE
+// owner for a JavaScript call — cross-language edges are never callable).
+const _JS_CALLABLE_FAMILY = new Set(['javascript', 'typescript', 'tsx', 'html']);
+
+function _calleeLanguageCompatible(index, def, callerLanguage) {
+    if (!callerLanguage) return true;
+    const defLang = index.files.get(def.file)?.language;
+    if (!defLang || defLang === callerLanguage) return true;
+    return _JS_CALLABLE_FAMILY.has(defLang) && _JS_CALLABLE_FAMILY.has(callerLanguage);
+}
+
+/**
+ * Ancestor-name closure of a type via the extends graph (bounded BFS) — a
+ * receiver typed Child legitimately reaches methods defined on Base (the
+ * #198 ancestor rule, callee direction). Includes the type itself.
+ */
+function _receiverTypeAncestors(index, typeName, maxHops = 6) {
+    const seen = new Set([typeName]);
+    let frontier = [typeName];
+    for (let hop = 0; hop < maxHops && frontier.length; hop++) {
+        const next = [];
+        for (const cls of frontier) {
+            const parents = index._getInheritanceParents?.(cls) || [];
+            for (const p of parents) {
+                const pName = typeof p === 'string' ? p : p?.name;
+                if (pName && !seen.has(pName)) { seen.add(pName); next.push(pName); }
+            }
+        }
+        frontier = next;
+    }
+    return seen;
+}
+
+/**
+ * Route a structural method call by its KNOWN receiver type (fix #257).
+ * Returns:
+ *   { resolve: def } — exactly one language-compatible project class (the
+ *                      type itself or an ancestor) defines the method
+ *   { external }     — builtin receiver type with no project match
+ *                      (Map.set is host code)
+ *   { uncertain }    — known type matching nothing or ambiguously: visible,
+ *                      never confirmed by bare-name resolution
+ *   null             — receiver type unknown; existing heuristics decide
+ */
+function _calleeReceiverTypeRoute(index, call, localTypes, language) {
+    const raw = call.receiverType || localTypes?.get(call.receiver);
+    if (!raw || typeof raw !== 'string') return null;
+    const head = _structuralTypeHead(raw) || raw;
+    const norm = _PY_TYPING_BUILTINS[head] || head;
+    const defs = (index.symbols.get(call.name) || []).filter(d =>
+        !NON_CALLABLE_TYPES.has(d.type) && d.className &&
+        _calleeLanguageCompatible(index, d, language));
+    let matches = defs.filter(d => d.className === head || d.className === norm);
+    if (matches.length === 0 && defs.length > 0) {
+        const ancestors = _receiverTypeAncestors(index, head);
+        matches = defs.filter(d => ancestors.has(d.className));
+    }
+    if (matches.length === 1) return { resolve: matches[0] };
+    if (matches.length > 1) return { uncertain: true }; // same-name classes — identity unresolvable (#206)
+    if (BUILTIN_RECEIVER_TYPES.has(norm)) return { external: true };
+    return { uncertain: true }; // known non-builtin type with no project method
+}
+
 function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, flowEntry) {
     if (JS_GLOBAL_RECEIVERS.has(call.receiver)) return null;
     if (call.receiverIsModule) return null;
@@ -4840,6 +4926,7 @@ function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, fl
     const ownerKeys = new Set();
     const ownerDefs = [];
     for (const d of defs) {
+        if (!_calleeLanguageCompatible(index, d, language)) continue; // fix #257
         if (NON_CALLABLE_TYPES.has(d.type)) {
             if (d.type === 'field' && d.className && _callableFieldDef(index, d)) {
                 ownerKeys.add(d.className);
@@ -4858,6 +4945,17 @@ function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, fl
         const owner = ownerKeys.values().next().value;
         if (flowEntry.externalVia || (flowEntry.type && flowEntry.type !== owner)) return null;
     }
+    // Parser-typed receiver disagreeing with the owner defeats the match
+    // unless the owner is an ancestor of the receiver's type (fix #257 —
+    // the flow-map defeater above, extended to #198 parser-typed receivers:
+    // a `new Map()` local can never single-owner-confirm a project method).
+    if (call.receiverType && typeof call.receiverType === 'string') {
+        const owner = ownerKeys.values().next().value;
+        const head = _structuralTypeHead(call.receiverType) || call.receiverType;
+        const norm = _PY_TYPING_BUILTINS[head] || head;
+        if (head !== owner && norm !== owner &&
+            !_receiverTypeAncestors(index, head).has(owner)) return null;
+    }
     if (traits?.typeSystem === 'nominal' && call.argCount != null &&
         !_callArityCompatible(call, ownerDefs, language)) return null;
     const match = ownerDefs[0];
@@ -4868,8 +4966,8 @@ function _calleeSingleOwnerMatch(index, def, fileEntry, call, name, language, fl
     const callerFe = index.files.get(def.file);
     const matchFe = index.files.get(match.file);
     if (matchFe && callerFe &&
-        isTestFile(matchFe.relativePath, matchFe.language) &&
-        !isTestFile(callerFe.relativePath, callerFe.language)) return null;
+        (isTestFile(matchFe.relativePath, matchFe.language) || isTestPath(matchFe.relativePath)) &&
+        !(isTestFile(callerFe.relativePath, callerFe.language) || isTestPath(callerFe.relativePath))) return null;
     return match;
 }
 

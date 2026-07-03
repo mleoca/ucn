@@ -5639,3 +5639,133 @@ describe('fix #234: search --unused excludes entry points and decorator names', 
         } finally { rm(dir); }
     });
 });
+
+
+// ============================================================================
+// Fix #257: callee-side receiver-type routing + single-owner defeaters
+// (found running trace on UCN itself: canonicalSymbols.set() on a `new Map()`
+// local resolved exact-binding into a test-fixture CacheService.set — three
+// fixture languages' defs conflated into ONE owner, the parser's
+// receiverType was never consulted on the callee side, and a plain-named
+// file under test/ escaped the test-owner defeater)
+// ============================================================================
+
+describe('fix #257: callee receiver-type routing and single-owner defeaters', () => {
+    function calleesFor(index, defName, opts = {}) {
+        const def = (index.symbols.get(defName) || [])[0];
+        assert.ok(def, `def ${defName} must exist`);
+        return index.findCallees(def, { includeMethods: true, ...opts });
+    }
+
+    it('builtin-typed receiver never confirms a project method (cross-language owners)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'main.js': 'function work() {\n  const m = new Map();\n  m.set("a", 1);\n  return m;\n}\nmodule.exports = { work };',
+            'test/fixtures/Service.java': 'public class CacheService {\n    public void set(String key, Object value) { }\n}',
+            'test/fixtures/service.py': 'class CacheService:\n    def set(self, key, value):\n        pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const legacy = calleesFor(index, 'work');
+            assert.ok(!legacy.some(c => c.name === 'set'),
+                'legacy mode: Map-typed receiver must not confirm CacheService.set');
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            assert.ok(!account.some(c => c.name === 'set' && c.tier === 'confirmed'),
+                'account mode: Map-typed receiver must not confirm CacheService.set');
+            assert.ok(account.calleeAccount?.conserved, 'callee account must stay conserved');
+        } finally { rm(dir); }
+    });
+
+    it('typed receiver resolves the RIGHT one of two owners (new confirm path)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'cache.js': 'class Cache { save() { return 1; } }\nmodule.exports = { Cache };',
+            'store.js': 'class Store { save() { return 2; } }\nmodule.exports = { Store };',
+            'main.js': 'const { Cache } = require("./cache");\nfunction work() {\n  const c = new Cache();\n  return c.save();\n}\nmodule.exports = { work };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            const save = account.find(c => c.name === 'save' && c.tier === 'confirmed');
+            assert.ok(save, 'c.save() on a new Cache() local must confirm');
+            assert.ok(save.file.endsWith('cache.js'),
+                `must resolve to Cache.save, got ${save.file}`);
+        } finally { rm(dir); }
+    });
+
+    it('typed receiver reaches a method defined on an ancestor class', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.js': 'class Base { save() { return 1; } }\nclass Child extends Base {}\nmodule.exports = { Base, Child };',
+            'other.js': 'class Other { save() { return 2; } }\nmodule.exports = { Other };',
+            'main.js': 'const { Child } = require("./base");\nfunction work() {\n  const c = new Child();\n  return c.save();\n}\nmodule.exports = { work };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            const save = account.find(c => c.name === 'save' && c.tier === 'confirmed');
+            assert.ok(save, 'Child-typed receiver must reach Base.save via inheritance');
+            assert.ok(save.file.endsWith('base.js'),
+                `must resolve to Base.save, got ${save.file}`);
+        } finally { rm(dir); }
+    });
+
+    it('single-owner never crosses language families (untyped receiver)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'main.js': 'function work(x) {\n  return x.store(1);\n}\nmodule.exports = { work };',
+            'keeper.py': 'class DataKeeper:\n    def store(self, v):\n        return v\n',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            assert.ok(!account.some(c => c.name === 'store' && c.tier === 'confirmed'),
+                'a JS call must never resolve to a Python-only owner');
+            assert.ok(account.calleeAccount?.conserved, 'callee account must stay conserved');
+        } finally { rm(dir); }
+    });
+
+    it('single-owner defeated when the only owner lives under a test path', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'main.js': 'function work(y) {\n  return y.helperThing();\n}\nmodule.exports = { work };',
+            'test/support/util.js': 'class Helper { helperThing() { return 1; } }\nmodule.exports = { Helper };',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            assert.ok(!account.some(c => c.name === 'helperThing' && c.tier === 'confirmed'),
+                'a prod caller must not single-owner-confirm into a test-path owner');
+        } finally { rm(dir); }
+    });
+
+    it('python: literal-dict receiver never confirms a project method', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\n',
+            'main.py': 'def work():\n    m = {}\n    m.update({"a": 1})\n    return m\n',
+            'svc.py': 'class Registry:\n    def update(self, d):\n        pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            assert.ok(!account.some(c => c.name === 'update' && c.tier === 'confirmed'),
+                'dict-typed receiver must not confirm Registry.update');
+        } finally { rm(dir); }
+    });
+
+    it('python: annotated receiver resolves the right one of two owners', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\n',
+            'svc.py': 'class Registry:\n    def update(self, d):\n        pass\n\nclass Journal:\n    def update(self, d):\n        pass\n',
+            'main.py': 'from svc import Registry\n\ndef work(r: Registry):\n    r.update({"a": 1})\n',
+        });
+        try {
+            const index = idx(dir);
+            const account = calleesFor(index, 'work', { collectAccount: true });
+            const upd = account.find(c => c.name === 'update' && c.tier === 'confirmed');
+            assert.ok(upd, 'Registry-annotated receiver must confirm update');
+            assert.ok(upd.className === 'Registry' || upd.file.endsWith('svc.py'),
+                `must resolve to Registry.update, got ${upd.className} in ${upd.file}`);
+        } finally { rm(dir); }
+    });
+});
