@@ -444,8 +444,8 @@ async function evaluateRepo(repo, oracle) {
         `zeroTrust ${summary.zeroTrustworthiness != null ? pct(summary.zeroTrustworthiness) : 'n/a'} (${summary.zeroCases} cases) | ` +
         `conserved ${pct(summary.conservedRate)}\n`);
     for (const [kind, k] of Object.entries(summary.byKind)) {
-        process.stdout.write(`    ${kind.padEnd(8)} n=${k.sampled} | tier1 ${pct(k.tier1Precision)} (${k.confirmedHits}/${k.confirmedEdges}) | ` +
-            `unverified ${pct(k.unverifiedPrecision)} (${k.unverifiedHits}/${k.unverifiedEdges}) | ` +
+        process.stdout.write(`    ${kind.padEnd(8)} n=${k.sampled} | tier1 ${k.confirmedEdges ? pct(k.tier1Precision) : 'n/a'} (${k.confirmedHits}/${k.confirmedEdges}) | ` +
+            `unverified ${k.unverifiedEdges ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedEdges}) | ` +
             `placement ${JSON.stringify(k.oraclePlacement)}\n`);
     }
     process.stdout.write(`  callee arm: precision ${pct(summary.calleePrecision)} (${summary.calleeHits}/${summary.calleeSites}) | ` +
@@ -560,7 +560,7 @@ async function main() {
     for (const { summary: s } of results) {
         if (s.error || !s.byKind) continue;
         for (const [kind, k] of Object.entries(s.byKind)) {
-            lines.push(`| ${s.repo} | ${kind} | ${k.sampled} | ${k.oracleCallEdges} | ${pct(k.tier1Precision)} (${k.confirmedHits}/${k.confirmedEdges}) | ${pct(k.unverifiedPrecision)} (${k.unverifiedHits}/${k.unverifiedEdges}) | ${k.tierSeparation ?? 'n/a'} | ${JSON.stringify(k.oraclePlacement)} |`);
+            lines.push(`| ${s.repo} | ${kind} | ${k.sampled} | ${k.oracleCallEdges} | ${k.confirmedEdges ? pct(k.tier1Precision) : 'n/a'} (${k.confirmedHits}/${k.confirmedEdges}) | ${k.unverifiedEdges ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedEdges}) | ${k.tierSeparation ?? 'n/a'} | ${JSON.stringify(k.oraclePlacement)} |`);
         }
     }
     lines.push('');
