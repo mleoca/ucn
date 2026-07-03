@@ -34,7 +34,7 @@ UCN is deliberately lightweight:
 - **No language servers** - tree-sitter does the parsing, no compilation needed
 - **MCP is optional** - only needed if you connect UCN to an AI agent, the CLI and Skill work on their own
 
-And it's built to be **trusted**: every "who calls this?" splits into what UCN can prove and what it can't — each flagged with a reason, nothing silently dropped, [measured in CI against real compilers and language servers](#answers-you-can-trust).
+And it's built to be **trusted**. grep hands you raw text matches to verify yourself; UCN splits every "who calls this?" into what it can prove and what it can't — each flagged with a reason, nothing silently dropped. That claim is measured, not promised: CI re-derives UCN's answers from the real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls) across ten production repos — **96.6–100% confirmed-tier precision, zero unexplained call edges, [or the build fails](#answers-you-can-trust)**.
 
 ---
 
