@@ -7281,3 +7281,228 @@ describe('fix #262: literal-assignment receiver typing', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #265: fresh-arm caller physics (zustand/hono families)', () => {
+    function pinned(index, name, relPath, startLine) {
+        const def = (index.symbols.get(name) || [])
+            .find(d => d.relativePath === relPath && d.startLine === startLine);
+        assert.ok(def, `pinned def ${relPath}:${startLine}:${name} must exist`);
+        return def;
+    }
+    function callersFor(index, name, def) {
+        return index.findCallers(name, {
+            targetDefinitions: [def], collectAccount: true,
+        });
+    }
+
+    it('overload-signature identity: pinning the implementation confirms the caller', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': [
+                'export function pick(a: string): string;',
+                'export function pick(a: string, b: number): string;',
+                'export function pick(a: string, b?: number) { return a; }',
+                'export const wire = (x: string) => pick(x);',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const impl = pinned(index, 'pick', 'lib.ts', 3);
+            assert.ok(!impl.isSignature, 'line 3 is the implementation');
+            const res = callersFor(index, 'pick', impl);
+            assert.ok(res.some(c => c.line === 4),
+                `implementation pin must confirm the call binding a signature: ${JSON.stringify(res.map(c => c.line))}`);
+            // Symmetric: pinning a signature reaches the same caller.
+            const sig = pinned(index, 'pick', 'lib.ts', 1);
+            assert.ok(sig.isSignature, 'line 1 is a signature');
+            assert.ok(callersFor(index, 'pick', sig).some(c => c.line === 4));
+        } finally { rm(dir); }
+    });
+
+    it('counter: same-name redefinition without signatures never closes', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'dup.js': [
+                'function greet() { return 1; }',
+                'function greet() { return 2; }',
+                'function use() { return greet(); }',
+                'module.exports = { use, greet };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('greet') || [];
+            assert.strictEqual(defs.length, 2);
+            // Exactly ONE pin owns the call — closure must not make both claim it.
+            const owners = defs.filter(d =>
+                callersFor(index, 'greet', d).some(c => c.line === 3));
+            assert.strictEqual(owners.length, 1,
+                'no-signature same-name defs stay distinct identities');
+        } finally { rm(dir); }
+    });
+
+    it('JSX component usage carries functionReference (usage-style edge)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.tsx': [
+                'export function Panel() { return <div />; }',
+                'export function Root() {',
+                '  return <Panel />;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'Panel', 'app.tsx', 1);
+            const res = callersFor(index, 'Panel', def);
+            const edge = res.find(c => c.line === 3);
+            assert.ok(edge, 'JSX usage is a confirmed edge');
+            assert.strictEqual(edge.isFunctionReference, true,
+                'JSX component usage is a function reference the runtime invokes');
+        } finally { rm(dir); }
+    });
+
+    it('alias-of-builtin field type excludes the hop call (StoreMap = Map)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'cache.ts': [
+                'type StoreMap = Map<string, number>;',
+                'export class MockCache {',
+                '  store: StoreMap;',
+                '  constructor(store: StoreMap) { this.store = store; }',
+                '  keys() { return this.store.keys(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'keys', 'cache.ts', 5);
+            const res = callersFor(index, 'keys', def);
+            assert.ok(!res.some(c => c.line === 5),
+                'this.store.keys() on a Map-aliased field is never MockCache.keys');
+            assert.ok(!(res.unverifiedEntries || []).some(u => u.line === 5),
+                'alias resolves to a builtin — excluded, not unverified');
+        } finally { rm(dir); }
+    });
+
+    it('alias-of-project-class field type validates the hop (confirm)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'car.ts': [
+                'export class Engine {',
+                '  run() { return 1; }',
+                '}',
+                'type Power = Engine;',
+                'export class Car {',
+                '  e: Power;',
+                '  constructor(e: Power) { this.e = e; }',
+                '  go() { return this.e.run(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'run', 'car.ts', 2);
+            const res = callersFor(index, 'run', def);
+            assert.ok(res.some(c => c.line === 8),
+                `alias-typed field validates against the base class: ${JSON.stringify(res.map(c => c.line))}`);
+        } finally { rm(dir); }
+    });
+
+    it('unresolvable field-hop type never degrades to binding confirmation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'wrap.ts': [
+                'export class Wrap {',
+                '  inner: ExternalThing;',
+                '  constructor(inner: ExternalThing) { this.inner = inner; }',
+                '  keys() {',
+                '    return this.inner.keys();',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'keys', 'wrap.ts', 4);
+            const res = callersFor(index, 'keys', def);
+            assert.ok(!res.some(c => c.line === 5),
+                'this.inner.keys() on an external-typed field must not confirm Wrap.keys');
+            assert.ok((res.unverifiedEntries || []).some(u => u.line === 5),
+                'untrusted hop head routes visible, never silently dropped');
+        } finally { rm(dir); }
+    });
+
+    it('getter return annotation types the hop like a field (Context.req)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'ctx.ts': [
+                'export class Req {',
+                '  param(k: string) { return k; }',
+                '}',
+                'export class Ctx {',
+                '  #r: Req | undefined;',
+                '  get req(): Req { return this.#r!; }',
+                '}',
+                'export function handler(c: Ctx) {',
+                '  return c.req.param("id");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'param', 'ctx.ts', 2);
+            const res = callersFor(index, 'param', def);
+            assert.ok(res.some(c => c.line === 9),
+                `getter-typed hop confirms: ${JSON.stringify(res.map(c => c.line))}`);
+        } finally { rm(dir); }
+    });
+
+    it('Object.prototype names defeat single-owner confirmation (demote-only)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'node.ts': [
+                'export class TreeNode {',
+                '  toString() { return "n"; }',
+                '}',
+                'export function dump(x: unknown) {',
+                '  return String(x) + (x as any).toString();',
+                '}',
+                'export function dumpTyped(n: TreeNode) {',
+                '  return n.toString();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'toString', 'node.ts', 2);
+            const res = callersFor(index, 'toString', def);
+            assert.ok(!res.some(c => c.line === 5),
+                'untyped x.toString() must not confirm via single project owner');
+            assert.ok((res.unverifiedEntries || []).some(u => u.line === 5),
+                'universal-name call routes visible possible-dispatch');
+            assert.ok(res.some(c => c.line === 8),
+                `typed receiver keeps confirming: ${JSON.stringify(res.map(c => c.line))}`);
+        } finally { rm(dir); }
+    });
+
+    it('counter: non-universal single-owner method names still confirm', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'kit.js': [
+                'class Kit {',
+                '  runIt() { return 1; }',
+                '}',
+                'function work(k) { return k.runIt(); }',
+                'module.exports = { Kit, work };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = pinned(index, 'runIt', 'kit.js', 2);
+            const res = callersFor(index, 'runIt', def);
+            assert.ok(res.some(c => c.line === 4),
+                'single-owner rule intact for ordinary names');
+        } finally { rm(dir); }
+    });
+});

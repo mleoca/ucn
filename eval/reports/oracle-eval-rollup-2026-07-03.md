@@ -7,7 +7,7 @@ lie the tiered caller contract forbids. Target: 0.
 
 | repo | oracle | sampled | oracle edges | tier1 precision | unverified precision | separation | missing-unexplained | zero-trust | conserved |
 |---|---|---|---|---|---|---|---|---|---|
-| zod | ts-morph | 50 | 1861 | 99.4% | 30.7% | 0.687 | **0** | 100.0% (9) | 100.0% |
+| zod | ts-morph | 50 | 1861 | 99.5% | 30.7% | 0.6871 | **0** | 100.0% (9) | 100.0% |
 | preact-signals | ts-morph | 24 | 24 | 100.0% | 8.3% | 0.9167 | **0** | 66.7% (3) | 100.0% |
 | express | ts-morph | 39 | 262 | 100.0% | 0.3% | 0.9975 | **0** | 100.0% (1) | 100.0% |
 | httpx | pyright | 50 | 879 | 99.9% | 37.3% | 0.6256 | **0** | 100.0% (7) | 100.0% |
@@ -27,7 +27,7 @@ evidence confirms the file but not the receiver type.
 
 | repo | kind | sampled | oracle edges | tier1 precision | unverified precision | separation | placement |
 |---|---|---|---|---|---|---|---|
-| zod | function | 36 | 1655 | 100.0% (142/142) | 29.9% (1510/5050) | 0.701 | {"confirmed":142,"unverified":1510,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
+| zod | function | 36 | 1655 | 100.0% (145/145) | 29.9% (1510/5050) | 0.701 | {"confirmed":145,"unverified":1510,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | method | 10 | 199 | 96.8% (30/31) | 40.8% (171/419) | 0.5596 | {"confirmed":28,"unverified":171,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | zod | class | 4 | 7 | 100.0% (7/7) | n/a (0/0) | n/a | {"confirmed":7,"unverified":0,"reportedNonCall":0,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |
 | preact-signals | function | 13 | 17 | 100.0% (15/15) | 0.0% (0/3) | 1 | {"confirmed":14,"unverified":0,"reportedNonCall":3,"missingExplained":0,"missingBeyondText":0,"missingUnexplained":0} |

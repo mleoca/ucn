@@ -172,6 +172,20 @@ function findCallers(index, name, options = {}) {
         definitionLines.add(`${def.file}:${def.startLine}`);
     }
 
+    // Overload-signature identity (fix #265, zustand-measured): a pin on any
+    // member of an overload group targets the WHOLE group — the signatures
+    // and the implementation declare one function, so a call binding the
+    // first signature's bindingId IS a call to the pinned implementation
+    // (useStore's only caller was excluded other-definition under the
+    // implementation pin, a false zero-caller answer).
+    if (options.targetDefinitions && options.targetDefinitions.length > 0 &&
+        definitions.length > options.targetDefinitions.length) {
+        const closed = _closeOverloadGroup(options.targetDefinitions, definitions);
+        if (closed !== options.targetDefinitions) {
+            options = { ...options, targetDefinitions: closed };
+        }
+    }
+
     // Possible-dispatch tiering inputs (nominal contract surface) — all fixed
     // per query, computed lazily once. targetTypes mirrors the receiver-class
     // disambiguation set (target classes + non-overriding subtypes); owner
@@ -338,7 +352,7 @@ function findCallers(index, name, options = {}) {
         pendingByFile.get(filePath).push({
             call, fileEntry, callerSymbol: null,
             isMethod: call.isMethod || false,
-            isFunctionReference: !!call.isFunctionReference,
+            isFunctionReference: !!(call.isFunctionReference || call.isJsxComponent),
             receiver: call.receiver, receiverType: call.receiverType,
             calledAs,
             _tier: TIER.UNVERIFIED, _reason: reason, _meta: meta,
@@ -1682,6 +1696,31 @@ function findCallers(index, name, options = {}) {
                                     continue;
                                 }
                             }
+                            // Unmatched-but-untrusted field-hop type (fix #265,
+                            // hono-measured): the hop PROVED the receiver is the
+                            // field's declared type — not the enclosing class —
+                            // yet the head earns no exclusion trust (external/
+                            // unresolvable name). Falling through let the class-
+                            // member name binding confirm `this.store.keys()`
+                            // as MockCache.keys ('exact-binding'): bindings
+                            // don't model receivers (#202). Route visible,
+                            // attributed via the field's type; never confirm,
+                            // never exclude. Structural only — nominal hops
+                            // keep their #202 promotion/embedding fall-through
+                            // (no measured family).
+                            if (!matchesTarget && !exclusionTrusted && viaFieldHop && structural) {
+                                if (collectAccount) {
+                                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                        dispatchVia: knownType,
+                                        dispatchCandidates: countDispatchCandidates(knownType),
+                                    });
+                                    continue;
+                                }
+                                if (!options.includeUncertain) {
+                                    if (stats) stats.uncertain = (stats.uncertain || 0) + 1;
+                                    continue;
+                                }
+                            }
                         } else {
                             // No parser-inferred type — try local type inference
                             // for Go/Java/Rust (nominal type systems)
@@ -2225,6 +2264,19 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
+                        // java.lang.Object universal names (fix #265 — the
+                        // structural gate's twin): toString/equals/hashCode
+                        // are satisfied by EVERY value via Object, marker or
+                        // not — unique project ownership is not identity
+                        // evidence for a receiver-evidence-free call.
+                        if (!knownDispatchType &&
+                            _universalMethodName(fileEntry.language, call.name)) {
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: `${_universalRootName(fileEntry.language)} — builtin contract`,
+                                externalContract: true,
+                            });
+                            continue;
+                        }
                         // Wrong-arity call that fits no project def (fix #229
                         // carve-out marker): the single-owner rule presumes no
                         // other candidate exists, but the arity disproves the
@@ -2451,6 +2503,19 @@ function findCallers(index, name, options = {}) {
                             });
                             continue;
                         }
+                        // Universal-contract names (fix #265): Object.prototype
+                        // (JS) / object dunders (Python) — every external value
+                        // satisfies the call, so unique project ownership below
+                        // is not receiver evidence. Demote-only.
+                        if (!typeQualifiedReceiver && _universalMethodName(fileEntry.language, call.name)) {
+                            const univVia = call.receiverType || fieldHopType || fieldDispatchType;
+                            routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                dispatchVia: univVia ||
+                                    `${_universalRootName(fileEntry.language)} — builtin contract`,
+                                externalContract: true,
+                            });
+                            continue;
+                        }
                         if (!typeQualifiedReceiver && methodOwnerKeys().size > 1) {
                             const knownDispatchType = call.receiverType || fieldHopType || fieldDispatchType;
                             if (knownDispatchType) {
@@ -2511,8 +2576,11 @@ function findCallers(index, name, options = {}) {
                     isMethod: call.isMethod || false,
                     // Function references can resolve through the plain binding
                     // path too (e.g. JS `arr.map(helper)` with a local binding) —
-                    // surface the parser's marker on the edge (fix #221).
-                    isFunctionReference: !!call.isFunctionReference,
+                    // surface the parser's marker on the edge (fix #221). JSX
+                    // component usage is the same shape (fix #265): `<App />`
+                    // compiles to jsx(App, ...) — a reference the runtime
+                    // invokes, not direct call syntax.
+                    isFunctionReference: !!(call.isFunctionReference || call.isJsxComponent),
                     receiver: call.receiver,
                     receiverType: call.receiverType,
                     calledAs,
@@ -4308,6 +4376,39 @@ const BUILTIN_RECEIVER_TYPES = new Set([
     'string', 'number', 'boolean', 'bigint', 'symbol',
 ]);
 
+// Universal-contract method names (fix #265, hono-measured: 183 untyped
+// `x.toString()` calls confirmed against JSXNode.toString via the single-
+// owner rule): names EVERY value satisfies through the language's root
+// object — Object.prototype (JS/TS), java.lang.Object (Java), object's
+// dunders (Python, protocol names by construction). Unique project
+// ownership of such a name is not identity evidence for a receiver-
+// evidence-free call — the #210 external-contract physics without needing
+// an override marker, because overriding these IS overriding the external
+// root. Demote-only (possible-dispatch); typed/validated/same-class
+// receivers keep normal physics. Go has no universal root; Rust's
+// trait-provided universals (to_string via Display) carry #210 markers.
+const _UNIVERSAL_METHOD_NAMES_JS = new Set([
+    'toString', 'toLocaleString', 'valueOf', 'hasOwnProperty',
+    'isPrototypeOf', 'propertyIsEnumerable',
+]);
+const _UNIVERSAL_METHOD_NAMES_JAVA = new Set([
+    'toString', 'equals', 'hashCode', 'getClass', 'clone',
+    'notify', 'notifyAll', 'wait', 'finalize',
+]);
+function _universalMethodName(language, name) {
+    if (language === 'python') return /^__[A-Za-z0-9_]+__$/.test(name);
+    if (language === 'java') return _UNIVERSAL_METHOD_NAMES_JAVA.has(name);
+    if (['javascript', 'typescript', 'tsx', 'html'].includes(language)) {
+        return _UNIVERSAL_METHOD_NAMES_JS.has(name);
+    }
+    return false;
+}
+function _universalRootName(language) {
+    if (language === 'python') return 'object';
+    if (language === 'java') return 'Object';
+    return 'Object.prototype';
+}
+
 /**
  * Can this receiverType justify EXCLUDING a caller (structural languages)?
  * True for builtins and names that resolve to a project class/struct — types
@@ -4759,23 +4860,103 @@ function _shareProjectDescendant(index, className, targetClasses) {
  * classes disagree, or the type is a trait/interface (dynamic dispatch —
  * a trait-typed field is not evidence against any implementor).
  */
+/**
+ * Overload-signature identity (fix #265, zustand-measured): TS overload
+ * signatures and their implementation — and Python @overload stubs and their
+ * body — declare ONE function: `export function useStore(a): T;` ×2 plus the
+ * implementation are the same symbol, so a call binding any member IS a call
+ * to the pinned one (the #208 alias-identity principle for callables).
+ * Closes the pin over same-file, same-class, same-nesting callable defs when
+ * the group contains a signature — the overload idiom's proof. Plain
+ * same-name redefinition (JS rebinding, Python last-wins shadowing) has no
+ * signature member and never closes. `definitions` is the same-name def list,
+ * so the group key needs no name component.
+ */
+function _closeOverloadGroup(targetDefs, definitions) {
+    const keyOf = (d) => `${d.file}\0${d.className || ''}\0${d.isNested ? 1 : 0}`;
+    const groups = new Map();
+    for (const d of definitions) {
+        if (NON_CALLABLE_TYPES.has(d.type)) continue;
+        const k = keyOf(d);
+        if (!groups.has(k)) groups.set(k, []);
+        groups.get(k).push(d);
+    }
+    let expanded = null;
+    for (const t of targetDefs) {
+        const group = groups.get(keyOf(t));
+        if (!group || group.length <= 1 || !group.some(d => d.isSignature)) continue;
+        for (const d of group) {
+            if (targetDefs.includes(d) || (expanded && expanded.includes(d))) continue;
+            if (!expanded) expanded = [...targetDefs];
+            expanded.push(d);
+        }
+    }
+    return expanded || targetDefs;
+}
+
+/**
+ * Pure-alias base resolution (fix #265 — the #208 identity for declared
+ * types): when EVERY type-kind definition of a name is an alias agreeing on
+ * one base, the name IS the base type (`type StoreMap = Map<...>` types a
+ * `store: StoreMap` field as Map). Chases alias-of-alias chains bounded and
+ * cycle-guarded; mixed or disagreeing names never resolve.
+ */
+function _pureAliasBase(index, typeName) {
+    let current = typeName;
+    const seen = new Set([current]);
+    for (let hop = 0; hop < 4; hop++) {
+        const defs = index.symbols.get(current);
+        if (!defs || defs.length === 0) return current === typeName ? null : current;
+        let base = null;
+        for (const d of defs) {
+            if (d.type !== 'type' && !IDENTITY_TYPE_KINDS.has(d.type)) continue;
+            if (d.type === 'type' && d.aliasOf) {
+                if (base === null) base = d.aliasOf;
+                else if (base !== d.aliasOf) return null; // disagreeing aliases
+            } else {
+                // a real type of this name exists — the name is not purely an alias
+                return current === typeName ? null : current;
+            }
+        }
+        if (!base) return current === typeName ? null : current;
+        if (seen.has(base)) return null; // cycle
+        seen.add(base);
+        current = base;
+    }
+    return current;
+}
+
 function _declaredFieldType(index, rootType, fieldName, language) {
     const defs = index.symbols.get(fieldName);
     if (!defs) return null;
     // 'private field' (JS #-fields, fix #219): equally compiler-true, and
-    // safer — nothing outside the class can rebind them.
+    // safer — nothing outside the class can rebind them. Getters and Python
+    // @property members (fix #265, hono-measured: Context.req is `get req():
+    // HonoRequest`) type the hop through their declared RETURN annotation —
+    // the same compiler-checked evidence in accessor clothing; the annotation
+    // is what the member-access expression evaluates to (value position).
+    const isAccessor = (d) => d.type === 'get' || d.memberType === 'get' ||
+        d.type === 'property' || d.memberType === 'property';
     const fields = defs.filter(d =>
-        (d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') &&
-        d.className === rootType && d.fieldType);
-    if (fields.length === 0) return null;
+        ((d.type === 'field' || d.memberType === 'field' || d.memberType === 'private field') && d.fieldType) ||
+        (isAccessor(d) && d.returnType));
+    const onType = fields.filter(d => d.className === rootType);
+    if (onType.length === 0) return null;
     const normalized = new Set();
-    for (const f of fields) {
-        const t = _normalizeFieldTypeName(f.fieldType, language);
+    for (const f of onType) {
+        const t = _normalizeFieldTypeName(isAccessor(f) ? f.returnType : f.fieldType, language);
         if (t) normalized.add(t);
         else return null; // any un-normalizable declaration → no evidence
     }
     if (normalized.size !== 1) return null; // same-named classes disagree
-    const typeName = [...normalized][0];
+    let typeName = [...normalized][0];
+    // Pure-alias heads resolve to their base (fix #265 — the #208 identity
+    // for declared types): `store: StoreMap` where `type StoreMap = Map<...>`
+    // types the field as Map, which the trust gate can judge (builtin →
+    // exclusion-grade; a project-class base validates normally). Mixed or
+    // disagreeing alias names stay as-is and fail the trust gate downstream.
+    const aliasBase = _pureAliasBase(index, typeName);
+    if (aliasBase) typeName = aliasBase;
     // Generic type parameters by convention (T, K, V1 — fix #220,
     // cursive-measured): `view: T` declares the field as WHATEVER the
     // instantiation chose — not a type identity. Without this, the hop

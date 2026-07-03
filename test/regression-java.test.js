@@ -3116,3 +3116,37 @@ describe('fix #258: chained-receiver fold (Java)', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #265: java.lang.Object universal names defeat single-owner', () => {
+    it('untyped-receiver toString never confirms via unique project ownership', () => {
+        const dir = tmp({
+            'Node.java': [
+                'public class Node {',
+                '    @Deprecated',
+                '    public String describe() { return "n"; }',
+                '    public String toString() { return "n"; }',
+                '}',
+            ].join('\n'),
+            'Dump.java': [
+                'import java.util.List;',
+                'public class Dump {',
+                '    public void run(List<Object> items) {',
+                '        items.forEach(item -> System.out.println(item.toString()));',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('toString') || [])[0];
+            assert.ok(def);
+            const res = index.findCallers('toString', {
+                targetDefinitions: [def], collectAccount: true,
+            });
+            assert.ok(!res.some(c => c.relativePath === 'Dump.java'),
+                'item.toString() satisfies Object — not identity evidence for Node.toString');
+            assert.ok((res.unverifiedEntries || []).some(u => /Dump/.test(u.file || '')),
+                'universal-name call routes visible, never dropped');
+        } finally { rm(dir); }
+    });
+});

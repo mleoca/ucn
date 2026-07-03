@@ -3871,3 +3871,61 @@ describe('fix #259: deadcode scan — Python floor division vs // comment', () =
         } finally { rm(dir); }
     });
 });
+
+describe('fix #265: @overload signature identity + dunder universal names', () => {
+    it('pinning the implementation confirms a caller binding an @overload stub', () => {
+        const dir = tmp({
+            'lib.py': [
+                'from typing import overload',
+                '',
+                '@overload',
+                'def parse(x: int) -> int: ...',
+                '@overload',
+                'def parse(x: str) -> str: ...',
+                'def parse(x):',
+                '    return x',
+                '',
+                'def use():',
+                '    return parse(1)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('parse') || [];
+            const sigs = defs.filter(d => d.isSignature);
+            assert.strictEqual(sigs.length, 2, '@overload stubs carry isSignature');
+            const impl = defs.find(d => !d.isSignature);
+            assert.ok(impl, 'implementation exists');
+            const res = index.findCallers('parse', {
+                targetDefinitions: [impl], collectAccount: true,
+            });
+            assert.ok(res.some(c => c.line === 11),
+                `implementation pin confirms the caller: ${JSON.stringify(res.map(c => c.line))}`);
+        } finally { rm(dir); }
+    });
+
+    it('dunder method calls never confirm via single project owner', () => {
+        const dir = tmp({
+            'shape.py': [
+                'class Shape:',
+                '    def __iter__(self):',
+                '        return iter([])',
+                '',
+                'def drain(x):',
+                '    return x.__iter__()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = (index.symbols.get('__iter__') || [])[0];
+            assert.ok(def);
+            const res = index.findCallers('__iter__', {
+                targetDefinitions: [def], collectAccount: true,
+            });
+            assert.ok(!res.some(c => c.line === 6),
+                'untyped x.__iter__() satisfies the object protocol externally');
+            assert.ok((res.unverifiedEntries || []).some(u => u.line === 6),
+                'dunder call routes visible possible-dispatch');
+        } finally { rm(dir); }
+    });
+});

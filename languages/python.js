@@ -138,6 +138,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 ...(paramTypes && { paramTypes }),
                 ...(docstring && { docstring }),
                 ...(decorators.length > 0 && { decorators }),
+                ...(isOverloadDecorated(decorators) && { isSignature: true }),
                 ...(nameLine !== decoratorStartLine && { nameLine })
             });
         }
@@ -283,6 +284,19 @@ function findFunctions(code, parser) {
     });
     functions.sort((a, b) => a.startLine - b.startLine);
     return functions;
+}
+
+/**
+ * A typing @overload-decorated def is a SIGNATURE of the implementation that
+ * follows, not a callable of its own (fix #265 — TS overload parity): the
+ * runtime discards the stub bodies, so pin identity must close over the
+ * group and resolution must prefer the implementation.
+ */
+function isOverloadDecorated(decorators) {
+    return decorators.some(d => {
+        const head = d.split('(')[0].trim();
+        return head === 'overload' || head.endsWith('.overload');
+    });
 }
 
 /**
@@ -472,6 +486,7 @@ function extractClassMembers(classNode, code) {
                     ...(paramTypes && { paramTypes }),
                     ...(docstring && { docstring }),
                     ...(memberDecorators.length > 0 && { decorators: memberDecorators }),
+                    ...(isOverloadDecorated(memberDecorators) && { isSignature: true }),
                     ...(nameLine !== startLine && { nameLine })
                 });
             }

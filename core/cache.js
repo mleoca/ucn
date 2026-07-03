@@ -112,7 +112,10 @@ const UCN_VERSION = require('../package.json').version;
 // v44 (fix #262): JS/TS literal ASSIGNMENTS type the variable (const lines
 // = [] → Array), and untyped reassignment deletes inferred types — call
 // records carry receiverType on literal-assigned receivers.
-const CACHE_FORMAT_VERSION = 44;
+// v45 (fix #265): Python typing @overload-decorated defs carry isSignature
+// (TS overload parity — pin identity closes over the overload group, and
+// pickBestDefinition prefers the implementation).
+const CACHE_FORMAT_VERSION = 45;
 
 /**
  * Save index to cache file
