@@ -9,7 +9,7 @@
 
 const fs = require('fs');
 const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
-const { _declaredFieldType } = require('./callers');
+const { _declaredFieldType, _projectTopLevelNames } = require('./callers');
 const path = require('path');
 const { isTestFile } = require('./discovery');
 
@@ -133,6 +133,14 @@ function getStats(index, options = {}) {
         // (resolves to top-level foo) from `obj.foo()` on a local variable.
         const fileImportAliases = new Map();         // filePath -> Set<string> of alias names
         const fieldHopCache = new Map();             // rootType\0field -> declared type|null
+        // Names import-bound to an EXTERNAL module, per file (fix #256,
+        // dogfood-measured: 895 node:test `describe(...)` calls in test
+        // files were attributed to a project closure named `describe` —
+        // the #215 name discipline says an externally-bound bare name
+        // cannot reach a project def, so it never counts toward the hot
+        // leaderboard). Relative modules, resolved modules, and resolver
+        // gaps (first segment names a project path) all stay countable.
+        const fileExternalNames = new Map();         // filePath -> Set<string>
         for (const [filePath, fileEntry] of index.files) {
             const aliases = new Set();
             // importNames are the named imports/exports brought into this file.
@@ -145,6 +153,16 @@ function getStats(index, options = {}) {
                 }
             }
             fileImportAliases.set(filePath, aliases);
+            let ext = null;
+            for (const b of (fileEntry.importBindings || [])) {
+                const mod = String(b.module || '');
+                if (!b.name || !mod || mod.startsWith('.') || mod.startsWith('/')) continue;
+                if (fileEntry.moduleResolved && fileEntry.moduleResolved[mod]) continue;
+                const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+                if (firstSeg && _projectTopLevelNames(index).has(firstSeg)) continue;
+                (ext || (ext = new Set())).add(b.name);
+            }
+            if (ext) fileExternalNames.set(filePath, ext);
         }
 
         for (const [filePath, entry] of index.callsCache) {
@@ -162,6 +180,9 @@ function getStats(index, options = {}) {
                     // Bare-name call: foo() or pkg.Foo() (Go package call has receiver
                     // but isMethod:false — keep counting under bareName since they
                     // resolve like top-level functions in their package).
+                    // Externally-bound names are the external library's calls,
+                    // never a project def's (fix #256).
+                    if (fileExternalNames.get(filePath)?.has(c.name)) continue;
                     bareNameCounts.set(c.name, (bareNameCounts.get(c.name) || 0) + 1);
                 } else if (isSelfMethod) {
                     // self/this.foo() — attributed to the enclosing class's foo

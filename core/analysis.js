@@ -154,10 +154,12 @@ function tagCallersReachable(callers, reachableSet) {
     for (const c of callers) {
         if (c.callerFile && c.callerStartLine != null) {
             c.reachable = reachableSet.has(symbolKey(c.callerFile, c.callerStartLine));
-        } else {
-            // Module-level / unknown caller — treat as unreachable (no enclosing function)
-            c.reachable = false;
         }
+        // Module-level callers get NO verdict (fix #256, rich-measured:
+        // every examples/*.py module-level `console.print(table)` rendered
+        // [unreachable]): the site executes at IMPORT time — function-graph
+        // reachability cannot speak for it, and "unreachable" invites
+        // deleting live code. Formatters mark only `reachable === false`.
     }
     return callers;
 }
@@ -444,9 +446,9 @@ function context(index, name, options = {}) {
     // Optional: filter to unreachable-only (helps surface dead-path callers/callees)
     if (options.unreachableOnly) {
         const before = callers.length;
-        callers = callers.filter(c => !c.reachable);
+        callers = callers.filter(c => c.reachable === false);
         filteredByFlag.unreachableOnly = before - callers.length;
-        callees = callees.filter(c => !c.reachable);
+        callees = callees.filter(c => c.reachable === false);
     }
 
     // Conservation account: reconciles the caller answer against the text
@@ -1079,13 +1081,12 @@ function impact(index, name, options = {}) {
     for (const site of filteredSites) {
         if (site.callerFile && site.callerStartLine != null) {
             site.reachable = impactReachable.has(symbolKey(site.callerFile, site.callerStartLine));
-        } else {
-            site.reachable = false;
         }
+        // Module-level sites: no verdict — import-time execution (fix #256).
     }
     if (options.unreachableOnly) {
         const before = filteredSites.length;
-        filteredSites = filteredSites.filter(s => !s.reachable);
+        filteredSites = filteredSites.filter(s => s.reachable === false);
         impactFilteredByFlag.unreachableOnly = before - filteredSites.length;
     }
     const callerHistogram = buildHistogram(filteredSites);
@@ -1373,7 +1374,7 @@ function about(index, name, options = {}) {
         // Optional: filter to unreachable-only callers
         if (options.unreachableOnly) {
             const before = allCallers.length;
-            allCallers = allCallers.filter(c => !c.reachable);
+            allCallers = allCallers.filter(c => c.reachable === false);
             aboutFilteredByFlag.unreachableOnly = before - allCallers.length;
             // Apply same filter to shadows using their callerStartLine/file when available.
             // Shadows lack callerStartLine, so they're treated as reachable=false (conservative,

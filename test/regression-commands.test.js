@@ -6107,3 +6107,49 @@ describe('fix #255: execute() never mutates the caller params object', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #256: stats --hot never credits externally-bound bare names', () => {
+    it('node:test describe() calls do not count toward a project symbol named describe', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function describe(list) { return list.length; }\nfunction hot() { return 1; }\nmodule.exports = { describe, hot };\n',
+            'use.js': 'const { hot } = require("./lib");\nhot();\nhot();\nhot();\n',
+            'spec.js': 'const { describe } = require("node:test");\ndescribe("a", () => {});\ndescribe("b", () => {});\ndescribe("c", () => {});\ndescribe("d", () => {});\n'
+        });
+        try {
+            const r = execute(idx(dir), 'stats', { hot: true, top: 10 });
+            assert.ok(r.ok);
+            const rows = r.result.hot.items;
+            const desc = rows.find(x => x.name === 'describe');
+            const hotRow = rows.find(x => x.name === 'hot');
+            assert.ok(hotRow && hotRow.callCount === 3, `project calls counted: ${JSON.stringify(rows)}`);
+            assert.ok(!desc || desc.callCount === 0,
+                `externally-bound describe() calls never credit the project def: ${JSON.stringify(desc)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #256: module-level call sites carry no reachability verdict', () => {
+    it('an import-time call site is never marked [unreachable]; function callers keep verdicts', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };\n',
+            'boot.js': 'const { helper } = require("./lib");\nhelper();\n',
+            'orphan.js': 'const { helper } = require("./lib");\nfunction never() { return helper(); }\nmodule.exports = { never };\n',
+            'main.js': 'const { helper } = require("./lib");\nfunction main() { return helper(); }\nmain();\n'
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'helper' });
+            assert.ok(r.ok);
+            const byFile = Object.fromEntries((r.result.callers || []).map(c =>
+                [c.relativePath, c.reachable]));
+            assert.strictEqual(byFile['boot.js'], undefined,
+                'module-level site: no verdict (executes at import)');
+            const { text } = require('../core/output').formatContext(r.result);
+            const bootLine = text.split('\n').find(l => l.includes('boot.js'));
+            assert.ok(bootLine && !bootLine.includes('[unreachable]'),
+                `module-level site never marked: ${bootLine}`);
+        } finally { rm(dir); }
+    });
+});
