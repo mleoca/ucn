@@ -7,14 +7,14 @@ tiered caller contract eliminates).
 
 | repo | lang | files | sampled | conserved | gap symbols | gap lines | beyond-text | tree violations | avg ms/account |
 |---|---|---|---|---|---|---|---|---|---|
-| zod | typescript | 287 | 24 | 100.0% | 0 | 0 | 15 | 0/20 | 44.4 |
-| preact-signals | typescript | 2 | 23 | 100.0% | 0 | 0 | 1 | 0/20 | 8.5 |
-| express | javascript | 150 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 17.8 |
-| httpx | python | 61 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 16.5 |
-| rich | python | 213 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 30.5 |
-| cobra | go | 36 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 11.7 |
-| grpc-go | go | 1037 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 128.9 |
-| ripgrep | rust | 100 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 36 |
-| cursive | rust | 187 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 17.8 |
-| gson | java | 210 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 19.4 |
-| clap | rust | 330 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 45.3 |
+| zod | typescript | 287 | 24 | 100.0% | 0 | 0 | 15 | 0/20 | 51.9 |
+| preact-signals | typescript | 2 | 23 | 100.0% | 0 | 0 | 1 | 0/20 | 8.3 |
+| express | javascript | 150 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 16.1 |
+| httpx | python | 61 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 17.2 |
+| rich | python | 213 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 29.5 |
+| cobra | go | 36 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 15.4 |
+| grpc-go | go | 1037 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 133.6 |
+| ripgrep | rust | 100 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 35.5 |
+| cursive | rust | 187 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 16.4 |
+| gson | java | 210 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 19.3 |
+| clap | rust | 330 | 24 | 100.0% | 0 | 0 | 0 | 0/20 | 45 |
