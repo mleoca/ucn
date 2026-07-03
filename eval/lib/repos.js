@@ -176,6 +176,49 @@ const REPOS = [
         language: 'go',
         targetCandidates: ['.'],
     },
+    {
+        // Router-interface Go (graduated from FRESH_POOL 2026-07-03 — used
+        // to tune fix #268). Motivated the callee-side external-identity
+        // families: qualified field types (mx.pool.Get on *sync.Pool,
+        // mx.handler.ServeHTTP on http.Handler bare-name-matched an
+        // _examples type), non-method package-qualified records
+        // (context.WithValue confirmed the project's only WithValue), and
+        // chained external returns (m.NotFoundHandler().ServeHTTP self-edge).
+        // Known oracle blind spot: _examples/ is a separate underscore-dir
+        // module the Go toolchain ignores — gopls cannot see its true
+        // NewRouter callers (~6 caller-precision FPs are this, not engine).
+        name: 'chi',
+        url: 'https://github.com/go-chi/chi',
+        commit: 'd7b767bcbea51e486bdc9fd06d25136767ec14b5',
+        language: 'go',
+        targetCandidates: ['.'],
+    },
+    {
+        // Overload-heavy Java builder API (graduated from FRESH_POOL
+        // 2026-07-03 — used to tune fix #268). Motivated the Java bare
+        // same-class overload family (the Builder.defaultValue delegation
+        // excluded other-definition — a false zero-caller answer) and the
+        // inherited-sibling overload discipline (ClassName.annotated(List)
+        // vs TypeName's final annotated(AnnotationSpec...)).
+        name: 'javapoet',
+        url: 'https://github.com/square/javapoet',
+        commit: 'b9017a9503b76e11b4ad4c1a9f050e2d29112cb0',
+        language: 'java',
+        targetCandidates: ['javapoet/src/main/java', 'src/main/java'],
+    },
+    {
+        // State-machine-dispatch Java (graduated from FRESH_POOL 2026-07-03
+        // — used to tune fix #268). Motivated the callee-side same-class
+        // overload arity selection (all 71 tb.process(...) sites confirmed
+        // to the 1-arg overload) and the eval's super-constructor
+        // by-construction verification (LeafNode's subclass super(data)
+        // sites — jdtls emits no type reference at those lines).
+        name: 'jsoup',
+        url: 'https://github.com/jhy/jsoup',
+        commit: 'd8c49e5ec72a08ca1ac4e08740e70dc0f47ad911',
+        language: 'java',
+        targetCandidates: ['src/main/java'],
+    },
 ];
 
 // ============================================================================
@@ -201,10 +244,7 @@ const FRESH_POOL = [
     { name: 'dayjs', url: 'https://github.com/iamkun/dayjs', language: 'javascript', targetCandidates: ['.'] },
     { name: 'flask', url: 'https://github.com/pallets/flask', language: 'python', targetCandidates: ['.'] },
     { name: 'click', url: 'https://github.com/pallets/click', language: 'python', targetCandidates: ['.'] },
-    { name: 'chi', url: 'https://github.com/go-chi/chi', language: 'go', targetCandidates: ['.'] },
     { name: 'serde_json', url: 'https://github.com/serde-rs/json', language: 'rust', targetCandidates: ['.'] },
-    { name: 'javapoet', url: 'https://github.com/square/javapoet', language: 'java', targetCandidates: ['javapoet/src/main/java', 'src/main/java'] },
-    { name: 'jsoup', url: 'https://github.com/jhy/jsoup', language: 'java', targetCandidates: ['src/main/java'] },
 ];
 
 /**
