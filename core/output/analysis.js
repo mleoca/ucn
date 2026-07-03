@@ -20,30 +20,6 @@ function calleeDocstringSnippet(text) {
 }
 
 /**
- * Render a single-line confidence histogram for caller/callee sections.
- * Returns null when there are <= 1 edges (not informative).
- *
- * @param {{high:number, medium:number, low:number, total:number}|null} h
- * @returns {string|null}
- */
-function formatHistogramLine(h) {
-    if (!h || h.total <= 1) return null;
-    return `  confidence: ${h.high} high (>0.8), ${h.medium} medium (0.5-0.8), ${h.low} low (<0.5)`;
-}
-
-/**
- * Decide whether the formatter should print reachability markers per item.
- * To reduce noise, markers only appear when at least one item is unreachable.
- *
- * @param {Array} items - Caller or callee objects with `reachable` field
- * @returns {boolean}
- */
-function shouldShowReachability(items) {
-    if (!items || items.length === 0) return false;
-    return items.some(c => c.reachable === false);
-}
-
-/**
  * Reachability display policy for a section: per-line [unreachable] markers
  * ONLY when reachability is mixed (they distinguish which); when ALL items are
  * unreachable a single aggregate note carries the information without

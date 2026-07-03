@@ -3461,8 +3461,8 @@ describe('deadcode: out-of-tree base-class overrides are not dead (fix: #210 ana
             const names = def.map(d => d.name);
             assert.ok(!names.includes('render'),
                 `render overrides an out-of-tree base — must not be claimed dead: ${names}`);
-            assert.strictEqual(def.excludedExternalContract, 1,
-                `exactly render is counted under excludedExternalContract: ${def.excludedExternalContract}`);
+            assert.strictEqual(def.excludedExternalContract, 2,
+                `render AND the Widget class itself (fix #253a: a class extending an unresolved base is framework-discoverable) are counted under excludedExternalContract: ${def.excludedExternalContract}`);
             assert.ok(names.includes('orphan'),
                 `standalone function with no callers is still dead: ${names}`);
 

@@ -44,6 +44,7 @@ const path = require('path');
 const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { isTestFile } = require('../core/discovery');
+const { DEF_NAME_LINE_KINDS } = require('../core/deadcode');
 const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
@@ -171,11 +172,30 @@ async function evaluateRepo(repo, oracle) {
             }
             totals.verified++;
 
-            // Definition positions to exclude: the claim's own lines, in every
-            // definition of this name in the claim's file (oracles may report
-            // the declaration as a reference — jdtls ignores includeDeclaration).
+            // Definition positions to exclude: the claim's own lines (oracles
+            // may report the declaration as a reference — jdtls ignores
+            // includeDeclaration), plus the engine's #243 rule: definition
+            // NAME lines of same-name def-kind symbols are declarations, not
+            // usages. The rust-analyzer shape that forces the mirror: a dead
+            // struct's `impl Foo` headers are references of Foo to the oracle,
+            // but deleting the struct deletes its impls — the claim is right.
             const defKeys = new Set([key(claim.file, claim.startLine)]);
             if (symbol && symbol.nameLine) defKeys.add(key(claim.file, symbol.nameLine));
+            for (const d of index.symbols.get(claim.name) || []) {
+                if (!DEF_NAME_LINE_KINDS.has(d.type)) continue;
+                defKeys.add(key(d.relativePath, d.nameLine ?? d.startLine));
+            }
+            // Self-recursion claims (fix #253c): the engine established that
+            // every reference of the name sits inside a same-name def's own
+            // body — mirror that by excluding in-range refs (deleting the
+            // symbol deletes the recursion sites with it).
+            const selfRanges = claim.selfRecursive
+                ? (index.symbols.get(claim.name) || [])
+                    .filter(d => DEF_NAME_LINE_KINDS.has(d.type))
+                    .map(d => ({ file: d.relativePath, start: d.startLine, end: d.endLine }))
+                : null;
+            const inSelfRange = (file, line) => selfRanges &&
+                selfRanges.some(r => r.file === file && line >= r.start && line <= r.end);
 
             const seen = new Set();
             const usageRefs = [];
@@ -184,6 +204,7 @@ async function evaluateRepo(repo, oracle) {
                 const ucnRel = toUcnRel(ref.file);
                 const k = key(ucnRel, ref.line);
                 if (defKeys.has(k) || seen.has(k)) continue;
+                if (inSelfRange(ucnRel, ref.line)) continue;
                 seen.add(k);
                 usageRefs.push({ file: ucnRel, line: ref.line, kind: ref.kind, indexed: indexedFiles.has(ucnRel) });
             }

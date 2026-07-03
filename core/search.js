@@ -576,6 +576,7 @@ function structuralSearch(index, options = {}) {
     try {
         const { term, param, receiver, returns: returnType, decorator, exported, unused } = options;
         let unusedDecoratorNames = null; // lazy — built once per --unused search (fix #234)
+        let selfRecursiveMemo = null;    // lazy — per-name self-recursion verdicts (fix #253c)
         // Auto-infer type: --receiver implies type=call
         const type = options.type || (receiver ? 'call' : undefined);
         const results = [];
@@ -724,13 +725,30 @@ function structuralSearch(index, options = {}) {
                     // Unused filter (expensive — last check)
                     if (unused) {
                         index.buildCalleeIndex();
-                        if (index.calleeIndex.has(symbolName)) continue;
+                        // A name whose every call site is its own recursion
+                        // has zero callers (fix #253c — the deadcode
+                        // carve-out, applied here). Class-kind names are
+                        // exempt: class liveness is reference-based
+                        // (`Color.RED` keeps enum Color alive) and --unused
+                        // has no text scan to see references — deadcode is
+                        // the command with that safety net. Memoized per search.
+                        if (!selfRecursiveMemo) selfRecursiveMemo = new Map();
+                        const selfOnly = (n) => {
+                            if (!selfRecursiveMemo.has(n)) {
+                                const defs = index.symbols.get(n) || [];
+                                const classLike = defs.some(d => classTypes.has(d.type) || d.type === 'namespace');
+                                const { nameOnlySelfRecursive } = require('./deadcode');
+                                selfRecursiveMemo.set(n, !classLike && nameOnlySelfRecursive(index, n));
+                            }
+                            return selfRecursiveMemo.get(n);
+                        };
+                        if (index.calleeIndex.has(symbolName) && !selfOnly(symbolName)) continue;
                         // Constructor members are invoked through the CLASS
                         // name (fix #239): `new Widget()` indexes under
                         // 'Widget', never under 'constructor'/'__init__'.
                         if (def.className &&
                             (def.type === 'constructor' || symbolName === 'constructor' || symbolName === '__init__') &&
-                            index.calleeIndex.has(def.className)) continue;
+                            index.calleeIndex.has(def.className) && !selfOnly(def.className)) continue;
                         // Runtime-invoked entry points are never unused (fix
                         // #234, campaign G2 ×4 languages: Go main/init, Java
                         // main, Rust main/#[test] all listed — the deadcode

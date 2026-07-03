@@ -6,12 +6,19 @@
  */
 
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
+const { dirname: pathDirname } = require('path');
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
-const { isOverrideMarked, codeUnitCompare, lineInRanges } = require('./shared');
+const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments } = require('./shared');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
+
+// Class-like kinds the audit claims directly (fix #253a — unused classes were
+// never reported: the audit surface had no class kinds). 'impl' stays out (an
+// impl block belongs to its struct — the struct claim covers it); 'type'
+// aliases and macros stay out (deferred — each is its own claim family).
+const CLASS_AUDIT_KINDS = ['class', 'struct', 'interface', 'trait', 'record', 'enum', 'namespace'];
 
 /** Strip a base-type expression to its bare name: `Mapping[str, int]`→Mapping, `java.util.List<Foo>`→List, `a::b::C`→C. */
 function _bareBaseName(raw) {
@@ -28,11 +35,29 @@ function _bareBaseName(raw) {
 // convention, rule #9.)
 const _UNIVERSAL_ROOTS = new Set(['object', 'Object']);
 
+// Python typing bases with a fixed, known surface that never dispatch an
+// arbitrary subclass method by name (fix #253b): `class DataService(Generic[T])`
+// is exactly `class DataService` for dispatch purposes — Generic contributes
+// __class_getitem__ machinery, nothing that calls subclass methods. Without
+// this, the external-base shield hid every public method of every generic
+// class. Python-gated: an external class literally named Generic in another
+// language could genuinely dispatch. Protocol stays OUT — protocol classes
+// are contract surface, and their members' "deadness" is a different claim.
+const _PY_NON_DISPATCHING_BASES = new Set(['Generic']);
+
 /** True when a base name resolves to NO in-project class/struct/interface/trait/record (an out-of-tree type). */
-function _baseIsExternal(index, bare) {
+function _baseIsExternal(index, bare, lang) {
     if (!bare || _UNIVERSAL_ROOTS.has(bare)) return false;
+    if (lang === 'python' && _PY_NON_DISPATCHING_BASES.has(bare)) return false;
     const defs = index.symbols.get(bare);
     return !(defs && defs.some(d => _CLASS_KINDS.includes(d.type)));
+}
+
+/** Does this CLASS DEF extend at least one base that is not in the project index? */
+function _classDefHasExternalBase(index, classDef, lang) {
+    if (!classDef.extends) return false;
+    const supers = Array.isArray(classDef.extends) ? classDef.extends : splitParentList(classDef.extends);
+    return supers.some(raw => _baseIsExternal(index, _bareBaseName(raw), lang));
 }
 
 /**
@@ -50,16 +75,10 @@ function _baseIsExternal(index, bare) {
  * `impl Display for`s.
  */
 function _classHasExternalBase(index, symbol) {
+    const lang = index.files.get(symbol.file)?.language;
     const classDefs = (index.symbols.get(symbol.className) || []).filter(c =>
         c.file === symbol.file && _CLASS_KINDS.includes(c.type));
-    for (const cd of classDefs) {
-        if (!cd.extends) continue;
-        const supers = Array.isArray(cd.extends) ? cd.extends : splitParentList(cd.extends);
-        for (const raw of supers) {
-            if (_baseIsExternal(index, _bareBaseName(raw))) return true;
-        }
-    }
-    return false;
+    return classDefs.some(cd => _classDefHasExternalBase(index, cd, lang));
 }
 
 /**
@@ -91,6 +110,55 @@ function overridesOutOfTreeBase(index, symbol) {
         !symbol.name.startsWith('#') && !symbol.name.startsWith('_');
     if (publicByShape && _classHasExternalBase(index, symbol)) return true;
     return false;
+}
+
+// Symbol types whose definition NAME line provably cannot reference a
+// same-name VALUE — used to stop same-name defs keeping each other alive
+// (fix #243). 'state' and 'field' stay OUT: `helper = other.helper` and
+// Java `int helper = Other.helper();` genuinely reference the name.
+const DEF_NAME_LINE_KINDS = new Set([
+    'function', 'method', 'static', 'public', 'abstract', 'constructor',
+    'private', 'classmethod', 'property', 'setter', 'deleter', 'get', 'set',
+    'override', 'static get', 'static set', 'override get', 'override set',
+    'static override', 'static override get', 'static override set',
+    'class', 'struct', 'interface', 'trait', 'record', 'enum', 'namespace', 'impl',
+]);
+
+/**
+ * Is EVERY call site of `name` inside the body of a same-name definition?
+ * Recursion is not liveness (fix #253c): if no code outside defs of the name
+ * calls the name, the whole same-name group is unreachable from outside —
+ * `function retry() { ...retry()... }` with no external caller is dead, but
+ * the calleeIndex fast path saw a call site and skipped it. Transitively
+ * sound for the group: a same-name def called only by another same-name def
+ * is dead exactly when its caller is. findCallees already excludes
+ * self-recursion; this mirrors that rule at the deadcode pre-filter.
+ * Conservative on any uncertainty: unknown def ranges or an outside site
+ * keep the name "used".
+ */
+function nameOnlySelfRecursive(index, name) {
+    const files = index.calleeIndex && index.calleeIndex.get(name);
+    if (!files || files.size === 0) return false;
+    const defs = (index.symbols.get(name) || []).filter(d => DEF_NAME_LINE_KINDS.has(d.type));
+    if (defs.length === 0) return false;
+    const defFiles = new Set(defs.map(d => d.file));
+    for (const f of files) {
+        if (!defFiles.has(f)) return false; // call site in a def-less file — external
+    }
+    const { getCachedCalls } = require('./callers');
+    for (const f of files) {
+        let calls;
+        try { calls = getCachedCalls(index, f); } catch { return false; }
+        if (!calls) return false;
+        for (const call of calls) {
+            if (call.name !== name && call.resolvedName !== name &&
+                !(call.resolvedNames && call.resolvedNames.includes(name))) continue;
+            const inside = defs.some(d => d.file === f &&
+                call.line >= d.startLine && call.line <= d.endLine);
+            if (!inside) return false;
+        }
+    }
+    return true;
 }
 
 /** Check if a position in a line is inside a string literal (quotes/backticks) */
@@ -328,18 +396,31 @@ function deadcode(index, options = {}) {
     const callableTypes = ['function', 'method', 'static', 'public', 'abstract', 'constructor',
         'private', 'get', 'set', 'property', 'setter', 'deleter', 'classmethod',
         'override', 'static get', 'static set', 'override get', 'override set',
-        'static override', 'static override get', 'static override set'];
+        'static override', 'static override get', 'static override set',
+        // Class-like kinds joined in fix #253a — unused classes/structs/
+        // interfaces were never audited in either mode.
+        ...CLASS_AUDIT_KINDS];
+    const auditTypeSet = new Set(callableTypes);
+    const classAuditSet = new Set(CLASS_AUDIT_KINDS);
     const callableNames = new Set();
     for (const [symbolName, symbols] of index.symbols) {
-        if (symbols.some(s => callableTypes.includes(s.type))) {
+        if (symbols.some(s => auditTypeSet.has(s.type))) {
             callableNames.add(symbolName);
         }
     }
 
     // Pre-filter: names in the callee index have call sites → definitely used → not dead.
+    // Exception (fix #253c): a name whose EVERY call site sits inside a
+    // same-name definition's own body is only self-recursive — recursion is
+    // not liveness. Those names fall through to the text scan, which excludes
+    // in-body references for them (selfRecursiveNames below).
     let potentiallyDeadNames = new Set();
+    const selfRecursiveNames = new Set();
     for (const name of callableNames) {
         if (!index.calleeIndex.has(name)) {
+            potentiallyDeadNames.add(name);
+        } else if (nameOnlySelfRecursive(index, name)) {
+            selfRecursiveNames.add(name);
             potentiallyDeadNames.add(name);
         }
     }
@@ -461,9 +542,21 @@ function deadcode(index, options = {}) {
         'static get', 'static set', 'override get', 'override set',
         'static override get', 'static override set']);
     const accessorNames = new Set();
+    // Names owned by a class-kind definition (fix #253a): in PYTHON files,
+    // string-interior matches count as usage for these — PEP 484 forward
+    // references (`x: "Foo"`, `Optional["Foo"]`) are real type references
+    // the type checker resolves; skipping them claimed live classes dead.
+    // Conservative direction only (docstring mentions also keep the class
+    // alive). Other languages keep the string skip: their in-string names
+    // are reflection (a documented limitation), not a language feature.
+    const classKindNames = new Set();
     for (const name of potentiallyDeadNames) {
-        if ((index.symbols.get(name) || []).some(s => ACCESSOR_KINDS.has(s.type))) {
+        const defs = index.symbols.get(name) || [];
+        if (defs.some(s => ACCESSOR_KINDS.has(s.type))) {
             accessorNames.add(name);
+        }
+        if (defs.some(s => classAuditSet.has(s.type))) {
+            classKindNames.add(name);
         }
     }
 
@@ -488,7 +581,11 @@ function deadcode(index, options = {}) {
                     if (present) namesInFile.push(name);
                 }
                 if (namesInFile.length === 0) continue;
-                const lines = content.split('\n');
+                // Block-comment interiors masked to spaces (fix #253d): the
+                // per-line skip below only handles // and # comments, so a
+                // name inside /* ... */ counted as usage — commented-out code
+                // silently kept its symbols "alive" and hid true dead claims.
+                const lines = maskBlockComments(content, fileEntry.language).split('\n');
                 for (const name of namesInFile) {
                     const nameLen = name.length;
                     for (let i = 0; i < lines.length; i++) {
@@ -511,8 +608,11 @@ function deadcode(index, options = {}) {
                             // Skip if inside a # comment (Python — # preceded by whitespace or at start)
                             if (hashIdx !== -1 && hashIdx < pos &&
                                 (hashIdx === 0 || /\s/.test(line[hashIdx - 1]))) continue;
-                            // Skip if inside a string literal
-                            if (isInsideString(line, pos)) continue;
+                            // Skip if inside a string literal — EXCEPT class-
+                            // kind names in Python (fix #253a): `x: "Foo"`
+                            // forward references are real type references.
+                            if (isInsideString(line, pos) &&
+                                !(fileEntry.language === 'python' && classKindNames.has(name))) continue;
                             // Property/field access (preceded by '.'), not a
                             // call: resolve the RECEIVER (fix #216, express-
                             // measured false-dead — `app.all(route, user.load)`
@@ -543,7 +643,15 @@ function deadcode(index, options = {}) {
                                 let r = pos - 2;
                                 while (r >= 0 && /[\w$]/.test(line[r])) r--;
                                 const receiver = line.slice(r + 1, pos - 1);
-                                if (!receiver && !isDecoratorRef) continue;
+                                // A CHAINED receiver (`z.string().email().isEmail`)
+                                // extracts as empty — for accessor-kind names
+                                // that read is still the consumption form, so
+                                // the #247 unscoped fallback below must get
+                                // its chance (zod-measured false-dead: eight
+                                // v3 getters whose only references are
+                                // chained reads; the empty-receiver drop
+                                // fired before the accessor exemption).
+                                if (!receiver && !isDecoratorRef && !accessorNames.has(name)) continue;
                                 if (['this', 'self', 'cls'].includes(receiver)) {
                                     dottedScope = 'same-file';
                                 } else {
@@ -569,10 +677,19 @@ function deadcode(index, options = {}) {
                             // (fix #247, eval-measured: Python's block colon made
                             // `if merge_url.is_relative_url:` read as a key, dropping the
                             // property's only consumption).
+                            // Python is exempt entirely (fix #253a): it has NO
+                            // bare-identifier-key syntax where the name is not
+                            // an expression — dict keys are expressions, and
+                            // `except Foo:` / `-> Foo:` / `while Foo:` are all
+                            // real usages the skip was dropping. `case Foo:`
+                            // (switch/match) is likewise an expression usage in
+                            // every language.
                             const afterChar = pos + nameLen < line.length ? line[pos + nameLen] : '';
                             const afterChar2 = pos + nameLen + 1 < line.length ? line[pos + nameLen + 1] : '';
                             if (afterChar === ':' && afterChar2 !== ':' &&
-                                !(pos > 0 && line[pos - 1] === '.')) continue;
+                                fileEntry.language !== 'python' &&
+                                !(pos > 0 && line[pos - 1] === '.') &&
+                                !/(^|[^\w$])case\s+$/.test(line.slice(0, pos))) continue;
                             // Valid reference found
                             if (!usageIndex.has(name)) usageIndex.set(name, []);
                             usageIndex.get(name).push({
@@ -588,18 +705,6 @@ function deadcode(index, options = {}) {
             } catch { /* skip unreadable files */ }
         }
     }
-
-    // Symbol types whose definition NAME line provably cannot reference a
-    // same-name VALUE — used to stop same-name defs keeping each other alive
-    // (fix #243). 'state' and 'field' stay OUT: `helper = other.helper` and
-    // Java `int helper = Other.helper();` genuinely reference the name.
-    const DEF_NAME_LINE_KINDS = new Set([
-        'function', 'method', 'static', 'public', 'abstract', 'constructor',
-        'private', 'classmethod', 'property', 'setter', 'deleter', 'get', 'set',
-        'override', 'static get', 'static set', 'override get', 'override set',
-        'static override', 'static override get', 'static override set',
-        'class', 'struct', 'interface', 'trait', 'record', 'enum', 'namespace', 'impl',
-    ]);
 
     for (const [name, symbols] of index.symbols) {
         // Definition NAME lines of same-name def-kind symbols are
@@ -622,9 +727,27 @@ function deadcode(index, options = {}) {
             return sameNameDefLines;
         };
 
+        // Same-name definition BODY ranges — consulted only for names the
+        // self-recursion carve-out (fix #253c) admitted: for those, a usage
+        // inside a same-name def's own body is the recursion itself, never
+        // outside liveness. Scoped to carve-out names so a sibling-method
+        // call (`self.f()` from another method) keeps counting elsewhere.
+        let sameNameDefRanges = null;
+        const defRanges = () => {
+            if (sameNameDefRanges) return sameNameDefRanges;
+            sameNameDefRanges = new Map();
+            for (const other of symbols) {
+                if (!DEF_NAME_LINE_KINDS.has(other.type)) continue;
+                let arr = sameNameDefRanges.get(other.file);
+                if (!arr) { arr = []; sameNameDefRanges.set(other.file, arr); }
+                arr.push([other.startLine, other.endLine]);
+            }
+            return sameNameDefRanges;
+        };
+
         for (const symbol of symbols) {
-            // Skip non-function/class types (callableTypes defined above)
-            if (!callableTypes.includes(symbol.type)) {
+            // Skip non-audited types (callableTypes defined above)
+            if (!auditTypeSet.has(symbol.type)) {
                 continue;
             }
 
@@ -682,7 +805,8 @@ function deadcode(index, options = {}) {
             }
 
             // Fast path: name has call sites in callee index → definitely used → not dead
-            if (index.calleeIndex.has(name)) {
+            // (unless every site is the name's own recursion — fix #253c).
+            if (index.calleeIndex.has(name) && !selfRecursiveNames.has(name)) {
                 continue;
             }
             // Constructor members are invoked through the CLASS name
@@ -691,8 +815,29 @@ function deadcode(index, options = {}) {
             // class's constructor dead).
             if (symbol.className &&
                 (symbol.type === 'constructor' || name === 'constructor' || name === '__init__') &&
-                index.calleeIndex.has(symbol.className)) {
+                index.calleeIndex.has(symbol.className) &&
+                !selfRecursiveNames.has(symbol.className)) {
                 continue;
+            }
+
+            // Class-kind claims (fix #253a): a class whose member the runtime
+            // or a framework invokes is live with zero textual references of
+            // the class NAME — `class Main { public static void main }`,
+            // a class with @app.route methods. Deleting the class deletes the
+            // entry point. Framework-registered members follow the same
+            // --include-decorated reveal as directly decorated symbols.
+            if (classAuditSet.has(symbol.type)) {
+                const members = (fileEntry?.symbols || []).filter(s =>
+                    s !== symbol && s.className === name);
+                if (members.some(m => langModule.isEntryPoint?.(m))) {
+                    continue;
+                }
+                if (members.some(m => isFrameworkEntrypoint(m, index))) {
+                    if (!options.includeDecorated) {
+                        excludedDecorated++;
+                        continue;
+                    }
+                }
             }
 
             // Slow path: check AST-based usage index for remaining names
@@ -707,10 +852,22 @@ function deadcode(index, options = {}) {
             let nonDefUsages = allUsages.filter(u =>
                 !(u.file === symbol.file && (u.line === symbol.startLine || u.line === symbol.nameLine)) &&
                 !(defNameLines().get(u.file)?.has(u.line)) &&
+                // Self-recursion carve-out names (fix #253c): a reference
+                // inside a same-name def's own body is the recursion itself.
+                !(selfRecursiveNames.has(name) &&
+                    lineInRanges(u.line, defRanges().get(u.file) || [])) &&
                 (!u.dottedScope ||
                     (u.dottedScope === 'same-file'
                         ? u.file === symbol.file
-                        : u.dottedScope === symbol.relativePath))
+                        // Directory-scoped packages (Go): the import binds the
+                        // package DIRECTORY, so the resolved module file may
+                        // be any sibling of the symbol's file (fix #253,
+                        // grpc-go-measured false-dead: the only usages of
+                        // `internal.EnforceSubConnEmbedding` resolved to a
+                        // sibling of internal/internal.go and were dropped).
+                        : (u.dottedScope === symbol.relativePath ||
+                            (langTraits(lang)?.packageScope === 'directory' &&
+                                pathDirname(u.dottedScope) === pathDirname(symbol.relativePath)))))
             );
 
             // For exported symbols in --include-exported mode, also filter out export-site
@@ -736,7 +893,14 @@ function deadcode(index, options = {}) {
                 // fix #210). A zero usage count is not evidence of deadness.
                 // Hidden by default; revealed under --include-exported, since
                 // it is external-reachable surface, not internal dead code.
-                const isExternalContract = overridesOutOfTreeBase(index, symbol);
+                // Class-kind claims (fix #253a) get the same shield when the
+                // class itself EXTENDS an unresolved base: frameworks discover
+                // such subclasses non-textually (django `Command(BaseCommand)`
+                // by module path, pytest plugins by registration) — zero
+                // in-project references is not evidence of deadness there.
+                const isExternalContract = classAuditSet.has(symbol.type)
+                    ? _classDefHasExternalBase(index, symbol, lang)
+                    : overridesOutOfTreeBase(index, symbol);
                 if (isExternalContract && !options.includeExported) {
                     excludedExternalContract++;
                     continue;
@@ -784,6 +948,9 @@ function deadcode(index, options = {}) {
                     ...(symbol.className && { className: symbol.className }),
                     isExported,
                     usageCount: 0,
+                    // The name's only references are its own recursion
+                    // (fix #253c) — say so, the reader will see call sites.
+                    ...(selfRecursiveNames.has(name) && { selfRecursive: true }),
                     ...(decorators.length > 0 && { decorators }),
                     ...(annotations.length > 0 && { annotations }),
                     ...(declaredOn && { declaredOn }),
@@ -808,4 +975,4 @@ function deadcode(index, options = {}) {
     } finally { index._endOp(); }
 }
 
-module.exports = { buildUsageIndex, deadcode };
+module.exports = { buildUsageIndex, deadcode, nameOnlySelfRecursive, DEF_NAME_LINE_KINDS };

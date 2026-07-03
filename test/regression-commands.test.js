@@ -5825,3 +5825,262 @@ describe('fix #252: extraction/search leftovers', () => {
         assert.strictEqual(lines[0], 'function foo() { return 1; }');
     });
 });
+
+// ============================================================================
+// FIX #253: deferred-design deadcode batch
+// ============================================================================
+
+describe('fix #253a: class-kind deadcode audit', () => {
+    it('claims an unused non-exported class; instantiated and extended classes stay alive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'class DeadWidget { crunch() { return 1; } }\n' +
+                'class LiveWidget { go() {} }\n' +
+                'class Base { m() {} }\n' +
+                'class Child extends Base { }\n' +
+                'function main() { return new LiveWidget(); }\nmodule.exports = { main };'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => `${c.name}:${c.type}`);
+            assert.ok(names.includes('DeadWidget:class'), `unused class claimed: ${names}`);
+            assert.ok(names.includes('Child:class'), `unused subclass claimed: ${names}`);
+            assert.ok(!names.some(n => n.startsWith('LiveWidget:')), `instantiated class alive: ${names}`);
+            assert.ok(!names.some(n => n.startsWith('Base:')), `extended class alive: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('Go: unused lowercase struct claimed; a struct used as a variable type stays alive', () => {
+        const dir = tmp({
+            'go.mod': 'module t\n',
+            'a.go': 'package main\n\ntype orphan struct{ id int }\n\ntype used struct{ id int }\n\n' +
+                'func main() {\n\tvar u used\n\t_ = u\n}\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => `${c.name}:${c.type}`);
+            assert.deepStrictEqual(names, ['orphan:struct']);
+        } finally { rm(dir); }
+    });
+
+    it('Rust: dead private struct claimed even with an impl block (impl headers are declarations)', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': 'struct Widget { id: u32 }\n\nimpl Widget {\n    fn make() -> Self { Widget { id: 0 } }\n}\n\npub fn run() -> u32 { 1 }\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => `${c.name}:${c.type}`);
+            assert.ok(names.includes('Widget:struct'), `struct with only self-construction claimed: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('Java: a class containing public static void main is never claimed (member entry point)', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Main.java': 'public class Main {\n    public static void main(String[] args) {\n        System.out.println(1);\n    }\n}\n',
+            'Orphan.java': 'class Orphan {\n    void crunch() { }\n}\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => `${c.name}:${c.type}`);
+            assert.ok(names.includes('Orphan:class'), `package-private unused class claimed: ${names}`);
+            assert.ok(!names.some(n => n.startsWith('Main:')), `entry-point class protected: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('a class with a framework-registered member follows the --include-decorated reveal', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'app.py': 'from flask import app\n\nclass Jobs:\n    @app.route("/tick")\n    def tick(self):\n        return 1\n'
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(r.ok);
+            assert.ok(!r.result.some(c => c.name === 'Jobs'),
+                'class with a route-decorated member is framework-reachable');
+            assert.ok(r.result.excludedDecorated >= 1, 'counted under excludedDecorated');
+        } finally { rm(dir); }
+    });
+
+    it('Python: forward-ref string annotations and except clauses keep classes alive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'fwd.py': 'class Ghost:\n    pass\n\nclass Spectre:\n    pass\n\ndef make(x: "Spectre"):\n    return x\n',
+            'exc.py': 'class CustomError(Exception):\n    pass\n\ndef risky():\n    try:\n        pass\n    except CustomError:\n        pass\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => c.name);
+            assert.ok(names.includes('Ghost'), `unreferenced class claimed: ${names}`);
+            assert.ok(!names.includes('Spectre'), `forward-ref "Spectre" is a real type reference: ${names}`);
+            assert.ok(!names.includes('CustomError'), `except CustomError: is a real usage: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('a switch case label is an expression usage, not an object key', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'b.ts': 'class Matcher { }\nfunction pick(k: unknown) {\n  switch (k) {\n    case Matcher:\n      return 1;\n  }\n  return 0;\n}\nexport { pick };\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            assert.ok(!r.result.some(c => c.name === 'Matcher'),
+                'case Matcher: keeps the class alive');
+        } finally { rm(dir); }
+    });
+
+    it('a class extending an unresolved base routes external-contract, revealed under --include-exported', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'cmd.py': 'from django.core.management import BaseCommand\n\nclass Command(BaseCommand):\n    def handle(self):\n        return 1\n'
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(r.ok);
+            assert.ok(!r.result.some(c => c.name === 'Command'),
+                'framework-discovered subclass hidden by default');
+            assert.ok(r.result.excludedExternalContract >= 1);
+            const r2 = execute(index, 'deadcode', { includeExported: true });
+            const cmd = r2.result.find(c => c.name === 'Command');
+            assert.ok(cmd, 'revealed under --include-exported');
+            assert.strictEqual(cmd.externalContract, true, 'labeled externalContract');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #253b: typing.Generic is a non-dispatching base', () => {
+    it('methods of a Generic[T] class are claimable; a real external base still shields', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'svc.py': 'from typing import Generic, TypeVar\nfrom framework import BaseHandler\nT = TypeVar("T")\n\n' +
+                'class DataService(Generic[T]):\n    def find(self, k):\n        return k\n\n' +
+                'class WebHook(BaseHandler):\n    def handle(self, req):\n        return req\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => c.name);
+            assert.ok(names.includes('find'), `Generic[T] does not shield methods: ${names}`);
+            assert.ok(names.includes('DataService'), `unused generic class claimed: ${names}`);
+            assert.ok(!names.includes('handle'), `real external base still shields: ${names}`);
+            assert.ok(!names.includes('WebHook'), `real external base shields the class: ${names}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #253c: self-recursion is not liveness', () => {
+    it('a function whose only call sites are its own recursion is claimed, marked selfRecursive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'c.js': 'function retry(n) { return n > 0 ? retry(n - 1) : 0; }\nmodule.exports = {};\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const claim = r.result.find(c => c.name === 'retry');
+            assert.ok(claim, 'self-recursive orphan claimed');
+            assert.strictEqual(claim.selfRecursive, true, 'claim carries the marker');
+            const text = output.formatDeadcode(r.result);
+            assert.ok(text.includes('only self-references'), 'text output says why');
+        } finally { rm(dir); }
+    });
+
+    it('counter-probes: an external call, or a non-call reference outside the body, keeps it alive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'c.js': 'function retry(n) { return n > 0 ? retry(n - 1) : 0; }\nfunction boot() { return retry(3); }\nmodule.exports = { boot };\n',
+            'd.js': 'function walk(t) { return t ? walk(t.next) : 0; }\nconst handlers = { onTick: walk };\nmodule.exports = { handlers };\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => c.name);
+            assert.ok(!names.includes('retry'), `externally called recursive fn alive: ${names}`);
+            assert.ok(!names.includes('walk'), `callback-referenced recursive fn alive: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('search --unused lists self-recursive functions but never class-kind names', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'Color.java': 'public enum Color {\n    RED(1), GREEN(2);\n    private final int v;\n    Color(int v) { this.v = v; }\n    public int value() { return v; }\n}\n',
+            'App.java': 'public class App {\n    public int main() {\n        return Color.RED.value();\n    }\n    private int spin(int n) { return n > 0 ? spin(n - 1) : 0; }\n}\n'
+        });
+        try {
+            const r = execute(idx(dir), 'search', { unused: true });
+            assert.ok(r.ok);
+            const names = r.result.results.map(s => `${s.className || ''}.${s.name}`);
+            assert.ok(names.includes('App.spin'), `self-recursive method has zero callers: ${names}`);
+            assert.ok(!names.includes('Color.Color'),
+                `enum ctor invoked by constants — class-kind names exempt from the carve-out: ${names}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #253d: block comments are not usage', () => {
+    it('a function referenced only inside /* */ is dead; string and regex /* stay untouched', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'd.js': 'function ghost() { return 1; }\n/*\n  ghost();\n*/\n' +
+                'function starry() { return 1; }\nconst s = "call starry() later";\n' +
+                'function classy() { return 1; }\nconst re = /[/*]/; classy();\n' +
+                'module.exports = {};\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', {});
+            assert.ok(r.ok);
+            const names = r.result.map(c => c.name);
+            assert.ok(names.includes('ghost'), `commented-out call is not usage: ${names}`);
+            assert.ok(!names.includes('classy'), `regex [/*] must not open a comment: ${names}`);
+        } finally { rm(dir); }
+    });
+
+    it('Rust: nested block comments mask fully; raw strings are never masked', () => {
+        const { maskBlockComments } = require('../core/shared');
+        const nested = maskBlockComments('/* outer /* inner */ still */ code();', 'rust');
+        assert.ok(nested.trim() === 'code();', `nested comment fully masked: ${JSON.stringify(nested)}`);
+        const raw = maskBlockComments('let r = r#"raw /* x */ text"#;\n/* real */ f();', 'rust');
+        assert.ok(raw.includes('raw /* x */ text'), 'raw string untouched');
+        assert.ok(!raw.includes('real'), 'real comment masked');
+    });
+
+    it('JS template literals and line structure survive masking', () => {
+        const { maskBlockComments } = require('../core/shared');
+        const src = 'let t = `tpl /* keep */ end`;\n/* line1\nline2 */ after();\n';
+        const masked = maskBlockComments(src, 'javascript');
+        assert.ok(masked.includes('tpl /* keep */ end'), 'template untouched');
+        assert.strictEqual(masked.split('\n').length, src.split('\n').length, 'line count preserved');
+        assert.ok(masked.includes('after();'), 'code after comment intact');
+        assert.ok(!masked.includes('line1') && !masked.includes('line2'), 'comment interior masked');
+    });
+});
+
+describe('fix #253: accessor reads on chained-call receivers are consumption', () => {
+    it('a getter whose only reference is `make().isReady` is not dead', () => {
+        // zod-measured (exported arm): eight v3 getters' only references are
+        // chained reads like `z.string().email().isEmail` — the receiver
+        // extracts as EMPTY (char before the dot is `)`), and the
+        // empty-receiver drop fired before the #247 accessor exemption.
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'w.ts': 'export class Widget {\n  get isReady(): boolean { return true; }\n  get isStale(): boolean { return false; }\n}\nexport function make(): Widget { return new Widget(); }\n',
+            'use.ts': 'import { make } from "./w";\nexport const ok = make().isReady;\n'
+        });
+        try {
+            const r = execute(idx(dir), 'deadcode', { includeExported: true });
+            assert.ok(r.ok);
+            const names = r.result.map(c => c.name);
+            assert.ok(!names.includes('isReady'), `chained accessor read is consumption: ${names}`);
+            assert.ok(names.includes('isStale'), `unread getter still claimed: ${names}`);
+        } finally { rm(dir); }
+    });
+});

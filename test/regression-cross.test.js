@@ -1738,7 +1738,7 @@ public class Service {
         assert.ok(!defaultNames.includes('cleanup'), 'Annotated cleanup should be excluded by default');
         assert.ok(!defaultNames.includes('dataSource'), 'Annotated dataSource should be excluded by default');
         assert.ok(defaultNames.includes('plainUnused'), 'plainUnused (no annotations) should still be detected');
-        assert.strictEqual(dcDefault.excludedDecorated, 2, 'Should report 2 excluded annotated symbols');
+        assert.strictEqual(dcDefault.excludedDecorated, 3, 'Should report 3: two annotated methods + the Service class carrying them (fix #253a: framework-registered members keep the class)');
 
         // With includeDecorated: annotated methods are included
         const dcAll = index.deadcode({ includeExported: true, includeDecorated: true });

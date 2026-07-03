@@ -5819,3 +5819,31 @@ describe('fix #240 (Go): exporters import lines, entrypoint definition attributi
         } finally { rm(dir); }
     });
 });
+
+describe('fix #253 (Go): package-qualified dotted usage scopes to the package DIRECTORY', () => {
+    it('an embedded interface reached via pkg.Name resolved to a SIBLING file still counts as usage', () => {
+        // grpc-go-measured false-dead: `internal.EnforceSubConnEmbedding`
+        // resolved through moduleResolved to a sibling of internal/internal.go,
+        // and the exact-file dottedScope comparison dropped the only usages.
+        // A Go import binds the package directory, not one file.
+        const dir = tmp({
+            'go.mod': 'module t\n',
+            'pkg/aaa.go': 'package pkg\n\nfunc Helper() int { return 1 }\n',
+            'pkg/marker.go': 'package pkg\n\ntype EnforceEmbedding interface {\n\tenforceEmbedding()\n}\n',
+            'main.go': 'package main\n\nimport "t/pkg"\n\ntype wrapper struct {\n\tpkg.EnforceEmbedding\n\tid int\n}\n\nfunc main() {\n\t_ = pkg.Helper()\n\t_ = wrapper{id: 1}\n}\n'
+        });
+        try {
+            const index = idx(dir);
+            // The fixture must exercise the sibling-file path: the import
+            // resolves to aaa.go while the interface lives in marker.go.
+            const mainEntry = [...index.files.values()].find(f => f.relativePath === 'main.go');
+            assert.strictEqual(mainEntry.moduleResolved['t/pkg'], 'pkg/aaa.go',
+                'fixture premise: module resolves to the sibling file');
+            const r = execute(index, 'deadcode', { includeExported: true });
+            assert.ok(r.ok);
+            const names = r.result.map(c => c.name);
+            assert.ok(!names.includes('EnforceEmbedding'),
+                `embedded pkg.EnforceEmbedding is a real usage: ${names}`);
+        } finally { rm(dir); }
+    });
+});

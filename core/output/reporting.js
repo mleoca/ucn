@@ -236,8 +236,10 @@ function formatDeadcode(results, options = {}) {
         const extStr = item.externalContract
             ? ' [reachable via out-of-tree base — external contract, not dead]'
             : '';
+        // The only references are the symbol's own recursion (fix #253c).
+        const recStr = item.selfRecursive ? ' [only self-references — recursive]' : '';
         const displayName = item.className ? `${item.className}.${item.name}` : item.name;
-        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${displayName} (${item.type})${exported}${hintStr}${declStr}${extStr}`);
+        lines.push(`  ${lineRange(item.startLine, item.endLine)} ${displayName} (${item.type})${exported}${hintStr}${declStr}${extStr}${recStr}`);
     }
 
     if (hidden > 0) {
@@ -303,7 +305,8 @@ function formatDeadcodeJson(results) {
                     ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
                     ...(item.annotations && item.annotations.length > 0 && { annotations: item.annotations }),
                     ...(item.declaredOn && { declaredOn: item.declaredOn }),
-                    ...(item.externalContract && { externalContract: true })
+                    ...(item.externalContract && { externalContract: true }),
+                    ...(item.selfRecursive && { selfRecursive: true })
                 };
             }),
         },

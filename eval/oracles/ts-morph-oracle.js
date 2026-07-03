@@ -201,6 +201,20 @@ function findDeclarationAt(sf, name, line) {
     for (const v of sf.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
         if (v.getName() === name && v.getStartLineNumber() === line) return v;
     }
+    // Interfaces, enums, type aliases, namespaces, and accessors — the
+    // deadcode eval claims these kinds (class-kind audit + accessor audit)
+    // and they were all "declaration not found" before (32 unpinnable zod
+    // exported-arm claims).
+    const NAMED_DECL_KINDS = [
+        SyntaxKind.InterfaceDeclaration, SyntaxKind.EnumDeclaration,
+        SyntaxKind.TypeAliasDeclaration, SyntaxKind.ModuleDeclaration,
+        SyntaxKind.GetAccessor, SyntaxKind.SetAccessor,
+    ];
+    for (const kind of NAMED_DECL_KINDS) {
+        for (const d of sf.getDescendantsOfKind(kind)) {
+            if (d.getName && d.getName() === name && d.getStartLineNumber() === line) return d;
+        }
+    }
     // CJS property-assigned functions (`proto.use = function use() {}`)
     for (const af of jsAssignedFunctions(sf)) {
         if (af.name === name && af.line === line) return af.anchor;
@@ -210,6 +224,11 @@ function findDeclarationAt(sf, name, line) {
     for (const cls of sf.getClasses()) {
         if (cls.getName() === name) return cls;
         for (const m of cls.getMethods()) if (m.getName() === name) return m;
+    }
+    for (const kind of NAMED_DECL_KINDS) {
+        for (const d of sf.getDescendantsOfKind(kind)) {
+            if (d.getName && d.getName() === name) return d;
+        }
     }
     return null;
 }

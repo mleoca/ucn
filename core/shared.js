@@ -285,6 +285,156 @@ function classDispatchNames(index, className, methodName, cap = 256) {
     return out;
 }
 
+// Languages with /* */ block comments (fix #253d). Python/HTML stay out:
+// Python has none (docstrings are strings, and doctest code inside them is
+// runnable), HTML's <!-- --> wraps virtual-JS line mapping.
+const BLOCK_COMMENT_LANGS = new Set(['javascript', 'typescript', 'tsx', 'go', 'java', 'rust']);
+
+// JS/TS chars after which a `/` starts a regex literal, not division.
+const _REGEX_PREV_CHARS = new Set(['=', '(', '[', '{', ',', ';', ':', '!', '&', '|', '?', '+', '-', '*', '%', '~', '^', '<', '>']);
+const _REGEX_PREV_WORDS = new Set(['return', 'typeof', 'case', 'in', 'of', 'new', 'delete', 'void', 'instanceof', 'do', 'else', 'yield', 'await']);
+
+/**
+ * Replace /* ... *\/ block-comment interiors with spaces, preserving line
+ * structure, so line-based usage scans stop counting commented-out code as
+ * consumption (fix #253d — the deadcode scan only skipped // and # lines).
+ *
+ * Failure directions are asymmetric: masking real code drops real usages
+ * (false-dead risk), while missing a comment keeps the status quo (false-
+ * alive). The scanner therefore only opens a block on a literal `/*` whose
+ * string/regex context is positively ruled out, and every ambiguous
+ * construct (mis-detected regex, template interpolation, lifetime lookalike)
+ * resolves to "skip without masking".
+ */
+function maskBlockComments(content, language) {
+    if (!BLOCK_COMMENT_LANGS.has(language) || !content.includes('/*')) return content;
+    const isJsLike = language === 'javascript' || language === 'typescript' || language === 'tsx';
+    const hasBacktick = isJsLike || language === 'go';
+    const out = content.split('');
+    const n = content.length;
+    let i = 0;
+    let prevSig = null; // last significant char seen in code mode
+    let prevWord = '';  // last identifier-ish word (survives whitespace)
+    const wordCh = (c) => c != null && /[\w$]/.test(c);
+    while (i < n) {
+        const ch = content[i];
+        const next = i + 1 < n ? content[i + 1] : '';
+        if (ch === '/' && next === '/') {
+            // Line comment — leave the text (the line scan handles // itself)
+            while (i < n && content[i] !== '\n') i++;
+            continue;
+        }
+        if (ch === '/' && next === '*') {
+            let depth = 1;
+            out[i] = ' '; out[i + 1] = ' ';
+            i += 2;
+            while (i < n && depth > 0) {
+                if (content[i] === '*' && content[i + 1] === '/') {
+                    depth--; out[i] = ' '; out[i + 1] = ' '; i += 2; continue;
+                }
+                if (language === 'rust' && content[i] === '/' && content[i + 1] === '*') {
+                    depth++; out[i] = ' '; out[i + 1] = ' '; i += 2; continue; // Rust block comments nest
+                }
+                if (content[i] !== '\n') out[i] = ' ';
+                i++;
+            }
+            prevSig = null; prevWord = '';
+            continue;
+        }
+        if (isJsLike && ch === '/') {
+            // Regex literal detection: a false "regex" here only SKIPS a
+            // region (missing comments inside it — safe); it never masks.
+            const isRegex = prevSig === null || _REGEX_PREV_CHARS.has(prevSig) ||
+                (wordCh(prevSig) && _REGEX_PREV_WORDS.has(prevWord));
+            if (isRegex) {
+                let j = i + 1, inClass = false;
+                while (j < n && content[j] !== '\n') {
+                    const c = content[j];
+                    if (c === '\\') { j += 2; continue; }
+                    if (c === '[') inClass = true;
+                    else if (c === ']') inClass = false;
+                    else if (c === '/' && !inClass) break;
+                    j++;
+                }
+                if (j < n && content[j] === '/') {
+                    i = j + 1; prevSig = '/'; prevWord = '';
+                    continue;
+                }
+                // No closing slash on the line — it was division after all.
+            }
+        }
+        if (language === 'rust' && (ch === 'r' || ch === 'b') && !(i > 0 && wordCh(content[i - 1]))) {
+            // Raw strings r"..." / r#"..."# / br#"..."# span lines with no escapes.
+            let j = i + (ch === 'b' && next === 'r' ? 2 : 1);
+            if (ch === 'r' || (ch === 'b' && next === 'r')) {
+                let hashes = 0;
+                while (content[j] === '#') { hashes++; j++; }
+                if (content[j] === '"') {
+                    j++;
+                    while (j < n) {
+                        if (content[j] === '"') {
+                            let h = 0;
+                            while (h < hashes && content[j + 1 + h] === '#') h++;
+                            if (h === hashes) { j += 1 + hashes; break; }
+                        }
+                        j++;
+                    }
+                    i = j; prevSig = '"'; prevWord = '';
+                    continue;
+                }
+            }
+        }
+        if (ch === '"' || ch === "'") {
+            if (language === 'java' && ch === '"' && next === '"' && content[i + 2] === '"') {
+                // Java text block """...""" — spans lines
+                i += 3;
+                while (i < n && !(content[i] === '"' && content[i + 1] === '"' && content[i + 2] === '"')) i++;
+                i += 3; prevSig = '"'; prevWord = '';
+                continue;
+            }
+            if (language === 'rust' && ch === "'" && !(next === '\\' || content[i + 2] === "'")) {
+                // Lifetime/label ('a, 'outer:), not a char literal
+                prevSig = ch; prevWord = ''; i++;
+                continue;
+            }
+            const quote = ch;
+            i++;
+            if (language === 'rust' && quote === '"') {
+                // Rust plain strings may span lines
+                while (i < n && content[i] !== quote) {
+                    if (content[i] === '\\') i++;
+                    i++;
+                }
+            } else {
+                // Single-line semantics elsewhere; unterminated ends at EOL
+                while (i < n && content[i] !== quote && content[i] !== '\n') {
+                    if (content[i] === '\\') i++;
+                    i++;
+                }
+            }
+            if (i < n && content[i] === quote) i++;
+            prevSig = quote; prevWord = '';
+            continue;
+        }
+        if (hasBacktick && ch === '`') {
+            // JS/TS template literal / Go raw string — spans lines
+            i++;
+            while (i < n && content[i] !== '`') {
+                if (isJsLike && content[i] === '\\') i++; // Go raw strings have no escapes
+                i++;
+            }
+            i++; prevSig = '`'; prevWord = '';
+            continue;
+        }
+        if (!/\s/.test(ch)) {
+            prevWord = wordCh(ch) ? (wordCh(prevSig) ? prevWord + ch : ch) : '';
+            prevSig = ch;
+        }
+        i++;
+    }
+    return out.join('');
+}
+
 module.exports = {
     pickBestDefinition,
     addTestExclusions,
@@ -293,6 +443,7 @@ module.exports = {
     inlineTestRanges,
     lineInRanges,
     classDispatchNames,
+    maskBlockComments,
     NON_CALLABLE_TYPES,
     CALLABLE_SYMBOL_KINDS,
     formatSymbolHandle,
