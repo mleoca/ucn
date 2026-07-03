@@ -2279,18 +2279,28 @@ function findCallers(index, name, options = {}) {
                         // receivers are excluded above (#198); untyped ones
                         // route visible. Module receivers stay exempt
                         // (rich.print(...) IS the module function).
+                        // EXCEPTION (fix #254, W8 BUG-4 — verify's BUG-BX rule
+                        // in the engine, range-based): a receiver naming a
+                        // namespace/module block that CONTAINS the pinned def
+                        // is a qualified function call — containment is
+                        // identity evidence, and the #215 scope check ties
+                        // the receiver to the containing file. Falls through
+                        // to confirm with its import/scope evidence.
                         if (!typeQualifiedReceiver && targetDefs2.length > 0 &&
                             targetDefs2.every(d => !d.className && !d.receiver)) {
-                            // Candidates here are the standalone defs the call
-                            // MIGHT reach through an unmodeled module receiver
-                            // (dynamic import) — methodOwnerKeys counts method
-                            // owners only and reported a contradictory 0
-                            // (fix #230).
-                            routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
-                                dispatchCandidates: methodOwnerKeys().size ||
-                                    targetDefs2.filter(d => !NON_CALLABLE_TYPES.has(d.type)).length,
-                            });
-                            continue;
+                            if (!_namespaceContainedDef(index, fileEntry, filePath,
+                                call.receiver, call.name, targetDefs2)) {
+                                // Candidates here are the standalone defs the call
+                                // MIGHT reach through an unmodeled module receiver
+                                // (dynamic import) — methodOwnerKeys counts method
+                                // owners only and reported a contradictory 0
+                                // (fix #230).
+                                routeUnverified(filePath, fileEntry, call, 'method-ambiguous', calledAs, {
+                                    dispatchCandidates: methodOwnerKeys().size ||
+                                        targetDefs2.filter(d => !NON_CALLABLE_TYPES.has(d.type)).length,
+                                });
+                                continue;
+                            }
                         }
                         // External-contract single owner (fix #210): same
                         // physics as the nominal gate above — an override
@@ -4644,6 +4654,50 @@ function _nonCallableFieldMember(index, typeName, name, language) {
  * (#215): the class defined in this file or a file binding of the name —
  * an unbound capitalized receiver may be a parameter or local.
  */
+/**
+ * Namespace/module-container resolution (fix #254, W8 BUG-4 — verify's
+ * BUG-BX rule brought into the engine, range-based): `Utils.slug()` where a
+ * `namespace Utils` block CONTAINS a definition of `slug` is a qualified
+ * FUNCTION call, not a method call — containment is identity evidence, not
+ * a naming heuristic. Requires #215 scope evidence tying the receiver to
+ * the containing file: the call site sits in that file, or an import
+ * binding of the receiver name resolves toward it (_importReaches — barrel
+ * chains). Structural languages only; Rust `mod` paths keep the path
+ * machinery.
+ * @param {object} index - ProjectIndex instance
+ * @param {object} fileEntry - The CALL SITE's file entry
+ * @param {string} callFileAbs - The call site's absolute file path
+ * @param {string} receiverName - The call's receiver text
+ * @param {string} calleeName - The called name
+ * @param {Array|null} restrictDefs - Candidate defs to test containment on
+ *        (the pinned targets on the caller side); null = all callable defs
+ * @returns {object|null} The contained definition, or null
+ */
+function _namespaceContainedDef(index, fileEntry, callFileAbs, receiverName, calleeName, restrictDefs) {
+    if (!receiverName || receiverName.includes('.') || receiverName.includes('::')) return null;
+    const nsDefs = (index.symbols.get(receiverName) || []).filter(s =>
+        s.type === 'namespace' || s.type === 'module');
+    if (nsDefs.length === 0) return null;
+    const candidates = restrictDefs ||
+        (index.symbols.get(calleeName) || []).filter(s => !NON_CALLABLE_TYPES.has(s.type));
+    const contained = candidates.filter(d => nsDefs.some(ns =>
+        ns.file === d.file && ns.startLine <= d.startLine &&
+        (ns.endLine ?? Infinity) >= (d.endLine ?? d.startLine)));
+    if (contained.length === 0) return null;
+    const targetAbs = new Set(contained.map(d => d.file));
+    if (targetAbs.has(callFileAbs)) return contained[0];
+    for (const im of (fileEntry?.importBindings || [])) {
+        if (im.name !== receiverName) continue;
+        const rel = fileEntry.moduleResolved && fileEntry.moduleResolved[String(im.module || '')];
+        if (!rel) continue;
+        const abs = path.join(index.root, rel);
+        if (targetAbs.has(abs) || _importReaches(index, abs, targetAbs)) {
+            return contained.find(d => d.file === abs) || contained[0];
+        }
+    }
+    return null;
+}
+
 function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     let receiver = call.receiver;
     if (!receiver) return null;
@@ -4651,6 +4705,15 @@ function _calleeTypeQualifiedReceiver(index, def, fileEntry, call, language) {
     const style = traits?.typeQualifiedCallStyle;
     if (style === 'path' && !call.isPathCall) return null;
     if (style === 'method-expr' && call.argCount != null && call.argCount < 1) return null;
+
+    // Namespace/module container (fix #254): checked before the
+    // capitalization gate — namespaces resolve by symbol lookup, not case
+    // convention. A hit is a qualified function call, exempt from the
+    // method filter downstream.
+    if (traits?.typeSystem === 'structural') {
+        const nsDef = _namespaceContainedDef(index, fileEntry, def.file, receiver, call.name, null);
+        if (nsDef) return { match: nsDef, typeName: receiver };
+    }
 
     const typeKindsOf = (name) => (index.symbols.get(name) || [])
         .filter(d => IDENTITY_TYPE_KINDS.has(d.type) || (d.type === 'type' && d.aliasOf));

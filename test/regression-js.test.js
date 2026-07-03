@@ -6960,3 +6960,118 @@ describe('fix #245 (JS/TS): export scanner and fileExports assembly', () => {
         }
     });
 });
+
+// ============================================================================
+// FIX #254: namespace-container containment (W8 BUG-4) + constructor-pin hint
+// ============================================================================
+
+describe('fix #254: namespace-container receivers confirm in the engine, both directions', () => {
+    const { execute } = require('../core/execute');
+    const NS_FIXTURE = {
+        'package.json': '{"name":"test"}',
+        'utils.ts': 'export namespace Utils {\n  export function slug(s: string): string {\n    return s.toLowerCase();\n  }\n  export function pad(s: string): string { return s + " "; }\n}\n',
+        'app.ts': 'import { Utils } from "./utils";\nexport function handle(name: string) {\n  return Utils.slug(name);\n}\n'
+    };
+
+    it('caller side: Utils.slug() confirms via range containment + import scope evidence', () => {
+        // Before: verify confirmed (name-only BUG-BX promotion) while context
+        // routed method-ambiguous — direction disagreement on the same site.
+        const dir = tmp(NS_FIXTURE);
+        try {
+            const index = idx(dir);
+            const c = execute(index, 'context', { name: 'slug' });
+            assert.ok(c.ok);
+            assert.ok((c.result.callers || []).some(x => x.callerName === 'handle'),
+                'namespace-qualified call is a confirmed caller');
+            assert.strictEqual((c.result.unverifiedCallers || []).length, 0);
+            assert.strictEqual(c.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('callee side: Utils.slug() is a qualified function call, not a filtered method call', () => {
+        const dir = tmp(NS_FIXTURE);
+        try {
+            const index = idx(dir);
+            const c = execute(index, 'context', { name: 'handle' });
+            assert.ok(c.ok);
+            assert.ok((c.result.callees || []).some(x => x.name === 'slug'),
+                'contained function is a confirmed callee');
+            assert.strictEqual(c.result.meta.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('verify inherits the engine tier — no verify-local promotion remains', () => {
+        const dir = tmp(NS_FIXTURE);
+        try {
+            const r = execute(idx(dir), 'verify', { name: 'slug' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.valid, 1);
+            assert.strictEqual(r.result.unverifiedCount, 0);
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: a same-named namespace NOT containing the def does not promote', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'other.ts': 'export namespace Utils {\n  export function pad(s: string): string { return s; }\n}\n',
+            'lib.ts': 'export function slug(s: string): string { return s.toLowerCase(); }\n',
+            'app.ts': 'import { Utils } from "./other";\nimport { slug } from "./lib";\nexport function handle(name: string) {\n  return Utils.slug(name);\n}\n'
+        });
+        try {
+            const c = execute(idx(dir), 'context', { name: 'slug', file: 'lib.ts' });
+            assert.ok(c.ok);
+            assert.strictEqual((c.result.callers || []).length, 0, 'no false promotion');
+            assert.ok((c.result.unverifiedCallers || []).some(u => u.reason === 'method-ambiguous'),
+                'stays visible unverified');
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: a receiver bound to a DIFFERENT module does not promote', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'real.ts': 'export namespace Utils {\n  export function slug(s: string): string { return s.toLowerCase(); }\n}\n',
+            'fake.ts': 'export const Utils = { other: 1 };\n',
+            'app.ts': 'import { Utils } from "./fake";\nexport function handle(name: string) {\n  return (Utils as any).slug(name);\n}\n'
+        });
+        try {
+            const c = execute(idx(dir), 'context', { name: 'slug' });
+            assert.ok(c.ok);
+            assert.strictEqual((c.result.callers || []).length, 0,
+                'import of an unrelated Utils is not scope evidence for the namespace');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #254: constructor-pin cross-references the class pin', () => {
+    const { execute } = require('../core/execute');
+
+    it('a 0-caller constructor pin hints at the class pin when new-sites exist', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'w.ts': 'export class Widget {\n  id: number;\n  constructor(id: number) { this.id = id; }\n}\n',
+            'use.ts': 'import { Widget } from "./w";\nexport const w = new Widget(1);\n'
+        });
+        try {
+            const index = idx(dir);
+            for (const cmd of ['context', 'about']) {
+                const r = execute(index, cmd, { name: 'constructor', className: 'Widget' });
+                assert.ok(r.ok);
+                assert.ok((r.result.warnings || []).some(w =>
+                    w.type === 'hint' && w.message.includes('indexed under the class name')),
+                    `${cmd} carries the cross-reference hint`);
+            }
+        } finally { rm(dir); }
+    });
+
+    it('counter-probe: a never-instantiated class gets no hint', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'w.ts': 'export class Ghost {\n  constructor(public id: number) {}\n}\n'
+        });
+        try {
+            const r = execute(idx(dir), 'context', { name: 'constructor', className: 'Ghost' });
+            assert.ok(r.ok);
+            assert.strictEqual((r.result.warnings || []).length, 0);
+        } finally { rm(dir); }
+    });
+});

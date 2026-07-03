@@ -461,34 +461,6 @@ function extractArrowTypesFromVarDecl(index, def) {
 }
 
 /**
- * BUG-BX: A receiver like `Utils.helper()` may be a TS namespace member call
- * for a regular (non-method) exported function. Returns true when the
- * receiver matches a known namespace/class symbol that contains a function
- * with the verified name.
- * @param {object} index - ProjectIndex instance
- * @param {string} receiver - Receiver text from the call site
- * @param {string} funcName - Name being verified
- * @param {string} defFile - The definition's file (to scope the match)
- * @returns {boolean}
- */
-function isNamespaceContainerFor(index, receiver, funcName, defFile) {
-    if (!receiver || !funcName) return false;
-    const candidates = index.symbols.get(receiver);
-    if (!candidates || candidates.length === 0) return false;
-    // Accept namespace, module, class, or interface containers
-    return candidates.some(c => {
-        const t = c.type;
-        if (t === 'namespace' || t === 'module' || t === 'class' || t === 'interface') {
-            // Same file as the def is the strongest signal; fall back to project-wide match.
-            if (!defFile || c.file === defFile) return true;
-            // Cross-file: only accept when receiver is a dedicated namespace/module
-            return t === 'namespace' || t === 'module';
-        }
-        return false;
-    });
-}
-
-/**
  * Constructor parameter lists for a CLASS verify/plan target (fix #230): a
  * class def carries no paramsStructured, so `verify Task` used to arg-check
  * `new Task(id, name)` against 0..0 — a false red on every parameterized
@@ -578,11 +550,9 @@ function _constructorParamLists(index, def, lang) {
  * (rendered with reasons, never silently dropped). The pre-v4 className and
  * receiver heuristics are gone — engine receiver physics decide tier and
  * exclusion, and their fallback branches could silently drop true callers.
- *
- * One verify-local promotion survives as positive evidence the engine does
- * not yet model: a receiver naming a namespace/class/module CONTAINER whose
- * body defines the target (BUG-BX `Utils.helper()`) confirms — containment
- * is identity evidence, not a naming heuristic.
+ * Namespace-container receivers (BUG-BX `Utils.helper()`) confirm in the
+ * ENGINE since fix #254 (range-based containment + scope evidence), so no
+ * verify-local promotion remains — the bands are the sweep's verbatim.
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Symbol name
@@ -596,23 +566,18 @@ function contractedCallerSweep(index, name, def) {
         collectAccount: true,
     });
 
-    const promotes = (c) => c.isMethod && c.receiver &&
-        isNamespaceContainerFor(index, c.receiver, name, def.file);
-
     const confirmed = [];
     const unverified = [];
     for (const c of rawCallers) {
-        if (c.tier !== 'unverified') { confirmed.push(c); continue; }
-        if (promotes(c)) { confirmed.push({ ...c, tier: 'confirmed', resolution: 'receiver-hint' }); continue; }
-        unverified.push(c);
+        if (c.tier !== 'unverified') confirmed.push(c);
+        else unverified.push(c);
     }
     for (const u of rawCallers.unverifiedEntries || []) {
-        if (promotes(u)) confirmed.push({ ...u, tier: 'confirmed', resolution: 'receiver-hint' });
-        else unverified.push(u);
+        unverified.push(u);
     }
 
-    // Conservation account from the POST-promotion claims (impact's manual
-    // composition — composeAccount would count promoted entries unverified).
+    // Conservation account from the sweep's claims (impact's manual
+    // composition).
     const { computeGroundSet, buildAccount } = require('./account');
     const groundSet = computeGroundSet(index, name);
     const accountRaw = rawCallers.accountRaw || { unverifiedLines: [], excludedEntries: [] };

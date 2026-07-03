@@ -505,6 +505,19 @@ function context(index, name, options = {}) {
         }
     };
 
+    // Constructor pins surface their invocation sites under the CLASS pin
+    // (`new Widget()` indexes under 'Widget' — the fix #239 liveness rule;
+    // fix #254 makes it discoverable): a bare empty answer sent readers
+    // hunting for callers the class pin already has.
+    if (def.className && callers.length === 0 &&
+        (def.type === 'constructor' || name === 'constructor' || name === '__init__') &&
+        index.getCalleeFiles(def.className)) {
+        warnings.push({
+            type: 'hint',
+            message: `Constructor invocations (\`new ${def.className}(...)\` / \`${def.className}(...)\`) are indexed under the class name — query \`${def.className}\` for the call sites.`,
+        });
+    }
+
     if (warnings.length > 0) {
         result.warnings = warnings;
     }
@@ -1618,6 +1631,17 @@ function about(index, name, options = {}) {
         ...(aboutWarnings.length > 0 && { warnings: aboutWarnings }),
         completeness: detectCompleteness(index)
     };
+
+    // Constructor pins surface their invocation sites under the CLASS pin
+    // (`new Widget()` indexes under 'Widget' — fix #254, same hint as context).
+    if (primary.className && (callers?.length ?? 0) === 0 &&
+        (primary.type === 'constructor' || symbolName === 'constructor' || symbolName === '__init__') &&
+        index.getCalleeFiles(primary.className)) {
+        result.warnings = [...(result.warnings || []), {
+            type: 'hint',
+            message: `Constructor invocations (\`new ${primary.className}(...)\` / \`${primary.className}(...)\`) are indexed under the class name — query \`${primary.className}\` for the call sites.`,
+        }];
+    }
 
     return result;
     } finally { index._endOp(); }
