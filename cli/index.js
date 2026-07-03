@@ -1653,6 +1653,7 @@ Common Flags:
   -v, --version       Print the UCN version and exit
 
 Quick Start:
+  ucn orient                          # First look at a new repo
   ucn toc                             # See project structure
   ucn about handleRequest             # Understand a function
   ucn impact handleRequest            # Before modifying

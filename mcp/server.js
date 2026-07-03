@@ -189,6 +189,7 @@ const TOOL_DESCRIPTION = `Code intelligence toolkit for AI agents. Extract speci
 TOP 5 (covers 90% of tasks): about, impact, trace, find, deadcode
 
 QUICK GUIDE — choosing the right command:
+  New/unfamiliar repo → orient (size, top dirs, hot functions, entry points, trust — run FIRST)
   Understand a symbol → about (everything), context (callers/callees only), smart (code + called functions inline)
   Before modifying    → impact (all call sites with args), verify (signature check), plan (preview refactor)
   Execution flow      → trace (function call tree) or graph (file imports/exports)

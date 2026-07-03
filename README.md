@@ -41,6 +41,7 @@ And it's built to be **trusted**: every "who calls this?" splits into what UCN c
 ```bash
 npm install -g ucn             # Node.js 20+
 
+ucn orient                     # first look at any repo: size, hot spots, trust
 ucn trace main --depth=3       # full execution flow
 ucn about handleRequest        # definition + callers + callees + tests
 ucn impact handleRequest       # every call site with arguments
@@ -237,6 +238,36 @@ Changed: 3 functions
 `ucn check` composes `diff-impact` + `verify` + `affected-tests` in one shot — flags ADDED functions with no callers, signature drift across call sites, and recommends which tests to run.
 
 ## Get the lay of the land in a new repo
+
+One command answers "what is this codebase?" — size and language mix, where the code lives, the most-called production functions, entry points, and how far to trust the index:
+
+```
+$ ucn orient
+
+PROJECT ORIENTATION — /path/to/project
+════════════════════════════════════════════════════════════
+169 files · 2111 symbols · javascript 67%, rust 8%, typescript 8%, java 7%, go 5%, python 5%
+
+TOP DIRS (by symbols):
+  core            516 symbols · 29 file(s)
+  languages       282 symbols · 8 file(s)
+  test            209 symbols · 29 file(s)
+  core/output     142 symbols · 14 file(s)
+  ...
+
+HOT (most-called production functions, top 8 of 1028):
+  execute — 1124 call(s) · core/execute.js:1608
+  ProjectIndex.build — 340 call(s) · core/project.js:221
+  getParser — 150 call(s) · languages/index.js:312
+  ...
+
+ENTRY POINTS: 389 — test 284, runtime 72, http 32, di 1
+TRUST: MEDIUM — 41 dynamic import(s), 13 eval, 6 reflection  (ucn doctor for detail)
+
+Next: ucn about execute · ucn toc --detailed · ucn stats --hot --top=20 · ucn doctor --deep
+```
+
+Then drill in:
 
 ```
 $ ucn brief fetch_user

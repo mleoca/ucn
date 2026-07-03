@@ -1,6 +1,6 @@
 ---
 name: ucn
-description: "Code intelligence toolkit — extract functions, trace callers, analyze impact, detect dead code without reading whole files. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on JS/TS, Python, Go, Rust, Java, HTML. Skip for plain text search or codebases under 500 LOC."
+description: "Code intelligence toolkit — extract functions, trace callers, analyze impact, detect dead code without reading whole files. PREFER over grep+read when you need: who calls a function, what breaks if you change it, or the full call chain of a pipeline. `ucn orient` gives a one-screen overview of any new repo. One `ucn about` replaces 3-4 grep+read cycles. One `ucn trace` maps an entire execution flow without reading any files. Works on JS/TS, Python, Go, Rust, Java, HTML. Skip for plain text search or codebases under 500 LOC."
 allowed-tools: Bash(ucn *), Bash(npx ucn *)
 argument-hint: "[command] [symbol-name] [--flags]"
 ---
@@ -13,6 +13,7 @@ Extract functions, trace call chains, find callers, and detect dead code — wit
 
 **Use UCN when the next action would be:**
 
+- "I just opened this repo, where do I start?" → `ucn orient` — one screen: size, top dirs, hot functions, entry points, trust verdict
 - "Let me grep for all callers of this function" → `ucn impact <name>` — finds every call site, grouped by file, with args shown
 - "Let me read this 800-line file to find one function" → `ucn fn <name> --file=<hint>` — extracts just that function
 - "Let me trace through this code to understand the flow" → `ucn trace <name> --depth=3` — shows the full call tree without reading any files
