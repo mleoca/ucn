@@ -53,28 +53,28 @@ ucn deadcode --exclude=test    # unused code, AST-verified
 $ ucn trace build --depth=2
 
 build
-├── detectProjectPattern (core/discovery.js:431) 1x
+├── detectProjectPattern (core/discovery.js:450) 1x
 ├── parseGitignore (core/discovery.js:131) 1x
-├── expandGlob (core/discovery.js:191) 1x
-│   ├── parseGlobPattern (core/discovery.js:227) 1x
-│   ├── walkDir (core/discovery.js:284) 1x
-│   └── compareNames (core/discovery.js:170) 1x
+├── expandGlob (core/discovery.js:199) 1x
+│   ├── parseGlobPattern (core/discovery.js:238) 1x
+│   ├── walkDir (core/discovery.js:295) 1x
+│   └── compareNames (core/discovery.js:178) 1x
 ├── parallelBuild (core/parallel-build.js:25) 1x
-├── indexFile (core/project.js:310) 1x
-│   ├── addSymbol (core/project.js:410) 4x
-│   ├── detectLanguage (languages/index.js:288) 1x
+├── indexFile (core/project.js:397) 1x
+│   ├── addSymbol (core/project.js:502) 4x
+│   ├── detectLanguage (languages/index.js:344) 1x
 │   ├── parse (core/parser.js:69) 1x
 │   ├── extractImports (core/imports.js:19) 1x
 │   └── extractExports (core/imports.js:44) 1x
-├── buildImportGraph (core/project.js:648) 1x
-└── buildInheritanceGraph (core/project.js:653) 1x
+├── buildImportGraph (core/project.js:798) 1x
+└── buildInheritanceGraph (core/project.js:803) 1x
     … calls UCN can't prove a receiver for (arr.push(), obj.get()) show as
       [unverified] leaves — abridged here
 
-CALLEE ACCOUNT: 23 nodes · 329 call sites = 43 confirmed + 151 unverified + 34 builtin + 101 excluded
+CALLEE ACCOUNT: 26 nodes expanded · 394 call sites = 61 confirmed + 162 unverified (162 uncertain-receiver) + 68 external/builtin + 103 excluded
 ```
 
-One command, no files opened — and the `CALLEE ACCOUNT:` line proves all 329 calls were sorted, nothing dropped.
+One command, no files opened — and the `CALLEE ACCOUNT:` line proves all 394 calls were sorted, nothing dropped.
 
 ---
 
@@ -87,19 +87,19 @@ $ ucn about expandGlob
 
 expandGlob (function)
 ════════════════════════════════════════════════════════════
-core/discovery.js:191-222  →  core/discovery.js:191:expandGlob
+core/discovery.js:199-233  →  core/discovery.js:199:expandGlob
 expandGlob (pattern: string, options: number = {}) : string[]
 
-USAGES: 6 total
-  3 calls, 3 imports, 0 references
+USAGES: 8 total
+  3 calls, 3 imports, 2 references
 
 CALLERS — CONFIRMED (7, 3 prod + 4 test):
   evidence: scope-match (all)
-  cli/index.js:1201 [runGlobCommand]
+  cli/index.js:1267 [runGlobCommand]
     const files = expandGlob(pattern);
-  core/cache.js:466 [isCacheStale]
+  core/cache.js:548 [isCacheStale] [unreachable]
     const currentFiles = expandGlob(pattern, globOpts);
-  core/project.js:192 [build]
+  core/project.js:257 [build]
     files = expandGlob(pattern, globOpts);
   test callers:
   test/integration.test.js:167
@@ -108,12 +108,12 @@ CALLERS — CONFIRMED (7, 3 prod + 4 test):
 
 CALLEES (3):
   evidence: exact-binding (all)
-  parseGlobPattern [utility] - core/discovery.js:227 (1x)
-  walkDir [utility] {fs} - core/discovery.js:284 (1x)
-  compareNames [utility] - core/discovery.js:170 (1x)
+  parseGlobPattern [utility] - core/discovery.js:238 (1x)
+  walkDir [utility] {fs} - core/discovery.js:295 (1x)
+  compareNames [utility] - core/discovery.js:178 (1x)
 
 ACCOUNT: "expandGlob" occurs on 14 lines in 6 files: 7 confirmed, 0 unverified,
-  7 non-call (4 import, 1 definition, 1 reference, 1 other-text), 0 other-target, 0 unaccounted
+  7 non-call (4 import, 1 definition, 2 reference, 0 other-text), 0 other-target, 0 unaccounted
 
 TESTS: 5 matches in 1 file(s)
 ```
@@ -127,30 +127,31 @@ UCN doesn't just find a name — it tells you how sure it is. Every answer from 
 ```
 $ ucn impact saveCache
 
-CALL SITES: 2 confirmed + 9 unverified
+CALL SITES: 2 confirmed + 11 unverified
 
 test/regression-go.test.js (2 calls)
-  :2004
+  :2007
     saveCache(index, cachePath);
 
-UNVERIFIED CALL SITES (9) — call syntax, no binding/receiver evidence:
-  mcp/server.js:779: index.saveCache(); (method-ambiguous)
-  test/cache.test.js:1779: index.saveCache(); (method-ambiguous)
-  ... (7 more)
+UNVERIFIED CALL SITES (11) — call syntax, no binding/receiver evidence:
+  core/project.js:2126: saveCache(cachePath) { ... } (call-not-resolved)
+  mcp/server.js:810: try { index.saveCache(); } catch (_) ... (method-ambiguous)
+  test/cache.test.js:1804: index.saveCache(); (method-ambiguous)
+  ... (8 more)
 
-ACCOUNT: "saveCache" occurs on 47 lines in 8 files: 2 confirmed, 9 unverified,
-  9 non-call (2 import, 1 definition, 0 reference, 6 other-text), 27 other-target, 0 unaccounted
+ACCOUNT: "saveCache" occurs on 55 lines in 8 files: 2 confirmed, 11 unverified,
+  11 non-call (2 import, 1 definition, 1 reference, 7 other-text), 31 other-target, 0 unaccounted
 ```
 
-UCN sorts every one of the 47 places the name appears:
+UCN sorts every one of the 55 places the name appears:
 
 - **2 confirmed** — call sites it can prove resolve to *this* `saveCache`.
-- **9 unverified** — real call sites it found but won't claim. `index.saveCache()` has an untyped receiver, so UCN can't prove which `saveCache` runs; it shows the site and the reason (`method-ambiguous`) instead of guessing.
-- **27 other-target** — occurrences that belong to a *different* `saveCache`, kept separate so they never pollute the answer.
-- **9 non-call** — imports, the definition, plain text.
+- **11 unverified** — real call sites it found but won't claim. `index.saveCache()` has an untyped receiver, so UCN can't prove which `saveCache` runs; it shows the site and the reason (`method-ambiguous`) instead of guessing.
+- **31 other-target** — occurrences that belong to a *different* `saveCache`, kept separate so they never pollute the answer.
+- **11 non-call** — imports, the definition, plain text.
 - **`0 unaccounted`** — the partition is complete. Nothing was dropped on the floor.
 
-The payoff: a **confirmed** answer is safe to refactor against, and an empty result with `0 unaccounted` means the symbol truly has no callers. UCN never hides a caller — and never invents one.
+The payoff: a **confirmed** answer is safe to refactor against, and a clean zero — no confirmed, no unverified, `0 unaccounted` — is a trustworthy zero (measured: 68 of 69 clean-zero samples across the 10-repo board agree with the compiler oracles; the one disagreement is a `new X()` on an old-style constructor function, which lands in the non-call counts, still visible). One caveat before deleting anything: callers aren't the only usages — if the NON-CALL counts are nonzero, run `ucn usages` to see what they are.
 
 ### Measured against ground truth
 
@@ -164,7 +165,7 @@ This isn't a promise — it's a gate. CI re-derives UCN's caller answers from re
 | Rust | rust-analyzer | 99.0–100% |
 | Java | jdtls | 96.6% |
 
-Ten pinned real-world repos (zod, express, httpx, rich, cobra, grpc-go, ripgrep, cursive, gson, preact-signals), three sampling seeds, every run gated at `missing-unexplained = 0`. The tree commands — `trace`, `blast`, `reverse-trace`, `affected-tests` — follow the same rule: confirmed trunk, uncertain branches flagged (`--expand-unverified` to follow). Run `ucn doctor` for the trust report on *your* repo.
+Ten pinned real-world repos (zod, express, httpx, rich, cobra, grpc-go, ripgrep, cursive, gson, preact-signals), three sampling seeds, every run gated at `missing-unexplained = 0` — plus a weekly fresh-repo arm: two unpinned repos the engine was never tuned on, same gate. The tree commands — `trace`, `blast`, `reverse-trace`, `affected-tests` — follow the same rule: confirmed trunk, uncertain branches flagged (`--expand-unverified` to follow). Run `ucn doctor` for the trust report on *your* repo.
 
 ## Change code without breaking things
 
@@ -251,9 +252,9 @@ fetch_user(user_id: int): dict
 $ ucn doctor
 
 UCN Trust Report — /path/to/project
-Index: 144 files, 1569 symbols
-Languages: javascript (74%), typescript (13%), java (4%), python (3%), rust (3%), go (3%)
-Cache: fresh, 221ms build
+Index: 169 files, 2104 symbols
+Languages: javascript (72%), typescript (14%), java (4%), python (4%), rust (4%), go (3%)
+Cache: fresh, 344ms build
 ...
 Trust level: HIGH
 ```
@@ -289,10 +290,10 @@ Test files to run (20):
 POSSIBLY AFFECTED (1) — reachable only through unverified call edges:
   doctor
 
-Uncovered (10): runGlobCommand, main, runProjectCommand, runFileCommand, evaluateRepo, ...
+Uncovered (12): runGlobCommand, main, isCacheStale, runProjectCommand, runFileCommand, ...
   ⚠ These affected functions have no test references
 
-Summary: 15 affected → 20 test files, 5/15 functions covered (33%) · 1 possibly affected (unverified chains)
+Summary: 15 affected → 20 test files, 3/15 functions covered (20%) · 1 possibly affected (unverified chains)
 ```
 
 The confirmed closure is what you run; `POSSIBLY AFFECTED` lists functions reached only through unverified edges — extra tests worth a look, kept separate.
@@ -316,7 +317,7 @@ crates/matcher/src/lib.rs
 921 exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.
 ```
 
-Classes, structs, traits, and enums are audited alongside functions. Symbols whose only call sites live inside their own definitions are claimed too, marked `[only self-references — recursive]`. Every claim class is checked against compiler/LSP ground truth in CI — a claim with an oracle-visible reference fails the build.
+Classes, structs, traits, and enums are audited alongside functions. Symbols whose only call sites live inside their own definitions are claimed too, marked `[only self-references — recursive]`. Deadcode claims are re-derived against compiler/LSP ground truth in CI — a default-audit claim with an oracle-visible reference fails the build.
 
 Find missing-await bugs:
 
