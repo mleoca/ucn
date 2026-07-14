@@ -124,7 +124,11 @@ const UCN_VERSION = require('../package.json').version;
 // v47 (fix #269): Python absolute imports resolve through the PEP-517 src
 // layout (`import click` → src/click/__init__.py) — persisted
 // importGraph/exportGraph/moduleResolved content changed.
-const CACHE_FORMAT_VERSION = 47;
+// v48 (fix #270): Java interface symbols record their extends clause (the
+// grammar's extends_interfaces child carries no `extends` field, so the
+// field lookup silently returned nothing) — cached interface symbols lack
+// the supertypes the deadcode heritage walk reads.
+const CACHE_FORMAT_VERSION = 48;
 
 /**
  * Save index to cache file

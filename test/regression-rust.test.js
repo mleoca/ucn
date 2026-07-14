@@ -4062,3 +4062,33 @@ pub fn go() -> String {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #270 (Rust): trait impls on the struct never shield inherent methods', () => {
+    // rust.js surfaces `impl Trait for X` as `implements` on the struct def,
+    // but inherent methods live in separate `impl X` blocks OUTSIDE the
+    // struct's source range — the heritage walk's in-range guard keeps an
+    // unrelated external trait impl from shielding a genuinely-dead method.
+    it('claims a non-pub inherent method next to an external trait impl', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'main.rs': [
+                'use std::fmt::Display;',
+                'struct Widget;',
+                'impl Display for Widget {',
+                '    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result { write!(f, "w") }',
+                '}',
+                'impl Widget {',
+                '    fn orphan_method(&self) -> u32 { 1 }',
+                '}',
+                'fn main() { let w = Widget; println!("{}", w); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(dead.some(d => d.name === 'orphan_method'),
+                `inherent method stays claimable despite the Display impl: ${dead.map(d => d.name)}`);
+            assert.strictEqual(dead.excludedExternalContract, 0);
+        } finally { rm(dir); }
+    });
+});

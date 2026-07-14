@@ -556,16 +556,26 @@ function extractImplements(classNode) {
  * Extract extends from interface
  */
 function extractInterfaceExtends(interfaceNode) {
-    const extendsNode = interfaceNode.childForFieldName('extends');
-    if (extendsNode) {
-        const interfaces = [];
-        for (let i = 0; i < extendsNode.namedChildCount; i++) {
-            const iface = extendsNode.namedChild(i);
-            interfaces.push(iface.text);
+    // The grammar exposes interface extends as an `extends_interfaces` child
+    // wrapping a type_list, not as an `extends` field — the field lookup
+    // returned null and interfaces silently never recorded their supertypes
+    // (fix #270: the deadcode heritage walk needs them).
+    const interfaces = [];
+    for (let i = 0; i < interfaceNode.namedChildCount; i++) {
+        const child = interfaceNode.namedChild(i);
+        if (child.type !== 'extends_interfaces') continue;
+        for (let j = 0; j < child.namedChildCount; j++) {
+            const entry = child.namedChild(j);
+            if (entry.type === 'type_list') {
+                for (let k = 0; k < entry.namedChildCount; k++) {
+                    interfaces.push(entry.namedChild(k).text);
+                }
+            } else {
+                interfaces.push(entry.text);
+            }
         }
-        return interfaces;
     }
-    return [];
+    return interfaces;
 }
 
 /**

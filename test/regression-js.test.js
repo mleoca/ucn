@@ -7706,3 +7706,102 @@ describe('fix #269: renamed destructure pins by the paired import module', () =>
         } finally { rm(dir); }
     });
 });
+
+describe('fix #270: external-contract shield walks the heritage closure (fastify silent family)', () => {
+    // fastify-measured: CustomLoggerImpl implements CustomLogger (project)
+    // extends FastifyBaseLogger (project, .d.ts) extends Pick<BaseLogger, ...
+    // 'silent'> (pino — external). The member surface the class must provide
+    // comes from the out-of-tree end of the chain, invisible without tsc —
+    // deleting the zero-usage `silent` impl member breaks the build.
+    it('shields a member required through implements → project interface → external base', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'contract.ts': [
+                "import { ExternalShape } from 'ext-pkg';",
+                'export interface MyContract extends ExternalShape { }',
+            ].join('\n'),
+            'impl.ts': [
+                "import { MyContract } from './contract';",
+                'class Impl implements MyContract {',
+                '    requiredByExt(): void { }',
+                '}',
+                'const i = new Impl();',
+                'void i;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'requiredByExt'),
+                `member of an implements chain reaching an external base must not be claimed: ${dead.map(d => d.name)}`);
+            assert.strictEqual(dead.excludedExternalContract, 1);
+        } finally { rm(dir); }
+    });
+
+    it('shields a public method whose class extends a project base that extends an external base', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.ts': [
+                "import { Ext } from 'ext-pkg';",
+                'export class Mid extends Ext { }',
+            ].join('\n'),
+            'leaf.ts': [
+                "import { Mid } from './base';",
+                'class Leaf extends Mid {',
+                '    hookish(): void { }',
+                '}',
+                'const l = new Leaf();',
+                'void l;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'hookish'),
+                `transitive extends chain reaching an external base must shield: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+
+    it('shields a non-exported class whose extends chain reaches an external base (class-kind claims)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.ts': [
+                "import { Ext } from 'ext-pkg';",
+                'export class Mid extends Ext { }',
+            ].join('\n'),
+            'c.ts': [
+                "import { Mid } from './base';",
+                'class NeverUsed extends Mid { }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'NeverUsed'),
+                `framework discovery reaches subclasses of subclasses — class claim shielded: ${dead.map(d => d.name)}`);
+            assert.strictEqual(dead.excludedExternalContract, 1);
+        } finally { rm(dir); }
+    });
+
+    it('keeps claiming when the whole heritage chain resolves in-project (counter)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'a.ts': [
+                'export class Root { }',
+                'export class Mid extends Root { }',
+                'class Leaf extends Mid {',
+                '    deadling(): void { }',
+                '}',
+                'const l = new Leaf();',
+                'void l;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(dead.some(d => d.name === 'deadling'),
+                `fully in-project chain: dead member stays claimable: ${dead.map(d => d.name)}`);
+            assert.strictEqual(dead.excludedExternalContract, 0);
+        } finally { rm(dir); }
+    });
+});

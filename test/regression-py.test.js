@@ -3996,3 +3996,52 @@ describe('fix #269: PEP-517 src layout resolves project imports', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #270 (Python): external-contract shield walks extends chains transitively', () => {
+    it('shields a public method when the parent chain reaches an unindexed base', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'base.py': [
+                'from ext_pkg import ExtBase',
+                'class Mid(ExtBase):',
+                '    pass',
+            ].join('\n'),
+            'leaf.py': [
+                'from base import Mid',
+                'class Leaf(Mid):',
+                '    def hookish(self):',
+                '        pass',
+                'w = Leaf()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(!dead.some(d => d.name === 'hookish'),
+                `subclass-of-subclass of a framework base is dispatchable surface: ${dead.map(d => d.name)}`);
+            assert.strictEqual(dead.excludedExternalContract, 1);
+        } finally { rm(dir); }
+    });
+
+    it('keeps claiming when the whole chain resolves in-project (counter)', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'a.py': [
+                'class Root:',
+                '    pass',
+                'class Mid(Root):',
+                '    pass',
+                'class Leaf(Mid):',
+                '    def deadling(self):',
+                '        pass',
+                'w = Leaf()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(dead.some(d => d.name === 'deadling'),
+                `fully in-project chain stays claimable: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+});

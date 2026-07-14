@@ -53,32 +53,90 @@ function _baseIsExternal(index, bare, lang) {
     return !(defs && defs.some(d => _CLASS_KINDS.includes(d.type)));
 }
 
-/** Does this CLASS DEF extend at least one base that is not in the project index? */
-function _classDefHasExternalBase(index, classDef, lang) {
-    if (!classDef.extends) return false;
-    const supers = Array.isArray(classDef.extends) ? classDef.extends : splitParentList(classDef.extends);
-    return supers.some(raw => _baseIsExternal(index, _bareBaseName(raw), lang));
+// Bounded heritage-closure depth (fix #270) — matches the engine's other
+// inheritance walks.
+const _HERITAGE_WALK_DEPTH = 8;
+
+/**
+ * Does this CLASS DEF reach at least one base that is NOT in the project
+ * index, walking `extends` chains transitively THROUGH resolved project types
+ * (fix #270)? One level was not enough — fastify-measured: CustomLoggerImpl
+ * implements CustomLogger (project) extends FastifyBaseLogger (project,
+ * .d.ts) extends Pick<BaseLogger, ...'silent'> (pino — external). The member
+ * surface the class must provide comes from the OUT-OF-TREE end of the chain,
+ * invisible without tsc, so a zero-usage impl member (`silent`) is contract
+ * surface — deleting it breaks the build. Same dispatch physics as one level;
+ * only the verdict moved from "direct parent external" to "heritage closure
+ * reaches external".
+ *
+ * `followImplements` additionally walks the def's OWN `implements` clause
+ * (first hop only — the measured family; deeper implements hops are
+ * classified-deferred). Method claims pass true only when the member sits
+ * INSIDE the def's source range: TS/Java members live in the class body, so
+ * the implements contract constrains them. Rust surfaces trait impls as
+ * `implements` on the struct (rust.js), but inherent methods live in separate
+ * `impl X` blocks OUTSIDE the struct's range — an unrelated `impl Display
+ * for X` must never shield a genuinely-dead inherent method (the original
+ * reason implements was not consulted here at all; trait-impl members
+ * themselves carry traitImpl/@Override markers → Rule A). Class-kind claims
+ * pass false: deleting the whole class removes its implements clause with it.
+ */
+function _heritageReachesExternalBase(index, classDef, lang, followImplements) {
+    const seen = new Set();
+    let frontier = [classDef];
+    for (let depth = 0; depth < _HERITAGE_WALK_DEPTH && frontier.length; depth++) {
+        const next = [];
+        for (const def of frontier) {
+            // Copy array-shaped extends — the implements push below must
+            // never mutate the symbol's own heritage data in the index.
+            const parents = def.extends
+                ? (Array.isArray(def.extends) ? [...def.extends] : splitParentList(def.extends))
+                : [];
+            if (depth === 0 && followImplements && Array.isArray(def.implements)) {
+                parents.push(...def.implements);
+            }
+            for (const raw of parents) {
+                const bare = _bareBaseName(raw);
+                if (!bare || seen.has(bare)) continue;
+                seen.add(bare);
+                if (_baseIsExternal(index, bare, lang)) return true;
+                for (const pd of index.symbols.get(bare) || []) {
+                    if (_CLASS_KINDS.includes(pd.type)) next.push(pd);
+                }
+            }
+        }
+        frontier = next;
+    }
+    return false;
 }
 
 /**
- * Does the method's enclosing class EXTEND at least one base that is NOT in the
- * project index? An out-of-tree base is a framework/library type UCN can't see;
- * via inheritance it may dispatch into a public method of the subclass
- * polymorphically (Starlette → build_middleware_stack) or by name convention
- * (Pydantic → bytes_schema). The class def is matched in the method's own file.
- *
- * `implements` is deliberately NOT consulted: implementing an external
- * interface/trait makes only the INTERFACE'S OWN methods a contract (those
- * carry traitImpl/@Override markers → handled by Rule A), not the class's
- * unrelated inherent methods. Counting it would wrongly shield, e.g., a Rust
- * struct's genuinely-dead inherent method just because the struct also
- * `impl Display for`s.
+ * Does the method's enclosing class reach at least one base that is NOT in
+ * the project index through its heritage closure? An out-of-tree base is a
+ * framework/library type UCN can't see; via inheritance it may dispatch into
+ * a public method of the subclass polymorphically (Starlette →
+ * build_middleware_stack), by name convention (Pydantic → bytes_schema), or
+ * REQUIRE the member outright (fastify → CustomLoggerImpl.silent, via an
+ * implements chain ending in pino). The class def is matched in the method's
+ * own file; `implements` is walked only when the member sits inside the class
+ * def's own range (see _heritageReachesExternalBase — the Rust guard).
  */
 function _classHasExternalBase(index, symbol) {
     const lang = index.files.get(symbol.file)?.language;
+    // The implements hop shields only contract-SATISFIABLE members: an
+    // interface implementation must be public, so in explicit-visibility
+    // languages a package-private/non-pub member provably cannot implement
+    // any interface member (javac rejects it) — `implements Runnable` never
+    // shields a package-private helper. Implicit-public languages satisfy
+    // contracts with unmarked members; the caller's public-by-shape check
+    // already screened those. Compiler physics, not a heuristic.
+    const contractSatisfiable = langTraits(lang)?.implicitlyPublicMembers ||
+        (symbol.modifiers || []).includes('public');
     const classDefs = (index.symbols.get(symbol.className) || []).filter(c =>
         c.file === symbol.file && _CLASS_KINDS.includes(c.type));
-    return classDefs.some(cd => _classDefHasExternalBase(index, cd, lang));
+    return classDefs.some(cd => _heritageReachesExternalBase(index, cd, lang,
+        contractSatisfiable &&
+        symbol.startLine >= cd.startLine && symbol.startLine <= cd.endLine));
 }
 
 /**
@@ -92,9 +150,12 @@ function _classHasExternalBase(index, symbol) {
  *       Rust `impl Trait for X`) AND a single project-wide method owner of the
  *       name (no in-project supertype defines it → the contract is external —
  *       the #210 ownerCount===1 rule).
- *   (B) a public-by-shape method whose class EXTENDS an unresolved base.
- *       Private/underscore members are never external-contract surface, so a
- *       genuinely-dead one stays claimable (the fix #211 shape predicate).
+ *   (B) a public-by-shape method whose class reaches an unresolved base
+ *       through its heritage closure (extends chains walked transitively,
+ *       plus the class's own `implements` clause when the member sits in the
+ *       class body — fix #270). Private/underscore members are never
+ *       external-contract surface, so a genuinely-dead one stays claimable
+ *       (the fix #211 shape predicate).
  * Data-driven, not language-keyed: classes without an `extends` clause (Go
  * embedding, Rust structs / inherent impls) never trip (B), and Rust trait
  * impls trip (A) via traitImpl — so new languages inherit correct behavior.
@@ -950,7 +1011,7 @@ function deadcode(index, options = {}) {
                 // by module path, pytest plugins by registration) — zero
                 // in-project references is not evidence of deadness there.
                 const isExternalContract = classAuditSet.has(symbol.type)
-                    ? _classDefHasExternalBase(index, symbol, lang)
+                    ? _heritageReachesExternalBase(index, symbol, lang, false)
                     : overridesOutOfTreeBase(index, symbol);
                 if (isExternalContract && !options.includeExported) {
                     excludedExternalContract++;

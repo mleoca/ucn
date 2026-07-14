@@ -3359,3 +3359,66 @@ describe('fix #268: callee-side same-class overload arity selection', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix #270 (Java): interface extends recorded; implements chain shields only public members', () => {
+    // The grammar exposes interface extends as an `extends_interfaces` child,
+    // not an `extends` field — the field lookup silently returned nothing and
+    // interfaces never recorded their supertypes.
+    it('records the extends clause on interface declarations', () => {
+        const result = parse('interface A extends B, C<D, E> { }', 'java');
+        const iface = result.classes.find(c => c.name === 'A');
+        assert.ok(iface, 'interface indexed');
+        assert.strictEqual(iface.extends, 'B, C<D, E>');
+    });
+
+    it('labels a public member externalContract when the implements chain reaches an external interface', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'MyContract.java': [
+                'import ext.pkg.ExternalShape;',
+                'public interface MyContract extends ExternalShape { }',
+            ].join('\n'),
+            'Impl.java': [
+                'class Impl implements MyContract {',
+                '  public void requiredByExt() { }',
+                '  public static void main(String[] a) { Impl i = new Impl(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            // public → exported surface: audited under includeExported, where
+            // the shield labels instead of hiding.
+            const dead = index.deadcode({ includeExported: true });
+            const claim = dead.find(d => d.name === 'requiredByExt');
+            assert.ok(claim, 'listed under includeExported');
+            assert.strictEqual(claim.externalContract, true,
+                'implements → project interface → external interface is contract surface');
+        } finally { rm(dir); }
+    });
+
+    it('package-private member cannot satisfy an interface contract — still claimed dead (counter)', () => {
+        // javac requires interface implementations to be public: a
+        // package-private member provably implements nothing, so
+        // `implements` never shields it (compiler physics, not heuristic).
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'MyContract.java': [
+                'import ext.pkg.ExternalShape;',
+                'public interface MyContract extends ExternalShape { }',
+            ].join('\n'),
+            'Impl.java': [
+                'class Impl implements MyContract {',
+                '  void helperling() { }',
+                '  public static void main(String[] a) { Impl i = new Impl(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode();
+            assert.ok(dead.some(d => d.name === 'helperling'),
+                `package-private member stays claimable: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+});
