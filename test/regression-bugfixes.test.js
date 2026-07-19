@@ -2846,3 +2846,72 @@ describe('fix #226: anchored gitignore patterns are root-only', () => {
         }
     });
 });
+
+// ============================================================================
+// Fix #274: semantic caller-analysis failures must never return partial truth
+// ============================================================================
+describe('fix #274: findCallers fails loudly on semantic engine defects', () => {
+    it('propagates a file-scoped diagnostic instead of silently skipping the file', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'target.js': 'export function target() { return 1; }\n',
+            'caller.js': "import { target } from './target.js';\nexport function run() { return target(); }\n",
+        });
+        try {
+            const index = idx(dir);
+            const callerPath = path.join(dir, 'caller.js');
+            const entry = index.files.get(callerPath);
+            assert.ok(entry, 'sanity: caller file indexed');
+            entry.bindings = {
+                filter() { throw new Error('semantic boom'); },
+            };
+
+            assert.throws(
+                () => index.findCallers('target', { collectAccount: true }),
+                /findCallers failed while analyzing caller\.js: semantic boom/,
+                'an engine defect must not produce a plausible partial caller answer',
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not turn an unreadable indexed file into an empty call set', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'caller.js': 'export function run() { return target(); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const callerPath = path.join(dir, 'caller.js');
+            fs.unlinkSync(callerPath);
+            assert.throws(
+                () => index.getCachedCalls(callerPath),
+                /getCachedCalls failed for caller\.js:.*ENOENT/,
+                'missing source must abort instead of becoming a false zero',
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('does not turn an unreadable callee source into a zero-dependency answer', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'caller.js': 'export function run() { return target(); }\n',
+        });
+        try {
+            const index = idx(dir);
+            const callerPath = path.join(dir, 'caller.js');
+            const run = index.symbols.get('run')[0];
+            fs.unlinkSync(callerPath);
+            assert.throws(
+                () => index.findCallees(run, { collectAccount: true }),
+                /findCallees failed while analyzing caller\.js: getCachedCalls failed for caller\.js:.*ENOENT/,
+                'trace-down failures must abort instead of asserting no dependencies',
+            );
+        } finally {
+            rm(dir);
+        }
+    });
+});

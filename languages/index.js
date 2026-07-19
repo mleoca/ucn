@@ -50,6 +50,9 @@ const STRUCTURAL_TRAITS = {
     // assignment rebinds functions onto objects (obj.print = print), so the
     // #218b gate routes such calls visible instead of excluding (fix #220).
     methodCallReachesFunctions: true,
+    // Whether `Type(...)` constructs a class without a `new` token. Python
+    // classes are ordinary callable objects; JS/TS classes require `new`.
+    classesCallableWithoutNew: false,
 };
 const NOMINAL_TRAITS = {
     typeSystem: 'nominal',
@@ -113,6 +116,7 @@ const NOMINAL_TRAITS = {
     // Go method values (obj.Method) and Java `::` references DO denote
     // methods — false. Per-language override, not preset-wide.
     memberAccessNeverMethod: false,
+    classesCallableWithoutNew: false,
 };
 
 // Language configurations
@@ -170,6 +174,7 @@ const LANGUAGES = {
             // and query code treats such receivers as module receivers. JS
             // from-imports bind values only (`import * as ns` is parser-marked).
             submoduleImports: true,
+            classesCallableWithoutNew: true,
             testFileCandidates: (base, ext) => [`test_${base}.py`, `${base}_test.py`],
             testDirs: ['tests'],
         },

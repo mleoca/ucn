@@ -1,8 +1,9 @@
 /**
  * core/confidence.js - Deterministic edge confidence scoring
  *
- * Assigns a 0.0-1.0 confidence score to each caller/callee edge based on
- * how the call was resolved. Rule-based, no ML.
+ * Assigns an ordinal 0.0-1.0 evidence weight to each caller/callee edge based
+ * on how the call was resolved. Rule-based, no ML. These values rank evidence;
+ * they are NOT probabilities and are NOT calibrated accuracy estimates.
  */
 
 'use strict';
@@ -19,7 +20,8 @@ const RESOLUTION = {
     UNCERTAIN:        'uncertain',
 };
 
-// Seed scores per resolution type (tunable)
+// Ordinal evidence weights per resolution type. The legacy public field is
+// named `confidence` for compatibility; do not interpret 0.98 as "98% likely".
 const SCORES = {
     [RESOLUTION.EXACT_BINDING]:    0.98,
     [RESOLUTION.SAME_CLASS]:       0.92,
@@ -59,6 +61,17 @@ function tierForResolution(resolution) {
     return RESOLUTION_TIER[resolution] || TIER.UNVERIFIED;
 }
 
+function scored(resolution, reasons) {
+    const evidenceScore = SCORES[resolution];
+    return {
+        confidence: evidenceScore,
+        evidenceScore,
+        scoreKind: 'ordinal-evidence-not-probability',
+        resolution,
+        evidence: reasons,
+    };
+}
+
 /**
  * Score a caller/callee edge based on resolution evidence.
  *
@@ -71,7 +84,7 @@ function tierForResolution(resolution) {
  * @param {boolean} [evidence.isUncertain] - Marked uncertain by resolution logic
  * @param {boolean} [evidence.isFunctionReference] - Passed as callback argument
  * @param {boolean} [evidence.hasReceiverType] - Go/Java/Rust parser-inferred receiverType
- * @returns {{ confidence: number, resolution: string, evidence: string[] }}
+ * @returns {{ confidence: number, evidenceScore: number, scoreKind: string, resolution: string, evidence: string[] }}
  */
 function scoreEdge(evidence) {
     const reasons = [];
@@ -81,38 +94,38 @@ function scoreEdge(evidence) {
     // (without this, a known mismatch would score receiver-hint 0.80).
     if (evidence.typeMismatch) {
         reasons.push('receiver type mismatch');
-        return { confidence: SCORES[RESOLUTION.UNCERTAIN], resolution: RESOLUTION.UNCERTAIN, evidence: reasons };
+        return scored(RESOLUTION.UNCERTAIN, reasons);
     }
 
     // Nominal dispatch tiering (contract surface only — callers.js sets these
     // flags exclusively under collectAccount, so legacy paths never see them).
     if (evidence.possibleDispatch) {
         reasons.push('interface/supertype dispatch');
-        return { confidence: SCORES[RESOLUTION.POSSIBLE_DISPATCH], resolution: RESOLUTION.POSSIBLE_DISPATCH, evidence: reasons };
+        return scored(RESOLUTION.POSSIBLE_DISPATCH, reasons);
     }
     if (evidence.methodAmbiguous) {
         reasons.push('untyped receiver, multiple same-name definitions');
-        return { confidence: SCORES[RESOLUTION.METHOD_AMBIGUOUS], resolution: RESOLUTION.METHOD_AMBIGUOUS, evidence: reasons };
+        return scored(RESOLUTION.METHOD_AMBIGUOUS, reasons);
     }
 
     // Exact binding match (highest confidence)
     if (evidence.hasBindingId) {
         reasons.push('binding-id match');
         if (evidence.hasImportEvidence) reasons.push('import-verified');
-        return { confidence: SCORES[RESOLUTION.EXACT_BINDING], resolution: RESOLUTION.EXACT_BINDING, evidence: reasons };
+        return scored(RESOLUTION.EXACT_BINDING, reasons);
     }
 
     // Same-class resolution (self/this/super/cls)
     if (evidence.resolvedBySameClass) {
         reasons.push('same-class method');
         if (evidence.hasInheritanceChain) reasons.push('via inheritance');
-        return { confidence: SCORES[RESOLUTION.SAME_CLASS], resolution: RESOLUTION.SAME_CLASS, evidence: reasons };
+        return scored(RESOLUTION.SAME_CLASS, reasons);
     }
 
     // Receiver hint narrowed to specific type
     if (evidence.resolvedByReceiverHint || evidence.hasReceiverType) {
         reasons.push(evidence.hasReceiverType ? 'parser receiver-type' : 'local type inference');
-        return { confidence: SCORES[RESOLUTION.RECEIVER_HINT], resolution: RESOLUTION.RECEIVER_HINT, evidence: reasons };
+        return scored(RESOLUTION.RECEIVER_HINT, reasons);
     }
 
     // Function reference (callback / passed-as-argument). Argument position is
@@ -123,10 +136,10 @@ function scoreEdge(evidence) {
         reasons.push('function reference');
         if (evidence.hasImportEvidence || evidence.hasSamePackageEvidence) {
             reasons.push(evidence.hasImportEvidence ? 'import-supported' : 'same package/module');
-            return { confidence: SCORES[RESOLUTION.SCOPE_MATCH], resolution: RESOLUTION.SCOPE_MATCH, evidence: reasons };
+            return scored(RESOLUTION.SCOPE_MATCH, reasons);
         }
         reasons.push('no import evidence');
-        return { confidence: SCORES[RESOLUTION.NAME_ONLY], resolution: RESOLUTION.NAME_ONLY, evidence: reasons };
+        return scored(RESOLUTION.NAME_ONLY, reasons);
     }
 
     // Scope/import-supported match
@@ -134,22 +147,22 @@ function scoreEdge(evidence) {
         if (evidence.hasImportEvidence) reasons.push('import-supported');
         if (evidence.hasReceiverEvidence) reasons.push('receiver binding in scope');
         if (evidence.hasSamePackageEvidence) reasons.push('same package/module');
-        return { confidence: SCORES[RESOLUTION.SCOPE_MATCH], resolution: RESOLUTION.SCOPE_MATCH, evidence: reasons };
+        return scored(RESOLUTION.SCOPE_MATCH, reasons);
     }
 
     // Uncertain
     if (evidence.isUncertain) {
         reasons.push('ambiguous resolution');
-        return { confidence: SCORES[RESOLUTION.UNCERTAIN], resolution: RESOLUTION.UNCERTAIN, evidence: reasons };
+        return scored(RESOLUTION.UNCERTAIN, reasons);
     }
 
     // Name-only match (no additional evidence)
     reasons.push('name match only');
-    return { confidence: SCORES[RESOLUTION.NAME_ONLY], resolution: RESOLUTION.NAME_ONLY, evidence: reasons };
+    return scored(RESOLUTION.NAME_ONLY, reasons);
 }
 
 /**
- * Filter edges by minimum confidence threshold.
+ * Filter edges by minimum ordinal evidence threshold (legacy name retained).
  * @param {Array} edges - Array of objects with .confidence property
  * @param {number} minConfidence - Minimum confidence (0.0-1.0)
  * @returns {{ kept: Array, filtered: number }}

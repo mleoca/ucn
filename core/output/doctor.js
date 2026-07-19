@@ -4,10 +4,6 @@
 
 'use strict';
 
-function pad(n, width = 4) {
-    return String(n).padStart(width);
-}
-
 function formatDoctor(result) {
     if (!result) return 'No project to analyze.';
     const lines = [];
@@ -32,23 +28,31 @@ function formatDoctor(result) {
         const buildHint = result.cache.buildMs ? `, ${result.cache.buildMs}ms build` : '';
         lines.push(`Cache: ${state}${buildHint}`);
     }
+    if (result.commandTrust) {
+        const c = result.commandTrust;
+        lines.push(`Command proofs: ${c.classified}/${c.commands} classified, ${c.oracleBacked} external-oracle-backed, ${c.unclassified} unclassified`);
+        lines.push('  Classification describes shipped proof coverage, not this repository\'s runtime accuracy.');
+    }
 
-    // Coverage (if computed)
-    if (result.coverage && result.coverage.total > 0) {
+    // Evidence profile (if computed). Confidence scores are rule labels, not
+    // empirically calibrated probabilities, so never call this accuracy.
+    const profile = result.evidenceProfile || result.coverage;
+    if (profile && profile.total > 0) {
         lines.push('');
-        lines.push('Resolution coverage (sampled):');
-        const c = result.coverage;
+        lines.push('Resolution evidence profile (sampled; not semantic accuracy):');
+        const c = profile;
         const total = c.total || 1;
-        lines.push(`  High confidence (>0.8): ${c.high} (${(c.high / total * 100).toFixed(1)}%)`);
-        lines.push(`  Medium (0.5-0.8):       ${c.medium} (${(c.medium / total * 100).toFixed(1)}%)`);
-        lines.push(`  Low (<0.5):             ${c.low} (${(c.low / total * 100).toFixed(1)}%)`);
-        lines.push(`  Sampled ${c.sampled} symbols → ${c.total} edges examined`);
-    } else if (result.coverage) {
+        lines.push(`  Confirmed evidence: ${c.confirmed} (${(c.confirmed / total * 100).toFixed(1)}%)`);
+        lines.push(`  Unverified:         ${c.unverified} (${(c.unverified / total * 100).toFixed(1)}%)`);
+        lines.push(`  Score bands: high ${c.high}, medium ${c.medium}, low ${c.low}`);
+        lines.push(`  Sampled ${c.sampled}/${c.candidateSymbols} pinned definitions → ${c.total} unique edge candidates`);
+        lines.push(`  Sample quality: ${c.adequate ? 'adequate' : 'insufficient'}${c.representative ? ', all indexed languages represented' : ''}`);
+    } else if (profile) {
         lines.push('');
-        lines.push('Resolution coverage: no edges in sample — likely a small or isolated project.');
+        lines.push('Resolution evidence profile: no caller edges in the stratified sample.');
     } else {
         lines.push('');
-        lines.push('Resolution coverage: not computed (use --deep for sampled analysis)');
+        lines.push('Resolution evidence profile: not computed (use --deep)');
     }
 
     // Blind spots
@@ -60,8 +64,12 @@ function formatDoctor(result) {
         ['Eval/exec calls', bs.evalCalls],
         ['Reflection',      bs.reflection],
         ['Parse failures',  bs.parseFailures],
+        ['Parser recovery', bs.parseRecoveries],
     ];
-    const unitFor = { 'Dynamic imports': 'import', 'Eval/exec calls': 'use', 'Reflection': 'use', 'Parse failures': 'failure' };
+    const unitFor = {
+        'Dynamic imports': 'import', 'Eval/exec calls': 'use', Reflection: 'use',
+        'Parse failures': 'failure',
+    };
     let anyBlindSpot = false;
     for (const [label, info] of bsLines) {
         if (info && info.count > 0) {
@@ -72,7 +80,11 @@ function formatDoctor(result) {
             // never present the display cap as the population (field-report #2).
             const fileCount = info.fileCount != null ? info.fileCount : info.files.length;
             const unit = unitFor[label] || 'use';
-            lines.push(`  ${label}: ${info.count} ${unit}${info.count === 1 ? '' : 's'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`);
+            if (label === 'Parser recovery') {
+                lines.push(`  ${label}: ${fileCount} recovered file${fileCount === 1 ? '' : 's'} (results may be partial)`);
+            } else {
+                lines.push(`  ${label}: ${info.count} ${unit}${info.count === 1 ? '' : 's'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`);
+            }
             const shownFiles = info.files.slice(0, 3);
             const sample = shownFiles.map(f => `    - ${f}`).join('\n');
             const moreFiles = fileCount - shownFiles.length;
@@ -82,9 +94,18 @@ function formatDoctor(result) {
     }
     if (!anyBlindSpot) lines.push('  (none detected)');
 
-    // Verdict
+    // Task-specific readiness. One scalar cannot honestly describe navigation,
+    // refactoring, and deletion risk.
     lines.push('');
-    lines.push(`Trust level: ${result.trust}${result.trustReason ? ' — ' + result.trustReason : ''}`);
+    if (result.dimensions) {
+        lines.push('Readiness:');
+        for (const key of ['navigation', 'refactor', 'deletion']) {
+            const d = result.dimensions[key];
+            if (d) lines.push(`  ${key}: ${d.level} — ${d.reason}`);
+        }
+        lines.push(`  semantic recall: ${result.dimensions.semanticRecall.level} — ${result.dimensions.semanticRecall.reason}`);
+    }
+    lines.push(`Overall (${result.trustScope || 'legacy'}): ${result.trust}${result.trustReason ? ' — ' + result.trustReason : ''}`);
     return lines.join('\n');
 }
 

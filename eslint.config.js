@@ -6,7 +6,7 @@ module.exports = [
     js.configs.recommended,
     {
         languageOptions: {
-            ecmaVersion: 2020,
+            ecmaVersion: 'latest',
             sourceType: 'commonjs',
             globals: {
                 // Node.js globals
@@ -31,7 +31,7 @@ module.exports = [
         },
         rules: {
             'no-undef': 'error',
-            'no-unused-vars': ['warn', { args: 'none', caughtErrors: 'none' }],
+            'no-unused-vars': ['warn', { args: 'none', caughtErrors: 'none', ignoreRestSiblings: true }],
             'no-redeclare': 'error',
             'eqeqeq': ['warn', 'smart'],
             'no-constant-condition': ['error', { checkLoops: false }],

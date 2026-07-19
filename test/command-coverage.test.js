@@ -874,7 +874,26 @@ describe('doctor command', () => {
         } finally { rm(dir); }
     });
 
-    it('deep mode produces resolution coverage histogram', () => {
+    it('reports files that failed before a file entry could be built', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'ok.js': 'export function ok() { return 1; }',
+        });
+        try {
+            const index = idx(dir);
+            index.failedFiles.add(path.join(dir, 'missing-from-index.js'));
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            assert.strictEqual(result.files.failed, 1);
+            assert.strictEqual(result.blindSpots.parseFailures.count, 1);
+            assert.strictEqual(result.blindSpots.parseFailures.fileCount, 1);
+            assert.deepStrictEqual(result.blindSpots.parseFailures.files, ['missing-from-index.js']);
+            assert.strictEqual(result.dimensions.index.level, 'MEDIUM');
+            assert.strictEqual(result.dimensions.semanticRecall.level, 'LOW');
+        } finally { rm(dir); }
+    });
+
+    it('deep mode produces an explicitly non-accuracy evidence profile', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper(x) { return x + 1; }\nmodule.exports = { helper };',
@@ -886,6 +905,8 @@ describe('doctor command', () => {
             assert.ok(ok);
             assert.ok(result.coverage, 'should have coverage data');
             assert.ok(result.coverage.total >= 0);
+            assert.strictEqual(result.coverage.kind, 'evidence-profile-not-accuracy');
+            assert.strictEqual(result.evidenceProfile, result.coverage);
         } finally { rm(dir); }
     });
 
@@ -930,17 +951,12 @@ describe('doctor command', () => {
             assert.ok(ok);
             assert.ok(result.blindSpots.evalCalls.count >= 1, 'eval flagged');
             assert.ok(result.blindSpots.reflection.count >= 1, 'getattr flagged');
-            // The bug: 3 blind-spot categories used to drop the tier to LOW even at
-            // 99% coverage. Now coverage drives the verdict; blind spots are a caveat.
-            if (result.coverage && result.coverage.total > 0) {
-                const safePct = (result.coverage.high + result.coverage.medium) / result.coverage.total;
-                if (safePct >= 0.85) {
-                    assert.strictEqual(result.trust, 'HIGH',
-                        `high coverage + blind spots should be HIGH, got ${result.trust} (${result.trustReason})`);
-                }
-            }
+            // A small sampled project may stay UNKNOWN; rule-assigned evidence
+            // weights are not an accuracy measurement and cannot justify HIGH.
+            assert.strictEqual(result.coverage.kind, 'evidence-profile-not-accuracy');
             assert.notStrictEqual(result.trust, 'LOW',
                 `blind-spot presence alone must not yield LOW: ${result.trustReason}`);
+            assert.strictEqual(result.dimensions.semanticRecall.level, 'MEDIUM');
         } finally { rm(dir); }
     });
 
@@ -959,7 +975,7 @@ describe('doctor command', () => {
     });
 
     it('caps the --deep verdict below HIGH when blind spots are pervasive (field-report #1, reviewer)', () => {
-        // Coverage only buckets confidence of FOUND edges — a reflection-hidden
+        // The evidence profile only buckets FOUND edges — a reflection-hidden
         // call is absent, not low-confidence. So pervasive reflection (here 8 of
         // 12 files) can hide a real slice of the call graph the sample can't see,
         // and must cap trust below HIGH even when found-edge confidence is high.
@@ -978,8 +994,8 @@ describe('doctor command', () => {
                 `reflection in 8 files, got ${result.blindSpots.reflection.fileCount}`);
             assert.notStrictEqual(result.trust, 'HIGH',
                 `pervasive blind spots must cap below HIGH: ${result.trust} (${result.trustReason})`);
-            assert.notStrictEqual(result.trust, 'UNKNOWN',
-                `should still produce a coverage-based verdict: ${result.trustReason}`);
+            assert.strictEqual(result.dimensions.semanticRecall.level, 'MEDIUM');
+            assert.match(result.dimensions.semanticRecall.reason, /runtime-resolved edges/);
         } finally { rm(dir); }
     });
 
@@ -1093,9 +1109,41 @@ describe('check command', () => {
             assert.ok(ok);
             if (!result.empty) {
                 assert.ok(result.changed.length > 0, 'should have changed entries');
+                assert.ok(result.trust, 'check should expose an auditable trust summary');
+                assert.strictEqual(result.trust.semanticComplete, false);
+                assert.strictEqual(result.trust.requiresCompilerAndTests, true);
                 const names = result.changed.map(c => c.name);
                 assert.ok(names.includes('brandNew') || names.includes('existing'));
+                for (const item of result.changed) {
+                    assert.ok(item.account, 'each checked symbol should expose account readiness');
+                    assert.strictEqual(item.account.safeToDelete, false);
+                }
             }
+        } finally { rm(dir); }
+    });
+
+    it('blocks a deleted symbol because the current index cannot prove deletion safety', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function doomed() { return 1; }\nmodule.exports = doomed;',
+        });
+        try {
+            execFileSync('git', ['init', '-q'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'add', '.'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir });
+            fs.writeFileSync(path.join(dir, 'a.js'), 'module.exports = {};\n');
+
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'check', { base: 'HEAD' });
+            assert.ok(ok);
+            assert.strictEqual(result.empty, undefined);
+            assert.strictEqual(result.trust.status, 'BLOCKED');
+            assert.ok(result.trust.incompleteAccounts > 0);
+            assert.ok(result.actions.some(a => a.kind === 'incomplete_account'));
+            const deleted = result.changed.find(c => c.kind === 'deleted');
+            assert.ok(deleted);
+            assert.strictEqual(deleted.account.available, false);
+            assert.strictEqual(deleted.account.safeToDelete, false);
         } finally { rm(dir); }
     });
 });

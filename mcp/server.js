@@ -123,6 +123,37 @@ const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars overrid
 // Broad commands (derived from registry): output is project-wide, truncation means you need a filter
 const BROAD_COMMANDS = new Set([...BROAD_CANONICAL].map(toMcpName));
 
+const CONTRACT_LINE_RE = /^\s*(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT):/;
+const MAX_PRESERVED_CONTRACT_LINES = 24;
+const MAX_PRESERVED_CONTRACT_CHARS = 8000;
+
+/**
+ * Keep trust/accounting metadata visible even when the human-readable body is
+ * truncated. A first-N slice without this footer can turn a qualified answer
+ * into an apparently complete one for an agent.
+ */
+function preservedContractMetadata(fullText, visibleText) {
+    const visible = new Set(visibleText.split('\n').map(line => line.trim()));
+    const selected = [];
+    let selectedChars = 0;
+    let omitted = 0;
+
+    for (const rawLine of fullText.split('\n')) {
+        if (!CONTRACT_LINE_RE.test(rawLine)) continue;
+        const line = rawLine.trim();
+        if (!line || visible.has(line)) continue;
+        if (selected.length >= MAX_PRESERVED_CONTRACT_LINES ||
+            selectedChars + line.length + 1 > MAX_PRESERVED_CONTRACT_CHARS) {
+            omitted++;
+            continue;
+        }
+        selected.push(line);
+        selectedChars += line.length + 1;
+    }
+
+    return { lines: selected, omitted, complete: omitted === 0 };
+}
+
 function toolResult(text, command, maxChars, suffixNote) {
     const suffix = suffixNote || '';
     if (!text) return { content: [{ type: 'text', text: '(no output)' + suffix }] };
@@ -135,6 +166,7 @@ function toolResult(text, command, maxChars, suffixNote) {
         // Cut at last newline to avoid breaking mid-line
         const lastNewline = truncated.lastIndexOf('\n');
         const cleanCut = lastNewline > limit * 0.8 ? truncated.substring(0, lastNewline) : truncated;
+        const contractMetadata = preservedContractMetadata(text, cleanCut);
         // Command-specific narrowing hints
         const hints = {
             toc: 'Use in= to scope to a subdirectory, or detailed=false for compact view.',
@@ -146,7 +178,25 @@ function toolResult(text, command, maxChars, suffixNote) {
             usages: 'Use file= to scope to specific files.',
         };
         const narrow = hints[command] || 'Use file=/in=/exclude= to narrow scope.';
-        return { content: [{ type: 'text', text: cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Or use all=true to see everything (warning: ~${fullTokens} tokens).` + suffix }] };
+        let rendered = cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Use all=true to lift formatter caps; the MCP transport still has a 100K character ceiling.`;
+        if (contractMetadata.lines.length > 0 || contractMetadata.omitted > 0) {
+            rendered += '\n\nPRESERVED CONTRACT METADATA (from omitted output):';
+            if (contractMetadata.lines.length > 0) rendered += '\n' + contractMetadata.lines.join('\n');
+            if (contractMetadata.omitted > 0) {
+                rendered += `\nWARNING: ${contractMetadata.omitted} additional contract line(s) could not fit the preservation budget; narrow scope before acting.`;
+            }
+        }
+        rendered += suffix;
+        return {
+            content: [{ type: 'text', text: rendered }],
+            structuredContent: {
+                truncated: true,
+                fullChars: fullSize,
+                requestedLimit: limit,
+                contractMetadata: contractMetadata.lines,
+                contractMetadataComplete: contractMetadata.complete,
+            },
+        };
     }
     return { content: [{ type: 'text', text: text + suffix }] };
 }
@@ -184,12 +234,12 @@ function resolveAndValidatePath(index, file) {
 // CONSOLIDATED TOOL REGISTRATION
 // ============================================================================
 
-const TOOL_DESCRIPTION = `Code intelligence toolkit for AI agents. Extract specific functions, trace call chains, find all callers, and detect dead code — without reading entire files or scanning full projects. Use instead of grep/read for code relationships. Supports JavaScript/TypeScript, Python, Go, Rust, Java, and HTML.
+const VERBOSE_TOOL_DESCRIPTION = `Code intelligence toolkit for AI agents. Extract specific functions, trace call chains, find all callers, and detect dead code without reading entire files or scanning full projects. Use instead of grep/read for code relationships. Supports JavaScript/TypeScript, Python, Go, Rust, Java, and HTML.
 
-TOP 5 (covers 90% of tasks): about, impact, trace, find, deadcode
+COMMON STARTING COMMANDS: orient, about, impact, trace, find
 
-QUICK GUIDE — choosing the right command:
-  New/unfamiliar repo → orient (size, top dirs, hot functions, entry points, trust — run FIRST)
+QUICK GUIDE: choosing the right command:
+  New/unfamiliar repo → orient (size, top dirs, hot functions, entry points, readiness; run FIRST)
   Understand a symbol → about (everything), context (callers/callees only), smart (code + called functions inline)
   Before modifying    → impact (all call sites with args), verify (signature check), plan (preview refactor)
   Execution flow      → trace (function call tree) or graph (file imports/exports)
@@ -199,39 +249,39 @@ QUICK GUIDE — choosing the right command:
 Commands:
 
 UNDERSTANDING CODE:
-- about <name>: Definition, source, callers, callees, and tests — everything in one call. Replaces 3-4 grep+read cycles. Your first stop for any function or class. Pass git=true for last-modified, author, and recent-changes (last 30d).
+- about <name>: Definition, source, callers, callees, and tests in one call. Replaces 3-4 grep+read cycles. Your first stop for any function or class. Pass git=true for last-modified, author, and recent-changes (last 30d).
 - context <name>: Who calls it and what does it call, without source code. Results are numbered for use with expand. For classes/structs, shows all methods instead.
-- impact <name>: Every call site with actual arguments passed, grouped by file. Essential before changing a function signature — shows exactly what breaks.
-- blast <name>: Transitive blast radius — callers of callers. Shows the full chain of functions affected if you change something. Like impact but recursive. Use depth (default: 3) to control how far up the chain to walk.
+- impact <name>: Every call site with actual arguments passed, grouped by file. Use it before changing a function signature to see the affected sites.
+- blast <name>: Transitive blast radius through callers of callers. Shows the full chain of functions affected by a change. Use depth (default: 3) to control how far up the chain to walk.
 - smart <name>: Get a function's source with all called functions expanded inline (not constants/variables). Use to understand or modify a function and its dependencies in one read.
-- trace <name>: Call tree from a function downward. Use to understand "what happens when X runs" — maps which modules a pipeline touches without reading files. Set depth (default: 3); setting depth expands all children.
+- trace <name>: Call tree from a function downward. Use to understand "what happens when X runs" and which modules a pipeline touches. Set depth (default: 3); setting depth expands all children.
 - example <name>: Best real-world usage example. Automatically scores call sites by quality and returns the top one with context. Use to understand expected calling patterns. Set diverse=true to cluster call sites by argument shape and return one representative per cluster (pair with top=N, default 3).
-- reverse_trace <name>: Upward call chain to entry points — who calls this, who calls those callers, etc. Use to find all paths that lead to a function. Set depth (default: 5) to control how far up. Complement to trace (which goes downward).
+- reverse_trace <name>: Upward call chain to entry points. Use to find paths that lead to a function. Set depth (default: 5) to control how far up. This complements trace, which goes downward.
 - related <name>: Sibling functions: same file, similar names, or shared callers/callees. Find companions to update together (e.g., serialize when you're changing deserialize). Name-based, not semantic.
 - brief <name>: Compact summary of a function: typed signature, first sentence of docstring, side-effect classification (fs/network/process/global_mutation), complexity (branches, depth, lines). Cheaper than about; more useful than fn when you don't need the body. Pass git=true for last-modified info.
 
 FINDING CODE:
 - find <name>: Locate definitions ranked by usage count. Supports glob patterns (e.g. find "handle*" or "_update*"). Use when you know the name but not the file.
 - usages <name>: See every usage organized by type: definitions, calls, imports, references. Complete picture of how something is used. Use code_only=true to skip comments/strings.
-- toc: Get a quick overview of a project you haven't seen before — file counts, line counts, function/class counts, entry points. Use detailed=true for full symbol listing.
+- toc: Get a quick overview of an unfamiliar project: file counts, line counts, function/class counts, and entry points. Use detailed=true for full symbol listing.
 - search <term>: Text search (like grep, respects .gitignore). Supports regex by default (e.g. "\\d+" or "foo|bar"). Supports context=N for surrounding lines, exclude/in for file filtering. Case-insensitive by default; set case_sensitive=true for exact case. Invalid regex auto-falls back to plain text. STRUCTURAL MODE: Add type=function|class|call|method|type to query the symbol index instead of text. Combine with param=, returns=, decorator=, receiver= (for calls), exported=true, unused=true. Term becomes optional name filter (glob). Example: type=function, param=Request → all functions taking Request.
 - tests <name>: Find test files covering a function, test case names, and how it's called in tests. Use before modifying or to find test patterns to follow.
 - affected_tests <name>: Which tests to run after changing a function. Combines blast (transitive callers) with test detection. Shows test files, coverage %, and uncovered functions. Use depth= to control depth.
-- deadcode: Find dead code: functions/classes with zero callers. Use during cleanup to identify safely deletable code. Excludes exported, decorated, and test symbols by default — use include_exported/include_decorated/include_tests to expand.
+- deadcode: Generate unreferenced-symbol candidates for review. Never treat the result as standalone deletion proof. Exported, decorated, and test symbols are excluded by default; use include_exported/include_decorated/include_tests to expand the audit.
 - entrypoints: Detect framework entry points: routes, handlers, DI providers, tasks. Auto-detects Express, Flask, Spring, Gin, Actix, and more. Use framework= to filter by specific framework.
-- endpoints: HTTP API surface — list server routes (Express/Fastify/Koa/NestJS/Flask/FastAPI/Spring/JAX-RS/Gin/Echo/Chi/Fiber/axum/actix/Next.js) and client requests (fetch/axios/requests/httpx/http/restTemplate/webClient/reqwest). Use bridge=true to match clients to servers across language boundaries; method=/prefix= to filter; server_only/client_only to halve output.
+- endpoints: HTTP API surface with server routes and client requests. Use bridge=true to match clients to servers across language boundaries; method=/prefix= to filter; server_only/client_only to reduce output.
 
 EXTRACTING CODE (use instead of reading entire files):
 - fn <name>: Extract one or more functions. Comma-separated for bulk extraction (e.g. "parse,format,validate"). Use file to disambiguate.
 - class <name>: Extract a class/struct/interface with all its methods. Handles all supported types: JS/TS, Python, Go, Rust, Java. Large classes (>200 lines) show summary; use max_lines for truncated source.
 - lines: Extract specific lines (e.g. range="10-20" or just "15"). Requires file and range. Use when you know the exact line range you need.
-- expand <item>: Drill into a numbered item from the last context result (requires running context first in the same session). Context returns numbered callers/callees — use this to see their full source code.
+- expand <item>: Drill into a numbered item from the last context result. Run context first in the same session. Use expand to see the selected source code.
 
 FILE DEPENDENCIES (require file param):
 - imports: All imports with resolved file paths. Use to understand dependencies before modifying or moving a file. Resolves relative, package, and language-specific patterns.
-- exporters: Every file that imports/depends on this file — shows dependents rather than dependencies. Use before moving, renaming, or deleting.
+- exporters: Every file that imports or depends on this file. Use before moving, renaming, or deleting.
 - file_exports: File's public API: all exported functions, classes, variables with signatures. Use to understand what a module offers before importing. Requires explicit export markers; use toc --detailed as fallback.
-- graph: File-level dependency tree. Use to understand module architecture — which files form a cluster, what the dependency chain looks like. Set direction ("imports"/"importers"/"both"). Can be noisy — use depth=1 for large codebases.
+- graph: File-level dependency tree. Use it to understand module clusters and dependency chains. Set direction ("imports"/"importers"/"both"). Use depth=1 for large codebases.
 - circular_deps: Detect circular import chains. Shows cycle paths and involved files. Use file= to check a specific file, exclude= to ignore paths.
 
 REFACTORING:
@@ -241,7 +291,7 @@ REFACTORING:
 - check: Pre-commit lint of pending changes against the index. Composes diff_impact + verify + affected_tests; flags ADDED functions with zero callers (ORPHAN), BROKEN_IMPORT, signature drift across call sites, and recommends which tests to run. Use base= to compare against a branch, staged=true for staged changes only.
 
 DIAGNOSTICS:
-- doctor: Index health/coverage report — file/symbol counts, language breakdown, dynamic-import / eval / reflection blind spots, parse failures, and a verdict (HIGH/MEDIUM/LOW trust). Use deep=true to also sample resolution coverage and bucket edges by confidence. Use in= to scope to a subtree.
+- doctor: Task-specific readiness report with index health, semantic blind spots, command proof classification, and navigation/refactor/deletion levels. deep=true adds a stratified resolution-evidence profile; it is not an accuracy estimate. Use in= to scope to a subtree.
 - orient: One-screen repo orientation for a codebase you just entered: size + language mix, densest directories, most-called functions, entry-point counts, and the trust verdict. Best FIRST command in a new repo.
 
 OTHER:
@@ -252,12 +302,43 @@ OTHER:
 - audit_async: Find async calls inside async functions that are likely missing await (probable bugs). JS/TS/Python only. Filter with file/exclude/limit.
 
 READING OUTPUT (trust contract):
-- Caller/impact answers PARTITION every text occurrence of the symbol — nothing is silently hidden. CONFIRMED entries carry binding/receiver/import evidence (safe to act on). UNVERIFIED entries are call-syntax matches without evidence, each with a reason — treat as possible callers before a breaking change. The ACCOUNT line reconciles the arithmetic; "0 unaccounted" means the partition is complete.
-- A CONFIRMED(0) + UNVERIFIED(0) answer with 0 unaccounted and no WARNING is a trustworthy zero: the symbol genuinely has no callers.
-- WARNING lines list unparsed files containing the symbol — their lines were NOT analyzed; fall back to text search there.
+- Caller/impact answers partition literal-name text lines. CONFIRMED entries carry binding/receiver/import evidence; UNVERIFIED entries are possible callers without target proof. ACCOUNT reconciles that text ground set. CONTRACT states the boundary explicitly.
+- A zero account is an observed-text zero, not proof of zero semantic callers: aliases, indirect calls, generated code, and runtime dispatch can exist. Never use it alone as safe-delete evidence; review usages/deadcode, warnings, and tests.
+- WARNING lines list unparsed files containing the symbol. Their lines were not analyzed; fall back to text search there.
 - verify arg-checks and plan plans CONFIRMED sites only; their UNVERIFIED CALL SITES sections list candidates to review manually. check reports "N callers (+M unverified)" per changed function.
 - context/smart/trace also account the callee side (CALLEE ACCOUNT line + unverified callees with reasons).
-- Advisory commands (related, example, stacktrace, endpoints bridge=true) mark output "Advisory:" — ranked heuristics, not verified claims. Every other listed answer is contract-backed.` + generateMcpParamSection();
+- Advisory commands (related, example, stacktrace, endpoints bridge=true) mark output "Advisory:". These are ranked heuristics, not verified claims. Other semantic answers expose their evidence/account boundaries.` + generateMcpParamSection();
+
+const CONCISE_TOOL_DESCRIPTION = `AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, Java, and HTML.
+
+Start:
+- orient: repo map and task-specific readiness.
+- find: definitions by name; brief: cheap signature/summary; about: compact symbol card.
+
+Understand and change:
+- context: direct callers/callees. impact: caller sites and arguments.
+- trace: downward execution tree. reverse_trace/blast: upward/transitive impact.
+- fn/class/lines: extract only the source needed. smart: target plus dependencies.
+- verify: confirmed-site arity check. plan: refactor preview. check/diff_impact: change preflight.
+- tests/affected_tests: relevant tests. usages: all AST usage kinds. deadcode: conservative candidate list.
+
+Architecture and search:
+- toc/stats/api/entrypoints: project surface. imports/exporters/file_exports/graph/circular_deps: file graph.
+- search: text or structural query. endpoints: server/client HTTP surface. typedef: types.
+- example/related/stacktrace/endpoints bridge=true are advisory heuristics.
+
+Trust contract:
+- CONFIRMED means binding/receiver/import evidence supports this target. UNVERIFIED means possible target; review it before a breaking change.
+- ACCOUNT conserves literal-name text lines only. CONTRACT states whether that partition is complete and always warns that semantic completeness is not proven. A clean zero is observed-text zero, never standalone deletion proof.
+- WARNING means parse/read blind spots. FILTERED means the displayed answer intentionally hides accounted entries.
+- Numeric confidence fields are ordinal evidence weights, not probabilities or calibrated accuracy.
+- MCP defaults about/context/impact to compact output; set compact=false for expressions/source. Truncated responses preserve contract metadata and expose structuredContent.truncated.
+- Use doctor deep=true for task readiness plus a stratified evidence profile; the profile is not an accuracy measurement.
+` + generateMcpParamSection();
+
+const TOOL_DESCRIPTION = process.env.UCN_MCP_VERBOSE_DESCRIPTION === '1'
+    ? VERBOSE_TOOL_DESCRIPTION
+    : CONCISE_TOOL_DESCRIPTION;
 
 server.registerTool(
     'ucn',
@@ -271,12 +352,12 @@ server.registerTool(
             exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
             exclude_tests: z.boolean().optional().describe('Exclude test files from results. Used by entrypoints (where tests are included by default).'),
-            include_methods: z.boolean().optional().describe('Include obj.method() callee expansion in trace/blast. No effect on about/context/impact/verify — method calls are always analyzed and tiered by receiver evidence'),
-            include_uncertain: z.boolean().optional().describe('No effect on tiered commands (about/context/impact/trace/blast/reverse_trace/affected_tests/verify/smart) — unverified candidates are always shown with reasons'),
-            expand_unverified: z.boolean().optional().describe('blast/reverse_trace: follow unverified caller edges in the tree — downstream nodes are marked as unverified chains (possible, not confirmed, impact)'),
-            min_confidence: z.number().min(0).max(1).optional().describe('Minimum confidence threshold (0.0-1.0) to filter caller/callee edges'),
-            show_confidence: z.boolean().optional().describe('Show confidence scores per edge (default: true). Set false to hide.'),
-            hide_confidence: z.boolean().optional().describe('Hide confidence scores per edge (alias of show_confidence=false).'),
+            include_methods: z.boolean().optional().describe('Include obj.method() callee expansion in trace/blast. No effect on about/context/impact/verify; method calls are always analyzed and tiered by receiver evidence'),
+            include_uncertain: z.boolean().optional().describe('No effect on tiered commands (about/context/impact/trace/blast/reverse_trace/affected_tests/verify/smart); unverified candidates are always shown with reasons'),
+            expand_unverified: z.boolean().optional().describe('blast/reverse_trace: follow unverified caller edges in the tree; downstream nodes are marked as possible, not confirmed, impact chains'),
+            min_confidence: z.number().min(0).max(1).optional().describe('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges'),
+            show_confidence: z.boolean().optional().describe('Show resolution-evidence labels. Numeric weights are ordinal, not probabilities.'),
+            hide_confidence: z.boolean().optional().describe('Hide resolution-evidence labels (alias of show_confidence=false).'),
             unreachable_only: z.boolean().optional().describe('Show only callers/callees that are unreachable from any detected entry point (about, context, impact).'),
             with_types: z.boolean().optional().describe('Include related type definitions in output'),
             detailed: z.boolean().optional().describe('Show full symbol listing per file'),
@@ -306,16 +387,16 @@ server.registerTool(
             range: z.string().optional().describe('Line range to extract, e.g. "10-20" or "15" (lines command)'),
             base: z.string().optional().describe('Git ref to diff against (default: HEAD). E.g. "HEAD~3", "main", a commit SHA'),
             staged: z.boolean().optional().describe('Analyze staged changes (diff_impact command)'),
-            deep: z.boolean().optional().describe('Run a deeper analysis (doctor: sample resolution coverage)'),
-            compact: z.boolean().optional().describe('Compact one-line-per-item output for about/context (saves tokens)'),
+            deep: z.boolean().optional().describe('Run deeper analysis (doctor: sample the ordinal resolution-evidence profile, not accuracy)'),
+            compact: z.boolean().optional().describe('Token-efficient output for about/context/impact. Defaults true on MCP; set false when source expressions are required.'),
             case_sensitive: z.boolean().optional().describe('Case-sensitive search (default: false, case-insensitive)'),
             all: z.boolean().optional().describe('Show all results (expand truncated sections). Applies to about, toc, related, trace, and others.'),
             top_level: z.boolean().optional().describe('Show only top-level functions in toc (exclude nested/indented)'),
             class_name: z.string().optional().describe('Class name to scope method analysis (e.g. "MarketDataFetcher" for close)'),
-            line: z.number().int().positive().optional().describe('Definition line pin — resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.'),
+            line: z.number().int().positive().optional().describe('Definition line pin. Resolves the symbol defined at this exact line (the middle component of a file:line:name handle). Disambiguates same-file same-name definitions.'),
             limit: z.number().int().positive().max(1000000).optional().describe('Max results to return (default: 500). Caps find, usages, search, deadcode, api, toc --detailed. Must be a positive integer.'),
             max_files: z.number().int().positive().max(10000000).optional().describe('Max files to index (default: 10000). Use for very large codebases. Must be a positive integer.'),
-            max_chars: z.number().int().positive().max(10000000).optional().describe('Max output chars before truncation. Targeted commands (about, context, smart, etc.): 10K default. Broad commands (toc, entrypoints, deadcode, etc.): 3K default. Max: 100K. Use all=true to bypass all caps.'),
+            max_chars: z.number().int().positive().max(100000).optional().describe('Max output chars before truncation. Targeted commands default to 10K; broad commands default to 3K. Maximum: 100K. all=true lifts formatter caps but keeps the 100K transport ceiling.'),
             // Structural search flags (search command)
             type: z.string().optional().describe('Symbol type filter for structural search: function, class, call, method, type. Triggers index-based search.'),
             param: z.string().optional().describe('Filter by parameter name or type (structural search). E.g. "Request", "ctx".'),
@@ -331,18 +412,17 @@ server.registerTool(
             server_only: z.boolean().optional().describe('Only list server routes (endpoints command).'),
             client_only: z.boolean().optional().describe('Only list client requests (endpoints command).'),
             unmatched: z.boolean().optional().describe('Only show unmatched routes/requests (endpoints command).'),
-            method: z.string().optional().describe('Filter by HTTP method (e.g. "GET", "POST") — endpoints command.'),
+            method: z.string().optional().describe('Filter by HTTP method (e.g. "GET", "POST") for endpoints.'),
             prefix: z.string().optional().describe('Filter routes/requests by path prefix (endpoints command).'),
             hide_uncertain: z.boolean().optional().describe('Hide uncertain (interpolated-path) bridges (endpoints command).')
 
         })
     },
     async (args) => {
-        const { command, project_dir } = args;
+        const { command, project_dir, ...rawParams } = args;
 
         // Normalize ALL params once — execute() handlers pick what they need.
         // This eliminates per-case param selection and prevents CLI/MCP drift.
-        const { command: _c, project_dir: _p, ...rawParams } = args;
         const ep = normalizeParams(rawParams);
 
         // Translate hide_confidence → showConfidence:false (canonical inverse).
@@ -373,7 +453,7 @@ server.registerTool(
             }
         }
 
-        // all=true bypasses both formatter caps AND char truncation (parity with CLI --all)
+        // all=true lifts formatter caps and raises MCP output to its hard ceiling.
         const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
 
         // Build stripping note (appended inside truncation boundary on success paths)
@@ -418,7 +498,7 @@ server.registerTool(
                 let aboutText = output.formatAbout(result, {
                     allHint: 'Repeat with all=true to show all.',
                     showConfidence: ep.showConfidence !== false,
-                    compact: ep.compact,
+                    compact: ep.compact !== false,
                 });
                 if (note) aboutText += '\n\n' + mn(note);
                 return tr(aboutText);
@@ -431,7 +511,7 @@ server.registerTool(
                 const { text, expandable } = output.formatContext(ctx, {
                     expandHint: 'Use expand command with item number to see code for any item.',
                     showConfidence: ep.showConfidence !== false,
-                    compact: ep.compact,
+                    compact: ep.compact !== false,
                 });
                 expandCacheInstance.save(index.root, ep.name, ep.file, expandable);
                 let ctxText = text;
@@ -443,7 +523,7 @@ server.registerTool(
                 index = getIndex(project_dir, ep);
                 const { ok, result, error, note } = execute(index, 'impact', ep);
                 if (!ok) return te(error);
-                let impactText = output.formatImpact(result, { compact: ep.compact });
+                let impactText = output.formatImpact(result, { compact: ep.compact !== false });
                 if (note) impactText += '\n\n' + mn(note);
                 return tr(impactText);
             }

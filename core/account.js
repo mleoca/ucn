@@ -316,6 +316,12 @@ function buildAccount(index, name, parts) {
     const accountedTotal = confirmed + unverified + nonCall.total + excludedTotal + groundSet.unparsed.lines;
     const unaccounted = groundSet.total - accountedTotal;
 
+    const textComplete = unaccounted === 0 &&
+        groundSet.unparsed.fileCount === 0 &&
+        groundSet.unreadableFiles.length === 0;
+    const observedTextZero = textComplete && confirmed === 0 && unverified === 0 &&
+        beyondText.count === 0;
+
     const account = {
         symbol: name,
         groundTotal: groundSet.total,
@@ -329,6 +335,18 @@ function buildAccount(index, name, parts) {
         beyondText,
         unaccounted,
         conserved: unaccounted === 0,
+        // This deliberately describes a narrower guarantee than "all callers".
+        // The conservation model proves that every literal-name text line was
+        // classified. It cannot prove that aliases, indirect calls, generated
+        // code, or runtime dispatch contain no additional semantic references.
+        contract: {
+            kind: 'literal-name-text-partition',
+            textComplete,
+            observedTextZero,
+            semanticComplete: false,
+            safeToDelete: false,
+            requiresUsageReview: nonCall.references > 0 || nonCall.unclassifiedText > 0,
+        },
     };
     if (parts.filtered && parts.filtered.total > 0) {
         account.filtered = parts.filtered;

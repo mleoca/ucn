@@ -295,6 +295,7 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 isConstructor: true,
                 ...(docstring && { docstring }),
                 ...(annotations.length > 0 && { annotations }),
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
                 ...(nameLine !== startLine && { nameLine })
             });
         }
@@ -423,7 +424,8 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 members: extractEnumConstants(node, lines),
                 modifiers,
                 ...(docstring && { docstring }),
-                ...(annotations.length > 0 && { annotations })
+                ...(annotations.length > 0 && { annotations }),
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs })
             });
         }
         return true;
@@ -479,6 +481,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(annotations.length > 0 && { annotations }),
+                ...(annotationsWithArgs.length > 0 && { annotationsWithArgs }),
                 ...(implementsInfo.length > 0 && { implements: implementsInfo })
             });
         }
@@ -843,6 +846,7 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
+        ...(tree.rootNode.hasError && { parseRecovery: true }),
         imports: [],
         exports: []
     };
@@ -869,7 +873,7 @@ function findCallsInCode(code, parser) {
         if (!argsNode) return null;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             return _extractStringArg(arg);
         }
         return null;
@@ -979,6 +983,7 @@ function findCallsInCode(code, parser) {
     // as an implicit-this field when NO local of that name is declared —
     // mistyping a shadowed local could wrongly exclude a true caller.
     const scopeDeclared = new Map();
+    const scopedTypeRestores = new Map();
     const collectDeclaredNames = (fnNode) => {
         const declared = new Set();
         const walk = (n) => {
@@ -1064,6 +1069,27 @@ function findCallsInCode(code, parser) {
                 const tn = arg.childForFieldName('type');
                 return tn ? `cast:${bareTypeName(tn.text)}` : 'expr';
             }
+            case 'class_literal': {
+                const tn = arg.namedChild(0);
+                return tn ? `class:${bareTypeName(tn.text)}` : 'class:Object';
+            }
+            case 'identifier': {
+                const typeName = getReceiverType(arg.text);
+                return typeName ? `type:${bareTypeName(typeName)}` : 'expr';
+            }
+            case 'method_invocation': {
+                // Preserve compiler-visible producer ownership for nested
+                // static factories: build(CodeBlock.of(...)) can select a
+                // CodeBlock overload without guessing from the method name.
+                const ownerNode = arg.childForFieldName('object');
+                const methodNode = arg.childForFieldName('name');
+                if (ownerNode?.type === 'identifier' && methodNode) {
+                    const ownerType = getReceiverType(ownerNode.text) ||
+                        (/^[A-Z]/.test(ownerNode.text) ? ownerNode.text : null);
+                    if (ownerType) return `call:${bareTypeName(ownerType)}:${methodNode.text}`;
+                }
+                return 'expr';
+            }
             case 'lambda_expression':
             case 'method_reference': return 'lambda';
             case 'unary_expression':
@@ -1078,7 +1104,7 @@ function findCallsInCode(code, parser) {
         const kinds = [];
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             kinds.push(argKindOf(arg));
         }
         return { argCount: kinds.length, argKinds: kinds.some(k => k !== 'expr') ? kinds : null };
@@ -1095,6 +1121,26 @@ function findCallsInCode(code, parser) {
             functionStack.push(entry);
             scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
             scopeDeclared.set(entry.startLine, collectDeclaredNames(node));
+        }
+
+        // Enhanced-for variables are compiler-typed locals whose scope is
+        // exactly the loop body. Record the type before visiting the body and
+        // restore any shadowed outer binding on leave.
+        if (node.type === 'enhanced_for_statement' && functionStack.length > 0) {
+            const typeNode = node.childForFieldName('type');
+            const nameNode = node.childForFieldName('name');
+            const typeName = extractTypeName(typeNode);
+            const scopeKey = functionStack[functionStack.length - 1].startLine;
+            const typeMap = scopeTypes.get(scopeKey);
+            if (nameNode && typeName && typeMap) {
+                scopedTypeRestores.set(node.id, {
+                    typeMap,
+                    name: nameNode.text,
+                    had: typeMap.has(nameNode.text),
+                    previous: typeMap.get(nameNode.text),
+                });
+                typeMap.set(nameNode.text, typeName);
+            }
         }
 
         // Handle method invocations: foo(), obj.foo(), this.foo()
@@ -1121,7 +1167,12 @@ function findCallsInCode(code, parser) {
                                 receiverFieldName = fldNode.text;
                                 receiverRootType = findEnclosingClassName(node);
                             } else if (rootNode.type === 'identifier') {
-                                const rootType = getReceiverType(rootNode.text);
+                                // `TypeName.CONSTANT.method()` is a one-hop
+                                // static-field receiver. The capitalized root
+                                // is type identity, then the field declaration
+                                // supplies the value's static type.
+                                const rootType = getReceiverType(rootNode.text) ||
+                                    (/^[A-Z]/.test(rootNode.text) ? rootNode.text : undefined);
                                 if (rootType) {
                                     receiverRoot = rootNode.text;
                                     receiverFieldName = fldNode.text;
@@ -1363,6 +1414,12 @@ function findCallsInCode(code, parser) {
         return true;
     }, {
         onLeave: (node) => {
+            const restore = scopedTypeRestores.get(node.id);
+            if (restore) {
+                if (restore.had) restore.typeMap.set(restore.name, restore.previous);
+                else restore.typeMap.delete(restore.name);
+                scopedTypeRestores.delete(node.id);
+            }
             if (isFunctionNode(node)) {
                 const leaving = functionStack.pop();
                 if (leaving) {

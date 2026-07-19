@@ -219,6 +219,33 @@ describe('perf: lazy calls cache loading', () => {
             rm(dir);
         }
     });
+
+    it('custom cache paths load their colocated call shards', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function helper() { return 1; }',
+            'app.js': 'import { helper } from "./lib.js";\nexport function main() { helper(); }'
+        });
+        try {
+            const cachePath = path.join(dir, 'custom-cache', 'index.json');
+            const index1 = idx(dir);
+            index1.findCallers('helper');
+            index1.saveCache(cachePath);
+
+            const { ProjectIndex } = require('../core/project');
+            const index2 = new ProjectIndex(dir);
+            assert.strictEqual(index2.loadCache(cachePath), true);
+            assert.strictEqual(index2.callsCache.size, 0, 'custom cache remains lazy');
+            assert.strictEqual(index2._callsCacheDir, path.dirname(cachePath));
+
+            const calls = index2.getCachedCalls(path.join(dir, 'app.js'));
+            assert.ok(calls?.some(c => c.name === 'helper'),
+                'semantic call records must come from custom-cache/calls');
+            assert.ok(index2.callsCache.size > 0);
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
 // ── importGraph/exportGraph as Sets ───────────────────────────────────────────
@@ -534,10 +561,13 @@ module.exports = { main };
             assert.ok(index2._reachableSymbols, '_reachableSymbols should be restored');
             assert.ok(index2._reachableFingerprint, 'fingerprint should be restored');
 
-            // Simulate drift: add a synthetic file to the in-memory map.
-            index2.files.set('/synthetic/extra.js', {
+            // Simulate drift with a real source file. Reliability mode must not
+            // silently treat an unreadable synthetic index entry as empty.
+            const extraFile = path.join(dir, 'extra.js');
+            fs.writeFileSync(extraFile, 'function extra() { return 2; }\n');
+            index2.files.set(extraFile, {
                 language: 'javascript',
-                relativePath: '../synthetic/extra.js',
+                relativePath: 'extra.js',
                 lines: 1,
                 symbols: [],
                 bindings: [],
@@ -1075,6 +1105,7 @@ describe('index reliability: parallel build equals sequential build', () => {
             '  *gen(): Iterable<number> { yield 1; }',
             '}',
             'export function typedFn(a: string, b: number): boolean { return !!a && b > 0; }',
+            'const HANDLERS = { run: () => typedFn("x", 1) };',
         ].join('\n');
         spec['rich1.py'] = [
             'from flask import Flask',

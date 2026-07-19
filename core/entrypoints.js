@@ -943,29 +943,27 @@ function detectEntrypoints(index, options = {}) {
             // (3) Top-level invocation targets: any non-method call with no
             //     enclosingFunction is module-load-time, so its callee is reachable.
             //     We treat the callee as an entry point (the function being kicked off).
-            try {
-                const calls = getCachedCalls(index, filePath);
-                if (calls && calls.length > 0) {
-                    for (const c of calls) {
-                        if (c.enclosingFunction != null) continue;
-                        if (c.isMethod) continue;
-                        // Resolve callee names (handles aliased imports)
-                        const names = c.resolvedNames || (c.resolvedName ? [c.resolvedName] : [c.name]);
-                        for (const n of names) {
-                            if (index.symbols.has(n)) allowed.add(n);
-                        }
+            const calls = getCachedCalls(index, filePath);
+            if (calls && calls.length > 0) {
+                for (const c of calls) {
+                    if (c.enclosingFunction != null) continue;
+                    if (c.isMethod) continue;
+                    // Resolve callee names (handles aliased imports)
+                    const names = c.resolvedNames || (c.resolvedName ? [c.resolvedName] : [c.name]);
+                    for (const n of names) {
+                        if (index.symbols.has(n)) allowed.add(n);
                     }
-
-                    // (4) Function containing a top-level `if (require.main === module) { ... }`
-                    //     wrapping calls — captured by treating any non-method call whose
-                    //     enclosingFunction body is at top level. The simplest detection:
-                    //     scan calls inside any function whose body contains the require.main
-                    //     guard. We approximate via the same `enclosingFunction` data: if a
-                    //     function contains top-level invocation-style entries, it's typically
-                    //     identified by the (3) check above. Skip explicit (4) detection here —
-                    //     (3) already covers `if (require.main === module) { main(); }`.
                 }
-            } catch (_e) { /* best-effort */ }
+
+                // (4) Function containing a top-level `if (require.main === module) { ... }`
+                //     wrapping calls — captured by treating any non-method call whose
+                //     enclosingFunction body is at top level. The simplest detection:
+                //     scan calls inside any function whose body contains the require.main
+                //     guard. We approximate via the same `enclosingFunction` data: if a
+                //     function contains top-level invocation-style entries, it's typically
+                //     identified by the (3) check above. Skip explicit (4) detection here —
+                //     (3) already covers `if (require.main === module) { main(); }`.
+            }
 
             // If we identified at least one specific entry, use that set.
             // Otherwise fall back to permissive (null) so a CLI file with neither
@@ -1143,6 +1141,18 @@ function computeReachability(index) {
     const langModuleCache = new Map();
     for (const [, symbols] of index.symbols) {
         for (const symbol of symbols) {
+            // JS/TS module-scope object registries are invoked through dynamic
+            // property access (HANDLERS[command](...)). There may be no static
+            // incoming edge to discover. Treat these members as conservative
+            // roots so deadcode never presents a dynamically reachable handler
+            // as safe to remove; callees then flow through the normal BFS.
+            if (symbol.registryMember) {
+                const registryKey = symbolKey(symbol.file, symbol.startLine);
+                if (!reachable.has(registryKey)) {
+                    reachable.add(registryKey);
+                    queue.push(symbol);
+                }
+            }
             const fileEntry = index.files.get(symbol.file);
             if (!fileEntry) continue;
             const lang = fileEntry.language;
@@ -1183,12 +1193,7 @@ function computeReachability(index) {
     for (const [filePath, fileEntry] of index.files) {
         const lang = fileEntry.language;
         if (lang !== 'javascript' && lang !== 'typescript' && lang !== 'tsx') continue;
-        let calls;
-        try {
-            calls = getCachedCalls(index, filePath);
-        } catch (_e) {
-            continue;
-        }
+        const calls = getCachedCalls(index, filePath);
         if (!calls || calls.length === 0) continue;
         for (const call of calls) {
             // Top-level call: AST recorded enclosingFunction === null/undefined.

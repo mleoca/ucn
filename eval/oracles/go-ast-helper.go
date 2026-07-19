@@ -24,6 +24,7 @@ import (
 	"bufio"
 	"encoding/json"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/token"
 	"os"
@@ -254,6 +255,21 @@ func classifyRef(rel string, line int, u16 int, name string) map[string]any {
 	return map[string]any{"ok": true, "kind": kind}
 }
 
+func sourceStatus(rel string) map[string]any {
+	clean := filepath.Clean(rel)
+	for _, segment := range strings.Split(clean, string(filepath.Separator)) {
+		if segment == "testdata" || strings.HasPrefix(segment, ".") || strings.HasPrefix(segment, "_") {
+			return map[string]any{"ok": true, "gated": true, "reason": "ignored-directory"}
+		}
+	}
+	abs := filepath.Join(root, clean)
+	match, err := build.Default.MatchFile(filepath.Dir(abs), filepath.Base(abs))
+	if err != nil {
+		return map[string]any{"ok": false, "error": err.Error()}
+	}
+	return map[string]any{"ok": true, "gated": !match, "reason": "build-constraints"}
+}
+
 func main() {
 	abs, _ := filepath.Abs(os.Args[1])
 	root = abs
@@ -283,6 +299,8 @@ func main() {
 			case "classify_ref":
 				resp = classifyRef(req["file"].(string), int(req["line"].(float64)),
 					int(req["utf16_col"].(float64)), req["name"].(string))
+			case "source_status":
+				resp = sourceStatus(req["file"].(string))
 			case "shutdown":
 				return
 			default:

@@ -11,6 +11,12 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 
 const { CLI_PATH, PROJECT_DIR, tmp, rm, runInteractive } = require('./helpers');
+const { CANONICAL_COMMANDS, toCliName } = require('../core/registry');
+
+function helpListsCommand(help, command) {
+    const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`^\\s{2}${escaped}(?:\\s|<)`, 'm').test(help);
+}
 
 describe('Interactive Mode', () => {
     it('supports all commands without errors', () => {
@@ -48,9 +54,23 @@ describe('Interactive Mode', () => {
             stdio: ['pipe', 'pipe', 'pipe']
         });
 
-        const expectedCommands = ['expand', 'deadcode', 'related', 'example', 'verify', 'plan', 'stacktrace', 'fn', 'class', 'lines', 'graph', 'file-exports'];
-        for (const cmd of expectedCommands) {
-            assert.ok(result.includes(cmd), `Interactive help should list "${cmd}"`);
+        for (const canonical of CANONICAL_COMMANDS) {
+            const cmd = toCliName(canonical);
+            assert.ok(helpListsCommand(result, cmd), `Interactive help should list "${cmd}"`);
+        }
+    });
+
+    it('one-shot help lists every registered command', () => {
+        const result = execFileSync('node', [CLI_PATH, '--help'], {
+            encoding: 'utf-8',
+            cwd: PROJECT_DIR,
+            timeout: 30000,
+            stdio: ['ignore', 'pipe', 'pipe']
+        });
+
+        for (const canonical of CANONICAL_COMMANDS) {
+            const cmd = toCliName(canonical);
+            assert.ok(helpListsCommand(result, cmd), `CLI help should list "${cmd}"`);
         }
     });
 

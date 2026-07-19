@@ -2028,24 +2028,23 @@ describe('fix #205: overload discipline and arity pruning (Java)', () => {
         try {
             const index = idx(dir);
             const res = callersOf(index, 'Sink.java:2:add');
-            // add("x") binds add(String); add(new Sub()) binds add(Element)
-            // via project ancestry Sub -> Element.
+            // add("x") binds add(String); add(new Sub()) and add(el) bind
+            // add(Element), the former via project ancestry Sub -> Element.
             assert.ok(!res.confirmed.includes('Use.java:4') && !res.confirmed.includes('Use.java:5'),
                 `string/constructor args must not confirm add(Number): ${res.confirmed}`);
-            assert.strictEqual(res.excluded.byReason['overload-mismatch']?.count, 2,
+            assert.strictEqual(res.excluded.byReason['overload-mismatch']?.count, 3,
                 `sibling-overload calls excluded with reason: ${JSON.stringify(res.excluded.byReason)}`);
         } finally { rm(dir); }
     });
 
-    it('variable args against several applicable overloads stay visible as overload-ambiguous', () => {
+    it('a statically typed variable proving a sibling overload is excluded', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = callersOf(index, 'Sink.java:2:add');
-            const entry = res.unverified.find(u => u.key === 'Use.java:6');
-            assert.ok(entry, `sink.add(el) stays visible: ${JSON.stringify(res.unverified)}`);
-            assert.strictEqual(entry.reason, 'overload-ambiguous');
-            assert.strictEqual(entry.dispatchCandidates, 3);
+            assert.ok(!res.confirmed.includes('Use.java:6'), 'sink.add(el) cannot bind add(Number)');
+            assert.ok(!res.unverified.some(u => u.key === 'Use.java:6'),
+                `a compiler-visible Element type is decisive: ${JSON.stringify(res.unverified)}`);
         } finally { rm(dir); }
     });
 
@@ -3256,15 +3255,15 @@ describe('fix #268: inherited sibling overloads join the Java overload disciplin
         };
     }
 
-    it('1-arg call undecidable vs the inherited final varargs sibling — visible, not confirmed', () => {
+    it('1-arg typed call proves the inherited final varargs sibling', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
             const res = contract(index, 'Child.java:3:annotated');
             assert.ok(!res.confirmed.includes('Use.java:4'),
                 `annotated(spec) may bind the inherited varargs overload: ${res.confirmed}`);
-            assert.ok(res.unverified.includes('Use.java:4'),
-                `undecidable overload routes visible: ${res.unverified}`);
+            assert.ok(!res.unverified.includes('Use.java:4'),
+                `the Spec parameter statically selects Spec...: ${res.unverified}`);
         } finally { rm(dir); }
     });
 
@@ -3419,6 +3418,271 @@ describe('fix #270 (Java): interface extends recorded; implements chain shields 
             const dead = index.deadcode();
             assert.ok(dead.some(d => d.name === 'helperling'),
                 `package-private member stays claimable: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #273 (Java): virtual bare calls and receiver-owned callees', () => {
+    it('resolves an inherited fixed static overload through a subclass qualifier', () => {
+        const dir = tmp({
+            'Base.java': [
+                'import java.lang.reflect.Type;',
+                'class Base { static String get(Type type) { return "base"; } }',
+            ].join('\n'),
+            'Child.java': [
+                'class Child extends Base {',
+                '  static String get(String name, Object... rest) { return "child"; }',
+                '}',
+            ].join('\n'),
+            'Use.java': 'class Use { String go() { return Child.get(Object.class); } }',
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(require('path').join(dir, 'Use.java'));
+            assert.ok(calls.some(c => c.name === 'get' && c.argKinds?.[0] === 'class:Object'));
+            const r = execute(index, 'context', { name: 'Base.java:2:get' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.callers || []).some(c => c.file === 'Use.java' && c.line === 1),
+                `fixed inherited overload owns Child.get(Object.class): ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('resolves a capitalized bare static field as a receiver value', () => {
+        const dir = tmp({
+            'Use.java': [
+                'class Pool { Object borrow() { return new Object(); } }',
+                'class Use {',
+                '  static final Pool BufferPool = new Pool();',
+                '  Object go() { return BufferPool.borrow(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const go = index.symbols.get('go')[0];
+            const callees = index.findCallees(go, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'borrow' && c.className === 'Pool'),
+                `capitalized field hop resolves Pool.borrow: ${JSON.stringify(callees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('types enhanced-for receivers within the loop and preserves interface dispatch', () => {
+        const dir = tmp({
+            'Factory.java': [
+                'interface Factory { void create(); }',
+                'class ConcreteFactory implements Factory { public void create() {} }',
+            ].join('\n'),
+            'Use.java': [
+                'import java.util.List;',
+                'class Use {',
+                '  void go(List<Factory> factories) {',
+                '    for (Factory factory : factories) factory.create();',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(require('path').join(dir, 'Use.java'));
+            assert.ok(calls.some(c => c.line === 4 && c.name === 'create' &&
+                c.receiverType === 'Factory'),
+            `enhanced-for variable carries its declared type: ${JSON.stringify(calls)}`);
+            const target = (index.symbols.get('create') || [])
+                .find(d => d.className === 'ConcreteFactory');
+            const r = execute(index, 'context', {
+                name: `${target.relativePath}:${target.startLine}:create`,
+            });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.unverifiedCallers || []).some(c => c.line === 4),
+                `interface loop receiver routes possible dispatch: ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('resolves duplicate simple type names through Java main/test package identity', () => {
+        const dir = tmp({
+            'src/main/java/p/Attribute.java': [
+                'package p;',
+                'public class Attribute { public String getValue() { return "p"; } }',
+            ].join('\n'),
+            'src/main/java/q/Outer.java': [
+                'package q;',
+                'public class Outer {',
+                '  static class Attribute { String getValue() { return "q"; } }',
+                '}',
+            ].join('\n'),
+            'src/test/java/p/AttributeTest.java': [
+                'package p;',
+                'class AttributeTest {',
+                '  String read(Attribute attr) { return attr.getValue(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', {
+                name: 'src/main/java/p/Attribute.java:2:getValue',
+            });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.callers || []).some(c =>
+                c.file === 'src/test/java/p/AttributeTest.java' && c.line === 3),
+            `same-package main/test type wins over foreign nested names: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch']);
+        } finally { rm(dir); }
+    });
+
+    it('uses an owner-scoped static factory return type to select an overload', () => {
+        const dir = tmp({
+            'CodeBlock.java': [
+                'class CodeBlock {',
+                '  static CodeBlock of(String value) { return new CodeBlock(); }',
+                '}',
+            ].join('\n'),
+            'Builder.java': [
+                'class Builder {',
+                '  void build(String format, Object... args) {}',
+                '  void build(CodeBlock code) {}',
+                '  void go() { build(CodeBlock.of("x")); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const go = index.symbols.get('go')[0];
+            const callees = index.findCallees(go, { collectAccount: true, includeMethods: true });
+            const edge = callees.find(c => c.name === 'build' && c.sites?.includes(4));
+            assert.ok(edge && edge.startLine === 3,
+                `CodeBlock.of return identity selects build(CodeBlock): ${JSON.stringify(callees)}`);
+            assert.ok(!(callees.unverifiedCallees || []).some(c =>
+                c.name === 'build' && c.sites?.includes(4)),
+            'the owner-scoped factory type makes overload selection exact');
+        } finally { rm(dir); }
+    });
+
+    it('tracks a capitalized static-field receiver without claiming one override', () => {
+        const dir = tmp({
+            'Base.java': [
+                'class Base {',
+                '  static Base VALUE = new Child();',
+                '  void run() {}',
+                '}',
+                'class Child extends Base { void run() {} }',
+                'class Use { void go() { Base.VALUE.run(); } }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const childRun = (index.symbols.get('run') || []).find(d => d.className === 'Child');
+            const r = execute(index, 'context', {
+                name: `${childRun.relativePath}:${childRun.startLine}:run`,
+            });
+            assert.ok(r.ok, JSON.stringify(r.error));
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.unverifiedCallers || []).some(c => c.line === 6),
+                `Base.VALUE may dispatch to Child.run: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch'],
+                `base-typed field cannot exclude a virtual override: ${JSON.stringify(json.meta.account)}`);
+        } finally { rm(dir); }
+    });
+
+    it('implicit-this calls in a base expose descendant overrides in both directions', () => {
+        const dir = tmp({
+            'Base.java': [
+                'class Base {',
+                '  boolean wantsNodes() { return false; }',
+                '  boolean matches() { return wantsNodes(); }',
+                '}',
+                'class Child extends Base {',
+                '  boolean wantsNodes() { return true; }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'Base.java:6:wantsNodes' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.unverifiedCallers || []).some(c => c.line === 3),
+                `base implicit-this call can dispatch to Child: ${JSON.stringify(json.data)}`);
+            const matches = index.symbols.get('matches')[0];
+            const callees = index.findCallees(matches, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'wantsNodes' && c.sites?.includes(3)),
+                'the base implementation is not the only runtime callee');
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'wantsNodes' && c.reason === 'possible-dispatch'),
+            `virtual callee remains visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('a receiver-qualified method never binds the enclosing same-name method', () => {
+        const dir = tmp({
+            'FieldSpec.java': 'class FieldSpec { void emit() {} }',
+            'TypeSpec.java': [
+                'class TypeSpec {',
+                '  void emit(Iterable<FieldSpec> fields) {',
+                '    for (FieldSpec fieldSpec : fields) fieldSpec.emit();',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const outer = (index.symbols.get('emit') || []).find(d => d.className === 'TypeSpec');
+            const callees = index.findCallees(outer, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.className === 'TypeSpec' && c.sites?.includes(3)),
+                `fieldSpec.emit cannot recurse into TypeSpec.emit: ${JSON.stringify(callees)}`);
+            assert.ok(callees.some(c => c.className === 'FieldSpec' && c.sites?.includes(3)) ||
+                (callees.unverifiedCallees || []).some(c => c.name === 'emit' && c.sites.includes(3)),
+            'the receiver-owned edge is exact when typed, otherwise visibly unverified');
+        } finally { rm(dir); }
+    });
+
+    it('an untyped chained method result never borrows a unique project return type', () => {
+        const dir = tmp({
+            'Tag.java': 'class Tag { String renderTag() { return "tag"; } }',
+            'ProjectValue.java': 'class ProjectValue { String getValue() { return "wrong"; } }',
+            'Use.java': [
+                'import java.util.Map;',
+                'class Use {',
+                '  String read(Map.Entry<String, Tag> entry) {',
+                '    return entry.getValue().renderTag();',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'Tag.java:1:renderTag' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.callers || []).some(c => c.file === 'Use.java' && c.line === 4) ||
+                (json.data.unverifiedCallers || []).some(c => c.file === 'Use.java' && c.line === 4),
+            `the real edge stays visible: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch'],
+                `ProjectValue.getValue(): String cannot type Map.Entry.getValue(): ${JSON.stringify(json.meta.account)}`);
+        } finally { rm(dir); }
+    });
+
+    it('an unresolved chained receiver never binds a same-name method in the caller class', () => {
+        const dir = tmp({
+            'Target.java': 'class Target { Target annotated() { return this; } }',
+            'Other.java': [
+                'class Other {',
+                '  Other annotated() { return this; }',
+                '  static <T> T check(T value) { return value; }',
+                '  Target go(Target raw) { return check(raw).annotated(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'Target.java:1:annotated' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.unverifiedCallers || []).some(c => c.file === 'Other.java' && c.line === 4),
+                `generic identity chain stays visible: ${JSON.stringify(json.data)}`);
+            const go = index.symbols.get('go')[0];
+            const callees = index.findCallees(go, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.className === 'Other' && c.name === 'annotated'),
+                'receiver-blind lexical binding never steals the chain terminal');
+            assert.ok((callees.unverifiedCallees || []).some(c => c.name === 'annotated'),
+                `callee chain stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
         } finally { rm(dir); }
     });
 });

@@ -14,6 +14,7 @@ const path = require('path');
 const fs = require('fs');
 const os = require('os');
 const { ProjectIndex } = require('../core/project');
+const { tsMorphOracle } = require('../eval/oracles/ts-morph-oracle');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -34,6 +35,57 @@ function idx(d, g) {
     i.build(g || null, { quiet: true });
     return i;
 }
+
+describe('Oracle contract', () => {
+    it('ts-morph call oracle keeps interface/base dispatch but rejects concrete sibling methods', async () => {
+        const d = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["**/*.ts"]}',
+            'router.ts': 'export interface Router { add(path: string): void }',
+            'smart.ts': [
+                'import type { Router } from "./router";',
+                'export class SmartRouter implements Router {',
+                '  add(path: string): void {}',
+                '}',
+            ].join('\n'),
+            'other.ts': [
+                'import type { Router } from "./router";',
+                'export class OtherRouter implements Router {',
+                '  add(path: string): void {}',
+                '}',
+            ].join('\n'),
+            'installed.ts': [
+                'import type { Router } from "./router";',
+                'export function installed(path: string): void {}',
+                'export class InstalledRouter implements Router {',
+                '  add: typeof installed = installed',
+                '}',
+            ].join('\n'),
+            'use.ts': [
+                'import type { Router } from "./router";',
+                'import { SmartRouter } from "./smart";',
+                'import { OtherRouter } from "./other";',
+                'import { InstalledRouter } from "./installed";',
+                'export function viaInterface(router: Router) { router.add("/interface") }',
+                'export function viaSmart() { new SmartRouter().add("/smart") }',
+                'export function viaOther() { new OtherRouter().add("/other") }',
+                'export function viaInstalled() { new InstalledRouter().add("/installed") }',
+            ].join('\n'),
+        });
+        try {
+            const handle = await tsMorphOracle.prepare(d);
+            const refs = await tsMorphOracle.findReferences(handle, {
+                name: 'add', file: 'smart.ts', line: 3,
+            });
+            const calls = refs.filter(r => r.kind === 'call')
+                .map(r => `${r.file}:${r.line}`);
+            assert.ok(calls.includes('use.ts:5'), `interface dispatch remains potential: ${calls}`);
+            assert.ok(calls.includes('use.ts:6'), `exact SmartRouter call remains: ${calls}`);
+            assert.ok(!calls.includes('use.ts:7'), `concrete sibling call is not SmartRouter.add: ${calls}`);
+            assert.ok(!calls.includes('use.ts:8'),
+                `standalone function installed as a sibling field is not SmartRouter.add: ${calls}`);
+        } finally { rm(d); }
+    });
+});
 
 // ============================================================================
 // 1. FUNCTION ALIASING — local rename breaks name-based tracking

@@ -11,7 +11,7 @@ const path = require('path');
 const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
-const { getCachedCalls } = require('./callers');
+const { getCachedCalls, _nameBindingReaches } = require('./callers');
 const { extractImports } = require('./imports');
 
 /**
@@ -181,6 +181,7 @@ function usages(index, name, options = {}) {
     const definitions = options.exclude || options.in
         ? allDefinitions.filter(d => index.matchesFilters(d.relativePath, options))
         : allDefinitions;
+    const targetFiles = new Set(allDefinitions.map(d => d.file).filter(Boolean));
 
     for (const def of definitions) {
         usagesList.push({
@@ -227,6 +228,19 @@ function usages(index, name, options = {}) {
                     if (importedFiles) for (const imp of importedFiles) {
                         const impEntry = index.files.get(imp);
                         if (impEntry?.symbols?.some(s => s.name === name)) {
+                            _importedHasDef = true;
+                            break;
+                        }
+                        // A module namespace may expose the target through a
+                        // re-export chain (`import httpx; httpx.URL(...)`,
+                        // where httpx/__init__.py re-exports URL).  Direct-file
+                        // symbol checks silently dropped these compiler-true
+                        // usages.  Reuse the caller engine's conservative
+                        // name-ownership chase: yes confirms; unknown stays
+                        // visible in this raw-usage inventory; only a proven
+                        // no is filtering evidence.
+                        if (targetFiles.size > 0 &&
+                            _nameBindingReaches(index, imp, name, targetFiles) !== 'no') {
                             _importedHasDef = true;
                             break;
                         }
@@ -833,40 +847,108 @@ function structuralSearch(index, options = {}) {
 function example(index, name, options = {}) {
     index._beginOp();
     try {
-    // MEDIUM-8: respect --include-tests. By default, test/fixture/mock files
-    // are excluded as low-signal examples. When the user passes
-    // includeTests:true, return matches from those files too.
-    const exclude = options.includeTests
-        ? []
-        : ['test', 'spec', '__tests__', '__mocks__', 'fixture', 'mock'];
-    const usageResults = usages(index, name, {
-        codeOnly: true,
-        className: options.className,
-        // Scope examples to files matching --file (the flag was accepted but
-        // silently ignored before).
+    // Resolve the exact target first. `--file`/stable handles identify the
+    // DEFINITION; they must never restrict candidate call sites to that same
+    // file (the old implementation did exactly that, selecting recursive or
+    // sibling calls while hiding every external example).
+    const { def } = index.resolveSymbol(name, {
         file: options.file,
-        exclude,
-        context: 5
+        className: options.className,
+        line: options.line,
     });
+    if (!def) return null;
 
-    const calls = usageResults.filter(u => u.usageType === 'call' && !u.isDefinition);
+    // Candidate identity comes from the contracted caller engine, not raw
+    // same-name usages. This prevents an example for Java A.equals from being
+    // selected out of B.equals and lets module re-exports/receiver evidence
+    // participate exactly as they do in about/context/impact.
+    const rawCallers = index.findCallers(name, {
+        targetDefinitions: [def],
+        collectAccount: true,
+    });
+    const candidates = [
+        ...rawCallers.filter(c => c.tier !== 'unverified')
+            .map(c => ({ ...c, evidenceTier: 'confirmed' })),
+        ...rawCallers.filter(c => c.tier === 'unverified')
+            .map(c => ({ ...c, evidenceTier: 'unverified' })),
+        ...(rawCallers.unverifiedEntries || [])
+            .map(c => ({ ...c, evidenceTier: 'unverified' })),
+    ].filter(c => !c.functionReference && c.calledAs !== 'bound');
+
+    // Dedupe by site, preferring confirmed evidence when a parser shape
+    // reaches the same line through more than one resolution path.
+    candidates.sort((a, b) =>
+        (a.evidenceTier === b.evidenceTier ? 0 : (a.evidenceTier === 'confirmed' ? -1 : 1)) ||
+        codeUnitCompare(a.relativePath || a.file || '', b.relativePath || b.file || '') ||
+        (a.line || 0) - (b.line || 0));
+    const seenSites = new Set();
+    const allCalls = [];
+    for (const candidate of candidates) {
+        const rel = candidate.relativePath || path.relative(index.root, candidate.file);
+        const siteKey = `${rel}:${candidate.line}`;
+        if (seenSites.has(siteKey)) continue;
+        seenSites.add(siteKey);
+        const filePath = path.isAbsolute(candidate.file)
+            ? candidate.file : path.join(index.root, rel);
+        let lines = [];
+        try { lines = index._readFile(filePath).split('\n'); } catch { /* fail-loud metadata stays on the project */ }
+        const at = candidate.line - 1;
+        allCalls.push({
+            ...candidate,
+            file: filePath,
+            relativePath: rel,
+            usageType: 'call',
+            content: candidate.content || lines[at] || '',
+            before: lines.slice(Math.max(0, at - 5), at),
+            after: lines.slice(at + 1, at + 6),
+        });
+    }
+
+    const callSiteInScope = call => {
+        if (!options.callSiteFile) return true;
+        const resolved = index.resolveFilePathForQuery(options.callSiteFile);
+        if (typeof resolved === 'string') return call.file === resolved;
+        return call.relativePath.includes(options.callSiteFile);
+    };
+    const confirmedAllCalls = allCalls.filter(call =>
+        call.evidenceTier === 'confirmed' && callSiteInScope(call));
+    const unverifiedAllCalls = allCalls.filter(call =>
+        call.evidenceTier === 'unverified' && callSiteInScope(call));
+    const includeByTestPolicy = call => {
+        if (options.includeTests) return true;
+        const fe = index.files.get(call.file);
+        return !isTestFile(call.relativePath, fe?.language);
+    };
+    // A command called `example` must never silently promote a same-name or
+    // possible-dispatch candidate into a target example. Select only from the
+    // confirmed evidence band; report the unverified pool as an abstention.
+    const calls = confirmedAllCalls.filter(includeByTestPolicy);
+    const visibleUnverified = unverifiedAllCalls.filter(includeByTestPolicy);
     if (calls.length === 0) {
-        // No matches in non-test files. Look at how many WERE excluded so we
-        // can tell the user there's something they could see with
-        // --include-tests, instead of saying "no examples found" silently.
-        if (!options.includeTests) {
-            const allUsages = usages(index, name, {
-                codeOnly: true,
-                className: options.className,
-                file: options.file,
-                exclude: [],
-                context: 0,
-            });
-            const excludedCalls = allUsages.filter(u =>
-                u.usageType === 'call' && !u.isDefinition).length;
-            if (excludedCalls > 0) {
-                return { best: null, totalCalls: 0, excludedTestCalls: excludedCalls };
-            }
+        // Tell the user when compiler-shaped candidates exist only in tests.
+        if (!options.includeTests && confirmedAllCalls.length > 0) {
+            return {
+                best: null,
+                totalCalls: 0,
+                confirmedCalls: 0,
+                unverifiedCalls: visibleUnverified.length,
+                excludedTestCalls: confirmedAllCalls.length,
+            };
+        }
+        if (visibleUnverified.length > 0) {
+            return {
+                advisory: 'scored-selection',
+                best: null,
+                totalCalls: 0,
+                confirmedCalls: 0,
+                unverifiedCalls: visibleUnverified.length,
+                unverifiedCandidates: visibleUnverified.slice(0, 10).map(c => ({
+                    file: c.relativePath,
+                    line: c.line,
+                    content: c.content,
+                    reason: c.reason || c.resolution || 'identity-unverified',
+                })),
+            };
         }
         return null;
     }
@@ -916,7 +998,13 @@ function example(index, name, options = {}) {
     // Advisory command (v4 two-tier surface): scored example selection, not
     // a verified "best" claim.
     if (!options.diverse) {
-        return { advisory: 'scored-selection', best, totalCalls: calls.length };
+        return {
+            advisory: 'scored-selection',
+            best,
+            totalCalls: calls.length,
+            confirmedCalls: calls.filter(c => c.evidenceTier === 'confirmed').length,
+            unverifiedCalls: visibleUnverified.length,
+        };
     }
 
     // --diverse: cluster call sites by AST argument-shape and return one
@@ -977,6 +1065,8 @@ function example(index, name, options = {}) {
         advisory: 'scored-selection',
         best,
         totalCalls: calls.length,
+        confirmedCalls: calls.filter(c => c.evidenceTier === 'confirmed').length,
+        unverifiedCalls: visibleUnverified.length,
         clusters,
         totalClusters: clusterList.length,
     };
@@ -1027,14 +1117,17 @@ function tests(index, nameOrFile, options = {}) {
     // Resolve --file scoping: find the source file that defines this symbol
     // and only include test files that import from it (directly or via re-exports).
     let sourceFileFilter = null;
+    let targetDefs = [];
     if (options.file && !isFilePath) {
-        const defs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className });
-        if (defs.length > 0) {
-            sourceFileFilter = _buildSourceFileImporters(index, defs);
+        targetDefs = index.find(nameOrFile, { exact: true, file: options.file, className: options.className });
+        if (targetDefs.length > 0) {
+            sourceFileFilter = _buildSourceFileImporters(index, targetDefs);
         }
         // If no defs found, sourceFileFilter stays null → no file scoping applied.
         // The execute handler validates before calling, so this path means
         // the file matched but no exact symbol — fall through gracefully.
+    } else if (!isFilePath) {
+        targetDefs = index.find(nameOrFile, { exact: true, className: options.className });
     }
 
     // Find all test files
@@ -1133,7 +1226,9 @@ function tests(index, nameOrFile, options = {}) {
             let localShadow = false;
             if (!isFilePath) {
                 const localDefs = (entry.symbols || []).filter(s => s.name === searchTerm);
+                const targetDefinedHere = !!options.file && targetDefs.some(d => d.file === testPath);
                 if (localDefs.length > 0 &&
+                    !targetDefinedHere &&
                     !(entry.importBindings || []).some(b => b.name === searchTerm)) {
                     localShadow = testRanges
                         ? localDefs.every(s => lineInRanges(s.startLine, testRanges))
@@ -1179,7 +1274,8 @@ function tests(index, nameOrFile, options = {}) {
                     matchType = 'call';
                 } else {
                     // 'reference' — check if inside string literal
-                    matchType = strPattern.test(lineContent) ? 'string-ref' : 'reference';
+                    matchType = strPattern.test(lineContent) ? 'string-ref' :
+                        (usage.inAttribute ? 'unverified-reference' : 'reference');
                 }
 
                 // className scoping for calls: check receiver
@@ -1188,11 +1284,22 @@ function tests(index, nameOrFile, options = {}) {
                 }
 
                 // className scoping for references: require class-associated receiver
-                if (className && (matchType === 'reference' || matchType === 'string-ref')) {
+                if (className && (matchType === 'reference' || matchType === 'string-ref' ||
+                    matchType === 'unverified-reference')) {
                     // Bare references (no receiver) like `fn = save` have no class
                     // association — skip them. Only keep member-access references
                     // where the receiver matches the target class.
-                    if (!usage.receiver) continue;
+                    if (!usage.receiver && matchType !== 'unverified-reference') continue;
+                    if (!usage.receiver && matchType === 'unverified-reference') {
+                        matches.push({
+                            line: usage.line,
+                            content: lineContent.trim(),
+                            matchType,
+                            evidenceTier: 'unverified',
+                            reason: 'macro-generated-reference',
+                        });
+                        continue;
+                    }
                     if (!dispatchNames.has(usage.receiver) &&
                         !(instanceTypeMap && dispatchNames.has(instanceTypeMap.get(usage.receiver)))) {
                         continue;
@@ -1275,6 +1382,90 @@ function tests(index, nameOrFile, options = {}) {
         }
     }
 
+    // Compiler-shaped caller supplement (trust command arm): the literal
+    // usage scan above is excellent for imports/type/string references, but
+    // receiver aliases and re-exported module calls are owned by the caller
+    // engine. Merge its CONFIRMED exact-target test sites so `tests` cannot
+    // miss calls that `about`/`impact` already know about. For a globally
+    // unique callable name, also retain account-unverified sites under the
+    // explicit `unverified-call` label: independent compiler/LSP evaluation
+    // shows these contain real interface/trait dispatch that a test-discovery
+    // command must not silently drop. Repeated names never receive that broad
+    // supplement because it would leak sibling classes/files.
+    if (!isFilePath && targetDefs.length > 0) {
+        const testInfo = new Map(testFiles.map(t => [t.path, t]));
+        const callerSites = [];
+        const globallyUniqueTarget = index.find(searchTerm, { exact: true }).length === 1;
+        for (const def of targetDefs) {
+            const raw = index.findCallers(searchTerm, {
+                targetDefinitions: [def],
+                collectAccount: true,
+            });
+            callerSites.push(
+                ...raw.map(c => ({ ...c, _testEvidenceTier: 'confirmed' })),
+                ...(globallyUniqueTarget ? (raw.unverifiedEntries || []).map(c => ({
+                    ...c,
+                    _testEvidenceTier: 'unverified',
+                })) : []),
+            );
+        }
+
+        for (const site of callerSites) {
+            const info = testInfo.get(site.file);
+            if (!info) continue;
+            if (info.testRanges && !lineInRanges(site.line, info.testRanges)) continue;
+            // For a repeated name, the source-import scope is an additional
+            // identity guard. For a globally unique name, exact-target caller
+            // evidence is stronger than filesystem layout: workspace-level
+            // Rust tests, Go black-box packages, and generated test trees may
+            // exercise a crate/package without importing the defining file.
+            // Unverified sites remain visibly tiered; they are not promoted.
+            if (sourceFileFilter && !globallyUniqueTarget && !sourceFileFilter.has(site.file)) continue;
+            // A bare callback/reference/call can bind a standalone function
+            // with the same name, but it cannot identify a class method
+            // target. Use the parser's call-kind bit rather than requiring a
+            // textual receiver: fluent chains such as `.addStaticBlock(...)`
+            // have a call receiver but no simple receiver identifier. Rust
+            // proc-macro attribute references are handled by the AST usage
+            // branch above as explicitly unverified references.
+            if (className && !site.isMethod) continue;
+            if (excludeArr.length > 0 &&
+                !index.matchesFilters(info.entry.relativePath, { exclude: excludeArr })) continue;
+            const localSameName = (info.entry.symbols || []).some(s => s.name === searchTerm);
+            const importsTargetName = (info.entry.importBindings || []).some(b => b.name === searchTerm);
+            const explicitlyScopedToLocal = !!options.file && targetDefs.some(d => d.file === site.file);
+            if (localSameName && !importsTargetName && !explicitlyScopedToLocal && !site.receiver) continue;
+
+            let fileResult = results.find(r => r.file === info.entry.relativePath);
+            if (!fileResult) {
+                fileResult = { file: info.entry.relativePath, matches: [] };
+                results.push(fileResult);
+            }
+            if (fileResult.matches.some(m => m.line === site.line &&
+                ['call', 'unverified-call'].includes(m.matchType))) continue;
+            fileResult.matches = fileResult.matches.filter(m =>
+                !(m.line === site.line && m.matchType === 'test-case'));
+            fileResult.matches.push({
+                line: site.line,
+                content: (site.content || index.getLineContent(site.file, site.line) || '').trim(),
+                matchType: site._testEvidenceTier === 'confirmed' ? 'call' : 'unverified-call',
+                evidenceTier: site._testEvidenceTier,
+                ...(site.resolution && { resolution: site.resolution }),
+                ...(site.reason && { reason: site.reason }),
+            });
+        }
+
+        for (const fileResult of results) {
+            fileResult.matches.sort((a, b) => (a.line || 0) - (b.line || 0) ||
+                codeUnitCompare(a.matchType || '', b.matchType || ''));
+            if (options.callsOnly) {
+                fileResult.matches = fileResult.matches.filter(m =>
+                    ['call', 'test-case', 'unverified-call'].includes(m.matchType));
+            }
+        }
+        results.sort((a, b) => codeUnitCompare(a.file || '', b.file || ''));
+    }
+
     return results;
     } finally { index._endOp(); }
 }
@@ -1300,6 +1491,25 @@ function _buildSourceFileImporters(index, defs) {
             if (fe.relativePath === d.relativePath) {
                 sourceAbsPaths.add(absPath);
                 break;
+            }
+        }
+    }
+
+    // Go imports own packages, not individual files. The resolver represents
+    // a package import with one deterministic file (for example active_help.go),
+    // so starting the reverse walk from only command.go loses real importers
+    // of other declarations in that same package. Expand only languages whose
+    // declared package scope is the directory; JS/TS/Python files in one
+    // directory remain distinct modules, and Java imports remain class-exact.
+    for (const srcPath of [...sourceAbsPaths]) {
+        const srcEntry = index.files.get(srcPath);
+        if (langTraits(srcEntry?.language)?.packageScope !== 'directory') continue;
+        const srcDir = path.dirname(srcPath);
+        for (const [candidatePath, candidateEntry] of index.files) {
+            if (candidateEntry.language === srcEntry.language &&
+                path.dirname(candidatePath) === srcDir &&
+                !isTestFile(candidateEntry.relativePath, candidateEntry.language)) {
+                sourceAbsPaths.add(candidatePath);
             }
         }
     }
@@ -1352,9 +1562,20 @@ function _buildSourceFileImporters(index, defs) {
             candidateDirs.add(path.join(srcDir, td));
         }
         // Java convention: src/main/java/com/pkg → src/test/java/com/pkg
+        let javaTestPackageDir = null;
         if (srcDir.includes(path.sep + 'main' + path.sep)) {
-            candidateDirs.add(srcDir.replace(path.sep + 'main' + path.sep, path.sep + 'test' + path.sep));
+            javaTestPackageDir = srcDir.replace(path.sep + 'main' + path.sep, path.sep + 'test' + path.sep);
+            candidateDirs.add(javaTestPackageDir);
         }
+
+        // Cargo integration tests may be nested (`tests/testsuite/foo.rs`).
+        // Derive the crate root from its conventional src/ segment; a
+        // workspace can contain many independent crate-local test trees.
+        const rustSrcMarker = path.sep + 'src' + path.sep;
+        const rustSrcAt = srcEntry.language === 'rust' ? srcPath.lastIndexOf(rustSrcMarker) : -1;
+        const rustIntegrationRoot = rustSrcAt >= 0
+            ? path.join(srcPath.slice(0, rustSrcAt), 'tests')
+            : null;
 
         for (const [absPath, fe] of index.files) {
             if (importers.has(absPath)) continue; // already included
@@ -1380,21 +1601,22 @@ function _buildSourceFileImporters(index, defs) {
                 continue;
             }
 
-            // Java: same-package tests need no import statement either — a
-            // test file in the same directory sees the source's package
-            // members directly (fix #244: tests --file silently dropped
-            // MathIntegrationTest.java while affected-tests found it).
-            if (srcEntry.language === 'java' && testDir === srcDir) {
+            // Java: same-package tests need no import statement either. The
+            // source and test packages can be physical mirrors under
+            // src/main and src/test, and ANY test class in that package may
+            // exercise the target (not only TargetNameTest.java).
+            if (srcEntry.language === 'java' &&
+                (testDir === srcDir || testDir === javaTestPackageDir)) {
                 importers.add(absPath);
                 continue;
             }
 
-            // Rust: Cargo integration tests live in <crate-root>/tests/ and
-            // import via the crate's PACKAGE name, which the import resolver
-            // does not map to project files (fix #244).
+            // Rust: Cargo integration tests live anywhere below
+            // <crate-root>/tests/ and import via the crate's PACKAGE name,
+            // which the import resolver does not map to project files.
             if (srcEntry.language === 'rust' &&
-                path.basename(testDir) === 'tests' &&
-                srcPath.startsWith(path.dirname(testDir) + path.sep)) {
+                rustIntegrationRoot &&
+                (absPath === rustIntegrationRoot || absPath.startsWith(rustIntegrationRoot + path.sep))) {
                 importers.add(absPath);
                 continue;
             }

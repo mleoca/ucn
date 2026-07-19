@@ -1134,6 +1134,8 @@ describe('Confidence Scoring', () => {
             const result = scoreEdge({ hasBindingId: true });
             assert.strictEqual(result.resolution, RESOLUTION.EXACT_BINDING);
             assert.strictEqual(result.confidence, SCORES[RESOLUTION.EXACT_BINDING]);
+            assert.strictEqual(result.evidenceScore, result.confidence);
+            assert.strictEqual(result.scoreKind, 'ordinal-evidence-not-probability');
         });
 
         it('scores same-class resolution', () => {
@@ -1475,7 +1477,7 @@ describe('Confidence Scoring', () => {
             } finally { rm(dir); }
         });
 
-        it('cross-file callee with import gets scope-match (0.65)', () => {
+        it('cross-file callee with an explicit import gets exact-binding (0.98)', () => {
             const dir = tmp({
                 'package.json': '{"name":"test"}',
                 'lib1.js': 'function process(x) { return x + 1; }\nmodule.exports = { process };',
@@ -1487,8 +1489,8 @@ describe('Confidence Scoring', () => {
                 const callees = index.findCallees(index.symbols.get('main')[0]);
                 const proc = callees.find(c => c.name === 'process');
                 assert.ok(proc, 'should find process callee');
-                assert.strictEqual(proc.resolution, 'scope-match');
-                assert.strictEqual(proc.confidence, 0.65);
+                assert.strictEqual(proc.resolution, 'exact-binding');
+                assert.strictEqual(proc.confidence, 0.98);
             } finally { rm(dir); }
         });
     });

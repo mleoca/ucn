@@ -2087,8 +2087,8 @@ describe('Bug Hunt: formatGraphJson outputs correct data shape', () => {
     });
 });
 
-describe('Bug Hunt: deadcode does not crash when file is deleted between index and query', () => {
-    it('should handle missing file gracefully with --include-exported', () => {
+describe('Bug Hunt: deadcode fails loudly when source disappears after indexing', () => {
+    it('reports the missing source instead of returning a plausible partial result', () => {
         const dir = tmp({
             'main.js': `
 const { helper } = require('./helper');
@@ -2103,10 +2103,13 @@ module.exports = { helper };
         const index = idx(dir);
         // Delete the helper file after indexing
         fs.unlinkSync(path.join(dir, 'helper.js'));
-        // Should not throw (before fix, _readFile would throw and crash the entire deadcode call)
-        const result = index.deadcode({ includeExported: true });
-        assert.ok(Array.isArray(result), 'should return results array without crashing');
-        rm(dir);
+        try {
+            assert.throws(
+                () => index.deadcode({ includeExported: true }),
+                /helper\.js|ENOENT/,
+                'a missing indexed source must be an explicit analysis failure'
+            );
+        } finally { rm(dir); }
     });
 });
 

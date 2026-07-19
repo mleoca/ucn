@@ -6153,3 +6153,112 @@ describe('fix #256: module-level call sites carry no reachability verdict', () =
         } finally { rm(dir); }
     });
 });
+
+describe('command trust arm: usages/tests/example exact-target regressions', () => {
+    it('usages follows a module namespace through a Python re-export chain', () => {
+        const dir = tmp({
+            'pyproject.toml': '[project]\nname = "pkg"\n',
+            'pkg/core.py': 'def build():\n    return 1\n',
+            'pkg/__init__.py': 'from .core import build\n',
+            'tests/test_build.py': 'import pkg\n\ndef test_build():\n    assert pkg.build() == 1\n',
+        });
+        try {
+            const r = execute(idx(dir), 'usages', {
+                name: 'build', includeTests: true, codeOnly: true,
+            });
+            assert.ok(r.ok, r.error);
+            assert.ok(r.result.some(u => u.relativePath === 'tests/test_build.py' &&
+                u.line === 4 && u.usageType === 'call'),
+            `re-exported module call must stay visible: ${JSON.stringify(r.result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('example stable handles select only confirmed calls to the pinned Java owner', () => {
+        const dir = tmp({
+            'pom.xml': '<project/>',
+            'A.java': 'class A { void run() {} }\n',
+            'B.java': 'class B { void run() {} }\n',
+            'Use.java': [
+                'class Use {',
+                '  void a() { A value = new A(); value.run(); }',
+                '  void b() { B value = new B(); value.run(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const aRun = (index.symbols.get('run') || []).find(d => d.className === 'A');
+            assert.ok(aRun);
+            const r = execute(index, 'example', {
+                name: `${aRun.relativePath}:${aRun.startLine}:run`,
+                includeTests: true,
+            });
+            assert.ok(r.ok, r.error);
+            assert.strictEqual(r.result.best.relativePath, 'Use.java');
+            assert.strictEqual(r.result.best.line, 2);
+            assert.strictEqual(r.result.best.evidenceTier, 'confirmed');
+            assert.strictEqual(r.result.unverifiedCalls, 0);
+        } finally { rm(dir); }
+    });
+
+    it('example abstains instead of promoting an untyped sibling dispatch', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': [
+                'class A { save() {} }',
+                'class B { save() {} }',
+                'function use(value) { value.save(); }',
+                'module.exports = { A, B, use };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = (index.symbols.get('save') || []).find(d => d.className === 'A');
+            const r = execute(index, 'example', {
+                name: `${target.relativePath}:${target.startLine}:save`,
+                includeTests: true,
+            });
+            assert.ok(r.ok, r.error);
+            assert.strictEqual(r.result.best, null);
+            assert.ok(r.result.unverifiedCalls > 0);
+            assert.match(output.formatExample(r.result, 'save'), /No confirmed call example/);
+        } finally { rm(dir); }
+    });
+
+    it('tests includes calls to a helper whose exact definition is in the test file', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/t\n',
+            'helper_test.go': [
+                'package sample',
+                'import "testing"',
+                'func checkOmit(v int) bool { return v == 0 }',
+                'func TestOmit(t *testing.T) { if !checkOmit(0) { t.Fatal("bad") } }',
+            ].join('\n'),
+        });
+        try {
+            const r = execute(idx(dir), 'tests', {
+                name: 'checkOmit', file: 'helper_test.go',
+            });
+            assert.ok(r.ok, r.error);
+            const file = r.result.find(x => x.file === 'helper_test.go');
+            assert.ok(file?.matches.some(m => m.line === 4 && m.matchType === 'call'),
+                `test-local helper call must be coverage evidence: ${JSON.stringify(r.result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('tests supplements renamed-import calls from the exact caller engine', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'export function run() { return 1; }\n',
+            'run.test.js': 'import { run as executeRun } from "./lib.js";\ntest("run", () => executeRun());\n',
+        });
+        try {
+            const r = execute(idx(dir), 'tests', { name: 'run', file: 'lib.js' });
+            assert.ok(r.ok, r.error);
+            const file = r.result.find(x => x.file === 'run.test.js');
+            assert.ok(file?.matches.some(m => m.line === 2 &&
+                ['call', 'unverified-call'].includes(m.matchType)),
+            `alias call must not disappear from test evidence: ${JSON.stringify(r.result)}`);
+        } finally { rm(dir); }
+    });
+});

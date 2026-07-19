@@ -26,7 +26,6 @@ const fs = require('fs');
 const { codeUnitCompare } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
-const { langTraits } = require('../languages');
 
 // ============================================================================
 // HTTP METHOD CONSTANTS

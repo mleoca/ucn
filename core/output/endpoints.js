@@ -15,8 +15,6 @@
 const { advisoryLine } = require('./shared');
 const { codeUnitCompare } = require('../shared');
 
-const SEP_TIER = { exact: 'EXACT', partial: 'PARTIAL', uncertain: 'UNCERTAIN' };
-
 function pad(s, n) {
     if (typeof s !== 'string') s = String(s);
     return s.length >= n ? s : s + ' '.repeat(n - s.length);

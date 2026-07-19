@@ -40,6 +40,8 @@ function addSymbol(fileEntry, item, type) {
     // compare full symbol shapes, but only for shapes present in their
     // fixtures — keep this list in sync by hand when addSymbol grows.
     if (item.paramTypes) symbol.paramTypes = item.paramTypes;
+    if (item.returnedFunctionResult) symbol.returnedFunctionResult = item.returnedFunctionResult;
+    if (item.isFunctionVariable) symbol.isFunctionVariable = true;
     if (item.isAsync) symbol.isAsync = true;
     if (item.isGenerator) symbol.isGenerator = true;
     if (item.generics) symbol.generics = item.generics;
@@ -62,6 +64,8 @@ function addSymbol(fileEntry, item, type) {
     if (item.traitName) symbol.traitName = item.traitName;
     if (item.isSignature) symbol.isSignature = true;
     if (item.memberAssigned) symbol.memberAssigned = true;
+    if (item.registryMember) symbol.registryMember = true;
+    if (item.registryContainer) symbol.registryContainer = item.registryContainer;
 
     fileEntry.symbols.push(symbol);
     // Property-assignment defs declare no lexical name (fix #269) — kept in
@@ -169,6 +173,7 @@ function processFile(filePath) {
         bindings: [],
         dynamicImports: dynamicCount || 0,
     };
+    if (parsed.parseRecovery) fileEntry.parseRecovery = true;
     if (importAliases) fileEntry.importAliases = importAliases;
     if (parsed.moduleAssignedNames) fileEntry.moduleAssignedNames = parsed.moduleAssignedNames;
     if (isBundled) fileEntry.isBundled = true;

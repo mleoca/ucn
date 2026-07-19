@@ -10,7 +10,7 @@
  */
 
 const path = require('path');
-const { McpClient, PROJECT_DIR } = require('./helpers');
+const { McpClient, PROJECT_DIR, TIMEOUT_MS } = require('./helpers');
 
 // ============================================================================
 // Test definitions

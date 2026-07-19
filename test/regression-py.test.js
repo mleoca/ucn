@@ -3997,6 +3997,63 @@ describe('fix #269: PEP-517 src layout resolves project imports', () => {
     });
 });
 
+describe('Python class calls are callees without a new-expression token', () => {
+    it('constructor and raised exception calls resolve to their class symbols', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'app.py': [
+                'class InvalidURL(Exception):',
+                '    pass',
+                'class Client:',
+                '    pass',
+                'def build(flag):',
+                '    if flag:',
+                '        raise InvalidURL("bad")',
+                '    return Client()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const build = (index.symbols.get('build') || [])[0];
+            const callees = index.findCallees(build, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'InvalidURL' && c.sites.includes(7)),
+                `raised class is a callee: ${JSON.stringify(callees)}`);
+            assert.ok(callees.some(c => c.name === 'Client' && c.sites.includes(8)),
+                `constructed class is a callee: ${JSON.stringify(callees)}`);
+            assert.ok(callees.calleeAccount.conserved);
+        } finally { rm(dir); }
+    });
+
+    it('lowercase imported classes own type-qualified method calls', () => {
+        const dir = tmp({
+            'requirements.txt': '',
+            'status.py': [
+                'class codes:',
+                '    @classmethod',
+                '    def is_ok(cls, value):',
+                '        return value == 200',
+            ].join('\n'),
+            'app.py': [
+                'from status import codes',
+                'class Response:',
+                '    @property',
+                '    def is_ok(self):',
+                '        return codes.is_ok(200)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const responseProp = (index.symbols.get('is_ok') || [])
+                .find(s => s.className === 'Response');
+            const callees = index.findCallees(responseProp, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.className === 'codes' && c.sites.includes(5)),
+                `imported lowercase class owns the call: ${JSON.stringify(callees)}`);
+            assert.ok(!callees.some(c => c.className === 'Response'),
+                'same-name enclosing property must not steal the receiver-qualified call');
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #270 (Python): external-contract shield walks extends chains transitively', () => {
     it('shields a public method when the parent chain reaches an unindexed base', () => {
         const dir = tmp({
@@ -4042,6 +4099,206 @@ describe('fix #270 (Python): external-contract shield walks extends chains trans
             const dead = index.deadcode();
             assert.ok(dead.some(d => d.name === 'deadling'),
                 `fully in-project chain stays claimable: ${dead.map(d => d.name)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #271 (Python): project type identity outranks receiver-blind names', () => {
+    function context(index, handle) {
+        const output = require('../core/output');
+        const result = execute(index, 'context', { name: handle });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return JSON.parse(output.formatContextJson(result.result));
+    }
+
+    it('does not rewrite a project class named Text to typing.Text/str in a chain', () => {
+        const dir = tmp({
+            'text.py': [
+                'class Text:',
+                '    def copy(self) -> "Text":',
+                '        return self',
+                '',
+                '    def blank_copy(self) -> "Text":',
+                '        return self',
+                '',
+                '    def join(self, values):',
+                '        return self',
+                '',
+                '    def render(self):',
+                '        text = self.copy()',
+                '        return text.blank_copy().join([])',
+            ].join('\n'),
+        });
+        try {
+            const json = context(idx(dir), 'text.py:8:join');
+            const caller = (json.data.callers || []).find(c => c.file === 'text.py' && c.line === 13);
+            assert.ok(caller, `Text-returning chain must reach Text.join: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('validated self.field type outranks a same-name enclosing method binding', () => {
+        const dir = tmp({
+            'live.py': 'class Live:\n    def update(self, value):\n        return value\n',
+            'spinner.py': 'class Spinner:\n    def update(self, value):\n        return value\n',
+            'status.py': [
+                'from live import Live',
+                'from spinner import Spinner',
+                '',
+                'class Status:',
+                '    def __init__(self):',
+                '        self._live = Live()',
+                '        self._spinner = Spinner()',
+                '',
+                '    def update(self, value):',
+                '        self._live.update(value)',
+                '        self._spinner.update(value)',
+            ].join('\n'),
+        });
+        try {
+            const json = context(idx(dir), 'live.py:2:update');
+            const caller = (json.data.callers || []).find(c => c.file === 'status.py' && c.line === 10);
+            assert.ok(caller, `Live-typed field must reach Live.update: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(caller.resolution, 'receiver-hint');
+            assert.ok(!(json.data.callers || []).some(c => c.file === 'status.py' && c.line === 11),
+                'Spinner-typed sibling must not reach Live.update');
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #272 (Python): lexical and module-qualified identity', () => {
+    it('selects the function-local class binding among repeated nested names', () => {
+        const dir = tmp({
+            'test_app.py': [
+                'def first():',
+                '    class Local:',
+                '        pass',
+                '    return Local()',
+                '',
+                'def second():',
+                '    class Local:',
+                '        pass',
+                '    return Local()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const result = execute(index, 'context', { name: 'test_app.py:7:Local' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(output.formatContextJson(result.result));
+            assert.ok((json.data.usages || []).some(c => c.file === 'test_app.py' && c.line === 9),
+                `second.Local constructor resolves lexically: ${JSON.stringify(json.data)}`);
+            assert.ok(!(json.data.usages || []).some(c => c.line === 4),
+                'first.Local is a distinct binding');
+        } finally { rm(dir); }
+    });
+
+    it('resolves a qualified project parent through its imported module', () => {
+        const dir = tmp({
+            'pkg/__init__.py': 'from .core import Base\n',
+            'pkg/core.py': 'class Base:\n    def run(self):\n        return 1\n',
+            'user.py': [
+                'import pkg',
+                'class Child(pkg.Base):',
+                '    pass',
+                'def use():',
+                '    child = Child()',
+                '    return child.run()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const output = require('../core/output');
+            const result = execute(index, 'context', { name: 'pkg/core.py:2:run' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(output.formatContextJson(result.result));
+            assert.ok((json.data.callers || []).some(c => c.file === 'user.py' && c.line === 6),
+                `qualified subclass reaches Base.run: ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('module-qualified decorators do not bind to the decorated local name', () => {
+        const dir = tmp({
+            'pkg/__init__.py': 'from .decorators import command\n',
+            'pkg/decorators.py': [
+                'def command():',
+                '    def wrap(fn):',
+                '        return fn',
+                '    return wrap',
+            ].join('\n'),
+            'user.py': [
+                'import pkg',
+                '@pkg.command()',
+                'def command():',
+                '    return 1',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const local = index.symbols.get('command').find(d =>
+                d.relativePath === 'user.py');
+            assert.ok(local, 'decorated local function should be indexed');
+            const callees = index.findCallees(local, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.relativePath === 'pkg/decorators.py' && c.startLine === 1),
+                `decorator resolves through module export: ${callees.map(c => `${c.relativePath}:${c.startLine}`)}`);
+            assert.ok(!callees.some(c => c.relativePath === 'user.py' && c.startLine === 3),
+                'decorated local function is not its own decorator callee');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #274 (Python): qualified constructor provenance', () => {
+    function context(index, handle) {
+        const output = require('../core/output');
+        const result = execute(index, 'context', { name: handle });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return JSON.parse(output.formatContextJson(result.result));
+    }
+
+    it('keeps an external constructor receiver visible but out of the confirmed tier', () => {
+        const dir = tmp({
+            'target.py': 'class URL:\n    def join(self):\n        return self\n',
+            'user.py': [
+                'import threading',
+                'def use():',
+                '    thread = threading.Thread()',
+                '    thread.join()',
+            ].join('\n'),
+        });
+        try {
+            const json = context(idx(dir), 'target.py:2:join');
+            assert.ok(!(json.data.callers || []).some(c => c.file === 'user.py' && c.line === 4),
+                `threading.Thread.join must not confirm URL.join: ${JSON.stringify(json.data)}`);
+            const visible = (json.data.unverifiedCallers || [])
+                .find(c => c.file === 'user.py' && c.line === 4);
+            assert.ok(visible, `external receiver remains visible: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(visible.reason, 'possible-dispatch');
+            assert.strictEqual(visible.dispatchVia, 'threading.Thread');
+            assert.strictEqual(visible.externalContract, true);
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('uses a resolved project module as exact constructor type provenance', () => {
+        const dir = tmp({
+            'pkg/__init__.py': 'from .url import URL\n',
+            'pkg/url.py': 'class URL:\n    def join(self):\n        return self\n',
+            'user.py': [
+                'import pkg',
+                'def use():',
+                '    url = pkg.URL()',
+                '    url.join()',
+            ].join('\n'),
+        });
+        try {
+            const json = context(idx(dir), 'pkg/url.py:2:join');
+            const caller = (json.data.callers || [])
+                .find(c => c.file === 'user.py' && c.line === 4);
+            assert.ok(caller, `resolved pkg.URL confirms URL.join: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(caller.resolution, 'receiver-hint');
+            assert.strictEqual(json.meta.account?.conserved, true);
         } finally { rm(dir); }
     });
 });

@@ -15,6 +15,10 @@
  *       // file: path RELATIVE to the prepared root; kind: 'function'|'method'|'class'
  *   async findReferences(handle, { name, file, line }) -> [{ file, line, kind }],
  *       // kind: 'call' | 'import' | 'reference' | 'definition'
+ *   async resolveDefinition?(handle, { name, file, line }) -> [{ file, line }],
+ *       // optional exact static-target adjudication for reference-search gaps
+ *   async isConfigurationGated?(handle, { file, line }) -> boolean,
+ *       // optional single-configuration coverage marker (Rust cfg, etc.)
  *   async dispose?(handle),            // optional graceful teardown (LSP shutdown)
  * }
  */
@@ -35,6 +39,12 @@ function validateOracle(oracle) {
         typeof oracle.listSymbols !== 'function' ||
         typeof oracle.findReferences !== 'function') {
         throw new Error('Oracle prepare/listSymbols/findReferences must be functions');
+    }
+    if (oracle.resolveDefinition != null && typeof oracle.resolveDefinition !== 'function') {
+        throw new Error('Oracle resolveDefinition must be a function when provided');
+    }
+    if (oracle.isConfigurationGated != null && typeof oracle.isConfigurationGated !== 'function') {
+        throw new Error('Oracle isConfigurationGated must be a function when provided');
     }
     if (!Array.isArray(oracle.languages) || oracle.languages.length === 0) {
         throw new Error('Oracle languages must be a non-empty array');

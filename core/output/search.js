@@ -151,6 +151,10 @@ function formatStructuralSearchJson(result) {
  * Format example result as text
  */
 function formatExample(result, name) {
+    if (result && !result.best && result.unverifiedCalls > 0) {
+        const n = result.unverifiedCalls;
+        return `No confirmed call example for "${name}". ${n} unverified candidate${n === 1 ? '' : 's'} require receiver/binding review (use impact or usages).`;
+    }
     // MEDIUM-8: when only test-file callers exist and the user didn't ask
     // for them, surface that fact explicitly instead of saying nothing was
     // found.
@@ -172,6 +176,7 @@ function formatExample(result, name) {
     lines.push(`${best.relativePath}:${best.line}`);
     const exAdvisory = advisoryLine(result.advisory);
     if (exAdvisory) lines.push(exAdvisory);
+    lines.push(`Evidence: ${best.evidenceTier || 'unverified'}${best.resolution ? ` (${best.resolution})` : ''}`);
     lines.push('');
 
     if (best.before) {
@@ -224,6 +229,7 @@ function formatExampleDiverse(result, name) {
         lines.push(`[${i + 1}] ${shape}  — ${c.count} call${c.count === 1 ? '' : 's'} in this cluster`);
         if (!rep) continue;
         lines.push(`    ${rep.relativePath || rep.file}:${rep.line}`);
+        lines.push(`    evidence: ${rep.evidenceTier || 'unverified'}${rep.resolution ? ` (${rep.resolution})` : ''}`);
 
         if (rep.before) {
             for (let j = 0; j < rep.before.length; j++) {
@@ -256,10 +262,17 @@ function formatExampleJson(result, name) {
         // Surface the excluded-test-usages count in JSON too (fix #237 — the
         // handler note that used to carry it duplicated the text body).
         const excluded = result?.excludedTestCalls || 0;
+        const unverified = result?.unverifiedCalls || 0;
         return JSON.stringify({
             found: false, query: name,
             ...(excluded > 0 && { excludedTestCalls: excluded }),
-            error: excluded > 0
+            ...(unverified > 0 && {
+                unverifiedCalls: unverified,
+                unverifiedCandidates: result.unverifiedCandidates || [],
+            }),
+            error: unverified > 0
+                ? `No confirmed call example for "${name}". ${unverified} unverified candidate${unverified === 1 ? '' : 's'} require receiver/binding review.`
+                : excluded > 0
                 ? `No call examples found for "${name}" (excluded ${excluded} test-file usage${excluded === 1 ? '' : 's'} — pass --include-tests to include them)`
                 : `No call examples found for "${name}"`,
         }, null, 2);
@@ -271,12 +284,17 @@ function formatExampleJson(result, name) {
         query: name,
         ...(result.advisory && { advisory: result.advisory }),
         totalCalls: result.totalCalls,
+        confirmedCalls: result.confirmedCalls || 0,
+        unverifiedCalls: result.unverifiedCalls || 0,
         best: {
             file: best.relativePath || best.file,
             line: best.line,
             content: best.content,
             score: best.score,
             reasons: best.reasons || [],
+            evidenceTier: best.evidenceTier || 'unverified',
+            ...(best.resolution && { resolution: best.resolution }),
+            ...(best.reason && { reason: best.reason }),
             ...(best.before && best.before.length > 0 && { before: best.before }),
             ...(best.after && best.after.length > 0 && { after: best.after })
         }
@@ -383,6 +401,11 @@ function formatTests(tests, name) {
     } else {
         const totalMatches = tests.reduce((sum, t) => sum + t.matches.length, 0);
         lines.push(`Found ${totalMatches} matches in ${tests.length} test file(s):\n`);
+        const unverified = tests.reduce((sum, t) => sum +
+            t.matches.filter(m => ['unverified-call', 'unverified-reference'].includes(m.matchType)).length, 0);
+        if (unverified > 0) {
+            lines.push(`UNVERIFIED: ${unverified} possible test call${unverified === 1 ? '' : 's'} need receiver/binding review.\n`);
+        }
 
         for (const testFile of tests) {
             lines.push(testFile.file);
@@ -390,6 +413,8 @@ function formatTests(tests, name) {
                 const typeLabel = match.matchType === 'test-case' ? '[test]' :
                     match.matchType === 'import' ? '[import]' :
                     match.matchType === 'call' ? '[call]' :
+                    match.matchType === 'unverified-call' ? '[unverified-call]' :
+                    match.matchType === 'unverified-reference' ? '[unverified-ref]' :
                     match.matchType === 'string-ref' ? '[string]' : '[ref]';
                 lines.push(`  ${match.line}: ${typeLabel} ${match.content}`);
             }

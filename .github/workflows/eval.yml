@@ -19,7 +19,7 @@ on:
 jobs:
   eval:
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v5
 
@@ -71,6 +71,9 @@ jobs:
 
       - name: "Deadcode eval (gate: default-arm false-dead = 0)"
         run: node eval/run-deadcode-eval.js --sample 300
+
+      - name: "Performance gate (cold build, warm cache, semantic query p95)"
+        run: npm run trust:gate:performance
 
       - name: Upload reports
         if: always()

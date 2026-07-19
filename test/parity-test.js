@@ -255,33 +255,33 @@ function testProcessData() {
             assert.ok(output.includes('evidence: '), 'Should show evidence aggregate in about');
         });
 
-        it('CLI: about --min-confidence=0.9 filters low-confidence edges', () => {
-            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--min-confidence=0.9']);
+        it('CLI: about --min-confidence=0.99 filters edges below the requested threshold', () => {
+            const output = runCli(FIXTURES_PATH, 'about', ['processData'], ['--min-confidence=0.99']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            // helper callee has confidence 0.65, should be filtered from CALLEES section
-            assert.ok(output.includes('below confidence threshold hidden'), 'Should show filtered edge note');
+            // Exact bindings score 0.98 and must still obey a stricter threshold.
+            assert.ok(output.includes('below evidence threshold hidden'), 'Should show filtered edge note');
             // Extract callees section and verify helper is not listed as a callee
             const calleesSection = output.split('CALLEES')[1]?.split('───')[0] || '';
             assert.ok(!calleesSection.includes('helper'), 'Low-confidence callee should be filtered from CALLEES');
         });
 
-        it('interactive: about --min-confidence=0.9 filters low-confidence edges', () => {
-            const output = runInteractive(FIXTURES_PATH, ['about processData --min-confidence=0.9']);
+        it('interactive: about --min-confidence=0.99 filters edges below the requested threshold', () => {
+            const output = runInteractive(FIXTURES_PATH, ['about processData --min-confidence=0.99']);
             assert.ok(output.includes('processData'), 'Should find symbol');
-            assert.ok(output.includes('below confidence threshold hidden'), 'Should show filtered edge note');
+            assert.ok(output.includes('below evidence threshold hidden'), 'Should show filtered edge note');
         });
 
-        it('MCP: about min_confidence=0.9 filters low-confidence edges', async () => {
-            const res = await mcpClient.callTool({ command: 'about', project_dir: FIXTURES_PATH, name: 'processData', min_confidence: 0.9 });
+        it('MCP: about min_confidence=0.99 filters edges below the requested threshold', async () => {
+            const res = await mcpClient.callTool({ command: 'about', project_dir: FIXTURES_PATH, name: 'processData', min_confidence: 0.99 });
             assert.ok(!res.isError, 'Should not error');
             assert.ok(res.text.includes('processData'), 'Should find symbol');
-            assert.ok(res.text.includes('below confidence threshold hidden'), 'MCP should show filtered edge note');
+            assert.ok(res.text.includes('below evidence threshold hidden'), 'MCP should show filtered edge note');
         });
 
-        it('MCP: context min_confidence=0.9 filters low-confidence edges', async () => {
-            const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData', min_confidence: 0.9 });
+        it('MCP: context min_confidence=0.99 filters edges below the requested threshold', async () => {
+            const res = await mcpClient.callTool({ command: 'context', project_dir: FIXTURES_PATH, name: 'processData', min_confidence: 0.99 });
             assert.ok(!res.isError, 'Should not error');
-            assert.ok(res.text.includes('below confidence threshold hidden'), 'MCP context should filter and note');
+            assert.ok(res.text.includes('below evidence threshold hidden'), 'MCP context should filter and note');
         });
 
         it('CLI: context --hide-confidence accepted (evidence aggregate is the only confidence display)', () => {

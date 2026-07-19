@@ -224,6 +224,9 @@ function extractEventHandlerCalls(htmlContent, htmlParser) {
 // ── Exported language module interface ──────────────────────────────────────
 
 function parse(code, parser) {
+    const { safeParse, getParseOptions } = require('./index');
+    const htmlTree = safeParse(parser, code, undefined, getParseOptions(code.length));
+    const htmlRecovery = !!htmlTree.rootNode.hasError;
     const result = extractJS(code, parser);
     if (!result) {
         return {
@@ -232,6 +235,7 @@ function parse(code, parser) {
             functions: [],
             classes: [],
             stateObjects: [],
+            ...(htmlRecovery && { parseRecovery: true }),
             imports: [],
             exports: []
         };
@@ -240,6 +244,7 @@ function parse(code, parser) {
     const jsResult = result.jsModule.parse(result.virtualJS, result.jsParser);
     jsResult.language = 'html';
     jsResult.totalLines = code.split('\n').length;
+    if (htmlRecovery) jsResult.parseRecovery = true;
     return jsResult;
 }
 

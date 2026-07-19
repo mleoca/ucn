@@ -108,7 +108,7 @@ function tagInTestCase(index, sites) {
 // ============================================================================
 
 /**
- * Bucket a confidence score into 'high' / 'medium' / 'low'.
+ * Bucket an ordinal evidence score into 'high' / 'medium' / 'low'.
  * Boundaries are inclusive at the lower end:
  *   confidence > 0.8  → high
  *   0.5 <= c <= 0.8   → medium
@@ -125,7 +125,7 @@ function bucketConfidence(c) {
 }
 
 /**
- * Build a confidence histogram from an array of edges (callers/callees).
+ * Build an ordinal evidence histogram from caller/callee edges.
  * Returns null when there are no edges (caller drops the section entirely).
  *
  * @param {Array} edges - Array of objects with `confidence` field
@@ -434,7 +434,7 @@ function context(index, name, options = {}) {
         return (a.startLine || 0) - (b.startLine || 0);
     });
 
-    // Trust signals: tag each caller/callee with reachability and build confidence histograms.
+    // Trust signals: tag each caller/callee with reachability and build ordinal evidence histograms.
     // Reachability is computed once per index and cached (see entrypoints.computeReachability).
     const reachableSet = computeReachability(index);
     tagCallersReachable(callers, reachableSet);
@@ -922,7 +922,7 @@ function impact(index, name, options = {}) {
         // about kept — impact answered differently from its siblings on the
         // same pin.
 
-        callSites = [];        callSites = [];
+        callSites = [];
         for (const c of callerResults) {
             const analysis = index.analyzeCallSite(
                 { file: c.file, relativePath: c.relativePath, line: c.line, content: c.content },
@@ -937,6 +937,8 @@ function impact(index, name, options = {}) {
                 callerFile: c.callerFile,
                 callerStartLine: c.callerStartLine,
                 confidence: c.confidence,
+                evidenceScore: c.evidenceScore,
+                scoreKind: c.scoreKind,
                 resolution: c.resolution,
                 ...(c.tier && { tier: c.tier }),
                 ...analysis
@@ -968,6 +970,8 @@ function impact(index, name, options = {}) {
             callerFile: c.callerFile,
             callerStartLine: c.callerStartLine,
             confidence: c.confidence,
+            evidenceScore: c.evidenceScore,
+            scoreKind: c.scoreKind,
             resolution: c.resolution,
             tier: c.tier,
         }));
@@ -1033,6 +1037,8 @@ function impact(index, name, options = {}) {
                 callerFile: call.callerFile,
                 callerStartLine: call.callerStartLine,
                 confidence: call.confidence,
+                evidenceScore: call.evidenceScore,
+                scoreKind: call.scoreKind,
                 resolution: call.resolution,
                 ...(call.tier && { tier: call.tier }),
                 ...analysis
@@ -1052,6 +1058,8 @@ function impact(index, name, options = {}) {
             expression: (u.content || '').trim(),
             callerName: u.callerName ?? null,
             confidence: u.confidence,
+            evidenceScore: u.evidenceScore,
+            scoreKind: u.scoreKind,
             resolution: u.resolution,
             tier: 'unverified',
             ...(u.reason && { reason: u.reason }),
@@ -1075,8 +1083,8 @@ function impact(index, name, options = {}) {
         impactFilteredByFlag.exclude += beforeUnverified - unverifiedSites.length;
     }
 
-    // Trust signals: tag each call site with reachability, build a confidence histogram.
-    // Histogram is computed BEFORE top-N truncation so the trust signal reflects the full scope.
+    // Trust signals: tag each call site with reachability and build an ordinal evidence histogram.
+    // It is computed BEFORE top-N truncation so the evidence profile reflects the full scope.
     const impactReachable = computeReachability(index);
     for (const site of filteredSites) {
         if (site.callerFile && site.callerStartLine != null) {
@@ -1426,6 +1434,8 @@ function about(index, name, options = {}) {
             expression: c.content.trim(),
             callerName: c.callerName,
             confidence: c.confidence,
+            evidenceScore: c.evidenceScore,
+            scoreKind: c.scoreKind,
             resolution: c.resolution,
             reachable: c.reachable,
         }));
@@ -1448,6 +1458,8 @@ function about(index, name, options = {}) {
                 expression: (c.content || '').trim(),
                 callerName: c.callerName ?? null,
                 confidence: c.confidence,
+                evidenceScore: c.evidenceScore,
+                scoreKind: c.scoreKind,
                 resolution: c.resolution,
                 ...(c.reason && { reason: c.reason }),
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
@@ -1495,6 +1507,8 @@ function about(index, name, options = {}) {
             weight: c.weight,
             callCount: c.callCount,
             confidence: c.confidence,
+            evidenceScore: c.evidenceScore,
+            scoreKind: c.scoreKind,
             resolution: c.resolution,
             reachable: c.reachable,
             ...(c.returnType && { returnType: c.returnType }),
@@ -2049,6 +2063,8 @@ function diffImpact(index, options = {}) {
                     callerName: c.callerName,
                     content: (c.content || '').trim(),
                     confidence: c.confidence,
+                    evidenceScore: c.evidenceScore,
+                    scoreKind: c.scoreKind,
                     resolution: c.resolution,
                     ...(c.tier && { tier: c.tier }),
                 })),
@@ -2058,6 +2074,10 @@ function diffImpact(index, options = {}) {
                     line: u.line,
                     callerName: u.callerName ?? null,
                     content: (u.content || '').trim(),
+                    confidence: u.confidence,
+                    evidenceScore: u.evidenceScore,
+                    scoreKind: u.scoreKind,
+                    resolution: u.resolution,
                     tier: 'unverified',
                     ...(u.reason && { reason: u.reason }),
                     ...(u.dispatchVia && { dispatchVia: u.dispatchVia }),
@@ -2298,7 +2318,7 @@ const _FIRE_AND_FORGET_PROMISE_FNS = new Set(['all', 'allSettled', 'race', 'any'
 function auditAsync(index, options = {}) {
     index._beginOp();
     try {
-        const { detectLanguage, getParser, getLanguageModule, safeParse } = require('../languages');
+        const { getParser, getLanguageModule, safeParse } = require('../languages');
         const issues = [];
 
         // Build a "is this name provably async" lookup from the symbol table.

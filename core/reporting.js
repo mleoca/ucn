@@ -12,6 +12,7 @@ const { codeUnitCompare, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const { _declaredFieldType, _projectTopLevelNames } = require('./callers');
 const path = require('path');
 const { isTestFile } = require('./discovery');
+const { summarizeCommandTrust } = require('./trust-matrix');
 
 /**
  * Get project statistics: file counts, symbol counts, LOC, language breakdown.
@@ -23,7 +24,7 @@ const { isTestFile } = require('./discovery');
 function getStats(index, options = {}) {
     // Count total symbols (not just unique names)
     let totalSymbols = 0;
-    for (const [name, symbols] of index.symbols) {
+    for (const [, symbols] of index.symbols) {
         totalSymbols += symbols.length;
     }
 
@@ -37,7 +38,7 @@ function getStats(index, options = {}) {
         ...(index.truncated && { truncated: index.truncated })
     };
 
-    for (const [filePath, fileEntry] of index.files) {
+    for (const [, fileEntry] of index.files) {
         const lang = fileEntry.language;
         if (!stats.byLanguage[lang]) {
             stats.byLanguage[lang] = { files: 0, lines: 0, symbols: 0 };
@@ -47,7 +48,7 @@ function getStats(index, options = {}) {
         stats.byLanguage[lang].symbols += fileEntry.symbols.length;
     }
 
-    for (const [name, symbols] of index.symbols) {
+    for (const [, symbols] of index.symbols) {
         for (const sym of symbols) {
             if (!Object.hasOwn(stats.byType, sym.type)) {
                 stats.byType[sym.type] = 0;
@@ -67,7 +68,7 @@ function getStats(index, options = {}) {
     // Per-function line counts for complexity audits
     if (options.functions) {
         const functions = [];
-        for (const [name, symbols] of index.symbols) {
+        for (const [, symbols] of index.symbols) {
             for (const sym of symbols) {
                 if (CALLABLE_SYMBOL_KINDS.has(sym.type)) {
                     const lineCount = sym.endLine - sym.startLine + 1;
@@ -298,7 +299,7 @@ function getStats(index, options = {}) {
             const isMethodRow = ownerClasses.size > 0 &&
                 (!representative || !!representative.className || !!representative.receiver);
 
-            let count = 0;
+            let count;
             let approximate = false;
             if (!isMethodRow) {
                 // Standalone function (or top-level package call): use bare-name calls
@@ -549,7 +550,7 @@ function getToc(index, options = {}) {
 
 /**
  * Project trust report. Tells the caller how much UCN itself trusts the index
- * for this project: resolution coverage, blind spots (dynamic imports, eval,
+ * for this project: sampled resolution evidence, blind spots (dynamic imports, eval,
  * reflection), parse failures, and a quick verdict.
  *
  * Cheap-by-default: counts + blind-spot scan are O(files). The expensive
@@ -560,9 +561,6 @@ function getToc(index, options = {}) {
  * @param {object} options - { deep, sampleSize, in, file }
  */
 function doctor(index, options = {}) {
-    const { detectLanguage, langTraits } = require('../languages');
-    const path = require('path');
-
     const inFilter = options.in || options.file || null;
     const matchInFilter = (rel) => {
         if (!inFilter) return true;
@@ -583,6 +581,7 @@ function doctor(index, options = {}) {
         evalCalls:      { count: 0, fileCount: 0, files: [] },
         reflection:     { count: 0, fileCount: 0, files: [] },
         parseFailures:  { count: 0, fileCount: 0, files: [] },
+        parseRecoveries:{ count: 0, fileCount: 0, files: [] },
     };
 
     // Reflection/eval signals come from the shared text-blind-spot counter
@@ -612,6 +611,7 @@ function doctor(index, options = {}) {
 
         if (fe.dynamicImports && fe.dynamicImports > 0) recordBlind(blindSpots.dynamicImports, fe.dynamicImports);
         if (fe.parseError) recordBlind(blindSpots.parseFailures, 1);
+        if (fe.parseRecovery) recordBlind(blindSpots.parseRecoveries, 1);
 
         // Read file once for eval/reflection signals (shared counter).
         if (hasTextBlindspots(lang)) {
@@ -623,12 +623,30 @@ function doctor(index, options = {}) {
         }
     }
 
-    // Resolution coverage — sampled by default to keep doctor fast.
-    let coverage = null;
+    // Files that failed before a fileEntry could be created are absent from
+    // index.files, so the loop above can never see them. They are the most
+    // important parse failures to surface: otherwise doctor can report a
+    // clean index precisely when entire files are missing from it.
+    const recordedParseFailureFiles = new Set(blindSpots.parseFailures.files);
+    for (const failedPath of index.failedFiles || []) {
+        const rel = path.relative(index.root, failedPath);
+        if (!matchInFilter(rel) || recordedParseFailureFiles.has(rel)) continue;
+        blindSpots.parseFailures.count++;
+        blindSpots.parseFailures.fileCount++;
+        fileCounts.failed = (fileCounts.failed || 0) + 1;
+        if (blindSpots.parseFailures.files.length < BLINDSPOT_FILE_CAP) {
+            blindSpots.parseFailures.files.push(rel);
+        }
+        recordedParseFailureFiles.add(rel);
+    }
+
+    // Evidence profile — sampled only in deep mode. This is deliberately NOT
+    // called "accuracy" or "coverage": it describes how UCN classified edges
+    // it found. Compiler/LSP oracle evaluation is the accuracy measurement.
+    let evidenceProfile = null;
     if (options.deep || options.sampleSize) {
-        coverage = computeCoverageSample(index, {
+        evidenceProfile = computeEvidenceProfile(index, {
             sampleSize: options.sampleSize || 200,
-            inFilter,
             matchInFilter,
         });
     }
@@ -640,85 +658,71 @@ function doctor(index, options = {}) {
         cache.buildMs = index.buildTime || null;
     } catch (e) { /* ignore */ }
 
-    // Compute trust verdict.
-    //
-    // Field-report #1: the old logic dropped the tier by one PER blind-spot
-    // category present, so any non-trivial Python/TS project (all of which have
-    // some getattr/eval/dynamic import) was forced to LOW even when --deep
-    // measured ~99% of edges at confidence ≥ 0.5 — a self-contradicting verdict
-    // ("99.1% ... LOW") that trains agents to distrust a healthy index. The fix:
-    //   - When --deep coverage exists it drives the tier. Coverage measures the
-    //     CONFIDENCE of edges UCN FOUND, NOT completeness — a reflection-hidden
-    //     edge is absent from the sample, never a low-confidence edge dragging
-    //     the % down — so sparse blind spots are a CAVEAT, while PERVASIVE ones
-    //     (a large share of files) can hide edges the sample can't see and cap
-    //     the verdict at MEDIUM (density, not mere presence; see below).
-    //   - Parse failures are a separate exception: a file UCN couldn't parse is
-    //     not in the sample at all, a genuine uncounted hole → cap at MEDIUM.
-    //   - Without --deep there is no measurement, so blind spots are the only
-    //     signal — but bounded to ONE tier total (not one per category), so a
-    //     handful of getattr doesn't read as untrustworthy.
-    let trust = 'UNKNOWN';
-    let trustReason = '';
-    const tier = ['HIGH', 'MEDIUM', 'LOW'];
-
     const blindSignals = [];
     if (blindSpots.parseFailures.count > 0) blindSignals.push(`${blindSpots.parseFailures.count} parse failure(s)`);
+    if (blindSpots.parseRecoveries.count > 0) blindSignals.push(`${blindSpots.parseRecoveries.count} parse-recovery file(s)`);
     if (blindSpots.evalCalls.count > 0) blindSignals.push(`${blindSpots.evalCalls.count} eval/exec use(s) in ${blindSpots.evalCalls.fileCount} file(s)`);
     if (blindSpots.reflection.count > 0) blindSignals.push(`${blindSpots.reflection.count} reflection use(s) in ${blindSpots.reflection.fileCount} file(s)`);
     if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s) in ${blindSpots.dynamicImports.fileCount} file(s)`);
 
-    if (coverage && coverage.total > 0) {
-        const safe = coverage.high + coverage.medium;
-        const safePct = safe / coverage.total;
-        let idx = safePct >= 0.85 ? 0 : safePct >= 0.6 ? 1 : 2;
-        // Parse failures: unparsed files aren't in the sample at all.
-        if (blindSpots.parseFailures.count > 0) idx = Math.max(idx, 1);
-        // Coverage measures the CONFIDENCE of edges UCN found, NOT completeness:
-        // a call hidden behind reflection/dynamic dispatch is simply absent from
-        // findCallers' result, never a low-confidence edge that drags the % down.
-        // So when blind spots are PERVASIVE — affecting a large share of files —
-        // they can hide a real fraction of the call graph that the sample can't
-        // see, and the verdict is capped at MEDIUM. Density, not mere presence:
-        // a handful of getattr stays a caveat (the old code dropped a tier per
-        // category, forcing every project to LOW); reflection across half the
-        // files does cap. Gated on a file-count floor — file share is meaningless
-        // for a handful of files, so small projects ride on coverage alone.
-        const scanned = fileCounts.scanned || 1;
-        const share = (fc) => fc / scanned;
-        const pervasiveBlindSpot = scanned >= 10 && (
-            share(blindSpots.reflection.fileCount) >= 0.5 ||
-            share(blindSpots.dynamicImports.fileCount) >= 0.4 ||
-            share(blindSpots.evalCalls.fileCount) >= 0.15
-        );
-        const baseIdx = idx;
-        if (pervasiveBlindSpot) idx = Math.max(idx, 1);
-        const capped = idx > baseIdx;
-        trust = tier[idx];
-        const reasons = [`${(safePct * 100).toFixed(1)}% of found edges have confidence ≥ 0.5`];
-        if (blindSignals.length) {
-            reasons.push(capped
-                ? `capped at MEDIUM — pervasive blind spots may hide edges the sample can't see: ${blindSignals.join(', ')}`
-                : `blind spots (caveat — coverage measures found edges, not completeness): ${blindSignals.join(', ')}`);
+    // Trust is task-specific. A healthy index can be excellent for navigation
+    // while still requiring review before a breaking refactor or deletion.
+    // Never infer semantic accuracy from rule-assigned confidence decimals.
+    const indexLevel = fileCounts.scanned === 0 ? 'UNKNOWN'
+        : blindSpots.parseFailures.count > 0 || blindSpots.parseRecoveries.count > 0 ||
+            cache.fresh === false ? 'MEDIUM' : 'HIGH';
+    const indexReason = fileCounts.scanned === 0 ? 'empty scope'
+        : blindSpots.parseFailures.count > 0
+            ? `${blindSpots.parseFailures.count} file(s) failed to parse`
+            : blindSpots.parseRecoveries.count > 0
+                ? `${blindSpots.parseRecoveries.count} file(s) required parser recovery; indexed results may be partial`
+                : cache.fresh === false ? 'index cache is stale' : 'fresh index; no parse failures';
+
+    let evidenceLevel = 'UNKNOWN';
+    let evidenceReason = 'not sampled; run --deep for a stratified evidence profile';
+    if (evidenceProfile) {
+        if (evidenceProfile.total === 0) {
+            evidenceReason = 'sample contained no caller edges';
+        } else {
+            const confirmedShare = evidenceProfile.confirmed / evidenceProfile.total;
+            evidenceLevel = !evidenceProfile.adequate ? 'UNKNOWN'
+                : confirmedShare >= 0.85 ? 'HIGH'
+                    : confirmedShare >= 0.55 ? 'MEDIUM' : 'LOW';
+            evidenceReason = `${(confirmedShare * 100).toFixed(1)}% confirmed-evidence edges across ${evidenceProfile.sampled} pinned definitions`;
+            if (!evidenceProfile.adequate) evidenceReason += '; sample too small for a readiness decision';
         }
-        trustReason = reasons.join('; ');
-    } else if (coverage) {
-        // Sampled but zero edges — can't say anything about confidence.
-        trust = 'UNKNOWN';
-        trustReason = 'no edges sampled (empty scope or filter matched nothing)';
-    } else if (fileCounts.scanned > 0) {
-        // Cheap path (no --deep): no measurement, so blind spots are the only
-        // signal — bounded to one tier total. Run --deep for a measured verdict.
-        let idx = 0;
-        if (blindSpots.parseFailures.count > 0) idx = Math.max(idx, 1);
-        if (blindSpots.evalCalls.count + blindSpots.reflection.count + blindSpots.dynamicImports.count > 0) {
-            idx = Math.min(2, idx + 1);
-        }
-        trust = tier[idx];
-        trustReason = blindSignals.length
-            ? `coverage not deep-checked (run --deep); blind spots: ${blindSignals.join(', ')}`
-            : 'no parse failures; coverage not deep-checked (run --deep)';
     }
+
+    const dynamicCount = blindSpots.evalCalls.count + blindSpots.reflection.count + blindSpots.dynamicImports.count;
+    const semanticLevel = blindSpots.parseFailures.count > 0 || blindSpots.parseRecoveries.count > 0 ? 'LOW'
+        : dynamicCount > 0 ? 'MEDIUM' : 'UNKNOWN';
+    const semanticReason = blindSignals.length
+        ? `semantic recall may miss runtime-resolved edges: ${blindSignals.join(', ')}`
+        : 'no known runtime blind spots detected; alias/dynamic completeness is not compiler-verified locally';
+
+    const navigationLevel = indexLevel;
+    const refactorLevel = indexLevel === 'UNKNOWN' || evidenceLevel === 'UNKNOWN' ? 'UNKNOWN'
+        : indexLevel === 'HIGH' && evidenceLevel === 'HIGH' && semanticLevel === 'UNKNOWN' ? 'MEDIUM'
+            : indexLevel === 'LOW' || evidenceLevel === 'LOW' || semanticLevel === 'LOW' ? 'LOW' : 'MEDIUM';
+    const deletionLevel = refactorLevel === 'LOW' ? 'LOW' : 'REVIEW';
+    const dimensions = {
+        index: { level: indexLevel, reason: indexReason },
+        evidence: { level: evidenceLevel, reason: evidenceReason },
+        semanticRecall: { level: semanticLevel, reason: semanticReason },
+        navigation: { level: navigationLevel, reason: indexReason },
+        refactor: {
+            level: refactorLevel,
+            reason: refactorLevel === 'UNKNOWN'
+                ? 'run --deep; review unverified and non-call occurrences before changing code'
+                : 'text-ground accounting is available; aliases, reflection, and unverified edges still require review',
+        },
+        deletion: {
+            level: deletionLevel,
+            reason: 'deletion additionally requires usages/deadcode review and tests; caller accounting alone is insufficient',
+        },
+    };
+    const trust = refactorLevel;
+    const trustReason = dimensions.refactor.reason;
 
     return {
         root: index.root,
@@ -727,10 +731,16 @@ function doctor(index, options = {}) {
         symbols: totalSymbols,
         languages: langs,
         blindSpots,
-        coverage,
+        evidenceProfile,
+        // Backward-compatible field name. `kind` prevents consumers from
+        // mistaking this for semantic coverage or measured accuracy.
+        coverage: evidenceProfile,
         cache,
+        commandTrust: summarizeCommandTrust(),
         trust,
         trustReason,
+        trustScope: 'refactor-readiness',
+        dimensions,
         ...(inFilter && { filter: inFilter }),
     };
 }
@@ -739,35 +749,83 @@ function doctor(index, options = {}) {
  * Sample-based coverage: pick up to N symbols, run findCallers, bucket confidence.
  * Doesn't pretend to be exhaustive — meant for a fast trust signal, not an audit.
  */
-function computeCoverageSample(index, { sampleSize, inFilter, matchInFilter }) {
-    const buckets = { high: 0, medium: 0, low: 0, total: 0, sampled: 0 };
-    const symbolNames = [];
-    for (const [name, arr] of index.symbols) {
+function computeEvidenceProfile(index, { sampleSize, matchInFilter }) {
+    const profile = {
+        kind: 'evidence-profile-not-accuracy',
+        high: 0, medium: 0, low: 0,
+        confirmed: 0, unverified: 0, total: 0,
+        sampled: 0, candidateSymbols: 0,
+        adequate: false, representative: false,
+        byLanguage: Object.create(null), byKind: Object.create(null),
+    };
+    const groups = new Map();
+    const seenHandles = new Set();
+    for (const [, arr] of index.symbols) {
         for (const sym of arr) {
-            if (!sym || !sym.relativePath) continue;
-            if (!matchInFilter(sym.relativePath)) continue;
-            if (sym.type === 'method' || sym.type === 'function' || sym.type === 'constructor') {
-                symbolNames.push(name);
-                if (symbolNames.length >= sampleSize * 2) break; // cap collection cost
+            if (!sym || !sym.relativePath || !matchInFilter(sym.relativePath)) continue;
+            if (sym.type !== 'method' && sym.type !== 'function' && sym.type !== 'constructor') continue;
+            const handle = `${sym.relativePath}:${sym.startLine}:${sym.name}`;
+            if (seenHandles.has(handle)) continue;
+            seenHandles.add(handle);
+            const lang = index.files.get(sym.file)?.language || 'unknown';
+            const key = `${lang}:${sym.type}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push({ sym, handle, lang });
+        }
+    }
+    profile.candidateSymbols = seenHandles.size;
+    for (const items of groups.values()) {
+        items.sort((a, b) => codeUnitCompare(a.handle, b.handle));
+    }
+
+    // Round-robin across language+kind buckets so discovery order, duplicate
+    // names, and one large language cannot dominate the verdict.
+    const orderedGroups = [...groups.entries()].sort((a, b) => codeUnitCompare(a[0], b[0]));
+    const sample = [];
+    for (let round = 0; sample.length < sampleSize; round++) {
+        let added = false;
+        for (const [, items] of orderedGroups) {
+            if (items[round]) {
+                sample.push(items[round]);
+                added = true;
+                if (sample.length >= sampleSize) break;
             }
         }
-        if (symbolNames.length >= sampleSize * 2) break;
+        if (!added) break;
     }
-    // Take a slice (not random — deterministic for tests)
-    const slice = symbolNames.slice(0, sampleSize);
-    buckets.sampled = slice.length;
+    profile.sampled = sample.length;
 
-    for (const name of slice) {
-        const callers = index.findCallers(name, { includeMethods: true, includeUncertain: true });
-        for (const c of callers) {
-            const conf = (c.confidence != null) ? c.confidence : 1;
-            buckets.total++;
-            if (conf > 0.8) buckets.high++;
-            else if (conf >= 0.5) buckets.medium++;
-            else buckets.low++;
+    for (const { sym, lang } of sample) {
+        profile.byLanguage[lang] = (profile.byLanguage[lang] || 0) + 1;
+        profile.byKind[sym.type] = (profile.byKind[sym.type] || 0) + 1;
+        const callers = index.findCallers(sym.name, {
+            includeMethods: true,
+            includeUncertain: true,
+            targetDefinitions: [sym],
+            collectAccount: true,
+        });
+        const allEdges = [...callers, ...(callers.unverifiedEntries || [])];
+        const seenSites = new Set();
+        for (const c of allEdges) {
+            const site = `${c.file || c.relativePath}:${c.line}:${c.tier || c.reason || ''}`;
+            if (seenSites.has(site)) continue;
+            seenSites.add(site);
+            const conf = c.confidence != null ? c.confidence : 0;
+            profile.total++;
+            if (c.tier === 'unverified' || c.reason) profile.unverified++;
+            else profile.confirmed++;
+            if (conf > 0.8) profile.high++;
+            else if (conf >= 0.5) profile.medium++;
+            else profile.low++;
         }
     }
-    return buckets;
+    const representedGroups = Object.keys(profile.byLanguage).length;
+    profile.representative = representedGroups === new Set(
+        [...groups.keys()].map(k => k.split(':')[0])
+    ).size;
+    const minSymbols = Math.min(30, profile.candidateSymbols);
+    profile.adequate = profile.sampled >= minSymbols && profile.total >= 20 && profile.representative;
+    return profile;
 }
 
 /**

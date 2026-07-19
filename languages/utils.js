@@ -687,7 +687,6 @@ let _cachedSubtreeEnds = null;
 function _buildNodeList(rootNode) {
     const nodes = [];
     const subtreeEnds = [];
-    const stack = [rootNode];
     // Iterative DFS with subtreeEnd tracking
     // We use a post-processing step to fill subtreeEnds
     function collect(node) {

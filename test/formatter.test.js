@@ -968,7 +968,7 @@ describe('New Formatter Coverage', () => {
                 confidenceFiltered: 3
             };
             const text = output.formatAbout(about);
-            assert.ok(text.includes('3 edge(s) below confidence threshold hidden'), 'Should show filtered count');
+            assert.ok(text.includes('3 edge(s) below evidence threshold hidden'), 'Should show filtered count');
         });
 
         it('shows aggregate evidence line instead of per-edge confidence', () => {
@@ -1133,6 +1133,8 @@ describe('New Formatter Coverage', () => {
             const { text } = output.formatContext(ctx);
             assert.ok(text.includes('ACCOUNT: "fn" occurs on 7 lines in 3 files: 2 confirmed, 1 unverified, 3 non-call (1 import, 1 definition, 0 reference, 1 other-text), 0 other-target, 0 unaccounted (+1 beyond-text caller)'),
                 `ACCOUNT line exact format: ${text}`);
+            assert.ok(text.includes('CONTRACT: literal-name text partition is DEGRADED'),
+                `CONTRACT line explains the guarantee boundary: ${text}`);
             assert.ok(text.includes('WARNING: 1 unparsed file contains "fn" (1 line, NOT analyzed): legacy/old-parser.js'),
                 'Unparsed warning rendered');
             assert.ok(text.includes('NON-CALL OCCURRENCES: 3 (1 imports, 1 definitions, 0 references, 1 other-text)'),
@@ -2423,27 +2425,33 @@ describe('Confidence rendering in formatContext', () => {
             meta: { complete: false, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 5, includeMethods: false },
         };
         const { text } = output.formatContext(ctx);
-        assert.ok(text.includes('5 edge(s) below confidence threshold hidden'));
+        assert.ok(text.includes('5 edge(s) below evidence threshold hidden'));
     });
 
-    it('includes confidence in JSON output', () => {
+    it('labels JSON call-edge scores as ordinal evidence, not probability', () => {
         const ctx = {
             function: 'myFn',
             file: 'a.js',
             callers: [{
                 relativePath: 'b.js', line: 10, content: 'myFn()',
-                callerName: 'caller1', confidence: 0.98, resolution: 'exact-binding',
+                callerName: 'caller1', confidence: 0.98, evidenceScore: 0.98,
+                scoreKind: 'ordinal-evidence-not-probability', resolution: 'exact-binding',
             }],
             callees: [{
                 name: 'dep', relativePath: 'c.js', startLine: 1, type: 'function',
-                weight: 'normal', confidence: 0.65, resolution: 'scope-match',
+                weight: 'normal', confidence: 0.65, evidenceScore: 0.65,
+                scoreKind: 'ordinal-evidence-not-probability', resolution: 'scope-match',
             }],
             meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 0, confidenceFiltered: 0, includeMethods: false },
         };
         const json = JSON.parse(output.formatContextJson(ctx));
         assert.strictEqual(json.data.callers[0].confidence, 0.98);
+        assert.strictEqual(json.data.callers[0].evidenceScore, 0.98);
+        assert.strictEqual(json.data.callers[0].scoreKind, 'ordinal-evidence-not-probability');
         assert.strictEqual(json.data.callers[0].resolution, 'exact-binding');
         assert.strictEqual(json.data.callees[0].confidence, 0.65);
+        assert.strictEqual(json.data.callees[0].evidenceScore, 0.65);
+        assert.strictEqual(json.data.callees[0].scoreKind, 'ordinal-evidence-not-probability');
         assert.strictEqual(json.data.callees[0].resolution, 'scope-match');
     });
 });
@@ -2451,6 +2459,38 @@ describe('Confidence rendering in formatContext', () => {
 // ============================================================================
 // Formatter truncation / --all bypass tests (K8s MCP fixes 2026-03-13)
 // ============================================================================
+
+describe('formatCheck trust gate', () => {
+    it('renders blocked evidence and preserves machine-readable safety limits', () => {
+        const result = {
+            base: 'HEAD',
+            staged: false,
+            changed: [{
+                name: 'removedFn', file: 'src/a.js', line: 5, kind: 'deleted',
+                callerCount: 0, unverifiedCallerCount: 0, signatureMismatches: 0,
+                account: { available: false, textComplete: false, safeToDelete: false },
+            }],
+            totalChanged: 1,
+            testFiles: [],
+            actions: [{ severity: 'error', kind: 'incomplete_account', message: 'removedFn: inspect manually' }],
+            trust: {
+                status: 'BLOCKED', accountsChecked: 0, incompleteAccounts: 1,
+                unverifiedCallSites: 0, signatureMismatches: 0, filteredEdges: 0,
+                usageReviewSymbols: 0, semanticComplete: false, safeToDelete: false,
+                requiresCompilerAndTests: true,
+            },
+        };
+        const text = output.formatCheck(result);
+        assert.ok(text.includes('TRUST: BLOCKED'));
+        assert.ok(text.includes('ACCOUNT-INCOMPLETE'));
+        assert.ok(text.includes('compiler and tests are required'));
+
+        const json = JSON.parse(output.formatCheckJson(result));
+        assert.strictEqual(json.trust.semanticComplete, false);
+        assert.strictEqual(json.trust.safeToDelete, false);
+        assert.strictEqual(json.trust.requiresCompilerAndTests, true);
+    });
+});
 
 describe('formatDiffImpact caller truncation and --all bypass', () => {
     function makeDiffResult(callerCount) {

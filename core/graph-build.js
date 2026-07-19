@@ -260,6 +260,39 @@ function buildInheritanceGraph(index) {
                         const alias = fileEntry.importAliases.find(a => a.local === parent);
                         if (alias && classNames.has(alias.original)) return alias.original;
                     }
+                    // Qualified structural parent: `class CustomCommand(
+                    // click.Command)`. The symbol table owns bare class names,
+                    // so keeping `click.Command` makes the subclass invisible
+                    // to dispatch/reachability. Normalize only when the
+                    // qualifier is an actual project module import and its
+                    // bounded import graph reaches exactly one matching class
+                    // definition—never by suffix alone.
+                    if (langTraits(fileEntry.language)?.typeSystem === 'structural' && parent.includes('.')) {
+                        const pieces = parent.split('.');
+                        const localModule = pieces[0];
+                        const className = pieces[pieces.length - 1];
+                        const binding = (fileEntry.importBindings || []).find(b => b.name === localModule);
+                        const rel = binding && fileEntry.moduleResolved?.[binding.module];
+                        if (rel && classNames.has(className)) {
+                            const moduleFile = path.join(index.root, rel);
+                            const candidateFiles = new Set((index.symbols.get(className) || [])
+                                .filter(d => ['class', 'interface', 'struct', 'trait', 'record'].includes(d.type))
+                                .map(d => d.file).filter(Boolean));
+                            const reached = new Set();
+                            const queue = [{ file: moduleFile, depth: 0 }];
+                            const seen = new Set();
+                            while (queue.length > 0) {
+                                const cur = queue.shift();
+                                if (!cur.file || seen.has(cur.file) || cur.depth > 4) continue;
+                                seen.add(cur.file);
+                                if (candidateFiles.has(cur.file)) reached.add(cur.file);
+                                for (const next of index.importGraph.get(cur.file) || []) {
+                                    queue.push({ file: next, depth: cur.depth + 1 });
+                                }
+                            }
+                            if (reached.size === 1) return className;
+                        }
+                    }
                     return parent;
                 });
 

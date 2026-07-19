@@ -13,6 +13,16 @@ function formatCheck(result) {
     const lines = [];
     lines.push(`Pre-commit Check vs ${result.base}${result.staged ? ' (staged)' : ''}`);
     lines.push('═'.repeat(60));
+    if (result.trust) {
+        lines.push(`TRUST: ${result.trust.status} — UCN evidence is not semantic proof; compiler and tests are required`);
+        const trustDetails = [];
+        if (result.trust.incompleteAccounts) trustDetails.push(`${result.trust.incompleteAccounts} incomplete account(s)`);
+        if (result.trust.unverifiedCallSites) trustDetails.push(`${result.trust.unverifiedCallSites} unverified caller(s)`);
+        if (result.trust.signatureMismatches) trustDetails.push(`${result.trust.signatureMismatches} signature mismatch(es)`);
+        if (result.trust.filteredEdges) trustDetails.push(`${result.trust.filteredEdges} filtered edge(s)`);
+        if (result.trust.usageReviewSymbols) trustDetails.push(`${result.trust.usageReviewSymbols} symbol(s) need usages review`);
+        if (trustDetails.length > 0) lines.push(`  ${trustDetails.join(' · ')}`);
+    }
 
     // Changed functions section
     const items = result.changed || [];
@@ -29,6 +39,7 @@ function formatCheck(result) {
             if (it.kind && it.kind !== 'changed') tags.push(it.kind.toUpperCase());
             if (it.signatureMismatches > 0) tags.push(`SIG-DRIFT(${it.signatureMismatches})`);
             if (it.orphan) tags.push('ORPHAN');
+            if (it.account && !it.account.textComplete) tags.push('ACCOUNT-INCOMPLETE');
             const tagStr = tags.length ? ' [' + tags.join(', ') + ']' : '';
             let callers = it.callerCount != null ? `${it.callerCount} caller${it.callerCount === 1 ? '' : 's'}` : '';
             if (it.unverifiedCallerCount > 0) {

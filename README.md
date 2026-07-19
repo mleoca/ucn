@@ -34,7 +34,20 @@ UCN is deliberately lightweight:
 - **No language servers** - tree-sitter does the parsing, no compilation needed
 - **MCP is optional** - only needed if you connect UCN to an AI agent, the CLI and Skill work on their own
 
-And it's built to be **trusted**. grep hands you raw text matches to verify yourself; UCN splits every "who calls this?" into what it can prove and what it can't — each flagged with a reason, nothing silently dropped. That claim is measured, not promised: CI re-derives UCN's answers from the real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls) across nineteen production repos — **96.6–100% confirmed-tier precision on eighteen of them, zero unexplained call edges, [or the build fails](#answers-you-can-trust)**.
+And it's built for **auditable trust**. grep hands you raw text matches to verify yourself; UCN separates target-backed edges from possible edges, explains exclusions, and reconciles its observed text set. It does not turn a zero into a deletion claim. CI re-derives answers from real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls). Publishing is gated on a representative five-repository board; the scheduled board covers nineteen plus rotating fresh repositories. See [Answers you can trust](#answers-you-can-trust).
+
+### Same engine, different transport
+
+The CLI and MCP tool use the same command registry, handlers, project index, persisted cache, and output formatters. The skill is guidance for choosing and interpreting those commands; it is not a third analysis engine.
+
+The transports intentionally have different defaults:
+
+- CLI prints full text unless `--compact` is passed. `--json` emits raw machine-readable JSON.
+- MCP defaults `about`, `context`, and `impact` to compact text. Targeted commands have a 10K character default, broad commands have a 3K default, and the hard ceiling is 100K. Truncated answers retain contract metadata.
+- MCP commands and parameters use snake_case. CLI commands and flags use hyphenated names.
+- A persistent MCP server keeps the process and index warm across calls. Repeated calls are normally faster than launching the CLI for every query, while semantic execution and cache behavior remain shared.
+
+When comparing text output, use equivalent flags and compact settings. Transport-specific retry hints use the spelling appropriate to that surface, so the final hint line may differ.
 
 ---
 
@@ -70,12 +83,12 @@ build
 ├── buildImportGraph (core/project.js:798) 1x
 └── buildInheritanceGraph (core/project.js:803) 1x
     … calls UCN can't prove a receiver for (arr.push(), obj.get()) show as
-      [unverified] leaves — abridged here
+      [unverified] leaves (abridged here)
 
 CALLEE ACCOUNT: 26 nodes expanded · 394 call sites = 61 confirmed + 162 unverified (162 uncertain-receiver) + 68 external/builtin + 103 excluded
 ```
 
-One command, no files opened — and the `CALLEE ACCOUNT:` line proves all 394 calls were sorted, nothing dropped.
+One command, no files opened. The `CALLEE ACCOUNT:` line reconciles all 394 indexed call sites into explicit buckets.
 
 ---
 
@@ -94,7 +107,7 @@ expandGlob (pattern: string, options: number = {}) : string[]
 USAGES: 8 total
   3 calls, 3 imports, 2 references
 
-CALLERS — CONFIRMED (7, 3 prod + 4 test):
+CALLERS: CONFIRMED (7, 3 prod + 4 test):
   evidence: scope-match (all)
   cli/index.js:1267 [runGlobCommand]
     const files = expandGlob(pattern);
@@ -115,15 +128,16 @@ CALLEES (3):
 
 ACCOUNT: "expandGlob" occurs on 14 lines in 6 files: 7 confirmed, 0 unverified,
   7 non-call (4 import, 1 definition, 2 reference, 0 other-text), 0 other-target, 0 unaccounted
+CONTRACT: literal-name text partition complete; semantic completeness is not claimed
 
 TESTS: 5 matches in 1 file(s)
 ```
 
-Callers split into **CONFIRMED** (binding/receiver/import evidence — prod first, then tests) and **UNVERIFIED** (found but unproven, each with a reason). The `ACCOUNT:` line reconciles every occurrence; `0 unaccounted` means nothing was hidden. Tune with `--min-confidence` / `--hide-confidence` / `--git`; walk callers *upward* with `ucn reverse-trace fn`.
+Callers split into **CONFIRMED** (binding/receiver/import evidence, with production before tests) and **UNVERIFIED** (found but unproven, each with a reason). `ACCOUNT:` reconciles the literal-name text set; `CONTRACT:` states its scope and completeness. Neither claims that aliases, generated code, reflection, runtime registration, or external consumers do not exist. Tune the evidence display with `--min-confidence` / `--hide-confidence` / `--git`; walk callers *upward* with `ucn reverse-trace fn`.
 
 ## Answers you can trust
 
-UCN doesn't just find a name — it tells you how sure it is. Every answer from `about`, `context`, and `impact` partitions *every* place the name appears into buckets you can act on:
+UCN doesn't just find a name. It shows the identity evidence it has and the uncertainty it retains. Every answer from `about`, `context`, and `impact` partitions *every observed literal-name occurrence* into auditable buckets:
 
 ```
 $ ucn impact saveCache
@@ -134,7 +148,7 @@ test/regression-go.test.js (2 calls)
   :2007
     saveCache(index, cachePath);
 
-UNVERIFIED CALL SITES (11) — call syntax, no binding/receiver evidence:
+UNVERIFIED CALL SITES (11): call syntax, no binding/receiver evidence
   core/project.js:2126: saveCache(cachePath) { ... } (call-not-resolved)
   mcp/server.js:810: try { index.saveCache(); } catch (_) ... (method-ambiguous)
   test/cache.test.js:1804: index.saveCache(); (method-ambiguous)
@@ -142,33 +156,38 @@ UNVERIFIED CALL SITES (11) — call syntax, no binding/receiver evidence:
 
 ACCOUNT: "saveCache" occurs on 55 lines in 8 files: 2 confirmed, 11 unverified,
   11 non-call (2 import, 1 definition, 1 reference, 7 other-text), 31 other-target, 0 unaccounted
+CONTRACT: literal-name text partition complete; semantic completeness is not claimed
 ```
 
 UCN sorts every one of the 55 places the name appears:
 
-- **2 confirmed** — call sites it can prove resolve to *this* `saveCache`.
-- **11 unverified** — real call sites it found but won't claim. `index.saveCache()` has an untyped receiver, so UCN can't prove which `saveCache` runs; it shows the site and the reason (`method-ambiguous`) instead of guessing.
-- **31 other-target** — occurrences that belong to a *different* `saveCache`, kept separate so they never pollute the answer.
-- **11 non-call** — imports, the definition, plain text.
-- **`0 unaccounted`** — the partition is complete. Nothing was dropped on the floor.
+- **2 confirmed**: call sites it can prove resolve to *this* `saveCache`.
+- **11 unverified**: real call sites it found but won't claim. `index.saveCache()` has an untyped receiver, so UCN can't prove which `saveCache` runs; it shows the site and the reason (`method-ambiguous`) instead of guessing.
+- **31 other-target**: occurrences that belong to a *different* `saveCache`, kept separate so they never pollute the answer.
+- **11 non-call**: imports, the definition, plain text.
+- **`0 unaccounted`**: every line in the observed literal-name set was assigned to a bucket.
 
-The payoff: a **confirmed** answer is safe to refactor against, and a clean zero — no confirmed, no unverified, `0 unaccounted` — is a trustworthy zero (measured: 68 of 69 clean-zero samples across the pinned-repo board agree with the compiler oracles; the one disagreement is a `new X()` on an old-style constructor function, which lands in the non-call counts, still visible). One caveat before deleting anything: callers aren't the only usages — if the NON-CALL counts are nonzero, run `ucn usages` to see what they are.
+The payoff is an answer an agent can audit instead of a single opaque match count. A confirmed edge is evidence for the pinned target; an unverified edge requires review. A clean account with no callers is an **observed-text zero**, not semantic-zero or safe-delete proof. Before deleting anything, run `ucn usages`, inspect entry points and public API exposure, check `ucn doctor --deep` deletion readiness, and corroborate with the compiler/type checker and tests.
 
 ### Measured against ground truth
 
-This isn't a promise — it's a gate. CI re-derives UCN's caller answers from real compilers and language servers and fails the build if a single true call edge is neither shown nor accounted for:
+This is a release gate, not a promise of universal program understanding. CI re-derives UCN answers from real compilers and language servers. The pinned release board must pass at least 98% confirmed precision, zero semantically missing in-scope edges, a conserved caller account, command-surface checks, dead-code checks, and performance budgets.
 
-| Language | Oracle | Confirmed-tier precision |
-|---|---|---|
-| TypeScript / JavaScript | ts-morph | 99.5–100% |
-| Python | pyright (LSP) | 97.7–99.9% |
-| Go | gopls | 98.8–100% |
-| Rust | rust-analyzer | 99.3–100%* |
-| Java | jdtls | 96.6–100% |
+Current pinned release-board results:
 
-\* clap reads 92.4% — its callers live behind cargo feature gates the oracle compiles out; UCN sees the text, rust-analyzer doesn't.
+| Repository | Language oracle | Confirmed caller precision | Caller recall | Callee precision/recall | Command checks |
+|---|---|---:|---:|---:|---:|
+| preact-signals | ts-morph | 100% | 100% | 100% / 100% | 100% |
+| httpx | pyright | 100% | 100% | 100% / 100% | 100% |
+| cobra | gopls | 100% | 100% | 100% / 100% | 100% |
+| clap | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
+| javapoet | jdtls | 100% | 100% | 100% / 100% | 100% |
 
-Nineteen pinned real-world repos (zod, preact-signals, express, hono, zustand, fastify, httpx, rich, click, cobra, grpc-go, viper, chi, ripgrep, cursive, clap, gson, javapoet, jsoup), three sampling seeds, every run gated at `missing-unexplained = 0` — plus a weekly fresh-repo arm: two unpinned repos the engine was never tuned on, same gate. The tree commands — `trace`, `blast`, `reverse-trace`, `affected-tests` — follow the same rule: confirmed trunk, uncertain branches flagged (`--expand-unverified` to follow). Run `ucn doctor` for the trust report on *your* repo.
+The command checks cover exact definition lookup, `find`, `fn`/`class`, `brief`, `typedef`, `usages`, `tests`, and `example` against the same external oracle population. The dead-code arm currently has zero false-dead claims on the release board. The performance arm measures cold build, cache load, first semantic query, steady-state p50/p95, and memory on the same repositories.
+
+Unverified precision is reported separately and is intentionally much lower on dispatch-heavy code. Unverified entries are review candidates, not confirmed claims. Rust feature-gated sites that one compiler configuration cannot load are reported as unscored rather than counted as passes.
+
+The scheduled board covers nineteen pinned repositories, multiple sampling seeds, and a rotating fresh-repository arm. It is broader than the five-repository publish gate and is used to expose regressions and overfitting. The tree commands `trace`, `blast`, `reverse-trace`, and `affected-tests` follow the same evidence discipline. Run `ucn doctor --deep` for task-specific readiness on your repository.
 
 ## Change code without breaking things
 
@@ -192,7 +211,7 @@ STATUS: ✓ All calls valid
   Patterns: 4 in try, 4 in callback
 ```
 
-The `Patterns:` line surfaces structural classification of each call site — `inLoop`, `inTry`, `inCallback`, `inTestCase`, `awaited` — so you can spot risky call sites (e.g., calls inside loops, missing `await`) at a glance. Same line appears on `impact` and inside `about`.
+The `Patterns:` line surfaces structural classification of each call site (`inLoop`, `inTry`, `inCallback`, `inTestCase`, `awaited`) so you can spot risky call sites such as calls inside loops or missing `await`. The same line appears on `impact` and inside `about`.
 
 Then preview the refactoring. UCN shows exactly what needs to change and where:
 
@@ -237,16 +256,16 @@ Changed: 3 functions
   ...
 ```
 
-`ucn check` composes `diff-impact` + `verify` + `affected-tests` in one shot — flags ADDED functions with no callers, signature drift across call sites, and recommends which tests to run.
+`ucn check` composes `diff-impact` + `verify` + `affected-tests` in one shot. It flags added functions with no callers, signature drift across call sites, and recommends which tests to run.
 
 ## Get the lay of the land in a new repo
 
-One command answers "what is this codebase?" — size and language mix, where the code lives, the most-called production functions, entry points, and how far to trust the index:
+One command answers "what is this codebase?": size and language mix, where the code lives, the most-called production functions, entry points, and how far to trust the index.
 
 ```
 $ ucn orient
 
-PROJECT ORIENTATION — /path/to/project
+PROJECT ORIENTATION: /path/to/project
 ════════════════════════════════════════════════════════════
 169 files · 2111 symbols · javascript 67%, rust 8%, typescript 8%, java 7%, go 5%, python 5%
 
@@ -258,13 +277,13 @@ TOP DIRS (by symbols):
   ...
 
 HOT (most-called production functions, top 8 of 1028):
-  execute — 1124 call(s) · core/execute.js:1608
-  ProjectIndex.build — 340 call(s) · core/project.js:221
-  getParser — 150 call(s) · languages/index.js:312
+  execute: 1124 call(s) · core/execute.js:1608
+  ProjectIndex.build: 340 call(s) · core/project.js:221
+  getParser: 150 call(s) · languages/index.js:312
   ...
 
-ENTRY POINTS: 389 — test 284, runtime 72, http 32, di 1
-TRUST: MEDIUM — 41 dynamic import(s), 13 eval, 6 reflection  (ucn doctor for detail)
+ENTRY POINTS: 389; test 284, runtime 72, http 32, di 1
+TRUST: MEDIUM; 41 dynamic import(s), 13 eval, 6 reflection  (ucn doctor for detail)
 
 Next: ucn about execute · ucn toc --detailed · ucn stats --hot --top=20 · ucn doctor --deep
 ```
@@ -279,20 +298,24 @@ fetch_user(user_id: int): dict
   async: no  |  side_effects: [fs, network, process]  |  complexity: branches=2, depth=2
 ```
 
-`brief` is the lighter alternative to `about` — typed signature, first sentence of the docstring, side-effect classification, and complexity, all in one screen. Pair with `--git` to see who last touched it and how often.
+`brief` is the lighter alternative to `about`: typed signature, first sentence of the docstring, side-effect classification, and complexity, all in one screen. Pair with `--git` to see who last touched it and how often.
 
 ```
 $ ucn doctor
 
-UCN Trust Report — /path/to/project
+UCN Trust Report: /path/to/project
 Index: 169 files, 2104 symbols
 Languages: javascript (72%), typescript (14%), java (4%), python (4%), rust (4%), go (3%)
 Cache: fresh, 344ms build
-...
-Trust level: HIGH
+Command proofs: 39/39 classified, 22 external-oracle-backed, 0 unclassified
+
+Readiness:
+  navigation: HIGH: fresh index; no parse failures
+  refactor: UNKNOWN: run --deep; review unverified and non-call occurrences
+  deletion: REVIEW: usages, public API, compiler, and tests are still required
 ```
 
-`doctor` reports how much UCN trusts the index — file/symbol counts, blind spots (dynamic imports, eval, reflection), parse failures, and a verdict. Use `--deep` to also sample resolution coverage.
+`doctor` reports task-specific readiness for the index: file/symbol counts, blind spots (dynamic imports, eval, reflection), parse failures, command-proof classification, and separate navigation/refactor/deletion levels. Use `--deep` to sample the resolution evidence profile. This profile is not measured accuracy; use the oracle reports for accuracy.
 
 `entrypoints` lists detected framework handlers (HTTP routes, DI beans, jobs, tests):
 
@@ -320,7 +343,7 @@ Test files to run (20):
     L167: const files = expandGlob('**/*.go', { root: tmpDir });  [call]
     ...
 
-POSSIBLY AFFECTED (1) — reachable only through unverified call edges:
+POSSIBLY AFFECTED (1): reachable only through unverified call edges
   doctor
 
 Uncovered (12): runGlobCommand, main, isCacheStale, runProjectCommand, runFileCommand, ...
@@ -329,7 +352,7 @@ Uncovered (12): runGlobCommand, main, isCacheStale, runProjectCommand, runFileCo
 Summary: 15 affected → 20 test files, 3/15 functions covered (20%) · 1 possibly affected (unverified chains)
 ```
 
-The confirmed closure is what you run; `POSSIBLY AFFECTED` lists functions reached only through unverified edges — extra tests worth a look, kept separate.
+The confirmed closure is what you run; `POSSIBLY AFFECTED` lists functions reached only through unverified edges. These extra tests are worth reviewing and remain separate.
 
 ## Find unused code
 
@@ -343,14 +366,14 @@ crates/globset/src/serde_impl.rs
   [  70-  74] GlobSet.deserialize (method)
 crates/matcher/src/lib.rs
   [ 397- 399] Captures.as_match (method)
-  [ 669- 678] Matcher.try_find_iter (method) [only self-references — recursive]
-  [ 796- 806] Matcher.try_captures_iter (method) [only self-references — recursive]
+  [ 669- 678] Matcher.try_find_iter (method) [only self-references, recursive]
+  [ 796- 806] Matcher.try_captures_iter (method) [only self-references, recursive]
   ...
 
 921 exported symbol(s) excluded from the audit (public API may have external callers). Use --include-exported to audit them.
 ```
 
-Classes, structs, traits, and enums are audited alongside functions. Symbols whose only call sites live inside their own definitions are claimed too, marked `[only self-references — recursive]`. Deadcode claims are re-derived against compiler/LSP ground truth in CI — a default-audit claim with an oracle-visible reference fails the build.
+Classes, structs, traits, and enums are audited alongside functions. Symbols whose only call sites live inside their own definitions are claimed too, marked `[only self-references, recursive]`. Deadcode claims are re-derived against compiler/LSP ground truth in CI. A default-audit claim with an oracle-visible reference fails the build.
 
 Find missing-await bugs:
 
@@ -362,7 +385,7 @@ Lists async calls inside async functions that lack `await` (JS/TS/Python).
 
 ## Map your API surface across languages
 
-UCN can match server routes to client requests across the supported languages — Express/Fastify/Koa/NestJS/Next.js, Flask/FastAPI, Spring/JAX-RS, Go net/http (Gin/Echo/Chi/Fiber), axum/actix-web on the server side; fetch/axios, requests/httpx, RestTemplate/WebClient, reqwest on the client side.
+UCN can match server routes to client requests across the supported languages: Express/Fastify/Koa/NestJS/Next.js, Flask/FastAPI, Spring/JAX-RS, Go net/http (Gin/Echo/Chi/Fiber), and axum/actix-web on the server side; fetch/axios, requests/httpx, RestTemplate/WebClient, and reqwest on the client side.
 
 ```bash
 ucn endpoints --bridge
@@ -403,7 +426,7 @@ function compareNames(a, b) {
 - **Coverage** - every command, every supported language, every surface (CLI, MCP, interactive)
 - **Systematic** - a harness exercises all command and flag combinations against real multi-language fixtures
 - **Test types** - unit, integration, per-language regression, formatter, cache, MCP edge cases, architecture parity guards
-- **Ground truth** - caller accuracy is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls on 19 pinned real repos, gated on zero unexplained edges (see [Answers you can trust](#answers-you-can-trust))
+- **Ground truth** - caller, callee, and oracle-judgable command behavior is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls. The publish gate uses five representative repositories; the scheduled board uses nineteen plus a rotating fresh-repository arm. Gates track confirmed precision, semantic recall, conservation, observed-zero agreement, dead-code false positives, and performance (see [Answers you can trust](#answers-you-can-trust))
 
 ---
 

@@ -10,12 +10,19 @@
   },
   "scripts": {
     "version": "node scripts/sync-server-version.js && git add server.json",
-    "test": "node --test test/parser-unit.test.js test/integration.test.js test/cache.test.js test/formatter.test.js test/interactive.test.js test/feature.test.js test/regression-js.test.js test/regression-py.test.js test/regression-go.test.js test/regression-java.test.js test/regression-rust.test.js test/regression-cross.test.js test/regression-mcp.test.js test/regression-parser.test.js test/regression-commands.test.js test/regression-fixes.test.js test/regression-bugfixes.test.js test/cross-language.test.js test/accuracy.test.js test/command-coverage.test.js test/perf-optimizations.test.js test/systematic-test.js test/mcp-edge-cases.js test/conservation.test.js test/parity-test.js",
+    "test": "node --test test/parser-unit.test.js test/integration.test.js test/cache.test.js test/formatter.test.js test/interactive.test.js test/feature.test.js test/regression-js.test.js test/regression-py.test.js test/regression-go.test.js test/regression-java.test.js test/regression-rust.test.js test/regression-cross.test.js test/regression-mcp.test.js test/regression-parser.test.js test/regression-commands.test.js test/regression-fixes.test.js test/regression-bugfixes.test.js test/cross-language.test.js test/accuracy.test.js test/command-coverage.test.js test/perf-optimizations.test.js test/systematic-test.js test/mcp-edge-cases.js test/conservation.test.js test/parity-test.js test/trust-matrix.test.js",
     "benchmark:agent": "node test/agent-understanding-benchmark.js",
     "eval:conservation": "node eval/conservation-real.js",
     "eval:oracle": "node eval/run-oracle-eval.js",
     "eval:deadcode": "node eval/run-deadcode-eval.js",
-    "lint": "eslint core/ cli/ mcp/ languages/"
+    "eval:performance": "node --expose-gc eval/run-performance-gate.js",
+    "lint": "eslint core/ cli/ mcp/ languages/",
+    "verify": "npm run lint && npm test",
+    "trust:gate:semantic": "node eval/run-oracle-eval.js --repo preact-signals,httpx,cobra,clap,javapoet --min-precision 0.98",
+    "trust:gate:deadcode": "node eval/run-deadcode-eval.js --repo preact-signals,httpx,cobra,clap,javapoet --sample 100 --arm default",
+    "trust:gate:performance": "node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx,cobra,clap,javapoet --queries 40",
+    "trust:gate:fast": "node eval/run-oracle-eval.js --repo preact-signals,httpx --min-precision 0.98 && node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx --queries 20",
+    "trust:gate": "npm run trust:gate:semantic && npm run trust:gate:deadcode && npm run trust:gate:performance"
   },
   "keywords": [
     "mcp",

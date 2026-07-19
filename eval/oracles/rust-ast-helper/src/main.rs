@@ -26,6 +26,11 @@
 //          ident-followed-by-(...) inside macro token trees (mirrors UCN's
 //          fix #201 token-tree convention, independently implemented on
 //          proc-macro2 token streams).
+//   {"op": "source_status", "file": rel, "line": n}
+//       -> {"ok": true, "configurationGated": bool}
+//          True when the line is inside a syn-parsed file/item/local carrying
+//          #[cfg(...)]. This exposes rust-analyzer's single-configuration
+//          coverage gaps without pretending they are engine false positives.
 //   {"op": "shutdown"} -> exits.
 //
 // Symbol enumeration walks the prepared root only; classification reads any
@@ -48,6 +53,7 @@ struct FileInfo {
     callee_pos: HashSet<(usize, usize)>,         // (line, charCol 0-based)
     def_pos: HashMap<(usize, usize), String>,    // decl-name positions -> name
     imports: Vec<(usize, usize)>,                // use-item line spans
+    cfg_spans: Vec<(usize, usize)>,              // #[cfg] owner line spans
 }
 
 struct Collector<'a> {
@@ -55,6 +61,15 @@ struct Collector<'a> {
 }
 
 impl<'a> Collector<'a> {
+    fn mark_cfg<T: Spanned>(&mut self, attrs: &[syn::Attribute], node: &T) {
+        if attrs.iter().any(|a| a.path().is_ident("cfg")) {
+            let span = node.span();
+            self.info
+                .cfg_spans
+                .push((span.start().line, span.end().line));
+        }
+    }
+
     fn record(&mut self, decl_line: usize, ident: &proc_macro2::Ident, kind: &'static str) {
         let np = ident.span().start();
         let name = ident.to_string();
@@ -67,7 +82,9 @@ impl<'a> Collector<'a> {
 
     fn record_def_only(&mut self, ident: &proc_macro2::Ident) {
         let np = ident.span().start();
-        self.info.def_pos.insert((np.line, np.column), ident.to_string());
+        self.info
+            .def_pos
+            .insert((np.line, np.column), ident.to_string());
     }
 
     fn mark_path_callee(&mut self, path: &syn::Path) {
@@ -108,7 +125,11 @@ fn vis_line(vis: &syn::Visibility) -> Option<usize> {
 
 /// First declaration-token line of a fn signature (UCN's function_item start:
 /// pub/default/const/async/unsafe/extern/fn — never attributes).
-fn fn_decl_line(vis: Option<&syn::Visibility>, defaultness: Option<&syn::token::Default>, sig: &syn::Signature) -> usize {
+fn fn_decl_line(
+    vis: Option<&syn::Visibility>,
+    defaultness: Option<&syn::token::Default>,
+    sig: &syn::Signature,
+) -> usize {
     let mut line = sig.fn_token.span().start().line;
     if let Some(v) = vis {
         if let Some(l) = vis_line(v) {
@@ -134,6 +155,58 @@ fn fn_decl_line(vis: Option<&syn::Visibility>, defaultness: Option<&syn::token::
 }
 
 impl<'a, 'ast> Visit<'ast> for Collector<'a> {
+    fn visit_item(&mut self, i: &'ast syn::Item) {
+        let attrs: &[syn::Attribute] = match i {
+            syn::Item::Const(x) => &x.attrs,
+            syn::Item::Enum(x) => &x.attrs,
+            syn::Item::ExternCrate(x) => &x.attrs,
+            syn::Item::Fn(x) => &x.attrs,
+            syn::Item::ForeignMod(x) => &x.attrs,
+            syn::Item::Impl(x) => &x.attrs,
+            syn::Item::Macro(x) => &x.attrs,
+            syn::Item::Mod(x) => &x.attrs,
+            syn::Item::Static(x) => &x.attrs,
+            syn::Item::Struct(x) => &x.attrs,
+            syn::Item::Trait(x) => &x.attrs,
+            syn::Item::TraitAlias(x) => &x.attrs,
+            syn::Item::Type(x) => &x.attrs,
+            syn::Item::Union(x) => &x.attrs,
+            syn::Item::Use(x) => &x.attrs,
+            _ => &[],
+        };
+        self.mark_cfg(attrs, i);
+        visit::visit_item(self, i);
+    }
+
+    fn visit_impl_item(&mut self, i: &'ast syn::ImplItem) {
+        let attrs: &[syn::Attribute] = match i {
+            syn::ImplItem::Const(x) => &x.attrs,
+            syn::ImplItem::Fn(x) => &x.attrs,
+            syn::ImplItem::Type(x) => &x.attrs,
+            syn::ImplItem::Macro(x) => &x.attrs,
+            _ => &[],
+        };
+        self.mark_cfg(attrs, i);
+        visit::visit_impl_item(self, i);
+    }
+
+    fn visit_trait_item(&mut self, i: &'ast syn::TraitItem) {
+        let attrs: &[syn::Attribute] = match i {
+            syn::TraitItem::Const(x) => &x.attrs,
+            syn::TraitItem::Fn(x) => &x.attrs,
+            syn::TraitItem::Type(x) => &x.attrs,
+            syn::TraitItem::Macro(x) => &x.attrs,
+            _ => &[],
+        };
+        self.mark_cfg(attrs, i);
+        visit::visit_trait_item(self, i);
+    }
+
+    fn visit_local(&mut self, i: &'ast syn::Local) {
+        self.mark_cfg(&i.attrs, i);
+        visit::visit_local(self, i);
+    }
+
     fn visit_item_fn(&mut self, i: &'ast syn::ItemFn) {
         let line = fn_decl_line(Some(&i.vis), None, &i.sig);
         self.record(line, &i.sig.ident, "function");
@@ -227,6 +300,9 @@ impl Server {
                 info.lines = src.split('\n').map(|s| s.to_string()).collect();
                 if let Ok(file) = syn::parse_file(&src) {
                     let mut c = Collector { info: &mut info };
+                    if file.attrs.iter().any(|a| a.path().is_ident("cfg")) {
+                        c.info.cfg_spans.push((1, c.info.lines.len().max(1)));
+                    }
                     c.visit_file(&file);
                 }
                 // parse failure: lines-only info — every ref classifies as
@@ -276,7 +352,9 @@ impl Server {
         // Fallback: word search on the given line
         let text = Self::line_text(info, line);
         match index_of_word(text, name) {
-            Some(char_idx) => json!({"ok": true, "line": line, "utf16Col": utf16_col(text, char_idx)}),
+            Some(char_idx) => {
+                json!({"ok": true, "line": line, "utf16Col": utf16_col(text, char_idx)})
+            }
             None => json!({"ok": false, "error": format!("name not found at {}:{}", rel, line)}),
         }
     }
@@ -300,6 +378,16 @@ impl Server {
         }
         json!({"ok": true, "kind": kind})
     }
+
+    fn source_status(&mut self, rel: &str, line: usize) -> Value {
+        let abs = self.root.join(rel);
+        let info = self.analyze(&abs);
+        let configuration_gated = info
+            .cfg_spans
+            .iter()
+            .any(|&(start, end)| line >= start && line <= end);
+        json!({"ok": true, "configurationGated": configuration_gated})
+    }
 }
 
 fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -311,7 +399,12 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
         let p = entry.path();
         let base = entry.file_name().to_string_lossy().to_string();
         if p.is_dir() {
-            if base.starts_with('.') || base == "target" || base == "node_modules" || base == "testdata" || base == "vendor" {
+            if base.starts_with('.')
+                || base == "target"
+                || base == "node_modules"
+                || base == "testdata"
+                || base == "vendor"
+            {
                 continue;
             }
             walk_rs(&p, out);
@@ -322,7 +415,11 @@ fn walk_rs(dir: &Path, out: &mut Vec<PathBuf>) {
 }
 
 fn utf16_col(line_text: &str, char_col: usize) -> usize {
-    line_text.chars().take(char_col).map(|c| c.len_utf16()).sum()
+    line_text
+        .chars()
+        .take(char_col)
+        .map(|c| c.len_utf16())
+        .sum()
 }
 
 fn char_col_from_utf16(line_text: &str, u16col: usize) -> usize {
@@ -372,9 +469,14 @@ fn get_usize(req: &Value, key: &str) -> usize {
 }
 
 fn main() {
-    let root = std::env::args().nth(1).expect("usage: rust-ast-helper <root>");
+    let root = std::env::args()
+        .nth(1)
+        .expect("usage: rust-ast-helper <root>");
     let root = std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(&root));
-    let mut server = Server { root, cache: HashMap::new() };
+    let mut server = Server {
+        root,
+        cache: HashMap::new(),
+    };
 
     let stdout = std::io::stdout();
     let mut out = stdout.lock();
@@ -395,15 +497,20 @@ fn main() {
             Err(e) => json!({"ok": false, "error": e.to_string()}),
             Ok(req) => match req.get("op").and_then(|v| v.as_str()) {
                 Some("list_symbols") => server.list_symbols(),
-                Some("name_position") => {
-                    server.name_position(get_str(&req, "file"), get_usize(&req, "line"), get_str(&req, "name"))
-                }
+                Some("name_position") => server.name_position(
+                    get_str(&req, "file"),
+                    get_usize(&req, "line"),
+                    get_str(&req, "name"),
+                ),
                 Some("classify_ref") => server.classify_ref(
                     get_str(&req, "file"),
                     get_usize(&req, "line"),
                     get_usize(&req, "utf16_col"),
                     get_str(&req, "name"),
                 ),
+                Some("source_status") => {
+                    server.source_status(get_str(&req, "file"), get_usize(&req, "line"))
+                }
                 Some("shutdown") => return,
                 _ => json!({"ok": false, "error": "unknown op"}),
             },

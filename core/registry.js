@@ -125,7 +125,7 @@ const FLAG_APPLICABILITY = {
     reverseTrace: ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
     smart:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
     trace:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    example:      ['name', 'file', 'className', 'diverse', 'top', 'includeTests'],
+    example:      ['name', 'file', 'className', 'line', 'diverse', 'top', 'includeTests'],
     related:      ['name', 'file', 'className', 'line', 'top', 'all'],
     brief:        ['name', 'file', 'className', 'line', 'git'],
     // Finding code
@@ -162,7 +162,7 @@ const FLAG_APPLICABILITY = {
     stacktrace:   ['stack'],
     api:          ['file', 'limit'],
     stats:        ['functions', 'hot', 'top'],
-    doctor:       ['file', 'in', 'limit', 'deep'],
+    doctor:       ['file', 'in', 'deep'],
     orient:       ['top'],
     auditAsync:   ['file', 'exclude', 'limit'],
 };

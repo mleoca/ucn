@@ -271,6 +271,7 @@ function indexSnapshot(index) {
             importAliases: (fe.importAliases || []).map(a => `${a.original} ${a.local}`).sort(),
             exportDetails: (fe.exportDetails || []).map(e => JSON.stringify(e)).sort(),
             moduleAssignedNames: [...(fe.moduleAssignedNames || [])].sort(),
+            parseRecovery: !!fe.parseRecovery,
         }))
         .sort((a, b) => a.relativePath.localeCompare(b.relativePath));
     const calls = [...index.files.keys()].sort().map(f => [

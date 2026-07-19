@@ -9,7 +9,7 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES, compareNames } = require('./discovery');
-const { extractImports, extractExports, resolveImport } = require('./imports');
+const { extractImports, extractExports } = require('./imports');
 const { parse, cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
 const { getTokenTypeAtPosition } = require('../languages/utils');
@@ -83,6 +83,13 @@ class ProjectIndex {
             this._opEnclosingFnCache = new Map();
             this._opTreeCache = new Map();
             this._opLinesCache = new Map();
+            // Query-time semantic derivations that depend only on one file's
+            // immutable call records. Reachability may ask findCallees() for
+            // thousands of symbols in the same few large files; rebuilding
+            // these structures per symbol turns the walk quadratic.
+            this._opReturnTypeFlowCache = new Map();
+            this._opCallsByLineCache = new Map();
+            this._opImportReachCache = new Map();
             this._opDepth = 0;
         }
         this._opDepth++;
@@ -99,6 +106,9 @@ class ProjectIndex {
             this._opEnclosingFnCache = null;
             this._opTreeCache = null;
             this._opLinesCache = null;
+            this._opReturnTypeFlowCache = null;
+            this._opCallsByLineCache = null;
+            this._opImportReachCache = null;
             // Free cached file content from callsCache entries (retained during
             // operation for _readFile caching, not needed between operations)
             for (const entry of this.callsCache.values()) {
@@ -120,7 +130,7 @@ class ProjectIndex {
         if (!this._opTreeCache) return null;
         const cached = this._opTreeCache.get(filePath);
         if (cached !== undefined) return cached;
-        let tree = null;
+        let tree;
         try {
             const parser = getParser(language);
             tree = parser ? safeParse(parser, content, undefined, PARSE_OPTIONS) : null;
@@ -495,6 +505,7 @@ class ProjectIndex {
             exportDetails: exports,
             symbols: [],
             bindings: [],
+            ...(parsed.parseRecovery && { parseRecovery: true }),
             ...(importAliases && { importAliases }),
             // Module-scope assignment targets (fix #217): names a module can
             // expose WITHOUT a def/class/import binding (`render = impl`,
@@ -518,6 +529,8 @@ class ProjectIndex {
                 params: item.params,
                 paramsStructured: item.paramsStructured,
                 returnType: item.returnType,
+                ...(item.returnedFunctionResult && { returnedFunctionResult: item.returnedFunctionResult }),
+                ...(item.isFunctionVariable && { isFunctionVariable: true }),
                 ...(item.paramTypes && { paramTypes: item.paramTypes }),
                 ...(item.isAsync && { isAsync: true }),
                 ...(item.isGenerator && { isGenerator: true }),
@@ -550,7 +563,9 @@ class ProjectIndex {
                 // just the traitImpl flag (fix #210).
                 ...(item.traitName && { traitName: item.traitName }),
                 ...(item.isSignature && { isSignature: true }),
-                ...(item.memberAssigned && { memberAssigned: true })
+                ...(item.memberAssigned && { memberAssigned: true }),
+                ...(item.registryMember && { registryMember: true }),
+                ...(item.registryContainer && { registryContainer: item.registryContainer })
             };
             fileEntry.symbols.push(symbol);
             // Property-assignment defs (fix #269: Reply.prototype.serialize
@@ -1418,7 +1433,7 @@ class ProjectIndex {
         // Match both "TypeName" and "*TypeName" receivers (for Go/Rust pointer receivers)
         const baseTypeName = typeName.replace(/^\*/, '');
 
-        for (const [name, symbols] of this.symbols) {
+        for (const [, symbols] of this.symbols) {
             for (const symbol of symbols) {
                 // Skip non-method types (fields, properties, etc.)
                 if (symbol.type === 'field' || symbol.type === 'property') {

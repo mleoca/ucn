@@ -170,6 +170,33 @@ const jdtlsOracle = {
         return refs;
     },
 
+    /** Resolve the compiler-selected declaration(s) at a call/reference line.
+     *  Eclipse reference search intentionally expands virtual method families;
+     *  definition lookup recovers the exact static target for precision and
+     *  callee-placement adjudication. */
+    async resolveDefinition(handle, { name, file, line }) {
+        const absFile = path.join(handle.root, file);
+        const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
+        const columns = nameColumns(sourceLine, name);
+        const defs = new Map();
+        for (const character of columns) {
+            const locations = await handle.lsp.request('textDocument/definition', {
+                textDocument: { uri: pathToUri(absFile) },
+                position: { line: line - 1, character },
+            }) || [];
+            for (const loc of Array.isArray(locations) ? locations : [locations]) {
+                const uri = loc.targetUri || loc.uri;
+                const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+                if (!uri || !range) continue;
+                const defAbs = uriToPath(uri);
+                if (!defAbs.startsWith(handle.repoRoot + path.sep)) continue;
+                const entry = { file: path.relative(handle.root, defAbs), line: range.start.line + 1 };
+                defs.set(`${entry.file}:${entry.line}`, entry);
+            }
+        }
+        return [...defs.values()];
+    },
+
     async dispose(handle) {
         try { handle.helper.child.stdin.write(JSON.stringify({ op: 'shutdown' }) + '\n'); } catch (e) { /* gone */ }
         try {
@@ -178,6 +205,19 @@ const jdtlsOracle = {
         } catch (e) { /* gone */ }
     },
 };
+
+function nameColumns(line, name) {
+    const cols = [];
+    for (let from = 0; from <= line.length - name.length;) {
+        const at = line.indexOf(name, from);
+        if (at < 0) break;
+        const before = at === 0 ? '' : line[at - 1];
+        const after = line[at + name.length] || '';
+        if (!/[\w$]/.test(before) && !/[\w$]/.test(after)) cols.push(at);
+        from = at + name.length;
+    }
+    return cols;
+}
 
 function resolveJava() {
     const candidates = [

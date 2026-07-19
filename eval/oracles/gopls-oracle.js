@@ -85,7 +85,73 @@ const goplsOracle = {
         }
         return refs;
     },
+
+    /** Resolve the compiler-selected declaration at a call/reference line.
+     *  gopls reference search expands implicit interface implementation
+     *  families; definition lookup recovers the static target so broad
+     *  virtual-family references do not masquerade as exact edges. */
+    async resolveDefinition(handle, { name, file, line }) {
+        const absFile = path.join(handle.root, file);
+        ensureOpen(handle, absFile);
+        const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
+        const defs = new Map();
+        for (const character of nameColumns(sourceLine, name)) {
+            const locations = await handle.lsp.request('textDocument/definition', {
+                textDocument: { uri: pathToUri(absFile) },
+                position: { line: line - 1, character },
+            }) || [];
+            for (const loc of Array.isArray(locations) ? locations : [locations]) {
+                const uri = loc.targetUri || loc.uri;
+                const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+                if (!uri || !range) continue;
+                const defAbs = uriToPath(uri);
+                if (!defAbs.startsWith(handle.moduleRoot + path.sep)) continue;
+                const entry = {
+                    file: path.relative(handle.root, defAbs),
+                    line: range.start.line + 1,
+                };
+                defs.set(`${entry.file}:${entry.line}`, entry);
+            }
+        }
+        return [...defs.values()];
+    },
+
+    /** Go build constraints and ignored source directories are outside the
+     *  active gopls package universe. Keep such UCN edges explicit but
+     *  unscored instead of reporting them as false positives. */
+    async isConfigurationGated(handle, { file }) {
+        const resp = await handle.helper.request({ op: 'source_status', file });
+        return !!resp.gated;
+    },
+
+    async dispose(handle) {
+        try { handle.helper.child.stdin.write(JSON.stringify({ op: 'shutdown' }) + '\n'); } catch { /* gone */ }
+        try {
+            await handle.lsp.request('shutdown');
+            handle.lsp.notify('exit');
+        } catch { /* gone */ }
+    },
 };
+
+function ensureOpen(handle, absFile) {
+    if (handle.opened.has(absFile)) return;
+    handle.lsp.didOpen(absFile, 'go', fs.readFileSync(absFile, 'utf-8'));
+    handle.opened.add(absFile);
+}
+
+function nameColumns(line, name) {
+    const out = [];
+    for (let from = 0; from <= line.length;) {
+        const i = line.indexOf(name, from);
+        if (i < 0) break;
+        const before = i === 0 || !/[A-Za-z0-9_]/.test(line[i - 1]);
+        const end = i + name.length;
+        const after = end >= line.length || !/[A-Za-z0-9_]/.test(line[end]);
+        if (before && after) out.push([...line.slice(0, i)].join('').length);
+        from = i + Math.max(1, name.length);
+    }
+    return out;
+}
 
 function resolveGopls() {
     const explicit = process.env.UCN_EVAL_GOPLS;

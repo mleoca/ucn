@@ -3879,6 +3879,70 @@ export function inner() {}
         } finally { rm(dir); }
     });
 
+    it('dynamic module-scope handler registries are indexed as conservative roots', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'dispatch.ts': [
+                'function used() { return 1; }',
+                'function unused() { return 2; }',
+                'const HANDLERS = Object.freeze({',
+                '  run: () => used(),',
+                '  stop() { return 0; },',
+                '} satisfies Record<string, () => number>);',
+            ].join('\n'),
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            const run = (index.symbols.get('run') || [])[0];
+            const stop = (index.symbols.get('stop') || [])[0];
+            assert.ok(run?.registryMember && stop?.registryMember,
+                'function-valued registry properties are semantic symbols');
+            assert.strictEqual(run.registryContainer, 'HANDLERS');
+            assert.ok(run.memberAssigned, 'registry keys do not create lexical bare-name bindings');
+            assert.ok(isReach(reach, index.symbols, 'run'), 'computed-dispatch handler is conservatively reachable');
+            assert.ok(isReach(reach, index.symbols, 'stop'), 'object method handler is conservatively reachable');
+            assert.ok(isReach(reach, index.symbols, 'used'), 'callee reachability flows out of a registry handler');
+            assert.ok(!isReach(reach, index.symbols, 'unused'), 'unrelated ordinary functions remain unreachable');
+        } finally { rm(dir); }
+    });
+
+    it('function-local object callbacks are not promoted to global reachability roots', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'callbacks.js': [
+                'function factory() {',
+                '  const LOCAL = { later: () => hidden() };',
+                '  return LOCAL;',
+                '}',
+                'function hidden() { return 1; }',
+            ].join('\n'),
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            assert.ok(!(index.symbols.get('later') || []).some(s => s.registryMember),
+                'local callback bags are not runtime roots by declaration alone');
+            assert.ok(!isReach(reach, index.symbols, 'hidden'),
+                'callee of an unreachable local callback stays unreachable');
+        } finally { rm(dir); }
+    });
+
+    it('function-valued CommonJS export-object properties are indexed and reachable', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'plugin.js': [
+                'function dependency() { return 1; }',
+                'module.exports = { execute: () => dependency() };',
+            ].join('\n'),
+        });
+        try {
+            const { index, reach } = reachableSet(dir);
+            const executeDef = (index.symbols.get('execute') || [])[0];
+            assert.ok(executeDef?.registryMember, 'CJS export object member carries registry provenance');
+            assert.ok(isReach(reach, index.symbols, 'execute'), 'public CJS object member is reachable');
+            assert.ok(isReach(reach, index.symbols, 'dependency'), 'its dependency is transitively reachable');
+        } finally { rm(dir); }
+    });
+
     // Cause 2: file-path patterns for runtime entries
     it('cause 2: cli.ts is a runtime entry file', () => {
         const dir = tmp({
@@ -5314,6 +5378,15 @@ describe('fix #209: structural dispatch tiering (JS/TS)', () => {
             assert.ok(entry, `codec.decode stays VISIBLE: ${JSON.stringify(r.result.unverifiedCallers)}`);
             assert.strictEqual(entry.reason, 'method-ambiguous');
             assert.strictEqual(r.result.meta.account.conserved, true);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'decode'),
+                `callee direction must not bind an untyped receiver to defs[0]: ${JSON.stringify(callees)}`);
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'decode' && c.reason === 'method-ambiguous'),
+            `callee ambiguity stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
         } finally { rm(dir); }
     });
 
@@ -5340,6 +5413,105 @@ describe('fix #209: structural dispatch tiering (JS/TS)', () => {
             const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
             assert.ok(confirmed.includes('app.ts:4'),
                 `single project-wide owner stays confirmed (#204 rule): ${confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('interface-typed method dispatch is not excluded because the interface file owns another definition', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'router.ts': 'export interface Router { add(path: string): void }',
+            'smart.ts': [
+                'import type { Router } from "./router";',
+                'export class SmartRouter implements Router {',
+                '  add(path: string): void {}',
+                '}',
+            ].join('\n'),
+            'trie.ts': [
+                'import type { Router } from "./router";',
+                'export class TrieRouter implements Router {',
+                '  add(path: string): void {}',
+                '}',
+            ].join('\n'),
+            'use.ts': [
+                'import type { Router } from "./router";',
+                'export function install(router: Router) {',
+                '  router.add("/health");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'smart.ts:3:add' });
+            assert.ok(r.ok);
+            const confirmed = (r.result.callers || []).map(c => `${c.relativePath}:${c.line}`);
+            assert.ok(!confirmed.includes('use.ts:3'),
+                `interface dispatch cannot confirm one implementation: ${confirmed}`);
+            const entry = (r.result.unverifiedCallers || [])
+                .find(u => `${u.relativePath}:${u.line}` === 'use.ts:3');
+            assert.ok(entry, `interface dispatch must stay visible: ${JSON.stringify(r.result.unverifiedCallers)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Router');
+            assert.strictEqual(r.result.meta.account.excluded.byReason['other-definition-import'], undefined);
+            assert.strictEqual(r.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('callee analysis keeps an interface-typed call as possible dispatch instead of confirming the declaration', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'router.ts': 'export interface Router { add(path: string): void }',
+            'smart.ts': [
+                'import type { Router } from "./router";',
+                'export class SmartRouter implements Router {',
+                '  add(path: string): void {}',
+                '}',
+            ].join('\n'),
+            'use.ts': [
+                'import type { Router } from "./router";',
+                'export function install(router: Router) {',
+                '  router.add("/health");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'use.ts:2:install' });
+            assert.ok(r.ok);
+            assert.ok(!(r.result.callees || []).some(c => c.name === 'add'),
+                `interface declaration is not an executable callee: ${JSON.stringify(r.result.callees)}`);
+            const entry = (r.result.unverifiedCallees || []).find(c => c.name === 'add');
+            assert.ok(entry, `possible implementation dispatch stays visible: ${JSON.stringify(r.result.unverifiedCallees)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Router');
+            assert.strictEqual(r.result.meta.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('callee analysis does not bind a base-class this call past descendant overrides', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'model.ts': [
+                'export class Base {',
+                '  parse(): string { return "base" }',
+                '  run(): string { return this.parse() }',
+                '}',
+                'export class Child extends Base {',
+                '  parse(): string { return "child" }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'model.ts:3:run' });
+            assert.ok(r.ok);
+            assert.ok(!(r.result.callees || []).some(c => c.name === 'parse'),
+                `base parse is not the only runtime callee: ${JSON.stringify(r.result.callees)}`);
+            const entry = (r.result.unverifiedCallees || []).find(c => c.name === 'parse');
+            assert.ok(entry, `override dispatch stays visible: ${JSON.stringify(r.result.unverifiedCallees)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Base');
+            assert.strictEqual(entry.dispatchCandidates, 2);
+            assert.strictEqual(r.result.meta.calleeAccount.conserved, true);
         } finally { rm(dir); }
     });
 });
@@ -7483,6 +7655,13 @@ describe('fix #265: fresh-arm caller physics (zustand/hono families)', () => {
                 'universal-name call routes visible possible-dispatch');
             assert.ok(res.some(c => c.line === 8),
                 `typed receiver keeps confirming: ${JSON.stringify(res.map(c => c.line))}`);
+            const dump = index.symbols.get('dump')[0];
+            const dumpCallees = index.findCallees(dump, { collectAccount: true, includeMethods: true });
+            assert.ok(!dumpCallees.some(c => c.name === 'toString' && c.sites?.includes(5)),
+                'callee single-owner resolution obeys the universal-root defeater');
+            assert.ok((dumpCallees.unverifiedCallees || []).some(c =>
+                c.name === 'toString' && c.sites.includes(5)),
+            `callee keeps the universal call visible: ${JSON.stringify(dumpCallees.unverifiedCallees)}`);
         } finally { rm(dir); }
     });
 
@@ -7613,6 +7792,76 @@ describe('fix #267: deadcode false-dead families from the hono/zustand graduatio
             assert.ok(dead.some(d => d.name === 'Unreferenced'),
                 'a genuinely-unreferenced .ts interface stays claimable');
         } finally { rm(dir); }
+    });
+});
+
+describe('TS class declaration + explicit this:Self function share constructor identity', () => {
+    it('new-expression confirms the ES5 runtime implementation pin', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'index.ts': [
+                'declare class Widget { constructor(x: number); }',
+                'function Widget(this: Widget, x: number) { return x; }',
+                'function make() { return new Widget(1); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const runtimeDef = (index.symbols.get('Widget') || []).find(s => s.type === 'function');
+            const callers = index.findCallers('Widget', {
+                targetDefinitions: [runtimeDef], collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.line === 3 && c.tier === 'confirmed'),
+                `new Widget must reach the explicit this:Widget implementation: ${JSON.stringify(callers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('ordinary same-name class/function declarations do not merge', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'index.ts': [
+                'class Widget {}',
+                'function Widget(x: number) { return x; }',
+                'function make() { return new Widget(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const runtimeDef = (index.symbols.get('Widget') || []).find(s => s.type === 'function');
+            const callers = index.findCallers('Widget', {
+                targetDefinitions: [runtimeDef], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.line === 3 && c.tier === 'confirmed'),
+                'no explicit this:Self proof means identities stay separate');
+        } finally { rm(dir); }
+    });
+});
+
+describe('JS alias resolution is lexical and position-aware', () => {
+    it('a block-local alias cannot rewrite a later module-level call', () => {
+        const { getParser } = require('../languages');
+        const { findCallsInCode } = require('../languages/javascript');
+        const calls = findCallsInCode([
+            'let batchedEffect;',
+            'while (batchedEffect) {',
+            '  let effect = batchedEffect;',
+            '  effect();',
+            '}',
+            'function effect() {}',
+            'function subscribe() { effect(); }',
+        ].join('\n'), getParser('javascript'));
+        const inner = calls.find(c => c.line === 4 && c.name === 'effect');
+        const outer = calls.find(c => c.line === 7 && c.name === 'effect');
+        assert.strictEqual(inner?.resolvedName, 'batchedEffect', 'alias resolves inside its block');
+        assert.strictEqual(outer?.resolvedName, undefined, 'alias does not leak outside its block');
+    });
+
+    it('aliases declared after a call do not rewrite the earlier call', () => {
+        const { getParser } = require('../languages');
+        const { findCallsInCode } = require('../languages/javascript');
+        const calls = findCallsInCode('target();\nconst target = replacement;\ntarget();', getParser('javascript'));
+        assert.strictEqual(calls.find(c => c.line === 1)?.resolvedName, undefined);
+        assert.strictEqual(calls.find(c => c.line === 3)?.resolvedName, 'replacement');
     });
 });
 
@@ -7802,6 +8051,186 @@ describe('fix #270: external-contract shield walks the heritage closure (fastify
             assert.ok(dead.some(d => d.name === 'deadling'),
                 `fully in-project chain: dead member stays claimable: ${dead.map(d => d.name)}`);
             assert.strictEqual(dead.excludedExternalContract, 0);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #271 (JS/TS): parser recovery and indirect receiver ownership', () => {
+    it('recovers a new-expression from tree-sitter ERROR tokens without text regex', () => {
+        // While a file is partially edited (and in some valid overload-heavy
+        // files the bundled grammar cannot fully parse), tree-sitter may
+        // flatten `new Hono<X>` into an ERROR node. The constructor identifier
+        // and `new` token still remain in the AST.
+        const source = [
+            'class Hono<E> {}',
+            'function beingEdited( {',
+            '  const app = new Hono<E>(',
+        ].join('\n');
+        const languages = require('../languages');
+        const parser = languages.getParser('typescript');
+        const tree = parser.parse(source);
+        const calls = languages.getLanguageModule('typescript').findCallsInCode(source, parser);
+        assert.strictEqual(tree.rootNode.hasError, true);
+        assert.ok(calls.some(c => c.name === 'Hono' && c.isConstructor && c.parseRecovery),
+            `constructor must survive parser recovery (tree hasError=${tree.rootNode.hasError}): ${JSON.stringify(calls)}`);
+    });
+
+    it('surfaces file-level parser recovery in doctor trust dimensions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'broken.ts': [
+                'export class Hono<E> {}',
+                'export function beingEdited( {',
+                '  const app = new Hono<E>(',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const fe = index.files.get(require('path').join(dir, 'broken.ts'));
+            assert.strictEqual(fe?.parseRecovery, true,
+                'file entry must persist tree-sitter recovery state');
+            const result = execute(index, 'doctor', {});
+            assert.ok(result.ok, result.error);
+            assert.strictEqual(result.result.blindSpots.parseRecoveries.count, 1);
+            assert.strictEqual(result.result.blindSpots.parseRecoveries.fileCount, 1);
+            assert.strictEqual(result.result.dimensions.index.level, 'MEDIUM');
+            assert.strictEqual(result.result.dimensions.semanticRecall.level, 'LOW');
+            const text = output.formatDoctor(result.result);
+            assert.match(text, /Parser recovery: 1 recovered file \(results may be partial\)/);
+            assert.match(text, /indexed results may be partial/);
+        } finally { rm(dir); }
+    });
+
+    it('deep receiver names stay visible and never bind to an enclosing field', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.ts': [
+                'interface Options { query?: string }',
+                'class Request {',
+                '  query(key: string): string { return key }',
+                '}',
+                'function run(c: any, options: Options): string {',
+                '  return options.query || c.req.query("pretty")',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'app.ts:3:query' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(output.formatContextJson(result.result));
+            assert.ok(!(json.data.callers || []).some(c => c.line === 6),
+                'unknown deep receiver is not confirmed');
+            assert.ok((json.data.unverifiedCallers || []).some(c => c.line === 6),
+                `unknown deep receiver stays visible: ${JSON.stringify(json.data)}`);
+            const run = index.symbols.get('run').find(d => d.startLine === 5);
+            const callees = index.findCallees(run, { collectAccount: true, includeMethods: true });
+            assert.ok((callees.unverifiedCallees || []).some(c => c.name === 'query'),
+                `callee stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.ok(!callees.some(c => c.name === 'query' && c.startLine === 1),
+                'Options.query field is never selected as the callee');
+        } finally { rm(dir); }
+    });
+
+    it('base-typed virtual calls expose descendant overrides as possible dispatch', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.ts': [
+                'class Base { run(): number { return 1 } }',
+                'class Child extends Base { run(): number { return 2 } }',
+                'function invoke(value: Base): number {',
+                '  return value.run()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const invoke = index.symbols.get('invoke')[0];
+            const callees = index.findCallees(invoke, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'run' && c.sites?.includes(4)),
+                `a virtual call is not an exact base callee: ${JSON.stringify(callees)}`);
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'run' && c.reason === 'possible-dispatch' && c.sites.includes(4)),
+            `base and override remain visible as possible dispatch: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('named API imports never borrow an unrelated method return type', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schema.ts': [
+                'export class Schema { default(): Schema { return this } }',
+                'const stringType = (): Schema => new Schema()',
+                'export const z = { string: stringType }',
+            ].join('\n'),
+            'mock.ts': [
+                'export class Mocker {',
+                '  string(): string { return "not a schema" }',
+                '}',
+            ].join('\n'),
+            'app.ts': [
+                'import { z } from "./schema"',
+                'export function run() { return z.string().default() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'schema.ts:1:default' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(output.formatContextJson(result.result));
+            assert.ok((json.data.callers || []).some(c => c.file === 'app.ts' && c.line === 2) ||
+                (json.data.unverifiedCallers || []).some(c => c.file === 'app.ts' && c.line === 2),
+            `the real edge stays visible: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch'],
+                `Mocker.string(): string must not exclude Schema.default: ${JSON.stringify(json.meta.account)}`);
+        } finally { rm(dir); }
+    });
+
+    it('an imported constructor shadows a same-named host global', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'request.js': [
+                'function Request(id) { this.id = id }',
+                'module.exports = Request',
+            ].join('\n'),
+            'app.js': [
+                'const Request = require("./request")',
+                'function build() { return new Request(1) }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const build = index.symbols.get('build')[0];
+            const callees = index.findCallees(build, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'Request' && c.relativePath === 'request.js'),
+                `lexical Request shadows the host Fetch global: ${JSON.stringify(callees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('recursive nested functions bind themselves, not a later same-named sibling', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'function first() {',
+                '  const walk = (n) => n ? walk(n - 1) : 0',
+                '  return walk(2)',
+                '}',
+                'function second() {',
+                '  const walk = (n) => n ? walk(n - 1) : 0',
+                '  return walk(2)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const walks = index.symbols.get('walk').sort((a, b) => a.startLine - b.startLine);
+            const callees = index.findCallees(walks[0], { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'walk' && c.startLine === walks[0].startLine),
+                `recursive edge must return to its lexical def: ${JSON.stringify(callees)}`);
+            assert.ok(!callees.some(c => c.name === 'walk' && c.startLine === walks[1].startLine),
+                'later sibling never steals the recursive call');
         } finally { rm(dir); }
     });
 });

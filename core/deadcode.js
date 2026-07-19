@@ -208,8 +208,7 @@ function nameOnlySelfRecursive(index, name) {
     }
     const { getCachedCalls } = require('./callers');
     for (const f of files) {
-        let calls;
-        try { calls = getCachedCalls(index, f); } catch { return false; }
+        const calls = getCachedCalls(index, f);
         if (!calls) return false;
         for (const call of calls) {
             if (call.name !== name && call.resolvedName !== name &&

@@ -6,7 +6,6 @@
  */
 
 const fs = require('fs');
-const path = require('path');
 const { detectLanguage, getParser, getLanguageModule, isSupported } = require('../languages');
 
 /**
@@ -58,6 +57,7 @@ const { detectLanguage, getParser, getLanguageModule, isSupported } = require('.
  * @property {StateDef[]} stateObjects - All state objects
  * @property {Array} imports - Import statements (from imports.js)
  * @property {Array} exports - Export statements (from imports.js)
+ * @property {boolean} [parseRecovery] - Tree-sitter recovered from syntax errors; results may be partial
  */
 
 /**

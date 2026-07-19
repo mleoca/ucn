@@ -16,8 +16,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { parse } = require('./parser');
-const { detectLanguage, langTraits } = require('../languages');
+const { detectLanguage } = require('../languages');
 const { formatSymbolHandle } = require('./shared');
 
 // ============================================================================
@@ -377,7 +376,7 @@ function sideEffectsFor(index, symbol) {
     if (index._sideEffectCache.has(key)) return index._sideEffectCache.get(key);
 
     const filePath = path.isAbsolute(symbol.file || '') ? symbol.file : path.join(index.root, symbol.file || symbol.relativePath || '');
-    let bodyText = '';
+    let bodyText;
     try {
         const content = fs.readFileSync(filePath, 'utf-8');
         const lines = content.split('\n');

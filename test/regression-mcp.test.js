@@ -442,6 +442,23 @@ describe('fix: MCP max_files parameter honored', () => {
 // MCP two-tier output limits
 // =============================================================================
 describe('MCP two-tier output limits', () => {
+    it('serves a concise, calibrated agent description by default', async () => {
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const res = await client.send('tools/list', {});
+            const description = res.result?.tools?.find(t => t.name === 'ucn')?.description || '';
+            assert.ok(description.length > 1000 && description.length < 8000,
+                `description should be useful without consuming the context window (${description.length} chars)`);
+            assert.ok(description.includes('observed-text zero'), description);
+            assert.ok(description.includes('ordinal evidence weights, not probabilities'), description);
+            assert.ok(!description.includes('genuinely has no callers'), description);
+        } finally {
+            client.stop();
+        }
+    });
+
     it('BROAD_COMMANDS set includes the correct commands', () => {
         const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
         for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
@@ -461,6 +478,33 @@ describe('MCP two-tier output limits', () => {
         const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
         for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
             assert.ok(serverCode.includes(`${cmd}:`), `Should have narrowing hint for ${cmd}`);
+        }
+    });
+
+    it('preserves caller ACCOUNT and CONTRACT metadata after truncation', async () => {
+        const callers = Array.from({ length: 80 }, (_, i) =>
+            `function caller${i}() { return target(${i}); }`).join('\n');
+        const dir = tmp({
+            'package.json': '{"name":"contract-truncation"}',
+            'index.js': `function target(x) { return x; }\n${callers}\nmodule.exports = { target };\n`,
+        });
+        const client = new McpClient();
+        try {
+            await client.start();
+            await client.initialize();
+            const res = await client.callTool('ucn', {
+                command: 'impact', project_dir: dir, name: 'target', max_chars: 800,
+            });
+            const text = res.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(text.includes('OUTPUT TRUNCATED'), text);
+            assert.ok(text.includes('PRESERVED CONTRACT METADATA'), text);
+            assert.ok(text.includes('ACCOUNT: "target"'), text);
+            assert.ok(text.includes('CONTRACT: literal-name text partition complete'), text);
+            assert.strictEqual(res.result?.structuredContent?.truncated, true);
+            assert.strictEqual(res.result?.structuredContent?.contractMetadataComplete, true);
+        } finally {
+            client.stop();
+            rm(dir);
         }
     });
 });
@@ -542,6 +586,16 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on max_files=0, got: ${JSON.stringify(res).slice(0, 300)}`);
+    });
+
+    it('max_chars above the documented 100K transport ceiling is rejected', async () => {
+        const res = await client.callTool('ucn', {
+            command: 'about', project_dir: PROJECT_DIR, name: 'main', max_chars: 100001,
+        });
+        const isError = res.error || (res.result && res.result.isError === true);
+        assert.ok(isError, `should error above max_chars=100000, got: ${JSON.stringify(res).slice(0, 300)}`);
+        assert.ok(/max_chars|number|less than|100000/i.test(errText(res)),
+            `error should describe the max_chars ceiling, got: ${errText(res).slice(0, 200)}`);
     });
 
     it('depth=0 is allowed (meaningful: limit to this symbol only)', async () => {
@@ -629,9 +683,11 @@ describe('fix #250: MCP find parity + compact + fn notes', () => {
     });
 
     it('compact=true changes about output shape', async () => {
-        const full = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne' });
-        const compact = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne', compact: true });
+        const full = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne', compact: false });
+        const compact = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne' });
         assert.ok(compact.text.length < full.text.length, `compact is smaller (${compact.text.length} vs ${full.text.length})`);
+        assert.ok(compact.text.includes('SOURCE: omitted in compact mode'), compact.text);
+        assert.ok(!compact.text.includes('─── CODE ───'), compact.text);
     });
 
     it('fn multi-definition notes use param syntax, not --flags', async () => {

@@ -1847,6 +1847,86 @@ describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
         } finally { rm(dir); }
     });
 
+    it('associated default() inside a macro token tree remains a path call', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                '#[derive(Default)]',
+                'pub struct ContextMode;',
+                'pub fn caller() {',
+                '    assert_eq!(ContextMode::default(), ContextMode);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = require('../core/callers').getCachedCalls(index,
+                path.join(dir, 'src/lib.rs')) || [];
+            const call = calls.find(c => c.name === 'default' && c.line === 4);
+            assert.ok(call, `default() is extracted from macro AST tokens: ${JSON.stringify(calls)}`);
+            assert.strictEqual(call.receiver, 'ContextMode');
+            assert.strictEqual(call.isPathCall, true);
+            assert.strictEqual(call.inMacro, true);
+        } finally { rm(dir); }
+    });
+
+    it('turbofish methods inside macro token trees remain call sites', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Matches;',
+                'impl Matches { pub fn get_many<T>(&self, _id: &str) -> Option<T> { None } }',
+                'pub fn check(m: Matches) {',
+                '    assert_eq!(m.get_many::<String>("x"), None);',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'src/lib.rs');
+            const calls = require('../core/callers').getCachedCalls(index, file) || [];
+            const call = calls.find(c => c.name === 'get_many' && c.line === 4);
+            assert.ok(call, `turbofish method is extracted: ${JSON.stringify(calls)}`);
+            assert.strictEqual(call.receiver, 'm');
+            assert.strictEqual(call.inMacro, true);
+            const usages = index._getCachedUsages(file, 'get_many') || [];
+            assert.ok(usages.some(u => u.line === 4 && u.usageType === 'call'),
+                `usage scan agrees it is a call: ${JSON.stringify(usages)}`);
+        } finally { rm(dir); }
+    });
+
+    it('proc-macro attribute references stay visible as unverified tests', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Arg;',
+                'impl Arg { pub fn value_delimiter(self, _c: char) -> Self { self } }',
+            ].join('\n'),
+            'tests/derive.rs': [
+                'use t::Arg;',
+                '#[test]',
+                'fn generated_builder_use() {',
+                '  struct Opt {',
+                '    #[arg(value_delimiter = \',\')]',
+                '    values: Vec<String>,',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'tests', {
+                name: 'value_delimiter', file: 'src/lib.rs', className: 'Arg',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const match = result.result.flatMap(r => r.matches.map(m => ({ file: r.file, ...m })))
+                .find(m => m.file === 'tests/derive.rs' && m.line === 5);
+            assert.strictEqual(match?.matchType, 'unverified-reference',
+                `generated reference stays visible and honest: ${JSON.stringify(result.result)}`);
+            assert.strictEqual(match?.reason, 'macro-generated-reference');
+        } finally { rm(dir); }
+    });
+
     it('macro_rules! transcriber calls are extracted; matcher patterns are not', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
@@ -2450,7 +2530,7 @@ impl Pal {
 `,
     };
 
-    it('chained-receiver call demotes to visible; self call stays confirmed', () => {
+    it('typed chained receiver excludes the wrong owner; self call stays confirmed', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
@@ -2463,9 +2543,10 @@ impl Pal {
                 `self.map(...) stays confirmed: ${confirmed}`);
             assert.ok(!confirmed.includes('src/color.rs:15'),
                 `parse_hex(v).map(...) is Option::map, not Rgb::map: ${confirmed}`);
-            const entry = (json.data.unverifiedCallers || [])
-                .find(u => u.line === 15);
-            assert.ok(entry, `chained call routes VISIBLE, not dropped: ${JSON.stringify(json.data.unverifiedCallers)}`);
+            assert.ok(!(json.data.unverifiedCallers || []).some(u => u.line === 15),
+                'Option::map is statically unrelated to Rgb::map');
+            assert.strictEqual(json.meta.account.excluded.byReason['receiver-type-mismatch']?.count, 1,
+                'the compiler-visible Option return type excludes the Rgb owner');
             assert.strictEqual(json.meta.account.conserved, true);
         } finally { rm(dir); }
     });
@@ -4089,6 +4170,239 @@ describe('fix #270 (Rust): trait impls on the struct never shield inherent metho
             assert.ok(dead.some(d => d.name === 'orphan_method'),
                 `inherent method stays claimable despite the Display impl: ${dead.map(d => d.name)}`);
             assert.strictEqual(dead.excludedExternalContract, 0);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #273 (Rust): chained associated-function receiver identity', () => {
+    it('keeps same-line macro and method calls in their own callable namespaces', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'macro_rules! arg { () => { 1 }; }',
+                'pub struct Command;',
+                'impl Command { pub fn arg(self, value: u8) -> Self { self } }',
+                'pub struct Group;',
+                'impl Group { pub fn arg(self, value: u8) -> Self { self } }',
+                'pub fn build(cmd: Command) { cmd.arg(arg!()); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const build = index.symbols.get('build')[0];
+            const callees = index.findCallees(build, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'arg' && c.type === 'macro'),
+                `arg! resolves only to the macro: ${JSON.stringify(callees)}`);
+            assert.ok(callees.some(c => c.name === 'arg' && c.className === 'Command'),
+                `cmd.arg resolves to Command.arg: ${JSON.stringify(callees)}`);
+            assert.ok(!callees.some(c => c.name === 'arg' && c.className === 'Group'),
+                'the same-named sibling method never steals either call');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('does not count line or block comments as call arguments', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub fn target(a: u8, b: u8) {}',
+                'pub fn go() {',
+                '  target(',
+                '    1,',
+                '    2, // explanation',
+                '  );',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(require('path').join(dir, 'src/lib.rs'));
+            const call = calls.find(c => c.name === 'target' && c.line === 3);
+            assert.strictEqual(call?.argCount, 2,
+                `comments are trivia, never arguments: ${JSON.stringify(calls)}`);
+            const r = execute(index, 'context', { name: 'src/lib.rs:1:target' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.callers || []).some(c => c.line === 3));
+        } finally { rm(dir); }
+    });
+
+    it('records Self struct expressions as constructors of the enclosing impl type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Rgb { r: u8, g: u8, b: u8 }',
+                'impl Rgb {',
+                '  pub fn make(r: u8, g: u8, b: u8) -> Self {',
+                '    Self { r, g, b }',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(require('path').join(dir, 'src/lib.rs'));
+            assert.ok(calls.some(c => c.line === 4 && c.name === 'Rgb' && c.isConstructor),
+                `Self expression keeps concrete constructor identity: ${JSON.stringify(calls)}`);
+            const r = execute(index, 'context', { name: 'src/lib.rs:1:Rgb' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.callers || []).some(c => c.line === 4) ||
+                (json.data.unverifiedCallers || []).some(c => c.line === 4),
+                `Rgb constructor edge is visible to agents: ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('Type::new().method() resolves through the constructed type, not a local same-name method', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Usage;',
+                'impl Usage {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn required(&self) -> bool { true }',
+                '}',
+                'pub struct Validator;',
+                'impl Validator {',
+                '  pub fn required(&self) -> bool { false }',
+                '  pub fn validate(&self) -> bool { Usage::new().required() }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const validate = index.symbols.get('validate')[0];
+            const callees = index.findCallees(validate, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'required' && c.className === 'Usage'),
+                `the folded chain owns Usage.required: ${JSON.stringify(callees)}`);
+            assert.ok(!callees.some(c => c.name === 'required' && c.className === 'Validator'),
+                'the enclosing same-name method never steals a receiver-qualified call');
+        } finally { rm(dir); }
+    });
+
+    it('receiver types are not smeared across a shadowing if-let binding', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct View;',
+                'impl View { pub fn downcast_mut<T>(&mut self) -> Option<T> { None } }',
+                'pub struct NamedView;',
+                'impl NamedView { pub fn with_view_mut(&mut self) {} }',
+                'pub struct BoxedView;',
+                'impl BoxedView { pub fn with_view_mut(&mut self) {} }',
+                'pub fn visit(v: &mut View) {',
+                '  if let Some(mut v) = v.downcast_mut::<NamedView>() {',
+                '    v.with_view_mut();',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'context', { name: 'src/lib.rs:4:with_view_mut' });
+            const json = JSON.parse(require('../core/output').formatContextJson(r.result));
+            assert.ok((json.data.callers || []).some(c => c.line === 9) ||
+                (json.data.unverifiedCallers || []).some(c => c.line === 9),
+            `shadowed receiver stays visible: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch'],
+                `outer View type must not type inner v: ${JSON.stringify(json.meta.account)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #274 (Rust): unresolved rebinding invalidates stale return flow', () => {
+    it('invalidates flow after a non-call match rebinding', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Wanted;',
+                'impl Wanted { pub fn run(&self) {} }',
+                'pub fn make() -> Result<Wanted, ()> { Ok(Wanted) }',
+                'pub fn use_it() {',
+                '  let value = make();',
+                '  let value = match value { Ok(value) => value, Err(_) => return };',
+                '  value.run();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const call = index.getCachedCalls(path.join(dir, 'src/lib.rs'))
+                .find(c => c.name === 'run' && c.line === 7);
+            assert.strictEqual(call?.receiverFlowInvalidated, true,
+                `non-call rebinding is persisted: ${JSON.stringify(call)}`);
+            const result = execute(index, 'context', { name: 'src/lib.rs:2:run' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            const visible = [...(json.data.callers || []), ...(json.data.unverifiedCallers || [])];
+            assert.ok(visible.some(c => c.file === 'src/lib.rs' && c.line === 7),
+                `true call stays visible: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch']);
+        } finally { rm(dir); }
+    });
+
+    it('keeps a method call visible after a Result-like value is shadowed by unwrap', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Wanted;',
+                'impl Wanted {',
+                '  pub fn run(&self) {}',
+                '}',
+                'pub fn make() -> Result<Wanted, ()> { Ok(Wanted) }',
+                'pub fn use_it() {',
+                '  let value = make();',
+                '  let value = value.unwrap();',
+                '  value.run();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'src/lib.rs:3:run' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            const visible = [...(json.data.callers || []), ...(json.data.unverifiedCallers || [])];
+            assert.ok(visible.some(c => c.file === 'src/lib.rs' && c.line === 9),
+                `the post-unwrap call must remain visible: ${JSON.stringify(json.data)}`);
+            const mismatches = json.meta.account?.excluded?.byReason?.['receiver-type-mismatch'];
+            assert.ok(!mismatches || !mismatches.sample?.some(s => s.file === 'src/lib.rs' && s.line === 9),
+                `the pre-shadow Result type must not leak: ${JSON.stringify(json.meta.account)}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('does not smear an outer receiver type through a nested tuple pattern binding', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Command;',
+                'impl Command {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn split(self) -> Option<(&\'static str, Wanted)> { None }',
+                '}',
+                'pub struct Wanted;',
+                'impl Wanted { pub fn run(&self) {} }',
+                'pub fn use_it() {',
+                '  let value = Command::new();',
+                '  let pair = value.split();',
+                '  if let Some(("wanted", value)) = pair {',
+                '    value.run();',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'src/lib.rs'));
+            const call = calls.find(c => c.name === 'run' && c.line === 12);
+            assert.strictEqual(call?.receiverPatternShadow, true,
+                `tuple pattern ownership is persisted: ${JSON.stringify(call)}`);
+            const result = execute(index, 'context', { name: 'src/lib.rs:7:run' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            const visible = [...(json.data.callers || []), ...(json.data.unverifiedCallers || [])];
+            assert.ok(visible.some(c => c.file === 'src/lib.rs' && c.line === 12),
+                `inner Wanted.run must remain visible: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account?.conserved, true);
         } finally { rm(dir); }
     });
 });

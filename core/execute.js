@@ -241,7 +241,6 @@ function checkFilePatternMatch(index, filePattern) {
         if (fileEntry.relativePath.includes(filePattern)) return null;
     }
     // Suggest similar directories/files to help user refine
-    const patternLower = filePattern.toLowerCase();
     const basename = filePattern.split('/').pop().toLowerCase();
     const suggestions = new Set();
     for (const [, fileEntry] of index.files) {
@@ -493,6 +492,7 @@ const HANDLERS = {
     example: (index, p) => {
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
+        const targetWasHandle = looksLikeHandle(p.name);
         applyClassMethodSyntax(p);
         const fileErr = checkFilePatternMatch(index, p.file);
         if (fileErr) return { ok: false, error: fileErr };
@@ -501,6 +501,12 @@ const HANDLERS = {
         const result = index.example(p.name, {
             file: p.file,
             className: p.className,
+            line: p.line,
+            // Preserve legacy plain-name `--file` as a call-site scope while
+            // letting a stable handle use its file component purely as exact
+            // target identity. Without this distinction, handles could never
+            // find examples outside the definition file.
+            callSiteFile: !targetWasHandle ? p.file : null,
             diverse: !!p.diverse,
             top: num(p.top, undefined),
             // MEDIUM-8: thread includeTests so test-file callers are included
@@ -583,7 +589,6 @@ const HANDLERS = {
             in: p.in,
             file: p.file,
             deep: !!p.deep,
-            sampleSize: num(p.limit, undefined),
         });
         return { ok: true, result };
     },
@@ -832,10 +837,21 @@ const HANDLERS = {
         // splitting would shear the filename at the dot into
         // className='helper', name='go' and silently return nothing
         // (fix #239, G3-go-measured). Mirror the engine's file-path test.
-        const testsTargetIsFile = typeof p.name === 'string' && (
+        const testsTargetIsHandle = looksLikeHandle(p.name);
+        const testsTargetIsFile = !testsTargetIsHandle && typeof p.name === 'string' && (
             p.name.includes('/') || p.name.includes('\\') ||
             /\.(js|ts|py|go|java|rs)$/.test(p.name));
         if (!testsTargetIsFile) applyClassMethodSyntax(p);
+        if (testsTargetIsHandle && p.line) {
+            const line = Number(p.line);
+            const pinned = (index.symbols.get(p.name) || []).filter(d =>
+                d.startLine === line && (!p.file || d.relativePath?.includes(p.file)));
+            if (pinned.length === 1 && !p.className && pinned[0].className) {
+                p.className = pinned[0].className;
+            }
+            const pinErr = checkDefinitionPin(index, p);
+            if (pinErr) return { ok: false, error: pinErr };
+        }
         if (p.file) {
             const fileErr = checkFilePatternMatch(index, p.file);
             if (fileErr) return { ok: false, error: fileErr };

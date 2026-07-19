@@ -322,8 +322,8 @@ function extractDecorators(node) {
  * `X: TypeAlias = ...` assignments become 'type' symbols with aliasOf.
  */
 function _processTypeAlias(node, classes, processedRanges, lines) {
-    let name = null;
-    let valueText = null;
+    let name;
+    let valueText;
     if (node.type === 'type_alias_statement') {
         // grammar shape: type <left> = <right>
         const left = node.namedChild(0);
@@ -543,6 +543,7 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
+        ...(tree.rootNode.hasError && { parseRecovery: true }),
         ...(moduleAssigned.size > 0 && { moduleAssignedNames: [...moduleAssigned].sort() }),
         imports: [],
         exports: []
@@ -654,17 +655,24 @@ function assignmentTargetOf(callNode) {
 }
 
 /**
- * Type name from a constructor-call callee: ClassName(...) or pkg.ClassName(...).
- * Uppercase-first heuristic (Python class naming convention).
+ * Type identity hint from a constructor-call callee: ClassName(...) or
+ * pkg.ClassName(...).  Preserve the qualifier: dropping `threading` from
+ * `threading.Thread()` turns an external class into an unqualified project
+ * type name and can falsely confirm `thread.join()` against Project.join.
+ * Uppercase-first remains a Python class-naming heuristic, so callers use the
+ * qualifier as routing/provenance evidence rather than a hidden hard claim.
  */
-function constructorTypeName(funcNode) {
+function constructorTypeInfo(funcNode) {
     if (!funcNode) return undefined;
     if (funcNode.type === 'identifier') {
-        return /^[A-Z]/.test(funcNode.text) ? funcNode.text : undefined;
+        return /^[A-Z]/.test(funcNode.text) ? { type: funcNode.text } : undefined;
     }
     if (funcNode.type === 'attribute') {
         const attr = funcNode.childForFieldName('attribute');
-        return attr && /^[A-Z]/.test(attr.text) ? attr.text : undefined;
+        const object = funcNode.childForFieldName('object');
+        return attr && /^[A-Z]/.test(attr.text)
+            ? { type: attr.text, qualifier: object?.type === 'identifier' ? object.text : undefined }
+            : undefined;
     }
     return undefined;
 }
@@ -676,6 +684,7 @@ function findCallsInCode(code, parser) {
     const aliases = new Map();  // Track local aliases: aliasName -> originalName
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
+    const localVarTypeQualifiers = new Map(); // varName -> imported module alias that owns the inferred type
     // Member-access aliases (fix #218): `append = output.append` makes a later
     // bare `append(part)` a METHOD call on `output` — it must carry the
     // receiver's evidence, never bind by bare name to a same-file def
@@ -687,6 +696,7 @@ function findCallsInCode(code, parser) {
     const memberAliasesStack = [];  // function-scoped save/restore, like localVarTypes
     const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
+    const localVarTypeQualifiersStack = [];
 
     // Helper: extract first string-arg literal from a call node.
     // Used by route extraction to capture path arg of requests.get('/users'), httpx.get('/users') etc.
@@ -697,7 +707,7 @@ function findCallsInCode(code, parser) {
         if (!argsNode) return null;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             // Handle f-string explicitly
             if (arg.type === 'string') {
                 // f-string detection: tree-sitter-python wraps interpolations as 'interpolation' children.
@@ -877,6 +887,7 @@ function findCallsInCode(code, parser) {
             });
             // Save localVarTypes so inner declarations don't leak to sibling functions
             localVarTypesStack.push(new Map(localVarTypes));
+            localVarTypeQualifiersStack.push(new Map(localVarTypeQualifiers));
             memberAliasesStack.push(new Map(memberAliases));
         }
 
@@ -902,8 +913,15 @@ function findCallsInCode(code, parser) {
                 const target = value.namedChildCount > 1 ? value.namedChild(value.namedChildCount - 1) : null;
                 const targetId = target?.type === 'as_pattern_target' ? target.namedChild(0) : null;
                 if (ctx?.type === 'call' && targetId?.type === 'identifier') {
-                    const ctorName = constructorTypeName(ctx.childForFieldName('function'));
-                    if (ctorName) localVarTypes.set(targetId.text, ctorName);
+                    const ctor = constructorTypeInfo(ctx.childForFieldName('function'));
+                    if (ctor) {
+                        localVarTypes.set(targetId.text, ctor.type);
+                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier)) {
+                            localVarTypeQualifiers.set(targetId.text, ctor.qualifier);
+                        } else {
+                            localVarTypeQualifiers.delete(targetId.text);
+                        }
+                    }
                 }
             }
         }
@@ -926,7 +944,14 @@ function findCallsInCode(code, parser) {
                 // type stale — nearest-preceding-assignment semantics (#199's
                 // documented rule). Without this, `x = ""; x = render(); x.m()`
                 // would carry str and falsely exclude project methods.
-                if (!typeNode) localVarTypes.delete(left.text);
+                if (!typeNode) {
+                    localVarTypes.delete(left.text);
+                    localVarTypeQualifiers.delete(left.text);
+                } else {
+                    // An annotation is the authoritative type source; a
+                    // previous constructor qualifier must not survive it.
+                    localVarTypeQualifiers.delete(left.text);
+                }
                 // Literal assignment types the variable (fix #218):
                 // ansi_bytes = b"…" → bytes; out = [] → list. Compiler-true,
                 // same trust grade as literal receivers ({}.get() → dict).
@@ -989,9 +1014,14 @@ function findCallsInCode(code, parser) {
                     nonCallableNames.add(left.text);
                     // Infer type from constructor call: x = ClassName(...) or
                     // x = pkg.ClassName(...). Python convention: classes start uppercase
-                    const ctorName = constructorTypeName(right.childForFieldName('function'));
-                    if (ctorName) {
-                        localVarTypes.set(left.text, ctorName);
+                    const ctor = constructorTypeInfo(right.childForFieldName('function'));
+                    if (ctor) {
+                        localVarTypes.set(left.text, ctor.type);
+                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier)) {
+                            localVarTypeQualifiers.set(left.text, ctor.qualifier);
+                        } else {
+                            localVarTypeQualifiers.delete(left.text);
+                        }
                     }
                 }
                 // Third: subscript/attribute access results are non-callable data
@@ -1023,7 +1053,7 @@ function findCallsInCode(code, parser) {
             if (callArgsNode) {
                 for (let i = 0; i < callArgsNode.namedChildCount; i++) {
                     const arg = callArgsNode.namedChild(i);
-                    if (arg.type === 'comment') continue;
+                    if (arg.type.endsWith('comment')) continue;
                     if (arg.type === 'list_splat' || arg.type === 'dictionary_splat') argSpread = true;
                     argCount++;
                 }
@@ -1142,6 +1172,9 @@ function findCallsInCode(code, parser) {
                     const receiverType = receiver
                         ? localVarTypes.get(receiver)
                         : (objNode ? PY_LITERAL_RECEIVER_TYPES[objNode.type] : undefined);
+                    const receiverTypeQualifier = receiver
+                        ? localVarTypeQualifiers.get(receiver)
+                        : undefined;
                     // Module receiver (httpx.get()) — unless locally shadowed
                     // by a typed instance binding
                     const receiverIsModule = !!receiver && moduleAliases.has(receiver) &&
@@ -1156,6 +1189,7 @@ function findCallsInCode(code, parser) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverIsModule && { receiverIsModule: true }),
                         ...(selfAttribute && { selfAttribute }),
                         ...(receiverCall && { receiverCall }),
@@ -1233,6 +1267,11 @@ function findCallsInCode(code, parser) {
                 if (saved) {
                     localVarTypes.clear();
                     for (const [k, v] of saved) localVarTypes.set(k, v);
+                }
+                const savedQualifiers = localVarTypeQualifiersStack.pop();
+                if (savedQualifiers) {
+                    localVarTypeQualifiers.clear();
+                    for (const [k, v] of savedQualifiers) localVarTypeQualifiers.set(k, v);
                 }
                 const savedAliases = memberAliasesStack.pop();
                 if (savedAliases) {

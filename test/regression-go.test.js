@@ -4557,6 +4557,84 @@ func getThing() interface{} { return nil }
             assert.strictEqual(res.conserved, true);
         } finally { rm(dir); }
     });
+
+    it('external interface params stay visible for implicit implementors in both directions', () => {
+        const dir = tmp({
+            'go.mod': 'module test\n\ngo 1.21\n',
+            'main.go': `package main
+
+type LocalError struct{}
+func (LocalError) Error() string { return "local" }
+
+func report(err error) string { return err.Error() }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const callers = callersOf(index, 'main.go:4:Error');
+            const caller = callers.unverified.find(u => u.key === 'main.go:6');
+            assert.ok(caller, `error.Error may dispatch to LocalError.Error: ${JSON.stringify(callers)}`);
+            assert.strictEqual(caller.reason, 'possible-dispatch');
+            assert.strictEqual(caller.dispatchVia, 'error');
+
+            const report = (index.symbols.get('report') || [])[0];
+            const callees = index.findCallees(report, { includeMethods: true, collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'Error'), 'external-interface call is never exact');
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'Error' && c.reason === 'possible-dispatch'),
+            'callee answer keeps the implicit implementation edge visible');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('preserves package-qualified receiver identity instead of conflating a bare type name', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'mux.go': `package m
+
+type Mux struct{}
+func (*Mux) ServeHTTP(a, b any) {}
+`,
+            'examples/custom.go': `package examples
+
+type Handler struct{}
+func (Handler) ServeHTTP(a, b any) {}
+`,
+            'middleware/use.go': `package middleware
+
+import "net/http"
+
+func use(next http.Handler, w http.ResponseWriter, r *http.Request) {
+	next.ServeHTTP(w, r)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const useFile = path.join(dir, 'middleware/use.go');
+            const call = index.getCachedCalls(useFile, index.files.get(useFile))
+                .find(c => c.name === 'ServeHTTP');
+            assert.strictEqual(call?.receiverType, 'Handler');
+            assert.strictEqual(call?.receiverTypeQualifier, 'http');
+
+            const callers = callersOf(index, 'mux.go:4:ServeHTTP');
+            assert.ok(!callers.confirmed.includes('middleware/use.go:6'),
+                'http.Handler never collapses to a same-named project Handler');
+            const caller = callers.unverified.find(u => u.key === 'middleware/use.go:6');
+            assert.ok(caller, `external interface dispatch stays visible: ${JSON.stringify(callers)}`);
+            assert.strictEqual(caller.reason, 'possible-dispatch');
+            assert.strictEqual(caller.dispatchVia, 'http.Handler');
+
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'ServeHTTP'),
+                'callee direction does not invent one concrete implementation');
+            const unverified = (callees.unverifiedCallees || []).find(c => c.name === 'ServeHTTP');
+            assert.strictEqual(unverified?.reason, 'possible-dispatch');
+            assert.strictEqual(unverified?.dispatchVia, 'http.Handler');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
 });
 
 // ============================================================================
@@ -5741,6 +5819,76 @@ func use(w *Widget) error {
                 'Widget.handle must stay a confirmed callee — Other.handle field is not evidence');
         } finally { rm(dir); }
     });
+
+    it('flows an assigned root type into an interface field hop', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'main.go': `package m
+
+type Runner interface { Run() }
+type RealRunner struct{}
+func (RealRunner) Run() {}
+type Context struct { Runner Runner }
+func makeContext() *Context { return nil }
+func use() {
+	ctx := makeContext()
+	ctx.Runner.Run()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'Run'), 'interface field has no exact runtime callee');
+            const entry = (callees.unverifiedCallees || []).find(c => c.name === 'Run');
+            assert.ok(entry, `flow-typed ctx.Runner.Run stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Runner');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('flows a module-root factory result into an interface field hop from a subpackage', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21\n',
+            'context.go': `package m
+
+type Runner interface { Run() }
+type Context struct { Runner Runner }
+func MakeContext() *Context { return nil }
+`,
+            'real/real.go': `package real
+
+type Runner struct{}
+func (Runner) Run() {}
+`,
+            'middleware/use.go': `package middleware
+
+import root "example.com/m"
+
+func use() {
+	ctx := root.MakeContext()
+	ctx.Runner.Run()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            assert.ok(callees.some(c => c.name === 'MakeContext'),
+                'the root-package producer resolves exactly');
+            assert.ok(!callees.some(c => c.name === 'Run'),
+                'an interface field still has no exact runtime callee');
+            const entry = (callees.unverifiedCallees || []).find(c => c.name === 'Run');
+            assert.ok(entry,
+                `root flow keeps interface dispatch visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(entry.reason, 'possible-dispatch');
+            assert.strictEqual(entry.dispatchVia, 'Runner');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
 });
 
 describe('fix #238 (Go): zero-param functions record empty params, not the unknown sentinel', () => {
@@ -6297,6 +6445,169 @@ describe('fix #268: callee-side external identity (Go)', () => {
             const edge = res.find(e => e.name === 'Run' && e.startLine === 3);
             assert.ok(edge && (edge.sites || []).includes(7),
                 `project return type resolves the chained callee: ${JSON.stringify(res.map(e => ({ n: e.name, l: e.startLine })))}`);
+        } finally { rm(dir); }
+    });
+
+    it('carries package function-variable and higher-order return signatures into dispatch', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': `package main
+
+import "net/http"
+
+type Local struct{}
+func (Local) ServeHTTP(http.ResponseWriter, *http.Request) {}
+
+var Default func(http.Handler) http.Handler
+func Chain() func(http.Handler) http.Handler { return Default }
+
+func use(next http.Handler, w http.ResponseWriter, r *http.Request) {
+	a := Default(next)
+	a.ServeHTTP(w, r)
+	mw := Chain()
+	b := mw(next)
+	b.ServeHTTP(w, r)
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const defaultDef = (index.symbols.get('Default') || [])[0];
+            const chainDef = (index.symbols.get('Chain') || [])[0];
+            assert.strictEqual(defaultDef?.isFunctionVariable, true);
+            assert.strictEqual(defaultDef?.returnType, 'http.Handler');
+            assert.strictEqual(chainDef?.returnedFunctionResult, 'http.Handler');
+
+            const target = (index.symbols.get('ServeHTTP') || [])
+                .find(d => d.className === 'Local');
+            const callers = index.findCallers('ServeHTTP', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'main.go'),
+                'external Handler results never invent Local.ServeHTTP callers');
+            const sites = (callers.unverifiedEntries || [])
+                .filter(c => c.relativePath === 'main.go' && c.reason === 'possible-dispatch')
+                .map(c => c.line);
+            assert.deepStrictEqual(sites, [13, 16]);
+
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'ServeHTTP'));
+            assert.deepStrictEqual(
+                (callees.unverifiedCallees || []).filter(c => c.name === 'ServeHTTP')[0]?.sites,
+                [13, 16]);
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps package-owned value receivers visible instead of binding global method names', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': `package main
+import "io"
+type Own struct{}
+func (Own) Write([]byte) (int, error) { return 0, nil }
+func use(buf []byte) { _, _ = io.Discard.Write(buf) }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'Write'),
+                'io.Discard.Write never resolves to Own.Write');
+            const entry = (callees.unverifiedCallees || []).find(c => c.name === 'Write');
+            assert.strictEqual(entry?.reason, 'possible-dispatch');
+            assert.strictEqual(entry?.dispatchVia, 'io.Discard');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('resolves aliased packages exactly and keeps constructor/type namespaces separate', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'deep/testutils/listener.go': 'package testutils\nfunc NewRestartableListener() {}\n',
+            'other/testutils/listener.go': 'package testutils\nfunc NewRestartableListener() {}\n',
+            'clients/types.go': `package clients
+type Node struct { Locality Locality }
+type Locality struct{}
+`,
+            'use/use.go': `package use
+import (
+	x "example.com/m/deep/testutils"
+	clients "example.com/m/clients"
+)
+func run() {
+	x.NewRestartableListener()
+	_ = clients.Locality{}
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const run = (index.symbols.get('run') || [])[0];
+            const callees = index.findCallees(run, { includeMethods: true, collectAccount: true });
+            const listener = callees.find(c => c.name === 'NewRestartableListener');
+            assert.strictEqual(listener?.relativePath, 'deep/testutils/listener.go');
+            const locality = callees.find(c => c.name === 'Locality');
+            assert.strictEqual(locality?.relativePath, 'clients/types.go');
+            assert.strictEqual(locality?.type, 'struct');
+            assert.strictEqual(locality?.startLine, 3,
+                'constructor resolves to the type, never Node.Locality field');
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('receiver return flow outranks a same-named package wrapper in callee resolution', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': `package main
+type Viper struct{}
+func New() *Viper { return nil }
+func ReadConfig() {}
+func (*Viper) ReadConfig() {}
+func use() {
+	v := New()
+	v.ReadConfig()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            const hits = callees.filter(c => c.name === 'ReadConfig');
+            assert.strictEqual(hits.length, 1);
+            assert.strictEqual(hits[0].className, 'Viper');
+            assert.strictEqual(hits[0].startLine, 5);
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('builtin-interface return flow blocks single-owner method confirmation', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': `package main
+type Directive int
+func (Directive) Error() string { return "directive" }
+func fail() error { return nil }
+func use() string {
+	err := fail()
+	return err.Error()
+}
+`,
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'main.go:3:Error' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.ok(!(json.data.callers || []).some(c => c.line === 7),
+                `error-interface dispatch must not confirm Directive.Error: ${JSON.stringify(json.data)}`);
+            const visible = (json.data.unverifiedCallers || []).find(c => c.line === 7);
+            assert.strictEqual(visible?.reason, 'possible-dispatch');
+            assert.strictEqual(visible?.dispatchVia, 'error — builtin contract');
+            assert.strictEqual(json.meta.account?.conserved, true);
         } finally { rm(dir); }
     });
 });

@@ -99,6 +99,109 @@ function getAssignmentName(leftNode) {
     return null;
 }
 
+/** True when a declaration is outside every function/class body. */
+function isModuleScope(node) {
+    let current = node && node.parent;
+    while (current) {
+        if (current.type === 'function_declaration' || current.type === 'arrow_function' ||
+            current.type === 'function_expression' || current.type === 'method_definition' ||
+            current.type === 'generator_function_declaration' || current.type === 'generator_function' ||
+            current.type === 'class_body') {
+            return false;
+        }
+        if (current.type === 'program' || current.type === 'module') return true;
+        current = current.parent;
+    }
+    return false;
+}
+
+/** Unwrap common type/runtime wrappers around an object-literal registry. */
+function unwrapObjectRegistry(node) {
+    let current = node;
+    while (current && (current.type === 'parenthesized_expression' ||
+        current.type === 'as_expression' || current.type === 'satisfies_expression' ||
+        current.type === 'type_assertion')) {
+        current = current.namedChild(0);
+    }
+    if (current && current.type === 'object') return current;
+    if (current && current.type === 'call_expression') {
+        const callee = current.childForFieldName('function');
+        if (callee && (callee.text === 'Object.freeze' || callee.text === 'Object.seal')) {
+            const args = current.childForFieldName('arguments');
+            const first = args && args.namedChild(0);
+            return unwrapObjectRegistry(first);
+        }
+    }
+    return null;
+}
+
+function objectPropertyName(nameNode) {
+    if (!nameNode) return null;
+    if (nameNode.type === 'identifier' || nameNode.type === 'property_identifier') return nameNode.text;
+    if (nameNode.type === 'string') {
+        const raw = nameNode.text;
+        if (raw.length >= 2 && raw[0] === raw[raw.length - 1]) return raw.slice(1, -1);
+    }
+    return null;
+}
+
+/**
+ * Index function-valued object properties. Module-scope objects are dynamic
+ * dispatch surfaces (`HANDLERS[command](...)`); without symbols for their
+ * members, calls inside them are orphaned and reachability/deadcode lie.
+ */
+function appendObjectFunctionMembers(objectNode, functions, lines, extraFields = {}) {
+    if (!objectNode) return 0;
+    let added = 0;
+    for (let i = 0; i < objectNode.namedChildCount; i++) {
+        const prop = objectNode.namedChild(i);
+        let nameNode = null;
+        let fnNode = null;
+        if (prop.type === 'method_definition') {
+            nameNode = prop.childForFieldName('name');
+            fnNode = prop;
+        } else if (prop.type === 'pair') {
+            const value = prop.childForFieldName('value');
+            if (value && (value.type === 'function_expression' || value.type === 'arrow_function' ||
+                value.type === 'generator_function')) {
+                nameNode = prop.childForFieldName('key');
+                fnNode = value;
+            }
+        }
+        const name = objectPropertyName(nameNode);
+        if (!name || !fnNode) continue;
+
+        const paramsNode = fnNode.childForFieldName('parameters');
+        const { startLine, endLine, indent } = nodeToLocation(prop, lines);
+        const returnType = extractReturnType(fnNode);
+        const generics = extractGenerics(fnNode);
+        const docstring = extractJSDocstring(lines, startLine);
+        const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
+        const typeAnno = buildTypeAnnotations(paramsStructured, returnType, lines, startLine, true);
+        const modifiers = extractModifiers(fnNode);
+        functions.push({
+            name,
+            params: extractParams(paramsNode),
+            paramsStructured,
+            startLine,
+            endLine,
+            indent,
+            isArrow: fnNode.type === 'arrow_function',
+            isGenerator: isGenerator(fnNode),
+            isAsync: modifiers.includes('async'),
+            modifiers,
+            memberAssigned: true,
+            registryMember: true,
+            ...extraFields,
+            ...typeAnno,
+            ...(generics && { generics }),
+            ...(docstring && { docstring }),
+        });
+        added++;
+    }
+    return added;
+}
+
 /**
  * Extract modifiers from a declaration NODE — AST tokens, never text
  * (fix #249: the first-line regex fabricated export/async/default from
@@ -215,7 +318,7 @@ function extractDecoratorsWithArgs(node) {
         let inner = null;
         for (let i = 0; i < n.namedChildCount; i++) {
             const c = n.namedChild(i);
-            if (c.type !== 'comment') { inner = c; break; }
+            if (!c.type.endsWith('comment')) { inner = c; break; }
         }
         if (!inner) return;
 
@@ -230,7 +333,7 @@ function extractDecoratorsWithArgs(node) {
             let firstStringArg = null;
             for (let j = 0; j < argsNode.namedChildCount; j++) {
                 const arg = argsNode.namedChild(j);
-                if (arg.type === 'comment') continue;
+                if (arg.type.endsWith('comment')) continue;
                 const s = extractStringArg(arg);
                 if (s && !s.interp) { firstStringArg = s.value; break; }
                 if (s) { firstStringArg = s.value; break; }
@@ -463,6 +566,21 @@ function _processFunction(node, functions, processedRanges, lines) {
                             }
                         }
                     }
+
+                    // Module-scope dispatch tables (including Object.freeze /
+                    // Object.seal wrappers). These handlers are invoked through
+                    // computed property access, so a plain name-based call graph
+                    // cannot discover their incoming edge. Index them explicitly
+                    // and let reachability treat them as conservative roots.
+                    if (!isArrow && !isFnExpr && isModuleScope(node)) {
+                        const registryObject = unwrapObjectRegistry(valueNode);
+                        if (registryObject) {
+                            const added = appendObjectFunctionMembers(registryObject, functions, lines, {
+                                registryContainer: nameNode.text,
+                            });
+                            if (added > 0) processedRanges.add(rangeKey);
+                        }
+                    }
                 }
             }
         }
@@ -555,37 +673,9 @@ function _processFunction(node, functions, processedRanges, lines) {
                 if (lhsText === 'module.exports' || lhsText === 'exports' ||
                     lhsText.startsWith('module.exports.') || lhsText.startsWith('exports.')) {
                     processedRanges.add(rangeKey);
-                    for (let pi = 0; pi < rightNode.namedChildCount; pi++) {
-                        const prop = rightNode.namedChild(pi);
-                        let nameNode = null;
-                        let fnNode = null;
-                        if (prop.type === 'method_definition') {
-                            nameNode = prop.childForFieldName('name');
-                            fnNode = prop;
-                        } else if (prop.type === 'pair') {
-                            const v = prop.childForFieldName('value');
-                            if (v && (v.type === 'function_expression' ||
-                                v.type === 'arrow_function' || v.type === 'generator_function')) {
-                                nameNode = prop.childForFieldName('key');
-                                fnNode = v;
-                            }
-                        }
-                        if (!nameNode || !fnNode) continue;
-                        const paramsNode = fnNode.childForFieldName('parameters');
-                        const { startLine, endLine, indent } = nodeToLocation(prop, lines);
-                        const paramsStructured = parseStructuredParams(paramsNode, 'javascript');
-                        functions.push({
-                            name: nameNode.text,
-                            params: extractParams(paramsNode),
-                            paramsStructured,
-                            startLine,
-                            endLine,
-                            indent,
-                            isArrow: fnNode.type === 'arrow_function',
-                            isGenerator: isGenerator(fnNode),
-                            modifiers: [],
-                        });
-                    }
+                    appendObjectFunctionMembers(rightNode, functions, lines, {
+                        registryContainer: lhsText,
+                    });
                 }
             }
         }
@@ -1071,6 +1161,40 @@ function extractClassMembers(classNode, codeOrLines) {
                     ...(decorators.length > 0 && { decorators }),
                     ...(decoratorsWithArgs.length > 0 && { decoratorsWithArgs })
                 });
+
+                // TypeScript constructor parameter-properties are declared
+                // fields, not ordinary parameters. Index them from the AST so
+                // `constructor(private repo: Repository)` gives
+                // `this.repo.save()` compiler-visible receiver evidence.
+                // Accessibility and `readonly` are syntax tokens on the
+                // parameter node; no text-pattern fallback is needed.
+                if (name === 'constructor' && paramsNode) {
+                    for (let pi = 0; pi < paramsNode.namedChildCount; pi++) {
+                        const param = paramsNode.namedChild(pi);
+                        if (!['required_parameter', 'optional_parameter'].includes(param.type)) continue;
+                        const access = Array.from({ length: param.namedChildCount }, (_, ci) => param.namedChild(ci))
+                            .find(n => n.type === 'accessibility_modifier');
+                        const readonly = Array.from({ length: param.childCount }, (_, ci) => param.child(ci))
+                            .some(n => n.type === 'readonly');
+                        if (!access && !readonly) continue;
+                        const pattern = param.childForFieldName('pattern');
+                        if (!pattern || pattern.type !== 'identifier') continue;
+                        const typeNode = param.childForFieldName('type');
+                        const fieldType = typeNode
+                            ? typeNode.text.replace(/^:\s*/, '').trim() : undefined;
+                        const loc = nodeToLocation(param, code);
+                        members.push({
+                            name: pattern.text,
+                            startLine: loc.startLine,
+                            endLine: loc.endLine,
+                            memberType: 'field',
+                            ...(fieldType && { fieldType }),
+                            ...(access && ['private', 'protected'].includes(access.text) && {
+                                modifiers: [access.text],
+                            }),
+                        });
+                    }
+                }
             }
         }
 
@@ -1274,6 +1398,7 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
+        ...(tree.rootNode.hasError && { parseRecovery: true }),
         imports: [],  // Handled by core/imports.js
         exports: []   // Handled by core/imports.js
     };
@@ -1398,7 +1523,11 @@ function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
     const functionStack = [];  // Stack of { name, startLine, endLine }
-    const aliases = new Map();  // Track local aliases: aliasName -> originalName (string or string[])
+    // Local aliases with lexical ownership. A flat aliasName→target map leaks
+    // block locals into the rest of a module (`let effect = batchedEffect`
+    // inside a loop rewrote a later module-level `effect()` call), producing
+    // false external edges and caller/callee disagreement.
+    const aliases = new Map();  // aliasName -> [{ target, declarationIndex, scopeStart, scopeEnd }]
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
     // Names whose type came from a DECLARED annotation (TS `x: Foo` / typed
@@ -1418,7 +1547,7 @@ function findCallsInCode(code, parser) {
         if (!argsNode) return null;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             return _extractStringArg(arg);
         }
         return null;
@@ -1434,7 +1563,7 @@ function findCallsInCode(code, parser) {
         let count = 0;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             count++;
         }
         return count;
@@ -1452,7 +1581,7 @@ function findCallsInCode(code, parser) {
         let target = null;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             if (idx === argIdx) { target = arg; break; }
             idx++;
         }
@@ -1589,6 +1718,38 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    const aliasScope = (declarator) => {
+        const declaration = declarator.parent;
+        const lexical = declaration?.type === 'lexical_declaration';
+        for (let p = declaration?.parent; p; p = p.parent) {
+            if (lexical && (p.type === 'statement_block' || p.type === 'switch_body' ||
+                p.type === 'for_statement' || p.type === 'for_in_statement')) return p;
+            if (isFunctionNode(p) || p.type === 'program' || p.type === 'module') return p;
+        }
+        return tree.rootNode;
+    };
+    const recordAlias = (name, target, declarator) => {
+        const scope = aliasScope(declarator);
+        if (!aliases.has(name)) aliases.set(name, []);
+        aliases.get(name).push({
+            target,
+            declarationIndex: declarator.startIndex,
+            scopeStart: scope.startIndex,
+            scopeEnd: scope.endIndex,
+        });
+    };
+    const resolveAlias = (name, callNode) => {
+        const records = aliases.get(name);
+        if (!records) return undefined;
+        let best;
+        for (const record of records) {
+            if (record.declarationIndex > callNode.startIndex ||
+                callNode.startIndex < record.scopeStart || callNode.endIndex > record.scopeEnd) continue;
+            if (!best || record.declarationIndex > best.declarationIndex) best = record;
+        }
+        return best && best.target;
+    };
+
     // fix #203: does a declaration node declare `name` (incl. shallow destructuring)?
     const _declaresName = (declNode, name) => {
         for (let i = 0; i < declNode.namedChildCount; i++) {
@@ -1698,7 +1859,7 @@ function findCallsInCode(code, parser) {
             }
             if (nameNode?.type === 'identifier' && initNode?.type === 'identifier') {
                 // Simple alias: const p = parse
-                aliases.set(nameNode.text, initNode.text);
+                recordAlias(nameNode.text, initNode.text, node);
             }
             // Ternary alias: const fn = cond ? parseCSV : parseJSON → both targets
             if (nameNode?.type === 'identifier' && initNode?.type === 'ternary_expression') {
@@ -1707,7 +1868,7 @@ function findCallsInCode(code, parser) {
                 const targets = [];
                 if (consequence?.type === 'identifier') targets.push(consequence.text);
                 if (alternative?.type === 'identifier') targets.push(alternative.text);
-                if (targets.length > 0) aliases.set(nameNode.text, targets);
+                if (targets.length > 0) recordAlias(nameNode.text, targets, node);
             }
             // Destructured rename: const { parse: csvParse } = require(...)
             if (nameNode?.type === 'object_pattern') {
@@ -1718,7 +1879,7 @@ function findCallsInCode(code, parser) {
                         const value = prop.childForFieldName('value');
                         if ((key?.type === 'identifier' || key?.type === 'property_identifier') &&
                             value?.type === 'identifier') {
-                            aliases.set(value.text, key.text);
+                            recordAlias(value.text, key.text, node);
                         }
                     }
                 }
@@ -1819,6 +1980,36 @@ function findCallsInCode(code, parser) {
             }
         }
 
+        // Tree-sitter recovery can flatten a valid constructor into an ERROR
+        // node when an earlier unsupported TypeScript construct destabilizes
+        // the surrounding declaration. Keep this AST-first: inspect recovery
+        // tokens/named children only—never source regex. Example (Hono's
+        // overload-heavy factory file): ERROR children `app`, `=`, `new`,
+        // `Hono` for `const app = new Hono<E>(...)`. Without this, the class
+        // had a false zero-caller answer even though the identifier and `new`
+        // token survived in the syntax tree.
+        if (node.type === 'ERROR') {
+            for (let i = 0; i < node.childCount - 1; i++) {
+                const token = node.child(i);
+                if (token.type !== 'new' || token.isNamed) continue;
+                let ctorNode = null;
+                for (let j = i + 1; j < node.childCount; j++) {
+                    const candidate = node.child(j);
+                    if (candidate.isNamed) { ctorNode = candidate; break; }
+                }
+                const ctorName = jsConstructorTypeName(ctorNode);
+                if (!ctorName) continue;
+                calls.push({
+                    name: ctorName,
+                    line: ctorNode.startPosition.row + 1,
+                    isMethod: ctorNode.type === 'member_expression',
+                    isConstructor: true,
+                    parseRecovery: true,
+                    enclosingFunction: getCurrentEnclosingFunction(),
+                });
+            }
+        }
+
         // Handle regular function calls: foo(), obj.foo(), foo.call()
         if (node.type === 'call_expression') {
             const funcNode = node.childForFieldName('function');
@@ -1833,7 +2024,7 @@ function findCallsInCode(code, parser) {
 
             if (funcNode.type === 'identifier') {
                 // Direct call: foo()
-                const alias = aliases.get(funcNode.text);
+                const alias = resolveAlias(funcNode.text, node);
                 const resolvedName = typeof alias === 'string' ? alias : undefined;
                 const resolvedNames = Array.isArray(alias) ? alias : undefined;
                 const firstArg = getFirstStringArg(node);
@@ -2031,7 +2222,7 @@ function findCallsInCode(code, parser) {
                     for (let i = 0; i < argsNode.namedChildCount; i++) {
                         const arg = argsNode.namedChild(i);
                         // Skip non-argument nodes (e.g. commas)
-                        if (arg.type === 'comment') continue;
+                        if (arg.type.endsWith('comment')) continue;
                         // Only check args at callback positions (null = all positions)
                         const isCallbackPos = callbackIndices === null || callbackIndices === undefined || callbackIndices.has(argIdx);
                         if (isCallbackPos) {

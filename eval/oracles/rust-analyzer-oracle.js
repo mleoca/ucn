@@ -59,7 +59,14 @@ const rustAnalyzerOracle = {
                 if (method === 'experimental/serverStatus' && params?.quiescent) quiesced(params);
             },
         });
-        await lsp.initialize(workspaceRoot, { checkOnSave: false });
+        // Evaluate the all-source contract, not only Cargo's default feature
+        // projection. Otherwise valid calls under `#[cfg(feature = ...)]`
+        // are mislabeled as UCN false positives merely because rust-analyzer
+        // marked that source inactive in this one configuration.
+        await lsp.initialize(workspaceRoot, {
+            checkOnSave: false,
+            cargo: { features: 'all', allTargets: true },
+        });
         process.stdout.write('  waiting for rust-analyzer to load the workspace (cargo metadata + build scripts)...\n');
         const status = await quiescent;
         if (status.health && status.health !== 'ok') {
@@ -111,6 +118,46 @@ const rustAnalyzerOracle = {
         return refs;
     },
 
+    /** Resolve the compiler-selected declaration(s) for a source-line name.
+     *  Reference search can omit inactive/re-exported workspace edges; this
+     *  independent definition check prevents those gaps from becoming fake
+     *  UCN precision failures. */
+    async resolveDefinition(handle, { name, file, line }) {
+        const absFile = path.join(handle.root, file);
+        if (!handle.opened.has(absFile)) {
+            handle.lsp.didOpen(absFile, 'rust', fs.readFileSync(absFile, 'utf-8'));
+            handle.opened.add(absFile);
+        }
+        const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
+        const columns = nameColumns(sourceLine, name);
+        const defs = new Map();
+        for (const character of columns) {
+            const locations = await handle.lsp.request('textDocument/definition', {
+                textDocument: { uri: pathToUri(absFile) },
+                position: { line: line - 1, character },
+            }) || [];
+            for (const loc of Array.isArray(locations) ? locations : [locations]) {
+                const uri = loc.targetUri || loc.uri;
+                const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+                if (!uri || !range) continue;
+                const defAbs = uriToPath(uri);
+                if (!defAbs.startsWith(handle.workspaceRoot + path.sep)) continue;
+                const entry = { file: path.relative(handle.root, defAbs), line: range.start.line + 1 };
+                defs.set(`${entry.file}:${entry.line}`, entry);
+            }
+        }
+        return [...defs.values()];
+    },
+
+    /** Whether this source line belongs to an explicitly cfg-gated AST owner.
+     *  rust-analyzer evaluates one target/feature/platform projection at a
+     *  time; unresolved calls in another valid projection are coverage gaps,
+     *  not evidence that UCN invented an edge. */
+    async isConfigurationGated(handle, { file, line }) {
+        const status = await handle.helper.request({ op: 'source_status', file, line });
+        return !!status.configurationGated;
+    },
+
     /** Graceful teardown — without LSP shutdown r-a prints a panic backtrace on exit. */
     async dispose(handle) {
         try { handle.helper.child.stdin.write(JSON.stringify({ op: 'shutdown' }) + '\n'); } catch (e) { /* gone */ }
@@ -120,6 +167,19 @@ const rustAnalyzerOracle = {
         } catch (e) { /* gone */ }
     },
 };
+
+function nameColumns(line, name) {
+    const cols = [];
+    for (let from = 0; from <= line.length - name.length;) {
+        const at = line.indexOf(name, from);
+        if (at < 0) break;
+        const before = at === 0 ? '' : line[at - 1];
+        const after = line[at + name.length] || '';
+        if (!/[\w$]/.test(before) && !/[\w$]/.test(after)) cols.push(at);
+        from = at + name.length;
+    }
+    return cols;
+}
 
 function resolveRustAnalyzer() {
     const explicit = process.env.UCN_EVAL_RUST_ANALYZER;

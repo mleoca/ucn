@@ -2870,6 +2870,10 @@ describe('CLI ↔ MCP parity: all commands produce non-error output', function()
         await assertParity('about', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
     });
 
+    it('brief: CLI ↔ MCP', async () => {
+        await assertParity('brief', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
+    });
+
     it('context: CLI ↔ MCP', async () => {
         await assertParity('context', ['helper'], [], { name: 'helper' }, ['helper']);
     });
@@ -2952,6 +2956,10 @@ describe('CLI ↔ MCP parity: all commands produce non-error output', function()
         await assertParity('entrypoints', [], [], {}, []);
     });
 
+    it('endpoints: CLI ↔ MCP', async () => {
+        await assertParity('endpoints', [], [], {}, []);
+    });
+
     // ── Extracting Code ──
 
     it('fn: CLI ↔ MCP', async () => {
@@ -3022,6 +3030,10 @@ describe('CLI ↔ MCP parity: all commands produce non-error output', function()
         await assertParity('diff-impact', [], [], { command: 'diff_impact' }, []);
     });
 
+    it('check: CLI ↔ MCP', async () => {
+        await assertParity('check', [], [], {}, ['Pre-commit Check']);
+    });
+
     // ── Other ──
 
     it('typedef: CLI ↔ MCP', async () => {
@@ -3042,6 +3054,23 @@ describe('CLI ↔ MCP parity: all commands produce non-error output', function()
 
     it('stats with --file: CLI ↔ MCP', async () => {
         await assertParity('stats', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['STATISTICS']);
+    });
+
+    it('doctor: CLI ↔ MCP', async () => {
+        await assertParity('doctor', [], [], {}, ['Command proofs: 39/39 classified']);
+    });
+
+    it('orient: CLI ↔ MCP', async () => {
+        await assertParity('orient', [], [], {}, ['PROJECT ORIENTATION']);
+    });
+
+    it('audit-async: CLI ↔ MCP', async () => {
+        await assertParity('audit-async', [], [], { command: 'audit_async' }, ['Async audit']);
+    });
+
+    it('stacktrace: CLI ↔ MCP', async () => {
+        const stack = 'at helper (utils.js:10:1)';
+        await assertParity('stacktrace', [stack], [], { stack }, ['helper', 'utils.js']);
     });
 });
 
@@ -3807,6 +3836,30 @@ describe('CLI file-mode scoping', () => {
 });
 
 describe('tests --file scoping', () => {
+    it('tests accepts a stable handle as a symbol target, not as a file path', () => {
+        const dir = tmp({
+            'lib.js': [
+                'class Service {',
+                '  save() { return 1; }',
+                '}',
+                'module.exports = { Service };',
+            ].join('\n'),
+            'test/lib.test.js': [
+                'const { Service } = require("../lib");',
+                'it("saves", () => { new Service().save(); });',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'lib.js:2:save' });
+            assert.ok(r.ok);
+            assert.strictEqual(r.result.length, 1);
+            assert.ok(r.result[0].matches.some(m => m.line === 2 && m.matchType === 'call'));
+            assert.ok(r.result.every(file => file.matches.every(m => !m.content.includes('class Service'))),
+                'handle must not degrade into a basename search for lib.js');
+        } finally { rm(dir); }
+    });
+
     it('tests --file scopes to test files that import from the target source', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
@@ -4228,6 +4281,32 @@ describe('flag validation parity across surfaces', () => {
 });
 
 describe('tests --file: no basename collision across directories', () => {
+    it('Go: package importers reach declarations in every file of the imported package', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/tool\ngo 1.21',
+            'anchor.go': 'package tool\n\nfunc Anchor() {}',
+            'command.go': 'package tool\n\ntype Command struct{}\nfunc (c *Command) CommandPath() string { return "x" }',
+            'doc/man_docs_test.go': [
+                'package doc',
+                'import (',
+                '  "testing"',
+                '  tool "example.com/tool"',
+                ')',
+                'func TestPath(t *testing.T) {',
+                '  var c *tool.Command',
+                '  _ = c.CommandPath()',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'CommandPath', file: 'command.go' });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('doc/man_docs_test.go')),
+                'package import must cover declarations outside the resolver anchor file');
+        } finally { rm(dir); }
+    });
+
     it('Go: same-basename files in different packages are separated', () => {
         const dir = tmp({
             'go.mod': 'module example.com/test\ngo 1.21',
@@ -4262,6 +4341,57 @@ describe('tests --file: no basename collision across directories', () => {
                 'Should include com/a/UtilTest');
             assert.ok(!r.result.some(t => t.file.includes('com/b/UtilTest')),
                 'Should NOT include com/b/UtilTest');
+        } finally { rm(dir); }
+    });
+
+    it('Java: a differently named test class in the mirrored package can exercise the target', () => {
+        const dir = tmp({
+            'src/main/java/com/acme/TypeSpec.java': [
+                'package com.acme;',
+                'public class TypeSpec {',
+                '  public static class Builder { public Builder addStaticBlock() { return this; } }',
+                '}',
+            ].join('\n'),
+            'src/test/java/com/acme/JavaFileTest.java': [
+                'package com.acme;',
+                'public class JavaFileTest {',
+                '  public void testBlock(TypeSpec.Builder b) { b.addStaticBlock(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', {
+                name: 'addStaticBlock',
+                file: 'src/main/java/com/acme/TypeSpec.java',
+                className: 'Builder',
+            });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('JavaFileTest.java')),
+                'same-package mirror must not depend on TargetNameTest naming');
+        } finally { rm(dir); }
+    });
+
+    it('Rust: nested Cargo integration-test modules remain in the source-file scope', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "tool"\nversion = "0.1.0"',
+            'src/lib.rs': 'pub struct Arg;\nimpl Arg { pub fn to_long(&self) -> i32 { 1 } }',
+            'tests/testsuite/parsed.rs': [
+                'use tool::Arg;',
+                '#[test]',
+                'fn parses() { let a = Arg; assert_eq!(a.to_long(), 1); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', {
+                name: 'to_long',
+                file: 'src/lib.rs',
+                className: 'Arg',
+            });
+            assert.ok(r.ok);
+            assert.ok(r.result.some(t => t.file.includes('tests/testsuite/parsed.rs')),
+                'nested integration test must be reachable from the crate source');
         } finally { rm(dir); }
     });
 });

@@ -128,7 +128,43 @@ const UCN_VERSION = require('../package.json').version;
 // grammar's extends_interfaces child carries no `extends` field, so the
 // field lookup silently returned nothing) — cached interface symbols lack
 // the supertypes the deadcode heritage walk reads.
-const CACHE_FORMAT_VERSION = 48;
+// v49: JS/TS module-scope object-literal dispatch members carry
+// registryMember/registryContainer so reachability does not classify live
+// HANDLERS[command](...) implementations as dead code.
+// v50: persist the same registry fields from parallel workers; v49 worker-built
+// caches silently dropped them and therefore cannot be trusted.
+// v51: JS/TS call aliases are lexical/position-aware; old calls caches can
+// contain resolvedName values leaked from an unrelated block or later line.
+// v55: Rust `Self { ... }` struct expressions persist the concrete enclosing
+// impl type as their constructor-call name.
+// v56: Java call records preserve typed identifiers/static-factory argument
+// kinds and capitalized static-field receiver roots for overload/dispatch
+// identity.
+// v57: Java capitalized type receivers are no longer also persisted as
+// implicit-this fields.
+// v58: Java enhanced-for variables persist their declared receiver type.
+// v59: Java class-literal argument kinds and capitalized static-field
+// receivers are persisted for inherited overload/field ownership.
+// v60: argument/comment scans ignore every tree-sitter comment node kind
+// (line_comment, block_comment, documentation_comment), not only `comment`.
+// v61: file entries persist tree-sitter parse-recovery state so doctor never
+// reports a recovered/possibly-partial file as a clean parse.
+// v62: Go call records preserve receiverTypeQualifier,
+// receiverRootTypeQualifier, and package-owned value receiver shape; symbols
+// preserve function-valued variables and returned-function result signatures.
+// These fields feed package identity and higher-order return flow.
+// v63: Python constructor-derived receiver types preserve the imported module
+// qualifier (`threading.Thread()` -> receiverTypeQualifier:'threading').
+// This prevents external/unresolved type owners from entering the confirmed
+// project-method tier through a bare class-name collision.
+// v64: Rust calls whose receiver is rebound by an enclosing if-let/while-let
+// pattern preserve receiverPatternShadow. Query-time return flow must not
+// smear an outer binding's type onto that inner pattern binding.
+// v65: Rust turbofish calls inside macro token trees are persisted as calls
+// (`m.get_many::<T>()`); v64 caches misclassified them as references.
+// v66: Rust call records preserve receiverFlowInvalidated after a non-call
+// lexical rebinding, preventing stale return types from excluding true calls.
+const CACHE_FORMAT_VERSION = 66;
 
 /**
  * Save index to cache file
@@ -444,7 +480,7 @@ function loadCache(index, cachePath) {
         // Prepare lazy calls cache loading — load manifest but defer shard parsing.
         // Shards are loaded on first getCachedCalls access via ensureCallsCacheLoaded().
         if (index.callsCache.size === 0) {
-            _prepareCallsCache(index);
+            _prepareCallsCache(index, cacheFile);
         }
 
         // Build directory→files index from loaded data
@@ -584,9 +620,16 @@ function isCacheStale(index) {
  * Actual shards are loaded on first ensureCallsCacheLoaded() call.
  * @param {object} index - ProjectIndex instance
  */
-function _prepareCallsCache(index) {
+function _prepareCallsCache(index, cacheFile) {
     if (index._callsCacheLoaded) return;
-    const cacheDir = path.join(index.root, '.ucn-cache');
+    // Shards live beside the selected index.json. A custom cachePath must be
+    // a complete portable cache, not an index file that silently looks for
+    // call shards under <project>/.ucn-cache. The latter caused cache-loaded
+    // semantic queries to reparse source (or consume unrelated stale shards).
+    const cacheDir = cacheFile
+        ? path.dirname(cacheFile)
+        : path.join(index.root, '.ucn-cache');
+    index._callsCacheDir = cacheDir;
     const manifestFile = path.join(cacheDir, 'calls', 'manifest.json');
     if (fs.existsSync(manifestFile)) {
         try {
@@ -631,7 +674,7 @@ function loadCallsCache(index) {
 
     // Legacy format: single calls-cache.json
     const callsCacheFile = index._callsCacheLegacyFile ||
-        path.join(index.root, '.ucn-cache', 'calls-cache.json');
+        path.join(index._callsCacheDir || path.join(index.root, '.ucn-cache'), 'calls-cache.json');
     if (!fs.existsSync(callsCacheFile)) return index.callsCache.size > 0;
 
     try {
@@ -669,7 +712,9 @@ function ensureCallsCacheLoaded(index) {
  * @param {string} hash - Shard hash from manifest
  */
 function _loadCallsShard(index, hash) {
-    const shardFile = path.join(index.root, '.ucn-cache', 'calls', `${hash}.json`);
+    const shardFile = path.join(
+        index._callsCacheDir || path.join(index.root, '.ucn-cache'),
+        'calls', `${hash}.json`);
     try {
         const data = JSON.parse(fs.readFileSync(shardFile, 'utf-8'));
         if (!Array.isArray(data)) return;

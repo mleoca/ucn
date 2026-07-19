@@ -125,10 +125,19 @@ const tsMorphOracle = {
                 const rel = path.relative(handle.root, refSf.getFilePath());
                 if (rel.startsWith('..')) continue;
                 const node = ref.getNode();
+                const kind = classifyReference(node, SyntaxKind, ref.isDefinition());
+                // TypeScript findReferences deliberately groups related
+                // structural methods. That is useful for rename, but not an
+                // exact runtime-call oracle: RegExpRouter.add() appeared as a
+                // reference to sibling SmartRouter.add(). For method call
+                // edges, retain exact-owner calls plus calls resolved through
+                // an interface/base that the target may override; reject
+                // concrete sibling owners.
+                if (kind === 'call' && !methodCallMayReach(handle, decl, node, SyntaxKind)) continue;
                 refs.push({
                     file: rel,
                     line: node.getStartLineNumber(),
-                    kind: classifyReference(node, SyntaxKind, ref.isDefinition()),
+                    kind,
                 });
             }
         }
@@ -147,6 +156,62 @@ function findTsConfig(dir) {
         current = parent;
     }
     return null;
+}
+
+function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
+    if (targetDecl.getKind() !== SyntaxKind.MethodDeclaration) return true;
+    const targetOwner = targetDecl.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
+    if (!targetOwner) return true;
+
+    let call = null;
+    const parent = referenceNode.getParent();
+    if (parent?.getKind() === SyntaxKind.CallExpression && parent.getExpression() === referenceNode) {
+        call = parent;
+    } else if (parent?.getKind() === SyntaxKind.PropertyAccessExpression &&
+        parent.getNameNode() === referenceNode) {
+        const grand = parent.getParent();
+        if (grand?.getKind() === SyntaxKind.CallExpression && grand.getExpression() === parent) call = grand;
+    }
+    if (!call) return true;
+
+    let signatureDecl;
+    try {
+        signatureDecl = handle.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration();
+    } catch (e) {
+        return true; // oracle uncertainty must not become a false negative
+    }
+    if (!signatureDecl) return true;
+    const sigInterface = signatureDecl.getFirstAncestorByKind(SyntaxKind.InterfaceDeclaration);
+    if (sigInterface) return true; // a target implementation may receive interface dispatch
+    const sigOwner = signatureDecl.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
+    // A concrete call may resolve to a standalone function installed as a
+    // class field (`RegExpRouter.match = match`). TypeScript's rename-oriented
+    // findReferences still groups that call with sibling class declarations,
+    // but runtime dispatch cannot reach those declarations. A declaration we
+    // cannot classify stays conservative; an actual function declaration is
+    // definitive negative ownership evidence.
+    if (!sigOwner) {
+        return signatureDecl.getKind() !== SyntaxKind.FunctionDeclaration;
+    }
+    if (sameDeclarationOwner(targetOwner, sigOwner)) return true;
+
+    // A call resolved to a base declaration may execute the target override.
+    // A call resolved to a different concrete sibling cannot.
+    let base = targetOwner.getBaseClass();
+    const visited = new Set();
+    while (base) {
+        const key = `${base.getSourceFile().getFilePath()}:${base.getStart()}`;
+        if (visited.has(key)) break;
+        visited.add(key);
+        if (sameDeclarationOwner(base, sigOwner)) return true;
+        base = base.getBaseClass();
+    }
+    return false;
+}
+
+function sameDeclarationOwner(a, b) {
+    return a.getSourceFile().getFilePath() === b.getSourceFile().getFilePath() &&
+        a.getStart() === b.getStart();
 }
 
 /**

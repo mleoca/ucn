@@ -23,7 +23,7 @@ const path = require('path');
 const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
-const { detectLanguage, getLanguageModule } = require('../languages');
+const { getLanguageModule } = require('../languages');
 
 /**
  * Contract-mode caller expansion for the tree commands. Memoizes the full
@@ -1244,7 +1244,7 @@ function affectedTests(index, name, options = {}) {
             // functions (#[test] fns in Rust's #[cfg(test)] mods, Go Test*)
             // live in production-path FILES but are tests themselves — the
             // language's getEntryPointKind says so; they need no coverage.
-            for (const [fp, fe] of index.files) {
+            for (const [, fe] of index.files) {
                 if (isTestFile(fe.relativePath, fe.language)) continue;
                 const langModule = getLanguageModule(fe.language);
                 const kindOf = langModule?.getEntryPointKind;

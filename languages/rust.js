@@ -907,7 +907,11 @@ function parse(code, parser) {
     classes.sort((a, b) => a.startLine - b.startLine);
     stateObjects.sort((a, b) => a.startLine - b.startLine);
 
-    return { language: 'rust', totalLines: lines.length, functions, classes, stateObjects, imports: [], exports: [] };
+    return {
+        language: 'rust', totalLines: lines.length, functions, classes, stateObjects,
+        ...(tree.rootNode.hasError && { parseRecovery: true }),
+        imports: [], exports: [],
+    };
 }
 
 /**
@@ -976,16 +980,48 @@ function _findRustChainRootType(callNode) {
  * Emitted calls mirror the regular handlers' field contract and carry
  * inMacro: true.
  */
-function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverType) {
+function _tokenTreeCallArgsAfter(children, nameIndex) {
+    let nextIndex = nameIndex + 1;
+    // Rust turbofish: method::<T>(...) / collect::<Vec<_>>(). Token trees
+    // expose the generic tokens as flat siblings between the name and the
+    // argument token_tree, so a direct-next check misclassified the method as
+    // a reference and omitted it from the call graph. Count angle tokens by
+    // text because nested generic closers may arrive as one `>>` token.
+    if (children[nextIndex]?.type === '::' && children[nextIndex + 1]?.type === '<') {
+        let depth = 0;
+        nextIndex++;
+        for (; nextIndex < children.length; nextIndex++) {
+            const text = children[nextIndex]?.text || '';
+            for (const ch of text) {
+                if (ch === '<') depth++;
+                else if (ch === '>') depth--;
+            }
+            if (depth === 0) {
+                nextIndex++;
+                break;
+            }
+        }
+    }
+    const args = children[nextIndex];
+    return args?.type === 'token_tree' && args.text.startsWith('(') ? args : null;
+}
+
+function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverType,
+    isPatternShadow, isFlowInvalidated) {
     const children = [];
     for (let i = 0; i < tree.childCount; i++) children.push(tree.child(i));
     for (let i = 0; i < children.length; i++) {
         const tok = children[i];
         if (tok.type === 'token_tree') {
-            extractCallsFromTokenTree(tok, enclosingFunction, calls, getReceiverType);
+            extractCallsFromTokenTree(tok, enclosingFunction, calls, getReceiverType,
+                isPatternShadow, isFlowInvalidated);
             continue;
         }
-        if (tok.type !== 'identifier') continue;
+        // `default` is tokenized as the Rust keyword even in the valid
+        // associated-call shape `Type::default()`. It is still an AST token,
+        // so admitting it here preserves the AST-first rule while recovering
+        // calls nested inside macro token trees (assert_eq!, matches!, ...).
+        if (tok.type !== 'identifier' && tok.type !== 'default') continue;
         const next = children[i + 1];
         const prev = children[i - 1];
         // $metavariable(...) — a macro fragment, not a named call
@@ -1003,7 +1039,8 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
             });
             continue;
         }
-        if (!next || next.type !== 'token_tree' || !next.text.startsWith('(')) continue;
+        const callArgs = _tokenTreeCallArgsAfter(children, i);
+        if (!callArgs) continue;
         if (prev && prev.type === '::') {
             // Path call: Type::func(...) / module::sub::func(...) — segments
             // can be identifiers, primitives (char::from), or path keywords
@@ -1056,13 +1093,17 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                     char_literal: 'char', boolean_literal: 'bool' })[recvTok.type]
                 : undefined;
             const receiverType = (receiver && receiver !== 'self' && getReceiverType)
-                ? getReceiverType(receiver) : litType;
+                ? getReceiverType(receiver, tok) : litType;
+            const receiverPatternShadow = !!(receiver && isPatternShadow?.(tok, receiver));
+            const receiverFlowInvalidated = !!(receiver && isFlowInvalidated?.(tok, receiver));
             calls.push({
                 name: tok.text,
                 line: tok.startPosition.row + 1,
                 isMethod: true,
                 receiver,
                 ...(receiverType && { receiverType }),
+                ...(receiverPatternShadow && { receiverPatternShadow: true }),
+                ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                 inMacro: true,
                 enclosingFunction
             });
@@ -1131,6 +1172,12 @@ function findCallsInCode(code, parser) {
     const functionStack = [];  // Stack of { name, startLine, endLine }
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
+    // Lexical rebindings that do not have a call producer (`let m = match m
+    // { ... }`) invalidate query-time return flow. Without a tombstone, the
+    // previous `m = make_result()` annotation survives and can positively
+    // exclude true calls on the rebound value. Events are range-aware so a
+    // nested-block shadow does not leak after the block.
+    const scopeFlowEvents = new Map();
 
     // Helper: extract first string-arg literal from a call_expression node.
     // Used by route extraction to capture path arg of client.get("/users") and
@@ -1141,7 +1188,7 @@ function findCallsInCode(code, parser) {
         if (!argsNode) return null;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             // format!() macro inside an arg: client.get(format!("/users/{}", id))
             if (arg.type === 'macro_invocation') {
                 const macroNode = arg.childForFieldName('macro');
@@ -1224,8 +1271,62 @@ function findCallsInCode(code, parser) {
             : null;
     };
 
+    const patternContainsName = (pattern, varName) => {
+        if (!pattern) return false;
+        const stack = [pattern];
+        while (stack.length > 0) {
+            const n = stack.pop();
+            if (n.type === 'identifier' && n.text === varName) return true;
+            for (let i = 0; i < n.namedChildCount; i++) stack.push(n.namedChild(i));
+        }
+        return false;
+    };
+
+    // Rust pattern bindings are block-scoped and may shadow a typed outer
+    // variable (`if let Some(v) = v.downcast_mut::<T>() { v.m() }`). The
+    // function-wide type map intentionally does not guess the pattern's type,
+    // but it must also never smear the OUTER type onto the inner binding.
+    const patternShadowsAt = (node, varName) => {
+        for (let a = node?.parent; a && !isFunctionNode(a); a = a.parent) {
+            if (a.type !== 'if_expression' && a.type !== 'while_expression') continue;
+            const cond = a.namedChildren.find(c => c.type === 'let_condition');
+            if (!cond) continue;
+            const body = a.namedChildren.find(c =>
+                c.type === 'block' && c.startIndex >= cond.endIndex);
+            if (!body || node.startIndex < body.startIndex || node.endIndex > body.endIndex) continue;
+            const pattern = cond.namedChild(0);
+            if (patternContainsName(pattern, varName)) return true;
+        }
+        return false;
+    };
+
+    const valueHasFlowProducer = (value) => {
+        let n = value;
+        while (n && ['try_expression', 'await_expression', 'parenthesized_expression'].includes(n.type)) {
+            n = n.namedChildCount === 1 ? n.namedChild(0) : null;
+        }
+        return n?.type === 'call_expression';
+    };
+
+    const flowInvalidatedAt = (node, varName) => {
+        const pos = node?.startIndex ?? -1;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const byName = scopeFlowEvents.get(functionStack[i].startLine);
+            const events = byName?.get(varName);
+            if (!events) continue;
+            let latest = null;
+            for (const event of events) {
+                if (event.at <= pos && pos <= event.until &&
+                    (!latest || event.at > latest.at)) latest = event;
+            }
+            if (latest) return latest.invalidated;
+        }
+        return false;
+    };
+
     // Look up variable type from scope chain
-    const getReceiverType = (varName) => {
+    const getReceiverType = (varName, atNode) => {
+        if (atNode && patternShadowsAt(atNode, varName)) return undefined;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return typeMap.get(varName);
@@ -1254,6 +1355,37 @@ function findCallsInCode(code, parser) {
             };
             functionStack.push(entry);
             scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
+            scopeFlowEvents.set(entry.startLine, new Map());
+        }
+
+        // Record binding state before visiting the initializer's children;
+        // `at=node.endIndex` means the new binding takes effect only after
+        // the RHS, matching Rust's shadowing semantics.
+        if (functionStack.length > 0 &&
+            (node.type === 'let_declaration' || node.type === 'assignment_expression')) {
+            const pattern = node.type === 'let_declaration'
+                ? node.childForFieldName('pattern') : node.childForFieldName('left');
+            const value = node.type === 'let_declaration'
+                ? node.childForFieldName('value') : node.childForFieldName('right');
+            if (pattern?.type === 'identifier' && value) {
+                const scopeKey = functionStack[functionStack.length - 1].startLine;
+                const byName = scopeFlowEvents.get(scopeKey);
+                if (byName) {
+                    if (!byName.has(pattern.text)) byName.set(pattern.text, []);
+                    let until = functionStack[functionStack.length - 1].endIndex ?? Infinity;
+                    if (node.type === 'let_declaration') {
+                        for (let p = node.parent; p; p = p.parent) {
+                            if (p.type === 'block') { until = p.endIndex; break; }
+                            if (isFunctionNode(p)) break;
+                        }
+                    }
+                    byName.get(pattern.text).push({
+                        at: node.endIndex,
+                        until,
+                        invalidated: !valueHasFlowProducer(value),
+                    });
+                }
+            }
         }
 
         // Handle function calls: foo(), obj.method(), Type::func(), foo::<T>()
@@ -1280,7 +1412,7 @@ function findCallsInCode(code, parser) {
             let argCount = 0;
             if (argsNode) {
                 for (let i = 0; i < argsNode.namedChildCount; i++) {
-                    if (argsNode.namedChild(i).type === 'comment') continue;
+                    if (argsNode.namedChild(i).type.endsWith('comment')) continue;
                     argCount++;
                 }
             }
@@ -1348,7 +1480,7 @@ function findCallsInCode(code, parser) {
                                 receiverField = fldNode.text;
                                 receiverRootType = rootNode.type === 'self'
                                     ? findEnclosingImplType(node)
-                                    : getReceiverType(rootNode.text);
+                                    : getReceiverType(rootNode.text, node);
                             }
                         } else if (obj && obj !== valueNode &&
                             (obj.type === 'identifier' || obj.type === 'self')) {
@@ -1407,8 +1539,10 @@ function findCallsInCode(code, parser) {
                             char_literal: 'char', boolean_literal: 'bool' })[valueNode.type]
                         : undefined;
                     const receiverType = (receiver && receiver !== 'self' && !receiverIsChainRoot)
-                        ? getReceiverType(receiver)
+                        ? getReceiverType(receiver, node)
                         : literalReceiverType;
+                    const receiverPatternShadow = !!(receiver && patternShadowsAt(node, receiver));
+                    const receiverFlowInvalidated = !!(receiver && flowInvalidatedAt(node, receiver));
                     const firstArg = getFirstStringArg(node);
                     // RUST-2: For chained calls like `a().b().parse::<T>().ok()`,
                     // each method should report the line where its OWN identifier
@@ -1421,6 +1555,8 @@ function findCallsInCode(code, parser) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverPatternShadow && { receiverPatternShadow: true }),
+                        ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                         ...(receiverIsChainRoot && { receiverIsChainRoot: true }),
                         ...(receiverField && { receiverRoot, receiverField }),
                         ...(receiverField && receiverRootType && { receiverRootType }),
@@ -1496,6 +1632,13 @@ function findCallsInCode(code, parser) {
                         if (parts.length > 1) pathQualifier = parts[parts.length - 2] || null;
                     }
                 }
+                // `Self { ... }` is a constructor for the enclosing impl
+                // target, not a project type literally named Self. Preserve
+                // the concrete identity in the call record so callers and
+                // callees can reconcile it with the struct symbol.
+                if (typeName === 'Self') {
+                    typeName = findEnclosingImplType(node) || typeName;
+                }
                 if (typeName) {
                     const enclosingFunction = getCurrentEnclosingFunction();
                     calls.push({
@@ -1535,7 +1678,9 @@ function findCallsInCode(code, parser) {
             for (let i = 0; i < node.childCount; i++) {
                 const child = node.child(i);
                 if (child.type === 'token_tree') {
-                    extractCallsFromTokenTree(child, enclosingFunction, calls, getReceiverType);
+                    extractCallsFromTokenTree(
+                        child, enclosingFunction, calls, getReceiverType,
+                        patternShadowsAt, flowInvalidatedAt);
                 }
             }
             return true;
@@ -1553,7 +1698,9 @@ function findCallsInCode(code, parser) {
                 for (let j = 0; j < rule.childCount; j++) {
                     const part = rule.child(j);
                     if (part.type === 'token_tree') {
-                        extractCallsFromTokenTree(part, enclosingFunction, calls, getReceiverType);
+                        extractCallsFromTokenTree(
+                            part, enclosingFunction, calls, getReceiverType,
+                            patternShadowsAt, flowInvalidatedAt);
                     }
                 }
             }
@@ -1569,7 +1716,9 @@ function findCallsInCode(code, parser) {
                 const valueNode = node.childForFieldName('value');
                 if (fieldNode) {
                     const receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
-                    const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver) : undefined;
+                    const receiverType = (receiver && receiver !== 'self') ? getReceiverType(receiver, node) : undefined;
+                    const receiverPatternShadow = !!(receiver && patternShadowsAt(node, receiver));
+                    const receiverFlowInvalidated = !!(receiver && flowInvalidatedAt(node, receiver));
                     const enclosingFunction = getCurrentEnclosingFunction();
                     // RUST-2: use the field identifier's line, not the wrapping field_expression's
                     calls.push({
@@ -1578,6 +1727,8 @@ function findCallsInCode(code, parser) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverPatternShadow && { receiverPatternShadow: true }),
+                        ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
                         isFunctionReference: true,
                         isPotentialCallback: true,
                         enclosingFunction
@@ -1655,6 +1806,7 @@ function findCallsInCode(code, parser) {
                 const leaving = functionStack.pop();
                 if (leaving) {
                     scopeTypes.delete(leaving.startLine);
+                    scopeFlowEvents.delete(leaving.startLine);
                 }
             }
         }
@@ -2136,15 +2288,15 @@ function findUsagesInCode(code, name, parser, tree) {
             // field_expression. Detect the `obj.name(` pattern via siblings.
             else if (parent.type === 'token_tree') {
                 const idx = _indexInParent(node, parent);
+                const siblings = Array.from({ length: parent.childCount }, (_, i) => parent.child(i));
+                const callArgs = _tokenTreeCallArgsAfter(siblings, idx);
                 // Method call pattern: [obj] [.] [name] [()] inside macro
                 if (idx >= 2) {
                     const dot = parent.child(idx - 1);
                     const obj = parent.child(idx - 2);
-                    const next = parent.child(idx + 1);
                     if (dot && dot.text === '.' && obj &&
                         (obj.type === 'identifier' || obj.type === 'self')) {
-                        if (next && next.type === 'token_tree' &&
-                            next.childCount > 0 && next.child(0).text === '(') {
+                        if (callArgs) {
                             usageType = 'call';
                         }
                         usages.push({ line, column, usageType, receiver: obj.text });
@@ -2153,12 +2305,9 @@ function findUsagesInCode(code, name, parser, tree) {
                 }
                 // Bare function call pattern: [name] [()] inside macro
                 if (idx >= 0) {
-                    const next = parent.child(idx + 1);
                     // Check no preceding dot (would be method call handled above)
                     const prev = idx > 0 ? parent.child(idx - 1) : null;
-                    if ((!prev || prev.text !== '.') &&
-                        next && next.type === 'token_tree' &&
-                        next.childCount > 0 && next.child(0).text === '(') {
+                    if ((!prev || prev.text !== '.') && callArgs) {
                         usageType = 'call';
                     }
                 }
@@ -2188,7 +2337,16 @@ function findUsagesInCode(code, name, parser, tree) {
             }
         }
 
-        usages.push({ line, column, usageType });
+        let inAttribute = false;
+        for (let a = parent; a; a = a.parent) {
+            if (a.type === 'attribute' || a.type === 'attribute_item') {
+                inAttribute = true;
+                break;
+            }
+            if (a.type === 'function_item' || a.type === 'impl_item' ||
+                a.type === 'struct_item') break;
+        }
+        usages.push({ line, column, usageType, ...(inAttribute && { inAttribute: true }) });
         return true;
     });
 

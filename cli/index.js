@@ -126,17 +126,12 @@ function validateNumericFlags(flags) {
  * and write the same plain message to stderr (for humans piping to a TTY).
  */
 function fail(msg) {
-    // Honor --json by writing a structured envelope to stdout for pipelines.
-    // We use try/catch around symbol lookups because `flags` may not be initialized
-    // yet when fail() is called from the early arg-parsing path (TDZ).
-    let wantsJson = false;
-    try { if (typeof flags !== 'undefined' && flags && flags.json) wantsJson = true; } catch (_) {}
-    if (!wantsJson) {
-        try { if (Array.isArray(process.argv) && process.argv.includes('--json')) wantsJson = true; } catch (_) {}
-    }
+    // This helper can run before parsed flags exist, so raw argv is the single
+    // reliable source for the output mode.
+    const wantsJson = process.argv.includes('--json');
     if (wantsJson) {
         const env = { meta: { ok: false }, error: typeof msg === 'string' ? msg : String(msg) };
-        try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) {}
+        try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) { /* stdout may be closed */ }
     }
     console.error(msg);
     throw new CommandError();
@@ -336,7 +331,7 @@ try {
     if (e instanceof FlagValidationError) {
         if (flags.json) {
             const env = { meta: { ok: false }, error: e.message };
-            try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) {}
+            try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) { /* stdout may be closed */ }
         }
         console.error(e.message);
         process.exit(1);
@@ -1575,7 +1570,7 @@ REFACTORING HELPERS
   verify <name>       Check all call sites match signature
   diff-impact         What changed in git diff and who calls it (--base, --staged)
   check               Pre-commit summary: diff-impact + verify + affected-tests in one shot
-  deadcode            Find unused functions/classes
+  deadcode            Unreferenced-symbol candidates (review before deletion)
   entrypoints         Detect framework entry points (routes, DI, tasks)
   endpoints           HTTP API: list server routes + client requests; --bridge to match
                         --bridge --server-only --client-only --unmatched
@@ -1587,8 +1582,8 @@ OTHER
   api                 Show exported/public symbols
   typedef <name>      Find type definitions
   stats               Project statistics (--functions for per-function line counts, --hot for top callers)
-  doctor              Project trust report (counts, blind spots, parse failures, verdict; --deep for resolution coverage)
-  orient              One-screen repo orientation: size, top dirs, hot functions, entry points, trust verdict (--top=N)
+  doctor              Parse health, blind spots, command proofs, and task readiness (--deep adds evidence profile)
+  orient              One-screen repo map: size, top dirs, hot functions, entry points, readiness (--top=N)
   stacktrace <text>   Parse stack trace, show code at each frame (alias: stack)
   audit-async         Find calls in async functions that are likely missing await (JS/TS/Python)
 
@@ -1605,19 +1600,20 @@ Common Flags:
   --max-files=N       Max files to index (large projects)
   --context=N         Lines of context around matches (search, usages)
   --json              Machine-readable output
+  --compact           Token-efficient about/context/impact output
   --code-only         Filter out comments/strings (search, usages)
   --with-types        Include type definitions (about, smart)
   --detailed          Show all symbols in toc (not just counts)
   --include-tests     Include test files in usage counts (about) and results (find, usages, deadcode)
-  --exclude-tests     Exclude test files (entrypoints — tests are included by default)
+  --exclude-tests     Exclude test files (entrypoints includes tests by default)
   --class-name=X      Scope to specific class (e.g., --class-name=Repository)
   --include-methods   Include method-call (obj.fn) callee expansion in trace/smart
-                        (no effect on caller-direction commands — about/context/impact/verify/
+                        (no effect on caller-direction commands: about/context/impact/verify/
                         blast/reverse-trace/affected-tests always tier method calls by evidence)
-  --include-uncertain No effect on tiered commands — unverified candidates are always
+  --include-uncertain No effect on tiered commands; unverified candidates are always
                         shown in their own section with reasons
   --expand-unverified Follow unverified caller edges in blast/reverse-trace trees
-                        (downstream nodes marked as unverified chains — possible, not confirmed, impact)
+                        (downstream nodes marked as possible, not confirmed, impact chains)
   --hide-confidence   Hide confidence scores (shown by default in about, context)
   --min-confidence=N  Filter low-confidence edges (about, context, blast, trace,
                         reverse-trace, smart, affected-tests)
@@ -1629,6 +1625,7 @@ Common Flags:
   --diverse           Cluster call sites by argument shape (example command, pair with --top=N)
   --git               Attach git enrichment (last modified, author, recent commits) to about/brief
   --include-decorated Include decorated/annotated symbols in deadcode
+  --deep              Add a stratified evidence profile to doctor (not measured accuracy)
   --framework=X       Filter entrypoints by framework (e.g., --framework=express,spring)
   --bridge            Match server routes to client requests (endpoints command).
                         Confidence tiers: EXACT, PARTIAL, UNCERTAIN
@@ -1649,6 +1646,7 @@ Common Flags:
   --base=<ref>        Git ref for diff-impact (default: HEAD)
   --staged            Analyze staged changes (diff-impact)
   --no-follow-symlinks  Don't follow symbolic links
+  --mcp               Start the MCP stdio server
   -i, --interactive   Keep index in memory for multiple queries
   -v, --version       Print the UCN version and exit
 
@@ -1674,7 +1672,7 @@ function runInteractive(rootDir) {
     // Same cache discipline as one-shot mode (fix #250: the REPL fully
     // re-parsed every session and never consumed cache-persisted state —
     // the divergence mechanism behind the relocation P1).
-    let iCacheFresh = false;
+    let iCacheFresh;
     if (flags.cache && !flags.clearCache) {
         const loaded = index.loadCache();
         iCacheFresh = loaded && !index.isCacheStale();
@@ -1720,6 +1718,7 @@ function runInteractive(rootDir) {
 Commands:
   toc                    Project overview (--detailed)
   find <name>            Find symbol (--exact, glob: "handle*")
+  brief <name>           Signature, docs, side effects, and complexity
   about <name>           Everything about a symbol
   usages <name>          All usages grouped by type
   context <name>         Callers + callees
@@ -1744,13 +1743,19 @@ Commands:
   search <term>          Text search (--context=N, --exclude=, --in=)
                          Structural: --type= --param= --returns= --decorator= --exported --unused
   typedef <name>         Find type definitions
-  deadcode               Find unused functions/classes
+  deadcode               Unreferenced-symbol candidates (review before deletion)
+  entrypoints            Detect runtime, framework, task, and test entry points
+  endpoints              List server/client HTTP endpoints (--bridge to match)
   verify <name>          Check call sites match signature
   plan <name>            Preview refactoring (--add-param=, --remove-param=, --rename-to=, --default-value=)
+  check                  Pre-commit diff, signature, and affected-test checks
   stacktrace <text>      Parse a stack trace
   api                    Show public symbols
   diff-impact            What changed and who's affected
   stats                  Index statistics
+  doctor                 Parse health, blind spots, command proofs, and task readiness
+  orient                 Repository map and readiness summary
+  audit-async            Find likely missing-await calls (JS/TS/Python)
   rebuild                Rebuild index
   quit                   Exit
 

@@ -31,6 +31,14 @@ function extractReturnType(node) {
     return null;
 }
 
+/** Compiler-declared result of a returned function type, if any. */
+function extractReturnedFunctionResult(node) {
+    const resultNode = node.childForFieldName('result');
+    if (resultNode?.type !== 'function_type') return null;
+    const innerResult = resultNode.childForFieldName('result');
+    return innerResult?.text.trim() || null;
+}
+
 /**
  * Extract Go parameters
  */
@@ -70,6 +78,46 @@ function extractReceiver(receiverNode) {
  * Returns true if node was matched, false otherwise
  */
 function _processFunction(node, functions, processedRanges, lines) {
+    // Package-level function-valued variables are callable symbols with a
+    // compiler-declared signature (`var DefaultLogger func(next
+    // http.Handler) http.Handler`). Indexing them as functions lets return
+    // flow type the result and prevents downstream interface calls from
+    // falling into global same-name guesses. Local function variables remain
+    // lexical values and are handled by call-site shadowing instead.
+    if (node.type === 'var_spec') {
+        const container = node.parent?.type === 'var_spec_list' ? node.parent?.parent : node.parent;
+        const isPackageLevel = container?.type === 'var_declaration' &&
+            container.parent?.type === 'source_file';
+        const typeNode = node.childForFieldName('type');
+        if (!isPackageLevel || typeNode?.type !== 'function_type') return false;
+        const rangeKey = `${node.startIndex}-${node.endIndex}`;
+        if (processedRanges.has(rangeKey)) return false;
+        processedRanges.add(rangeKey);
+        const paramsNode = typeNode.childForFieldName('parameters');
+        const resultNode = typeNode.childForFieldName('result');
+        const names = [];
+        for (let i = 0; i < node.namedChildCount; i++) {
+            const child = node.namedChild(i);
+            if (child.type === 'identifier') names.push(child);
+        }
+        const { startLine, endLine, indent } = nodeToLocation(node, lines);
+        for (const nameNode of names) {
+            const isExported = /^[A-Z]/.test(nameNode.text);
+            functions.push({
+                name: nameNode.text,
+                params: extractGoParams(paramsNode),
+                paramsStructured: parseStructuredParams(paramsNode, 'go'),
+                startLine,
+                endLine,
+                indent,
+                modifiers: isExported ? ['export'] : [],
+                isFunctionVariable: true,
+                ...(resultNode?.text.trim() && { returnType: resultNode.text.trim() }),
+            });
+        }
+        return true;
+    }
+
     if (node.type === 'function_declaration') {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
         if (processedRanges.has(rangeKey)) return false;
@@ -81,6 +129,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         if (nameNode) {
             const { startLine, endLine, indent } = nodeToLocation(node, lines);
             const returnType = extractReturnType(node);
+            const returnedFunctionResult = extractReturnedFunctionResult(node);
             const docstring = extractGoDocstring(lines, startLine);
             const typeParams = extractTypeParams(node);
             const isExported = /^[A-Z]/.test(nameNode.text);
@@ -94,6 +143,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 indent,
                 modifiers: isExported ? ['export'] : [],
                 ...(returnType && { returnType }),
+                ...(returnedFunctionResult && { returnedFunctionResult }),
                 ...(docstring && { docstring }),
                 ...(typeParams && { generics: typeParams })
             });
@@ -114,6 +164,7 @@ function _processFunction(node, functions, processedRanges, lines) {
             const { startLine, endLine, indent } = nodeToLocation(node, lines);
             const receiver = extractReceiver(receiverNode);
             const returnType = extractReturnType(node);
+            const returnedFunctionResult = extractReturnedFunctionResult(node);
             const docstring = extractGoDocstring(lines, startLine);
             const isExported = /^[A-Z]/.test(nameNode.text);
 
@@ -128,6 +179,7 @@ function _processFunction(node, functions, processedRanges, lines) {
                 receiver,
                 modifiers: isExported ? ['export'] : [],
                 ...(returnType && { returnType }),
+                ...(returnedFunctionResult && { returnedFunctionResult }),
                 ...(docstring && { docstring })
             });
         }
@@ -567,6 +619,7 @@ function parse(code, parser) {
         functions,
         classes,
         stateObjects,
+        ...(tree.rootNode.hasError && { parseRecovery: true }),
         imports: [],
         exports: []
     };
@@ -656,7 +709,7 @@ function findCallsInCode(code, parser, options = {}) {
         if (!argsNode) return null;
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             const arg = argsNode.namedChild(i);
-            if (arg.type === 'comment') continue;
+            if (arg.type.endsWith('comment')) continue;
             // fmt.Sprintf interpolation
             if (arg.type === 'call_expression') {
                 const inner = arg.childForFieldName('function');
@@ -678,6 +731,8 @@ function findCallsInCode(code, parser, options = {}) {
     const closureScopes = new Map();
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
+    // Package qualifier paired with an inferred/declared receiver type.
+    const scopeTypeQualifiers = new Map();
     // Names whose scope type is a New*-prefix GUESS (fix #266) — per scope
     const scopeGuesses = new Map();
     // Track function-typed parameter names per scope (scopeStartLine -> Set<name>)
@@ -717,11 +772,31 @@ function findCallsInCode(code, parser, options = {}) {
         return null;
     };
 
+    // Preserve the package qualifier separately from the bare type name.
+    // `http.Handler` and a project-local `Handler` are different identities;
+    // dropping `http.` lets an unrelated same-named project type steal method
+    // dispatch. Pointer wrappers do not change that provenance.
+    const extractTypeQualifier = (typeNode) => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'pointer_type') {
+            for (let i = 0; i < typeNode.namedChildCount; i++) {
+                const q = extractTypeQualifier(typeNode.namedChild(i));
+                if (q) return q;
+            }
+        }
+        if (typeNode.type === 'qualified_type') {
+            const pkg = typeNode.childForFieldName('package') || typeNode.namedChild(0);
+            return pkg?.text || null;
+        }
+        return null;
+    };
+
     // Build type map from function/method parameters and receiver.
     // Also returns funcParamNames: parameter names with function types (func(...) ...)
     // so calls to them can be skipped (they're local parameter calls, not global function calls).
     const buildScopeTypeMap = (node) => {
         const typeMap = new Map();
+        const typeQualifierMap = new Map();
         const funcParamNames = new Set();
 
         // Method receiver: func (f *Framework) Method()
@@ -736,6 +811,8 @@ function findCallsInCode(code, parser, options = {}) {
                         const typeName = extractTypeName(typeNode);
                         if (nameNode && typeName) {
                             typeMap.set(nameNode.text, typeName);
+                            const qualifier = extractTypeQualifier(typeNode);
+                            if (qualifier) typeQualifierMap.set(nameNode.text, qualifier);
                         }
                     }
                 }
@@ -764,14 +841,18 @@ function findCallsInCode(code, parser, options = {}) {
                     } else {
                         const typeName = extractTypeName(typeNode);
                         if (typeName) {
-                            for (const nn of nameNodes) typeMap.set(nn.text, typeName);
+                            const qualifier = extractTypeQualifier(typeNode);
+                            for (const nn of nameNodes) {
+                                typeMap.set(nn.text, typeName);
+                                if (qualifier) typeQualifierMap.set(nn.text, qualifier);
+                            }
                         }
                     }
                 }
             }
         }
 
-        return { typeMap, funcParamNames };
+        return { typeMap, typeQualifierMap, funcParamNames };
     };
 
     // Helper to extract function name from a function node
@@ -821,6 +902,13 @@ function findCallsInCode(code, parser, options = {}) {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return typeMap.get(varName);
+        }
+        return undefined;
+    };
+    const getReceiverTypeQualifier = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const qualifiers = scopeTypeQualifiers.get(functionStack[i].startLine);
+            if (qualifiers?.has(varName)) return qualifiers.get(varName);
         }
         return undefined;
     };
@@ -947,8 +1035,9 @@ function findCallsInCode(code, parser, options = {}) {
                 endLine: node.endPosition.row + 1
             };
             functionStack.push(entry);
-            const { typeMap, funcParamNames } = buildScopeTypeMap(node);
+            const { typeMap, typeQualifierMap, funcParamNames } = buildScopeTypeMap(node);
             scopeTypes.set(entry.startLine, typeMap);
+            scopeTypeQualifiers.set(entry.startLine, typeQualifierMap);
             if (funcParamNames.size > 0) {
                 funcParamScopes.set(entry.startLine, funcParamNames);
             }
@@ -974,15 +1063,20 @@ function findCallsInCode(code, parser, options = {}) {
                     for (let vi = 0; vi < Math.min(names.length, values.length); vi++) {
                         const val = values[vi];
                         let typeName = null;
+                        let typeQualifier = null;
                         let typeGuessed = false;
                         // &Type{...} or Type{...}
                         if (val.type === 'composite_literal') {
-                            typeName = extractTypeName(val.childForFieldName('type'));
+                            const typeNode = val.childForFieldName('type');
+                            typeName = extractTypeName(typeNode);
+                            typeQualifier = extractTypeQualifier(typeNode);
                         } else if (val.type === 'unary_expression' && val.childCount > 0) {
                             for (let ci = 0; ci < val.namedChildCount; ci++) {
                                 const ch = val.namedChild(ci);
                                 if (ch.type === 'composite_literal') {
-                                    typeName = extractTypeName(ch.childForFieldName('type'));
+                                    const typeNode = ch.childForFieldName('type');
+                                    typeName = extractTypeName(typeNode);
+                                    typeQualifier = extractTypeQualifier(typeNode);
                                     break;
                                 }
                             }
@@ -1020,12 +1114,20 @@ function findCallsInCode(code, parser, options = {}) {
                                             : argNode.type === 'selector_expression'
                                                 ? argNode.childForFieldName('field')?.text || null
                                                 : extractTypeName(argNode);
+                                        if (argNode.type === 'selector_expression') {
+                                            typeQualifier = argNode.childForFieldName('operand')?.text || null;
+                                        } else {
+                                            typeQualifier = extractTypeQualifier(argNode);
+                                        }
                                     }
                                 }
                             }
                         }
                         if (typeName) {
                             typeMap.set(names[vi], typeName);
+                            const qualifiers = scopeTypeQualifiers.get(scopeKey);
+                            if (typeQualifier) qualifiers?.set(names[vi], typeQualifier);
+                            else qualifiers?.delete(names[vi]);
                             let gset = scopeGuesses.get(scopeKey);
                             if (typeGuessed) {
                                 if (!gset) { gset = new Set(); scopeGuesses.set(scopeKey, gset); }
@@ -1052,10 +1154,14 @@ function findCallsInCode(code, parser, options = {}) {
                     if (spec.type !== 'var_spec') return;
                     const typeName = extractTypeName(spec.childForFieldName('type'));
                     if (!typeName) return;
+                    const qualifier = extractTypeQualifier(spec.childForFieldName('type'));
                     for (let j = 0; j < spec.namedChildCount; j++) {
                         const id = spec.namedChild(j);
                         if (id.type === 'identifier') {
                             varTypeMap.set(id.text, typeName);
+                            const qualifiers = scopeTypeQualifiers.get(scopeKey);
+                            if (qualifier) qualifiers?.set(id.text, qualifier);
+                            else qualifiers?.delete(id.text);
                             scopeGuesses.get(scopeKey)?.delete(id.text); // declared type clears any guess
                         }
                     }
@@ -1134,7 +1240,7 @@ function findCallsInCode(code, parser, options = {}) {
             let argSpread = false;
             if (argsNode) {
                 for (let i = 0; i < argsNode.namedChildCount; i++) {
-                    if (argsNode.namedChild(i).type === 'comment') continue;
+                    if (argsNode.namedChild(i).type.endsWith('comment')) continue;
                     argCount++;
                 }
                 for (let i = 0; i < argsNode.childCount; i++) {
@@ -1183,20 +1289,32 @@ function findCallsInCode(code, parser, options = {}) {
                     // If receiver is a known import alias, this is a package call, not a method call
                     const isPkgCall = receiver && importAliases.has(receiver);
                     const receiverType = (!isPkgCall && receiver) ? getReceiverType(receiver) : undefined;
+                    const receiverTypeQualifier = receiverType
+                        ? getReceiverTypeQualifier(receiver) : undefined;
                     // fix #202: one-hop declared-field receivers — h.inner.Run().
                     // receiverRoot/Field/RootType let findCallers hop to the
                     // field's declared struct-field type cross-file.
-                    let receiverRoot, receiverFieldName, receiverRootType, receiverRootTypeGuessed;
+                    let receiverRoot, receiverFieldName, receiverRootType,
+                        receiverRootTypeQualifier, receiverRootTypeGuessed,
+                        receiverRootIsModule;
                     if (!receiver && operandNode?.type === 'selector_expression') {
                         const rootNode = operandNode.childForFieldName('operand');
                         const fldNode = operandNode.childForFieldName('field');
-                        if (rootNode?.type === 'identifier' && fldNode &&
-                            !importAliases.has(rootNode.text)) {
+                        if (rootNode?.type === 'identifier' && fldNode) {
                             receiverRoot = rootNode.text;
                             receiverFieldName = fldNode.text;
-                            receiverRootType = getReceiverType(rootNode.text);
-                            if (receiverRootType && isGuessedType(rootNode.text)) {
-                                receiverRootTypeGuessed = true;
+                            if (importAliases.has(rootNode.text)) {
+                                // Package-owned value receiver:
+                                // io.Discard.Write(...). The package qualifier
+                                // is identity evidence even though the value's
+                                // concrete type lives outside the project.
+                                receiverRootIsModule = true;
+                            } else {
+                                receiverRootType = getReceiverType(rootNode.text);
+                                receiverRootTypeQualifier = getReceiverTypeQualifier(rootNode.text);
+                                if (receiverRootType && isGuessedType(rootNode.text)) {
+                                    receiverRootTypeGuessed = true;
+                                }
                             }
                         }
                     }
@@ -1243,9 +1361,12 @@ function findCallsInCode(code, parser, options = {}) {
                         isMethod: !isPkgCall,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
+                        ...(receiverRootIsModule && { receiverRootIsModule: true }),
                         ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                        ...(receiverFieldName && receiverRootTypeQualifier && { receiverRootTypeQualifier }),
                         ...(receiverFieldName && receiverRootType && receiverRootTypeGuessed && { receiverRootTypeGuessed: true }),
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
@@ -1323,6 +1444,8 @@ function findCallsInCode(code, parser, options = {}) {
                 if (fieldNode && operandNode) {
                     const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
                     const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                    const receiverTypeQualifier = receiverType
+                        ? getReceiverTypeQualifier(receiver) : undefined;
                     const enclosingFunction = getCurrentEnclosingFunction();
                     calls.push({
                         name: fieldNode.text,
@@ -1330,6 +1453,7 @@ function findCallsInCode(code, parser, options = {}) {
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverTypeQualifier && { receiverTypeQualifier }),
                         ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                         enclosingFunction,
                         isPotentialCallback: true,
@@ -1379,6 +1503,8 @@ function findCallsInCode(code, parser, options = {}) {
                         if (fieldNode && operandNode) {
                             const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
                             const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                            const receiverTypeQualifier = receiverType
+                                ? getReceiverTypeQualifier(receiver) : undefined;
                             const enclosingFunction = getCurrentEnclosingFunction();
                             calls.push({
                                 name: fieldNode.text,
@@ -1386,6 +1512,7 @@ function findCallsInCode(code, parser, options = {}) {
                                 isMethod: true,
                                 receiver,
                                 ...(receiverType && { receiverType }),
+                                ...(receiverTypeQualifier && { receiverTypeQualifier }),
                                 ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                                 enclosingFunction,
                                 isPotentialCallback: true,
@@ -1474,6 +1601,8 @@ function findCallsInCode(code, parser, options = {}) {
                     if (fieldNode && operandNode) {
                         const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
                         const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                        const receiverTypeQualifier = receiverType
+                            ? getReceiverTypeQualifier(receiver) : undefined;
                         const enclosingFunction = getCurrentEnclosingFunction();
                         calls.push({
                             name: fieldNode.text,
@@ -1481,6 +1610,7 @@ function findCallsInCode(code, parser, options = {}) {
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),
+                            ...(receiverTypeQualifier && { receiverTypeQualifier }),
                             ...(receiverType && isGuessedType(receiver) && { receiverTypeGuessed: true }),
                             enclosingFunction,
                             isPotentialCallback: true,

@@ -5,7 +5,6 @@
  * as the first argument instead of using `this`.
  */
 
-const path = require('path');
 const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
 const { escapeRegExp, codeUnitCompare } = require('./shared');
 

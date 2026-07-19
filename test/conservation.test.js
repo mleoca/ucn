@@ -52,6 +52,14 @@ function accountForSymbol(index, name, { log = false } = {}) {
         assert.strictEqual(account.unaccounted, 0,
             `unaccounted must be 0 for "${name}": ${JSON.stringify(account)}`);
         assert.ok(account.conserved, `account.conserved must be true for "${name}"`);
+        assert.strictEqual(account.contract.kind, 'literal-name-text-partition');
+        assert.strictEqual(account.contract.semanticComplete, false,
+            'text conservation must never be represented as semantic completeness');
+        assert.strictEqual(account.contract.safeToDelete, false,
+            'a zero literal-name partition is not deletion proof');
+        assert.strictEqual(account.contract.textComplete,
+            account.unparsed.fileCount === 0 && account.unreadableFiles.length === 0,
+            'parse/read failures must degrade the text contract');
 
         if (log && account.callNotResolved && account.callNotResolved.length > 0) {
             console.log(`  [gap] "${name}": ${account.callNotResolved.length} call line(s) not claimed by engine`,

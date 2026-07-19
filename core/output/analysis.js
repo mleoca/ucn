@@ -75,9 +75,9 @@ function isTestEntry(entry) {
 }
 
 /**
- * Render the conservation contract lines: ACCOUNT (always), WARNING (unparsed
- * files containing the symbol), FILTERED (display-filter hides). Returns [].
- * when no account is present (e.g. class-type context).
+ * Render the conservation contract lines: ACCOUNT and CONTRACT (always),
+ * WARNING (unparsed files containing the symbol), FILTERED (display-filter
+ * hides). Returns [] when no account is present (e.g. class-type context).
  */
 function formatAccountLines(account) {
     if (!account) return [];
@@ -93,6 +93,18 @@ function formatAccountLines(account) {
         line += ` (+${account.beyondText.count} beyond-text caller${account.beyondText.count === 1 ? '' : 's'})`;
     }
     lines.push(line);
+    const contract = account.contract || {};
+    const textComplete = contract.textComplete !== undefined
+        ? contract.textComplete
+        : Boolean(account.conserved) && !(account.unparsed && account.unparsed.fileCount > 0) &&
+            !(account.unreadableFiles && account.unreadableFiles.length > 0);
+    if (!textComplete) {
+        lines.push('CONTRACT: literal-name text partition is DEGRADED; review WARNING and unaccounted lines before acting. Semantic completeness is not claimed.');
+    } else if (contract.observedTextZero) {
+        lines.push('CONTRACT: observed-text zero only; every literal-name line was classified, but aliases, indirect calls, generated code, and runtime dispatch may exist. Not safe-delete proof.');
+    } else {
+        lines.push('CONTRACT: literal-name text partition complete; semantic completeness is not claimed (aliases, indirect calls, generated code, and runtime dispatch may exist).');
+    }
     if (account.unparsed && account.unparsed.fileCount > 0) {
         lines.push(`WARNING: ${account.unparsed.fileCount} unparsed file${account.unparsed.fileCount === 1 ? '' : 's'} ` +
             `contain${account.unparsed.fileCount === 1 ? 's' : ''} "${account.symbol}" ` +
@@ -184,6 +196,8 @@ function formatContextJson(context) {
                     // Tier parity with the function-path callers list: class
                     // usages are the confirmed-tier answer for type symbols.
                     ...(c.confidence !== undefined && { confidence: c.confidence }),
+                    ...(c.evidenceScore !== undefined && { evidenceScore: c.evidenceScore }),
+                    ...(c.scoreKind && { scoreKind: c.scoreKind }),
                     ...(c.resolution && { resolution: c.resolution }),
                     ...(c.tier && { tier: c.tier })
                 })),
@@ -193,6 +207,10 @@ function formatContextJson(context) {
                     expression: c.content,
                     callerName: c.callerName ?? null,
                     tier: 'unverified',
+                    ...(c.confidence !== undefined && { confidence: c.confidence }),
+                    ...(c.evidenceScore !== undefined && { evidenceScore: c.evidenceScore }),
+                    ...(c.scoreKind && { scoreKind: c.scoreKind }),
+                    ...(c.resolution && { resolution: c.resolution }),
                     ...(c.reason && { reason: c.reason }),
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
@@ -225,6 +243,8 @@ function formatContextJson(context) {
                 ...(c.calledAs && { calledAs: c.calledAs }),
                 ...(c.isFunctionReference && { functionReference: true }),
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
+                ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 ...(c.tier && { tier: c.tier }),
                 ...(c.reachable !== undefined && { reachable: c.reachable }),
             })),
@@ -236,6 +256,8 @@ function formatContextJson(context) {
                 ...(c.calledAs && { calledAs: c.calledAs }),
                 ...(c.isFunctionReference && { functionReference: true }),
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
+                ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 tier: 'unverified',
                 ...(c.reason && { reason: c.reason }),
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
@@ -250,6 +272,8 @@ function formatContextJson(context) {
                 params: c.params,  // FULL params
                 weight: c.weight || 'normal',  // Dependency weight: core, setup, utility
                 ...(c.confidence != null && { confidence: c.confidence, resolution: c.resolution }),
+                ...(c.evidenceScore != null && { evidenceScore: c.evidenceScore }),
+                ...(c.scoreKind && { scoreKind: c.scoreKind }),
                 ...(c.tier && { tier: c.tier }),
                 ...(c.sites && { sites: c.sites }),
                 ...(c.functionReference && { functionReference: true }),
@@ -377,7 +401,7 @@ function formatContext(ctx, options = {}) {
     if (ctx.meta) {
         const notes = [];
         if (ctx.meta.dynamicImports) { const dn = dynamicImportsNote(ctx.meta.dynamicImports, ctx.meta); if (dn) notes.push(dn); }
-        if (ctx.meta.confidenceFiltered) notes.push(`${ctx.meta.confidenceFiltered} edge(s) below confidence threshold hidden`);
+        if (ctx.meta.confidenceFiltered) notes.push(`${ctx.meta.confidenceFiltered} edge(s) below evidence threshold hidden`);
         if (notes.length) {
             lines.push(`  Note: ${notes.join(', ')}`);
         }
@@ -401,7 +425,7 @@ function formatContext(ctx, options = {}) {
         : `CALLERS — CONFIRMED (${callers.length}):`;
     lines.push(`${compact ? '' : '\n'}${tierHeader}`);
     const callerEvidence = options.showConfidence !== false ? formatEvidenceLine(callers) : null;
-    if (callerEvidence && !compact) lines.push(callerEvidence);
+    if (callerEvidence) lines.push(callerEvidence);
     const callerReach = reachabilityDisplay(callers, hasEntrypoints, 'caller');
     const renderCaller = (c) => {
         const callerName = c.callerName ? ` [${c.callerName}]` : '';
@@ -470,7 +494,7 @@ function formatContext(ctx, options = {}) {
     const callees = ctx.callees || [];
     lines.push(`${compact ? '' : '\n'}CALLEES (${callees.length}):`);
     const calleeEvidence = options.showConfidence !== false ? formatEvidenceLine(callees) : null;
-    if (calleeEvidence && !compact) lines.push(calleeEvidence);
+    if (calleeEvidence) lines.push(calleeEvidence);
     const calleeReach = reachabilityDisplay(callees, hasEntrypoints, 'callee');
     for (const c of callees) {
         const weight = c.weight && c.weight !== 'normal' ? ` [${c.weight}]` : '';
@@ -709,14 +733,18 @@ function formatAbout(about, options = {}) {
         }
     }
     if (about.confidenceFiltered) {
-        lines.push(`  Note: ${about.confidenceFiltered} edge(s) below confidence threshold hidden`);
+        lines.push(`  Note: ${about.confidenceFiltered} edge(s) below evidence threshold hidden`);
     }
 
     // Usage summary (fast-path approximation; ACCOUNT below is the exact
     // text-ground truth — both are labeled to avoid confusion)
     lines.push('');
-    lines.push(`USAGES: ${about.totalUsages} total`);
-    lines.push(`  ${about.usages.calls} calls, ${about.usages.imports} imports, ${about.usages.references} references`);
+    if (compact) {
+        lines.push(`USAGES: ${about.totalUsages} total (${about.usages.calls} calls, ${about.usages.imports} imports, ${about.usages.references} references)`);
+    } else {
+        lines.push(`USAGES: ${about.totalUsages} total`);
+        lines.push(`  ${about.usages.calls} calls, ${about.usages.imports} imports, ${about.usages.references} references`);
+    }
 
     // Callers — CONFIRMED tier, prod before test
     const hasEntrypoints = about.hasEntrypoints !== false;
@@ -740,7 +768,7 @@ function formatAbout(about, options = {}) {
             const caller = c.callerName ? `[${c.callerName}]` : '';
             const unreachableMark = (aboutCallerReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
             lines.push(`  ${c.file}:${c.line} ${caller}${unreachableMark}`);
-            lines.push(`    ${c.expression}`);
+            if (!compact && c.expression) lines.push(`    ${c.expression}`);
         };
         for (const c of prodTop) renderAboutCaller(c);
         if (testTop.length > 0) {
@@ -773,7 +801,7 @@ function formatAbout(about, options = {}) {
         for (const u of aboutUnverified.top) {
             const caller = u.callerName ? ` [${u.callerName}]` : '';
             const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
-            const expr = u.expression ? `: ${u.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
+            const expr = !compact && u.expression ? `: ${u.expression.replace(/\s+/g, ' ').slice(0, 100)}` : '';
             lines.push(`  ${u.file}:${u.line}${caller}${expr}${reason}`);
         }
         if (aboutUnverified.total > aboutUnverified.top.length) {
@@ -799,13 +827,13 @@ function formatAbout(about, options = {}) {
             const sideEffects = (c.sideEffects && c.sideEffects.length) ? ` {${c.sideEffects.join(',')}}` : '';
             const unreachableMark = (aboutCalleeReach.perLine && c.reachable === false) ? ' [unreachable]' : '';
             lines.push(`  ${c.name}${weight}${returnSuffix}${sideEffects} - ${c.file}:${c.line} (${c.callCount}x)${unreachableMark}`);
-            if (c.docstring) {
+            if (!compact && c.docstring) {
                 const snip = calleeDocstringSnippet(c.docstring);
                 if (snip) lines.push(`    "${snip}"`);
             }
 
             // Inline expansion: show first 3 lines of callee code
-            if (expand && root && c.file && c.startLine) {
+            if (!compact && expand && root && c.file && c.startLine) {
                 try {
                     const filePath = path.isAbsolute(c.file) ? c.file : path.join(root, c.file);
                     const content = fs.readFileSync(filePath, 'utf-8');
@@ -840,6 +868,13 @@ function formatAbout(about, options = {}) {
     // Tests
     if (about.tests.totalMatches > 0) {
         lines.push('');
+        if (compact) {
+            const shown = about.tests.files.length > 0 ? `: ${about.tests.files.join(', ')}` : '';
+            const partial = about.tests.fileCount > about.tests.files.length
+                ? ` (showing ${about.tests.files.length} of ${about.tests.fileCount} files)`
+                : '';
+            lines.push(`TESTS: ${about.tests.totalMatches} matches${partial}${shown}`);
+        } else {
         if (about.tests.fileCount > about.tests.files.length) {
             lines.push(`TESTS: ${about.tests.totalMatches} matches in ${about.tests.fileCount} file(s), showing ${about.tests.files.length}:`);
             aboutTruncated = true;
@@ -848,6 +883,7 @@ function formatAbout(about, options = {}) {
         }
         for (const f of about.tests.files) {
             lines.push(`  ${f}`);
+        }
         }
     }
 
@@ -881,10 +917,13 @@ function formatAbout(about, options = {}) {
     }
 
     // Code
-    if (about.code) {
+    if (about.code && !compact) {
         lines.push('');
         lines.push('─── CODE ───');
         lines.push(about.code);
+    } else if (about.code && compact) {
+        lines.push('');
+        lines.push(`SOURCE: omitted in compact mode; use fn ${sym.handle || sym.name} to extract it.`);
     }
 
     if (aboutTruncated) {

@@ -24,8 +24,36 @@ jobs:
           node-version: 24
           cache: npm
 
+      - uses: actions/setup-go@v6
+        with:
+          go-version: stable
+          cache: false
+
+      - name: Install gopls (Go release oracle)
+        run: |
+          go install golang.org/x/tools/gopls@latest
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+
+      - name: Install rust-analyzer (Rust release oracle)
+        run: rustup component add rust-analyzer rust-src
+
+      - uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - name: Install jdtls (Java release oracle)
+        run: |
+          curl -fsSL -o /tmp/jdtls.tar.gz "https://download.eclipse.org/jdtls/milestones/1.60.0/jdt-language-server-1.60.0-202606262232.tar.gz"
+          echo "e94c303d8198f977930803582738771fd18c52c5492878410bf222b1aa81ef1d  /tmp/jdtls.tar.gz" | sha256sum -c
+          mkdir -p "$HOME/jdtls" && tar -xzf /tmp/jdtls.tar.gz -C "$HOME/jdtls"
+          echo "UCN_EVAL_JDTLS=$HOME/jdtls/bin/jdtls" >> "$GITHUB_ENV"
+
       - run: npm ci
+      - run: npm run lint
       - run: npm test
+      - name: Release trust gate (one compiler/LSP board per language)
+        run: npm run trust:gate
 
   publish-npm:
     needs: test
