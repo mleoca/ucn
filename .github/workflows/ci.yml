@@ -38,8 +38,15 @@ jobs:
       - name: Update test count badge
         if: matrix.node-version == 24 && github.ref == 'refs/heads/main' && github.event_name == 'push'
         run: |
-          PASS=$(grep '# pass ' test-output.txt | tail -1 | awk '{print $3}')
-          TOTAL=$(grep '# tests ' test-output.txt | tail -1 | awk '{print $3}')
+          # Match both reporter formats: TAP ("# pass N") and spec ("ℹ pass N").
+          # Node's default test reporter changed with the runtime version, so the
+          # badge must not depend on which one this matrix entry produces.
+          PASS=$(grep -E '^(#|ℹ) pass ' test-output.txt | tail -1 | awk '{print $NF}')
+          TOTAL=$(grep -E '^(#|ℹ) tests ' test-output.txt | tail -1 | awk '{print $NF}')
+          if [ -z "$PASS" ] || [ -z "$TOTAL" ]; then
+            echo "::error::could not parse test counts from test-output.txt"
+            exit 1
+          fi
           echo "{\"schemaVersion\":1,\"label\":\"tests\",\"message\":\"${PASS}/${TOTAL} passing\",\"color\":\"brightgreen\"}" > badge.json
           curl -s -X PATCH \
             -H "Authorization: token ${{ secrets.GIST_TOKEN }}" \
