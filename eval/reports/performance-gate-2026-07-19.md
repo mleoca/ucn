@@ -1,13 +1,13 @@
-# UCN performance gate — 2026-07-19
+# UCN performance gate - 2026-07-19
 
-Real pinned repositories; cold AST build, persisted-index load, first semantic query, and steady-state pinned `context` board.
+Real pinned repositories; cold AST build, 3 isolated persisted-index startup samples, and a steady-state pinned `context` board.
 
-| repo | files | LOC | cold | LOC/s | cache load | first query | warm/cold | query p50 | query p95 | RSS | result |
+| repo | files | LOC | cold | LOC/s | cache load median | first query median/max | warm/cold | query p50 | query p95 | peak RSS | result |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|
-| preact-signals | 2 | 4196 | 195.435ms | 21470.054 | 1.024ms | 12.395ms | 0.069 | 1.951ms | 18.108ms | 260.8MB | PASS |
-| httpx | 61 | 17807 | 757.213ms | 23516.501 | 5.483ms | 155.624ms | 0.213 | 3.612ms | 29.347ms | 492MB | PASS |
-| cobra | 36 | 16765 | 663.281ms | 25275.863 | 2.821ms | 62.077ms | 0.098 | 2.39ms | 5.559ms | 557.8MB | PASS |
-| clap | 330 | 83356 | 1325.387ms | 62891.82 | 16.735ms | 453.348ms | 0.355 | 18.361ms | 139.647ms | 994.9MB | PASS |
-| javapoet | 39 | 12212 | 488.099ms | 25019.514 | 3.698ms | 38.733ms | 0.087 | 3.528ms | 45.546ms | 1120.7MB | PASS |
+| preact-signals | 2 | 4196 | 184.677ms | 22720.75 | 0.588ms | 4.146/13.72ms | 0.026 | 1.694ms | 16.901ms | 237.6MB | PASS |
+| httpx | 61 | 17807 | 865.199ms | 20581.392 | 4.993ms | 172.109/222.798ms | 0.205 | 3.833ms | 26.173ms | 428.3MB | PASS |
+| cobra | 36 | 16765 | 698.002ms | 24018.556 | 2.54ms | 54.358/71.946ms | 0.082 | 2.164ms | 4.357ms | 312.7MB | PASS |
+| clap | 330 | 83356 | 1004.663ms | 82969.115 | 16.061ms | 290.523/390.497ms | 0.305 | 14.359ms | 148.354ms | 764.8MB | PASS |
+| javapoet | 39 | 12212 | 432.533ms | 28233.684 | 3.356ms | 34.863/38.646ms | 0.088 | 2.803ms | 29.826ms | 336.9MB | PASS |
 
 Budgets: {"minColdLocPerSec":10000,"maxCacheLoadMs":1500,"maxFirstQueryMs":500,"maxWarmColdRatio":0.65,"maxQueryP50Ms":75,"maxQueryP95Ms":250,"maxRssMb":1536}.

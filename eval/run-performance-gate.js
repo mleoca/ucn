@@ -5,9 +5,9 @@
  *
  * Measures the path an agent actually pays for:
  *   1. cold AST index build;
- *   2. persisted-index load and first semantic warm-up;
+ *   2. repeated persisted-index load and first semantic warm-up;
  *   3. a deterministic board of pinned `context` queries;
- *   4. process RSS after the board.
+ *   4. per-repository process RSS after the board.
  *
  * Absolute latency budgets catch slow releases. Ratio/throughput budgets make
  * the gate portable across CI hosts. Tiny repositories are excluded from the
@@ -19,24 +19,34 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { spawnSync } = require('child_process');
 const { performance } = require('perf_hooks');
 
 const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { REPOS, cloneAtCommit, resolveTarget } = require('./lib/repos');
+const {
+    DEFAULT_BUDGETS,
+    percentile,
+    summarizeSamples,
+    evaluatePerformanceBudgets,
+} = require('./performance-gate-policy');
 
 const args = process.argv.slice(2);
 const repoArg = readArg('--repo');
 const repoNames = repoArg ? new Set(repoArg.split(',').map(s => s.trim()).filter(Boolean)) : null;
-const queryCount = positiveNumber('--queries', 40);
+const queryCount = positiveInteger('--queries', 40);
+const startupSamples = positiveInteger('--startup-samples', 3);
+const workerRepoName = readArg('--worker-repo');
+const workerResultPath = readArg('--worker-result');
 const budgets = {
-    minColdLocPerSec: positiveNumber('--min-cold-loc-sec', 10000),
-    maxCacheLoadMs: positiveNumber('--max-cache-load-ms', 1500),
-    maxFirstQueryMs: positiveNumber('--max-first-query-ms', 500),
-    maxWarmColdRatio: positiveNumber('--max-warm-cold-ratio', 0.65),
-    maxQueryP50Ms: positiveNumber('--max-query-p50-ms', 75),
-    maxQueryP95Ms: positiveNumber('--max-query-p95-ms', 250),
-    maxRssMb: positiveNumber('--max-rss-mb', 1536),
+    minColdLocPerSec: positiveNumber('--min-cold-loc-sec', DEFAULT_BUDGETS.minColdLocPerSec),
+    maxCacheLoadMs: positiveNumber('--max-cache-load-ms', DEFAULT_BUDGETS.maxCacheLoadMs),
+    maxFirstQueryMs: positiveNumber('--max-first-query-ms', DEFAULT_BUDGETS.maxFirstQueryMs),
+    maxWarmColdRatio: positiveNumber('--max-warm-cold-ratio', DEFAULT_BUDGETS.maxWarmColdRatio),
+    maxQueryP50Ms: positiveNumber('--max-query-p50-ms', DEFAULT_BUDGETS.maxQueryP50Ms),
+    maxQueryP95Ms: positiveNumber('--max-query-p95-ms', DEFAULT_BUDGETS.maxQueryP95Ms),
+    maxRssMb: positiveNumber('--max-rss-mb', DEFAULT_BUDGETS.maxRssMb),
 };
 const REPORTS_DIR = path.join(__dirname, 'reports');
 
@@ -47,7 +57,8 @@ function readArg(flag) {
 
 function positiveNumber(flag, fallback) {
     const raw = readArg(flag);
-    if (raw == null) return fallback;
+    if (!args.includes(flag)) return fallback;
+    if (raw == null) throw new Error(`${flag} requires a value`);
     const value = Number(raw);
     if (!Number.isFinite(value) || value <= 0) {
         throw new Error(`${flag} must be a positive number (got ${raw})`);
@@ -55,14 +66,14 @@ function positiveNumber(flag, fallback) {
     return value;
 }
 
-function elapsed(start) { return Number((performance.now() - start).toFixed(3)); }
-function rate(n, d) { return d > 0 ? Number((n / d).toFixed(3)) : 0; }
-function percentile(values, fraction) {
-    if (values.length === 0) return 0;
-    const sorted = [...values].sort((a, b) => a - b);
-    return sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * fraction) - 1)];
+function positiveInteger(flag, fallback) {
+    const value = positiveNumber(flag, fallback);
+    if (!Number.isInteger(value)) throw new Error(`${flag} must be a positive integer (got ${value})`);
+    return value;
 }
 
+function elapsed(start) { return Number((performance.now() - start).toFixed(3)); }
+function rate(n, d) { return d > 0 ? Number((n / d).toFixed(3)) : 0; }
 function indexLineCount(index) {
     let total = 0;
     for (const [, fe] of index.files) total += fe.lines || 0;
@@ -96,45 +107,56 @@ async function evaluateRepo(repo) {
     process.stdout.write(`\n=== ${repo.name} (${repo.language}) @ ${repo.commit.slice(0, 8)} ===\n`);
 
     if (global.gc) global.gc();
-    const cold = new ProjectIndex(target);
+    let cold = new ProjectIndex(target);
     const coldStart = performance.now();
     cold.build(null, { quiet: true });
     const coldMs = elapsed(coldStart);
     const lines = indexLineCount(cold);
+    const fileCount = cold.files.size;
     const coldLocPerSec = rate(lines * 1000, coldMs);
 
     const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), `ucn-perf-${repo.name}-`));
     const cachePath = path.join(tempDir, 'index.json');
-    let cacheSaveMs = 0;
-    let cacheLoadMs = 0;
-    let firstQueryMs = 0;
+    let cacheSaveMs;
+    let cacheLoadMs;
+    let firstQueryMs;
     let queryErrors = 0;
     let queryTimes = [];
+    const cacheLoadSamplesMs = [];
+    const firstQuerySamplesMs = [];
     try {
         let started = performance.now();
         cold.saveCache(cachePath);
         cacheSaveMs = elapsed(started);
+        cold = null;
 
-        if (global.gc) global.gc();
-        const warm = new ProjectIndex(target);
-        started = performance.now();
-        const loaded = warm.loadCache(cachePath);
-        cacheLoadMs = elapsed(started);
-        if (!loaded) throw new Error('cache load returned false');
+        let warm;
+        let board;
+        for (let sample = 0; sample < startupSamples; sample++) {
+            if (global.gc) global.gc();
+            warm = new ProjectIndex(target);
+            started = performance.now();
+            const loaded = warm.loadCache(cachePath);
+            cacheLoadSamplesMs.push(elapsed(started));
+            if (!loaded) throw new Error('cache load returned false');
 
-        const board = callableBoard(warm, queryCount);
-        if (board.length === 0) throw new Error('no callable symbols available for query board');
+            board = callableBoard(warm, queryCount);
+            if (board.length === 0) throw new Error('no callable symbols available for query board');
 
-        // First query pays lazy calls-shard materialization. Report it
-        // separately so steady-state p95 cannot hide startup work.
-        const first = board[0];
-        started = performance.now();
-        const firstResult = execute(warm, 'context', {
-            name: `${first.relativePath}:${first.startLine}:${first.name}`,
-            compact: true,
-        });
-        firstQueryMs = elapsed(started);
-        if (!firstResult.ok) queryErrors++;
+            // Each sample uses a fresh loaded index, so every timing includes
+            // lazy calls-shard materialization and reachability startup.
+            const first = board[0];
+            started = performance.now();
+            const firstResult = execute(warm, 'context', {
+                name: `${first.relativePath}:${first.startLine}:${first.name}`,
+                compact: true,
+            });
+            firstQuerySamplesMs.push(elapsed(started));
+            if (!firstResult.ok) queryErrors++;
+        }
+
+        cacheLoadMs = summarizeSamples(cacheLoadSamplesMs).median;
+        firstQueryMs = summarizeSamples(firstQuerySamplesMs).median;
 
         for (const def of board) {
             started = performance.now();
@@ -151,49 +173,40 @@ async function evaluateRepo(repo) {
 
     const queryP50Ms = Number(percentile(queryTimes, 0.50).toFixed(3));
     const queryP95Ms = Number(percentile(queryTimes, 0.95).toFixed(3));
+    if (global.gc) global.gc();
     const rssMb = Number((process.memoryUsage().rss / 1024 / 1024).toFixed(1));
+    const peakRssMb = Number((process.resourceUsage().maxRSS / 1024).toFixed(1));
     const warmColdRatio = rate(cacheLoadMs + firstQueryMs, coldMs);
-    const failures = [];
+    const metrics = {
+        lines, coldMs, coldLocPerSec, cacheLoadMs, firstQueryMs, warmColdRatio,
+        queryP50Ms, queryP95Ms, peakRssMb, queryErrors,
+    };
+    const { failures, warnings } = evaluatePerformanceBudgets(metrics, budgets);
+    const firstSummary = summarizeSamples(firstQuerySamplesMs);
 
-    // Small repos are fixed-cost dominated; apply throughput/ratio only once
-    // there is enough work to make the comparison meaningful.
-    if (lines >= 5000 && coldLocPerSec < budgets.minColdLocPerSec) {
-        failures.push(`cold throughput ${coldLocPerSec} LOC/s < ${budgets.minColdLocPerSec}`);
-    }
-    if (cacheLoadMs > budgets.maxCacheLoadMs) {
-        failures.push(`cache load ${cacheLoadMs}ms > ${budgets.maxCacheLoadMs}ms`);
-    }
-    if (firstQueryMs > budgets.maxFirstQueryMs) {
-        failures.push(`first semantic query ${firstQueryMs}ms > ${budgets.maxFirstQueryMs}ms`);
-    }
-    if (coldMs >= 500 && warmColdRatio > budgets.maxWarmColdRatio) {
-        failures.push(`warm/cold ratio ${warmColdRatio} > ${budgets.maxWarmColdRatio}`);
-    }
-    if (queryP50Ms > budgets.maxQueryP50Ms) {
-        failures.push(`query p50 ${queryP50Ms}ms > ${budgets.maxQueryP50Ms}ms`);
-    }
-    if (queryP95Ms > budgets.maxQueryP95Ms) {
-        failures.push(`query p95 ${queryP95Ms}ms > ${budgets.maxQueryP95Ms}ms`);
-    }
-    if (rssMb > budgets.maxRssMb) failures.push(`RSS ${rssMb}MB > ${budgets.maxRssMb}MB`);
-    if (queryErrors > 0) failures.push(`${queryErrors} semantic query error(s)`);
-
-    process.stdout.write(`  ${cold.files.size} files, ${lines} LOC | cold ${coldMs}ms (${coldLocPerSec} LOC/s) | ` +
-        `cache load ${cacheLoadMs}ms + first query ${firstQueryMs}ms (ratio ${warmColdRatio})\n`);
+    process.stdout.write(`  ${fileCount} files, ${lines} LOC | cold ${coldMs}ms (${coldLocPerSec} LOC/s) | ` +
+        `cache load median ${cacheLoadMs}ms + first query median ${firstQueryMs}ms ` +
+        `(max ${firstSummary.max}ms, n=${firstSummary.count}, ratio ${warmColdRatio})\n`);
     process.stdout.write(`  context board n=${queryTimes.length} | p50 ${queryP50Ms}ms | p95 ${queryP95Ms}ms | ` +
-        `RSS ${rssMb}MB | errors ${queryErrors}${failures.length ? ` | FAIL: ${failures.join('; ')}` : ''}\n`);
+        `RSS ${rssMb}MB, peak ${peakRssMb}MB | errors ${queryErrors}` +
+        `${failures.length ? ` | FAIL: ${failures.join('; ')}` : ''}` +
+        `${warnings.length ? ` | NOTE: ${warnings.join('; ')}` : ''}\n`);
 
     return {
         repo: repo.name,
         language: repo.language,
         commit: repo.commit,
-        files: cold.files.size,
+        files: fileCount,
         lines,
         coldMs,
         coldLocPerSec,
         cacheSaveMs,
         cacheLoadMs,
+        cacheLoadSamplesMs,
         firstQueryMs,
+        firstQuerySamplesMs,
+        firstQueryMaxMs: firstSummary.max,
+        firstQuerySpreadMs: firstSummary.spread,
         warmColdRatio,
         queryCount: queryTimes.length,
         queryP50Ms,
@@ -201,8 +214,37 @@ async function evaluateRepo(repo) {
         queryMaxMs: Number(Math.max(...queryTimes).toFixed(3)),
         queryErrors,
         rssMb,
+        peakRssMb,
         failures,
+        warnings,
     };
+}
+
+function workerArgs(repo, resultPath) {
+    const passthrough = [];
+    for (let i = 0; i < args.length; i++) {
+        if (args[i] === '--worker-repo' || args[i] === '--worker-result') {
+            i++;
+            continue;
+        }
+        passthrough.push(args[i]);
+    }
+    return [...process.execArgv, __filename, ...passthrough,
+        '--worker-repo', repo.name, '--worker-result', resultPath];
+}
+
+async function workerMain() {
+    if (!workerResultPath) throw new Error('--worker-result is required with --worker-repo');
+    const repo = REPOS.find(candidate => candidate.name === workerRepoName);
+    if (!repo) throw new Error(`Unknown worker repository: ${workerRepoName}`);
+    let result;
+    try {
+        result = await evaluateRepo(repo);
+    } catch (error) {
+        process.stderr.write(`  FAILED ${repo.name}: ${error.stack || error.message}\n`);
+        result = { repo: repo.name, language: repo.language, error: error.message, failures: [error.message] };
+    }
+    fs.writeFileSync(workerResultPath, JSON.stringify(result));
 }
 
 async function main() {
@@ -215,16 +257,28 @@ async function main() {
 
     const results = [];
     let failed = false;
-    for (const repo of repos) {
-        try {
-            const result = await evaluateRepo(repo);
+    const workerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-perf-workers-'));
+    try {
+        for (const repo of repos) {
+            const resultPath = path.join(workerDir, `${repo.name}.json`);
+            const child = spawnSync(process.execPath, workerArgs(repo, resultPath), {
+                cwd: process.cwd(),
+                env: process.env,
+                stdio: 'inherit',
+                timeout: 10 * 60 * 1000,
+            });
+            if (child.error || child.status !== 0 || !fs.existsSync(resultPath)) {
+                const message = child.error?.message || `performance worker exited ${child.status}`;
+                results.push({ repo: repo.name, language: repo.language, error: message, failures: [message] });
+                failed = true;
+                continue;
+            }
+            const result = JSON.parse(fs.readFileSync(resultPath, 'utf8'));
             results.push(result);
             if (result.failures.length) failed = true;
-        } catch (error) {
-            failed = true;
-            process.stderr.write(`  FAILED ${repo.name}: ${error.stack || error.message}\n`);
-            results.push({ repo: repo.name, language: repo.language, error: error.message, failures: [error.message] });
         }
+    } finally {
+        fs.rmSync(workerDir, { recursive: true, force: true });
     }
 
     fs.mkdirSync(REPORTS_DIR, { recursive: true });
@@ -234,15 +288,16 @@ async function main() {
     fs.writeFileSync(jsonPath, JSON.stringify(report, null, 2));
 
     const md = [
-        `# UCN performance gate — ${date}`,
+        `# UCN performance gate - ${date}`,
         '',
-        'Real pinned repositories; cold AST build, persisted-index load, first semantic query, and steady-state pinned `context` board.',
+        `Real pinned repositories; cold AST build, ${startupSamples} isolated persisted-index startup samples, ` +
+            'and a steady-state pinned `context` board.',
         '',
-        '| repo | files | LOC | cold | LOC/s | cache load | first query | warm/cold | query p50 | query p95 | RSS | result |',
+        '| repo | files | LOC | cold | LOC/s | cache load median | first query median/max | warm/cold | query p50 | query p95 | peak RSS | result |',
         '|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|',
         ...results.map(r => r.error
-            ? `| ${r.repo} | — | — | — | — | — | — | — | — | — | — | **ERROR: ${r.error}** |`
-            : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.rssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : 'PASS'} |`),
+            ? `| ${r.repo} | - | - | - | - | - | - | - | - | - | - | **ERROR: ${r.error}** |`
+            : `| ${r.repo} | ${r.files} | ${r.lines} | ${r.coldMs}ms | ${r.coldLocPerSec} | ${r.cacheLoadMs}ms | ${r.firstQueryMs}/${r.firstQueryMaxMs}ms | ${r.warmColdRatio} | ${r.queryP50Ms}ms | ${r.queryP95Ms}ms | ${r.peakRssMb}MB | ${r.failures.length ? `**FAIL:** ${r.failures.join('; ')}` : r.warnings.length ? `PASS (${r.warnings.join('; ')})` : 'PASS'} |`),
         '',
         `Budgets: ${JSON.stringify(budgets)}.`,
     ];
@@ -253,7 +308,8 @@ async function main() {
 }
 
 if (require.main === module) {
-    main().catch(error => {
+    const entry = workerRepoName ? workerMain : main;
+    entry().catch(error => {
         process.stderr.write(`${error.stack || error.message}\n`);
         process.exitCode = 1;
     });

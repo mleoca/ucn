@@ -25,6 +25,7 @@ Required automation checks:
 3. No unreadable or unparsed files are reported.
 4. No contract metadata was lost to truncation.
 5. Unverified and excluded reasons are retained for review.
+6. Compiler/LSP evaluation reports keep configuration-unscored evidence below the release ceiling; a high-precision result from an undersized scored subset is not accepted.
 
 Even when all five hold, `account.contract.semanticComplete` remains false. Use compiler/type-checker, test, runtime, and framework evidence for semantic decisions.
 

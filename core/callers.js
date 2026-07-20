@@ -3148,12 +3148,9 @@ function findCallees(index, definition, options = {}) {
         // Only class methods are excluded — they are independently addressable symbols.
         // Calls within closures (named functions without className) ARE included as
         // callees of the parent function, since closures are part of the parent's behavior.
-        const innerSymbolRanges = fileEntry ? fileEntry.symbols
-            .filter(s => !NON_CALLABLE_TYPES.has(s.type) &&
-                    s.className &&  // Only exclude class methods, not closures
-                    s.startLine > def.startLine && s.endLine <= def.endLine &&
-                    s.startLine !== def.startLine)
-            .map(s => [s.startLine, s.endLine]) : [];
+        const innerSymbolRanges = fileEntry
+            ? _innerClassMethodRanges(index, def, fileEntry)
+            : [];
 
         const callees = new Map();  // key -> { name, bindingId, count }
         let selfAttrCalls = null;   // collected for Python self.attr.method() resolution
@@ -5315,6 +5312,41 @@ function _callsInDefinitionRange(index, filePath, calls, startLine, endLine) {
     return ordered.slice(lowerBound(startLine), lowerBound(endLine + 1));
 }
 
+/**
+ * Return independently-addressable class method ranges nested inside one
+ * definition. Reachability calls findCallees for thousands of symbols; a
+ * full fileEntry.symbols scan per symbol made this step quadratic in files
+ * with many methods. Cache one sorted range list per file, then binary-slice
+ * the relevant start-line window for each definition.
+ */
+function _innerClassMethodRanges(index, def, fileEntry) {
+    let ordered = index._opInnerSymbolRangesCache?.get(def.file);
+    if (!ordered) {
+        ordered = fileEntry.symbols
+            .filter(symbol => !NON_CALLABLE_TYPES.has(symbol.type) && symbol.className)
+            .map(symbol => [symbol.startLine, symbol.endLine])
+            .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+        index._opInnerSymbolRangesCache?.set(def.file, ordered);
+    }
+
+    const lowerBound = (needle) => {
+        let lo = 0, hi = ordered.length;
+        while (lo < hi) {
+            const mid = (lo + hi) >>> 1;
+            if (ordered[mid][0] < needle) lo = mid + 1;
+            else hi = mid;
+        }
+        return lo;
+    };
+    const from = lowerBound(def.startLine + 1);
+    const to = lowerBound(def.endLine + 1);
+    const ranges = [];
+    for (let i = from; i < to; i++) {
+        if (ordered[i][1] <= def.endLine) ranges.push(ordered[i]);
+    }
+    return ranges;
+}
+
 /** Nearest preceding flow assignment for this call's receiver (fn scope, then module). */
 function _lookupReturnTypeFlow(map, call) {
     if (!map) return undefined;
@@ -5469,28 +5501,35 @@ function _rejectedNominalFlowVia(text, language, opts = {}) {
  *  - no project type def at all: external name — safe, can't conflate
  */
 function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
+    const opCache = index._opFlowTypeOriginCache;
+    const cacheKey = `${producerFile}\x00${typeName}\x00${qualifier || ''}`;
+    if (opCache?.has(cacheKey)) return opCache.get(cacheKey);
+    const finish = (result) => {
+        if (opCache) opCache.set(cacheKey, result);
+        return result;
+    };
     const typeDefs = (index.symbols.get(typeName) || [])
         .filter(d => IDENTITY_TYPE_KINDS.has(d.type) && d.file);
-    if (typeDefs.length === 0) return { fromFile: producerFile };
-    if (qualifier === '<unresolvable>') return null;
+    if (typeDefs.length === 0) return finish({ fromFile: producerFile });
+    if (qualifier === '<unresolvable>') return finish(null);
     if (qualifier) {
         const fe = index.files.get(producerFile);
         const inPkg = fe && _qualifiedProducerDefs(index, fe, qualifier, typeDefs);
         if (inPkg && inPkg.length > 0 && new Set(inPkg.map(d => d.file)).size === 1) {
-            return { fromFile: inPkg[0].file };
+            return finish({ fromFile: inPkg[0].file });
         }
-        return null;
+        return finish(null);
     }
     const sameFile = typeDefs.find(d => d.file === producerFile);
-    if (sameFile) return { fromFile: sameFile.file };
+    if (sameFile) return finish({ fromFile: sameFile.file });
     const dir = path.dirname(producerFile);
     const sameDir = typeDefs.filter(d => path.dirname(d.file) === dir);
-    if (sameDir.length === 1) return { fromFile: sameDir[0].file };
-    if (sameDir.length > 1) return null;
+    if (sameDir.length === 1) return finish({ fromFile: sameDir[0].file });
+    if (sameDir.length > 1) return finish(null);
     const imports = index.importGraph.get(producerFile);
     if (imports) {
         const imported = typeDefs.filter(d => imports.has(d.file));
-        if (imported.length === 1) return { fromFile: imported[0].file };
+        if (imported.length === 1) return finish({ fromFile: imported[0].file });
     }
     // Re-export chains (fix #258, the #209 lesson brought to identity
     // resolution): `use clap::Command` lands the import edge on the crate's
@@ -5498,8 +5537,8 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
     // (depth 4) and pin only when exactly ONE same-name type is reachable.
     const reachable = typeDefs.filter(d =>
         _importReaches(index, producerFile, new Set([d.file])));
-    if (reachable.length === 1) return { fromFile: reachable[0].file };
-    return null;
+    if (reachable.length === 1) return finish({ fromFile: reachable[0].file });
+    return finish(null);
 }
 
 /**
@@ -8186,13 +8225,27 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
  */
 function _foldChainedReceiverType(index, fileEntry, filePath, call, ctx) {
     if (!call.receiverCall || !call.receiverCallLine || !ctx.records) return null;
-    const prods = ctx.records.filter(r =>
-        r !== call && r.line === call.receiverCallLine && r.name === call.receiverCall &&
-        !r.isMacro && !r.inMacro &&
-        // Kind match: the consumer knows whether its producer was a method-
-        // shaped call — `.arg(arg("x"))` has both a chained method `arg` and
-        // a plain closure call `arg` on one line; only the right kind folds.
-        !!r.isMethod === !!call.receiverCallIsMethod);
+    // A large builder-style function may contain hundreds of chained calls.
+    // Scanning every record for every hop made one function O(calls²). Build
+    // a context-local producer lookup once, then resolve each hop directly.
+    if (!ctx.producerIndex) {
+        ctx.producerIndex = new Map();
+        for (const record of ctx.records) {
+            if (record.isMacro || record.inMacro) continue;
+            const key = `${record.line}\x00${record.name}\x00${record.isMethod ? 1 : 0}`;
+            let group = ctx.producerIndex.get(key);
+            if (!group) {
+                group = [];
+                ctx.producerIndex.set(key, group);
+            }
+            group.push(record);
+        }
+    }
+    // Kind match: the consumer knows whether its producer was a method-shaped
+    // call. `.arg(arg("x"))` has both a chained method `arg` and a plain
+    // closure call `arg` on one line; only the right kind folds.
+    const producerKey = `${call.receiverCallLine}\x00${call.receiverCall}\x00${call.receiverCallIsMethod ? 1 : 0}`;
+    const prods = (ctx.producerIndex.get(producerKey) || []).filter(r => r !== call);
     if (prods.length === 0) return null;
     const results = prods.map(r =>
         _typeOfCallResultFold(index, fileEntry, filePath, r, ctx, call.receiverCallAwaited));

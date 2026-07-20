@@ -51,6 +51,7 @@ const {
 } = require('./command-proof');
 const { REPOS, cloneAtCommit, resolveTarget, seededRandom, resolveFreshCommit, selectFreshRepos } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
+const { optionalRate, evaluateOracleCoverage } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
 const { jediOracle } = require('./oracles/jedi-oracle');
@@ -63,7 +64,8 @@ const repoFilter = readArgValue(args, '--repo'); // name, or comma-separated nam
 const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim())) : null;
 const sampleSize = Number(readArgValue(args, '--sample') || 50);
 const oracleFilter = readArgValue(args, '--oracle');
-const minPrecision = readArgValue(args, '--min-precision') ? Number(readArgValue(args, '--min-precision')) : null;
+const minPrecision = optionalRateArg('--min-precision');
+const maxUnscoredRatio = optionalRateArg('--max-unscored-ratio');
 // Statistical-hardening runs: a different seed draws a different stratified
 // sample, confirming the board numbers aren't sample artifacts. Non-default
 // seeds get their own report filenames so they never clobber the canonical
@@ -95,6 +97,13 @@ const REF_BUCKETS = [
 function readArgValue(argv, flag) {
     const i = argv.indexOf(flag);
     return i === -1 ? null : (argv[i + 1] || null);
+}
+
+function optionalRateArg(flag) {
+    if (!args.includes(flag)) return null;
+    const raw = readArgValue(args, flag);
+    if (raw == null) throw new Error(`${flag} requires a value`);
+    return optionalRate(raw, flag);
 }
 
 function key(file, line) { return `${file}:${line}`; }
@@ -881,6 +890,13 @@ async function main() {
             if (result.summary.definitionLookupErrors > 0) gateFailed = true;
             if (result.summary.sourceStatusErrors > 0) gateFailed = true;
             if (result.summary.commandProof.failures > 0) gateFailed = true;
+            const coverageGate = evaluateOracleCoverage(result.summary, maxUnscoredRatio);
+            result.summary.precisionUnscoredRatio = Number(coverageGate.precisionUnscoredRatio.toFixed(4));
+            result.summary.calleeUnscoredRatio = Number(coverageGate.calleeUnscoredRatio.toFixed(4));
+            if (coverageGate.failures.length > 0) {
+                process.stdout.write(`  ⚠ ORACLE COVERAGE GATE FAILURE: ${coverageGate.failures.join('; ')}\n`);
+                gateFailed = true;
+            }
             if (result.summary.conservedRate < 1) {
                 process.stdout.write(`  ⚠ CONSERVATION GATE FAILURE: ${pct(result.summary.conservedRate)} of sampled accounts conserved\n`);
                 gateFailed = true;

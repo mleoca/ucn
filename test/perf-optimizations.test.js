@@ -94,6 +94,76 @@ function outer() {
     });
 });
 
+describe('perf: findCallees inner-method range cache', () => {
+    it('builds one sorted range table per file for an operation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': `
+class Worker {
+    start() { return this.step(); }
+    step() { return this.finish(); }
+    finish() { return 1; }
+}
+module.exports = { Worker };
+`,
+        });
+        try {
+            const index = idx(dir);
+            const filePath = path.join(dir, 'lib.js');
+            const classDef = index.symbols.get('Worker').find(def => def.type === 'class');
+            const methodDef = index.symbols.get('start').find(def => def.className === 'Worker');
+            index._beginOp();
+            try {
+                index.findCallees(classDef, { includeMethods: true });
+                const cached = index._opInnerSymbolRangesCache.get(filePath);
+                assert.ok(cached, 'class-method ranges should be cached');
+                assert.ok(cached.length >= 3, 'all class methods should share the file table');
+                index.findCallees(methodDef, { includeMethods: true });
+                assert.strictEqual(index._opInnerSymbolRangesCache.get(filePath), cached,
+                    'later definitions should reuse the same sorted table');
+            } finally {
+                index._endOp();
+            }
+            assert.strictEqual(index._opInnerSymbolRangesCache, null,
+                'operation cache should be released');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('perf: chained-receiver identity caches', () => {
+    it('memoizes annotation origins during an operation and releases the cache', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "chain-cache"\nversion = "0.1.0"',
+            'src/main.rs': `
+struct Builder;
+impl Builder {
+    fn new() -> Self { Self }
+    fn step(self) -> Self { self }
+}
+fn main() { Builder::new().step(); }
+`,
+        });
+        try {
+            const index = idx(dir);
+            const mainDef = index.symbols.get('main')[0];
+            index._beginOp();
+            try {
+                index.findCallees(mainDef, { includeMethods: true });
+                assert.ok(index._opFlowTypeOriginCache.size > 0,
+                    'chained return-type identity should be memoized');
+            } finally {
+                index._endOp();
+            }
+            assert.strictEqual(index._opFlowTypeOriginCache, null,
+                'annotation-origin cache should be released');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
 // ── Incremental callee index ──────────────────────────────────────────────────
 
 describe('perf: incremental callee index', () => {

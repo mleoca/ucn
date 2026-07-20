@@ -183,7 +183,7 @@ Current pinned release-board results:
 | clap | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
 | javapoet | jdtls | 100% | 100% | 100% / 100% | 100% |
 
-The command checks cover exact definition lookup, `find`, `fn`/`class`, `brief`, `typedef`, `usages`, `tests`, and `example` against the same external oracle population. The dead-code arm currently has zero false-dead claims on the release board. The performance arm measures cold build, cache load, first semantic query, steady-state p50/p95, and memory on the same repositories.
+The command checks cover exact definition lookup, `find`, `fn`/`class`, `brief`, `typedef`, `usages`, `tests`, and `example` against the same external oracle population. The dead-code arm currently has zero false-dead claims on the release board. The semantic gate also caps configuration-unscored caller and callee evidence at 10%, so platform filtering cannot silently make a small scored subset look representative. The performance arm runs every repository in an isolated process, takes three fresh-cache startup samples, reports median and maximum first-query latency, and independently gates steady-state p50/p95 and peak memory.
 
 Unverified precision is reported separately and is intentionally much lower on dispatch-heavy code. Unverified entries are review candidates, not confirmed claims. Rust feature-gated sites that one compiler configuration cannot load are reported as unscored rather than counted as passes.
 
@@ -426,7 +426,7 @@ function compareNames(a, b) {
 - **Coverage** - every command, every supported language, every surface (CLI, MCP, interactive)
 - **Systematic** - a harness exercises all command and flag combinations against real multi-language fixtures
 - **Test types** - unit, integration, per-language regression, formatter, cache, MCP edge cases, architecture parity guards
-- **Ground truth** - caller, callee, and oracle-judgable command behavior is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls. The publish gate uses five representative repositories; the scheduled board uses nineteen plus a rotating fresh-repository arm. Gates track confirmed precision, semantic recall, conservation, observed-zero agreement, dead-code false positives, and performance (see [Answers you can trust](#answers-you-can-trust))
+- **Ground truth** - caller, callee, and oracle-judgable command behavior is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls. The publish gate uses five representative repositories; the scheduled board uses nineteen plus a rotating fresh-repository arm. Gates track confirmed precision, semantic recall, conservation, observed-zero agreement, oracle configuration coverage, dead-code false positives, isolated startup latency, steady-state latency, and peak memory (see [Answers you can trust](#answers-you-can-trust))
 
 ---
 

@@ -54,6 +54,8 @@ class ProjectIndex {
         this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
         this._opTreeCache = null;        // per-operation parsed-tree cache (Map<filePath, tree|null>, bounded FIFO)
         this._opLinesCache = null;       // per-operation split-lines cache (Map<filePath, string[]>, bounded FIFO)
+        this._opInnerSymbolRangesCache = null; // per-operation sorted class-method ranges by file
+        this._opFlowTypeOriginCache = null; // per-operation annotation type identity results
         this.calleeIndex = null;         // name -> Set<filePath> — inverted call index (built lazily)
     }
 
@@ -89,6 +91,8 @@ class ProjectIndex {
             // these structures per symbol turns the walk quadratic.
             this._opReturnTypeFlowCache = new Map();
             this._opCallsByLineCache = new Map();
+            this._opInnerSymbolRangesCache = new Map();
+            this._opFlowTypeOriginCache = new Map();
             this._opImportReachCache = new Map();
             this._opDepth = 0;
         }
@@ -108,6 +112,8 @@ class ProjectIndex {
             this._opLinesCache = null;
             this._opReturnTypeFlowCache = null;
             this._opCallsByLineCache = null;
+            this._opInnerSymbolRangesCache = null;
+            this._opFlowTypeOriginCache = null;
             this._opImportReachCache = null;
             // Free cached file content from callsCache entries (retained during
             // operation for _readFile caching, not needed between operations)
