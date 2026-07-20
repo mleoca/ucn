@@ -221,6 +221,126 @@ def classify_ref(rel_file, line, utf16_col, name):
     return {"ok": True, "kind": classify(info, line, char_col, is_definition)}
 
 
+def _platform_value(node):
+    if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Name):
+        if node.value.id == "sys" and node.attr == "platform":
+            return sys.platform
+        if node.value.id == "os" and node.attr == "name":
+            return os.name
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+        values = [_platform_value(item) for item in node.elts]
+        return values if all(value is not None for value in values) else None
+    return None
+
+
+def _platform_test_value(node):
+    """Evaluate only explicit sys.platform/os.name comparisons."""
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, ast.Not):
+        value = _platform_test_value(node.operand)
+        return None if value is None else not value
+    if not isinstance(node, ast.Compare) or len(node.ops) != 1 or len(node.comparators) != 1:
+        return None
+    left = _platform_value(node.left)
+    right = _platform_value(node.comparators[0])
+    if left is None or right is None:
+        return None
+    op = node.ops[0]
+    if isinstance(op, ast.Eq):
+        return left == right
+    if isinstance(op, ast.NotEq):
+        return left != right
+    if isinstance(op, ast.In) and isinstance(right, list):
+        return left in right
+    if isinstance(op, ast.NotIn) and isinstance(right, list):
+        return left not in right
+    return None
+
+
+def _line_in_nodes(line, nodes):
+    return any(getattr(node, "lineno", 0) <= line <= getattr(node, "end_lineno", 0)
+               for node in nodes)
+
+
+def _line_platform_gated(tree, line):
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.If):
+            continue
+        active = _platform_test_value(node.test)
+        if active is None:
+            continue
+        if _line_in_nodes(line, node.body) and not active:
+            return True
+        if _line_in_nodes(line, node.orelse) and active:
+            return True
+    return False
+
+
+def _contains_import_error(nodes):
+    for root in nodes:
+        for node in ast.walk(root):
+            if not isinstance(node, ast.Raise) or node.exc is None:
+                continue
+            exc = node.exc.func if isinstance(node.exc, ast.Call) else node.exc
+            if isinstance(exc, ast.Name) and exc.id == "ImportError":
+                return True
+    return False
+
+
+def _module_rejects_current_platform(abs_path):
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError, ValueError):
+        return False
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        active = _platform_test_value(node.test)
+        if active is None:
+            continue
+        selected = node.body if active else node.orelse
+        if _contains_import_error(selected):
+            return True
+    return False
+
+
+def _module_file(module):
+    parts = module.split(".")
+    for base in (PROJECT_ROOT, ROOT):
+        plain = os.path.join(base, *parts) + ".py"
+        package = os.path.join(base, *parts, "__init__.py")
+        if os.path.isfile(plain):
+            return plain
+        if os.path.isfile(package):
+            return package
+    return None
+
+
+def source_status(rel_file, line):
+    """Report code excluded by the active interpreter platform.
+
+    This is deliberately narrow: explicit sys.platform/os.name branches, or
+    a direct project import whose module raises ImportError on this platform.
+    Ordinary unresolved code never becomes unscored.
+    """
+    abs_path = os.path.join(ROOT, rel_file)
+    try:
+        with open(abs_path, encoding="utf-8", errors="replace") as f:
+            tree = ast.parse(f.read())
+    except (OSError, SyntaxError, ValueError):
+        return {"ok": True, "configurationGated": False}
+    if _line_platform_gated(tree, line):
+        return {"ok": True, "configurationGated": True}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module:
+            imported = _module_file(node.module)
+            if imported and _module_rejects_current_platform(imported):
+                return {"ok": True, "configurationGated": True}
+    return {"ok": True, "configurationGated": False}
+
+
 def find_references(rel_file, line, name):
     if jedi is None:
         return {"ok": False, "error": "jedi not importable in %s" % sys.executable}
@@ -282,6 +402,8 @@ def main():
                 resp = name_position(req["file"], req["line"], req["name"])
             elif op == "classify_ref":
                 resp = classify_ref(req["file"], req["line"], req["utf16_col"], req["name"])
+            elif op == "source_status":
+                resp = source_status(req["file"], req["line"])
             elif op == "shutdown":
                 break
             else:

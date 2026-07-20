@@ -759,8 +759,22 @@ function deadcode(index, options = {}) {
                                 } else {
                                     const binding = (fileEntry.importBindings || [])
                                         .find(b => b.name === receiver);
-                                    const resolved = binding && fileEntry.moduleResolved &&
-                                        fileEntry.moduleResolved[binding.module];
+                                    let resolved;
+                                    if (binding && fileEntry.moduleResolved) {
+                                        // `from . import types` binds the
+                                        // concrete `.types` submodule even
+                                        // though the import record's module is
+                                        // the package (`.`). Graph building
+                                        // records both resolutions. Prefer the
+                                        // composed submodule so qualified type
+                                        // and value references are attributed
+                                        // to the file that actually owns them.
+                                        const mod = String(binding.module);
+                                        const submodule = mod.endsWith('.')
+                                            ? mod + receiver : mod + '.' + receiver;
+                                        resolved = fileEntry.moduleResolved[submodule] ||
+                                            fileEntry.moduleResolved[mod];
+                                    }
                                     if (resolved) {
                                         dottedScope = resolved;
                                     } else if (!isDecoratorRef && !accessorNames.has(name)) {
@@ -850,6 +864,15 @@ function deadcode(index, options = {}) {
         for (const symbol of symbols) {
             // Skip non-audited types (callableTypes defined above)
             if (!auditTypeSet.has(symbol.type)) {
+                continue;
+            }
+
+            // Named function expressions are consumed by their expression
+            // position (argument / assigned value) — the enclosing call
+            // executes them, and the name itself creates no deletable
+            // surface (ECMA-262 body-only scope). Auditing them claims
+            // callback handlers dead (`app.on('ready', function boot(){})`).
+            if (symbol.bodyScopedName) {
                 continue;
             }
 

@@ -29,6 +29,7 @@
  * Usage:
  *   node eval/run-deadcode-eval.js                  # all repos with an oracle
  *   node eval/run-deadcode-eval.js --repo zod,gson  # subset
+ *   node eval/run-deadcode-eval.js --release         # publish-blocking shared board
  *   node eval/run-deadcode-eval.js --sample 60      # claims per repo per arm
  *   node eval/run-deadcode-eval.js --arm default    # default | exported | both
  *   node eval/run-deadcode-eval.js --oracle jedi    # force an oracle
@@ -46,7 +47,7 @@ const { execute } = require('../core/execute');
 const { isTestFile } = require('../core/discovery');
 const { DEF_NAME_LINE_KINDS } = require('../core/deadcode');
 const { maskBlockComments, escapeRegExp } = require('../core/shared');
-const { REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
+const { REPOS, RELEASE_REPOS, cloneAtCommit, resolveTarget, seededRandom } = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
@@ -56,6 +57,7 @@ const { rustAnalyzerOracle } = require('./oracles/rust-analyzer-oracle');
 const { jdtlsOracle } = require('./oracles/jdtls-oracle');
 
 const args = process.argv.slice(2);
+const releaseOnly = args.includes('--release');
 const repoFilter = readArgValue(args, '--repo');
 const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim())) : null;
 const sampleSize = Number(readArgValue(args, '--sample') || 60);
@@ -284,7 +286,8 @@ async function evaluateRepo(repo, oracle) {
 }
 
 async function main() {
-    const oracleRepos = REPOS.filter(r =>
+    const baseRepos = releaseOnly ? RELEASE_REPOS : REPOS;
+    const oracleRepos = baseRepos.filter(r =>
         ORACLES.some(o => o.languages.includes(r.language)) &&
         (!repoFilterSet || repoFilterSet.has(r.name)));
     if (oracleRepos.length === 0) {
@@ -317,18 +320,18 @@ async function main() {
     }
 
     const lines = [
-        `# Deadcode eval — ${date}`,
+        `# Deadcode eval: ${date}`,
         '',
         'Every symbol UCN deadcode reports unused is checked against compiler/LSP',
         'ground truth. `false-dead` = the oracle found a reference UCN\'s usage',
-        'scan missed — deleting the symbol breaks the code. Gate: default-arm',
+        'scan missed; deleting the symbol breaks the code. Gate: default-arm',
         'false-dead = 0.',
         '',
         '| repo | oracle | arm | claims | sampled | agreed-dead | false-dead | outside-universe | unpinnable |',
         '|---|---|---|---|---|---|---|---|---|',
     ];
     for (const r of results) {
-        if (r.error) { lines.push(`| ${r.repo} | — | — | — | — | — | — | — | ERROR: ${r.error} |`); continue; }
+        if (r.error) { lines.push(`| ${r.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ERROR: ${r.error} |`); continue; }
         for (const { summary: s } of r.arms) {
             lines.push(`| ${r.repo} | ${r.oracle} | ${s.arm} | ${s.claims} | ${s.sampled} | ${s.agreedDead} | **${s.falseDead}** | ${s.outsideUniverse} | ${s.unpinnable} |`);
         }

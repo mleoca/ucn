@@ -671,7 +671,7 @@ function constructorTypeInfo(funcNode) {
         const attr = funcNode.childForFieldName('attribute');
         const object = funcNode.childForFieldName('object');
         return attr && /^[A-Z]/.test(attr.text)
-            ? { type: attr.text, qualifier: object?.type === 'identifier' ? object.text : undefined }
+            ? { type: attr.text, qualifier: object?.text || undefined }
             : undefined;
     }
     return undefined;
@@ -685,6 +685,8 @@ function findCallsInCode(code, parser) {
     const nonCallableNames = new Set();  // Track names assigned non-callable values
     const localVarTypes = new Map();  // Track local variable types: varName -> typeName (for receiverType inference)
     const localVarTypeQualifiers = new Map(); // varName -> imported module alias that owns the inferred type
+    const constructedReceiverVars = new Set(); // exact constructor-result bindings
+    const withBindingVars = new Set(); // names produced by a context-manager as-target
     // Member-access aliases (fix #218): `append = output.append` makes a later
     // bare `append(part)` a METHOD call on `output` — it must carry the
     // receiver's evidence, never bind by bare name to a same-file def
@@ -697,6 +699,8 @@ function findCallsInCode(code, parser) {
     const moduleAliases = new Set();  // Names bound to MODULES (import httpx / import numpy as np)
     const localVarTypesStack = [];  // Stack for function-scoped save/restore of localVarTypes
     const localVarTypeQualifiersStack = [];
+    const constructedReceiverVarsStack = [];
+    const withBindingVarsStack = [];
 
     // Helper: extract first string-arg literal from a call node.
     // Used by route extraction to capture path arg of requests.get('/users'), httpx.get('/users') etc.
@@ -848,6 +852,16 @@ function findCallsInCode(code, parser) {
                 }
             }
             if (p.type === 'function_definition' || p.type === 'async_function_definition') {
+                const params = p.childForFieldName('parameters');
+                if (params) {
+                    for (let i = 0; i < params.namedChildCount; i++) {
+                        const prm = params.namedChild(i);
+                        const prmName = prm.type === 'identifier'
+                            ? prm
+                            : (prm.childForFieldName('name') || prm.namedChild(0));
+                        if (prmName?.type === 'identifier' && prmName.text === name) return true;
+                    }
+                }
                 const body = p.childForFieldName('body');
                 return body ? _bindsNameInScope(body, name) : false;
             }
@@ -888,6 +902,8 @@ function findCallsInCode(code, parser) {
             // Save localVarTypes so inner declarations don't leak to sibling functions
             localVarTypesStack.push(new Map(localVarTypes));
             localVarTypeQualifiersStack.push(new Map(localVarTypeQualifiers));
+            constructedReceiverVarsStack.push(new Set(constructedReceiverVars));
+            withBindingVarsStack.push(new Set(withBindingVars));
             memberAliasesStack.push(new Map(memberAliases));
         }
 
@@ -912,11 +928,18 @@ function findCallsInCode(code, parser) {
                 const ctx = value.namedChild(0);
                 const target = value.namedChildCount > 1 ? value.namedChild(value.namedChildCount - 1) : null;
                 const targetId = target?.type === 'as_pattern_target' ? target.namedChild(0) : null;
+                const recordWithTargets = n => {
+                    if (!n) return;
+                    if (n.type === 'identifier') withBindingVars.add(n.text);
+                    for (let i = 0; i < n.namedChildCount; i++) recordWithTargets(n.namedChild(i));
+                };
+                recordWithTargets(targetId || target);
                 if (ctx?.type === 'call' && targetId?.type === 'identifier') {
                     const ctor = constructorTypeInfo(ctx.childForFieldName('function'));
                     if (ctor) {
                         localVarTypes.set(targetId.text, ctor.type);
-                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier)) {
+                        constructedReceiverVars.add(targetId.text);
+                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier.split('.')[0])) {
                             localVarTypeQualifiers.set(targetId.text, ctor.qualifier);
                         } else {
                             localVarTypeQualifiers.delete(targetId.text);
@@ -940,6 +963,8 @@ function findCallsInCode(code, parser) {
                     }
                 }
                 memberAliases.delete(left.text); // any assignment rebinds the name
+                constructedReceiverVars.delete(left.text);
+                withBindingVars.delete(left.text);
                 // Rebinding without a known type makes any previously inferred
                 // type stale — nearest-preceding-assignment semantics (#199's
                 // documented rule). Without this, `x = ""; x = render(); x.m()`
@@ -1017,7 +1042,8 @@ function findCallsInCode(code, parser) {
                     const ctor = constructorTypeInfo(right.childForFieldName('function'));
                     if (ctor) {
                         localVarTypes.set(left.text, ctor.type);
-                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier)) {
+                        constructedReceiverVars.add(left.text);
+                        if (ctor.qualifier && moduleAliases.has(ctor.qualifier.split('.')[0])) {
                             localVarTypeQualifiers.set(left.text, ctor.qualifier);
                         } else {
                             localVarTypeQualifiers.delete(left.text);
@@ -1101,6 +1127,7 @@ function findCallsInCode(code, parser) {
                         ...(argSpread && { argSpread: true }),
                         enclosingFunction,
                         uncertain,
+                        ...(isShadowedByLocal(funcNode, funcNode.text) && { localShadow: true }),
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
                 }
@@ -1190,7 +1217,11 @@ function findCallsInCode(code, parser) {
                         receiver,
                         ...(receiverType && { receiverType }),
                         ...(receiverTypeQualifier && { receiverTypeQualifier }),
+                        ...(receiver && constructedReceiverVars.has(receiver) && { receiverConstructed: true }),
+                        ...(receiver && withBindingVars.has(receiver) && { receiverWithBinding: true }),
                         ...(receiverIsModule && { receiverIsModule: true }),
+                        ...(receiver && objNode?.type === 'identifier' &&
+                            isShadowedByLocal(objNode, receiver) && { receiverLocalBinding: true }),
                         ...(selfAttribute && { selfAttribute }),
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
@@ -1273,6 +1304,12 @@ function findCallsInCode(code, parser) {
                     localVarTypeQualifiers.clear();
                     for (const [k, v] of savedQualifiers) localVarTypeQualifiers.set(k, v);
                 }
+                const savedConstructed = constructedReceiverVarsStack.pop();
+                constructedReceiverVars.clear();
+                if (savedConstructed) for (const name of savedConstructed) constructedReceiverVars.add(name);
+                const savedWithBindings = withBindingVarsStack.pop();
+                withBindingVars.clear();
+                if (savedWithBindings) for (const name of savedWithBindings) withBindingVars.add(name);
                 const savedAliases = memberAliasesStack.pop();
                 if (savedAliases) {
                     memberAliases.clear();
@@ -1304,13 +1341,33 @@ function findImportsInCode(code, parser) {
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
                 if (child.type === 'dotted_name') {
-                    // import os
-                    imports.push({
-                        module: child.text,
-                        names: [child.text.split('.').pop()],
-                        type: 'import',
-                        line
-                    });
+                    // `import pkg.submodule` binds `pkg`, while also loading
+                    // the complete submodule. Record both ownership edges so
+                    // `pkg.public_api()` can resolve through pkg/__init__.py
+                    // and `pkg.submodule.member` can still resolve to the
+                    // imported child module.
+                    const parts = child.text.split('.');
+                    if (parts.length > 1) {
+                        imports.push({
+                            module: parts[0],
+                            names: [parts[0]],
+                            type: 'import',
+                            line
+                        });
+                        imports.push({
+                            module: child.text,
+                            names: [],
+                            type: 'import-submodule',
+                            line
+                        });
+                    } else {
+                        imports.push({
+                            module: child.text,
+                            names: [child.text],
+                            type: 'import',
+                            line
+                        });
+                    }
                 } else if (child.type === 'aliased_import') {
                     // import sys as system
                     const nameNode = child.namedChild(0);
@@ -1536,6 +1593,16 @@ function findUsagesInCode(code, name, parser, tree) {
                 if (object && object.type === 'identifier') {
                     usages.push({ line, column, usageType, receiver: object.text });
                     return true;
+                }
+                // Constructed receiver: ColorTriplet(...).normalized is a
+                // class-associated property reference, not an unowned bare
+                // name. This matters to class-scoped `tests` queries.
+                if (object && object.type === 'call') {
+                    const ctor = object.childForFieldName('function');
+                    if (ctor?.type === 'identifier') {
+                        usages.push({ line, column, usageType, receiver: ctor.text });
+                        return true;
+                    }
                 }
                 // self.attr receiver (unittest setUp idiom: self.w = Widget(3);
                 // self.w.render()) — record the ATTR name so the instance-type

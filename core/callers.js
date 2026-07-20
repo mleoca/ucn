@@ -133,6 +133,55 @@ function getCachedCalls(index, filePath, options = {}) {
     }
 }
 
+function _javaPackageKey(relativePath) {
+    const normalized = String(relativePath || '').replace(/\\/g, '/');
+    const marker = '/java/';
+    const at = normalized.lastIndexOf(marker);
+    const packagePath = at >= 0 ? normalized.slice(at + marker.length) : normalized;
+    return path.posix.dirname(packagePath);
+}
+
+function _javaConstructorDisposition(index, filePath, fileEntry, call, targetDefs) {
+    const typeKinds = new Set(['class', 'record', 'enum']);
+    const targets = (targetDefs || []).filter(d => typeKinds.has(d.type));
+    if (targets.length === 0) return 'target';
+    const all = (index.symbols.get(call.name) || []).filter(d => typeKinds.has(d.type));
+    const targetKeys = new Set(targets.map(d => `${d.file}:${d.startLine}`));
+    const isTarget = d => targetKeys.has(`${d.file}:${d.startLine}`);
+
+    if (call.receiver) {
+        const owned = all.filter(d => d.enclosingType === call.receiver);
+        if (owned.some(isTarget)) return 'target';
+        if (owned.length > 0) return 'other';
+        // Lowercase qualifiers are package fragments; the Java parser retains
+        // only the terminal qualifier, so identity is not provable here.
+        return 'unknown';
+    }
+
+    const bindings = (fileEntry.importBindings || []).filter(b =>
+        b.name === call.name || b.alias === call.name);
+    if (bindings.length > 0) {
+        const resolvedFiles = bindings.map(b => fileEntry.moduleResolved?.[b.module])
+            .filter(Boolean).map(rel => path.join(index.root, rel));
+        if (resolvedFiles.some(fp => targets.some(d => d.file === fp))) return 'target';
+        if (resolvedFiles.length > 0) return 'other';
+        return 'unknown';
+    }
+
+    const caller = index.findEnclosingFunction(filePath, call.line, true);
+    if (targets.some(d => d.file === filePath &&
+        (!d.enclosingType || d.enclosingType === caller?.className))) return 'target';
+
+    const callerPackage = _javaPackageKey(fileEntry.relativePath);
+    const samePackage = all.filter(d => !d.enclosingType &&
+        _javaPackageKey(d.relativePath) === callerPackage);
+    if (samePackage.some(isTarget)) return 'target';
+    if (samePackage.length > 0) return 'other';
+
+    if (all.length > 0 && all.every(isTarget)) return 'target';
+    return 'unknown';
+}
+
 /**
  * Find all call sites that invoke the named symbol.
  *
@@ -313,6 +362,24 @@ function findCallers(index, name, options = {}) {
             exportAliasRenamers.get(e.alias).add(fp);
         }
     }
+    // CommonJS callable default export: `const express = require('./lib')`
+    // followed by `express()` denotes the local function assigned to
+    // `module.exports`, even though the call-site spelling differs. This is
+    // exact module ownership: require bindings preserve their default-like
+    // shape and the resolved module records the assigned local definition.
+    for (const [fp, fe] of index.files) {
+        for (const b of (fe.importBindings || [])) {
+            if (!b.defaultLike) continue;
+            const rel = fe.moduleResolved && fe.moduleResolved[b.module];
+            if (!rel) continue;
+            const moduleFile = path.join(index.root, rel);
+            if (!aliasTargetFiles.has(moduleFile)) continue;
+            const exported = index.files.get(moduleFile)?.exportDetails || [];
+            if (!exported.some(e => e.type === 'module.exports' && e.name === name)) continue;
+            if (!importAliasLocals.has(fp)) importAliasLocals.set(fp, new Set());
+            importAliasLocals.get(fp).add(b.alias || b.name);
+        }
+    }
     // Files that can reach each renaming module through imports — re-export
     // chains run deep (test → mini/index → external → schemas), so a fixed
     // hop count misses real surfaces. Bounded reverse-import BFS; matching
@@ -342,6 +409,14 @@ function findCallers(index, name, options = {}) {
         for (const local of locals) aliasNames.add(local);
     }
     const hasAliasSurfaces = aliasNames.size > 0;
+    const shadowCanReachPinnedTarget = (filePath, call) => {
+        if (call.resolvedName === name || call.resolvedNames?.includes(name)) return true;
+        const scope = call.enclosingFunction;
+        return !!scope && (options.targetDefinitions || definitions).some(d =>
+            d.file === filePath && d.name === call.name &&
+            d.startLine >= scope.startLine && d.endLine <= scope.endLine &&
+            d.startLine <= call.line);
+    };
 
     // Phase 1: Find matching calls without reading file content.
     // Collect pending callers keyed by file — content is read only in Phase 2.
@@ -415,6 +490,64 @@ function findCallers(index, name, options = {}) {
                     }
                     if (!calledAs) continue;
                 }
+                if (!calledAs && call.name !== name &&
+                    (call.resolvedName === name ||
+                     (call.resolvedNames && call.resolvedNames.includes(name)))) {
+                    calledAs = call.name;
+                }
+
+                // Java constructor identity is package/import/nesting scoped.
+                // A bare `new Tag()` imported from parser.Tag cannot construct
+                // either Evaluator.Tag or Token.Tag merely because all three
+                // share the terminal name. Keep unresolved ownership visible;
+                // only compiler-shaped scope evidence enters the confirmed tier.
+                if (call.isConstructor && fileEntry.language === 'java') {
+                    const constructorDisposition = _javaConstructorDisposition(
+                        index, filePath, fileEntry, call,
+                        options.targetDefinitions || definitions);
+                    if (constructorDisposition === 'other') {
+                        recordExcluded(filePath, call.line, 'other-definition-import');
+                        continue;
+                    }
+                    if (constructorDisposition === 'unknown') {
+                        if (collectAccount) {
+                            routeUnverified(filePath, fileEntry, call,
+                                'ambiguous-binding', calledAs);
+                        }
+                        continue;
+                    }
+                }
+
+                // A named function expression's name is visible only inside
+                // its own body (ECMA-262). A pinned NFE target can be called
+                // only by code within its range (recursion); any other site
+                // provably binds a different definition of the name.
+                const pinnedForScope = options.targetDefinitions || definitions;
+                if (!call.isMethod && options.targetDefinitions &&
+                    pinnedForScope.length > 0 &&
+                    pinnedForScope.every(d => d.bodyScopedName) &&
+                    !pinnedForScope.some(d => d.file === filePath &&
+                        call.line >= d.startLine && call.line <= d.endLine)) {
+                    recordExcluded(filePath, call.line, 'other-definition');
+                    continue;
+                }
+
+                // A cast receiver type is a compile-true STATIC type, but a
+                // cast naming a type with NO project definition places the
+                // value in code UCN cannot see (java.lang.Integer, external
+                // interfaces). Name-knowledge is never routing evidence
+                // (#222(4)): the invisible type may extend the target's
+                // class, so an unresolved cast neither confirms nor excludes
+                // — drop to the receiver-evidence-free physics (#210
+                // external-contract / #204 owner rules decide, both modes),
+                // exactly the pre-cast-capture record shape. Resolved casts
+                // keep their honest typed routing.
+                if (call.receiverTypeCast && call.receiverType &&
+                    !(index.symbols.get(call.receiverType) || [])
+                        .some(d => NON_CALLABLE_TYPES.has(d.type) && d.type !== 'field')) {
+                    call = { ...call, receiver: undefined, receiverType: undefined,
+                        receiverTypeCast: undefined };
+                }
 
                 // Return-type flow: an untyped method receiver may be a
                 // variable assigned from a call with a known return annotation
@@ -484,6 +617,55 @@ function findCallers(index, name, options = {}) {
                         call = { ...call, receiverType: undefined,
                             receiverQualifiedFlow: origin.via };
                     }
+                }
+
+                // An unqualified constructor name can still have exact import
+                // provenance: `from io import StringIO; out = StringIO()`.
+                // A resolved project import pins the type to that file; a
+                // clearly external import blocks project-local single-owner
+                // confirmation. Annotation-only receivers do not take this
+                // path because they may hold a project subtype.
+                if (call.isMethod && call.receiverConstructed && call.receiverType &&
+                    !call.receiverTypeQualifier &&
+                    langTraits(fileEntry.language)?.typeSystem === 'structural') {
+                    const bindings = (fileEntry.importBindings || []).filter(b =>
+                        b.name === call.receiverType || b.alias === call.receiverType);
+                    if (bindings.length > 0) {
+                        const project = bindings.map(b => ({
+                            binding: b,
+                            rel: fileEntry.moduleResolved && fileEntry.moduleResolved[b.module],
+                        })).find(x => x.rel);
+                        if (project) {
+                            call = { ...call,
+                                receiverType: project.binding.name,
+                                receiverTypeFlowFile: path.join(index.root, project.rel),
+                            };
+                        } else {
+                            const projectish = bindings.some(b => {
+                                const mod = String(b.module || '');
+                                const first = mod.split(/[./]/).filter(Boolean)[0];
+                                return mod.startsWith('.') ||
+                                    (first && _projectTopLevelNames(index).has(first));
+                            });
+                            const via = `${bindings[0].module}.${bindings[0].name}`;
+                            call = { ...call, receiverType: undefined,
+                                ...(projectish
+                                    ? { receiverQualifiedFlow: `${via} — unresolved module` }
+                                    : { receiverExternalFlow: via }) };
+                        }
+                    }
+                }
+
+                // An untyped value produced by a context manager (`with ...
+                // as out`) has no receiver identity. A unique project method
+                // spelling is not enough to confirm it; keep the edge visible
+                // until an annotation/constructor/return flow proves the type.
+                if (collectAccount && call.isMethod && call.receiverWithBinding &&
+                    !call.receiverType && !call.receiverExternalFlow && !call.receiverQualifiedFlow) {
+                    routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                        dispatchVia: 'context-manager result',
+                    });
+                    continue;
                 }
 
                 // Chained-receiver typing (fix #219): the receiver IS a call —
@@ -750,6 +932,24 @@ function findCallers(index, name, options = {}) {
                     // same-name symbol shadows it invisibly.
                     const cbTargetFiles = new Set(cbTargetDefs.map(d => d.file).filter(Boolean));
                     const cbSameFile = cbTargetFiles.has(filePath);
+                    // A module-local definition owns a bare callback name
+                    // before any file-level import graph evidence. Importing
+                    // the target's package elsewhere in the file cannot make
+                    // `register(group)` refer past a local `def group()`.
+                    // Ownership requires a def a BARE name can actually bind
+                    // (#218a/#222(3)/#269(2)): class members, property-
+                    // assigned functions, and body-scoped function-expression
+                    // names never own module scope — a same-file `class X {
+                    // validate() {} }` must not exclude the imported
+                    // validate passed as a callback.
+                    if (!cbSameFile && (index.symbols.get(call.name) || []).some(d =>
+                        d.file === filePath && !cbTargetFiles.has(d.file) &&
+                        d.startLine <= call.line &&
+                        !d.className && !d.memberAssigned && !d.bodyScopedName &&
+                        !NON_CALLABLE_TYPES.has(d.type))) {
+                        recordExcluded(filePath, call.line, 'other-definition-import');
+                        continue;
+                    }
                     const cbSamePackage = !cbSameFile &&
                         langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
                         cbTargetDefs.some(d => d.file &&
@@ -772,7 +972,12 @@ function findCallers(index, name, options = {}) {
                             // same-name definition in this file (or one this file
                             // imports) that is NOT the target — same disposition
                             // as the import-graph disambiguation for plain calls.
-                            const cbOtherDefFiles = new Set(definitions
+                            // Bare-name bindable defs only (#222(3)): a foreign
+                            // class's same-name METHOD is unreachable by a bare
+                            // reference and proves no mis-link.
+                            const cbOtherDefFiles = new Set((index.symbols.get(call.name) || [])
+                                .filter(d => !d.className && !d.memberAssigned &&
+                                    !d.bodyScopedName && !NON_CALLABLE_TYPES.has(d.type))
                                 .map(d => d.file).filter(f => f && !cbTargetFiles.has(f)));
                             if (cbOtherDefFiles.has(filePath) ||
                                 (cbImports && setSome(cbImports, imp => cbOtherDefFiles.has(imp)))) {
@@ -791,7 +996,7 @@ function findCallers(index, name, options = {}) {
                     // locals and inner-arrow params (fix #203 — parser-side
                     // lexical scope walk sets call.localShadow; JS block-accurate,
                     // Python function-wide assignment semantics).
-                    if (call.localShadow ||
+                    if ((call.localShadow && !shadowCanReachPinnedTarget(filePath, call)) ||
                         (callerSymbol && Array.isArray(callerSymbol.paramsStructured) &&
                             callerSymbol.paramsStructured.some(p => p && p.name === call.name))) {
                         recordExcluded(filePath, call.line, 'local-shadow');
@@ -822,7 +1027,8 @@ function findCallers(index, name, options = {}) {
                 // an isFunctionReference-only argument ref (`router.use(path,
                 // f)` inside `use(fn)`'s forEach closure) used to slip past to
                 // binding resolution and exact-confirm on the shadowed name.
-                if (call.localShadow && !call.isPotentialCallback) {
+                if (call.localShadow && !call.isPotentialCallback &&
+                    !shadowCanReachPinnedTarget(filePath, call)) {
                     recordExcluded(filePath, call.line, 'local-shadow');
                     continue;
                 }
@@ -838,7 +1044,7 @@ function findCallers(index, name, options = {}) {
                 // Super records resolve only through the parent-chain walk.
                 const selfReceivers = new Set(['self', 'cls', 'this']);
                 const indirectStructuralReceiver = call.isMethod && !call.receiver &&
-                    !!(call.receiverRoot || call.receiverField || call.receiverCall);
+                    !!(call.receiverRoot || call.receiverField || call.receiverCall || call.receiverType);
                 const skipLocalBinding = (call.receiver && !selfReceivers.has(call.receiver)) ||
                     indirectStructuralReceiver;
                 if (!bindingId && !skipLocalBinding) {
@@ -1389,7 +1595,7 @@ function findCallers(index, name, options = {}) {
                 // modules must not exclude: a binding to an unresolved module
                 // whose first segment matches a project directory routes
                 // visible instead.
-                if (!bindingId && !call.isMethod && !calledAs &&
+                if (!bindingId && !call.isMethod &&
                     langTraits(fileEntry.language)?.typeSystem === 'structural' &&
                     (fileEntry.importBindings || []).length > 0) {
                     // Renamed destructures look up by the RESOLVED name (fix
@@ -1400,7 +1606,31 @@ function findCallers(index, name, options = {}) {
                     // ownership chase and the call scope-confirmed against
                     // hooks.js's unrelated validate.
                     const lookupName = call.resolvedName || call.name;
-                    let nameBindings = fileEntry.importBindings.filter(b => b.name === lookupName);
+                    // Alias-matched surfaces (calledAs — import/export renames)
+                    // spell the call by the LOCAL alias while importBindings
+                    // store the ORIGINAL name: `import { _gt as gt }` binds
+                    // name '_gt' with alias 'gt'. Match the alias side too so
+                    // the #217 chase adjudicates the rename by NAME (borrowed
+                    // renames still exclude other-definition-import) instead
+                    // of the empty lookup excluding every legitimate renamed
+                    // call as name-not-in-scope.
+                    let nameBindings = fileEntry.importBindings.filter(b =>
+                        b.name === lookupName ||
+                        (calledAs && b.alias === lookupName));
+                    // Python bindings carry no alias field — the pairing
+                    // lives in fileEntry.importAliases ({original, local});
+                    // map the alias back to its original's binding so the
+                    // chase adjudicates `from lib import transform as t`.
+                    if (calledAs && nameBindings.length === 0 &&
+                        (fileEntry.importAliases || []).length > 0) {
+                        const originals = new Set(fileEntry.importAliases
+                            .filter(a => a && a.local === lookupName && a.original)
+                            .map(a => a.original));
+                        if (originals.size > 0) {
+                            nameBindings = fileEntry.importBindings.filter(b =>
+                                originals.has(b.name));
+                        }
+                    }
                     // Exact alias pairing (fix #269): two renames of one
                     // source name from DIFFERENT modules — the record's local
                     // alias (call.name) picks its own binding; source-name
@@ -1871,7 +2101,8 @@ function findCallers(index, name, options = {}) {
                                     // from the producing annotation's scope — the name
                                     // was written THERE, not in the consuming file.
                                     const identity = _resolveReceiverTypeIdentity(
-                                        index, call.receiverTypeFlowFile || filePath, knownType, targetDefs);
+                                        index, call.receiverTypeFlowFile || filePath, knownType, targetDefs,
+                                        call.receiverTypeFlowFile ? undefined : call.line);
                                     if (identity === 'other') {
                                         receiverTypeValidated = false;
                                     } else if (identity === 'unknown') {
@@ -1898,6 +2129,19 @@ function findCallers(index, name, options = {}) {
                                             receiverTypeUnresolved = true;
                                         }
                                     }
+                                }
+                            } else if (structural) {
+                                // Name-only subtype sets cannot represent an
+                                // imported parent that is exposed under a
+                                // different type name. Resolve the receiver's
+                                // exact declaration and walk its file-scoped
+                                // ancestry before treating it as unrelated.
+                                const identity = _resolveStructuralFlowTypeIdentity(
+                                    index, call.receiverTypeFlowFile || filePath, knownType, targetDefs);
+                                if (identity === 'target') {
+                                    receiverTypeValidated = true;
+                                } else if (identity === 'unknown') {
+                                    receiverTypeUnresolved = true;
                                 }
                             }
                             const matchesTarget = receiverTypeValidated ||
@@ -2052,7 +2296,7 @@ function findCallers(index, name, options = {}) {
                                                 // target's package, not a same-named foreign type.
                                                 let identity = 'target';
                                                 if (targetDefs.some(d => (d.className || (d.receiver || '').replace(/^\*/, '')) === inferredType)) {
-                                                    identity = _resolveReceiverTypeIdentity(index, filePath, inferredType, targetDefs);
+                                                    identity = _resolveReceiverTypeIdentity(index, filePath, inferredType, targetDefs, call.line);
                                                 }
                                                 if (identity === 'target') {
                                                     inferredMatch = true;
@@ -2110,7 +2354,7 @@ function findCallers(index, name, options = {}) {
                                 // its type is unknown, identity proves nothing.
                                 if (matchesTarget && call.isPathCall &&
                                     langTraits(fileEntry.language)?.typeQualifiedCallStyle === 'path') {
-                                    const identity = _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs);
+                                    const identity = _resolveReceiverTypeIdentity(index, filePath, call.receiver, targetDefs, call.line);
                                     if (identity === 'other') {
                                         isUncertain = true;
                                         typeMismatch = true;
@@ -2383,7 +2627,7 @@ function findCallers(index, name, options = {}) {
                     // name fallback above handles multi-definition names; this
                     // covers single-definition targets that skip it.
                     if (typeQualifiedReceiver) {
-                        const identity = _resolveReceiverTypeIdentity(index, filePath, receiverName, targetDefs2);
+                        const identity = _resolveReceiverTypeIdentity(index, filePath, receiverName, targetDefs2, call.line);
                         if (identity === 'other') {
                             recordExcluded(filePath, call.line, 'path-type-mismatch');
                             continue;
@@ -2723,6 +2967,30 @@ function findCallers(index, name, options = {}) {
                     if (call.isMethod && !call.receiverIsModule && !recvSubmoduleRel) {
                         const tTypes = dispatchTargetTypes(targetDefs2);
                         const typeQualifiedReceiver = !!(call.receiver && tTypes.has(call.receiver));
+                        // A local receiver whose nearest assignment the flow
+                        // machinery examined and could NOT type holds a value
+                        // of unknown provenance (`local = factory()`) — the
+                        // #222(4) evidence class with a local producer, so
+                        // single-owner spelling must not confirm it. A bare
+                        // never-assigned parameter has no such evidence and
+                        // keeps the measured #204/#209 single-owner physics
+                        // (`run(codec) { codec.decodeFrames(...) }` stays
+                        // confirmed when Codec is the one project owner).
+                        if (!typeQualifiedReceiver && call.receiverLocalBinding &&
+                            !call.receiverType && !fieldHopType && !fieldDispatchType &&
+                            !call.receiverExternalFlow && !call.receiverQualifiedFlow) {
+                            let demoteFlowMap = returnFlowCache.get(filePath);
+                            if (demoteFlowMap === undefined) {
+                                demoteFlowMap = _buildReturnTypeFlowMap(index, filePath, calls);
+                                returnFlowCache.set(filePath, demoteFlowMap);
+                            }
+                            if (_receiverAssignedUntyped(demoteFlowMap, call)) {
+                                routeUnverified(filePath, fileEntry, call, 'possible-dispatch', calledAs, {
+                                    dispatchVia: call.receiverRootType || 'local receiver',
+                                });
+                                continue;
+                            }
+                        }
                         // External-producer receiver (fix #222, httpx-measured
                         // — the #220 Go rule for structural languages): the
                         // variable was assigned from a call into an external
@@ -2898,9 +3166,13 @@ function findCallers(index, name, options = {}) {
                         // Method calls where binding resolution was skipped (non-self receiver)
                         // and the receiver has no binding evidence → uncertain (JS/TS/Python only)
                         isUncertain: !!isUncertain || uncertainMethodReceiver,
-                        hasReceiverType: langTraits(fileEntry.language)?.typeSystem === 'structural'
-                            ? (receiverTypeValidated || resolvedByTypedAttribute)
-                            : !!call.receiverType,
+                        // Only a receiver type that was validated against the
+                        // pinned target earns receiver-hint confidence. Raw
+                        // nominal annotations may name an interface, external
+                        // type, or unresolved same-name owner; declared-field
+                        // hops and local inference participate once validated.
+                        hasReceiverType: !!(receiverTypeValidated ||
+                            resolvedByTypedAttribute || nominalInferredMatch),
                         hasReceiverEvidence: !!(call.receiver &&
                             (fileEntry.bindings || []).some(b => b.name === call.receiver)),
                         hasImportEvidence: !!bindingId || hasImportLink || !!call.moduleOwnedPath,
@@ -3312,6 +3584,21 @@ function findCallees(index, definition, options = {}) {
             if (!isDirectMatch && !isNestedCallback) continue;
             if (calleeAccount) calleeAccount.totalSites++;
 
+            // Parser-proven lexical shadow: a parameter/local named `option`
+            // cannot call an imported/project `option`. A nested local
+            // function with that name is the one safe exception and remains
+            // eligible for exact same-file resolution below.
+            if (call.localShadow && !call.resolvedName && !call.resolvedNames) {
+                const localTarget = (index.symbols.get(call.name) || []).some(s =>
+                    s.file === def.file && !NON_CALLABLE_TYPES.has(s.type) &&
+                    s.startLine >= def.startLine && s.endLine <= def.endLine &&
+                    s.startLine <= call.line);
+                if (!localTarget) {
+                    noteSite(siteId, 'excluded', 'local-shadow', call);
+                    continue;
+                }
+            }
+
             // Query-time return flow for an ordinary receiver assignment:
             // `v := New(); v.ReadConfig()`. The compiler-declared return type
             // is stronger than constructor-name guesses and must participate
@@ -3511,7 +3798,8 @@ function findCallees(index, definition, options = {}) {
                         externalContract: true,
                     });
                     continue;
-                } else if (localTypes && localTypes.has(call.receiver) && !directReceiverFlow?.type) {
+                } else if (!call.receiverType && localTypes &&
+                    localTypes.has(call.receiver) && !directReceiverFlow?.type) {
                     // Resolve method calls on locally-constructed objects:
                     // bt = Backtester(...); bt.run_backtest() → Backtester.run_backtest
                     // Go: f.Run() where f is *Framework → Framework.Run (receiver match)
@@ -3728,7 +4016,21 @@ function findCallees(index, definition, options = {}) {
                         });
                         continue;
                     }
-                    // No match found with inferred type — fall through to include as unresolved
+                    // A compiler-typed nominal receiver that does not resolve
+                    // to a method on that type must never fall through to the
+                    // generic same-name ranking. The receiver may name an
+                    // external interface or an unindexed ancestor, so keep
+                    // the dispatch visible without inventing one concrete
+                    // project callee.
+                    if (collectAccount && langTraits(language)?.typeSystem === 'nominal') {
+                        noteUnverified(siteId, call, 'possible-dispatch', {
+                            dispatchVia: typeName,
+                            dispatchCandidates: _countDispatchCandidates(
+                                index, typeName, symbols || []),
+                        });
+                        continue;
+                    }
+                    // Structural legacy mode retains its historical fallback.
                 } else if (call.receiverCall && (!call.receiver || call.receiverIsChainRoot) && !call.isConstructor &&
                     langTraits(language)?.typeSystem === 'nominal') {
                     // Chained receiver, nominal callee direction (fix #268,
@@ -3851,7 +4153,7 @@ function findCallees(index, definition, options = {}) {
                     });
                     continue;
                 }
-                if (collectAccount && call.receiver && !call.receiverType &&
+                if (collectAccount && call.receiver && !call.receiverIsModule && !call.receiverType &&
                     !call.receiverCall && !call.isPotentialCallback &&
                     !['self', 'cls', 'this', 'super', 'Self'].includes(call.receiver)) {
                     const owners = new Set((index.symbols.get(call.name) || [])
@@ -3882,8 +4184,18 @@ function findCallees(index, definition, options = {}) {
             const shadowsBuiltin = !call.receiver && (
                 fileEntry?.importBindings?.some(b => b.name === call.name) ||
                 fileEntry?.bindings?.some(b => b.name === call.name));
-            if (!selfShaped && !shadowsBuiltin && index.isKeyword(call.name, language)) {
+            if (!selfShaped && !call.receiverIsModule && !shadowsBuiltin &&
+                index.isKeyword(call.name, language)) {
                 noteSite(siteId, 'external', null, call);
+                continue;
+            }
+
+            // A local alias such as `get_style = console.get_style` preserves
+            // the callable relationship, but the surface spelling no longer
+            // lets a definition oracle verify the target directly. Keep it
+            // visible without presenting it as an exact callee.
+            if (call.aliasCall) {
+                noteUnverified(siteId, call, 'alias-call');
                 continue;
             }
 
@@ -3959,7 +4271,7 @@ function findCallees(index, definition, options = {}) {
                             existing.count += 1;
                             if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                         } else {
-                            callees.set(key, { name: effectiveName, bindingId: match.bindingId, count: 1,
+                            callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
                                 ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                         }
                     }
@@ -3991,7 +4303,7 @@ function findCallees(index, definition, options = {}) {
                                 existing.count += 1;
                                 if (collectAccount) { existing.sites.push(call.line); existing.siteIds.push(siteId); }
                             } else {
-                                callees.set(key, { name: effectiveName, bindingId: match.bindingId, count: 1,
+                                callees.set(key, { name: match.name, bindingId: match.bindingId, count: 1,
                                     ...(collectAccount && { sites: [call.line], siteIds: [siteId] }) });
                             }
                         }
@@ -5363,6 +5675,28 @@ function _lookupReturnTypeFlow(map, call) {
     return undefined;
 }
 
+// True when the receiver's NEAREST preceding assignment is a flow tombstone —
+// the variable provably holds a value the type machinery examined and could
+// not type (`local = factory()`). This is the #222(4) unknown-provenance
+// evidence class with a local producer: it demotes single-owner confirmation.
+// A never-assigned parameter has no entries and keeps the documented
+// #204/#209 single-owner physics — parameter-ness alone is not provenance
+// evidence against the one project owner.
+function _receiverAssignedUntyped(map, call) {
+    if (!map || !call.receiver) return false;
+    const fnScope = call.enclosingFunction ? `${call.enclosingFunction.startLine}` : '';
+    for (const scope of fnScope === '' ? [''] : [fnScope, '']) {
+        const entries = map.get(`${scope}:${call.receiver}`);
+        if (!entries) continue;
+        let best = null;
+        for (const e of entries) {
+            if (e.line < call.line && (!best || e.line > best.line)) best = e;
+        }
+        if (best) return !!best.invalidated;
+    }
+    return false;
+}
+
 // Return-annotation names that must never type a receiver in nominal flow:
 // builtin interfaces/primitives whose project implementors UCN cannot see —
 // a receiver typed `error` CAN dispatch into a project type's Error() method,
@@ -5522,6 +5856,48 @@ function _resolveFlowTypeOrigin(index, producerFile, typeName, qualifier) {
     }
     const sameFile = typeDefs.find(d => d.file === producerFile);
     if (sameFile) return finish({ fromFile: sameFile.file });
+    // An explicit imported name outranks directory proximity. Structural
+    // modules commonly contain several same-named classes in sibling files;
+    // `import { Hono } from './hono'` still pins one declaration exactly.
+    const producerEntry = index.files.get(producerFile);
+    const namedBindings = (producerEntry?.importBindings || []).filter(b =>
+        b.name === typeName || b.alias === typeName);
+    if (namedBindings.length > 0) {
+        const resolvedFiles = new Set();
+        for (const b of namedBindings) {
+            const rel = producerEntry.moduleResolved?.[b.module];
+            if (rel) resolvedFiles.add(path.join(index.root, rel));
+        }
+        const bound = typeDefs.filter(d => resolvedFiles.has(d.file));
+        if (new Set(bound.map(d => d.file)).size === 1) {
+            return finish({ fromFile: bound[0].file });
+        }
+        // The binding may land on a barrel. Chase the imported NAME through
+        // modeled re-exports, and pin only one reachable declaration.
+        const reachable = typeDefs.filter(d => [...resolvedFiles].some(start =>
+            _nameBindingReaches(index, start, typeName, new Set([d.file])) === 'yes'));
+        if (new Set(reachable.map(d => d.file)).size === 1) {
+            return finish({ fromFile: reachable[0].file });
+        }
+        // An UN-modelable export surface is 'unknown', never negative
+        // evidence (#217) — Rust `pub use` chains defeat the name-level
+        // chase, and returning null here unpinned every `use clap::Command`
+        // fold root (clap confirmed placement 1432 → 10). Fall back to the
+        // measured #258 FILE-level unique-reach rail, anchored at the
+        // binding's own resolved module files so same-directory declarations
+        // stay shadowed (the structural parallel-API protection) and only
+        // the declared module's closure can pin.
+        if (resolvedFiles.size > 0) {
+            const fileReachable = typeDefs.filter(d => [...resolvedFiles].some(start =>
+                start === d.file || _importReaches(index, start, new Set([d.file]))));
+            if (new Set(fileReachable.map(d => d.file)).size === 1) {
+                return finish({ fromFile: fileReachable[0].file });
+            }
+        }
+        // An explicit binding shadows same-directory declarations even when
+        // its external or dynamic export surface cannot be resolved.
+        return finish(null);
+    }
     const dir = path.dirname(producerFile);
     const sameDir = typeDefs.filter(d => path.dirname(d.file) === dir);
     if (sameDir.length === 1) return finish({ fromFile: sameDir[0].file });
@@ -6060,19 +6436,46 @@ function _sameNominalPackageDir(dirA, dirB, language) {
     return a === norm(dirB);
 }
 
-function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs) {
+function _resolveReceiverTypeIdentity(index, filePath, knownType, targetDefs, line) {
     const typeDefs = (index.symbols.get(knownType) || []).filter(d => IDENTITY_TYPE_KINDS.has(d.type));
     if (typeDefs.length <= 1) return 'target';
-    const language = index.files.get(filePath)?.language;
+    const fileEntry = index.files.get(filePath);
+    const language = fileEntry?.language;
     const targetDirs = new Set(targetDefs.map(d => d.file && path.dirname(d.file)).filter(Boolean));
     const inTargetPkg = (d) => d.file && [...targetDirs].some(dir =>
         _sameNominalPackageDir(path.dirname(d.file), dir, language));
-    const sameFile = typeDefs.filter(d => d.file === filePath);
+    // Explicit imports outrank package proximity. This matters in Java files
+    // that sit beside `Token.Comment` but import `org.jsoup.nodes.Comment`.
+    // A nested type is not a package member and cannot win a bare type lookup.
+    const namedBindings = (fileEntry?.importBindings || []).filter(b =>
+        b.name === knownType || b.alias === knownType);
+    if (namedBindings.length > 0) {
+        const resolved = new Set(namedBindings.map(b => fileEntry.moduleResolved?.[b.module])
+            .filter(Boolean).map(rel => path.join(index.root, rel)));
+        const imported = typeDefs.filter(d => resolved.has(d.file));
+        if (imported.length > 0) return imported.some(inTargetPkg) ? 'target' : 'other';
+        return 'unknown';
+    }
+    const callerClass = line != null
+        ? index.findEnclosingFunction(filePath, line, true)?.className : null;
+    const sameFile = typeDefs.filter(d => d.file === filePath &&
+        (!d.enclosingType || d.enclosingType === callerClass));
     if (sameFile.length > 0) return sameFile.some(inTargetPkg) ? 'target' : 'other';
     const callerDir = path.dirname(filePath);
     const sameDir = typeDefs.filter(d => d.file &&
+        !d.enclosingType &&
         _sameNominalPackageDir(path.dirname(d.file), callerDir, language));
     if (sameDir.length > 0) return sameDir.some(inTargetPkg) ? 'target' : 'other';
+    if (language === 'java') {
+        const wildcardPackages = (fileEntry?.imports || [])
+            .filter(m => String(m).endsWith('.*'))
+            .map(m => String(m).slice(0, -2));
+        if (wildcardPackages.length > 0) {
+            const imported = typeDefs.filter(d => !d.enclosingType && d.relativePath &&
+                wildcardPackages.includes(_javaPackageKey(d.relativePath).replace(/\//g, '.')));
+            if (imported.length > 0) return imported.some(inTargetPkg) ? 'target' : 'other';
+        }
+    }
     const imports = index.importGraph.get(filePath);
     if (imports) {
         const imported = typeDefs.filter(d => d.file && imports.has(d.file));
@@ -6107,7 +6510,7 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         const files = new Set();
         for (const mf of methodFiles) {
             for (const td of typeDefs) {
-                if (td.file === mf || path.dirname(td.file) === path.dirname(mf)) files.add(td.file);
+                if (td.file === mf) files.add(td.file);
             }
             if (files.size === 0) files.add(mf);
         }
@@ -6118,28 +6521,70 @@ function _resolveStructuralFlowTypeIdentity(index, originFile, knownType, target
         if (!file) return 'unknown';
         const files = targetFiles.get(name) || new Set();
         if (files.has(file)) return 'target';
-        const sameDir = [...files].some(f => path.dirname(f) === path.dirname(file));
-        return sameDir ? 'target' : 'other';
+        return 'other';
     };
     const direct = ownerIdentity(knownType, origin.fromFile);
-    if (direct) return direct;
+    if (direct === 'target') return direct;
+
+    const targetKeys = new Set(targetDefs
+        .filter(d => d.file && d.startLine != null)
+        .map(d => `${d.file}:${d.startLine}`));
+    const overridesPinnedSlot = (name, file) => {
+        if (!file) return false;
+        const methodName = targetDefs[0]?.name;
+        if (!methodName) return false;
+        return (index.symbols.get(methodName) || []).some(d =>
+            d.file === file && d.className === name &&
+            !targetKeys.has(`${d.file}:${d.startLine}`));
+    };
+
+    // Resolve a parent as written in the child file. Import bindings know the
+    // module file, while export details recover the source-side type name for
+    // `export { Internal as PublicBase }`. Keeping both pieces prevents
+    // same-named classes in other files from being conflated.
+    const parentOrigin = (parent, childFile) => {
+        const fe = index.files.get(childFile);
+        if (fe) {
+            const alias = (fe.importAliases || []).find(a => a.local === parent);
+            const importedName = alias?.original || parent;
+            const binding = (fe.importBindings || []).find(b =>
+                b.name === importedName || b.alias === parent);
+            const rel = binding && fe.moduleResolved?.[binding.module];
+            if (rel) {
+                const parentFile = path.join(index.root, rel);
+                const parentEntry = index.files.get(parentFile);
+                const exported = (parentEntry?.exportDetails || []).find(e =>
+                    (e.alias || e.name) === importedName);
+                const canonical = exported?.name || importedName;
+                const ownsCanonical = (index.symbols.get(canonical) || []).some(d =>
+                    IDENTITY_TYPE_KINDS.has(d.type) && d.file === parentFile);
+                return { name: ownsCanonical ? canonical : importedName, file: parentFile };
+            }
+        }
+        const parentFile = index._resolveClassFile
+            ? index._resolveClassFile(parent, childFile) : undefined;
+        return { name: parent, file: parentFile };
+    };
 
     const queue = [{ name: knownType, file: origin.fromFile }];
     const visited = new Set();
-    let sawUnresolved = false;
+    let sawUnresolved = direct === 'unknown';
     while (queue.length > 0 && visited.size < 128) {
         const cur = queue.shift();
         const key = `${cur.file || ''}\0${cur.name}`;
         if (visited.has(key)) continue;
         visited.add(key);
+        // An override on the concrete receiver intercepts dispatch before the
+        // ancestor slot. In that case ancestry is evidence for the other
+        // definition, not the pinned one.
+        if (overridesPinnedSlot(cur.name, cur.file)) continue;
         const parents = index._getInheritanceParents(cur.name, cur.file) || [];
         for (const parent of parents) {
-            const pFile = index._resolveClassFile
-                ? index._resolveClassFile(parent, cur.file) : undefined;
-            const verdict = ownerIdentity(parent, pFile);
+            const edge = parentOrigin(parent, cur.file);
+            const verdict = ownerIdentity(edge.name, edge.file);
             if (verdict === 'target') return 'target';
             if (verdict === 'unknown') sawUnresolved = true;
-            if (pFile) queue.push({ name: parent, file: pFile });
+            if (edge.file) queue.push(edge);
             else sawUnresolved = true;
         }
     }
@@ -6355,7 +6800,7 @@ function _goQualifierNamesImport(index, fieldFile, qualifier) {
 function _calleeStructuralModuleRoute(index, fileEntry, call, language) {
     const bindings = (fileEntry?.importBindings || []).filter(b => b.name === call.receiver);
     if (bindings.length === 0) return { unknown: true };
-    return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, call.name);
+    return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, call.name, false);
 }
 
 function _calleeStructuralImportedNameRoute(index, fileEntry, call, language) {
@@ -6366,15 +6811,10 @@ function _calleeStructuralImportedNameRoute(index, fileEntry, call, language) {
         if (paired.length > 0) bindings = paired;
     }
     if (bindings.length === 0) return null;
-    return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, lookupName);
+    return _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, lookupName, true);
 }
 
-function _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, exportName) {
-    const candidates = (index.symbols.get(exportName) || []).filter(d =>
-        (!NON_CALLABLE_TYPES.has(d.type) ||
-            (call.isConstructor && d.type === 'class') ||
-            (langTraits(language)?.classesCallableWithoutNew && d.type === 'class')) &&
-        _calleeLanguageCompatible(index, d, language));
+function _calleeStructuralBindingRoute(index, fileEntry, call, language, bindings, exportName, allowDefaultExport) {
     const matches = new Map();
     let sawProjectish = false;
     let sawUnknown = false;
@@ -6392,15 +6832,103 @@ function _calleeStructuralBindingRoute(index, fileEntry, call, language, binding
         }
         sawProjectish = true;
         const moduleFile = path.join(index.root, rel);
-        for (const d of candidates) {
-            const verdict = _nameBindingReaches(index, moduleFile, exportName, new Set([d.file]));
-            if (verdict === 'yes') matches.set(`${d.file}:${d.startLine}`, d);
-            else if (verdict === 'unknown') sawUnknown = true;
+        const routed = _calleeExportDefinitions(index, moduleFile, exportName, language, call, {
+            allowDefaultExport: allowDefaultExport && !!binding.defaultLike,
+        });
+        for (const d of routed.matches) {
+            matches.set(`${d.file}:${d.startLine}`, d);
         }
+        if (routed.unknown) sawUnknown = true;
     }
     if (matches.size > 0) return { matches: [...matches.values()] };
     if (!sawProjectish && !sawUnknown) return { external: true };
     return { unknown: true };
+}
+
+// Resolve a module attribute to its implementation definition while
+// preserving identity across ESM/TS barrel renames and Python re-export
+// imports. Searching only symbols named with the public spelling loses
+// `export { _gt as gt }`, because its implementation is named `_gt`.
+function _calleeExportDefinitions(index, startAbs, exposedName, language, call, options = {}) {
+    const matches = new Map();
+    const visited = new Set();
+    let unknown = false;
+    let frontier = [[startAbs, exposedName]];
+    const shapeMatches = d =>
+        (!NON_CALLABLE_TYPES.has(d.type) ||
+            (call.isConstructor && d.type === 'class') ||
+            (langTraits(language)?.classesCallableWithoutNew && d.type === 'class')) &&
+        _calleeLanguageCompatible(index, d, language);
+
+    for (let depth = 0; depth <= 4 && frontier.length > 0; depth++) {
+        const next = [];
+        for (const [abs, attr] of frontier) {
+            const stateKey = `${abs}\x00${attr}`;
+            if (visited.has(stateKey)) continue;
+            visited.add(stateKey);
+            const fe = index.files.get(abs);
+            if (!fe) { unknown = true; continue; }
+
+            const enqueue = (module, nextAttr) => {
+                const rel = fe.moduleResolved && fe.moduleResolved[module];
+                if (!rel) {
+                    const mod = String(module || '');
+                    const firstSeg = mod.split(/[./]/).filter(Boolean)[0];
+                    if (mod.startsWith('.') ||
+                        (firstSeg && _projectTopLevelNames(index).has(firstSeg))) unknown = true;
+                    return;
+                }
+                next.push([path.join(index.root, rel), nextAttr]);
+            };
+
+            const details = fe.exportDetails || [];
+            const localExposed = fe.language === 'python' ||
+                (fe.exports || []).includes(attr) ||
+                details.some(e => !e.source && (e.alias || e.name) === attr);
+            if (localExposed) {
+                for (const d of (index.symbols.get(attr) || [])) {
+                    if (d.file === abs && shapeMatches(d)) {
+                        matches.set(`${d.file}:${d.startLine}`, d);
+                    }
+                }
+            }
+
+            // A simple CommonJS require binds the value assigned directly to
+            // module.exports. This applies to a bare imported-name call only,
+            // never to namespace.member() routing.
+            if (options.allowDefaultExport && depth === 0) {
+                for (const e of details) {
+                    if (e.type !== 'module.exports' || !e.name) continue;
+                    for (const d of (index.symbols.get(e.name) || [])) {
+                        if (d.file === abs && shapeMatches(d)) {
+                            matches.set(`${d.file}:${d.startLine}`, d);
+                        }
+                    }
+                }
+            }
+
+            for (const e of details) {
+                if (!e.source) continue;
+                if (e.type === 're-export' && (e.alias || e.name) === attr) enqueue(e.source, e.name);
+                else if (e.type === 're-export-all') {
+                    if (e.alias) { if (e.alias === attr) unknown = true; }
+                    else enqueue(e.source, attr);
+                }
+            }
+            const aliases = fe.importAliases || [];
+            for (const b of (fe.importBindings || [])) {
+                const exposed = [b.alias || b.name,
+                    ...aliases.filter(a => a.original === b.name).map(a => a.local)];
+                if (exposed.includes(attr)) enqueue(b.module, b.name);
+            }
+            if ((fe.importNames || []).includes('*')) unknown = true;
+            if ((fe.moduleAssignedNames || []).includes(attr)) unknown = true;
+            if ((index.symbols.get('__getattr__') || []).some(s => s.file === abs && !s.className)) unknown = true;
+        }
+        frontier = next;
+    }
+    if (frontier.length > 0) unknown = true;
+    return { matches: [...matches.values()], unknown };
 }
 
 function _calleeGoPackageMatch(index, call, importModule) {
@@ -7260,6 +7788,28 @@ function _buildTargetTypeSet(index, targetDefs, definitions) {
             }
         }
     }
+    // Rust Deref changes method lookup identity: methods on Target are
+    // callable through the wrapper value. Close only over wrappers whose
+    // indexed type definitions all agree on one Deref target.
+    if (targetTypes.size > 0) {
+        const derefPairs = [];
+        for (const [wrapper, defs] of index.symbols) {
+            const typeDefs = defs.filter(d => IDENTITY_TYPE_KINDS.has(d.type));
+            if (typeDefs.length === 0 || !typeDefs.every(d => d.derefTarget)) continue;
+            const targets = new Set(typeDefs.map(d => d.derefTarget));
+            if (targets.size === 1) derefPairs.push([wrapper, [...targets][0]]);
+        }
+        let changed = derefPairs.length > 0;
+        while (changed) {
+            changed = false;
+            for (const [wrapper, target] of derefPairs) {
+                if (targetTypes.has(target) && !targetTypes.has(wrapper)) {
+                    targetTypes.add(wrapper);
+                    changed = true;
+                }
+            }
+        }
+    }
     // Type aliases are the SAME type (Rust `pub type StyledString =
     // SpannedString<Style>`, Go `type A = B`) — compiler-checked identity,
     // not a subtype edge. Close over them in BOTH directions: a method on
@@ -7720,6 +8270,21 @@ const _STRUCTURAL_FLOW_REJECT = new Set([
     'this', 'Self', 'Object', 'None',
 ]);
 
+// Small, stable stdlib contracts used only to type the value of a chained
+// receiver. These are runtime identity facts, not guesses about user code.
+function _builtinMethodReturnType(language, receiverType, methodName) {
+    if (language !== 'python') return null;
+    const owner = String(receiverType || '').split('.').pop();
+    if (methodName === 'getvalue') {
+        if (owner === 'BytesIO') return 'bytes';
+        if (owner === 'StringIO') return 'str';
+    }
+    if (owner === 'bytes' && methodName === 'decode') return 'str';
+    if (owner === 'str' && methodName === 'encode') return 'bytes';
+    if (['list', 'dict', 'set'].includes(owner) && methodName === 'copy') return owner;
+    return null;
+}
+
 /**
  * Type a chained receiver from its producer's declared return annotation
  * (fix #219): `parseAsync(args).catch(...)` — the receiver of .catch IS the
@@ -8125,6 +8690,16 @@ function _typeOfCallResultFoldInner(index, fileEntry, filePath, record, ctx, con
         }
         if (rt && rt.externalVia) return rt;
         if (rt && rt.type) {
+            // Stdlib return contracts apply only when no project type shadows
+            // the name (#232 shadowing rule): a project class named StringIO
+            // keeps its own annotations authoritative.
+            const projectShadow = (index.symbols.get(
+                String(rt.type).split('.').pop()) || [])
+                .some(d => NON_CALLABLE_TYPES.has(d.type) && d.type !== 'field');
+            if (!projectShadow) {
+                const builtinReturn = _builtinMethodReturnType(language, rt.type, name);
+                if (builtinReturn) return { type: builtinReturn };
+            }
             return _methodReturnOnType(index, rt.type, rt.fromFile, name, language,
                 { filePath, consumerAwaited });
         }

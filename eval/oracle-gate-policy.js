@@ -19,8 +19,14 @@ function rate(numerator, denominator) {
  * release board look stronger than the evidence supports.
  */
 function evaluateOracleCoverage(summary, maxUnscoredRatio) {
-    const precisionUniverse = (summary.confirmedEdges || 0) + (summary.unverifiedEdges || 0);
-    const precisionUnscoredRatio = rate(summary.configurationGatedUnscored || 0, precisionUniverse);
+    // The release precision claim is the confirmed tier. Unverified entries
+    // are an explicit abstention band and do not enter tier1Precision, so
+    // configuration-gated abstentions must not dilute the coverage of the
+    // claim being gated. Report their coverage separately for transparency.
+    const precisionUniverse = summary.confirmedEdges || 0;
+    const precisionUnscoredRatio = rate(summary.confirmedUnscored || 0, precisionUniverse);
+    const unverifiedUniverse = summary.unverifiedEdges || 0;
+    const unverifiedUnscoredRatio = rate(summary.unverifiedUnscored || 0, unverifiedUniverse);
     const calleeUniverse = (summary.calleeSites || 0) + (summary.calleeUnscoredSites || 0);
     const calleeUnscoredRatio = rate(summary.calleeUnscoredSites || 0, calleeUniverse);
     const failures = [];
@@ -34,7 +40,7 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
             `> ${(maxUnscoredRatio * 100).toFixed(2)}%`);
     }
 
-    return { failures, precisionUnscoredRatio, calleeUnscoredRatio };
+    return { failures, precisionUnscoredRatio, unverifiedUnscoredRatio, calleeUnscoredRatio };
 }
 
 module.exports = { optionalRate, evaluateOracleCoverage };

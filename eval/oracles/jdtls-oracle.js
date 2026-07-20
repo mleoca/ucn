@@ -176,7 +176,8 @@ const jdtlsOracle = {
      *  callee-placement adjudication. */
     async resolveDefinition(handle, { name, file, line }) {
         const absFile = path.join(handle.root, file);
-        const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
+        const source = fs.readFileSync(absFile, 'utf-8').split('\n');
+        const sourceLine = source[line - 1] || '';
         const columns = nameColumns(sourceLine, name);
         const defs = new Map();
         for (const character of columns) {
@@ -193,6 +194,27 @@ const jdtlsOracle = {
                 const entry = { file: path.relative(handle.root, defAbs), line: range.start.line + 1 };
                 defs.set(`${entry.file}:${entry.line}`, entry);
             }
+        }
+        if (defs.size === 0 && sourceLine.includes('->')) {
+            const fallback = await resolveLambdaReceiverMethod(
+                handle, { absFile, file, line, name, source, sourceLine });
+            for (const entry of fallback) {
+                defs.set(`${entry.file}:${entry.line}`, entry);
+            }
+        }
+        // Static definition lookup stops at an interface declaration, but an
+        // exactly constructed receiver has a known runtime class. Follow that
+        // class through JDT's type hierarchy and include the inherited
+        // implementation selected at runtime. Example:
+        //   Connection.Request req = new HttpConnection.Request();
+        //   req.addHeader(...)
+        // The static target is Connection.Base.addHeader; the executed body is
+        // HttpConnection.Base.addHeader. This is compiler-backed adjudication,
+        // not a name-based oracle exception.
+        const runtimeDefs = await resolveConstructedReceiverMethods(
+            handle, { absFile, file, line, name, source, sourceLine });
+        for (const entry of runtimeDefs) {
+            defs.set(`${entry.file}:${entry.line}`, entry);
         }
         return [...defs.values()];
     },
@@ -217,6 +239,205 @@ function nameColumns(line, name) {
         from = at + name.length;
     }
     return cols;
+}
+
+async function definitionLocationsAt(handle, absFile, line, character) {
+    const response = await handle.lsp.request('textDocument/definition', {
+        textDocument: { uri: pathToUri(absFile) },
+        position: { line: line - 1, character },
+    }) || [];
+    const out = [];
+    for (const loc of Array.isArray(response) ? response : [response]) {
+        const uri = loc.targetUri || loc.uri;
+        const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+        if (!uri || !range) continue;
+        const defAbs = uriToPath(uri);
+        if (!defAbs.startsWith(handle.repoRoot + path.sep)) continue;
+        out.push({ absFile: defAbs, file: path.relative(handle.root, defAbs),
+            line: range.start.line + 1 });
+    }
+    return out;
+}
+
+async function resolveLambdaReceiverMethod(handle, query) {
+    const escaped = query.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    let receiver = null;
+    let receiverStart = -1;
+    for (const nameCol of nameColumns(query.sourceLine, query.name)) {
+        const prefix = query.sourceLine.slice(0, nameCol);
+        const match = prefix.match(new RegExp(
+            `([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)\\s*\\.\\s*$`));
+        if (!match || !new RegExp(`^${escaped}$`).test(query.sourceLine.slice(nameCol, nameCol + query.name.length))) {
+            continue;
+        }
+        receiver = match[1];
+        receiverStart = prefix.lastIndexOf(receiver);
+        break;
+    }
+    if (!receiver) return [];
+
+    const rootName = receiver.split('.')[0];
+    let ownerName = null;
+    let ownerLocations = [];
+    if (/^[A-Z_$]/.test(rootName)) {
+        ownerName = rootName;
+        ownerLocations = await definitionLocationsAt(
+            handle, query.absFile, query.line, receiverStart);
+    } else {
+        const escapedRoot = rootName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const floor = methodScanFloor(query.source, query.line);
+        for (let at = query.line - 2, remaining = 250; at > floor && remaining-- > 0; at--) {
+            const text = query.source[at];
+            const explicit = text.match(new RegExp(
+                `\\b([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*(?:\\s*<[^;=]+>)?(?:\\[\\])?)\\s+${escapedRoot}\\s*(?:=|;)`));
+            const inferred = text.match(new RegExp(
+                `\\bvar\\s+${escapedRoot}\\s*=\\s*new\\s+([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)`));
+            const rawType = inferred ? inferred[1] : explicit?.[1];
+            if (!rawType) continue;
+            ownerName = rawType.replace(/<.*$/, '').replace(/\[\]$/, '').split('.').pop();
+            const typeCol = text.indexOf(ownerName);
+            if (typeCol < 0) return [];
+            ownerLocations = await definitionLocationsAt(handle, query.absFile, at + 1, typeCol);
+            break;
+        }
+    }
+    if (!ownerName || ownerLocations.length !== 1) return [];
+
+    const owner = ownerLocations[0];
+    const symbols = await handle.lsp.request('textDocument/documentSymbol', {
+        textDocument: { uri: pathToUri(owner.absFile) },
+    }) || [];
+    const methods = documentMethodsForOwner(symbols, ownerName, query.name);
+    if (methods.length !== 1) return [];
+    return [{ file: owner.file, line: methods[0].line }];
+}
+
+function constructedReceiverAt(query) {
+    let receiver = null;
+    for (const nameCol of nameColumns(query.sourceLine, query.name)) {
+        const prefix = query.sourceLine.slice(0, nameCol);
+        const match = prefix.match(/([A-Za-z_$][\w$]*)\s*\.\s*$/);
+        if (match) { receiver = match[1]; break; }
+    }
+    if (!receiver) return null;
+
+    const escaped = receiver.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const assignment = new RegExp(
+        `\\b${escaped}\\s*=\\s*new\\s+([A-Za-z_$][\\w$]*(?:\\.[A-Za-z_$][\\w$]*)*)`);
+    const anyAssignment = new RegExp(`\\b${escaped}\\s*=`);
+    const floor = methodScanFloor(query.source, query.line);
+    for (let at = query.line - 2, remaining = 300; at > floor && remaining-- > 0; at--) {
+        const text = query.source[at];
+        const exact = text.match(assignment);
+        if (exact) {
+            const rawType = exact[1];
+            return {
+                receiver,
+                rawType,
+                ownerName: rawType.split('.').pop(),
+                line: at + 1,
+                character: text.lastIndexOf(rawType.split('.').pop()),
+            };
+        }
+        // A nearer non-constructor assignment invalidates older provenance.
+        if (anyAssignment.test(text)) return null;
+    }
+    return null;
+}
+
+async function resolveConstructedReceiverMethods(handle, query) {
+    const constructed = constructedReceiverAt(query);
+    if (!constructed || constructed.character < 0) return [];
+
+    const starts = await handle.lsp.request('textDocument/prepareTypeHierarchy', {
+        textDocument: { uri: pathToUri(query.absFile) },
+        position: { line: constructed.line - 1, character: constructed.character },
+    }) || [];
+    let frontier = Array.isArray(starts) ? [...starts] : [starts];
+    const visited = new Set();
+    while (frontier.length > 0 && visited.size < 64) {
+        const next = [];
+        const levelMatches = [];
+        for (const item of frontier) {
+            if (!item?.uri) continue;
+            const itemRange = item.selectionRange || item.range;
+            const itemKey = `${item.uri}:${itemRange?.start?.line ?? -1}:${item.name}`;
+            if (visited.has(itemKey)) continue;
+            visited.add(itemKey);
+
+            const ownerAbs = uriToPath(item.uri);
+            if (ownerAbs.startsWith(handle.repoRoot + path.sep)) {
+                const symbols = await handle.lsp.request('textDocument/documentSymbol', {
+                    textDocument: { uri: item.uri },
+                }) || [];
+                for (const method of documentMethodsForOwner(symbols, item.name, query.name)) {
+                    levelMatches.push({ file: path.relative(handle.root, ownerAbs), line: method.line });
+                }
+            }
+
+            const parents = await handle.lsp.request('typeHierarchy/supertypes', { item }) || [];
+            for (const parent of parents) next.push(parent);
+        }
+        // Java dispatch selects the nearest declaration. Continuing above it
+        // would incorrectly credit overridden interface/superclass methods.
+        // Uniqueness guard: several same-name declarations at the nearest
+        // level are an overload family — crediting them all would let an
+        // edge confirmed against the WRONG overload pass (the engine's own
+        // #205 discipline). Abstain instead of guessing.
+        if (levelMatches.length === 1) return levelMatches;
+        if (levelMatches.length > 1) return [];
+        frontier = next;
+    }
+    return [];
+}
+
+// Provenance scans must not cross the enclosing method: a same-named local
+// constructed in an EARLIER method is not this receiver's type. Walk upward
+// tracking unmatched '{' openers — control-flow openers keep scanning (a
+// local declared before an if-block is real provenance), method/type openers
+// floor the scan.
+function methodScanFloor(source, fromLine) {
+    let depth = 0;
+    for (let at = fromLine - 2; at >= 0; at--) {
+        const text = source[at] || '';
+        for (let i = text.length - 1; i >= 0; i--) {
+            const ch = text[i];
+            if (ch === '}') depth++;
+            else if (ch === '{') {
+                if (depth > 0) { depth--; continue; }
+                const head = text.slice(0, i);
+                if (!/\b(?:if|else|for|while|switch|try|catch|finally|do|synchronized)\b[^{]*$/.test(head)) {
+                    return at;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+function documentMethodsForOwner(symbols, ownerName, methodName) {
+    const matches = [];
+    const walkOwner = node => {
+        for (const child of node.children || []) {
+            if (child.name.replace(/\(.*/, '') === methodName && child.kind === 6) {
+                const range = child.selectionRange || child.range;
+                if (range) matches.push({ line: range.start.line + 1 });
+            }
+        }
+    };
+    const walk = nodes => {
+        for (const node of nodes || []) {
+            if (node.name === ownerName && [5, 10, 11, 23].includes(node.kind)) walkOwner(node);
+            if (node.children) walk(node.children);
+            if (node.containerName === ownerName &&
+                node.name.replace(/\(.*/, '') === methodName && node.kind === 6) {
+                const range = node.location?.range || node.selectionRange || node.range;
+                if (range) matches.push({ line: range.start.line + 1 });
+            }
+        }
+    };
+    walk(symbols);
+    return matches;
 }
 
 function resolveJava() {
@@ -258,4 +479,4 @@ function findRepoRoot(dir) {
     return pomRoot || dir;
 }
 
-module.exports = { jdtlsOracle };
+module.exports = { jdtlsOracle, constructedReceiverAt };

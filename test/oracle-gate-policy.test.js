@@ -18,20 +18,22 @@ describe('oracle gate policy', () => {
     it('accepts the measured Clap configuration coverage', () => {
         const verdict = evaluateOracleCoverage({
             confirmedEdges: 2032,
+            confirmedUnscored: 20,
             unverifiedEdges: 1555,
-            configurationGatedUnscored: 167,
+            unverifiedUnscored: 147,
             calleeSites: 2274,
             calleeUnscoredSites: 2,
         }, 0.10);
         assert.deepEqual(verdict.failures, []);
-        assert.ok(verdict.precisionUnscoredRatio < 0.05);
+        assert.ok(verdict.precisionUnscoredRatio < 0.01);
+        assert.ok(verdict.unverifiedUnscoredRatio < 0.10);
     });
 
     it('fails when configuration filtering makes the scored subset unrepresentative', () => {
         const verdict = evaluateOracleCoverage({
             confirmedEdges: 50,
+            confirmedUnscored: 25,
             unverifiedEdges: 50,
-            configurationGatedUnscored: 25,
             calleeSites: 90,
             calleeUnscoredSites: 20,
         }, 0.10);
@@ -43,11 +45,23 @@ describe('oracle gate policy', () => {
     it('remains report-only when no coverage ceiling is requested', () => {
         const verdict = evaluateOracleCoverage({
             confirmedEdges: 4,
-            configurationGatedUnscored: 1,
+            confirmedUnscored: 1,
         }, null);
         assert.deepEqual(verdict.failures, []);
         assert.equal(verdict.precisionUnscoredRatio, 0.25,
             'report-only runs must still expose the measured coverage');
+    });
+
+    it('reports configuration-gated abstentions without weakening confirmed precision coverage', () => {
+        const verdict = evaluateOracleCoverage({
+            confirmedEdges: 100,
+            confirmedUnscored: 0,
+            unverifiedEdges: 1000,
+            unverifiedUnscored: 800,
+        }, 0.10);
+        assert.deepEqual(verdict.failures, []);
+        assert.equal(verdict.precisionUnscoredRatio, 0);
+        assert.equal(verdict.unverifiedUnscoredRatio, 0.8);
     });
 
     it('rejects a valueless release threshold instead of silently disabling it', () => {

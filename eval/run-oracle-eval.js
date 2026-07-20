@@ -21,6 +21,7 @@
  * Usage:
  *   node eval/run-oracle-eval.js                  # all repos with a matching oracle
  *   node eval/run-oracle-eval.js --repo zod       # one repo (or comma-separated list)
+ *   node eval/run-oracle-eval.js --release        # publish-blocking shared board
  *   node eval/run-oracle-eval.js --sample 20      # symbols per repo (default 50)
  *   node eval/run-oracle-eval.js --oracle jedi    # force an oracle (default: first match;
  *                                                 # python = pyright, jedi second opinion)
@@ -48,8 +49,17 @@ const {
     createCommandProofSummary,
     evaluateSymbolCommandProof,
     finalizeCommandProof,
+    lineContainsIdentifier,
 } = require('./command-proof');
-const { REPOS, cloneAtCommit, resolveTarget, seededRandom, resolveFreshCommit, selectFreshRepos } = require('./lib/repos');
+const {
+    REPOS,
+    RELEASE_REPOS,
+    cloneAtCommit,
+    resolveTarget,
+    seededRandom,
+    resolveFreshCommit,
+    selectFreshRepos,
+} = require('./lib/repos');
 const { validateOracle } = require('./oracles/oracle-interface');
 const { optionalRate, evaluateOracleCoverage } = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
@@ -60,6 +70,7 @@ const { rustAnalyzerOracle } = require('./oracles/rust-analyzer-oracle');
 const { jdtlsOracle } = require('./oracles/jdtls-oracle');
 
 const args = process.argv.slice(2);
+const releaseOnly = args.includes('--release');
 const repoFilter = readArgValue(args, '--repo'); // name, or comma-separated names
 const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim())) : null;
 const sampleSize = Number(readArgValue(args, '--sample') || 50);
@@ -315,9 +326,25 @@ async function evaluateRepo(repo, oracle) {
                 const candidateFile = best.relativePath || best.file;
                 const relFile = path.isAbsolute(candidateFile)
                     ? path.relative(index.root, candidateFile) : candidateFile;
-                const status = await definitionStatus(relFile, best.line, sym.name, targetDef);
+                const status = await definitionStatus(
+                    relFile, best.line, best.calledAs || sym.name, targetDef);
                 if (status === 'target') return 'hit';
                 if (await isConfigurationGated(relFile, best.line)) return 'unscored';
+                // 'other' is a positive contradiction — the site provably
+                // calls a different definition, and the selection fails.
+                // 'unresolved' (oracle blindness: `reg: any` receivers,
+                // platform-only modules) and 'unavailable' (the oracle has
+                // no definition lookup at all — ts-morph) contradict
+                // nothing (#217 — unknown never fails a claim), so the
+                // selection reports unscored — guarded by the called token
+                // actually being on the line, so a fabricated site can
+                // never ride this path.
+                if (status === 'unresolved' || status === 'unavailable') {
+                    if (lineContainsIdentifier(index, relFile, best.line,
+                        best.calledAs || sym.name)) {
+                        return 'unscored';
+                    }
+                }
                 return 'miss';
             },
         });
@@ -341,10 +368,12 @@ async function evaluateRepo(repo, oracle) {
         // decision 2026-06-12; the #218f class-kind precedent).
         const confirmed = dedupe((json.data.callers || json.data.usages || []).map(c => ({
             file: c.file, line: c.line,
+            ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
         })));
         const unverified = dedupe((json.data.unverifiedCallers || []).map(c => ({
             file: c.file, line: c.line,
+            ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
         })));
         const account = json.meta.account;
@@ -381,7 +410,8 @@ async function evaluateRepo(repo, oracle) {
         const edgeMatchesTarget = async c => {
             if (superCtorSite(c)) return { hit: true, scorable: true, definitionValidated: false };
             if (needsDefinitionAdjudication) {
-                const status = await definitionStatus(c.file, c.line, sym.name, targetDef);
+                const status = await definitionStatus(
+                    c.file, c.line, c.calledAs || sym.name, targetDef);
                 if (status === 'target') return { hit: true, scorable: true, definitionValidated: true };
                 const referenceHit = edgeHitWithoutDefinition(c);
                 if (status === 'other' && !referenceHit && await isConfigurationGated(c.file, c.line)) {
@@ -395,7 +425,8 @@ async function evaluateRepo(repo, oracle) {
                 return { hit: false, scorable: true, definitionValidated: false };
             }
             if (edgeHitWithoutDefinition(c)) return { hit: true, scorable: true, definitionValidated: false };
-            const definitionHit = await resolvesTo(c.file, c.line, sym.name, targetDef);
+            const definitionHit = await resolvesTo(
+                c.file, c.line, c.calledAs || sym.name, targetDef);
             if (definitionHit) return { hit: true, scorable: true, definitionValidated: true };
             if (await isConfigurationGated(c.file, c.line)) {
                 return { hit: false, scorable: false, definitionValidated: false };
@@ -858,7 +889,12 @@ function rate(n, d) { return d ? Number((n / d).toFixed(4)) : 0; }
 function pct(x) { return `${(x * 100).toFixed(1)}%`; }
 
 async function main() {
-    const baseRepos = freshCount ? selectFreshRepos(freshCount) : REPOS;
+    if (freshCount && releaseOnly) {
+        throw new Error('--release and --fresh cannot be combined');
+    }
+    const baseRepos = freshCount
+        ? selectFreshRepos(freshCount)
+        : (releaseOnly ? RELEASE_REPOS : REPOS);
     const oracleRepos = baseRepos.filter(r =>
         ORACLES.some(o => o.languages.includes(r.language)) &&
         (!repoFilterSet || repoFilterSet.has(r.name)));
@@ -892,6 +928,8 @@ async function main() {
             if (result.summary.commandProof.failures > 0) gateFailed = true;
             const coverageGate = evaluateOracleCoverage(result.summary, maxUnscoredRatio);
             result.summary.precisionUnscoredRatio = Number(coverageGate.precisionUnscoredRatio.toFixed(4));
+            result.summary.unverifiedUnscoredRatio = Number(
+                coverageGate.unverifiedUnscoredRatio.toFixed(4));
             result.summary.calleeUnscoredRatio = Number(coverageGate.calleeUnscoredRatio.toFixed(4));
             if (coverageGate.failures.length > 0) {
                 process.stdout.write(`  ⚠ ORACLE COVERAGE GATE FAILURE: ${coverageGate.failures.join('; ')}\n`);
@@ -925,8 +963,28 @@ async function main() {
         }
     }
 
+    // A dated rollup describes the DATE's board, not the last invocation —
+    // per-repo runs used to clobber the .md down to a single row (the
+    // documented release-report hazard, realized on 2026-07-20). Merge this
+    // run's results over every same-dated per-repo JSON on disk so the
+    // committed rollup always carries the full board; the exit gate stays
+    // scoped to the CURRENT run's repos.
+    const rollupByRepo = new Map();
+    const perRepoSuffix = `-${date}${seedSuffix}.json`;
+    for (const f of fs.readdirSync(REPORTS_DIR)) {
+        if (!f.startsWith('oracle-eval-') || !f.endsWith(perRepoSuffix) ||
+            f.includes('rollup')) continue;
+        try {
+            const prior = JSON.parse(fs.readFileSync(path.join(REPORTS_DIR, f), 'utf8'));
+            if (prior?.summary?.repo) rollupByRepo.set(prior.summary.repo, prior);
+        } catch { /* partial/unreadable file — this run's rows still land */ }
+    }
+    for (const r of results) if (r?.summary?.repo) rollupByRepo.set(r.summary.repo, r);
+    const rollupResults = [...rollupByRepo.values()].sort((a, b) =>
+        a.summary.repo < b.summary.repo ? -1 : a.summary.repo > b.summary.repo ? 1 : 0);
+
     const lines = [
-        `# Oracle eval — ${date}${freshCount ? ' (fresh-repo arm: unpinned rotation)' : ''}`,
+        `# Oracle eval: ${date}${freshCount ? ' (fresh-repo arm: unpinned rotation)' : ''}`,
         '',
         'UCN tiered caller answers scored against compiler/LSP ground truth.',
         '`semantic-missing` is the release gate: every indexed, in-scope oracle',
@@ -936,8 +994,8 @@ async function main() {
         '| repo | oracle | sampled | oracle edges | tier1 precision | semantic recall | semantic missing | unverified precision | observed-zero agreement | conserved |',
         '|---|---|---|---|---|---|---|---|---|---|',
     ];
-    for (const { summary: s } of results) {
-        if (s.error) { lines.push(`| ${s.repo} | — | — | — | — | — | — | — | — | ERROR: ${s.error} |`); continue; }
+    for (const { summary: s } of rollupResults) {
+        if (s.error) { lines.push(`| ${s.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | ERROR: ${s.error} |`); continue; }
         lines.push(`| ${s.repo} | ${s.oracle} | ${s.sampled} | ${s.oracleCallEdges} | ${pct(s.tier1Precision)} | ${pct(s.semanticRecall)} | **${s.semanticMissing}** | ${pct(s.unverifiedPrecision)} | ${s.observedZeroAgreement != null ? pct(s.observedZeroAgreement) : 'n/a'} (${s.zeroCases}) | ${pct(s.conservedRate)} |`);
     }
     lines.push('');
@@ -951,7 +1009,7 @@ async function main() {
     lines.push('');
     lines.push('| repo | evaluated | definition | find | extract | brief | typedef | usages | tests | example | execution errors | failures |');
     lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
-    for (const { summary: s } of results) {
+    for (const { summary: s } of rollupResults) {
         if (s.error || !s.commandProof) continue;
         const c = s.commandProof;
         const cell = m => `${pct(m.recall)} (${m.hits}/${m.eligible})`;
@@ -961,12 +1019,12 @@ async function main() {
     lines.push('## Per-kind breakdown');
     lines.push('');
     lines.push('Same metrics split by symbol kind (function / method / class), to');
-    lines.push('localize precision gaps — e.g. method-name conflation, where import');
+    lines.push('localize precision gaps, such as method-name conflation where import');
     lines.push('evidence confirms the file but not the receiver type.');
     lines.push('');
     lines.push('| repo | kind | sampled | oracle edges | tier1 precision | tier1 cfg-unscored | unverified precision | unverified cfg-unscored | separation | placement |');
     lines.push('|---|---|---|---|---|---|---|---|---|---|');
-    for (const { summary: s } of results) {
+    for (const { summary: s } of rollupResults) {
         if (s.error || !s.byKind) continue;
         for (const [kind, k] of Object.entries(s.byKind)) {
             lines.push(`| ${s.repo} | ${kind} | ${k.sampled} | ${k.oracleCallEdges} | ${k.confirmedScored ? pct(k.tier1Precision) : 'n/a'} (${k.confirmedHits}/${k.confirmedScored}) | ${k.confirmedUnscored} | ${k.unverifiedScored ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedScored}) | ${k.unverifiedUnscored} | ${k.tierSeparation ?? 'n/a'} | ${JSON.stringify(k.oraclePlacement)} |`);
@@ -977,7 +1035,7 @@ async function main() {
     lines.push('');
     lines.push('The same oracle edges re-read from the CALLER side: for each oracle');
     lines.push('call ref of a sampled symbol, the enclosing function\'s callee answer');
-    lines.push('(findCallees collectAccount — the trace-down engine path) must show');
+    lines.push('(findCallees collectAccount, the trace-down engine path) must show');
     lines.push('the exact site as confirmed or unverified. Account-only and');
     lines.push('same-name-other-definition placements are semantic misses unless');
     lines.push('exact definition lookup proves the reference search expanded a');
@@ -985,7 +1043,7 @@ async function main() {
     lines.push('');
     lines.push('| repo | callee precision | semantic recall | semantic missing | confirmed | oracle-broad | other-def | unverified | unverified+other | accounted | module-level | beyond-text |');
     lines.push('|---|---|---|---|---|---|---|---|---|---|---|---|');
-    for (const { summary: s } of results) {
+    for (const { summary: s } of rollupResults) {
         if (s.error || !s.calleePlacement) continue;
         const cp = s.calleePlacement;
         lines.push(`| ${s.repo} | ${pct(s.calleePrecision)} (${s.calleeHits}/${s.calleeSites}) | ${pct(s.calleeSemanticRecall)} | **${s.calleeSemanticMissing}** | ${cp.confirmed} | ${cp.oracleBroadReference} | ${cp.confirmedOtherDef} | ${cp.unverified} | ${cp.unverifiedWithOtherDef} | ${cp.accounted} | ${cp.moduleLevel} | ${cp.missingBeyondText} |`);
@@ -1004,7 +1062,7 @@ async function main() {
     lines.push('');
     lines.push('| repo | confirmed edges validated | unverified edges validated | oracle calls validated | broad-family refs excluded | unresolved refs | lookup errors | cfg-unscored precision edges | cfg-unscored callee sites | source-status errors |');
     lines.push('|---|---|---|---|---|---|---|---|---|---|');
-    for (const { summary: s } of results) {
+    for (const { summary: s } of rollupResults) {
         if (s.error) continue;
         lines.push(`| ${s.repo} | ${s.definitionValidatedConfirmed} | ${s.definitionValidatedUnverified} | ${s.definitionValidatedOracleCalls} | ${s.oracleBroadReferenceEdges} | ${s.definitionUnresolvedReferenceEdges} | **${s.definitionLookupErrors}** | ${s.configurationGatedUnscored} | ${s.calleeUnscoredSites} | **${s.sourceStatusErrors}** |`);
     }

@@ -49,12 +49,14 @@ function addSymbol(fileEntry, item, type) {
     if (item.implements) symbol.implements = item.implements;
     if (item.indent !== undefined) symbol.indent = item.indent;
     if (item.isNested) symbol.isNested = item.isNested;
+    if (item.enclosingType) symbol.enclosingType = item.enclosingType;
     if (item.isMethod) symbol.isMethod = item.isMethod;
     if (item.receiver) symbol.receiver = item.receiver;
     if (item.className) symbol.className = item.className;
     if (item.memberType) symbol.memberType = item.memberType;
     if (item.fieldType) symbol.fieldType = item.fieldType;
     if (item.aliasOf) symbol.aliasOf = item.aliasOf;
+    if (item.derefTarget) symbol.derefTarget = item.derefTarget;
     if (item.decorators && item.decorators.length > 0) symbol.decorators = item.decorators;
     if (item.decoratorsWithArgs && item.decoratorsWithArgs.length > 0) symbol.decoratorsWithArgs = item.decoratorsWithArgs;
     if (item.annotationsWithArgs && item.annotationsWithArgs.length > 0) symbol.annotationsWithArgs = item.annotationsWithArgs;
@@ -64,13 +66,15 @@ function addSymbol(fileEntry, item, type) {
     if (item.traitName) symbol.traitName = item.traitName;
     if (item.isSignature) symbol.isSignature = true;
     if (item.memberAssigned) symbol.memberAssigned = true;
+    if (item.bodyScopedName) symbol.bodyScopedName = true;
     if (item.registryMember) symbol.registryMember = true;
     if (item.registryContainer) symbol.registryContainer = item.registryContainer;
 
     fileEntry.symbols.push(symbol);
     // Property-assignment defs declare no lexical name (fix #269) — kept in
     // lockstep with project.js addSymbol (the parallel≡sequential guard).
-    if (!item.memberAssigned) {
+    // Named function expressions bind only inside their own body.
+    if (!item.memberAssigned && !item.bodyScopedName) {
         fileEntry.bindings.push({
             id: symbol.bindingId,
             name: symbol.name,
@@ -165,7 +169,12 @@ function processFile(filePath) {
             .map(n => {
                 // Rename pairing (fix #269) — lockstep with project.js.
                 const rn = (i.renames || []).find(r => r.original === n);
-                return { name: n, module: i.module, ...(rn && { alias: rn.local }) };
+                return {
+                    name: n,
+                    module: i.module,
+                    ...(rn && { alias: rn.local }),
+                    ...(i.defaultLike && { defaultLike: true }),
+                };
             })),
         exports: exports.map(e => e.name),
         exportDetails: exports,

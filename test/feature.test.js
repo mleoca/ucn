@@ -1706,6 +1706,35 @@ send(\`\${HOST}/api\`, JSON.stringify({}));
         } finally { rm(dir); }
     });
 
+    it('example abstains when the only conserved call is unresolved', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/example\n\ngo 1.22\n',
+            'viper.go': [
+                'package example',
+                'type Viper struct{}',
+                'var v = New()',
+                'func New() *Viper { return &Viper{} }',
+                'func ConfigFileUsed() string { return v.ConfigFileUsed() }',
+                'func (v *Viper) ConfigFileUsed() string { return "config" }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.example('ConfigFileUsed', {
+                file: 'viper.go',
+                className: 'Viper',
+                includeTests: true,
+            });
+            assert.ok(result, `expected an explicit abstention: ${JSON.stringify(result)}`);
+            assert.strictEqual(result.best, null);
+            assert.strictEqual(result.confirmedCalls, 0);
+            assert.ok(result.unverifiedCalls >= 1,
+                `expected the unresolved call to remain visible: ${JSON.stringify(result)}`);
+            assert.ok(result.unverifiedCandidates.some(c => c.reason === 'call-not-resolved'),
+                `expected the conservation reason: ${JSON.stringify(result)}`);
+        } finally { rm(dir); }
+    });
+
     it('execute(example) with only test callers surfaces the excluded count once', () => {
         // fix #237: the handler note duplicated the formatter body — the
         // excluded-test-usages message now lives in the body (text + JSON)
@@ -3286,4 +3315,3 @@ describe('BUG-1: impact text surfaces structural call-site patterns', () => {
         } finally { rm(dir); }
     });
 });
-

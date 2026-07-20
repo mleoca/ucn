@@ -16,6 +16,7 @@ const {
 } = require('../core/trust-matrix');
 
 const ROOT = path.join(__dirname, '..');
+const { REPOS, RELEASE_REPO_NAMES, RELEASE_REPOS } = require('../eval/lib/repos');
 
 describe('command trust matrix: fail-closed proof coverage', () => {
     it('classifies every canonical command exactly once', () => {
@@ -116,5 +117,30 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         const weekly = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         assert.match(publish, /npm run trust:gate/);
         assert.match(weekly, /trust:gate:performance/);
+    });
+
+    it('keeps one machine-readable release board across gates and documentation', () => {
+        const pkg = require('../package.json');
+        const readme = fs.readFileSync(path.join(ROOT, 'README.md'), 'utf8');
+        assert.strictEqual(RELEASE_REPO_NAMES.length, 7);
+        assert.strictEqual(new Set(RELEASE_REPO_NAMES).size, RELEASE_REPO_NAMES.length);
+        assert.deepStrictEqual(RELEASE_REPOS.map(repo => repo.name), [...RELEASE_REPO_NAMES]);
+        assert.ok(RELEASE_REPOS.every(repo => REPOS.includes(repo)));
+        for (const script of [
+            pkg.scripts['trust:gate:semantic'],
+            pkg.scripts['trust:gate:deadcode'],
+            pkg.scripts['trust:gate:performance'],
+        ]) {
+            assert.match(script, /--release/, `${script} must use the shared release board`);
+            assert.doesNotMatch(script, /--repo/, `${script} must not duplicate the release list`);
+        }
+        assert.match(readme, /seven-repository/i);
+        assert.match(readme, /nineteen pinned repositories/i);
+        for (const name of RELEASE_REPO_NAMES) {
+            assert.ok(readme.includes(name), `README must name release repository ${name}`);
+        }
+        for (const repo of REPOS) {
+            assert.ok(readme.includes(repo.name), `README must name scheduled repository ${repo.name}`);
+        }
     });
 });

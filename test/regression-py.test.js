@@ -56,6 +56,72 @@ describe('Regression: Python class methods in context', () => {
     });
 });
 
+describe('fix #272 (Python): dotted-package ownership and constructed properties', () => {
+    it('treats an unaliased dotted import as both a package and submodule edge', () => {
+        const dir = tmp({
+            'src/pkg/__init__.py': 'from .api import run as run\n',
+            'src/pkg/api.py': 'def run():\n    return 1\n',
+            'src/pkg/sub.py': 'VALUE = 1\n',
+            'tests/test_api.py': 'import pkg.sub\n\ndef test_run():\n    assert pkg.run() == 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const testPath = path.join(dir, 'tests/test_api.py');
+            const entry = index.files.get(testPath);
+            assert.ok(entry.importBindings.some(b => b.name === 'pkg' && b.module === 'pkg'));
+            assert.ok(entry.moduleResolved.pkg === 'src/pkg/__init__.py');
+            assert.ok(entry.moduleResolved['pkg.sub'] === 'src/pkg/sub.py');
+            const result = index.usages('run');
+            assert.ok(result.some(u => u.relativePath === 'tests/test_api.py' && u.line === 4),
+                `package-surface call missing: ${JSON.stringify(result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('associates a property reference on a fresh instance with its class', () => {
+        const languages = require('../languages');
+        const parser = languages.getParser('python');
+        const mod = languages.getLanguageModule('python');
+        const source = 'assert ColorTriplet(1, 2, 3).normalized == (1, 2, 3)\n';
+        const usages = mod.findUsagesInCode(source, 'normalized', parser);
+        assert.deepStrictEqual(usages, [{
+            line: 1,
+            column: 29,
+            usageType: 'reference',
+            receiver: 'ColorTriplet',
+        }]);
+    });
+});
+
+describe('Python package submodule reference ownership', () => {
+    it('keeps a class used only through a relative submodule type annotation alive', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'pkg/__init__.py': '',
+            'pkg/types.py': [
+                'from typing import TypedDict',
+                'class OptionHelpExtra(TypedDict):',
+                '    value: str',
+                'class Unused(TypedDict):',
+                '    value: str',
+            ].join('\n'),
+            'pkg/core.py': [
+                'from . import types',
+                'def get_extra() -> types.OptionHelpExtra:',
+                '    extra: types.OptionHelpExtra = {}',
+                '    return extra',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const dead = index.deadcode({ includeExported: true });
+            assert.ok(!dead.some(d => d.name === 'OptionHelpExtra'),
+                `qualified annotation is a real type usage: ${JSON.stringify(dead)}`);
+            assert.ok(dead.some(d => d.name === 'Unused'),
+                `unused sibling remains auditable: ${JSON.stringify(dead)}`);
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Python magic methods not flagged as deadcode', () => {
     it('should NOT report __init__, __call__, __enter__, __exit__ as dead code', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-py-magic-'));
@@ -4299,6 +4365,181 @@ describe('fix #274 (Python): qualified constructor provenance', () => {
             assert.ok(caller, `resolved pkg.URL confirms URL.join: ${JSON.stringify(json.data)}`);
             assert.strictEqual(caller.resolution, 'receiver-hint');
             assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #275: Python lexical call ownership', () => {
+    it('marks parameter calls as local shadows instead of imported functions', () => {
+        const dir = tmp({
+            'lib.py': 'def option(value):\n    return value\n',
+            'app.py': [
+                'from lib import option',
+                'def apply(option, value):',
+                '    return option(value)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('option').find(d => d.relativePath === 'lib.py');
+            const callers = index.findCallers('option', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.py' && c.line === 3),
+                `parameter call must not bind to imported option: ${JSON.stringify(callers)}`);
+            assert.ok(callers.accountRaw.excludedEntries.some(e =>
+                e.relativePath === undefined && e.line === 3 && e.reason === 'local-shadow'),
+            `local-shadow reason missing: ${JSON.stringify(callers.accountRaw)}`);
+
+            const apply = index.symbols.get('apply')[0];
+            const callees = index.findCallees(apply, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'option'),
+                `parameter call must not become a callee: ${JSON.stringify(callees)}`);
+            assert.ok(callees.calleeAccount.excluded.byReason['local-shadow'] >= 1);
+        } finally { rm(dir); }
+    });
+
+    it('keeps calls to a nested function bound in the same lexical scope', () => {
+        const dir = tmp({
+            'app.py': [
+                'def outer():',
+                '    def emulate(value):',
+                '        return value',
+                '    return emulate(1)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('emulate')[0];
+            const callers = index.findCallers('emulate', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.relativePath === 'app.py' && c.line === 4),
+                `nested lexical call missing: ${JSON.stringify(callers)}`);
+            const outer = index.symbols.get('outer')[0];
+            const callees = index.findCallees(outer, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'emulate' && c.relativePath === 'app.py'),
+                `nested lexical callee missing: ${JSON.stringify(callees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('does not confirm external constructor or untyped with-result methods by spelling', () => {
+        const dir = tmp({
+            'target.py': [
+                'class Formatter:',
+                '    def getvalue(self):',
+                '        return "project"',
+            ].join('\n'),
+            'app.py': [
+                'from io import StringIO',
+                'def external():',
+                '    out = StringIO()',
+                '    return out.getvalue()',
+                'def managed(ctx):',
+                '    with ctx as out:',
+                '        return out.getvalue()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('getvalue')[0];
+            const callers = index.findCallers('getvalue', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.py' && [4, 7].includes(c.line)),
+                `unproven receiver entered confirmed tier: ${JSON.stringify(callers)}`);
+            const visible = callers.unverifiedEntries || [];
+            assert.ok(visible.some(c => c.line === 4 && c.reason === 'possible-dispatch'));
+            assert.ok(visible.some(c => c.line === 7 && c.reason === 'possible-dispatch'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #276: Python alias and chained-builtin precision', () => {
+    it('preserves a class constructor alias in JSON output', () => {
+        const dir = tmp({
+            'app.py': [
+                'class Widget:',
+                '    pass',
+                'def build():',
+                '    Alias = Widget',
+                '    return Alias()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', { name: 'app.py:1:Widget' });
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            const usage = json.data.usages.find(c => c.line === 5);
+            assert.ok(usage, `aliased construction missing: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(usage.calledAs, 'Alias');
+        } finally { rm(dir); }
+    });
+
+    it('resolves a module-qualified function even when its name is a builtin', () => {
+        const dir = tmp({
+            'printer.py': 'def print(value):\n    return value\n',
+            'app.py': [
+                'import printer',
+                'def run():',
+                '    return printer.print("ok")',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'print' && c.relativePath === 'printer.py'),
+                `module-owned builtin spelling must resolve: ${JSON.stringify(callees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps local callable aliases visible but out of exact callees', () => {
+        const dir = tmp({
+            'app.py': [
+                'class Console:',
+                '    def get_style(self, name):',
+                '        return name',
+                'def render(console):',
+                '    get_style = console.get_style',
+                '    return get_style("bold")',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const render = index.symbols.get('render')[0];
+            const callees = index.findCallees(render, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'get_style' && c.sites?.includes(6)),
+                `alias call must not claim an exact definition: ${JSON.stringify(callees)}`);
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'get_style' && c.reason === 'alias-call' && c.sites.includes(6)),
+            `alias call must remain visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('types BytesIO.getvalue in a chained receiver as bytes', () => {
+        const dir = tmp({
+            'target.py': 'class Codec:\n    def decode(self):\n        return "project"\n',
+            'app.py': [
+                'import io',
+                'def read():',
+                '    stream = io.BytesIO()',
+                '    return stream.getvalue().decode()',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('decode')[0];
+            const callers = index.findCallers('decode', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.py' && c.line === 4),
+                `bytes.decode must not confirm Codec.decode: ${JSON.stringify(callers)}`);
+            const result = execute(index, 'context', { name: 'target.py:2:decode' });
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.strictEqual(json.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });

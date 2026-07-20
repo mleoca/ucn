@@ -24,7 +24,7 @@ const { performance } = require('perf_hooks');
 
 const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
-const { REPOS, cloneAtCommit, resolveTarget } = require('./lib/repos');
+const { REPOS, RELEASE_REPOS, cloneAtCommit, resolveTarget } = require('./lib/repos');
 const {
     DEFAULT_BUDGETS,
     percentile,
@@ -33,6 +33,7 @@ const {
 } = require('./performance-gate-policy');
 
 const args = process.argv.slice(2);
+const releaseOnly = args.includes('--release');
 const repoArg = readArg('--repo');
 const repoNames = repoArg ? new Set(repoArg.split(',').map(s => s.trim()).filter(Boolean)) : null;
 const queryCount = positiveInteger('--queries', 40);
@@ -248,7 +249,8 @@ async function workerMain() {
 }
 
 async function main() {
-    const repos = REPOS.filter(repo => !repoNames || repoNames.has(repo.name));
+    const baseRepos = releaseOnly ? RELEASE_REPOS : REPOS;
+    const repos = baseRepos.filter(repo => !repoNames || repoNames.has(repo.name));
     if (repos.length === 0) throw new Error(`No repositories match --repo ${repoArg || '(all)'}`);
     if (repoNames) {
         const missing = [...repoNames].filter(name => !repos.some(repo => repo.name === name));

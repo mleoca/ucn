@@ -164,7 +164,27 @@ const UCN_VERSION = require('../package.json').version;
 // (`m.get_many::<T>()`); v64 caches misclassified them as references.
 // v66: Rust call records preserve receiverFlowInvalidated after a non-call
 // lexical rebinding, preventing stale return types from excluding true calls.
-const CACHE_FORMAT_VERSION = 66;
+// v67: JS/TS constructor calls preserve lexical-shadow evidence, and method
+// calls on fresh constructions preserve the exact constructed receiver type.
+// Both fields affect caller identity and must not be read from older shards.
+// v68: unaliased dotted Python imports persist separate package and submodule
+// ownership edges (`import pkg.sub` binds pkg and loads pkg.sub).
+// v69: CommonJS simple-require bindings preserve defaultLike so callable
+// module.exports values resolve exactly across caller and callee queries.
+// v70: Python receiver records preserve exact constructor provenance and
+// context-manager result bindings for conservative dispatch tiering.
+// v71: structural method records preserve untyped local-receiver ownership;
+// single-owner spelling alone cannot confirm a parameter/assigned value.
+// v72: Rust type symbols preserve the compiler-declared Deref Target so
+// wrapper receiver method lookup reaches the target type without guessing.
+// v73: JS/TS call records preserve qualified-constructor provenance and bound
+// local receivers; conditional reassignments no longer persist a definite
+// inferred constructor type past a branch.
+// Java nested type symbols preserve their enclosing type for exact constructor
+// ownership across same-named top-level and inner classes, and cast receivers
+// retain their compiler-declared type. Rust tuple fields are indexed by numeric
+// position so `self.0.method()` participates in declared-field resolution.
+const CACHE_FORMAT_VERSION = 73;
 
 /**
  * Save index to cache file

@@ -122,7 +122,87 @@ const pyrightOracle = {
         }
         return refs;
     },
+
+    /** Resolve the exact declaration selected at a claimed call/reference.
+     *  Bulk reference search can omit alias, lazy-module, platform, and local
+     *  flow sites. Precision credit is granted only when this independent
+     *  definition lookup lands on the sampled declaration. */
+    async resolveDefinition(handle, { name, file, line }) {
+        const absFile = path.join(handle.root, file);
+        if (!handle.opened.has(absFile)) {
+            handle.lsp.didOpen(absFile, 'python', fs.readFileSync(absFile, 'utf-8'));
+            handle.opened.add(absFile);
+        }
+        const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
+        const defs = new Map();
+        const requestAt = async (queryFile, queryLine, character) => {
+            const response = await handle.lsp.request('textDocument/definition', {
+                textDocument: { uri: pathToUri(queryFile) },
+                position: { line: queryLine - 1, character },
+            }) || [];
+            for (const loc of Array.isArray(response) ? response : [response]) {
+                const uri = loc.targetUri || loc.uri;
+                const range = loc.targetSelectionRange || loc.targetRange || loc.range;
+                if (!uri || !range) continue;
+                const defAbs = uriToPath(uri);
+                if (!defAbs.startsWith(handle.projectRoot + path.sep)) continue;
+                const entry = {
+                    file: path.relative(handle.root, defAbs),
+                    line: range.start.line + 1,
+                };
+                defs.set(`${entry.file}:${entry.line}`, entry);
+            }
+        };
+        for (const character of nameColumns(sourceLine, name)) {
+            await requestAt(absFile, line, character);
+        }
+
+        // Pyright resolves a call through a local callable alias to the alias
+        // assignment. Follow one simple assignment hop to recover the actual
+        // declaration while keeping arbitrary data-flow out of the oracle.
+        const firstHop = [...defs.values()];
+        for (const entry of firstHop) {
+            const defAbs = path.join(handle.root, entry.file);
+            let defLine = '';
+            try { defLine = fs.readFileSync(defAbs, 'utf-8').split('\n')[entry.line - 1] || ''; } catch { continue; }
+            const rhs = simpleCallableAliasRhs(defLine, name);
+            if (!rhs) continue;
+            if (!handle.opened.has(defAbs)) {
+                handle.lsp.didOpen(defAbs, 'python', fs.readFileSync(defAbs, 'utf-8'));
+                handle.opened.add(defAbs);
+            }
+            await requestAt(defAbs, entry.line, rhs.character);
+        }
+        return [...defs.values()];
+    },
+
+    async isConfigurationGated(handle, { file, line }) {
+        const status = await handle.helper.request({ op: 'source_status', file, line });
+        return !!status.configurationGated;
+    },
 };
+
+function nameColumns(line, name) {
+    const cols = [];
+    let from = 0;
+    while (from <= line.length) {
+        const i = line.indexOf(name, from);
+        if (i < 0) break;
+        const before = i > 0 ? line[i - 1] : '';
+        const after = line[i + name.length] || '';
+        if (!/[A-Za-z0-9_]/.test(before) && !/[A-Za-z0-9_]/.test(after)) cols.push(i);
+        from = i + Math.max(1, name.length);
+    }
+    return cols;
+}
+
+function simpleCallableAliasRhs(line, queriedName) {
+    const match = line.match(/^\s*([A-Za-z_]\w*)\s*(?::[^=]+)?=\s*(?:[A-Za-z_]\w*\.)*([A-Za-z_]\w*)\s*(?:#.*)?$/);
+    if (!match || match[1] !== queriedName) return null;
+    const rhsName = match[2];
+    const character = line.lastIndexOf(rhsName);
+    return character >= 0 ? { name: rhsName, character } : null;
+}
 
 const SKIP_DIRS = new Set(['node_modules', '__pycache__', '.git', '.venv', 'venv', '.tox', '.ucn-cache']);
 const MAX_OPEN_FILES = 5000;

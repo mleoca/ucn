@@ -432,6 +432,7 @@ function _processClass(node, types, processedRanges, lines, code) {
         const { startLine, endLine } = nodeToLocation(node, lines);
         const implInfo = extractImplInfo(node);
         const docstring = extractRustDocstring(lines, startLine);
+        const derefTarget = extractDerefTarget(node, implInfo.traitName);
 
         types.push({
             name: implInfo.name,
@@ -442,6 +443,7 @@ function _processClass(node, types, processedRanges, lines, code) {
             typeName: implInfo.typeName,
             members: extractImplMembers(node, lines, implInfo.typeName),
             modifiers: [],
+            ...(derefTarget && { derefTarget }),
             ...(docstring && { docstring })
         });
         return true;  // matched
@@ -548,17 +550,39 @@ function _processClass(node, types, processedRanges, lines, code) {
  */
 function _postProcessTraitImpls(types) {
     const implTraits = new Map(); // typeName → [traitName, ...]
+    const derefTargets = new Map(); // typeName -> Set<Target>
     for (const t of types) {
         if (t.type === 'impl' && t.traitName && t.typeName) {
             if (!implTraits.has(t.typeName)) implTraits.set(t.typeName, []);
             implTraits.get(t.typeName).push(t.traitName);
+            if (t.derefTarget) {
+                if (!derefTargets.has(t.typeName)) derefTargets.set(t.typeName, new Set());
+                derefTargets.get(t.typeName).add(t.derefTarget);
+            }
         }
     }
     for (const t of types) {
         if ((t.type === 'struct' || t.type === 'enum') && implTraits.has(t.name)) {
             t.implements = implTraits.get(t.name);
+            const targets = derefTargets.get(t.name);
+            if (targets?.size === 1) t.derefTarget = [...targets][0];
         }
     }
+}
+
+function extractDerefTarget(implNode, traitName) {
+    if (!traitName || !/(^|::)Deref(?:Mut)?$/.test(traitName)) return null;
+    let found = null;
+    const walk = node => {
+        if (found) return;
+        if (node.type === 'type_item' && node.childForFieldName('name')?.text === 'Target') {
+            found = aliasBaseTypeName(node.childForFieldName('type'));
+            return;
+        }
+        for (let i = 0; i < node.namedChildCount; i++) walk(node.namedChild(i));
+    };
+    walk(implNode);
+    return found;
 }
 
 /**
@@ -653,6 +677,28 @@ function extractStructFields(structNode, codeOrLines) {
     const fields = [];
     const bodyNode = structNode.childForFieldName('body');
     if (!bodyNode) return fields;
+
+    if (bodyNode.type === 'ordered_field_declaration_list') {
+        let position = 0;
+        for (let i = 0; i < bodyNode.namedChildCount; i++) {
+            const field = bodyNode.namedChild(i);
+            // Visibility modifiers and field attributes (`#[serde(..)] u32`)
+            // are separate children; the type node owns the tuple position.
+            // Numeric member names let the shared declared-field hop resolve
+            // `self.0.method()` exactly.
+            if (field.type === 'visibility_modifier' ||
+                field.type === 'attribute_item') continue;
+            const { startLine, endLine } = nodeToLocation(field, code);
+            fields.push({
+                name: String(position++),
+                startLine,
+                endLine,
+                memberType: 'field',
+                fieldType: field.text,
+            });
+        }
+        return fields;
+    }
 
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const field = bodyNode.namedChild(i);
@@ -1474,7 +1520,7 @@ function findCallsInCode(code, parser) {
                         if (obj?.type === 'field_expression') {
                             const rootNode = obj.childForFieldName('value');
                             const fldNode = obj.childForFieldName('field');
-                            if (fldNode?.type === 'field_identifier' && rootNode &&
+                            if ((fldNode?.type === 'field_identifier' || fldNode?.type === 'integer_literal') && rootNode &&
                                 (rootNode.type === 'identifier' || rootNode.type === 'self')) {
                                 receiverRoot = rootNode.text;
                                 receiverField = fldNode.text;
@@ -2139,6 +2185,30 @@ function _indexInParent(node, parent) {
 function findUsagesInCode(code, name, parser, tree) {
     tree = tree || parseTree(parser, code);
     const usages = [];
+    // Lazy same-file enum→variants map: built only when a paren-less
+    // `Type::name` reference needs the enum-variant check.
+    let _enumVariants = null;
+    const sameFileEnumVariant = (enumName, variantName) => {
+        if (_enumVariants === null) {
+            _enumVariants = new Map();
+            traverseTreeCached(tree.rootNode, (n) => {
+                if (n.type !== 'enum_item') return;
+                const enName = n.childForFieldName('name')?.text;
+                const body = n.childForFieldName('body');
+                if (!enName || !body) return;
+                let set = _enumVariants.get(enName);
+                if (!set) { set = new Set(); _enumVariants.set(enName, set); }
+                for (let i = 0; i < body.namedChildCount; i++) {
+                    const child = body.namedChild(i);
+                    if (child.type === 'enum_variant') {
+                        const vn = child.childForFieldName('name')?.text;
+                        if (vn) set.add(vn);
+                    }
+                }
+            });
+        }
+        return _enumVariants.get(enumName)?.has(variantName) || false;
+    };
 
     visitNameNodes(tree, code, name, (node) => {
         // Look for identifier, field_identifier (method names in obj.method() calls),
@@ -2198,6 +2268,34 @@ function findUsagesInCode(code, name, parser, tree) {
                         const receiver = segs[segs.length - 1];
                         if (receiver) {
                             usages.push({ line, column, usageType, receiver });
+                            return true;
+                        }
+                    }
+                } else if (sameNode(parent.childForFieldName('name'), node)) {
+                    // Associated method value: `Cursive::quit` is a reference
+                    // to the method even though no call_expression wraps it.
+                    // Preserve its type receiver so the project-aware usage
+                    // layer can distinguish it from `Enum::Variant`.
+                    const pathNode = parent.childForFieldName('path');
+                    if (pathNode) {
+                        const segs = pathNode.text.split('::');
+                        const receiver = segs[segs.length - 1];
+                        // A same-file `enum Receiver { Name }` proves this is
+                        // the variant, not an associated item of the queried
+                        // symbol — provable without the index, so filtered
+                        // here; cross-file receivers stay for the project
+                        // layer's owner check.
+                        if (receiver && sameFileEnumVariant(receiver, name)) {
+                            return true;
+                        }
+                        if (receiver) {
+                            usages.push({
+                                line,
+                                column,
+                                usageType: 'reference',
+                                receiver,
+                                scopedReference: true,
+                            });
                             return true;
                         }
                     }

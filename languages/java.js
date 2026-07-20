@@ -328,6 +328,15 @@ function findFunctions(code, parser) {
  * Returns true if node was matched, false otherwise
  */
 function _processClass(node, classes, processedRanges, lines, code) {
+    const enclosingTypeName = current => {
+        for (let p = current.parent; p; p = p.parent) {
+            if (p.type === 'class_declaration' || p.type === 'interface_declaration' ||
+                p.type === 'enum_declaration' || p.type === 'record_declaration') {
+                return p.childForFieldName('name')?.text || null;
+            }
+        }
+        return null;
+    };
     // Class declarations
     if (node.type === 'class_declaration') {
         const rangeKey = `${node.startIndex}-${node.endIndex}`;
@@ -347,8 +356,9 @@ function _processClass(node, classes, processedRanges, lines, code) {
             const implementsInfo = extractImplements(node);
 
             // Check if this is a nested/inner class
-            let parentNode = node.parent;
+            const parentNode = node.parent;
             const isNested = parentNode && parentNode.type === 'class_body';
+            const enclosingType = enclosingTypeName(node);
 
             classes.push({
                 name: nameNode.text,
@@ -358,6 +368,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 members,
                 modifiers,
                 ...(isNested && { isNested: true }),
+                ...(enclosingType && { enclosingType }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(annotations.length > 0 && { annotations }),
@@ -392,6 +403,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 type: 'interface',
                 members: extractClassMembers(node, lines),
                 modifiers,
+                ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(annotations.length > 0 && { annotations }),
@@ -423,6 +435,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 type: 'enum',
                 members: extractEnumConstants(node, lines),
                 modifiers,
+                ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
                 ...(annotations.length > 0 && { annotations }),
                 ...(annotationsWithArgs.length > 0 && { annotationsWithArgs })
@@ -478,6 +491,7 @@ function _processClass(node, classes, processedRanges, lines, code) {
                 type: 'record',
                 members,
                 modifiers,
+                ...(enclosingTypeName(node) && { enclosingType: enclosingTypeName(node) }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(annotations.length > 0 && { annotations }),
@@ -1150,8 +1164,22 @@ function findCallsInCode(code, parser) {
 
             if (nameNode) {
                 const enclosingFunction = getCurrentEnclosingFunction();
-                const receiver = (objNode?.type === 'identifier' || objNode?.type === 'this') ? objNode.text : undefined;
-                const receiverType = (receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined;
+                let receiverNode = objNode;
+                while (receiverNode?.type === 'parenthesized_expression' && receiverNode.namedChildCount === 1) {
+                    receiverNode = receiverNode.namedChild(0);
+                }
+                let castReceiverType;
+                let castReceiverName;
+                if (receiverNode?.type === 'cast_expression') {
+                    castReceiverType = extractTypeName(receiverNode.childForFieldName('type'));
+                    const valueNode = receiverNode.childForFieldName('value');
+                    if (valueNode?.type === 'identifier') castReceiverName = valueNode.text;
+                }
+                const receiver = castReceiverName ||
+                    ((receiverNode?.type === 'identifier' || receiverNode?.type === 'this')
+                        ? receiverNode.text : undefined);
+                const receiverType = castReceiverType ||
+                    ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
                 // fix #202: one-hop declared-field receivers —
                 // this.service.execute(), svc.client.run(), and bare
                 // service.execute() where service is a class field (only when
@@ -1215,6 +1243,7 @@ function findCallsInCode(code, parser) {
                     isMethod: !!objNode,
                     receiver,
                     ...(receiverType && { receiverType }),
+                    ...(castReceiverType && { receiverTypeCast: true }),
                     ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),
                     ...(receiverCall && { receiverCall }),

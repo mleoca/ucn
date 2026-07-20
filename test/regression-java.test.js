@@ -2211,9 +2211,9 @@ describe('fix #210: external-contract methods (Java)', () => {
 }
 `,
         'Caller.java': `public class Caller {
-    void use(Object o) {
+    void use(Object o, LazyNum[] nums) {
         int a = ((Integer) o).intValue();
-        int b = ((Caller) o).ownMethod();
+        int b = nums[0].ownMethod();
     }
 }
 `,
@@ -3498,6 +3498,33 @@ describe('fix #273 (Java): virtual bare calls and receiver-owned callees', () =>
         } finally { rm(dir); }
     });
 
+    it('does not bind an external-interface receiver to a same-name project method', () => {
+        const dir = tmp({
+            'ProjectEntry.java': 'class ProjectEntry { String getKey() { return "wrong"; } }',
+            'Use.java': [
+                'import java.util.Map;',
+                'class Use {',
+                '  void copy(Map<String, String> values) {',
+                '    for (Map.Entry<String, String> entry : values.entrySet()) {',
+                '      String key = entry.getKey();',
+                '    }',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const copy = index.symbols.get('copy')[0];
+            const callees = index.findCallees(copy, { collectAccount: true, includeMethods: true });
+            assert.ok(!callees.some(c => c.name === 'getKey' && c.sites?.includes(5)),
+                `Map.Entry.getKey must not bind ProjectEntry.getKey: ${JSON.stringify(callees)}`);
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'getKey' && c.reason === 'possible-dispatch' && c.sites.includes(5)),
+            `external interface dispatch must stay visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
     it('resolves duplicate simple type names through Java main/test package identity', () => {
         const dir = tmp({
             'src/main/java/p/Attribute.java': [
@@ -3683,6 +3710,96 @@ describe('fix #273 (Java): virtual bare calls and receiver-owned callees', () =>
                 'receiver-blind lexical binding never steals the chain terminal');
             assert.ok((callees.unverifiedCallees || []).some(c => c.name === 'annotated'),
                 `callee chain stays visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('pins same-named top-level and nested constructors by Java ownership', () => {
+        const dir = tmp({
+            'src/main/java/p/Outer.java': [
+                'package p;',
+                'public class Outer {',
+                '  public static class Tag {}',
+                '  Tag own() { return new Tag(); }',
+                '}',
+            ].join('\n'),
+            'src/main/java/q/Tag.java': 'package q; public class Tag {}',
+            'src/test/java/q/Use.java': [
+                'package q;',
+                'import p.Outer;',
+                'class Use {',
+                '  Object local() { return new Tag(); }',
+                '  Object nested() { return new Outer.Tag(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('Tag');
+            const nested = defs.find(d => d.relativePath.endsWith('/p/Outer.java'));
+            const top = defs.find(d => d.relativePath.endsWith('/q/Tag.java'));
+            assert.strictEqual(nested.enclosingType, 'Outer');
+
+            const nestedCallers = index.findCallers('Tag', {
+                targetDefinitions: [nested], collectAccount: true,
+            });
+            assert.ok(nestedCallers.some(c => c.relativePath.endsWith('/q/Use.java') && c.line === 5));
+            assert.ok(!nestedCallers.some(c => c.relativePath.endsWith('/q/Use.java') && c.line === 4));
+
+            const topCallers = index.findCallers('Tag', {
+                targetDefinitions: [top], collectAccount: true,
+            });
+            assert.ok(topCallers.some(c => c.relativePath.endsWith('/q/Use.java') && c.line === 4));
+            assert.ok(!topCallers.some(c => c.relativePath.endsWith('/q/Use.java') && c.line === 5));
+        } finally { rm(dir); }
+    });
+
+    it('uses cast types and ignores nested types during package lookup', () => {
+        const dir = tmp({
+            'src/main/java/nodes/Node.java': [
+                'package nodes;',
+                'public class Node { public Node parentElement() { return this; } }',
+            ].join('\n'),
+            'src/main/java/nodes/TextNode.java': 'package nodes; public class TextNode extends Node {}',
+            'src/main/java/nodes/Comment.java': [
+                'package nodes;',
+                'public class Comment { public String getData() { return "node"; } }',
+            ].join('\n'),
+            'src/main/java/parser/Token.java': [
+                'package parser;',
+                'class Token {',
+                '  static class Comment { String getData() { return "token"; } }',
+                '}',
+            ].join('\n'),
+            'src/test/java/parser/Use.java': [
+                'package parser;',
+                'import nodes.*;',
+                'class Use {',
+                '  Node parent(TextNode text) { return ((Node) text).parentElement(); }',
+                '  String data() { Comment comment = new Comment(); return comment.getData(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const parent = index.symbols.get('parentElement')[0];
+            const parentCallers = index.findCallers('parentElement', {
+                targetDefinitions: [parent], collectAccount: true,
+            });
+            assert.ok(parentCallers.some(c => c.relativePath.endsWith('/parser/Use.java') && c.line === 4),
+                `cast receiver must resolve Node.parentElement: ${JSON.stringify(parentCallers)}`);
+
+            const getDataDefs = index.symbols.get('getData');
+            const nodeData = getDataDefs.find(d => d.relativePath.endsWith('/nodes/Comment.java'));
+            const tokenData = getDataDefs.find(d => d.relativePath.endsWith('/parser/Token.java'));
+            const nodeCallers = index.findCallers('getData', {
+                targetDefinitions: [nodeData], collectAccount: true,
+            });
+            assert.ok(nodeCallers.some(c => c.relativePath.endsWith('/parser/Use.java') && c.line === 5),
+                `wildcard import must outrank nested same-package type: ${JSON.stringify(nodeCallers)}`);
+            const tokenCallers = index.findCallers('getData', {
+                targetDefinitions: [tokenData], collectAccount: true,
+            });
+            assert.ok(!tokenCallers.some(c => c.relativePath.endsWith('/parser/Use.java') && c.line === 5));
         } finally { rm(dir); }
     });
 });

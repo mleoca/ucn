@@ -18,9 +18,9 @@
     "eval:performance": "node --expose-gc eval/run-performance-gate.js",
     "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js",
     "verify": "npm run lint && npm test",
-    "trust:gate:semantic": "node eval/run-oracle-eval.js --repo preact-signals,httpx,cobra,clap,javapoet --min-precision 0.98 --max-unscored-ratio 0.10",
-    "trust:gate:deadcode": "node eval/run-deadcode-eval.js --repo preact-signals,httpx,cobra,clap,javapoet --sample 100 --arm default",
-    "trust:gate:performance": "node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx,cobra,clap,javapoet --queries 40",
+    "trust:gate:semantic": "node eval/run-oracle-eval.js --release --min-precision 0.98 --max-unscored-ratio 0.10",
+    "trust:gate:deadcode": "node eval/run-deadcode-eval.js --release --sample 100 --arm default",
+    "trust:gate:performance": "node --expose-gc eval/run-performance-gate.js --release --queries 40",
     "trust:gate:fast": "node eval/run-oracle-eval.js --repo preact-signals,httpx --min-precision 0.98 && node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx --queries 20",
     "trust:gate": "npm run trust:gate:semantic && npm run trust:gate:deadcode && npm run trust:gate:performance"
   },

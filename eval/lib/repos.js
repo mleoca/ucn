@@ -252,6 +252,25 @@ const REPOS = [
     },
 ];
 
+// Publish-blocking board. Keep this as a named subset of REPOS so every
+// release runner consumes one source of truth instead of repeating a comma-
+// separated list in package scripts. The board includes one repository per
+// compiler/LSP oracle plus second, style-different Go and Rust repositories.
+const RELEASE_REPO_NAMES = Object.freeze([
+    'preact-signals',
+    'httpx',
+    'cobra',
+    'viper',
+    'ripgrep',
+    'clap',
+    'javapoet',
+]);
+const RELEASE_REPOS = Object.freeze(RELEASE_REPO_NAMES.map(name => {
+    const repo = REPOS.find(candidate => candidate.name === name);
+    if (!repo) throw new Error(`Release repository "${name}" is not in REPOS`);
+    return repo;
+}));
+
 // ============================================================================
 // FRESH-REPO ARM (generalization guard)
 // ============================================================================
@@ -350,4 +369,15 @@ function seededRandom(seed) {
     };
 }
 
-module.exports = { REPOS, FRESH_POOL, EVAL_TEMP_DIR, cloneAtCommit, resolveTarget, seededRandom, resolveFreshCommit, selectFreshRepos };
+module.exports = {
+    REPOS,
+    RELEASE_REPOS,
+    RELEASE_REPO_NAMES,
+    FRESH_POOL,
+    EVAL_TEMP_DIR,
+    cloneAtCommit,
+    resolveTarget,
+    seededRandom,
+    resolveFreshCommit,
+    selectFreshRepos,
+};

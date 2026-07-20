@@ -6395,6 +6395,34 @@ describe('fix #268: callee-side external identity (Go)', () => {
         } finally { rm(dir); }
     });
 
+    it('nested callback parameter types outrank outer same-name local inference', () => {
+        const dir = tmp({
+            'go.mod': 'module example.com/m\n\ngo 1.21',
+            'main.go': [
+                'package main',
+                'type Router interface { With() Router }',
+                'type Mux struct{}',
+                'func (*Mux) With() Router { return nil }',
+                'func NewMux() *Mux { return nil }',
+                'func use() {',
+                '    r := NewMux()',
+                '    func(r Router) { r.With() }(r)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const use = (index.symbols.get('use') || [])[0];
+            const callees = index.findCallees(use, { includeMethods: true, collectAccount: true });
+            assert.ok(!callees.some(c => c.name === 'With' && c.sites?.includes(8)),
+                `Router parameter must not inherit outer r's Mux type: ${JSON.stringify(callees)}`);
+            assert.ok((callees.unverifiedCallees || []).some(c =>
+                c.name === 'With' && c.reason === 'possible-dispatch' && c.sites.includes(8)),
+            `interface dispatch must stay visible: ${JSON.stringify(callees.unverifiedCallees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
     it('chained call on an external-returning producer never confirms a project def', () => {
         const dir = tmp({
             'go.mod': 'module example.com/m\n\ngo 1.21',

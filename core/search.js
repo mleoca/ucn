@@ -8,7 +8,7 @@
 'use strict';
 
 const path = require('path');
-const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
+const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
 const { getCachedCalls, _nameBindingReaches } = require('./callers');
@@ -220,15 +220,16 @@ function usages(index, name, options = {}) {
                 // Pre-compute: does any imported project file define this name?
                 // Used to filter namespace member expressions (e.g., DropdownMenuPrimitive.Separator)
                 // while keeping module access patterns (e.g., output.formatExample())
-                let _importedHasDef = null;
-                const importedFileHasDef = () => {
-                    if (_importedHasDef !== null) return _importedHasDef;
+                const _importedHasDef = new Map();
+                const importedFileHasDef = (receiver) => {
+                    const cacheKey = receiver || '';
+                    if (_importedHasDef.has(cacheKey)) return _importedHasDef.get(cacheKey);
                     const importedFiles = index.importGraph.get(filePath);
-                    _importedHasDef = false;
+                    let found = false;
                     if (importedFiles) for (const imp of importedFiles) {
                         const impEntry = index.files.get(imp);
                         if (impEntry?.symbols?.some(s => s.name === name)) {
-                            _importedHasDef = true;
+                            found = true;
                             break;
                         }
                         // A module namespace may expose the target through a
@@ -241,11 +242,72 @@ function usages(index, name, options = {}) {
                         // no is filtering evidence.
                         if (targetFiles.size > 0 &&
                             _nameBindingReaches(index, imp, name, targetFiles) !== 'no') {
-                            _importedHasDef = true;
+                            found = true;
                             break;
                         }
                     }
-                    return _importedHasDef;
+
+                    // Named namespace surfaces need one more ownership axis:
+                    // `import { util } from './core'; util.helper()` where
+                    // core exports `* as util` from the helper's module. The
+                    // imported file does not itself define `helper`; entering
+                    // the namespace is what reaches the owning file.
+                    if (!found && receiver && targetFiles.size > 0) {
+                        const queue = [];
+                        let unknown = false;
+                        for (const b of (fileEntry.importBindings || [])) {
+                            if (b.name !== receiver && b.alias !== receiver) continue;
+                            const rel = fileEntry.moduleResolved?.[b.module];
+                            if (rel) queue.push({ file: path.join(index.root, rel), attr: b.name, depth: 0 });
+                            else if (String(b.module).startsWith('.')) unknown = true;
+                        }
+                        const seen = new Set();
+                        while (!found && queue.length > 0) {
+                            const cur = queue.shift();
+                            const state = `${cur.file}\0${cur.attr || ''}`;
+                            if (seen.has(state)) continue;
+                            seen.add(state);
+                            if (targetFiles.has(cur.file)) { found = true; break; }
+                            if (cur.depth >= 4) { unknown = true; continue; }
+                            const fe = index.files.get(cur.file);
+                            if (!fe) { unknown = true; continue; }
+                            for (const e of (fe.exportDetails || [])) {
+                                if (!e.source) continue;
+                                let nextAttr;
+                                if (e.type === 're-export-all' && e.alias === cur.attr) {
+                                    nextAttr = null; // entered the namespace
+                                } else if (e.type === 're-export-all' && !e.alias && cur.attr) {
+                                    nextAttr = cur.attr; // transparent barrel
+                                } else if (e.type === 're-export' &&
+                                    (e.alias || e.name) === cur.attr) {
+                                    nextAttr = e.name;
+                                } else {
+                                    continue;
+                                }
+                                const rel = fe.moduleResolved?.[e.source];
+                                if (rel) {
+                                    queue.push({
+                                        file: path.join(index.root, rel),
+                                        attr: nextAttr,
+                                        depth: cur.depth + 1,
+                                    });
+                                } else if (String(e.source).startsWith('.')) {
+                                    unknown = true;
+                                }
+                            }
+                            // Dynamic/CJS export objects cannot prove that a
+                            // namespace property is unrelated. Keep the usage
+                            // visible rather than manufacturing a false miss.
+                            if ((fe.exportDetails || []).some(e =>
+                                e.type === 'exports' || e.type === 'module.exports') ||
+                                (fe.moduleAssignedNames || []).includes(cur.attr)) {
+                                unknown = true;
+                            }
+                        }
+                        if (!found && unknown) found = true;
+                    }
+                    _importedHasDef.set(cacheKey, found);
+                    return found;
                 };
 
                 // A qualified usage whose RECEIVER is a symbol defined in this
@@ -264,6 +326,24 @@ function usages(index, name, options = {}) {
                         continue;
                     }
 
+                    // Rust `Type::method` method values carry their owner from
+                    // the AST. Keep them only for a matching method owner;
+                    // class/struct queries must not absorb `Enum::Variant`
+                    // references that happen to share the target type name.
+                    // Owners are CALLABLE member defs only — an enum variant
+                    // member also carries className, and counting it as an
+                    // owner would let `Boundary::Grid` survive a struct-Grid
+                    // query via its own enum. Lowercase receivers are module
+                    // paths (`render::draw` reaches the free fn); `Self` is
+                    // the enclosing type — both keep escape-hatch visibility.
+                    if (fileEntry.language === 'rust' && u.scopedReference &&
+                        u.receiver && /^[A-Z]/.test(u.receiver) && u.receiver !== 'Self') {
+                        const methodOwners = new Set(definitions
+                            .filter(d => d.className && CALLABLE_SYMBOL_KINDS.has(d.type))
+                            .map(d => d.className));
+                        if (!methodOwners.has(u.receiver)) continue;
+                    }
+
                     // Filter member expressions with unrelated receivers in JS/TS/Python.
                     // Keeps: standalone usages, self/this/cls/super, method calls on known types,
                     //        qualified usages whose receiver this file defines,
@@ -272,7 +352,10 @@ function usages(index, name, options = {}) {
                     if (u.receiver && !['self', 'this', 'cls', 'super'].includes(u.receiver) &&
                         fileEntry.language !== 'go' && fileEntry.language !== 'java' && fileEntry.language !== 'rust') {
                         const hasMethodDef = definitions.some(d => d.className);
-                        if (!hasMethodDef && !receiverDefinedHere(u.receiver) && !importedFileHasDef()) {
+                        const sameFileMember = definitions.some(d =>
+                            d.file === filePath && d.memberAssigned);
+                        if (!hasMethodDef && !sameFileMember && !receiverDefinedHere(u.receiver) &&
+                            !importedFileHasDef(u.receiver)) {
                             continue;
                         }
                     }
@@ -738,6 +821,10 @@ function structuralSearch(index, options = {}) {
 
                     // Unused filter (expensive — last check)
                     if (unused) {
+                        // Named function expressions are consumed by their
+                        // expression position — never "unused" (the deadcode
+                        // twin of the bodyScopedName audit skip).
+                        if (def.bodyScopedName) continue;
                         index.buildCalleeIndex();
                         // A name whose every call site is its own recursion
                         // has zero callers (fix #253c — the deadcode
@@ -873,7 +960,21 @@ function example(index, name, options = {}) {
             .map(c => ({ ...c, evidenceTier: 'unverified' })),
         ...(rawCallers.unverifiedEntries || [])
             .map(c => ({ ...c, evidenceTier: 'unverified' })),
-    ].filter(c => !c.functionReference && c.calledAs !== 'bound');
+    ].filter(c => !c.functionReference && !c.isFunctionReference && c.calledAs !== 'bound');
+
+    // `about`/`context` expose conserved call lines that no engine candidate
+    // claimed as `call-not-resolved`. `example` must preserve the same
+    // evidence contract: when those are the only candidate sites, abstain
+    // explicitly instead of returning a misleading "no examples" error.
+    // Compose the text-ground account only on this empty-candidate path so
+    // normal example selection does not pay for a second project-wide scan.
+    if (candidates.length === 0) {
+        const { composeAccount, callNotResolvedEntries } = require('./analysis');
+        const callerAccount = composeAccount(index, name, rawCallers);
+        candidates.push(...callNotResolvedEntries(index, callerAccount)
+            .filter(c => !c.functionReference && c.calledAs !== 'bound')
+            .map(c => ({ ...c, evidenceTier: 'unverified' })));
+    }
 
     // Dedupe by site, preferring confirmed evidence when a parser shape
     // reaches the same line through more than one resolution path.
@@ -1203,19 +1304,24 @@ function tests(index, nameOrFile, options = {}) {
 
             // Fast pre-check: skip if searchTerm doesn't appear in file
             if (!content.includes(searchTerm) && !linkedRecords) continue;
-            // className scoping: skip test files that reference neither the
-            // class nor any non-overriding subclass (fix #246 — a test
-            // holding only a Circle exercises Shape.describe).
-            if (className && ![...dispatchNames].some(dn => content.includes(dn))) continue;
-
-            // --file scoping: only include test files that import from the target source
-            if (sourceFileFilter && !sourceFileFilter.has(testPath)) {
-                continue;
-            }
+            const sourceFileLinked = !sourceFileFilter || sourceFileFilter.has(testPath);
 
             // AST-based usage detection
             const astUsages = index._getCachedUsages(testPath, searchTerm) || [];
             if (astUsages.length === 0 && !linkedRecords) continue;
+            // Compiler attributes can invoke generated builder methods across
+            // workspace/facade boundaries that the source import graph cannot
+            // represent (`#[arg(value_delimiter = ',')]`). Keep these explicit
+            // AST references as unverified instead of silently dropping a real
+            // test. Ordinary calls/references still require source ownership.
+            const hasAttributeReference = astUsages.some(u => u.inAttribute &&
+                (!testRanges || lineInRanges(u.line, testRanges)));
+            if (!sourceFileLinked && !hasAttributeReference) continue;
+            // className scoping normally requires the class or a dispatching
+            // descendant in the file. Generated attribute references are the
+            // conservative exception: they carry an explicit unverified tier.
+            if (className && ![...dispatchNames].some(dn => content.includes(dn)) &&
+                !hasAttributeReference) continue;
 
             // A test file that DEFINES searchTerm itself owns bare-name
             // calls of it (fix #246 — the #244 affectedTests rule, tests()
@@ -1254,6 +1360,7 @@ function tests(index, nameOrFile, options = {}) {
 
             for (const usage of astUsages) {
                 if (usage.usageType === 'definition') continue; // not relevant in test files
+                if (!sourceFileLinked && !usage.inAttribute) continue;
                 // Inline-test-promoted file: only lines inside the test
                 // ranges are test code (fix #244).
                 if (testRanges && !lineInRanges(usage.line, testRanges)) continue;
@@ -1351,7 +1458,8 @@ function tests(index, nameOrFile, options = {}) {
             // Language-aware test-case detection. Under a local same-name
             // shadow the term on a test line is the file's OWN helper —
             // only anchor test cases to matches that survived the shadow.
-            if (!localShadow || matches.some(m => m.matchType !== 'import')) {
+            if (sourceFileLinked &&
+                (!localShadow || matches.some(m => m.matchType !== 'import'))) {
                 _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
             }
 
@@ -1531,7 +1639,7 @@ function _buildSourceFileImporters(index, defs) {
             // If so, add it to the queue so its importers are also discovered.
             if (!visited.has(imp)) {
                 const fe = index.files.get(imp);
-                if (fe && _fileReExportsSymbol(fe, symbolName, current)) {
+                if (fe && _fileReExportsSymbol(index, fe, symbolName, current)) {
                     visited.add(imp);
                     queue.push(imp);
                 }
@@ -1636,13 +1744,28 @@ function _buildSourceFileImporters(index, defs) {
  * Handles: named re-exports, `module.exports = require(...)` blanket re-exports,
  * `export * from ...`, and files that both import from source and export the symbol.
  */
-function _fileReExportsSymbol(fileEntry, symbolName, sourceAbsPath) {
-    if (!fileEntry.exports || fileEntry.exports.length === 0) return false;
-    // Check if any export matches the symbol name
-    if (symbolName && fileEntry.exports.some(exp => exp.name === symbolName)) return true;
+function _fileReExportsSymbol(index, fileEntry, symbolName, sourceAbsPath) {
+    // Python module imports become module attributes. Package __init__.py
+    // commonly exposes its public API through `from .core import Context as
+    // Context`, which has no separate export statement in the AST.
+    if (fileEntry.language === 'python' && symbolName) {
+        for (const binding of (fileEntry.importBindings || [])) {
+            if (binding.name !== symbolName && binding.alias !== symbolName) continue;
+            const rel = fileEntry.moduleResolved?.[binding.module];
+            if (rel && path.join(index.root, rel) === sourceAbsPath) return true;
+        }
+    }
+
+    const exportNames = fileEntry.exports || [];
+    const details = fileEntry.exportDetails || [];
+    if (exportNames.length === 0 && details.length === 0) return false;
+    // Check if any export matches the symbol name. fileEntry.exports is the
+    // persisted string-name list; exportDetails carries source/type metadata.
+    if (symbolName && (exportNames.includes(symbolName) ||
+        details.some(exp => exp.name === symbolName || exp.alias === symbolName))) return true;
     // Blanket re-exports: module.exports = require(...), export * from ...
     // These have undefined or generic names but re-export everything from the imported module
-    const hasBlanketExport = fileEntry.exports.some(exp =>
+    const hasBlanketExport = details.some(exp =>
         !exp.name || exp.type === 'module.exports' || exp.type === 're-export' || exp.type === 'export-all'
     );
     if (hasBlanketExport) return true;

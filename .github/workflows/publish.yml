@@ -52,7 +52,7 @@ jobs:
       - run: npm ci
       - run: npm run lint
       - run: npm test
-      - name: Release trust gate (one compiler/LSP board per language)
+      - name: Release trust gate (seven repos across five external oracles)
         run: npm run trust:gate
 
   publish-npm:

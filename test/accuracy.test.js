@@ -15,6 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const { ProjectIndex } = require('../core/project');
 const { tsMorphOracle } = require('../eval/oracles/ts-morph-oracle');
+const { constructedReceiverAt } = require('../eval/oracles/jdtls-oracle');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,26 @@ function idx(d, g) {
 }
 
 describe('Oracle contract', () => {
+    it('jdtls adjudication retains exact constructed receiver provenance', () => {
+        const source = [
+            'void run(Context context) {',
+            '  Connection.Request req = new HttpConnection.Request();',
+            '  req.addHeader("x", "y");',
+            '  req = context.request();',
+            '  req.addHeader("z", "w");',
+            '}',
+        ];
+        assert.deepStrictEqual(constructedReceiverAt({
+            source, sourceLine: source[2], line: 3, name: 'addHeader',
+        }), {
+            receiver: 'req', rawType: 'HttpConnection.Request', ownerName: 'Request',
+            line: 2, character: 46,
+        });
+        assert.strictEqual(constructedReceiverAt({
+            source, sourceLine: source[4], line: 5, name: 'addHeader',
+        }), null, 'a nearer non-constructor assignment invalidates runtime provenance');
+    });
+
     it('ts-morph call oracle keeps interface/base dispatch but rejects concrete sibling methods', async () => {
         const d = tmp({
             'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["**/*.ts"]}',
@@ -83,6 +104,33 @@ describe('Oracle contract', () => {
             assert.ok(!calls.includes('use.ts:7'), `concrete sibling call is not SmartRouter.add: ${calls}`);
             assert.ok(!calls.includes('use.ts:8'),
                 `standalone function installed as a sibling field is not SmartRouter.add: ${calls}`);
+        } finally { rm(d); }
+    });
+
+    it('ts-morph call oracle rejects an unrelated receiver for a universal method name', async () => {
+        const d = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["**/*.ts"]}',
+            'view.ts': [
+                'export class View {',
+                '  toString(): string { return "view" }',
+                '}',
+            ].join('\n'),
+            'use.ts': [
+                'import { View } from "./view"',
+                'class Digest { toString(): string { return "digest" } }',
+                'export const right = new View().toString()',
+                'export const wrong = new Digest().toString()',
+            ].join('\n'),
+        });
+        try {
+            const handle = await tsMorphOracle.prepare(d);
+            const refs = await tsMorphOracle.findReferences(handle, {
+                name: 'toString', file: 'view.ts', line: 2,
+            });
+            const calls = refs.filter(r => r.kind === 'call')
+                .map(r => `${r.file}:${r.line}`);
+            assert.ok(calls.includes('use.ts:3'), `exact View call remains: ${calls}`);
+            assert.ok(!calls.includes('use.ts:4'), `unrelated Digest call is excluded: ${calls}`);
         } finally { rm(d); }
     });
 });
@@ -1483,7 +1531,7 @@ module.exports = { createParser, parseCSV, main };
         } finally { rm(d); }
     });
 
-    it('LIMITATION: method chaining hides callees', () => {
+    it('FIXED: a freshly constructed method chain exposes its first callee', () => {
         const d = tmp({
             'package.json': '{"name":"t"}',
             'lib.js': `
@@ -1501,13 +1549,12 @@ module.exports = { Builder, create };
             const index = idx(d);
             const def = index.symbols.get('create')?.[0];
             const callees = index.findCallees(def);
-            // Chained method calls filtered without includeMethods
             const hasBuilder = callees.some(c => c.name === 'Builder');
             assert.ok(hasBuilder, 'Constructor call detected');
-            // Method chain calls are method calls — filtered by default
+            // `new Builder()` gives the first chained receiver an exact type.
             const hasSetName = callees.some(c => c.name === 'setName');
-            assert.ok(!hasSetName,
-                'Method chain calls filtered — setName not in callees without includeMethods');
+            assert.ok(hasSetName,
+                'Freshly constructed receiver resolves Builder.setName');
         } finally { rm(d); }
     });
 

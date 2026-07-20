@@ -193,6 +193,8 @@ function formatContextJson(context) {
                     line: c.line,
                     expression: c.content,
                     callerName: c.callerName,
+                    ...(c.calledAs && { calledAs: c.calledAs }),
+                    ...(c.isFunctionReference && { functionReference: true }),
                     // Tier parity with the function-path callers list: class
                     // usages are the confirmed-tier answer for type symbols.
                     ...(c.confidence !== undefined && { confidence: c.confidence }),
@@ -206,6 +208,8 @@ function formatContextJson(context) {
                     line: c.line,
                     expression: c.content,
                     callerName: c.callerName ?? null,
+                    ...(c.calledAs && { calledAs: c.calledAs }),
+                    ...(c.isFunctionReference && { functionReference: true }),
                     tier: 'unverified',
                     ...(c.confidence !== undefined && { confidence: c.confidence }),
                     ...(c.evidenceScore !== undefined && { evidenceScore: c.evidenceScore }),

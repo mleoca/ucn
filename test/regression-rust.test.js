@@ -67,6 +67,23 @@ impl User {
     });
 });
 
+describe('fix #272 (Rust): associated method references', () => {
+    it('records Type::method callback values with their owner', () => {
+        const languages = require('../languages');
+        const parser = languages.getParser('rust');
+        const mod = languages.getLanguageModule('rust');
+        const source = [
+            'struct Cursive;',
+            'impl Cursive { fn quit(&mut self) {} }',
+            'fn install() { set_callback(Cursive::quit); }',
+        ].join('\n');
+        const usages = mod.findUsagesInCode(source, 'quit', parser);
+        assert.ok(usages.some(u => u.line === 3 && u.usageType === 'reference' &&
+            u.receiver === 'Cursive' && u.scopedReference),
+        `associated method reference missing: ${JSON.stringify(usages)}`);
+    });
+});
+
 describe('Regression: Rust main and #[test] not flagged as deadcode', () => {
     it('should NOT report main() or #[test] functions as dead code in Rust', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-main-'));
@@ -1562,6 +1579,41 @@ mod tests {
                 rust.getEntryPointKind(sym), 'test',
                 'cfg(test) module function should classify as test kind'
             );
+        } finally { rm(dir); }
+    });
+});
+
+describe('Rust generated attribute references in tests', () => {
+    it('keeps a workspace-facade attribute reference as an unverified test match', () => {
+        const dir = tmp({
+            'Cargo.toml': '[workspace]\nmembers = ["builder", "facade"]\nresolver = "2"',
+            'builder/Cargo.toml': '[package]\nname = "builder"\nversion = "0.1.0"\nedition = "2021"',
+            'builder/src/lib.rs': [
+                'pub struct Arg;',
+                'impl Arg {',
+                '    pub fn value_delimiter(self, _value: char) -> Self { self }',
+                '}',
+            ].join('\n'),
+            'facade/Cargo.toml': '[package]\nname = "facade"\nversion = "0.1.0"\nedition = "2021"',
+            'facade/src/lib.rs': 'pub use builder::Arg;',
+            'tests/derive.rs': [
+                '#[test]',
+                'fn generated_builder_configuration() {',
+                '    #[arg(value_delimiter = \',\')]',
+                '    struct Opt;',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const results = index.tests('value_delimiter', {
+                file: 'builder/src/lib.rs', className: 'Arg',
+            });
+            const match = results.find(r => r.file === 'tests/derive.rs')?.matches
+                .find(m => m.line === 3);
+            assert.ok(match, `generated reference missing: ${JSON.stringify(results)}`);
+            assert.strictEqual(match.matchType, 'unverified-reference');
+            assert.strictEqual(match.evidenceTier, 'unverified');
         } finally { rm(dir); }
     });
 });
@@ -4403,6 +4455,63 @@ describe('fix #274 (Rust): unresolved rebinding invalidates stale return flow', 
             assert.ok(visible.some(c => c.file === 'src/lib.rs' && c.line === 12),
                 `inner Wanted.run must remain visible: ${JSON.stringify(json.data)}`);
             assert.strictEqual(json.meta.account?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #276 (Rust): Deref target method lookup', () => {
+    it('resolves a wrapper receiver through its declared Deref Target', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'use std::ops::Deref;',
+                'pub struct Core;',
+                'impl Core { pub fn add_layer(&mut self) {} }',
+                'pub struct Runner(Core);',
+                'impl Deref for Runner {',
+                '  type Target = Core;',
+                '  fn deref(&self) -> &Core { &self.0 }',
+                '}',
+                'pub fn use_it(runner: &mut Runner) { runner.add_layer(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const runner = (index.symbols.get('Runner') || [])
+                .find(d => d.type === 'struct');
+            assert.strictEqual(runner?.derefTarget, 'Core');
+            const result = execute(index, 'context', { name: 'src/lib.rs:3:add_layer' });
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.ok((json.data.callers || []).some(c => c.line === 9),
+                `Deref receiver must reach Core.add_layer: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.meta.account.excluded.byReason['receiver-type-mismatch']);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('resolves a numeric tuple field through its declared type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Str;',
+                'impl Str { pub fn as_str(&self) -> &str { "" } }',
+                'pub struct Id(Str);',
+                'impl Id {',
+                '  pub fn as_str(&self) -> &str {',
+                '    self.0.as_str()',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const field = (index.symbols.get('0') || []).find(d => d.className === 'Id');
+            assert.strictEqual(field?.fieldType, 'Str');
+            const result = execute(index, 'context', { name: 'src/lib.rs:2:as_str' });
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.ok((json.data.callers || []).some(c => c.line === 6),
+                `tuple field must reach Str.as_str: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });

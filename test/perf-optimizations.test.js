@@ -1189,6 +1189,11 @@ describe('index reliability: parallel build equals sequential build', () => {
         spec['rich2.rs'] = [
             'pub trait Greet { fn hello(&self) -> String; }',
             'pub struct Greeter;',
+            'pub struct Wrapper(Greeter);',
+            'impl std::ops::Deref for Wrapper {',
+            '    type Target = Greeter;',
+            '    fn deref(&self) -> &Greeter { &self.0 }',
+            '}',
             'impl Greet for Greeter {',
             '    fn hello(&self) -> String { String::from("hi") }',
             '}',
@@ -1211,6 +1216,27 @@ describe('index reliability: parallel build equals sequential build', () => {
             '\treturn c.Flags().String() + sb.String() + buf.String()',
             '}',
             'func pair() (int, error) { return 0, nil }',
+        ].join('\n');
+        // defaultLike import bindings (CJS callable default), named function
+        // expressions (bodyScopedName — bindings-table exclusion must match
+        // across build paths), and Java nested types (enclosingType): shapes
+        // the guard could not previously generate (the #219 fixture lesson).
+        spec['rich4.js'] = [
+            'const factory = require("./rich5");',
+            'test("boot", function bootPhase() { return factory(); });',
+            'module.exports = { go: () => factory() };',
+        ].join('\n');
+        spec['rich5.js'] = [
+            'function createThing() { return 1; }',
+            'module.exports = createThing;',
+        ].join('\n');
+        spec['Rich6.java'] = [
+            'public class Rich6 {',
+            '    public static class Inner {',
+            '        int size() { return 1; }',
+            '    }',
+            '    int use(Object o) { return ((Inner) o).size(); }',
+            '}',
         ].join('\n');
         const dir = tmp(spec);
         try {

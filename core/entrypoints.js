@@ -644,7 +644,15 @@ function buildCallbackEntrypointMap(index) {
                     if (!enc || !enc.name || enc.name === '<anonymous>') continue;
                     const route = routeLines.get(enc.startLine);
                     if (!route || handledLines.has(enc.startLine)) continue;
-                    if (index.symbols.has(enc.name)) continue; // real defs took pass 2
+                    // Real defs took pass 2 (they arrive as function
+                    // REFERENCES on the route line). The inline expression's
+                    // own indexed symbol (bodyScopedName, anchored at this
+                    // registration line) is not a pass-2 shape — it IS the
+                    // handler this pass exists to surface.
+                    const encDefs = index.symbols.get(enc.name) || [];
+                    const inlineDef = encDefs.find(d => d.bodyScopedName &&
+                        d.file === filePath && d.startLine === enc.startLine);
+                    if (encDefs.length > 0 && !inlineDef) continue;
                     if (!result.has(enc.name)) {
                         result.set(enc.name, {
                             framework: route.pattern.framework,

@@ -505,7 +505,12 @@ class ProjectIndex {
                     // = require('./validation')` — the record's local alias
                     // pins to ITS module, not any module exporting the name.
                     const rn = (i.renames || []).find(r => r.original === n);
-                    return { name: n, module: i.module, ...(rn && { alias: rn.local }) };
+                    return {
+                        name: n,
+                        module: i.module,
+                        ...(rn && { alias: rn.local }),
+                        ...(i.defaultLike && { defaultLike: true }),
+                    };
                 })),
             exports: exports.map(e => e.name),
             exportDetails: exports,
@@ -548,12 +553,14 @@ class ProjectIndex {
                 ...(item.implements && { implements: item.implements }),
                 ...(item.indent !== undefined && { indent: item.indent }),
                 ...(item.isNested && { isNested: item.isNested }),
+                ...(item.enclosingType && { enclosingType: item.enclosingType }),
                 ...(item.isMethod && { isMethod: item.isMethod }),
                 ...(item.receiver && { receiver: item.receiver }),
                 ...(item.className && { className: item.className }),
                 ...(item.memberType && { memberType: item.memberType }),
                 ...(item.fieldType && { fieldType: item.fieldType }),
                 ...(item.aliasOf && { aliasOf: item.aliasOf }),
+                ...(item.derefTarget && { derefTarget: item.derefTarget }),
                 ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
                 // Decorator/annotation/attribute argument capture for endpoints command:
                 // these fields hold the parsed first-string-arg of each route-style annotation.
@@ -570,6 +577,7 @@ class ProjectIndex {
                 ...(item.traitName && { traitName: item.traitName }),
                 ...(item.isSignature && { isSignature: true }),
                 ...(item.memberAssigned && { memberAssigned: true }),
+                ...(item.bodyScopedName && { bodyScopedName: true }),
                 ...(item.registryMember && { registryMember: true }),
                 ...(item.registryContainer && { registryContainer: item.registryContainer })
             };
@@ -577,8 +585,10 @@ class ProjectIndex {
             // Property-assignment defs (fix #269: Reply.prototype.serialize
             // = function) declare no lexical name — a bare reference in the
             // file can never bind them, so they never enter the bindings
-            // table (the symbol stays indexed and method-reachable).
-            if (!item.memberAssigned) {
+            // table (the symbol stays indexed and method-reachable). Named
+            // function expressions (bodyScopedName) bind only inside their
+            // own body (ECMA-262) — same consequence.
+            if (!item.memberAssigned && !item.bodyScopedName) {
                 fileEntry.bindings.push({
                     id: symbol.bindingId,
                     name: symbol.name,

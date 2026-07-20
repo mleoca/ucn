@@ -182,7 +182,6 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
     }
     if (!signatureDecl) return true;
     const sigInterface = signatureDecl.getFirstAncestorByKind(SyntaxKind.InterfaceDeclaration);
-    if (sigInterface) return true; // a target implementation may receive interface dispatch
     const sigOwner = signatureDecl.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
     // A concrete call may resolve to a standalone function installed as a
     // class field (`RegExpRouter.match = match`). TypeScript's rename-oriented
@@ -191,6 +190,8 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
     // cannot classify stays conservative; an actual function declaration is
     // definitive negative ownership evidence.
     if (!sigOwner) {
+        if (sigInterface) return receiverTypeMayReachTarget(
+            handle, call, targetOwner, SyntaxKind);
         return signatureDecl.getKind() !== SyntaxKind.FunctionDeclaration;
     }
     if (sameDeclarationOwner(targetOwner, sigOwner)) return true;
@@ -207,6 +208,26 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
         base = base.getBaseClass();
     }
     return false;
+}
+
+function receiverTypeMayReachTarget(handle, call, targetOwner, SyntaxKind) {
+    // Rename-oriented references may group universal/repeated interface
+    // methods even when the receiver can never be the target owner. Check
+    // both assignability directions: an interface/base receiver may dispatch
+    // to the target subtype, while a concrete subtype may inherit a target
+    // method. Unresolved/any/unknown receivers remain conservative.
+    try {
+        const access = call.getExpression();
+        if (access?.getKind() !== SyntaxKind.PropertyAccessExpression) return true;
+        const receiverType = handle.project.getTypeChecker()
+            .getTypeAtLocation(access.getExpression());
+        if (receiverType.isAny?.() || receiverType.isUnknown?.()) return true;
+        const targetType = targetOwner.getType();
+        return targetType.isAssignableTo(receiverType) ||
+            receiverType.isAssignableTo(targetType);
+    } catch {
+        return true;
+    }
 }
 
 function sameDeclarationOwner(a, b) {

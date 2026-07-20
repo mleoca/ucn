@@ -34,7 +34,7 @@ UCN is deliberately lightweight:
 - **No language servers** - tree-sitter does the parsing, no compilation needed
 - **MCP is optional** - only needed if you connect UCN to an AI agent, the CLI and Skill work on their own
 
-And it's built for **auditable trust**. grep hands you raw text matches to verify yourself; UCN separates target-backed edges from possible edges, explains exclusions, and reconciles its observed text set. It does not turn a zero into a deletion claim. CI re-derives answers from real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls). Publishing is gated on a representative five-repository board; the scheduled board covers nineteen plus rotating fresh repositories. See [Answers you can trust](#answers-you-can-trust).
+And it's built for **auditable trust**. grep hands you raw text matches to verify yourself; UCN separates target-backed edges from possible edges, explains exclusions, and reconciles its observed text set. It does not turn a zero into a deletion claim. CI re-derives answers from real compilers and language servers (ts-morph, pyright, gopls, rust-analyzer, jdtls). Publishing is gated on a representative seven-repository board; the scheduled board covers nineteen pinned repositories plus rotating fresh repositories. See [Answers you can trust](#answers-you-can-trust).
 
 ### Same engine, different transport
 
@@ -175,19 +175,31 @@ This is a release gate, not a promise of universal program understanding. CI re-
 
 Current pinned release-board results:
 
-| Repository | Language oracle | Confirmed caller precision | Caller recall | Callee precision/recall | Command checks |
-|---|---|---:|---:|---:|---:|
-| preact-signals | ts-morph | 100% | 100% | 100% / 100% | 100% |
-| httpx | pyright | 100% | 100% | 100% / 100% | 100% |
-| cobra | gopls | 100% | 100% | 100% / 100% | 100% |
-| clap | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
-| javapoet | jdtls | 100% | 100% | 100% / 100% | 100% |
+| Repository | Pinned commit | Language oracle | Confirmed caller precision | Caller recall | Callee precision/recall | Command checks |
+|---|---|---|---:|---:|---:|---:|
+| [preact-signals](https://github.com/preactjs/signals) | [`e0ce9fdf`](https://github.com/preactjs/signals/commit/e0ce9fdf92df7f0ece2c89d44554c39f36dc6882) | ts-morph | 100% | 100% | 100% / 100% | 100% |
+| [httpx](https://github.com/encode/httpx) | [`b5addb64`](https://github.com/encode/httpx/commit/b5addb64f0161ff6bfe94c124ef76f6a1fba5254) | pyright | 100% | 100% | 100% / 100% | 100% |
+| [cobra](https://github.com/spf13/cobra) | [`ad460ea8`](https://github.com/spf13/cobra/commit/ad460ea8f249db69c943a365fb84f3a59042d54e) | gopls | 100% | 100% | 100% / 100% | 100% |
+| [viper](https://github.com/spf13/viper) | [`528f7416`](https://github.com/spf13/viper/commit/528f7416c4b56a4948673984b190bf8713f0c3c4) | gopls | 100% | 100% | 100% / 100% | 100% |
+| [ripgrep](https://github.com/BurntSushi/ripgrep) | [`82313cf9`](https://github.com/BurntSushi/ripgrep/commit/82313cf95849bfe425109ad9506a52154879b1b1) | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
+| [clap](https://github.com/clap-rs/clap) | [`d3e59a9a`](https://github.com/clap-rs/clap/commit/d3e59a9ab214910b9dad02921b7ef42c6400de9b) | rust-analyzer | 100% | 100% | 100% / 100% | 100% |
+| [javapoet](https://github.com/square/javapoet) | [`b9017a95`](https://github.com/square/javapoet/commit/b9017a9503b76e11b4ad4c1a9f050e2d29112cb0) | jdtls | 100% | 100% | 100% / 100% | 100% |
 
-The command checks cover exact definition lookup, `find`, `fn`/`class`, `brief`, `typedef`, `usages`, `tests`, and `example` against the same external oracle population. The dead-code arm currently has zero false-dead claims on the release board. The semantic gate also caps configuration-unscored caller and callee evidence at 10%, so platform filtering cannot silently make a small scored subset look representative. The performance arm runs every repository in an isolated process, takes three fresh-cache startup samples, reports median and maximum first-query latency, and independently gates steady-state p50/p95 and peak memory.
+Each semantic run draws a deterministic, reference-count-stratified sample of up to 50 compiler/LSP symbols per repository. The command checks cover exact definition lookup, `find`, `fn`/`class`, `brief`, `typedef`, `usages`, `tests`, and `example` against that same external-oracle population. The dead-code arm audits up to 100 claims per release repository and currently has zero false-dead claims. The semantic gate caps configuration-unscored confirmed caller and callee evidence at 10%, so platform filtering cannot silently make a small scored precision subset look representative. Configuration-gated unverified abstentions are reported separately and never presented as confirmed evidence. The performance arm runs every repository in an isolated process, takes three fresh-cache startup samples, reports median and maximum first-query latency, and independently gates steady-state p50/p95 and peak memory.
+
+Evidence: [semantic rollup](eval/reports/oracle-eval-rollup-2026-07-20.md), [dead-code rollup](eval/reports/deadcode-eval-rollup-2026-07-20.md), and [performance rollup](eval/reports/performance-gate-2026-07-20.md). Reproduce all three release gates with `npm run trust:gate`; the pinned source manifest is [`eval/lib/repos.js`](eval/lib/repos.js).
 
 Unverified precision is reported separately and is intentionally much lower on dispatch-heavy code. Unverified entries are review candidates, not confirmed claims. Rust feature-gated sites that one compiler configuration cannot load are reported as unscored rather than counted as passes.
 
-The scheduled board covers nineteen pinned repositories, multiple sampling seeds, and a rotating fresh-repository arm. It is broader than the five-repository publish gate and is used to expose regressions and overfitting. The tree commands `trace`, `blast`, `reverse-trace`, and `affected-tests` follow the same evidence discipline. Run `ucn doctor --deep` for task-specific readiness on your repository.
+The scheduled board covers nineteen pinned repositories, multiple sampling seeds, and a rotating fresh-repository arm. It is broader than the seven-repository publish gate and is used to expose regressions and overfitting:
+
+- JavaScript and TypeScript: zod, preact-signals, express, hono, zustand, fastify
+- Python: httpx, rich, click
+- Go: cobra, grpc-go, viper, chi
+- Rust: ripgrep, cursive, clap
+- Java: gson, javapoet, jsoup
+
+Repos that expose a gap remain on this scheduled board; they are not removed to preserve a perfect release table. HTML has parser, integration, and cross-surface regression coverage, but no compiler/LSP real-repository oracle is claimed. The tree commands `trace`, `blast`, `reverse-trace`, and `affected-tests` follow the same evidence discipline. Run `ucn doctor --deep` for task-specific readiness on your repository.
 
 ## Change code without breaking things
 
@@ -426,7 +438,7 @@ function compareNames(a, b) {
 - **Coverage** - every command, every supported language, every surface (CLI, MCP, interactive)
 - **Systematic** - a harness exercises all command and flag combinations against real multi-language fixtures
 - **Test types** - unit, integration, per-language regression, formatter, cache, MCP edge cases, architecture parity guards
-- **Ground truth** - caller, callee, and oracle-judgable command behavior is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls. The publish gate uses five representative repositories; the scheduled board uses nineteen plus a rotating fresh-repository arm. Gates track confirmed precision, semantic recall, conservation, observed-zero agreement, oracle configuration coverage, dead-code false positives, isolated startup latency, steady-state latency, and peak memory (see [Answers you can trust](#answers-you-can-trust))
+- **Ground truth** - caller, callee, and oracle-judgable command behavior is measured against ts-morph, pyright, gopls, rust-analyzer, and jdtls. The publish gate uses seven representative repositories; the scheduled board uses nineteen pinned repositories plus a rotating fresh-repository arm. Gates track confirmed precision, semantic recall, conservation, observed-zero agreement, oracle configuration coverage, dead-code false positives, isolated startup latency, steady-state latency, and peak memory (see [Answers you can trust](#answers-you-can-trust))
 
 ---
 

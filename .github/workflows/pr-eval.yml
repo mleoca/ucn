@@ -1,13 +1,14 @@
 name: PR Eval Gate
 
 # Fast contract gate on every PR/push: oracle eval on the two quickest
-# ground-truth repos (preact-signals via ts-morph, httpx via pyright —
+# ground-truth repos (preact-signals via ts-morph, httpx via pyright;
 # no Go/Rust/Java toolchains needed, ~2 min total). Fails on:
 #  - semantic-missing > 0 (an indexed oracle call edge not actually shown in
 #    confirmed/unverified; conserving it in a count is no longer enough)
 #  - tier-1 precision below the floor (locks the measured numbers in:
-#    both fast-gate repos now measure 100% — a 98% floor blocks material drift)
-# The full 6-repo battery stays in eval.yml (weekly + dispatch).
+#    both fast-gate repos now measure 100%; a 98% floor blocks material drift)
+# The seven-repository publish battery runs before release. The weekly and
+# manually dispatched workflow covers all nineteen pinned repositories.
 
 on:
   pull_request:

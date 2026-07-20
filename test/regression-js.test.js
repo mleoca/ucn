@@ -191,6 +191,168 @@ module.exports = { parse };
     });
 });
 
+describe('Project-aware JavaScript receiver resolution', () => {
+    it('keeps usages through a local namespace named like a standard module', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'util.js': 'exports.escapeRegex = function escapeRegex(value) { return value }',
+            'local.js': 'const util = require("./util")\nutil.escapeRegex("x")',
+            'core.mjs': 'export * as util from "./esm-util.mjs"',
+            'esm-util.mjs': 'export function escapeRegex(value) { return value }',
+            'barrel.mjs': 'import { util } from "./core.mjs"\nutil.escapeRegex("x")',
+            'external.js': 'const util = require("node:util")\nutil.escapeRegex("x")',
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.usages('escapeRegex').filter(u => u.usageType === 'call');
+            assert.ok(calls.some(u => u.relativePath === 'local.js' && u.line === 2),
+                `local namespace usage must remain visible: ${JSON.stringify(calls)}`);
+            assert.ok(calls.some(u => u.relativePath === 'barrel.mjs' && u.line === 2),
+                `re-exported namespace usage must remain visible: ${JSON.stringify(calls)}`);
+            assert.ok(!calls.some(u => u.relativePath === 'external.js'),
+                `external namespace must not borrow the project symbol: ${JSON.stringify(calls)}`);
+        } finally { rm(dir); }
+    });
+
+    it('indexes private method definitions and calls as usages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'box.js': [
+                'class Box {',
+                '  #clone() { return new Box() }',
+                '  copy() { return this.#clone() }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const usages = index.usages('#clone');
+            assert.ok(usages.some(u => u.isDefinition && u.line === 2),
+                `private definition must be indexed: ${JSON.stringify(usages)}`);
+            assert.ok(usages.some(u => u.usageType === 'call' && u.line === 3),
+                `private call must be indexed: ${JSON.stringify(usages)}`);
+        } finally { rm(dir); }
+    });
+
+    it('does not bind a constructor parameter to a project class with the same name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'class Class {}',
+                'function shadowed(Class) { return new Class() }',
+                'function exact() { return new Class() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('Class')[0];
+            const callers = index.findCallers('Class', {
+                targetDefinitions: [target], collectAccount: true, includeMethods: true,
+            });
+            assert.ok(callers.some(c => c.line === 3),
+                `unshadowed constructor must resolve: ${JSON.stringify(callers)}`);
+            assert.ok(!callers.some(c => c.line === 2),
+                `constructor parameter must shadow the project class: ${JSON.stringify(callers)}`);
+            assert.ok(callers.accountRaw.excludedEntries.some(e =>
+                e.line === 2 && e.reason === 'local-shadow'),
+            `shadowed constructor must carry an exclusion reason: ${JSON.stringify(callers.accountRaw)}`);
+        } finally { rm(dir); }
+    });
+
+    it('uses the exact type of a freshly constructed method receiver', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'class Right { run() { return 1 } }',
+                'class Wrong { run() { return 2 } }',
+                'function start() { return new Right().run() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('run');
+            const right = defs.find(d => d.className === 'Right');
+            const wrong = defs.find(d => d.className === 'Wrong');
+            const rightCallers = index.findCallers('run', {
+                targetDefinitions: [right], collectAccount: true, includeMethods: true,
+            });
+            const wrongCallers = index.findCallers('run', {
+                targetDefinitions: [wrong], collectAccount: true, includeMethods: true,
+            });
+            assert.ok(rightCallers.some(c => c.line === 3),
+                `constructed Right receiver must resolve exactly: ${JSON.stringify(rightCallers)}`);
+            assert.ok(!wrongCallers.some(c => c.line === 3),
+                `constructed Right receiver cannot call Wrong.run: ${JSON.stringify(wrongCallers)}`);
+            assert.ok(wrongCallers.accountRaw.excludedEntries.some(e =>
+                e.line === 3 && e.reason === 'receiver-type-mismatch'),
+            `wrong owner must carry an exclusion reason: ${JSON.stringify(wrongCallers.accountRaw)}`);
+        } finally { rm(dir); }
+    });
+
+    it('follows an imported base type exposed under a different name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.ts': [
+                'class Internal { run(): number { return 1 } }',
+                'export { Internal as PublicBase }',
+            ].join('\n'),
+            'child.ts': [
+                'import { PublicBase } from "./base"',
+                'export class Public extends PublicBase {}',
+            ].join('\n'),
+            'app.ts': [
+                'import { Public } from "./child"',
+                'export function start() { return new Public().run() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('run').find(d => d.className === 'Internal');
+            const callers = index.findCallers('run', {
+                targetDefinitions: [target], collectAccount: true, includeMethods: true,
+            });
+            assert.ok(callers.some(c => c.relativePath === 'app.ts' && c.line === 2),
+                `renamed base identity must preserve inherited dispatch: ${JSON.stringify(callers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('does not cross a concrete override while following renamed ancestry', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'base.ts': [
+                'class Internal { run(): number { return 1 } }',
+                'export { Internal as PublicBase }',
+            ].join('\n'),
+            'child.ts': [
+                'import { PublicBase } from "./base"',
+                'export class Public extends PublicBase {',
+                '  run(): number { return 2 }',
+                '}',
+            ].join('\n'),
+            'app.ts': [
+                'import { Public } from "./child"',
+                'export function start() { return new Public().run() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('run');
+            const inherited = defs.find(d => d.className === 'Internal');
+            const own = defs.find(d => d.className === 'Public');
+            const inheritedCallers = index.findCallers('run', {
+                targetDefinitions: [inherited], collectAccount: true, includeMethods: true,
+            });
+            const ownCallers = index.findCallers('run', {
+                targetDefinitions: [own], collectAccount: true, includeMethods: true,
+            });
+            assert.ok(!inheritedCallers.some(c => c.relativePath === 'app.ts'),
+                `override must intercept the ancestor slot: ${JSON.stringify(inheritedCallers)}`);
+            assert.ok(ownCallers.some(c => c.relativePath === 'app.ts' && c.line === 2),
+                `constructed receiver must resolve its own override: ${JSON.stringify(ownCallers)}`);
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // BUG TESTS: smart command should not duplicate main function
 // ============================================================================
@@ -8231,6 +8393,350 @@ describe('fix #271 (JS/TS): parser recovery and indirect receiver ownership', ()
                 `recursive edge must return to its lexical def: ${JSON.stringify(callees)}`);
             assert.ok(!callees.some(c => c.name === 'walk' && c.startLine === walks[1].startLine),
                 'later sibling never steals the recursive call');
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #272: declaration recovery and reference-complete usages', () => {
+    it('recovers a later declaration swallowed by an ERROR region using AST boundaries', () => {
+        const source = [
+            'export interface Broken {',
+            '  <',
+            '    T extends string,',
+            'export abstract class Tail {',
+            '  abstract finish<T>(): void',
+            '}',
+        ].join('\n');
+        const parsed = parse(source, 'typescript');
+        const tail = parsed.classes.find(c => c.name === 'Tail');
+        assert.ok(tail, `tail declaration must survive parser recovery: ${JSON.stringify(parsed.classes)}`);
+        assert.strictEqual(tail.startLine, 4);
+        assert.ok(tail.members.some(m => m.name === 'finish' && m.startLine === 5));
+        assert.strictEqual(parsed.parseRecovery, true);
+    });
+
+    it('records awaited generic TypeScript method calls', () => {
+        const languages = require('../languages');
+        const parser = languages.getParser('typescript');
+        const mod = languages.getLanguageModule('typescript');
+        const source = [
+            'declare const request: RequestApi',
+            'async function load() {',
+            '  return await request.parseBody<{ name: string }>()',
+            '}',
+        ].join('\n');
+        const calls = mod.findCallsInCode(source, parser);
+        assert.ok(calls.some(c => c.name === 'parseBody' && c.line === 3 && c.isMethod),
+            `generic awaited call must be indexed: ${JSON.stringify(calls)}`);
+    });
+
+    it('indexes nested per-instance function assignments as definitions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'app.js': [
+                'function configure(reply) {',
+                '  reply.send = (value) => value',
+                '  reply.info = function (value) { return value }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            assert.ok(index.symbols.get('send')?.some(d => d.startLine === 2),
+                `nested arrow member missing: ${JSON.stringify(index.symbols.get('send'))}`);
+            assert.ok(index.symbols.get('info')?.some(d => d.startLine === 3),
+                `nested function member missing: ${JSON.stringify(index.symbols.get('info'))}`);
+        } finally { rm(dir); }
+    });
+
+    it('keeps same-file CommonJS member references in usages', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'exports.normalizeType = function (value) { return value }',
+                'exports.all = (values) => values.map(exports.normalizeType)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.usages('normalizeType', { file: 'lib.js' });
+            assert.ok(result.some(u => u.line === 2 && u.usageType === 'reference'),
+                `CommonJS member reference missing: ${JSON.stringify(result)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #275: exact callable exports and renamed callee ownership', () => {
+    it('resolves a callable CommonJS default export in both directions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'module.exports = createApplication',
+                'function createApplication() { return {} }',
+            ].join('\n'),
+            'app.js': [
+                'const express = require("./lib")',
+                'function start() { return express() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('createApplication')[0];
+            const callers = index.findCallers('createApplication', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.relativePath === 'app.js' && c.line === 2),
+                `callable default caller missing: ${JSON.stringify(callers)}`);
+
+            const start = index.symbols.get('start')[0];
+            const callees = index.findCallees(start, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === 'createApplication' && c.relativePath === 'lib.js'),
+                `callable default callee missing: ${JSON.stringify(callees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+
+            const selected = index.example('createApplication', { file: 'lib.js', line: 2 });
+            assert.strictEqual(selected.best.relativePath, 'app.js');
+            assert.strictEqual(selected.best.line, 2,
+                'the export assignment is a reference, never a usage example');
+        } finally { rm(dir); }
+    });
+
+    it('chases a public export alias through a barrel to its implementation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'impl.ts': 'export function _greater(value: number) { return value > 0 }',
+            'barrel.ts': 'export * from "./impl"',
+            'public.ts': 'export { _greater as greater } from "./barrel"',
+            'app.ts': [
+                'import * as checks from "./public"',
+                'export function run() { return checks.greater(1) }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, { collectAccount: true, includeMethods: true });
+            assert.ok(callees.some(c => c.name === '_greater' && c.relativePath === 'impl.ts'),
+                `renamed implementation missing: ${JSON.stringify(callees)}`);
+            assert.strictEqual(callees.calleeAccount.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps untyped local receiver dispatch out of the confirmed tier', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.ts': 'export class Store { add(value: unknown) { return value } }',
+            'app.ts': [
+                'export function run(factory: () => any) {',
+                '  const local = factory()',
+                '  return local.add(1)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('add')[0];
+            const callers = index.findCallers('add', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.ts' && c.line === 3),
+                `untyped local receiver must not confirm: ${JSON.stringify(callers)}`);
+            assert.ok((callers.unverifiedEntries || []).some(c =>
+                c.relativePath === 'app.ts' && c.line === 3 && c.reason === 'possible-dispatch'));
+        } finally { rm(dir); }
+    });
+
+    it('keeps branch-typed and dynamically-qualified receivers unverified; pristine-param bind keeps #221 confirmation', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'class Hooks { validate() { return true } }',
+                'class ContentType { toString() { return "content" } }',
+                'class Reply { send(value) { return value } }',
+                'module.exports = { Hooks, ContentType, Reply }',
+            ].join('\n'),
+            'app.js': [
+                'const { ContentType } = require("./lib")',
+                'function bindSchema(schema) {',
+                '  return schema.validate.bind(schema)',
+                '}',
+                'function normalize(contentType) {',
+                '  if (typeof contentType === "string") contentType = new ContentType(contentType)',
+                '  return contentType.toString()',
+                '}',
+                'function route(context) {',
+                '  const reply = new context.Reply()',
+                '  return reply.send(new Error("boom"))',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = (name, className) => index.symbols.get(name)
+                .find(d => d.className === className);
+            const assertVisibleOnly = (name, className, line) => {
+                const callers = index.findCallers(name, {
+                    targetDefinitions: [target(name, className)], collectAccount: true,
+                });
+                assert.ok(!callers.some(c => c.relativePath === 'app.js' && c.line === line),
+                    `${className}.${name} must not confirm: ${JSON.stringify(callers)}`);
+                assert.ok((callers.unverifiedEntries || []).some(c =>
+                    c.relativePath === 'app.js' && c.line === line &&
+                    c.reason === 'possible-dispatch'),
+                `${className}.${name} must stay visible: ${JSON.stringify(callers.unverifiedEntries)}`);
+            };
+            // `schema.validate.bind(schema)` on a pristine parameter keeps
+            // the measured #204/#221 physics: single project-wide owner +
+            // usage-style bind site stays CONFIRMED (calledAs 'bound').
+            // Demotion requires unknown-provenance evidence — an untypeable
+            // assignment (tombstone), external flow, or a dynamic qualifier
+            // like the two shapes below — never parameter-ness alone.
+            const bound = index.findCallers('validate', {
+                targetDefinitions: [target('validate', 'Hooks')], collectAccount: true,
+            });
+            assert.ok(bound.some(c => c.relativePath === 'app.js' && c.line === 3 &&
+                c.calledAs === 'bound'),
+            `bind site keeps #221 confirmation: ${JSON.stringify(bound)}`);
+            assertVisibleOnly('toString', 'ContentType', 7);
+            assertVisibleOnly('send', 'Reply', 11);
+        } finally { rm(dir); }
+    });
+
+    it('does not treat an ordinary argument variable as a foreign callback', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'request.ts': 'export class Request { header(name: string) { return name } }',
+            'app.ts': [
+                'export function setValue(map: Map<string, string>, header: string, value: string) {',
+                '  map.set(header, value)',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('header')[0];
+            const callers = index.findCallers('header', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.ts' && c.line === 2),
+                `data argument must not become Request.header callback: ${JSON.stringify(callers)}`);
+            assert.ok(callers.accountRaw.excludedEntries.some(e =>
+                e.line === 2 && e.reason === 'local-shadow'));
+        } finally { rm(dir); }
+    });
+});
+
+// ============================================================================
+// Fix #277: named function expressions are body-scoped (ECMA-262) — the name
+// never enters the bindings table, never steals resolution from a real def,
+// and is never audited by deadcode (callback handlers claimed dead).
+// ============================================================================
+
+describe('fix #277: named function expressions are body-scoped', () => {
+    it('an NFE argument never steals the binding from the imported def', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'runner.js': 'function run() { return 1; }\nmodule.exports = { run };',
+            'app.js': [
+                'const { run } = require("./runner");',
+                'test("x", function run() {});',
+                'function main() { return run(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('run')
+                .find(d => d.file.endsWith('runner.js'));
+            const callers = index.findCallers('run', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.relativePath === 'app.js' && c.line === 3),
+                `imported run() keeps its true caller: ${JSON.stringify(callers)}`);
+            const nfe = index.symbols.get('run')
+                .find(d => d.file.endsWith('app.js'));
+            assert.ok(nfe && nfe.bodyScopedName === true,
+                'NFE stays indexed with the body-scope marker');
+            const nfeCallers = index.findCallers('run', {
+                targetDefinitions: [nfe], collectAccount: true,
+            });
+            assert.ok(!nfeCallers.some(c => c.relativePath === 'app.js' && c.line === 3),
+                `main()'s run() never binds the NFE: ${JSON.stringify(nfeCallers)}`);
+        } finally { rm(dir); }
+    });
+
+    it('deadcode never claims a callback-named function expression', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'boot.js': [
+                'const app = { on(evt, fn) { fn(); } };',
+                'app.on("ready", function bootPhase() { return 1; });',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'deadcode', {});
+            assert.ok(r.ok);
+            const claims = (r.result.deadCode || r.result || []);
+            const list = Array.isArray(claims) ? claims : (claims.symbols || []);
+            assert.ok(!list.some(s => s.name === 'bootPhase'),
+                `NFE callback must not be claimed dead: ${JSON.stringify(list.map(s => s.name))}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #277b: same-file class member never excludes an imported callback', () => {
+    it('imported validate as app.use(validate) stays a caller despite class X.validate', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'schemas.js': 'function validate(x) { return !!x; }\nmodule.exports = { validate };',
+            'app.js': [
+                'const { validate } = require("./schemas");',
+                'class X { validate() { return true; } }',
+                'function setup(app) { app.use(validate); }',
+                'module.exports = { X, setup };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('validate')
+                .find(d => d.file.endsWith('schemas.js'));
+            const callers = index.findCallers('validate', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            const all = [...callers, ...(callers.unverifiedEntries || [])];
+            assert.ok(all.some(c => c.relativePath === 'app.js' && c.line === 3),
+                `imported callback survives the class-member name: ${JSON.stringify({
+                    confirmed: callers.map(c => `${c.relativePath}:${c.line}`),
+                    unverified: (callers.unverifiedEntries || []).map(c => `${c.relativePath}:${c.line}`),
+                    excluded: callers.accountRaw?.excludedEntries,
+                })}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix #277c: nested destructured arrow params are locals, not callbacks', () => {
+    it('({ save }) => use(save) never becomes a caller of a project save', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'store.ts': 'export function save(v: number) { return v; }',
+            'app.ts': [
+                'export function run(items: Array<{ save: () => void, rest: number[] }>) {',
+                '  return items.map(({ save, rest: [first] }) => use(save, first));',
+                '}',
+                'export function use(...args: unknown[]) { return args; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('save')[0];
+            const callers = index.findCallers('save', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.ts' && c.line === 2),
+                `destructured param is a local, not store.save: ${JSON.stringify(callers)}`);
+            assert.ok((callers.accountRaw?.excludedEntries || []).some(e =>
+                e.line === 2 && e.reason === 'local-shadow'),
+            `destructured param excludes as local-shadow: ${JSON.stringify(callers.accountRaw?.excludedEntries)}`);
         } finally { rm(dir); }
     });
 });
