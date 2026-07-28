@@ -124,6 +124,47 @@ function resolveCommand(name, surface) {
     return CANONICAL_COMMANDS.find(cmd => toCliName(cmd) === name) || null;
 }
 
+function editDistance(left, right) {
+    const a = String(left || '').toLowerCase();
+    const b = String(right || '').toLowerCase();
+    const row = Array.from({ length: b.length + 1 }, (_, i) => i);
+    for (let i = 1; i <= a.length; i++) {
+        let diagonal = row[0];
+        row[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            const above = row[j];
+            row[j] = Math.min(
+                row[j] + 1,
+                row[j - 1] + 1,
+                diagonal + (a[i - 1] === b[j - 1] ? 0 : 1),
+            );
+            diagonal = above;
+        }
+    }
+    return row[b.length];
+}
+
+/**
+ * Return a single high-confidence correction for a misspelled public command.
+ * The threshold is deliberately strict because the CLI's first positional can
+ * also be a project path; an unrelated missing path must not become a command.
+ */
+function suggestCommand(name, surface = 'cli') {
+    if (!name) return null;
+    const spellings = CANONICAL_COMMANDS.map(command => ({
+        command,
+        spelling: surface === 'mcp' ? toMcpName(command) : toCliName(command),
+    }));
+    const ranked = spellings
+        .map(row => ({ ...row, distance: editDistance(name, row.spelling) }))
+        .sort((a, b) => a.distance - b.distance || a.spelling.localeCompare(b.spelling));
+    const best = ranked[0];
+    const threshold = String(name).length <= 4 ? 2 : Math.min(3, Math.floor(String(name).length / 3));
+    if (!best || best.distance > threshold) return null;
+    if (ranked[1] && ranked[1].distance === best.distance) return null;
+    return best.spelling;
+}
+
 /**
  * Convert snake_case params to camelCase.
  * Passes through params not in PARAM_MAP unchanged.
@@ -219,6 +260,7 @@ module.exports = {
     BROAD_COMMANDS,
     FILE_LOCAL_COMMANDS,
     resolveCommand,
+    suggestCommand,
     normalizeParams,
     getCliCommandSet,
     getMcpCommandEnum,

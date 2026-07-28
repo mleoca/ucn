@@ -3857,7 +3857,7 @@ describe('fix #244 (Python): setUp self.attr receivers and interior-node class s
         try {
             const index = idx(dir);
             const at = execute(index, 'affectedTests', { name: 'util_fn' });
-            const credited = at.result.testFiles.flatMap(f => f.coveredFunctions);
+            const credited = at.result.testFiles.flatMap(f => f.linkedFunctions);
             assert.ok(!credited.includes('save'),
                 'Service.save cannot reach util_fn — the tree itself excludes that site');
         } finally { rm(dir); }

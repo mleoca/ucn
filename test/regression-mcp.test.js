@@ -11,6 +11,11 @@ const fs = require('fs');
 const os = require('os');
 
 const { ProjectIndex } = require('../core/project');
+const {
+    getProjectCachePath,
+    getLegacyProjectCacheDir,
+    clearProjectCache,
+} = require('../core/cache');
 const output = require('../core/output');
 const { BROAD_COMMANDS } = require('../core/registry');
 const { tmp, rm, McpClient, PROJECT_DIR } = require('./helpers');
@@ -373,8 +378,13 @@ describe('fix: MCP stale cache after file edit', () => {
             });
             const text2 = res2.result?.content?.map(c => c.text).join('') || '';
             assert.ok(text2.includes('beta'), `Second query should find beta immediately after edit, got: ${text2}`);
+            assert.ok(fs.existsSync(getProjectCachePath(dir)),
+                'MCP should persist the shared per-user project cache');
+            assert.ok(!fs.existsSync(getLegacyProjectCacheDir(dir)),
+                'MCP must not create a cache inside the analyzed project');
         } finally {
             if (client) client.stop();
+            clearProjectCache(dir);
             rm(dir);
         }
     });

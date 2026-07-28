@@ -64,7 +64,8 @@ describe('Output Formatting', () => {
         });
         assert.ok(typeof text === 'string', 'Should return a string');
         assert.ok(text.includes('parse'), 'Should reference the query name');
-        assert.ok(text.includes('no tests found'), 'Should say no tests found');
+        assert.ok(text.includes('no statically linked tests found'),
+            'Should state that only static linkage was searched');
     });
 
     it('formatTests handles null result gracefully', () => {
@@ -73,7 +74,8 @@ describe('Output Formatting', () => {
             text = output.formatTests(null, 'parse');
         });
         assert.ok(typeof text === 'string', 'Should return a string');
-        assert.ok(text.includes('no tests found'), 'Should say no tests found');
+        assert.ok(text.includes('no statically linked tests found'),
+            'Should state that only static linkage was searched');
     });
 
     it('formatTestsJson handles undefined gracefully', () => {
@@ -2574,7 +2576,7 @@ describe('formatAffectedTests test file truncation and --all bypass', () => {
         for (let i = 0; i < fileCount; i++) {
             testFiles.push({
                 file: `test/test_${i}.js`,
-                coveredFunctions: [`fn${i}`],
+                linkedFunctions: [`fn${i}`],
                 matches: [{ line: 1, content: `fn${i}()`, matchType: 'call' }]
             });
         }
@@ -2583,9 +2585,13 @@ describe('formatAffectedTests test file truncation and --all bypass', () => {
             file: 'src/core.js',
             line: 10,
             depth: 3,
-            summary: { totalAffected: fileCount, totalTestFiles: fileCount, coveredFunctions: fileCount },
+            summary: {
+                totalAffected: fileCount,
+                totalTestFiles: fileCount,
+                staticallyLinkedFunctions: fileCount,
+            },
             testFiles,
-            uncovered: [],
+            notStaticallyLinked: [],
         };
     }
 

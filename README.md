@@ -74,6 +74,7 @@ ucn trace parseRequest --direction=callers --to=entrypoints
 # Direct versus transitively affected tests
 ucn tests parseRequest
 ucn tests parseRequest --depth=3
+ucn tests src/parser.ts
 
 # A symbol when named; the Git diff when unnamed
 ucn impact parseRequest
@@ -89,9 +90,11 @@ ucn deps src/server.ts --direction=imports --detailed
 ucn deps --cycles
 ```
 
+`tests` reports static call/reference linkage, not runtime coverage. A file target is resolved through imports and exact caller evidence; it is never reduced to a generic basename search. Empty results explicitly warn that subprocess/black-box tests, reflection, generated code, or external harnesses may still exercise the target.
+
 ## CLI and MCP parity
 
-All surfaces resolve a public command through the same registry, normalize parameters once, call the same `execute()` handler, and use the same public formatter. File, project, glob, and interactive CLI modes use that route too.
+All surfaces resolve a public command through the same registry, normalize parameters once, call the same `execute()` handler, and use the same public formatter. File, project, glob, and interactive CLI modes use that route too. CLI JSON includes `meta.contract` with the command question, decision-safety class, truth boundary, and suggested next actions.
 
 Text output is equivalent for equivalent parameters. `--json` always returns one stable envelope:
 
@@ -105,6 +108,22 @@ Text output is equivalent for equivalent parameters. `--json` always returns one
 CLI commands and flags use hyphenated spelling. MCP commands and parameters use snake case where needed, such as `audit_async`, `project_dir`, and `class_name`.
 
 The MCP server publishes exactly one tool named `ucn`. Its `command` enum contains the 18 commands, and its generated description lists the parameters accepted by each command. A warm MCP process reuses the same index cache and is normally faster than starting a CLI process for each question.
+
+## Cache location
+
+UCN does not write its default cache into the analyzed project. Each canonical
+project path gets an isolated directory under the user's cache root:
+
+- `UCN_CACHE_DIR` when explicitly set;
+- `$XDG_CACHE_HOME/ucn` on XDG systems;
+- `~/Library/Caches/ucn` on macOS;
+- `%LOCALAPPDATA%/ucn/cache` on Windows;
+- `~/.cache/ucn` on other systems.
+
+The project directory name is combined with a path hash, so same-named
+checkouts do not share state. `--no-cache` bypasses persistence and
+`--clear-cache` clears the current project's user cache. On first use, UCN
+migrates and removes its legacy `<project>/.ucn-cache` directory.
 
 ## Evidence you can audit
 

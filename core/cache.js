@@ -7,11 +7,193 @@
 
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const crypto = require('crypto');
 const { expandGlob, detectProjectPattern, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
 
 // Read UCN version for cache invalidation
 const UCN_VERSION = require('../package.json').version;
+
+const CACHE_DIRECTORY_NAME = 'ucn';
+const CACHE_PROJECTS_DIRECTORY = 'projects';
+const LEGACY_CACHE_DIRECTORY = '.ucn-cache';
+
+/**
+ * Resolve the per-user cache root without writing anything.
+ *
+ * UCN_CACHE_DIR is the explicit override. Otherwise follow the host cache
+ * convention: XDG_CACHE_HOME on Unix, Library/Caches on macOS, and
+ * LOCALAPPDATA on Windows. Every fallback remains below the user's home.
+ *
+ * @param {object} [options]
+ * @param {NodeJS.ProcessEnv} [options.env]
+ * @param {string} [options.platform]
+ * @param {string} [options.homeDir]
+ * @returns {string}
+ */
+function getUserCacheRoot({
+    env = process.env,
+    platform = process.platform,
+    homeDir = os.homedir(),
+} = {}) {
+    const resolveConfiguredPath = (configured) => {
+        const value = String(configured || '').trim();
+        if (!value) return null;
+        if (value === '~') return homeDir;
+        if (value.startsWith('~/') || value.startsWith('~\\')) {
+            return path.resolve(homeDir, value.slice(2));
+        }
+        return path.resolve(value);
+    };
+
+    const explicit = resolveConfiguredPath(env.UCN_CACHE_DIR);
+    if (explicit) return explicit;
+
+    const xdg = resolveConfiguredPath(env.XDG_CACHE_HOME);
+    if (xdg) return path.join(xdg, CACHE_DIRECTORY_NAME);
+
+    if (platform === 'darwin') {
+        return path.join(homeDir, 'Library', 'Caches', CACHE_DIRECTORY_NAME);
+    }
+    if (platform === 'win32') {
+        const localAppData = resolveConfiguredPath(env.LOCALAPPDATA);
+        return localAppData
+            ? path.join(localAppData, CACHE_DIRECTORY_NAME, 'cache')
+            : path.join(homeDir, 'AppData', 'Local', CACHE_DIRECTORY_NAME, 'cache');
+    }
+    return path.join(homeDir, '.cache', CACHE_DIRECTORY_NAME);
+}
+
+/**
+ * Canonicalize a project root for cache identity. Symlinked paths to the same
+ * checkout share one cache, while separate copies remain isolated.
+ *
+ * @param {string} projectRoot
+ * @returns {string}
+ */
+function canonicalProjectRoot(projectRoot) {
+    const resolved = path.resolve(projectRoot);
+    try {
+        const realpath = fs.realpathSync.native || fs.realpathSync;
+        return realpath(resolved);
+    } catch (_) {
+        return resolved;
+    }
+}
+
+/**
+ * Return the default cache directory for one project.
+ *
+ * The readable basename aids manual inspection; the canonical-path hash
+ * prevents collisions between unrelated projects with the same directory
+ * name without exposing the full checkout path.
+ *
+ * @param {string} projectRoot
+ * @param {object} [options] - Forwarded to getUserCacheRoot()
+ * @returns {string}
+ */
+function getProjectCacheDir(projectRoot, options) {
+    const canonicalRoot = canonicalProjectRoot(projectRoot);
+    const slug = (path.basename(canonicalRoot) || 'project')
+        .replace(/[^A-Za-z0-9._-]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 48) || 'project';
+    const identity = process.platform === 'win32'
+        ? canonicalRoot.toLowerCase()
+        : canonicalRoot;
+    const hash = crypto.createHash('sha256').update(identity).digest('hex').slice(0, 20);
+    return path.join(getUserCacheRoot(options), CACHE_PROJECTS_DIRECTORY, `${slug}-${hash}`);
+}
+
+/**
+ * @param {string} projectRoot
+ * @param {object} [options]
+ * @returns {string}
+ */
+function getProjectCachePath(projectRoot, options) {
+    return path.join(getProjectCacheDir(projectRoot, options), 'index.json');
+}
+
+/**
+ * @param {string} projectRoot
+ * @returns {string}
+ */
+function getLegacyProjectCacheDir(projectRoot) {
+    return path.join(path.resolve(projectRoot), LEGACY_CACHE_DIRECTORY);
+}
+
+/**
+ * Move a legacy project-local cache to the per-user location. Migration is
+ * best-effort because cache availability must never block an analysis query.
+ * Symlinks are left untouched to avoid following or deleting user-managed
+ * paths outside the project.
+ *
+ * @param {string} projectRoot
+ * @param {string} [targetDir]
+ * @returns {boolean} True when a legacy directory was removed or migrated.
+ */
+function migrateLegacyProjectCache(projectRoot, targetDir = getProjectCacheDir(projectRoot)) {
+    const legacyDir = getLegacyProjectCacheDir(projectRoot);
+    let legacyStat;
+    try {
+        legacyStat = fs.lstatSync(legacyDir);
+    } catch (_) {
+        return false;
+    }
+    if (!legacyStat.isDirectory() || legacyStat.isSymbolicLink()) return false;
+
+    try {
+        if (fs.existsSync(targetDir)) {
+            fs.rmSync(legacyDir, { recursive: true, force: true });
+            return true;
+        }
+
+        fs.mkdirSync(path.dirname(targetDir), { recursive: true });
+        try {
+            fs.renameSync(legacyDir, targetDir);
+            return true;
+        } catch (error) {
+            if (error.code !== 'EXDEV') throw error;
+        }
+
+        const tempDir = `${targetDir}.migrating-${process.pid}-${Date.now()}`;
+        try {
+            fs.cpSync(legacyDir, tempDir, { recursive: true, errorOnExist: true });
+            fs.renameSync(tempDir, targetDir);
+            fs.rmSync(legacyDir, { recursive: true, force: true });
+            return true;
+        } catch (_) {
+            fs.rmSync(tempDir, { recursive: true, force: true });
+            return false;
+        }
+    } catch (_) {
+        return false;
+    }
+}
+
+/**
+ * Remove both the current per-user cache and the obsolete project-local cache
+ * for one project.
+ *
+ * @param {string} projectRoot
+ * @returns {string[]} Removed directories.
+ */
+function clearProjectCache(projectRoot) {
+    const removed = [];
+    for (const cacheDir of [
+        getProjectCacheDir(projectRoot),
+        getLegacyProjectCacheDir(projectRoot),
+    ]) {
+        try {
+            if (!fs.existsSync(cacheDir)) continue;
+            fs.rmSync(cacheDir, { recursive: true, force: true });
+            removed.push(cacheDir);
+        } catch (_) {
+            // Cache cleanup is best-effort; callers can rebuild regardless.
+        }
+    }
+    return removed;
+}
 
 // Index/calls cache format version — bump when the persisted call-record or
 // symbol shape changes (saveCache writes it; loadCache rejects anything else).
@@ -276,9 +458,12 @@ const CACHE_FORMAT_VERSION = 112;
  * @returns {string} - Path to cache file
  */
 function saveCache(index, cachePath) {
+    if (!cachePath) {
+        migrateLegacyProjectCache(index.root);
+    }
     const cacheDir = cachePath
         ? path.dirname(cachePath)
-        : path.join(index.root, '.ucn-cache');
+        : getProjectCacheDir(index.root);
 
     if (!fs.existsSync(cacheDir)) {
         fs.mkdirSync(cacheDir, { recursive: true });
@@ -467,7 +652,10 @@ function saveCache(index, cachePath) {
  * @returns {boolean} - True if loaded successfully
  */
 function loadCache(index, cachePath) {
-    const cacheFile = cachePath || path.join(index.root, '.ucn-cache', 'index.json');
+    if (!cachePath) {
+        migrateLegacyProjectCache(index.root);
+    }
+    const cacheFile = cachePath || getProjectCachePath(index.root);
 
     if (!fs.existsSync(cacheFile)) {
         return false;
@@ -727,11 +915,11 @@ function _prepareCallsCache(index, cacheFile) {
     if (index._callsCacheLoaded) return;
     // Shards live beside the selected index.json. A custom cachePath must be
     // a complete portable cache, not an index file that silently looks for
-    // call shards under <project>/.ucn-cache. The latter caused cache-loaded
+    // call shards under the default project cache. The latter caused cache-loaded
     // semantic queries to reparse source (or consume unrelated stale shards).
     const cacheDir = cacheFile
         ? path.dirname(cacheFile)
-        : path.join(index.root, '.ucn-cache');
+        : getProjectCacheDir(index.root);
     index._callsCacheDir = cacheDir;
     const manifestFile = path.join(cacheDir, 'calls', 'manifest.json');
     if (fs.existsSync(manifestFile)) {
@@ -777,7 +965,7 @@ function loadCallsCache(index) {
 
     // Legacy format: single calls-cache.json
     const callsCacheFile = index._callsCacheLegacyFile ||
-        path.join(index._callsCacheDir || path.join(index.root, '.ucn-cache'), 'calls-cache.json');
+        path.join(index._callsCacheDir || getProjectCacheDir(index.root), 'calls-cache.json');
     if (!fs.existsSync(callsCacheFile)) return index.callsCache.size > 0;
 
     try {
@@ -816,7 +1004,7 @@ function ensureCallsCacheLoaded(index) {
  */
 function _loadCallsShard(index, hash) {
     const shardFile = path.join(
-        index._callsCacheDir || path.join(index.root, '.ucn-cache'),
+        index._callsCacheDir || getProjectCacheDir(index.root),
         'calls', `${hash}.json`);
     try {
         const data = JSON.parse(fs.readFileSync(shardFile, 'utf-8'));
@@ -872,5 +1060,7 @@ function _computeReachabilityFingerprint(index) {
 
 module.exports = {
     saveCache, loadCache, loadCallsCache, isCacheStale, ensureCallsCacheLoaded,
+    getUserCacheRoot, getProjectCacheDir, getProjectCachePath,
+    getLegacyProjectCacheDir, migrateLegacyProjectCache, clearProjectCache,
     _computeReachabilityFingerprint, CACHE_FORMAT_VERSION,
 };

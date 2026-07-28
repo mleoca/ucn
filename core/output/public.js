@@ -8,6 +8,9 @@
  * public surface has one formatter decision for each canonical command.
  */
 
+const { COMMAND_CONTRACTS } = require('../command-contracts');
+const { COMMAND_TRUST_MATRIX } = require('../trust-matrix');
+
 const legacy = {
     ...require('./analysis'),
     ...require('./analysis-ext'),
@@ -31,6 +34,18 @@ function block(title, text) {
 
 function appendNote(text, note) {
     return note ? `${text}\n\n${note}` : text;
+}
+
+function contractMeta(command) {
+    const contract = COMMAND_CONTRACTS[command];
+    const trust = COMMAND_TRUST_MATRIX[command];
+    if (!contract || !trust) return undefined;
+    return {
+        question: contract.question,
+        decisionSafety: trust.decisionSafety,
+        truth: contract.truth,
+        next: contract.next,
+    };
 }
 
 function modeOf(command, result) {
@@ -189,6 +204,7 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         meta: {
             command,
             ...(modeOf(command, result) && { mode: modeOf(command, result) }),
+            contract: contractMeta(command),
             ...commandMeta,
             ...(execution.note && { note: execution.note }),
         },
@@ -200,5 +216,6 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
 module.exports = {
     formatPublicText,
     formatPublicJson,
+    contractMeta,
     modeOf,
 };

@@ -2134,6 +2134,12 @@ class ProjectIndex {
     /** Load index from cache file */
     loadCache(cachePath) { return indexCache.loadCache(this, cachePath); }
 
+    /** Return this project's default per-user cache file path. */
+    getCachePath() { return indexCache.getProjectCachePath(this.root); }
+
+    /** Remove this project's per-user cache and any legacy project-local cache. */
+    clearCache() { return indexCache.clearProjectCache(this.root); }
+
     /** Load callsCache from separate file on demand (called by findCallers/findCallees) */
     loadCallsCache() { return indexCache.loadCallsCache(this); }
 

@@ -15,8 +15,127 @@ const { execSync } = require('child_process');
 
 const { parse, parseFile, detectLanguage } = require('../core/parser');
 const { ProjectIndex, parseDiff } = require('../core/project');
-const { CACHE_FORMAT_VERSION } = require('../core/cache');
+const {
+    CACHE_FORMAT_VERSION,
+    getUserCacheRoot,
+    getProjectCacheDir,
+    getProjectCachePath,
+    getLegacyProjectCacheDir,
+    clearProjectCache,
+} = require('../core/cache');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
+
+describe('Per-user cache placement', () => {
+    it('stores the default cache outside the project tree', () => {
+        const dir = tmp({
+            'package.json': '{"name":"cache-placement"}',
+            'index.js': 'function main() { return 1; }',
+        });
+        try {
+            const index = new ProjectIndex(dir);
+            index.build(null, { quiet: true });
+            const saved = index.saveCache();
+
+            assert.strictEqual(saved, getProjectCachePath(dir));
+            assert.ok(saved.startsWith(path.resolve(process.env.UCN_CACHE_DIR) + path.sep));
+            assert.ok(fs.existsSync(saved), 'per-user cache should be written');
+            assert.ok(!fs.existsSync(getLegacyProjectCacheDir(dir)),
+                'default cache must not create files in the project');
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+
+    it('honors explicit and platform cache roots', () => {
+        const homeDir = path.join(path.parse(process.cwd()).root, 'users', 'cache-test');
+        assert.strictEqual(
+            getUserCacheRoot({
+                env: { UCN_CACHE_DIR: '~/custom-cache' },
+                platform: 'linux',
+                homeDir,
+            }),
+            path.join(homeDir, 'custom-cache'));
+        assert.strictEqual(
+            getUserCacheRoot({
+                env: { XDG_CACHE_HOME: path.join(homeDir, 'xdg') },
+                platform: 'linux',
+                homeDir,
+            }),
+            path.join(homeDir, 'xdg', 'ucn'));
+        assert.strictEqual(
+            getUserCacheRoot({ env: {}, platform: 'darwin', homeDir }),
+            path.join(homeDir, 'Library', 'Caches', 'ucn'));
+        assert.strictEqual(
+            getUserCacheRoot({ env: {}, platform: 'linux', homeDir }),
+            path.join(homeDir, '.cache', 'ucn'));
+    });
+
+    it('isolates projects with the same basename', () => {
+        const parentA = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-cache-parent-a-'));
+        const parentB = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-cache-parent-b-'));
+        const dirA = path.join(parentA, 'service');
+        const dirB = path.join(parentB, 'service');
+        fs.mkdirSync(dirA);
+        fs.mkdirSync(dirB);
+        try {
+            assert.notStrictEqual(getProjectCacheDir(dirA), getProjectCacheDir(dirB));
+            assert.strictEqual(path.basename(getProjectCacheDir(dirA)).startsWith('service-'), true);
+            assert.strictEqual(path.basename(getProjectCacheDir(dirB)).startsWith('service-'), true);
+        } finally {
+            clearProjectCache(dirA);
+            clearProjectCache(dirB);
+            fs.rmSync(parentA, { recursive: true, force: true });
+            fs.rmSync(parentB, { recursive: true, force: true });
+        }
+    });
+
+    it('migrates a legacy project cache and removes project pollution', () => {
+        const dir = tmp({
+            'package.json': '{"name":"legacy-cache"}',
+            'index.js': 'function migrated() { return true; }',
+        });
+        try {
+            const legacyPath = path.join(getLegacyProjectCacheDir(dir), 'index.json');
+            const initial = new ProjectIndex(dir);
+            initial.build(null, { quiet: true });
+            initial.saveCache(legacyPath);
+            assert.ok(fs.existsSync(legacyPath));
+            assert.ok(!fs.existsSync(getProjectCachePath(dir)));
+
+            const migrated = new ProjectIndex(dir);
+            assert.strictEqual(migrated.loadCache(), true);
+            assert.ok(migrated.symbols.has('migrated'));
+            assert.ok(fs.existsSync(getProjectCachePath(dir)));
+            assert.ok(!fs.existsSync(getLegacyProjectCacheDir(dir)));
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+
+    it('clears both current and legacy cache locations', () => {
+        const dir = tmp({
+            'package.json': '{"name":"clear-cache"}',
+            'index.js': 'function cached() {}',
+        });
+        try {
+            const index = idx(dir);
+            index.saveCache();
+            const legacyDir = getLegacyProjectCacheDir(dir);
+            fs.mkdirSync(legacyDir, { recursive: true });
+            fs.writeFileSync(path.join(legacyDir, 'legacy.json'), '{}');
+
+            const removed = index.clearCache();
+            assert.strictEqual(removed.length, 2);
+            assert.ok(!fs.existsSync(getProjectCacheDir(dir)));
+            assert.ok(!fs.existsSync(legacyDir));
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});
 
 describe('Cache Behavior', () => {
 
@@ -33,7 +152,7 @@ describe('Cache Behavior', () => {
             index1.saveCache();
 
             // Verify cache file exists
-            const cacheFile = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const cacheFile = getProjectCachePath(tmpDir);
             assert.ok(fs.existsSync(cacheFile), 'Cache file should exist');
 
             // Create new index and load cache
@@ -151,7 +270,7 @@ describe('Cache Behavior', () => {
         const tmpDir = createTempDir();
         try {
             // Create cache directory with invalid JSON
-            const cacheDir = path.join(tmpDir, '.ucn-cache');
+            const cacheDir = getProjectCacheDir(tmpDir);
             fs.mkdirSync(cacheDir, { recursive: true });
             fs.writeFileSync(path.join(cacheDir, 'index.json'), 'not valid json {{{');
 
@@ -168,7 +287,7 @@ describe('Cache Behavior', () => {
         const tmpDir = createTempDir();
         try {
             // Create cache with wrong version
-            const cacheDir = path.join(tmpDir, '.ucn-cache');
+            const cacheDir = getProjectCacheDir(tmpDir);
             fs.mkdirSync(cacheDir, { recursive: true });
             fs.writeFileSync(path.join(cacheDir, 'index.json'), JSON.stringify({
                 version: 999,
@@ -327,7 +446,7 @@ module.exports = { myFunc };
             index1.build('**/*.js', { quiet: true });
 
             // Save cache
-            const cacheDir = path.join(tmpDir, '.ucn-cache');
+            const cacheDir = getProjectCacheDir(tmpDir);
             fs.mkdirSync(cacheDir, { recursive: true });
             index1.saveCache(path.join(cacheDir, 'index.json'));
 
@@ -376,7 +495,7 @@ module.exports = { testFunc };
             const index1 = new ProjectIndex(tmpDir);
             index1.build('**/*.js', { quiet: true });
 
-            const cacheDir = path.join(tmpDir, '.ucn-cache');
+            const cacheDir = getProjectCacheDir(tmpDir);
             fs.mkdirSync(cacheDir, { recursive: true });
             index1.saveCache(path.join(cacheDir, 'index.json'));
 
@@ -655,13 +774,13 @@ function helper() { return 42; }
             index1.saveCache();
 
             // Verify main cache file does NOT have inline callsCache
-            const mainCachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const mainCachePath = getProjectCachePath(tmpDir);
             const cacheData = JSON.parse(fs.readFileSync(mainCachePath, 'utf-8'));
             assert.strictEqual(cacheData.version, CACHE_FORMAT_VERSION, 'Cache version should be current');
             assert.ok(!cacheData.callsCache, 'Main cache should not have inline callsCache');
 
             // Verify sharded calls cache exists (calls/manifest.json)
-            const callsManifest = path.join(tmpDir, '.ucn-cache', 'calls', 'manifest.json');
+            const callsManifest = path.join(getProjectCacheDir(tmpDir), 'calls', 'manifest.json');
             assert.ok(fs.existsSync(callsManifest), 'Calls manifest should exist');
 
             // Load in new instance
@@ -1938,9 +2057,12 @@ describe('fix: CLI error paths still save cache', () => {
             }
 
             // Cache should exist despite the error
-            const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+            const cachePath = getProjectCachePath(dir);
             assert.ok(fs.existsSync(cachePath), 'cache file exists after failed command');
+            assert.ok(!fs.existsSync(getLegacyProjectCacheDir(dir)),
+                'CLI failure path must not leave a project-local cache');
         } finally {
+            clearProjectCache(dir);
             rm(dir);
         }
     });
@@ -2007,7 +2129,7 @@ describe('Cache v6 relative paths', () => {
             index1.saveCache();
 
             // Check that cache uses relative paths
-            const cachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const cachePath = getProjectCachePath(tmpDir);
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
             assert.strictEqual(cacheData.version, CACHE_FORMAT_VERSION);
 
@@ -2066,7 +2188,7 @@ describe('Cache v6 relative paths', () => {
             index.build(null, { quiet: true });
             index.saveCache();
 
-            const cachePath = path.join(tmpDir, '.ucn-cache', 'index.json');
+            const cachePath = getProjectCachePath(tmpDir);
             const cacheJson = fs.readFileSync(cachePath, 'utf-8');
 
             // Verify file keys and graph keys use relative paths.
@@ -2408,7 +2530,7 @@ describe('fix #227: canonical index order and no stale-calls resurrection', () =
 });
 
 describe('fix #249: relocated project cache stays portable', () => {
-    it('a copied project directory rehydrates every path under the NEW root', () => {
+    it('a cache copied to a new project identity rehydrates every path under the NEW root', () => {
         const { computeReachability } = require('../core/entrypoints');
         const dirA = tmp({
             'package.json': '{"name":"test"}',
@@ -2423,6 +2545,8 @@ describe('fix #249: relocated project cache stays portable', () => {
             indexA.saveCache();
 
             fs.cpSync(dirA, dirB, { recursive: true });
+            fs.mkdirSync(path.dirname(getProjectCacheDir(dirB)), { recursive: true });
+            fs.cpSync(getProjectCacheDir(dirA), getProjectCacheDir(dirB), { recursive: true });
             const indexB = new ProjectIndex(dirB, { quiet: true });
             const loaded = indexB.loadCache();
             assert.ok(loaded, 'copied cache loads');
@@ -2444,6 +2568,8 @@ describe('fix #249: relocated project cache stays portable', () => {
             assert.deepStrictEqual(relKeys(rehydrated, dirB), relKeys(freshB._reachableSymbols, dirB),
                 'loaded reachability answers agree with a fresh compute');
         } finally {
+            clearProjectCache(dirA);
+            clearProjectCache(dirB);
             rm(dirA);
             fs.rmSync(dirB, { recursive: true, force: true });
         }

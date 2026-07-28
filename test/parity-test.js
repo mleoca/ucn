@@ -17,11 +17,12 @@ const {
     generateMcpParamSection,
     normalizeParams,
     resolveCommand,
+    suggestCommand,
     toCliName,
     toMcpName,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
-const { formatPublicText } = require('../core/output');
+const { formatPublicJson, formatPublicText } = require('../core/output');
 const { tmp, rm, idx, runCli, runInteractive, McpClient } = require('./helpers');
 
 const ROOT = path.join(__dirname, '..');
@@ -73,6 +74,13 @@ describe('v5 public command registry', () => {
         assert.strictEqual(resolveCommand('audit_async', 'mcp'), 'auditAsync');
     });
 
+    it('offers only high-confidence corrections for misspelled commands', () => {
+        assert.strictEqual(suggestCommand('shwo', 'cli'), 'show');
+        assert.strictEqual(suggestCommand('audit_asnyc', 'mcp'), 'audit_async');
+        assert.strictEqual(suggestCommand('src', 'cli'), null,
+            'an unrelated missing path must not be reinterpreted as a command');
+    });
+
     it('normalizes MCP spelling once', () => {
         assert.deepStrictEqual(normalizeParams({
             with_source: true,
@@ -89,6 +97,15 @@ describe('v5 public command registry', () => {
         assert.deepStrictEqual(Object.keys(FLAG_APPLICABILITY).sort(), [...EXPECTED_COMMANDS].sort());
         for (const command of BROAD_COMMANDS) assert.ok(EXPECTED_COMMANDS.includes(command));
         for (const command of FILE_LOCAL_COMMANDS) assert.ok(EXPECTED_COMMANDS.includes(command));
+    });
+
+    it('puts the honest command contract in every machine-readable answer', () => {
+        const document = JSON.parse(formatPublicJson('find', [], { name: 'missing' }));
+        assert.strictEqual(document.meta.contract.question,
+            'Which indexed definition or type does this name identify?');
+        assert.strictEqual(document.meta.contract.decisionSafety, 'navigation');
+        assert.ok(document.meta.contract.truth);
+        assert.ok(document.meta.contract.next.length > 0);
     });
 });
 
@@ -218,6 +235,11 @@ describe('18-command CLI/MCP/interactive parity', () => {
     it('source accepts symbol and file-range forms', () => {
         assert.match(runCli(dir, 'source', ['processData'], ['--file=src/service.js']), /processData/);
         assert.match(runCli(dir, 'source', ['src/service.js:1-2']), /helper/);
+    });
+
+    it('CLI and interactive mode recover from command typos with one correction', () => {
+        assert.match(runCli(dir, 'shwo', ['processData']), /Did you mean "show"\?/);
+        assert.match(runInteractive(dir, ['shwo processData']), /Did you mean "show"\?/);
     });
 
     it('CLI and MCP expose the same explicit range and non-compact controls', async () => {

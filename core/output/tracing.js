@@ -531,7 +531,7 @@ function formatAffectedTests(result, options = {}) {
     lines.push('');
 
     if (result.testFiles.length === 0) {
-        lines.push('No test files found for any affected function.');
+        lines.push('No confirmed static test links found for any affected function.');
     } else {
         const MAX_TEST_FILES = options.all ? Infinity : 30;
         const displayFiles = result.testFiles.slice(0, MAX_TEST_FILES);
@@ -539,7 +539,7 @@ function formatAffectedTests(result, options = {}) {
         lines.push(`Test files to run (${summary.totalTestFiles}):`);
         lines.push('');
         for (const tf of displayFiles) {
-            lines.push(`  ${tf.file} (covers: ${tf.coveredFunctions.join(', ')})`);
+            lines.push(`  ${tf.file} (links: ${tf.linkedFunctions.join(', ')})`);
             // Show up to 5 key matches per file
             const keyMatches = tf.matches
                 .filter(m => m.matchType === 'call' || m.matchType === 'test-case')
@@ -567,7 +567,7 @@ function formatAffectedTests(result, options = {}) {
             lines.push(`  Additional test files (${pat.length}):`);
             const MAX_POSSIBLE = options.all ? Infinity : 10;
             for (const tf of pat.slice(0, MAX_POSSIBLE)) {
-                lines.push(`    ${tf.file} (covers: ${tf.coveredFunctions.join(', ')})`);
+                lines.push(`    ${tf.file} (links: ${tf.linkedFunctions.join(', ')})`);
             }
             if (pat.length > MAX_POSSIBLE) {
                 lines.push(`    ... ${pat.length - MAX_POSSIBLE} more (use --all)`);
@@ -575,17 +575,18 @@ function formatAffectedTests(result, options = {}) {
         }
     }
 
-    if (result.uncovered.length > 0) {
+    const notStaticallyLinked = result.notStaticallyLinked || [];
+    if (notStaticallyLinked.length > 0) {
         lines.push('');
-        lines.push(`Uncovered (${result.uncovered.length}): ${result.uncovered.join(', ')}`);
-        lines.push('  ⚠ These affected functions have no test references');
+        lines.push(`Not statically linked (${notStaticallyLinked.length}): ${notStaticallyLinked.join(', ')}`);
+        lines.push('  ⚠ No indexed test call/reference path was found; this is not runtime coverage data');
     }
 
     lines.push('');
     const pct = summary.totalAffected > 0
-        ? Math.round(summary.coveredFunctions / summary.totalAffected * 100)
+        ? Math.round(summary.staticallyLinkedFunctions / summary.totalAffected * 100)
         : 0;
-    let summaryLine = `Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} test files, ${summary.coveredFunctions}/${summary.totalAffected} functions covered (${pct}%)`;
+    let summaryLine = `Summary: ${summary.totalAffected} affected → ${summary.totalTestFiles} statically linked test files, ${summary.staticallyLinkedFunctions}/${summary.totalAffected} functions linked (${pct}%)`;
     if (summary.possiblyAffected > 0) {
         summaryLine += ` · ${summary.possiblyAffected} possibly affected (unverified chains)`;
     }

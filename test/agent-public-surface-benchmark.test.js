@@ -15,10 +15,11 @@ const {
 } = require('./agent-public-surface-benchmark');
 
 describe('public-surface agent benchmark contract', () => {
-    it('covers every public command exactly once', () => {
+    it('covers every public command and includes adversarial repeat scenarios', () => {
         assert.deepEqual(
-            SCENARIOS.map(scenario => scenario.command).sort(),
+            [...new Set(SCENARIOS.map(scenario => scenario.command))].sort(),
             [...CANONICAL_COMMANDS].sort());
+        assert.ok(SCENARIOS.length > CANONICAL_COMMANDS.length);
         assert.equal(new Set(SCENARIOS.map(scenario => scenario.id)).size, SCENARIOS.length);
         assert.ok(SCENARIOS.every(scenario =>
             scenario.prompt && scenario.assertions.length > 0));
@@ -83,6 +84,7 @@ describe('public-surface agent benchmark contract', () => {
             selectionScore: 1,
             parameterScore: 1,
             answerPassed: true,
+            contractPassed: true,
             cliOk: true,
             mcpOk: true,
             parity: true,
@@ -93,6 +95,7 @@ describe('public-surface agent benchmark contract', () => {
             estimatedOutputTokens: 100,
         }));
         const passing = summarize(passingRows);
+        passing.recoveryRate = 1;
         assert.deepEqual(evaluateGates(passing), { passed: true, failures: [] });
 
         passingRows[0] = {
@@ -102,7 +105,9 @@ describe('public-surface agent benchmark contract', () => {
             parity: false,
             toolCalls: 4,
         };
-        const failing = evaluateGates(summarize(passingRows), RELEASE_GATES);
+        const failingSummary = summarize(passingRows);
+        failingSummary.recoveryRate = 1;
+        const failing = evaluateGates(failingSummary, RELEASE_GATES);
         assert.equal(failing.passed, false);
         assert.ok(failing.failures.some(failure => /answer accuracy/.test(failure)));
         assert.ok(failing.failures.some(failure => /parity/.test(failure)));

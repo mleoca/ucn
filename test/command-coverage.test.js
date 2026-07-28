@@ -1684,7 +1684,7 @@ describe('tree contract: blast/reverseTrace frontier + accounts', () => {
         } finally { rm(d); }
     });
 
-    it('affectedTests: possible band from unverified chains, uncovered stays confirmed-band', () => {
+    it('affectedTests: possible band from unverified chains, static-link gaps stay confirmed-band', () => {
         const d = tmp({
             ...DISPATCH_FIXTURE,
             'use_test.go': 'package m\n\nimport "testing"\n\nfunc TestTopLevel(t *testing.T) { TopLevel() }\n',
@@ -1699,7 +1699,8 @@ describe('tree contract: blast/reverseTrace frontier + accounts', () => {
                 JSON.stringify(at.possiblyAffectedTests));
             assert.ok(!at.testFiles.some(tf => tf.file === 'use_test.go'),
                 'possible-band test file must not claim confirmed coverage');
-            assert.ok(at.uncovered.includes('Run'), 'confirmed-band uncovered keeps the root');
+            assert.ok(at.notStaticallyLinked.includes('Run'),
+                'confirmed-band static-link gaps keep the root');
             const text = output.formatAffectedTests(at);
             assert.ok(text.includes('POSSIBLY AFFECTED (2)'), text);
         } finally { rm(d); }

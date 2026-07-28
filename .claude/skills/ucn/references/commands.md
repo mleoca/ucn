@@ -18,7 +18,7 @@ UCN exposes exactly 18 task-oriented public commands. CLI uses hyphenated names;
 | Command | Purpose |
 |---|---|
 | `impact [handle]` | Show direct symbol impact when given a handle; without one, analyze the Git diff. |
-| `tests <handle>` | Find direct tests. Set `--depth=N` for transitive affected tests. |
+| `tests <handle\|file>` | Find statically linked direct tests. Set `--depth=N` for transitive affected tests. Empty results are not runtime coverage proof. |
 | `check [handle]` | Validate confirmed call-site arity for a symbol; without one, run the composed pre-commit diagnostic. |
 | `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits. |
 
@@ -58,10 +58,10 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--all` | Lift result and formatter caps where supported. |
 | `--compact` / `--no-compact` | Select token-efficient or full semantic output. |
 | `--range=N-M` | Extract an explicit line range with `source --file=<path>`. |
-| `--json` | Emit the stable CLI `{ meta, data }` envelope. |
+| `--json` | Emit the stable CLI `{ meta, data }` envelope; `meta.contract` carries the truth boundary, decision safety, and next actions. |
 | `--expand-unverified` | Follow possible caller edges while preserving their unverified status. |
 | `--base=<ref>` / `--staged` | Scope Git-diff `impact` or target-less `check`. |
-| `--no-cache` / `--clear-cache` | Bypass or clear the persisted project cache. |
+| `--no-cache` / `--clear-cache` | Bypass or clear the current project's per-user cache. Set `UCN_CACHE_DIR` to override its root. |
 | `--workers=N` | Set build workers; `0` disables parallel build. |
 | `--include-exported` | Include exported symbols in `deadcode`. |
 | `--include-decorated` | Include decorated symbols in `deadcode`. |

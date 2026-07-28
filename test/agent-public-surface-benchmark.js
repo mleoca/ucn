@@ -34,6 +34,7 @@ const {
     toCliName,
     toMcpName,
 } = require('../core/registry');
+const { COMMAND_TRUST_MATRIX } = require('../core/trust-matrix');
 
 const DEFAULT_FIXTURE = path.join(__dirname, 'fixtures', 'agent-benchmark');
 const DEFAULT_JSON = path.join(__dirname, 'agent-public-surface-benchmark-report.json');
@@ -46,7 +47,10 @@ const RELEASE_GATES = Object.freeze({
     minSurfaceSuccessRate: 1,
     minParityRate: 1,
     minDiscoverabilityRate: 1,
+    minContractRate: 1,
+    minRecoveryRate: 1,
     maxMedianAgentToolCalls: 2,
+    maxOutputTokensP95: 2000,
 });
 
 const POSITIONAL_PARAM = Object.freeze({
@@ -334,6 +338,37 @@ const SCENARIOS = Object.freeze([
                 doc => doc.data?.frames?.[0]?.code?.includes('processRefund(')),
         ],
     },
+    {
+        id: 'A19',
+        prompt: 'Find tests for src/index.ts without mistaking unrelated local variables named index for coverage.',
+        command: 'tests',
+        params: { name: 'src/index.ts' },
+        assertions: [
+            assertion('file target does not degrade into a basename symbol scan',
+                doc => Array.isArray(doc.data) && doc.data.length === 0),
+            assertion('empty static selection states its runtime-coverage boundary',
+                doc => doc.meta?.note?.includes('not runtime coverage evidence')),
+            assertion('tests contract remains review-required',
+                doc => doc.meta?.contract?.decisionSafety === 'review-required'),
+        ],
+    },
+    {
+        id: 'A20',
+        prompt: 'Assess production code only, excluding tests from every repository health projection.',
+        command: 'repo',
+        params: { sections: 'summary,health', deep: true, exclude: 'tests' },
+        assertions: [
+            assertion('summary and health scan the same scoped file set',
+                doc => doc.data?.summary?.files === doc.data?.health?.files?.scanned),
+            assertion('excluded test directories do not leak into the summary',
+                doc => doc.data?.summary?.dirs?.every(
+                    entry => !entry.dir.startsWith('tests'))),
+            assertion('excluded test files do not leak into blind spots',
+                doc => Object.values(doc.data?.health?.blindSpots || {}).every(
+                    blindSpot => !blindSpot?.files?.some(
+                        file => file.startsWith('tests/')))),
+        ],
+    },
 ]);
 
 function readArgValue(argv, key) {
@@ -499,6 +534,16 @@ function scoreAssertions(scenario, document) {
     };
 }
 
+function scoreContract(scenario, document) {
+    const contract = document?.meta?.contract;
+    const expectedSafety = COMMAND_TRUST_MATRIX[scenario.command]?.decisionSafety;
+    return !!contract &&
+        typeof contract.question === 'string' && contract.question.length > 0 &&
+        typeof contract.truth === 'string' && contract.truth.length > 0 &&
+        Array.isArray(contract.next) &&
+        contract.decisionSafety === expectedSafety;
+}
+
 function discoverabilityScore(description, scenario) {
     const commandName = toMcpName(scenario.command);
     const commandVisible = description.includes(`  ${commandName}:`);
@@ -522,6 +567,7 @@ async function runScenario(client, projectDir, scenario, plan, toolDescription) 
             parameterScore: 0,
             toolCalls: 0,
             answerPassed: false,
+            contractPassed: false,
             assertionFailures: ['agent plan contains no tool call'],
             cliOk: false,
             mcpOk: false,
@@ -552,6 +598,7 @@ async function runScenario(client, projectDir, scenario, plan, toolDescription) 
                     : `CLI JSON execution failed: ${cliJson.stderr || cliJson.error || cliJson.status}`,
             ],
         };
+    const contractPassed = scoreContract(scenario, document);
     const parity = cliText.ok && mcp.ok &&
         cliText.stdout.trimEnd() === mcp.text.trimEnd();
 
@@ -565,6 +612,7 @@ async function runScenario(client, projectDir, scenario, plan, toolDescription) 
         parameterScore: planScore.parameterScore,
         toolCalls: planScore.toolCalls,
         answerPassed: assertions.passed,
+        contractPassed,
         assertionFailures: assertions.failures,
         cliOk: cliJson.ok && cliText.ok && !!document,
         mcpOk: mcp.ok,
@@ -579,6 +627,43 @@ async function runScenario(client, projectDir, scenario, plan, toolDescription) 
             ? null
             : (cliJson.stderr || cliText.stderr || cliJson.error || cliText.error),
         mcpError: mcp.error,
+    };
+}
+
+async function runRecoveryChecks(client, projectDir) {
+    const typo = runCli(projectDir, { command: 'shwo', params: {} }, false);
+    const missingCliTarget = runCli(projectDir, { command: 'show', params: {} }, false);
+    const missingMcpTarget = await runMcp(client, projectDir, {
+        command: 'show',
+        params: {},
+    });
+    const ignoredMcpParam = await runMcp(client, projectDir, {
+        command: 'find',
+        params: { name: 'chargeCard', depth: 3 },
+    });
+    const checks = [
+        {
+            label: 'CLI typo offers one correction',
+            passed: !typo.ok && /Did you mean "show"\?/.test(typo.stderr),
+        },
+        {
+            label: 'CLI missing target names the required input',
+            passed: !missingCliTarget.ok && /Symbol name is required/.test(missingCliTarget.stderr),
+        },
+        {
+            label: 'MCP missing target names the required input',
+            passed: !missingMcpTarget.ok &&
+                /Symbol name is required/.test(missingMcpTarget.text || missingMcpTarget.error || ''),
+        },
+        {
+            label: 'MCP ignored parameter remains explicit',
+            passed: ignoredMcpParam.ok &&
+                /depth ignored \(not applicable to find\)/.test(ignoredMcpParam.text),
+        },
+    ];
+    return {
+        rate: rate(checks.map(check => Number(check.passed))),
+        checks,
     };
 }
 
@@ -604,6 +689,7 @@ function summarize(results) {
         mcpSuccessRate: rate(results.map(result => Number(result.mcpOk))),
         parityRate: rate(results.map(result => Number(result.parity))),
         discoverabilityRate: rate(results.map(result => result.discoverabilityScore)),
+        contractRate: rate(results.map(result => Number(result.contractPassed))),
         medianAgentToolCalls: percentile(results.map(result => result.toolCalls), 0.50),
         p95AgentToolCalls: percentile(results.map(result => result.toolCalls), 0.95),
         cliJsonMsP50: percentile(results.map(result => result.cliJsonMs || 0), 0.50),
@@ -627,6 +713,8 @@ function evaluateGates(summary, gates = RELEASE_GATES) {
         ['mcpSuccessRate', gates.minSurfaceSuccessRate, 'MCP success rate'],
         ['parityRate', gates.minParityRate, 'CLI/MCP parity rate'],
         ['discoverabilityRate', gates.minDiscoverabilityRate, 'discoverability rate'],
+        ['contractRate', gates.minContractRate, 'answer-contract rate'],
+        ['recoveryRate', gates.minRecoveryRate, 'failure-recovery rate'],
     ];
     for (const [field, floor, label] of floors) {
         if (summary[field] < floor) {
@@ -636,6 +724,10 @@ function evaluateGates(summary, gates = RELEASE_GATES) {
     if (summary.medianAgentToolCalls > gates.maxMedianAgentToolCalls) {
         failures.push(`median agent tool calls ${summary.medianAgentToolCalls} ` +
             `> ${gates.maxMedianAgentToolCalls}`);
+    }
+    if (summary.outputTokensP95 > gates.maxOutputTokensP95) {
+        failures.push(`output tokens p95 ${summary.outputTokensP95} ` +
+            `> ${gates.maxOutputTokensP95}`);
     }
     if (summary.commandsCovered !== CANONICAL_COMMANDS.length) {
         failures.push(`public command coverage ${summary.commandsCovered}/${CANONICAL_COMMANDS.length}`);
@@ -669,23 +761,29 @@ function formatMarkdown(report) {
         `| MCP success | ${summary.mcpSuccessRate} | ${RELEASE_GATES.minSurfaceSuccessRate} |`,
         `| CLI/MCP text parity | ${summary.parityRate} | ${RELEASE_GATES.minParityRate} |`,
         `| command/parameter discoverability | ${summary.discoverabilityRate} | ${RELEASE_GATES.minDiscoverabilityRate} |`,
+        `| answer contract | ${summary.contractRate} | ${RELEASE_GATES.minContractRate} |`,
+        `| failure recovery | ${summary.recoveryRate} | ${RELEASE_GATES.minRecoveryRate} |`,
         `| median agent tool calls | ${summary.medianAgentToolCalls} | ≤ ${RELEASE_GATES.maxMedianAgentToolCalls} |`,
         `| CLI JSON latency p50/p95 | ${summary.cliJsonMsP50}/${summary.cliJsonMsP95} ms | report-only |`,
         `| warm MCP latency p50/p95 | ${summary.mcpMsP50}/${summary.mcpMsP95} ms | report-only |`,
-        `| output tokens p50/p95 | ${summary.outputTokensP50}/${summary.outputTokensP95} | report-only |`,
+        `| output tokens p50/p95 | ${summary.outputTokensP50}/${summary.outputTokensP95} | p95 ≤ ${RELEASE_GATES.maxOutputTokensP95} |`,
         '',
         `Gate: **${report.gate.passed ? 'PASS' : 'FAIL'}**`,
     ];
     if (report.gate.failures.length) {
         for (const failure of report.gate.failures) lines.push(`- ${failure}`);
     }
+    lines.push('', '## Recovery checks', '');
+    for (const check of report.recovery?.checks || []) {
+        lines.push(`- ${check.passed ? 'PASS' : 'FAIL'} — ${check.label}`);
+    }
     lines.push('', '## Task results', '');
-    lines.push('| id | task | expected → selected | params | answer | CLI | MCP | parity | calls | tokens |');
-    lines.push('|---|---|---|---:|---:|---:|---:|---:|---:|---:|');
+    lines.push('| id | task | expected → selected | params | answer | contract | CLI | MCP | parity | calls | tokens |');
+    lines.push('|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|');
     for (const result of report.lastRun) {
-        lines.push(`| ${result.id} | ${result.prompt} | ${result.expectedCommand} → ${result.selectedCommand || 'none'} | ${result.parameterScore} | ${result.answerPassed ? 'pass' : 'fail'} | ${result.cliOk ? 'pass' : 'fail'} | ${result.mcpOk ? 'pass' : 'fail'} | ${result.parity ? 'pass' : 'fail'} | ${result.toolCalls} | ${result.estimatedOutputTokens || 0} |`);
+        lines.push(`| ${result.id} | ${result.prompt} | ${result.expectedCommand} → ${result.selectedCommand || 'none'} | ${result.parameterScore} | ${result.answerPassed ? 'pass' : 'fail'} | ${result.contractPassed ? 'pass' : 'fail'} | ${result.cliOk ? 'pass' : 'fail'} | ${result.mcpOk ? 'pass' : 'fail'} | ${result.parity ? 'pass' : 'fail'} | ${result.toolCalls} | ${result.estimatedOutputTokens || 0} |`);
         for (const failure of result.assertionFailures || []) {
-            lines.push(`|  | ↳ assertion | ${failure} |  |  |  |  |  |  |  |`);
+            lines.push(`|  | ↳ assertion | ${failure} |  |  |  |  |  |  |  |  |`);
         }
     }
     lines.push('', '## Task corpus', '');
@@ -704,6 +802,7 @@ async function runBenchmark(options = {}) {
     const runs = options.runs || 3;
     const allResults = [];
     let toolMetadata = null;
+    let recovery = null;
 
     for (let run = 1; run <= runs; run++) {
         const client = new McpClient();
@@ -726,12 +825,14 @@ async function runBenchmark(options = {}) {
                     client, fixtureDir, scenario, plan, tool.description || '');
                 allResults.push({ run, ...result });
             }
+            if (run === 1) recovery = await runRecoveryChecks(client, fixtureDir);
         } finally {
             client.stop();
         }
     }
 
     const summary = summarize(allResults);
+    summary.recoveryRate = recovery?.rate || 0;
     const gate = evaluateGates(summary);
     if (toolMetadata?.toolCount !== 1) {
         gate.passed = false;
@@ -742,7 +843,7 @@ async function runBenchmark(options = {}) {
         gate.failures.push('MCP command enum does not match the 18-command registry');
     }
     return {
-        schemaVersion: 2,
+        schemaVersion: 3,
         generatedAt: new Date().toISOString(),
         fixtureDir,
         runs,
@@ -750,6 +851,7 @@ async function runBenchmark(options = {}) {
         gates: RELEASE_GATES,
         gate,
         tool: toolMetadata,
+        recovery,
         scenarios: scenarios.map(scenario => ({
             id: scenario.id,
             prompt: scenario.prompt,
@@ -804,6 +906,8 @@ async function main() {
     process.stdout.write(`  selection=${report.summary.selectionAccuracy} ` +
         `parameters=${report.summary.parameterAccuracy} ` +
         `answers=${report.summary.answerAccuracy} ` +
+        `contracts=${report.summary.contractRate} ` +
+        `recovery=${report.summary.recoveryRate} ` +
         `parity=${report.summary.parityRate} ` +
         `median_calls=${report.summary.medianAgentToolCalls}\n`);
     process.stdout.write(`  gate=${report.gate.passed ? 'PASS' : 'FAIL'}\n`);

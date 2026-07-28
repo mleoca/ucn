@@ -702,7 +702,7 @@ describe('affected-tests: transitive test detection', () => {
         }
     });
 
-    it('identifies uncovered functions', () => {
+    it('identifies functions without static test links', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nfunction caller() { return helper(); }\nmodule.exports = { helper, caller };',
@@ -713,8 +713,8 @@ describe('affected-tests: transitive test detection', () => {
             const result = index.affectedTests('helper');
             assert.ok(result);
             // 'caller' has no test references
-            assert.ok(result.uncovered.includes('caller'), 'caller should be uncovered');
-            assert.ok(result.summary.uncoveredCount > 0);
+            assert.ok(result.notStaticallyLinked.includes('caller'));
+            assert.ok(result.summary.notStaticallyLinkedCount > 0);
         } finally {
             rm(dir);
         }
@@ -770,27 +770,37 @@ describe('affected-tests: transitive test detection', () => {
             affectedFunctions: ['fn', 'caller'],
             testFiles: [{
                 file: 'test/lib.test.js',
-                coveredFunctions: ['fn'],
+                linkedFunctions: ['fn'],
                 matchCount: 1,
                 matches: [{ line: 5, content: 'fn();', matchType: 'call', functionName: 'fn' }]
             }],
-            summary: { totalAffected: 2, totalTestFiles: 1, coveredFunctions: 1, uncoveredCount: 1 },
-            uncovered: ['caller'],
+            summary: {
+                totalAffected: 2,
+                totalTestFiles: 1,
+                staticallyLinkedFunctions: 1,
+                notStaticallyLinkedCount: 1,
+            },
+            notStaticallyLinked: ['caller'],
         };
         const text = output.formatAffectedTests(result);
         assert.ok(text.includes('affected-tests: fn'));
         assert.ok(text.includes('2 functions affected'));
         assert.ok(text.includes('Test files to run (1)'));
-        assert.ok(text.includes('Uncovered (1): caller'));
-        assert.ok(text.includes('1/2 functions covered (50%)'));
+        assert.ok(text.includes('Not statically linked (1): caller'));
+        assert.ok(text.includes('1/2 functions linked (50%)'));
     });
 
     it('formatAffectedTestsJson returns valid JSON', () => {
         const result = {
             root: 'fn', file: 'lib.js', line: 1, depth: 3,
             affectedFunctions: ['fn'], testFiles: [],
-            summary: { totalAffected: 1, totalTestFiles: 0, coveredFunctions: 0, uncoveredCount: 1 },
-            uncovered: ['fn'],
+            summary: {
+                totalAffected: 1,
+                totalTestFiles: 0,
+                staticallyLinkedFunctions: 0,
+                notStaticallyLinkedCount: 1,
+            },
+            notStaticallyLinked: ['fn'],
         };
         const json = JSON.parse(output.formatAffectedTestsJson(result));
         assert.strictEqual(json.root, 'fn');
@@ -837,7 +847,7 @@ describe('affected-tests: transitive test detection', () => {
             assert.ok(result);
             assert.strictEqual(result.testFiles.length, 0);
             const text = output.formatAffectedTests(result);
-            assert.ok(text.includes('No test files found'));
+            assert.ok(text.includes('No confirmed static test links found'));
         } finally {
             rm(dir);
         }
@@ -893,8 +903,8 @@ describe('affected-tests: transitive test detection', () => {
             const result = index.affectedTests('core');
             assert.ok(result);
             assert.strictEqual(result.testFiles.length, 2, 'should find both test files');
-            // 'mid' is uncovered — no test references it directly
-            assert.ok(result.uncovered.includes('mid'));
+            // 'mid' has no static test link — no test references it directly
+            assert.ok(result.notStaticallyLinked.includes('mid'));
         } finally {
             rm(dir);
         }
@@ -1126,7 +1136,8 @@ describe('affected-tests: transitive test detection', () => {
             assert.ok(result);
             assert.ok(result.testFiles.length > 0, 'should find TypeScript test file');
             assert.ok(result.testFiles[0].file.includes('.test.ts'));
-            assert.strictEqual(result.summary.coveredFunctions, result.summary.totalAffected, 'all functions should be covered');
+            assert.strictEqual(result.summary.staticallyLinkedFunctions,
+                result.summary.totalAffected, 'all functions should be statically linked');
         } finally {
             rm(dir);
         }
@@ -1214,7 +1225,7 @@ describe('affected-tests: transitive test detection', () => {
             affectedFunctions: ['fn'],
             testFiles: [{
                 file: 'test/lib.test.js',
-                coveredFunctions: ['fn'],
+                linkedFunctions: ['fn'],
                 matchCount: 3,
                 matches: [
                     { line: 1, content: 'const { fn } = require("../lib");', matchType: 'import', functionName: 'fn' },
@@ -1222,8 +1233,13 @@ describe('affected-tests: transitive test detection', () => {
                     { line: 3, content: '  fn();', matchType: 'call', functionName: 'fn' },
                 ]
             }],
-            summary: { totalAffected: 1, totalTestFiles: 1, coveredFunctions: 1, uncoveredCount: 0 },
-            uncovered: [],
+            summary: {
+                totalAffected: 1,
+                totalTestFiles: 1,
+                staticallyLinkedFunctions: 1,
+                notStaticallyLinkedCount: 0,
+            },
+            notStaticallyLinked: [],
         };
         const text = output.formatAffectedTests(result);
         // Formatter should show call and test-case matches, not imports
@@ -5125,7 +5141,7 @@ describe('fix #246: affectedTests coverage bands agree with the engine account',
             const r = execute(index, 'affectedTests', { name: 'save', file: 'lib.js', line: 1 });
             assert.ok(r.ok);
             assert.strictEqual(r.result.testFiles.length, 0, 's.save() on a typed Store is excluded, never coverage');
-            assert.ok(r.result.uncovered.includes('save'));
+            assert.ok(r.result.notStaticallyLinked.includes('save'));
         } finally { rm(dir); }
     });
 
@@ -5139,9 +5155,10 @@ describe('fix #246: affectedTests coverage bands agree with the engine account',
             const index = idx(dir);
             const r = execute(index, 'affectedTests', { name: 'save' });
             assert.ok(r.ok);
-            assert.strictEqual(r.result.uncovered.length, 0, 'persist() is a confirmed edge of save');
+            assert.strictEqual(r.result.notStaticallyLinked.length, 0,
+                'persist() is a confirmed edge of save');
             const tf = r.result.testFiles.find(t => t.file.includes('r.test.js'));
-            assert.ok(tf && tf.coveredFunctions.includes('save'));
+            assert.ok(tf && tf.linkedFunctions.includes('save'));
             assert.ok(tf.matches.some(m => m.matchType === 'call' && m.line === 2));
         } finally { rm(dir); }
     });
@@ -5156,7 +5173,7 @@ describe('fix #246: affectedTests coverage bands agree with the engine account',
             const index = idx(dir);
             const r = execute(index, 'affectedTests', { name: 'formatItem' });
             assert.ok(r.ok);
-            assert.strictEqual(r.result.uncovered.length, 0);
+            assert.strictEqual(r.result.notStaticallyLinked.length, 0);
             const tf = r.result.testFiles.find(t => t.file.includes('d.test.js'));
             assert.ok(tf && tf.matches.some(m => m.matchType === 'call'), 'usage-style edge counts as call coverage');
         } finally { rm(dir); }
@@ -5260,6 +5277,27 @@ describe('fix #246: tests command discipline', () => {
                 assert.ok(f.matches.some(m => m.matchType === 'import'), 'import line listed');
                 assert.ok(f.matches.some(m => m.matchType === 'call'), 'call of imported name listed');
             }
+        } finally { rm(dir); }
+    });
+
+    it('file-path targets never degrade into a generic basename symbol scan', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/index.js': 'function boot(){ return 1; }\nmodule.exports={boot};\n',
+            '__tests__/unrelated.test.js': [
+                'it("uses local indexes", () => {',
+                '  const index = new Map();',
+                '  index.set("x", 1);',
+                '  expect(index.get("x")).toBe(1);',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const r = execute(index, 'tests', { name: 'src/index.js' });
+            assert.ok(r.ok);
+            assert.deepStrictEqual(r.result, [],
+                'local variables named index are not evidence for src/index.js');
         } finally { rm(dir); }
     });
 
@@ -6293,6 +6331,60 @@ describe('command trust arm: usages/tests/example exact-target regressions', () 
             assert.ok(file?.matches.some(m => m.line === 2 &&
                 ['call', 'unverified-call'].includes(m.matchType)),
             `alias call must not disappear from test evidence: ${JSON.stringify(r.result)}`);
+        } finally { rm(dir); }
+    });
+
+    it('impact never treats RegExp.test() in production as a test-case bracket', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'lib.js': 'function target() { return 1; }\nmodule.exports = { target };\n',
+            'app.js': [
+                'const { target } = require("./lib");',
+                'function main(value) {',
+                '  if (/ready/.test(value)) target();',
+                '}',
+                'module.exports = { main };',
+            ].join('\n'),
+        });
+        try {
+            const r = execute(idx(dir), 'impact', { name: 'target' });
+            assert.ok(r.ok, r.error);
+            assert.strictEqual(r.result.patterns.inTestCase, 0);
+            assert.ok(r.result.byFile.flatMap(group => group.sites)
+                .every(site => site.inTestCase === false));
+        } finally { rm(dir); }
+    });
+});
+
+describe('repo scope is consistent across every projection', () => {
+    it('exclude filters summary, stats, health, evidence, and blind spots together', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'src/app.js': [
+                'function boot() { return 1; }',
+                'function main() { return boot(); }',
+                'module.exports = { main };',
+            ].join('\n'),
+            'test/dynamic.test.js': [
+                'test("loads", async () => {',
+                '  const mod = await import("../src/app.js");',
+                '  expect(mod.main()).toBe(1);',
+                '});',
+            ].join('\n'),
+        });
+        try {
+            const r = execute(idx(dir), 'repo', {
+                sections: 'summary,stats,health',
+                deep: true,
+                exclude: ['test'],
+            });
+            assert.ok(r.ok, r.error);
+            assert.strictEqual(r.result.summary.files, 1);
+            assert.strictEqual(r.result.stats.files, 1);
+            assert.strictEqual(r.result.health.files.scanned, 1);
+            assert.strictEqual(r.result.health.blindSpots.dynamicImports.count, 0);
+            assert.ok(r.result.health.evidenceProfile.candidateSymbols <= 2);
+            assert.ok(!r.result.summary.dirs.some(row => row.dir.startsWith('test')));
         } finally { rm(dir); }
     });
 });

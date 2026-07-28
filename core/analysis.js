@@ -13,6 +13,7 @@ const { execFileSync } = require('child_process');
 const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots, codeUnitCompare } = require('./shared');
+const { isTestFile } = require('./discovery');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageAdapter } = require('../languages');
 
@@ -47,7 +48,8 @@ function tagInTestCase(index, sites) {
         try { langModule = getLanguageAdapter(fe.language); } catch (_) { /* ignore */ }
         const meta = { fileEntry: fe, langModule, language: fe.language, jsTestRanges: null };
         // For JS-family files, build line ranges of describe/it/test framework calls.
-        if (langModule && (fe.language === 'javascript' || fe.language === 'typescript' ||
+        if (langModule && isTestFile(fe.relativePath, fe.language) &&
+            (fe.language === 'javascript' || fe.language === 'typescript' ||
             fe.language === 'tsx' || fe.language === 'html')) {
             try {
                 const calls = index.getCachedCalls ? index.getCachedCalls(filePath) : null;

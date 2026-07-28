@@ -170,7 +170,7 @@ const COMMAND_CONTRACTS = Object.freeze({
         examples: ['ucn tests parseRequest', 'ucn tests parseRequest --depth=3'],
         jsonData: 'Direct mode returns test files and matches; affected mode returns root/path and tiered test results.',
         output: 'Broad command; control traversal with `depth`, `file`, and `exclude`.',
-        next: ['Run the selected tests with the project test runner.', 'Use `trace --direction=callers` to inspect uncovered paths.'],
+        next: ['Run the selected tests with the project test runner.', 'Use `trace --direction=callers` to inspect paths without static test links.'],
         benchmark: 'A09',
     }),
     check: contract({

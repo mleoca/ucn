@@ -11,7 +11,10 @@ const fs = require('fs');
 const path = require('path');
 const { tmp, rm, idx } = require('./helpers');
 const { execute } = require('../core/execute');
-const { saveCache, loadCache, isCacheStale, CACHE_FORMAT_VERSION } = require('../core/cache');
+const {
+    saveCache, loadCache, isCacheStale, getProjectCacheDir, getProjectCachePath,
+    CACHE_FORMAT_VERSION,
+} = require('../core/cache');
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
@@ -443,7 +446,7 @@ describe('perf: cache v8', () => {
         try {
             const index = idx(dir);
             index.saveCache();
-            const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+            const cachePath = getProjectCachePath(dir);
             const cacheData = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
             assert.strictEqual(cacheData.version, CACHE_FORMAT_VERSION, 'should save as current version');
             assert.ok(!cacheData.calleeIndex, 'should not include calleeIndex');
@@ -486,12 +489,12 @@ describe('perf: atomic shard writes', () => {
             index.saveCache();
 
             // Verify final calls directory exists with manifest
-            const callsDir = path.join(dir, '.ucn-cache', 'calls');
+            const callsDir = path.join(getProjectCacheDir(dir), 'calls');
             assert.ok(fs.existsSync(callsDir), 'calls dir should exist');
             assert.ok(fs.existsSync(path.join(callsDir, 'manifest.json')), 'manifest should exist');
 
             // Verify temp directory was cleaned up
-            const tmpDir = path.join(dir, '.ucn-cache', 'calls.tmp');
+            const tmpDir = path.join(getProjectCacheDir(dir), 'calls.tmp');
             assert.ok(!fs.existsSync(tmpDir), 'temp dir should be cleaned up after rename');
         } finally {
             rm(dir);
@@ -740,7 +743,7 @@ module.exports = { main };
                 'flag should be cleared after successful saveCache');
             // Verify cache file actually contains reachableSymbols
             const cacheData = JSON.parse(fs.readFileSync(
-                path.join(dir, '.ucn-cache', 'index.json'), 'utf-8'));
+                getProjectCachePath(dir), 'utf-8'));
             assert.ok(Array.isArray(cacheData.reachableSymbols),
                 'cache file should have reachableSymbols array');
             assert.ok(cacheData.reachableSymbols.length > 0,
@@ -774,7 +777,7 @@ module.exports = { main };
             index1.build(null, { quiet: true });
             index1.saveCache();
             const cache1 = JSON.parse(fs.readFileSync(
-                path.join(dir, '.ucn-cache', 'index.json'), 'utf-8'));
+                getProjectCachePath(dir), 'utf-8'));
             assert.ok(!cache1.reachableSymbols,
                 'run 1 should not have reachableSymbols (stats does not need it)');
 
@@ -792,7 +795,7 @@ module.exports = { main };
             if (shouldSave) index2.saveCache();
 
             const cache2 = JSON.parse(fs.readFileSync(
-                path.join(dir, '.ucn-cache', 'index.json'), 'utf-8'));
+                getProjectCachePath(dir), 'utf-8'));
             assert.ok(Array.isArray(cache2.reachableSymbols),
                 'run 2 should now persist reachableSymbols');
             assert.ok(cache2.reachableFingerprint,
@@ -831,12 +834,12 @@ describe('perf: PERF-3 atomic index.json write', () => {
 
             for (let i = 0; i < 5; i++) {
                 index.saveCache();
-                const cachePath = path.join(dir, '.ucn-cache', 'index.json');
+                const cachePath = getProjectCachePath(dir);
                 const data = JSON.parse(fs.readFileSync(cachePath, 'utf-8'));
                 assert.strictEqual(data.version, CACHE_FORMAT_VERSION, 'cache version should be intact');
             }
 
-            const tmpFile = path.join(dir, '.ucn-cache', 'index.json.tmp');
+            const tmpFile = `${getProjectCachePath(dir)}.tmp`;
             assert.ok(!fs.existsSync(tmpFile), '.tmp file should be cleaned up');
         } finally {
             rm(dir);

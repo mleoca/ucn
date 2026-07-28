@@ -9,9 +9,16 @@ const { describe, it } = require('node:test');
 const assert = require('node:assert');
 const { execFileSync } = require('child_process');
 const path = require('path');
+const fs = require('fs');
 
 const { CLI_PATH, PROJECT_DIR, tmp, rm, runInteractive } = require('./helpers');
 const { CANONICAL_COMMANDS, toCliName } = require('../core/registry');
+const {
+    getProjectCacheDir,
+    getProjectCachePath,
+    getLegacyProjectCacheDir,
+    clearProjectCache,
+} = require('../core/cache');
 
 function helpListsCommand(help, command) {
     const escaped = command.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -19,6 +26,33 @@ function helpListsCommand(help, command) {
 }
 
 describe('Interactive Mode', () => {
+    it('--clear-cache clears legacy and per-user state before rebuilding', () => {
+        const dir = tmp({
+            'package.json': '{"name":"interactive-cache"}',
+            'index.js': 'function main() { return 1; }',
+        });
+        try {
+            const cacheDir = getProjectCacheDir(dir);
+            fs.mkdirSync(cacheDir, { recursive: true });
+            fs.writeFileSync(path.join(cacheDir, 'obsolete'), 'old');
+            const legacyDir = getLegacyProjectCacheDir(dir);
+            fs.mkdirSync(legacyDir, { recursive: true });
+            fs.writeFileSync(path.join(legacyDir, 'obsolete'), 'old');
+
+            runInteractive(dir, ['repo'], ['--clear-cache']);
+
+            assert.ok(fs.existsSync(getProjectCachePath(dir)),
+                'interactive mode should persist the rebuilt per-user cache');
+            assert.ok(!fs.existsSync(path.join(cacheDir, 'obsolete')),
+                'old per-user cache contents should be removed');
+            assert.ok(!fs.existsSync(legacyDir),
+                'legacy project cache should be removed');
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+
     it('supports all commands without errors', () => {
         const commands = [
             'deadcode',

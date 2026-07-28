@@ -21,6 +21,12 @@ const { CANONICAL_COMMANDS } = require('./registry');
 // HELPERS
 // ============================================================================
 
+const NO_STATIC_TEST_LINK_NOTE =
+    'No confirmed static test link was found. This is not runtime coverage evidence: ' +
+    'subprocess/black-box tests, reflection, generated code, and external harnesses can still ' +
+    'exercise the target. Inspect the project test runner and search for the defining module/file ' +
+    'before concluding it is untested.';
+
 function requireName(name) {
     if (!name || (typeof name === 'string' && !name.trim())) {
         return 'Symbol name is required.';
@@ -868,7 +874,12 @@ const HANDLERS = {
             top = Math.min(n, 100);
         }
         const { orient } = require('./reporting');
-        const result = orient(index, { top });
+        const result = orient(index, {
+            top,
+            file: p.file,
+            in: p.in,
+            exclude: toExcludeArray(p.exclude),
+        });
         return { ok: true, result };
     },
 
@@ -877,6 +888,7 @@ const HANDLERS = {
         const result = doctor(index, {
             in: p.in,
             file: p.file,
+            exclude: toExcludeArray(p.exclude),
             deep: !!p.deep,
         });
         return { ok: true, result };
@@ -1209,7 +1221,11 @@ const HANDLERS = {
             exclude: toExcludeArray(p.exclude),
         });
         addMode(result, 'direct');
-        return { ok: true, result };
+        return {
+            ok: true,
+            result,
+            ...(result.length === 0 && { note: NO_STATIC_TEST_LINK_NOTE }),
+        };
     },
 
     affectedTests: (index, p) => {
@@ -1230,7 +1246,8 @@ const HANDLERS = {
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const note = treeNote(result);
         const tNote = truncationNote(index);
-        const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
+        const selectionNote = result.testFiles.length === 0 ? NO_STATIC_TEST_LINK_NOTE : null;
+        const combined = [note, tNote, selectionNote].filter(Boolean).join('\n') || undefined;
         return { ok: true, result, ...(combined && { note: combined }) };
     },
 
@@ -1906,6 +1923,9 @@ const HANDLERS = {
             functions: p.functions || false,
             hot: p.hot || false,
             top,
+            file: p.file,
+            in: p.in,
+            exclude: toExcludeArray(p.exclude),
         });
         return note ? { ok: true, result, note } : { ok: true, result };
     },

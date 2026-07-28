@@ -6,6 +6,15 @@ const { spawn, execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
+
+// Keep default-cache tests and spawned CLI/MCP processes out of the real user
+// cache. Each test worker gets an isolated root that is removed on exit.
+const TEST_CACHE_ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-test-cache-'));
+process.env.UCN_CACHE_DIR = TEST_CACHE_ROOT;
+process.once('exit', () => {
+    fs.rmSync(TEST_CACHE_ROOT, { recursive: true, force: true });
+});
+
 const { ProjectIndex } = require('../../core/project');
 const { LANGUAGES, langTraits } = require('../../languages');
 
@@ -16,6 +25,7 @@ const FIXTURES_PATH = path.join(__dirname, '..', 'fixtures');
 const CLI_PATH = path.join(__dirname, '../../cli/index.js');
 const MCP_PATH = path.join(__dirname, '../../mcp/server.js');
 const TIMEOUT_MS = 30000;
+const MCP_TIMEOUT_MS = TIMEOUT_MS * 2;
 
 // ── Temp directory helpers ──────────────────────────────────────────────────
 
@@ -72,10 +82,10 @@ function runCli(fixtureDir, command, args = [], flags = []) {
     }
 }
 
-function runInteractive(fixtureDir, commands) {
+function runInteractive(fixtureDir, commands, flags = []) {
     const input = commands.join('\n') + '\nquit\n';
     try {
-        return execFileSync('node', [CLI_PATH, '--interactive', fixtureDir], {
+        return execFileSync('node', [CLI_PATH, '--interactive', ...flags, fixtureDir], {
             input,
             timeout: TIMEOUT_MS,
             encoding: 'utf-8',
@@ -89,7 +99,7 @@ function runInteractive(fixtureDir, commands) {
 // ── MCP Client ──────────────────────────────────────────────────────────────
 
 class McpClient {
-    constructor({ timeoutMs = TIMEOUT_MS } = {}) {
+    constructor({ timeoutMs = MCP_TIMEOUT_MS } = {}) {
         this.proc = null;
         this.requestId = 0;
         this.pending = new Map();

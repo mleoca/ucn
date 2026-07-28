@@ -3240,7 +3240,7 @@ describe('fix #244 (Java): same-package test discovery and shadow discipline', (
             const at = execute(index, 'affectedTests', { name: 'square', file: 'Calculator.java' });
             assert.strictEqual(at.result.testFiles.length, 0,
                 'the bare call binds HelperTest.square — the account excludes the site, the coverage band must agree');
-            assert.ok(at.result.uncovered.includes('square'));
+            assert.ok(at.result.notStaticallyLinked.includes('square'));
         } finally { rm(dir); }
     });
 });

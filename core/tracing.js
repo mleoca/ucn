@@ -784,12 +784,12 @@ function reverseTrace(index, name, options = {}) {
  * Two bands (tree contract): `affectedFunctions`/`testFiles` come from the
  * confirmed-chain closure; names reachable only through >= 1 unverified hop
  * land in `possiblyAffected`, their additional test files in
- * `possiblyAffectedTests`. Coverage/uncovered claims are confirmed-band only.
+ * `possiblyAffectedTests`. Static-linkage claims are confirmed-band only.
  *
  * @param {object} index - ProjectIndex instance
  * @param {string} name - Function name
  * @param {object} options - { depth, file, className, exclude, includeMethods }
- * @returns {object|null} Affected test files with coverage stats
+ * @returns {object|null} Affected test files with static-linkage stats
  */
 function affectedTests(index, name, options = {}) {
     index._beginOp();
@@ -1130,7 +1130,7 @@ function affectedTests(index, name, options = {}) {
                 }
 
                 if (fileMatches.size > 0) {
-                    const coveredFunctions = [...fileMatches.keys()];
+                    const linkedFunctions = [...fileMatches.keys()];
                     const allMatches = [];
                     for (const matches of fileMatches.values()) allMatches.push(...matches);
                     // Deduplicate same line+function (test-case line might overlap with call line)
@@ -1144,40 +1144,41 @@ function affectedTests(index, name, options = {}) {
                     }
                     const deduped = [...dedupMap.values()].sort((a, b) => a.line - b.line);
 
-                    // Only count functions with call or test-case matches as covered.
-                    // Import-only or reference-only functions are not real coverage.
-                    const realCoveredAll = coveredFunctions.filter(fn => {
+                    // Only count functions with call or test-case matches as
+                    // statically linked. Import-only or reference-only records
+                    // are useful evidence, but are not an exercising path.
+                    const realLinkedAll = linkedFunctions.filter(fn => {
                         const fnMatches = deduped.filter(m => m.functionName === fn);
                         return fnMatches.some(m => m.matchType === 'call' || m.matchType === 'test-case');
                     });
-                    const realCoveredFunctions = realCoveredAll.filter(fn => affectedNames.has(fn));
-                    const possiblyCovered = realCoveredAll.filter(fn => possiblyNames.has(fn));
+                    const staticallyLinkedFunctions = realLinkedAll.filter(fn => affectedNames.has(fn));
+                    const possiblyLinkedFunctions = realLinkedAll.filter(fn => possiblyNames.has(fn));
 
-                    if (realCoveredFunctions.length > 0) {
-                        // Confirmed band: matches for confirmed-covered names
+                    if (staticallyLinkedFunctions.length > 0) {
+                        // Confirmed band: matches for confirmed-linked names
                         const realMatches = deduped.filter(m =>
                             affectedNames.has(m.functionName) &&
                             (m.matchType === 'call' || m.matchType === 'test-case' ||
-                             realCoveredFunctions.includes(m.functionName))
+                             staticallyLinkedFunctions.includes(m.functionName))
                         );
                         results.push({
                             file: fileEntry.relativePath,
-                            coveredFunctions: realCoveredFunctions,
-                            ...(possiblyCovered.length > 0 && { possiblyCovered }),
+                            linkedFunctions: staticallyLinkedFunctions,
+                            ...(possiblyLinkedFunctions.length > 0 && { possiblyLinkedFunctions }),
                             matchCount: realMatches.length,
                             matches: realMatches
                         });
-                    } else if (possiblyCovered.length > 0) {
+                    } else if (possiblyLinkedFunctions.length > 0) {
                         // Possible band: file reaches the change only through
                         // unverified chains.
                         const possibleMatches = deduped.filter(m =>
                             possiblyNames.has(m.functionName) &&
                             (m.matchType === 'call' || m.matchType === 'test-case' ||
-                             possiblyCovered.includes(m.functionName))
+                             possiblyLinkedFunctions.includes(m.functionName))
                         );
                         possibleResults.push({
                             file: fileEntry.relativePath,
-                            coveredFunctions: possiblyCovered,
+                            linkedFunctions: possiblyLinkedFunctions,
                             matchCount: possibleMatches.length,
                             matches: possibleMatches
                         });
@@ -1199,22 +1200,25 @@ function affectedTests(index, name, options = {}) {
             if (inResults || inPossible) {
                 const existing = inResults || inPossible;
                 const have = new Set([
-                    ...existing.coveredFunctions,
-                    ...(existing.possiblyCovered || []),
+                    ...existing.linkedFunctions,
+                    ...(existing.possiblyLinkedFunctions || []),
                 ]);
                 const extra = [...entry.byName.keys()].filter(n => !have.has(n)).sort(codeUnitCompare);
                 if (extra.length > 0) {
                     if (inResults) {
-                        existing.possiblyCovered = [...(existing.possiblyCovered || []), ...extra].sort(codeUnitCompare);
+                        existing.possiblyLinkedFunctions = [
+                            ...(existing.possiblyLinkedFunctions || []),
+                            ...extra,
+                        ].sort(codeUnitCompare);
                     } else {
-                        existing.coveredFunctions = [...existing.coveredFunctions, ...extra].sort(codeUnitCompare);
+                        existing.linkedFunctions = [...existing.linkedFunctions, ...extra].sort(codeUnitCompare);
                     }
                 }
                 continue;
             }
-            const covered = [...entry.byName.keys()].sort(codeUnitCompare);
+            const linked = [...entry.byName.keys()].sort(codeUnitCompare);
             const matches = [];
-            for (const fn of covered) {
+            for (const fn of linked) {
                 for (const ln of [...entry.byName.get(fn)].sort((a, b) => a - b)) {
                     matches.push({
                         line: ln,
@@ -1226,17 +1230,17 @@ function affectedTests(index, name, options = {}) {
             }
             possibleResults.push({
                 file: entry.rel,
-                coveredFunctions: covered,
+                linkedFunctions: linked,
                 matchCount: matches.length,
                 matches,
             });
         }
 
-        // Sort by coverage breadth then alphabetically
-        results.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || codeUnitCompare(a.file, b.file));
-        possibleResults.sort((a, b) => b.coveredFunctions.length - a.coveredFunctions.length || codeUnitCompare(a.file, b.file));
+        // Sort by linkage breadth then alphabetically
+        results.sort((a, b) => b.linkedFunctions.length - a.linkedFunctions.length || codeUnitCompare(a.file, b.file));
+        possibleResults.sort((a, b) => b.linkedFunctions.length - a.linkedFunctions.length || codeUnitCompare(a.file, b.file));
 
-        // Compute coverage stats.
+        // Compute static-linkage stats.
         // Filter out test function names from affectedNames — they are callers,
         // not production symbols that need test coverage.
         const isProductionName = (n) => {
@@ -1262,15 +1266,20 @@ function affectedTests(index, name, options = {}) {
         const namesForCoverage = productionNames.size > 0 ? productionNames : affectedNames;
         const possiblyProduction = [...possiblyNames].filter(isProductionName);
 
-        const coveredSet = new Set();
-        for (const r of results) for (const f of r.coveredFunctions) {
-            if (namesForCoverage.has(f)) coveredSet.add(f);
+        const linkedSet = new Set();
+        for (const r of results) for (const f of r.linkedFunctions) {
+            if (namesForCoverage.has(f)) linkedSet.add(f);
         }
-        const uncovered = [...namesForCoverage].filter(n => !coveredSet.has(n));
+        const notStaticallyLinked = [...namesForCoverage].filter(n => !linkedSet.has(n));
 
         return {
             root: blastResult.root, file: blastResult.file, line: blastResult.line,
             depth: blastResult.maxDepth,
+            selection: {
+                basis: 'static-call-and-reference-links',
+                runtimeCoverage: false,
+                absenceProvesUntested: false,
+            },
             affectedFunctions: [...namesForCoverage],
             possiblyAffected: possiblyProduction,
             testFiles: results,
@@ -1280,13 +1289,13 @@ function affectedTests(index, name, options = {}) {
             summary: {
                 totalAffected: namesForCoverage.size,
                 totalTestFiles: results.length,
-                coveredFunctions: coveredSet.size,
-                uncoveredCount: uncovered.length,
+                staticallyLinkedFunctions: linkedSet.size,
+                notStaticallyLinkedCount: notStaticallyLinked.length,
                 possiblyAffected: possiblyProduction.length,
                 possiblyAffectedTests: possibleResults.length,
                 unverifiedEdges: blastResult.summary ? blastResult.summary.unverifiedEdges : 0,
             },
-            uncovered,
+            notStaticallyLinked,
             warnings: blastResult.warnings,
         };
     } finally { index._endOp(); }

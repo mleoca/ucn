@@ -238,7 +238,7 @@ const CONCISE_TOOL_DESCRIPTION = `Auditable AST code intelligence for JavaScript
 - find/usages/search/source: locate definitions, references, text/structure, or exact source.
 - trace: direction=callees or callers; to=entrypoints follows callers to roots.
 - impact: symbol impact when name is set; Git-diff impact when it is omitted.
-- tests: direct tests by default; depth>0 includes transitive affected tests.
+- tests: static direct links by default; depth>0 includes transitive affected links. Empty results are not runtime coverage proof.
 - deps/api/entrypoints/endpoints: architecture and public surfaces.
 - check: symbol signature check when name is set; precommit check when omitted. plan previews a refactor.
 - deadcode/audit_async/stacktrace: focused audits and runtime evidence.

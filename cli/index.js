@@ -14,7 +14,7 @@ const { detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getCliCommandSet, resolveCommand, FLAG_APPLICABILITY, toCliName, FILE_LOCAL_COMMANDS } = require('../core/registry');
+const { getCliCommandSet, resolveCommand, suggestCommand, FLAG_APPLICABILITY, toCliName, FILE_LOCAL_COMMANDS } = require('../core/registry');
 const { buildPublicParams, isPublicCommand } = require('../core/public-command');
 const { execute } = require('../core/execute');
 
@@ -27,6 +27,13 @@ class CommandError extends Error { constructor() { super(); } }
 // mode catches it inside its REPL try/catch and continues the session.
 class FlagValidationError extends Error {
     constructor(msg) { super(msg); this.name = 'FlagValidationError'; }
+}
+
+function unknownCommandMessage(command, { interactive = false } = {}) {
+    const suggestion = suggestCommand(command, 'cli');
+    const correction = suggestion ? ` Did you mean "${suggestion}"?` : '';
+    const help = interactive && !suggestion ? ' Type "help" for available commands.' : '';
+    return `Unknown command: ${command}.${correction}${help}`;
 }
 
 /**
@@ -427,7 +434,10 @@ function main() {
             // Single file mode
             runFileCommand(target, command, arg);
         } else {
-            console.error(`Error: "${target}" not found`);
+            const suggestion = suggestCommand(target, 'cli');
+            console.error(suggestion
+                ? unknownCommandMessage(target)
+                : `Error: "${target}" not found`);
             process.exit(1);
         }
     } catch (e) {
@@ -509,7 +519,7 @@ function runFileCommand(filePath, command, arg) {
     }
 
     if (!isPublicCommand(canonical)) {
-        fail(`Unknown command: ${command}`);
+        fail(unknownCommandMessage(command));
     }
 
     // Require arg for commands that need it.
@@ -565,12 +575,9 @@ function runProjectCommand(rootDir, command, arg) {
 
     // Clear cache if requested
     if (flags.clearCache) {
-        const cacheDir = path.join(index.root, '.ucn-cache');
-        if (fs.existsSync(cacheDir)) {
-            fs.rmSync(cacheDir, { recursive: true, force: true });
-            if (!flags.quiet) {
-                console.error('Cache cleared');
-            }
+        const removed = index.clearCache();
+        if (removed.length > 0 && !flags.quiet) {
+            console.error('Cache cleared');
         }
     }
 
@@ -603,7 +610,7 @@ function runProjectCommand(rootDir, command, arg) {
     const canonical = resolveCommand(command, 'cli') || command;
 
     if (!isPublicCommand(canonical)) {
-        fail(`Unknown command: ${command}`);
+        fail(unknownCommandMessage(command));
     }
     warnInapplicableFlags(canonical, flags, (message) => console.error(message));
 
@@ -656,7 +663,7 @@ function runGlobCommand(pattern, command, arg) {
     index.build(files, { quiet: true });
 
     if (!isPublicCommand(canonical)) {
-        fail(`Unknown command: ${command}`);
+        fail(unknownCommandMessage(command));
     }
     warnInapplicableFlags(canonical, flags, (message) => console.error(message));
     const publicParams = buildPublicParams(canonical, arg, flags);
@@ -716,6 +723,7 @@ Common flags:
   --all --compact --no-compact --json --include-tests --class-name=X --line=N
   --range=N-M (source with --file=PATH)
   --base=REF --staged --no-cache --clear-cache --max-files=N --workers=N
+  Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
 
 Trust:
   CONFIRMED means target-identity evidence exists. UNVERIFIED means possible and
@@ -741,12 +749,18 @@ function runInteractive(rootDir) {
 
     console.log('Building index...');
     const index = new ProjectIndex(rootDir);
+    if (flags.clearCache) {
+        const removed = index.clearCache();
+        if (removed.length > 0 && !flags.quiet) {
+            console.error('Cache cleared');
+        }
+    }
     // Same cache discipline as one-shot mode (fix #250: the REPL fully
     // re-parsed every session and never consumed cache-persisted state —
     // the divergence mechanism behind the relocation P1).
     let iCacheFresh;
-    if (flags.cache && !flags.clearCache) {
-        const loaded = index.loadCache();
+    if (flags.cache) {
+        const loaded = !flags.clearCache && index.loadCache();
         iCacheFresh = loaded && !index.isCacheStale();
         if (!iCacheFresh && loaded) {
             index.build(null, { quiet: true, forceRebuild: true, workers: flags.workers });
@@ -889,7 +903,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
     warnInapplicableFlags(command, iflags, (message) => console.log(message));
 
     if (!isPublicCommand(command)) {
-        console.log(`Unknown command: ${command}. Type "help" for available commands.`);
+        console.log(unknownCommandMessage(command, { interactive: true }));
         return;
     }
     const publicParams = buildPublicParams(command, arg, iflags);

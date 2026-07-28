@@ -1616,7 +1616,7 @@ mod tests {
     });
 });
 
-describe('BUG-CY: Rust tests inside #[cfg(test)] mod block are not in uncovered', () => {
+describe('BUG-CY: Rust tests inside #[cfg(test)] mod block are statically linked', () => {
     it('helper called by an inline #[cfg(test)] mod test should be covered', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"',
@@ -1641,14 +1641,15 @@ mod tests {
             const result = index.affectedTests('helper');
             assert.ok(result, 'affectedTests should return a result');
 
-            // BUG-CY: helper must be in coveredFunctions, not uncovered.
+            // BUG-CY: helper must be statically linked.
             assert.ok(
-                !result.uncovered.includes('helper'),
-                `helper should be covered (called from inline #[cfg(test)] mod tests), but got uncovered: [${result.uncovered.join(', ')}]`
+                !result.notStaticallyLinked.includes('helper'),
+                `helper should be linked from inline #[cfg(test)] mod tests: ` +
+                `[${result.notStaticallyLinked.join(', ')}]`
             );
             assert.strictEqual(
-                result.summary.uncoveredCount, 0,
-                'uncoveredCount should be 0 when the only target is covered by an inline test'
+                result.summary.notStaticallyLinkedCount, 0,
+                'notStaticallyLinkedCount should be 0 for an inline test link'
             );
             // The lib.rs file (containing the inline #[cfg(test)] mod) should appear in testFiles.
             assert.ok(
@@ -3880,7 +3881,8 @@ describe('fix #244 (Rust): test-discovery physics', () => {
             assert.ok(t1.result.length > 0 && t1.result[0].matches.some(m => m.line === 3),
                 'the path qualifier IS the receiver');
             const at = execute(index, 'affectedTests', { name: 'make', className: 'Kit' });
-            assert.ok(!at.result.uncovered.includes('make'), 'make covered by its direct #[test] caller');
+            assert.ok(!at.result.notStaticallyLinked.includes('make'),
+                'make linked by its direct #[test] caller');
         } finally { rm(dir); }
     });
 
@@ -3896,7 +3898,7 @@ describe('fix #244 (Rust): test-discovery physics', () => {
             assert.ok(t.result.some(f => f.matches.some(m => m.line === 3 && m.matchType === 'call')),
                 'f::<T>() is a call, not a reference');
             const at = execute(index, 'affectedTests', { name: 'make_container' });
-            assert.ok(!at.result.uncovered.includes('make_container'),
+            assert.ok(!at.result.notStaticallyLinked.includes('make_container'),
                 'coverage agrees with the account');
         } finally { rm(dir); }
     });

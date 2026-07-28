@@ -397,7 +397,7 @@ function formatTests(tests, name) {
     const lines = [`Tests for "${name}":\n`];
 
     if (!tests || !Array.isArray(tests) || tests.length === 0) {
-        lines.push('  (no tests found)');
+        lines.push('  (no statically linked tests found)');
     } else {
         const totalMatches = tests.reduce((sum, t) => sum + t.matches.length, 0);
         lines.push(`Found ${totalMatches} matches in ${tests.length} test file(s):\n`);

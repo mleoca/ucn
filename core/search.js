@@ -1269,6 +1269,50 @@ function tests(index, nameOrFile, options = {}) {
         if (targetRels.size === 0) targetRels = null;
     }
 
+    // File targets answer "which tests exercise code from this file?", not
+    // "which tests mention the file's basename?". The old basename scan turned
+    // `tests cli/index.js` into a project-wide search for the symbol `index`,
+    // producing huge, unrelated answers. Pin every callable declared by the
+    // resolved file and let the caller engine prove test call sites instead.
+    // Import-linked tests are still handled below so class/type-only use and
+    // module-level coverage remain visible.
+    const fileTargetCallerSites = new Map(); // absolute test file → tiered sites
+    if (isFilePath && targetRels) {
+        const testFileInfo = new Map(testFiles.map(info => [info.path, info]));
+        const fileTargetDefs = [];
+        for (const [, fe] of index.files) {
+            if (!targetRels.has(fe.relativePath)) continue;
+            for (const symbol of fe.symbols || []) {
+                if (CALLABLE_SYMBOL_KINDS.has(symbol.type)) fileTargetDefs.push(symbol);
+            }
+        }
+        for (const def of fileTargetDefs) {
+            const raw = index.findCallers(def.name, {
+                targetDefinitions: [def],
+                collectAccount: true,
+            });
+            const globallyUnique = index.find(def.name, { exact: true }).length === 1;
+            const sites = [
+                ...raw.map(site => ({ ...site, _testEvidenceTier: 'confirmed' })),
+                ...(globallyUnique ? (raw.unverifiedEntries || []).map(site => ({
+                    ...site,
+                    _testEvidenceTier: 'unverified',
+                })) : []),
+            ];
+            for (const site of sites) {
+                const info = testFileInfo.get(site.file);
+                if (!info) continue;
+                if (info.testRanges && !lineInRanges(site.line, info.testRanges)) continue;
+                let rows = fileTargetCallerSites.get(site.file);
+                if (!rows) {
+                    rows = [];
+                    fileTargetCallerSites.set(site.file, rows);
+                }
+                rows.push(site);
+            }
+        }
+    }
+
     const className = options.className || null;
     // className scoping accepts the class plus its non-overriding
     // descendants — a subclass instance without its own override dispatches
@@ -1301,14 +1345,20 @@ function tests(index, nameOrFile, options = {}) {
                     if (hits.length > 0) linkedRecords = hits;
                 }
             }
+            const provenFileSites = fileTargetCallerSites.get(testPath) || [];
 
             // Fast pre-check: skip if searchTerm doesn't appear in file
-            if (!content.includes(searchTerm) && !linkedRecords) continue;
+            if (!isFilePath && !content.includes(searchTerm) && !linkedRecords) continue;
+            if (isFilePath && !linkedRecords && provenFileSites.length === 0) continue;
             const sourceFileLinked = !sourceFileFilter || sourceFileFilter.has(testPath);
 
             // AST-based usage detection
-            const astUsages = index._getCachedUsages(testPath, searchTerm) || [];
-            if (astUsages.length === 0 && !linkedRecords) continue;
+            // A file path is not a symbol. Its basename must never be sent
+            // through the usage index (e.g. `index.js` → every local `index`).
+            const astUsages = isFilePath
+                ? []
+                : (index._getCachedUsages(testPath, searchTerm) || []);
+            if (astUsages.length === 0 && !linkedRecords && provenFileSites.length === 0) continue;
             // Compiler attributes can invoke generated builder methods across
             // workspace/facade boundaries that the source import graph cannot
             // represent (`#[arg(value_delimiter = ',')]`). Keep these explicit
@@ -1455,10 +1505,29 @@ function tests(index, nameOrFile, options = {}) {
                 }
             }
 
+            // Exact-target caller evidence for callable declarations in a file
+            // target. This covers same-package tests (notably Go) that do not
+            // import the implementation file, without falling back to a
+            // basename text heuristic.
+            for (const site of provenFileSites) {
+                const matchType = site._testEvidenceTier === 'confirmed'
+                    ? 'call'
+                    : 'unverified-call';
+                if (matches.some(m => m.line === site.line && m.matchType === matchType)) continue;
+                matches.push({
+                    line: site.line,
+                    content: (site.content || index.getLineContent(testPath, site.line) || '').trim(),
+                    matchType,
+                    evidenceTier: site._testEvidenceTier,
+                    ...(site.resolution && { resolution: site.resolution }),
+                    ...(site.reason && { reason: site.reason }),
+                });
+            }
+
             // Language-aware test-case detection. Under a local same-name
             // shadow the term on a test line is the file's OWN helper —
             // only anchor test cases to matches that survived the shadow.
-            if (sourceFileLinked &&
+            if (!isFilePath && sourceFileLinked &&
                 (!localShadow || matches.some(m => m.matchType !== 'import'))) {
                 _addTestCaseMatches(index, testPath, entry, searchTerm, className, instanceTypeMap, matches);
             }

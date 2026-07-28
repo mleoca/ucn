@@ -14,6 +14,20 @@ const path = require('path');
 const { isTestFile } = require('./discovery');
 const { summarizeCommandTrust } = require('./trust-matrix');
 
+function matchesReportingScope(index, relativePath, options = {}) {
+    if (!relativePath) return false;
+    if (options.file && !relativePath.includes(options.file)) return false;
+    const exclude = Array.isArray(options.exclude)
+        ? options.exclude
+        : (options.exclude
+            ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
+            : []);
+    return index.matchesFilters(relativePath, {
+        ...(exclude.length > 0 && { exclude }),
+        ...(options.in && { in: options.in }),
+    });
+}
+
 /**
  * Get project statistics: file counts, symbol counts, LOC, language breakdown.
  *
@@ -22,15 +36,15 @@ const { summarizeCommandTrust } = require('./trust-matrix');
  * @returns {object}
  */
 function getStats(index, options = {}) {
-    // Count total symbols (not just unique names)
-    let totalSymbols = 0;
-    for (const [, symbols] of index.symbols) {
-        totalSymbols += symbols.length;
-    }
+    const scopedFiles = [...index.files].filter(([, fileEntry]) =>
+        matchesReportingScope(index, fileEntry.relativePath, options));
+    const scopedPaths = new Set(scopedFiles.map(([filePath]) => filePath));
+    const totalSymbols = scopedFiles.reduce(
+        (sum, [, fileEntry]) => sum + (fileEntry.symbols || []).length, 0);
 
     const stats = {
         root: index.root,
-        files: index.files.size,
+        files: scopedFiles.length,
         symbols: totalSymbols,  // Total symbol count, not unique names
         buildTime: index.buildTime,
         byLanguage: {},
@@ -38,7 +52,7 @@ function getStats(index, options = {}) {
         ...(index.truncated && { truncated: index.truncated })
     };
 
-    for (const [, fileEntry] of index.files) {
+    for (const [, fileEntry] of scopedFiles) {
         const lang = fileEntry.language;
         if (!stats.byLanguage[lang]) {
             stats.byLanguage[lang] = { files: 0, lines: 0, symbols: 0 };
@@ -48,8 +62,8 @@ function getStats(index, options = {}) {
         stats.byLanguage[lang].symbols += fileEntry.symbols.length;
     }
 
-    for (const [, symbols] of index.symbols) {
-        for (const sym of symbols) {
+    for (const [, fileEntry] of scopedFiles) {
+        for (const sym of fileEntry.symbols || []) {
             if (!Object.hasOwn(stats.byType, sym.type)) {
                 stats.byType[sym.type] = 0;
             }
@@ -59,17 +73,22 @@ function getStats(index, options = {}) {
 
     // Surface build warnings (parse failures, skipped files)
     if (index.failedFiles && index.failedFiles.size > 0) {
-        stats.warnings = {
-            failedFiles: [...index.failedFiles].map(f => path.relative(index.root, f)),
-            count: index.failedFiles.size
-        };
+        const failedFiles = [...index.failedFiles]
+            .map(f => path.relative(index.root, f))
+            .filter(rel => matchesReportingScope(index, rel, options));
+        if (failedFiles.length > 0) {
+            stats.warnings = {
+                failedFiles,
+                count: failedFiles.length,
+            };
+        }
     }
 
     // Per-function line counts for complexity audits
     if (options.functions) {
         const functions = [];
-        for (const [, symbols] of index.symbols) {
-            for (const sym of symbols) {
+        for (const [, fileEntry] of scopedFiles) {
+            for (const sym of fileEntry.symbols || []) {
                 if (CALLABLE_SYMBOL_KINDS.has(sym.type)) {
                     const lineCount = sym.endLine - sym.startLine + 1;
                     const relativePath = sym.relativePath || (sym.file ? path.relative(index.root, sym.file) : '');
@@ -142,7 +161,7 @@ function getStats(index, options = {}) {
         // leaderboard). Relative modules, resolved modules, and resolver
         // gaps (first segment names a project path) all stay countable.
         const fileExternalNames = new Map();         // filePath -> Set<string>
-        for (const [filePath, fileEntry] of index.files) {
+        for (const [filePath, fileEntry] of scopedFiles) {
             const aliases = new Set();
             // importNames are the named imports/exports brought into this file.
             // importAliases (when present) carry namespace import aliases (e.g.
@@ -167,6 +186,7 @@ function getStats(index, options = {}) {
         }
 
         for (const [filePath, entry] of index.callsCache) {
+            if (!scopedPaths.has(filePath)) continue;
             if (!entry || !Array.isArray(entry.calls)) continue;
             const seenInFile = new Set();
             const aliasesForFile = fileImportAliases.get(filePath) || new Set();
@@ -243,6 +263,7 @@ function getStats(index, options = {}) {
         for (const [name, symbols] of index.symbols) {
             for (const sym of symbols) {
                 if (!FUNCTION_TYPES.has(sym.type)) continue;
+                if (!matchesReportingScope(index, sym.relativePath, options)) continue;
                 const owner = sym.className || (sym.receiver && sym.receiver.replace(/^\*/, ''));
                 if (owner) {
                     let s = classOwnersByName.get(name);
@@ -277,6 +298,7 @@ function getStats(index, options = {}) {
                 if (!FUNCTION_TYPES.has(sym.type)) continue;
                 const relativePath = sym.relativePath ||
                     (sym.file ? path.relative(index.root, sym.file) : '');
+                if (!matchesReportingScope(index, relativePath, options)) continue;
                 const locKey = `${relativePath}:${sym.startLine}`;
                 if (seenLoc.has(locKey)) continue;
                 seenLoc.add(locKey);
@@ -561,11 +583,8 @@ function getToc(index, options = {}) {
  * @param {object} options - { deep, sampleSize, in, file }
  */
 function doctor(index, options = {}) {
-    const inFilter = options.in || options.file || null;
-    const matchInFilter = (rel) => {
-        if (!inFilter) return true;
-        return rel.includes(inFilter);
-    };
+    const hasFilter = !!(options.in || options.file || options.exclude);
+    const matchInFilter = (rel) => matchesReportingScope(index, rel, options);
 
     const fileCounts = { total: 0, scanned: 0 };
     const langs = {};
@@ -741,7 +760,13 @@ function doctor(index, options = {}) {
         trustReason,
         trustScope: 'refactor-readiness',
         dimensions,
-        ...(inFilter && { filter: inFilter }),
+        ...(hasFilter && {
+            filter: {
+                ...(options.file && { file: options.file }),
+                ...(options.in && { in: options.in }),
+                ...(options.exclude && { exclude: options.exclude }),
+            },
+        }),
     };
 }
 
@@ -807,6 +832,9 @@ function computeEvidenceProfile(index, { sampleSize, matchInFilter }) {
         const allEdges = [...callers, ...(callers.unverifiedEntries || [])];
         const seenSites = new Set();
         for (const c of allEdges) {
+            const rel = c.relativePath ||
+                (c.file && path.isAbsolute(c.file) ? path.relative(index.root, c.file) : c.file);
+            if (!matchInFilter(rel)) continue;
             const site = `${c.file || c.relativePath}:${c.line}:${c.tier || c.reason || ''}`;
             if (seenSites.has(site)) continue;
             seenSites.add(site);
@@ -838,14 +866,23 @@ function orient(index, options = {}) {
     const top = options.top || 8;
     // Fetch a deeper hot list so production functions survive the filter
     // below even when test helpers dominate raw call counts.
-    const stats = getStats(index, { hot: true, top: Math.min(top * 5, 200) });
-    const health = doctor(index, {});
+    const scope = {
+        file: options.file,
+        in: options.in,
+        exclude: options.exclude,
+    };
+    const stats = getStats(index, {
+        ...scope,
+        hot: true,
+        top: Math.min(top * 5, 200),
+    });
+    const health = doctor(index, scope);
 
     // Densest directories (leaf dirname rollup — "where does the code live")
     const dirMap = new Map();
     for (const [, fe] of index.files) {
         const rp = fe.relativePath;
-        if (!rp) continue;
+        if (!rp || !matchesReportingScope(index, rp, scope)) continue;
         const slash = rp.lastIndexOf('/');
         const dir = slash === -1 ? '.' : rp.slice(0, slash);
         const e = dirMap.get(dir) || { dir, files: 0, symbols: 0 };
@@ -861,7 +898,18 @@ function orient(index, options = {}) {
     let entrypoints = null;
     try {
         const { detectEntrypoints } = require('./entrypoints');
-        const eps = detectEntrypoints(index, {});
+        const detected = detectEntrypoints(index, {
+            file: options.file,
+            exclude: Array.isArray(options.exclude)
+                ? options.exclude
+                : (options.exclude
+                    ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
+                    : []),
+        });
+        const eps = Array.isArray(detected)
+            ? detected.filter(entry => matchesReportingScope(
+                index, entry.relativePath || entry.file, scope))
+            : detected;
         if (Array.isArray(eps)) {
             const byType = new Map();
             for (const e of eps) byType.set(e.type, (byType.get(e.type) || 0) + 1);

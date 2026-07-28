@@ -24,6 +24,8 @@ CLI, MCP, and interactive mode resolve the same 18 public commands through one r
 
 MCP keeps its process and project index warm across calls. Targeted commands default to 10K output characters, broad commands to 3K, with a 100K hard ceiling. Use `max_chars`, a narrower file/directory scope, or a smaller section projection when necessary.
 
+Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use.
+
 Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
 
 ## Interpret evidence correctly
@@ -66,7 +68,7 @@ An observed-text zero is not semantic zero or safe-delete proof. Numeric evidenc
 1. Pin the exact definition with `find`.
 2. Run `impact`; review every unverified, excluded, filtered, and warning entry.
 3. Run `trace --direction=callers` for transitive behavioral impact.
-4. Run `tests --depth=3`; treat uncovered paths as test-planning signals.
+4. Run `tests --depth=3`; treat paths without static test links as test-planning signals, not runtime coverage proof.
 5. Make the change.
 6. Run `check <handle>`, the relevant compiler/type checker, and selected tests.
 7. Run target-less `check` to reconcile the repository diff.
