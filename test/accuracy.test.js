@@ -162,6 +162,52 @@ describe('Oracle contract', () => {
         } finally { rm(d); }
     });
 
+    it('ts-morph exact-definition lookup distinguishes proof from abstention', async () => {
+        const typed = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true},"include":["**/*.ts"]}',
+            'a.ts': [
+                'export class A { run(): void {} }',
+                'export function task(): void {}',
+            ].join('\n'),
+            'b.ts': 'export class B { run(): void {} }',
+            'use.ts': [
+                'import { A } from "./a"',
+                'import { task } from "./a"',
+                'export function use(value: A) { value.run() }',
+                'const alias = task',
+                'alias()',
+            ].join('\n'),
+        });
+        const plain = tmp({
+            'a.js': 'export class A { run() {} }',
+            'b.js': 'export class B { run() {} }',
+            'use.js': 'export function use(value) { value.run() }',
+        });
+        try {
+            const typedHandle = await tsMorphOracle.prepare(typed);
+            const typedDefs = await tsMorphOracle.resolveDefinition(typedHandle, {
+                name: 'run', file: 'use.ts', line: 3,
+            });
+            assert.ok(typedDefs.some(def => def.file === 'a.ts' && def.line === 1),
+                `typed dispatch must resolve exactly: ${JSON.stringify(typedDefs)}`);
+            const aliasDefs = await tsMorphOracle.resolveDefinition(typedHandle, {
+                name: 'alias', file: 'use.ts', line: 5,
+            });
+            assert.ok(aliasDefs.some(def => def.file === 'a.ts' && def.line === 2),
+                `const aliases must retain their compiler-resolved origin: ${JSON.stringify(aliasDefs)}`);
+
+            const plainHandle = await tsMorphOracle.prepare(plain);
+            const plainDefs = await tsMorphOracle.resolveDefinition(plainHandle, {
+                name: 'run', file: 'use.js', line: 1,
+            });
+            assert.deepStrictEqual(plainDefs, [],
+                'an any-typed plain-JS receiver is an explicit oracle abstention');
+        } finally {
+            rm(typed);
+            rm(plain);
+        }
+    });
+
     it('ts-morph call oracle covers declaration-only classes with prototype implementations', async () => {
         const d = tmp({
             'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["**/*.ts"]}',

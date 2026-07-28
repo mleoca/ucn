@@ -244,6 +244,15 @@ describe('JSON formatters', () => {
             assert.match(text, /STATUS: ⚠ All calls uncertain/);
         });
 
+        it('valid > 0 and uncertain > 0 → partial verification, never a clean pass', () => {
+            const text = output.formatVerify({
+                ...baseResult,
+                totalCalls: 5, valid: 2, mismatches: 0, uncertain: 3
+            });
+            assert.ok(!text.includes('✓ All calls valid'));
+            assert.match(text, /STATUS: ⚠ Partial verification: 2 valid, 3 uncertain/);
+        });
+
         it('mismatches > 0 → "N mismatches"', () => {
             const text = output.formatVerify({
                 ...baseResult,
@@ -1302,6 +1311,30 @@ describe('New Formatter Coverage', () => {
             assert.ok(text.includes('10 usages:'), 'Should show total usages');
             assert.ok(text.includes('6 calls'), 'Should show calls breakdown');
             assert.ok(text.includes('2 imports'), 'Should show imports breakdown');
+        });
+
+        it('labels fast find counts as activity when references were not counted', () => {
+            const text = output.formatFindDetailed([
+                {
+                    name: 'parse',
+                    relativePath: 'src/a.js',
+                    startLine: 1,
+                    endLine: 1,
+                    type: 'function',
+                    params: '',
+                    usageCounts: {
+                        total: 4,
+                        calls: 2,
+                        definitions: 1,
+                        imports: 1,
+                        references: 0,
+                        complete: false,
+                    },
+                },
+            ], 'parse');
+            assert.match(text, /4 indexed activity/);
+            assert.match(text, /references not counted — use usages/);
+            assert.doesNotMatch(text, /4 usages/);
         });
 
     });

@@ -18,7 +18,12 @@ const {
 } = require('../core/cache');
 const output = require('../core/output');
 const { BROAD_COMMANDS } = require('../core/registry');
-const { tmp, rm, McpClient, PROJECT_DIR } = require('./helpers');
+const {
+    DEFAULT_OUTPUT_CHARS,
+    BROAD_OUTPUT_CHARS,
+    applyOutputBudget,
+} = require('../core/output-budget');
+const { tmp, rm, McpClient, PROJECT_DIR, runCli } = require('./helpers');
 
 // ============================================================================
 // MCP DEMO FIXES
@@ -479,18 +484,51 @@ describe('MCP two-tier output limits', () => {
     });
 
     it('broad commands use 3K default, targeted use 10K', () => {
-        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
-        assert.ok(serverCode.includes('BROAD_OUTPUT_CHARS = 3000'), 'Broad limit should be 3000');
-        assert.ok(serverCode.includes('DEFAULT_OUTPUT_CHARS = 10000'), 'Targeted limit should be 10000');
-        assert.ok(serverCode.includes('BROAD_COMMANDS.has(command) ? BROAD_OUTPUT_CHARS : DEFAULT_OUTPUT_CHARS'),
-            'toolResult should select limit based on command type');
+        assert.strictEqual(BROAD_OUTPUT_CHARS, 3000);
+        assert.strictEqual(DEFAULT_OUTPUT_CHARS, 10000);
+        assert.strictEqual(applyOutputBudget('x'.repeat(4000), {
+            command: 'repo',
+            surface: 'mcp',
+        }).requestedLimit, 3000);
+        assert.strictEqual(applyOutputBudget('x'.repeat(11000), {
+            command: 'show',
+            surface: 'mcp',
+        }).requestedLimit, 10000);
     });
 
     it('each broad command has a narrowing hint', () => {
-        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
         for (const cmd of ['repo', 'entrypoints', 'endpoints', 'impact', 'tests', 'deadcode', 'usages', 'deps']) {
-            assert.ok(serverCode.includes(`${cmd}:`), `Should have narrowing hint for ${cmd}`);
+            const budget = applyOutputBudget('line\n'.repeat(3000), {
+                command: cmd,
+                maxChars: 500,
+                surface: 'mcp',
+            });
+            assert.ok(/Use .+=/.test(budget.text),
+                `Should have an MCP-native narrowing hint for ${cmd}: ${budget.text}`);
+            assert.ok(!budget.text.includes('--'),
+                `MCP hint must not leak CLI syntax for ${cmd}`);
         }
+    });
+
+    it('CLI uses the shared text budget and preserves JSON as complete output', () => {
+        const callers = Array.from({ length: 80 }, (_, i) =>
+            `export function caller${i}() { return target(${i}); }`).join('\n');
+        const dir = tmp({
+            'index.js': `export function target(x) { return x; }\n${callers}\n`,
+        });
+        try {
+            const text = runCli(dir, 'impact', ['target'], ['--max-chars=700']);
+            assert.ok(text.includes('OUTPUT TRUNCATED'), text);
+            assert.ok(text.includes('--max-chars=N'), text);
+            const json = JSON.parse(runCli(
+                dir,
+                'impact',
+                ['target'],
+                ['--max-chars=700', '--json'],
+            ));
+            assert.strictEqual(json.meta.command, 'impact');
+            assert.ok(json.data, 'JSON is not transport-truncated');
+        } finally { rm(dir); }
     });
 
     it('preserves caller ACCOUNT and CONTRACT metadata after truncation', async () => {

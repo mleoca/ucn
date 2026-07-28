@@ -242,6 +242,7 @@ function expandGlob(pattern, options = {}) {
         // Anchored gitignore patterns ('/name') apply only to entries directly
         // under the project root — the .gitignore's own directory (fix #226).
         anchorRoot: root,
+        onSkippedFile: options.onSkippedFile,
         onFile: (filePath) => {
             if (files.length < maxFiles) {
                 files.push(filePath);
@@ -363,6 +364,8 @@ function walkDir(dir, options, depth = 0, visited = new Set()) {
         } else if (isFile) {
             if (options.filePattern.test(entry.name)) {
                 options.onFile(fullPath);
+            } else if (options.onSkippedFile) {
+                options.onSkippedFile(fullPath);
             }
         }
     }
@@ -447,6 +450,39 @@ const ALL_SUPPORTED_EXTENSIONS = [
     'c', 'h', 'cc', 'cpp', 'cxx', 'c++', 'hpp', 'hh', 'hxx', 'h++',
     'cs', 'csx', 'html', 'htm',
 ];
+
+// Source-like extensions that UCN deliberately does not parse. This is not an
+// attempt to recognize every file in existence: it is the honest handoff set
+// used by project-wide discovery so `repo`/`doctor` cannot report a clean,
+// complete index while silently omitting a common programming language.
+const UNSUPPORTED_SOURCE_EXTENSIONS = {
+    rb: 'Ruby', rake: 'Ruby',
+    php: 'PHP',
+    swift: 'Swift',
+    kt: 'Kotlin', kts: 'Kotlin',
+    scala: 'Scala', sc: 'Scala',
+    lua: 'Lua',
+    dart: 'Dart',
+    ex: 'Elixir', exs: 'Elixir',
+    erl: 'Erlang', hrl: 'Erlang',
+    clj: 'Clojure', cljs: 'ClojureScript', cljc: 'Clojure',
+    groovy: 'Groovy',
+    vb: 'Visual Basic', vbs: 'Visual Basic',
+    fs: 'F#', fsx: 'F#', fsi: 'F#',
+    hs: 'Haskell', lhs: 'Haskell',
+    zig: 'Zig',
+    sol: 'Solidity',
+    vue: 'Vue', svelte: 'Svelte',
+    sh: 'Shell', bash: 'Shell', zsh: 'Shell', fish: 'Shell',
+    ps1: 'PowerShell',
+    sql: 'SQL',
+};
+
+function classifyUnsupportedSourceFile(filePath) {
+    const extension = path.extname(filePath).slice(1).toLowerCase();
+    const language = UNSUPPORTED_SOURCE_EXTENSIONS[extension];
+    return language ? { extension, language } : null;
+}
 
 // Build-manifest hints: when present, we know the project has files of that language
 // regardless of whether sources are visible at the time of scan. Used as hints, not gates —
@@ -624,6 +660,8 @@ module.exports = {
     PROJECT_MARKERS,
     TEST_PATTERNS,
     ALL_SUPPORTED_EXTENSIONS,
+    UNSUPPORTED_SOURCE_EXTENSIONS,
+    classifyUnsupportedSourceFile,
     MANIFEST_HINTS,
     compareNames
 };

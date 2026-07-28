@@ -63,7 +63,8 @@ const repoFilterSet = repoFilter ? new Set(repoFilter.split(',').map(s => s.trim
 const sampleSize = Number(readArgValue(args, '--sample') || 60);
 const armFilter = readArgValue(args, '--arm') || 'both';
 const oracleFilter = readArgValue(args, '--oracle');
-const REPORTS_DIR = path.join(__dirname, 'reports');
+const REPORTS_DIR = path.resolve(
+    process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 
 // Same precedence as run-oracle-eval.js: first language match wins.
 const ORACLES = [tsMorphOracle, pyrightOracle, jediOracle, goplsOracle, rustAnalyzerOracle, jdtlsOracle]

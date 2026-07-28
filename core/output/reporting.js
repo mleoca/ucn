@@ -243,7 +243,8 @@ function formatDeadcode(results, options = {}) {
     }
 
     if (hidden > 0) {
-        lines.push(`\n${hidden} more result(s) not shown. Use --top=${results.length} or --all to see all.`);
+        lines.push(`\n${hidden} more result(s) not shown. ${options.topHint ||
+            `Use --top=${results.length} or --all to see all.`}`);
     }
 
     // Show counts of excluded items with expansion hints
@@ -400,7 +401,7 @@ function formatEntrypointsJson(results) {
 /**
  * formatOrient — one-screen cold-repo orientation.
  */
-function formatOrient(result) {
+function formatOrient(result, options = {}) {
     const lines = [];
     lines.push(`PROJECT ORIENTATION — ${result.root}`);
     lines.push('═'.repeat(60));
@@ -413,7 +414,7 @@ function formatOrient(result) {
     const langStr = langs
         .map(l => `${l.lang} ${Math.round((l.symbols / totalSym) * 100)}%`)
         .join(', ');
-    lines.push(`${result.files} files · ${result.symbols} symbols · ${langStr}`);
+    lines.push(`${result.files} files · ${result.symbols} symbols · ${langStr || 'supported languages: none'}`);
     lines.push('');
 
     if (result.dirs?.length) {
@@ -438,7 +439,7 @@ function formatOrient(result) {
     if (result.entrypoints) {
         const byType = result.entrypoints.byType
             .map(t => `${t.type} ${t.count}`).join(', ');
-        lines.push(`ENTRY POINTS: ${result.entrypoints.total} — ${byType}`);
+        lines.push(`ENTRY POINTS: ${result.entrypoints.total}${byType ? ` — ${byType}` : ''}`);
     } else {
         lines.push('ENTRY POINTS: (detection unavailable)');
     }
@@ -449,16 +450,24 @@ function formatOrient(result) {
     if (bs.evalCalls) bsParts.push(`${bs.evalCalls} eval`);
     if (bs.reflection) bsParts.push(`${bs.reflection} reflection`);
     if (bs.parseFailures) bsParts.push(`${bs.parseFailures} parse failure(s)`);
-    lines.push(`TRUST: ${result.trust?.level || 'UNKNOWN'}${bsParts.length ? ' — ' + bsParts.join(', ') : ''}  (ucn repo --sections=health --deep for detail)`);
+    if (bs.unsupportedSources) bsParts.push(`${bs.unsupportedSources} unsupported source file(s)`);
+    lines.push(`TRUST: ${result.trust?.level || 'UNKNOWN'}${bsParts.length ? ' — ' + bsParts.join(', ') : ''}  (${options.healthHint || 'ucn repo --sections=health --deep for detail'})`);
+    if (result.unsupportedSources?.count > 0) {
+        const languages = Object.entries(result.unsupportedSources.languages || {})
+            .map(([language, count]) => `${language} ${count}`)
+            .join(', ');
+        lines.push(`SKIPPED SOURCE: ${result.unsupportedSources.count} file(s)${languages ? ` (${languages})` : ''} — use grep/ripgrep plus a language-native analyzer.`);
+    }
     lines.push('');
 
-    const next = [];
-    if (result.suggest) next.push(`ucn show ${result.suggest}`);
-    next.push(
-        'ucn repo --sections=files --detailed',
-        'ucn repo --sections=stats --hot --top=20',
-        'ucn repo --sections=health --deep',
-    );
+    const next = options.nextHints
+        ? options.nextHints(result)
+        : [
+            ...(result.suggest ? [`ucn show ${result.suggest}`] : []),
+            'ucn repo --sections=files --detailed',
+            'ucn repo --sections=stats --hot --top=20',
+            'ucn repo --sections=health --deep',
+        ];
     lines.push(`Next: ${next.join(' · ')}`);
 
     return lines.join('\n');

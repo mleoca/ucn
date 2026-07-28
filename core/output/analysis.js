@@ -156,11 +156,12 @@ function unverifiedCalleeLines(entries, compact) {
 }
 
 /** "NON-CALL OCCURRENCES" summary line from the account. */
-function formatNonCallLine(account, hintName) {
+function formatNonCallLine(account, hintName, usagesHint) {
     if (!account || !account.nonCall || account.nonCall.total === 0) return null;
     const nc = account.nonCall;
+    const hint = usagesHint || `ucn usages ${hintName}`;
     return `NON-CALL OCCURRENCES: ${nc.total} (${nc.imports} imports, ${nc.definitions} definitions, ` +
-        `${nc.references} references, ${nc.unclassifiedText} other-text) — counts only; see: ucn usages ${hintName}`;
+        `${nc.references} references, ${nc.unclassifiedText} other-text) — counts only; see: ${hint}`;
 }
 
 /** Format context (callers + callees) as JSON */
@@ -303,6 +304,7 @@ function formatContext(ctx, options = {}) {
     if (!ctx) return { text: 'Symbol not found.', expandable: [] };
 
     const expandHint = options.expandHint != null ? options.expandHint : 'Use ucn_expand with item number to see code for any item.';
+    const allHint = options.allHint || 'use --all';
 
     const lines = [];
     const expandable = [];
@@ -380,7 +382,7 @@ function formatContext(ctx, options = {}) {
                 shown++;
             }
             if (typeUnverified.length > shown) {
-                lines.push(`  (+${typeUnverified.length - shown} more unverified — use --all)`);
+                lines.push(`  (+${typeUnverified.length - shown} more unverified — ${allHint})`);
             }
         }
 
@@ -520,7 +522,7 @@ function formatContext(ctx, options = {}) {
             summarized += sites.length - samples.length;
         }
         if (summarized > 0) {
-            lines.push(`  (+${summarized} more runtime-dispatch sites — use --all)`);
+            lines.push(`  (+${summarized} more runtime-dispatch sites — ${allHint})`);
         }
     }
 
@@ -549,7 +551,7 @@ function formatContext(ctx, options = {}) {
             shown++;
         }
         if (actionableUnverified.length > shown) {
-            lines.push(`  (+${actionableUnverified.length - shown} more unverified — use --all)`);
+            lines.push(`  (+${actionableUnverified.length - shown} more unverified — ${allHint})`);
         }
     }
 
@@ -593,7 +595,7 @@ function formatContext(ctx, options = {}) {
     // Conservation contract lines: non-call summary + ACCOUNT/WARNING/FILTERED
     const account = ctx.meta && ctx.meta.account;
     if (account) {
-        const nonCallLine = formatNonCallLine(account, ctx.function);
+        const nonCallLine = formatNonCallLine(account, ctx.function, options.usagesHint);
         if (nonCallLine) lines.push(`${compact ? '' : '\n'}${nonCallLine}`);
         const accountLines = formatAccountLines(account);
         if (accountLines.length > 0) {
@@ -751,6 +753,7 @@ function formatAbout(about, options = {}) {
     }
 
     const lines = [];
+    const allHint = options.allHint || 'use --all';
     const sym = about.symbol;
     const { expand, root, depth } = options;
 
@@ -867,7 +870,7 @@ function formatAbout(about, options = {}) {
             lines.push(`  ${u.file}:${u.line}${caller}${expr}${reason}`);
         }
         if (aboutUnverified.total > aboutUnverified.top.length) {
-            lines.push(`  (+${aboutUnverified.total - aboutUnverified.top.length} more unverified — use --all)`);
+            lines.push(`  (+${aboutUnverified.total - aboutUnverified.top.length} more unverified — ${allHint})`);
         }
     }
 

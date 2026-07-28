@@ -10,8 +10,10 @@ const {
     toCliInvocation,
     toMcpArguments,
     scorePlan,
+    normalizeSurfaceGuidance,
     summarize,
     evaluateGates,
+    formatMarkdown,
 } = require('./agent-public-surface-benchmark');
 
 describe('public-surface agent benchmark contract', () => {
@@ -111,5 +113,57 @@ describe('public-surface agent benchmark contract', () => {
         assert.equal(failing.passed, false);
         assert.ok(failing.failures.some(failure => /answer accuracy/.test(failure)));
         assert.ok(failing.failures.some(failure => /parity/.test(failure)));
+    });
+
+    it('labels reference-plan scoring as conformance, not live-agent accuracy', () => {
+        const markdown = formatMarkdown({
+            generatedAt: 'now',
+            fixtureDir: '/fixture',
+            runs: 1,
+            planSource: 'checked-in reference plans',
+            measurementKind: 'reference-plan-contract-conformance',
+            liveAgentPlans: false,
+            summary: {
+                commandsCovered: CANONICAL_COMMANDS.length,
+                selectionAccuracy: 1,
+                parameterAccuracy: 1,
+                answerAccuracy: 1,
+                cliSuccessRate: 1,
+                mcpSuccessRate: 1,
+                parityRate: 1,
+                discoverabilityRate: 1,
+                contractRate: 1,
+                recoveryRate: 1,
+                medianAgentToolCalls: 1,
+                cliJsonMsP50: 1,
+                cliJsonMsP95: 1,
+                mcpMsP50: 1,
+                mcpMsP95: 1,
+                outputTokensP50: 1,
+                outputTokensP95: 1,
+            },
+            gate: { passed: true, failures: [] },
+            recovery: { checks: [] },
+            lastRun: [],
+            scenarios: [],
+        });
+        assert.match(markdown, /reference-plan command conformance/i);
+        assert.match(markdown, /not a claim about a live model/i);
+        assert.doesNotMatch(markdown, /\| task-to-command selection \|/);
+    });
+
+    it('normalizes only CLI/MCP-native guidance for semantic parity', () => {
+        const cli = 'ACCOUNT: 3 = 2 confirmed + 1 unverified\n' +
+            'Next: ucn show run · ucn repo --sections=health --deep\n' +
+            'Use --limit=N to return and display more results.';
+        const mcp = 'ACCOUNT: 3 = 2 confirmed + 1 unverified\n' +
+            'Next: command=show name=run · command=repo sections=health deep=true\n' +
+            'Use limit=<n> to return and display more results.';
+        assert.strictEqual(normalizeSurfaceGuidance(cli), normalizeSurfaceGuidance(mcp));
+        assert.notStrictEqual(
+            normalizeSurfaceGuidance(cli.replace('confirmed', 'excluded')),
+            normalizeSurfaceGuidance(mcp),
+            'engine/trust facts remain byte-sensitive',
+        );
     });
 });

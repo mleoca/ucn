@@ -583,7 +583,12 @@ function getToc(index, options = {}) {
  * @param {object} options - { deep, sampleSize, in, file }
  */
 function doctor(index, options = {}) {
-    const hasFilter = !!(options.in || options.file || options.exclude);
+    const normalizedExclude = Array.isArray(options.exclude)
+        ? options.exclude.filter(Boolean)
+        : (options.exclude
+            ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
+            : []);
+    const hasFilter = !!(options.in || options.file || normalizedExclude.length > 0);
     const matchInFilter = (rel) => matchesReportingScope(index, rel, options);
 
     const fileCounts = { total: 0, scanned: 0 };
@@ -601,6 +606,9 @@ function doctor(index, options = {}) {
         reflection:     { count: 0, fileCount: 0, files: [] },
         parseFailures:  { count: 0, fileCount: 0, files: [] },
         parseRecoveries:{ count: 0, fileCount: 0, files: [] },
+        unsupportedSources: {
+            count: 0, fileCount: 0, files: [], languages: {}, extensions: {},
+        },
     };
 
     // Reflection/eval signals come from the shared text-blind-spot counter
@@ -659,6 +667,23 @@ function doctor(index, options = {}) {
         recordedParseFailureFiles.add(rel);
     }
 
+    // Project-wide discovery also records common source languages for which
+    // UCN has no parser. These are not parse failures: they are an explicit
+    // engine boundary and a required grep/ripgrep handoff.
+    for (const skipped of index.unsupportedFiles || []) {
+        const rel = skipped.relativePath;
+        if (!matchInFilter(rel)) continue;
+        const unsupported = blindSpots.unsupportedSources;
+        unsupported.count++;
+        unsupported.fileCount++;
+        unsupported.languages[skipped.language] =
+            (unsupported.languages[skipped.language] || 0) + 1;
+        unsupported.extensions[skipped.extension] =
+            (unsupported.extensions[skipped.extension] || 0) + 1;
+        if (unsupported.files.length < BLINDSPOT_FILE_CAP) unsupported.files.push(rel);
+    }
+    fileCounts.unsupported = blindSpots.unsupportedSources.fileCount;
+
     // Evidence profile — sampled only in deep mode. This is deliberately NOT
     // called "accuracy" or "coverage": it describes how UCN classified edges
     // it found. Compiler/LSP oracle evaluation is the accuracy measurement.
@@ -683,30 +708,48 @@ function doctor(index, options = {}) {
     if (blindSpots.evalCalls.count > 0) blindSignals.push(`${blindSpots.evalCalls.count} eval/exec use(s) in ${blindSpots.evalCalls.fileCount} file(s)`);
     if (blindSpots.reflection.count > 0) blindSignals.push(`${blindSpots.reflection.count} reflection use(s) in ${blindSpots.reflection.fileCount} file(s)`);
     if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s) in ${blindSpots.dynamicImports.fileCount} file(s)`);
+    if (blindSpots.unsupportedSources.count > 0) {
+        const mix = Object.entries(blindSpots.unsupportedSources.languages)
+            .map(([language, count]) => `${language} ${count}`)
+            .join(', ');
+        blindSignals.push(`${blindSpots.unsupportedSources.count} unsupported source file(s): ${mix}`);
+    }
 
     // Trust is task-specific. A healthy index can be excellent for navigation
     // while still requiring review before a breaking refactor or deletion.
     // Never infer semantic accuracy from rule-assigned confidence decimals.
-    const indexLevel = fileCounts.scanned === 0 ? 'UNKNOWN'
-        : blindSpots.parseFailures.count > 0 || blindSpots.parseRecoveries.count > 0 ||
-            cache.fresh === false ? 'MEDIUM' : 'HIGH';
-    const indexReason = fileCounts.scanned === 0 ? 'empty scope'
+    const unsupportedCount = blindSpots.unsupportedSources.count;
+    const incompleteIndex = blindSpots.parseFailures.count > 0 ||
+        blindSpots.parseRecoveries.count > 0 || cache.fresh === false ||
+        !!index.truncated || unsupportedCount > 0;
+    const indexLevel = fileCounts.scanned === 0 && unsupportedCount > 0 ? 'UNSUPPORTED'
+        : fileCounts.scanned === 0 ? 'UNKNOWN'
+            : incompleteIndex ? 'PARTIAL' : 'HIGH';
+    const indexReason = fileCounts.scanned === 0 && unsupportedCount > 0
+        ? `0 supported files indexed; ${unsupportedCount} unsupported source file(s) require grep/ripgrep`
+        : fileCounts.scanned === 0 ? 'empty scope'
         : blindSpots.parseFailures.count > 0
             ? `${blindSpots.parseFailures.count} file(s) failed to parse`
             : blindSpots.parseRecoveries.count > 0
                 ? `${blindSpots.parseRecoveries.count} file(s) required parser recovery; indexed results may be partial`
-                : cache.fresh === false ? 'index cache is stale' : 'fresh index; no parse failures';
+                : cache.fresh === false ? 'index cache is stale'
+                    : index.truncated ? `file discovery stopped at maxFiles=${index.truncated.maxFiles}`
+                        : unsupportedCount > 0
+                            ? `${fileCounts.scanned} supported file(s) indexed; ${unsupportedCount} unsupported source file(s) require grep/ripgrep`
+                            : 'fresh index; no parse failures';
 
     let evidenceLevel = 'UNKNOWN';
     let evidenceReason = 'not sampled; run --deep for a stratified evidence profile';
     if (evidenceProfile) {
         if (evidenceProfile.total === 0) {
+            evidenceLevel = 'NONE';
             evidenceReason = 'sample contained no caller edges';
         } else {
             const confirmedShare = evidenceProfile.confirmed / evidenceProfile.total;
-            evidenceLevel = !evidenceProfile.adequate ? 'UNKNOWN'
-                : confirmedShare >= 0.85 ? 'HIGH'
-                    : confirmedShare >= 0.55 ? 'MEDIUM' : 'LOW';
+            // Confirmed share is a classification mix, not accuracy and not a
+            // readiness score. A conservative engine can be excellent while
+            // intentionally routing many edges to visible unverified bands.
+            evidenceLevel = evidenceProfile.adequate ? 'PROFILED' : 'LIMITED';
             evidenceReason = `${(confirmedShare * 100).toFixed(1)}% confirmed-evidence edges across ${evidenceProfile.sampled} pinned definitions`;
             if (!evidenceProfile.adequate) evidenceReason += '; sample too small for a readiness decision';
         }
@@ -714,15 +757,19 @@ function doctor(index, options = {}) {
 
     const dynamicCount = blindSpots.evalCalls.count + blindSpots.reflection.count + blindSpots.dynamicImports.count;
     const semanticLevel = blindSpots.parseFailures.count > 0 || blindSpots.parseRecoveries.count > 0 ? 'LOW'
-        : dynamicCount > 0 ? 'MEDIUM' : 'UNKNOWN';
+        : unsupportedCount > 0 ? 'PARTIAL'
+            : dynamicCount > 0 ? 'REVIEW' : 'UNKNOWN';
     const semanticReason = blindSignals.length
         ? `semantic recall may miss runtime-resolved edges: ${blindSignals.join(', ')}`
         : 'no known runtime blind spots detected; alias/dynamic completeness is not compiler-verified locally';
 
     const navigationLevel = indexLevel;
-    const refactorLevel = indexLevel === 'UNKNOWN' || evidenceLevel === 'UNKNOWN' ? 'UNKNOWN'
-        : indexLevel === 'HIGH' && evidenceLevel === 'HIGH' && semanticLevel === 'UNKNOWN' ? 'MEDIUM'
-            : indexLevel === 'LOW' || evidenceLevel === 'LOW' || semanticLevel === 'LOW' ? 'LOW' : 'MEDIUM';
+    const hardIndexRisk = blindSpots.parseFailures.count > 0 ||
+        blindSpots.parseRecoveries.count > 0 || cache.fresh === false || !!index.truncated;
+    const refactorLevel = indexLevel === 'UNKNOWN' ? 'UNKNOWN'
+        : indexLevel === 'UNSUPPORTED' ? 'UNSUPPORTED'
+            : hardIndexRisk ? 'LOW'
+                : unsupportedCount > 0 ? 'PARTIAL' : 'REVIEW';
     const deletionLevel = refactorLevel === 'LOW' ? 'LOW' : 'REVIEW';
     const dimensions = {
         index: { level: indexLevel, reason: indexReason },
@@ -731,17 +778,23 @@ function doctor(index, options = {}) {
         navigation: { level: navigationLevel, reason: indexReason },
         refactor: {
             level: refactorLevel,
-            reason: refactorLevel === 'UNKNOWN'
-                ? 'run --deep; review unverified and non-call occurrences before changing code'
-                : 'text-ground accounting is available; aliases, reflection, and unverified edges still require review',
+            reason: indexLevel === 'UNKNOWN'
+                ? 'no supported source scope was indexed'
+                : indexLevel === 'UNSUPPORTED'
+                    ? 'UCN cannot analyze this source scope; use grep/ripgrep and a language-native tool'
+                    : unsupportedCount > 0
+                        ? 'supported files are analyzable, but skipped language files require grep/ripgrep before cross-language changes'
+                        : 'text-ground accounting is available; aliases, reflection, and unverified edges still require review',
         },
         deletion: {
             level: deletionLevel,
             reason: 'deletion additionally requires usages/deadcode review and tests; caller accounting alone is insufficient',
         },
     };
-    const trust = refactorLevel;
-    const trustReason = dimensions.refactor.reason;
+    // `repo` is an orientation/navigation command. Its headline must answer
+    // that task, while refactor/deletion remain separately visible dimensions.
+    const trust = navigationLevel;
+    const trustReason = dimensions.navigation.reason;
 
     return {
         root: index.root,
@@ -751,20 +804,17 @@ function doctor(index, options = {}) {
         languages: langs,
         blindSpots,
         evidenceProfile,
-        // Backward-compatible field name. `kind` prevents consumers from
-        // mistaking this for semantic coverage or measured accuracy.
-        coverage: evidenceProfile,
         cache,
         commandTrust: summarizeCommandTrust(),
         trust,
         trustReason,
-        trustScope: 'refactor-readiness',
+        trustScope: 'navigation-readiness',
         dimensions,
         ...(hasFilter && {
             filter: {
                 ...(options.file && { file: options.file }),
                 ...(options.in && { in: options.in }),
-                ...(options.exclude && { exclude: options.exclude }),
+                ...(normalizedExclude.length > 0 && { exclude: normalizedExclude }),
             },
         }),
     };
@@ -954,8 +1004,10 @@ function orient(index, options = {}) {
                 evalCalls: health.blindSpots?.evalCalls?.count ?? 0,
                 reflection: health.blindSpots?.reflection?.count ?? 0,
                 parseFailures: health.blindSpots?.parseFailures?.count ?? 0,
+                unsupportedSources: health.blindSpots?.unsupportedSources?.count ?? 0,
             },
         },
+        unsupportedSources: health.blindSpots?.unsupportedSources ?? null,
         suggest: hottestProd ? hottestProd.name : null,
     };
 }

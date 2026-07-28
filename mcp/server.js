@@ -33,8 +33,9 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getMcpCommandEnum, normalizeParams, BROAD_COMMANDS: BROAD_CANONICAL, toMcpName, FLAG_APPLICABILITY, REVERSE_PARAM_MAP, generateMcpParamSection, resolveCommand } = require('../core/registry');
+const { getMcpCommandEnum, normalizeParams, FLAG_APPLICABILITY, REVERSE_PARAM_MAP, generateMcpParamSection, resolveCommand } = require('../core/registry');
 const { execute } = require('../core/execute');
+const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 
 // ============================================================================
 // INDEX CACHE
@@ -111,90 +112,24 @@ const server = new McpServer({
 // TOOL HELPERS
 // ============================================================================
 
-const DEFAULT_OUTPUT_CHARS = 10000;  // ~2.5K tokens — targeted commands
-const BROAD_OUTPUT_CHARS = 3000;     // ~750 tokens — broad commands where truncated listings are useless
-const MAX_OUTPUT_CHARS = 100000;     // hard ceiling even with max_chars override
-
-// Broad commands (derived from registry): output is project-wide, truncation means you need a filter
-const BROAD_COMMANDS = new Set([...BROAD_CANONICAL].map(toMcpName));
-
-const CONTRACT_LINE_RE = /^\s*(?:ACCOUNT|CONTRACT|WARNING|FILTERED|CALLEE ACCOUNT|TREE ACCOUNT):/;
-const MAX_PRESERVED_CONTRACT_LINES = 24;
-const MAX_PRESERVED_CONTRACT_CHARS = 8000;
-
-/**
- * Keep trust/accounting metadata visible even when the human-readable body is
- * truncated. A first-N slice without this footer can turn a qualified answer
- * into an apparently complete one for an agent.
- */
-function preservedContractMetadata(fullText, visibleText) {
-    const visible = new Set(visibleText.split('\n').map(line => line.trim()));
-    const selected = [];
-    let selectedChars = 0;
-    let omitted = 0;
-
-    for (const rawLine of fullText.split('\n')) {
-        if (!CONTRACT_LINE_RE.test(rawLine)) continue;
-        const line = rawLine.trim();
-        if (!line || visible.has(line)) continue;
-        if (selected.length >= MAX_PRESERVED_CONTRACT_LINES ||
-            selectedChars + line.length + 1 > MAX_PRESERVED_CONTRACT_CHARS) {
-            omitted++;
-            continue;
-        }
-        selected.push(line);
-        selectedChars += line.length + 1;
-    }
-
-    return { lines: selected, omitted, complete: omitted === 0 };
-}
-
 function toolResult(text, command, maxChars, suffixNote) {
     const suffix = suffixNote || '';
-    if (!text) return { content: [{ type: 'text', text: '(no output)' + suffix }] };
-    const defaultLimit = BROAD_COMMANDS.has(command) ? BROAD_OUTPUT_CHARS : DEFAULT_OUTPUT_CHARS;
-    const limit = Math.min(maxChars || defaultLimit, MAX_OUTPUT_CHARS);
-    if (text.length > limit) {
-        const fullSize = text.length;
-        const fullTokens = Math.round(fullSize / 4);
-        const truncated = text.substring(0, limit);
-        // Cut at last newline to avoid breaking mid-line
-        const lastNewline = truncated.lastIndexOf('\n');
-        const cleanCut = lastNewline > limit * 0.8 ? truncated.substring(0, lastNewline) : truncated;
-        const contractMetadata = preservedContractMetadata(text, cleanCut);
-        // Command-specific narrowing hints
-        const hints = {
-            repo: 'Use sections= to select one view, or in= to scope to a subdirectory.',
-            entrypoints: 'Use framework= to filter by framework, exclude= to skip patterns.',
-            endpoints: 'Use prefix= to filter by URL prefix, method= to filter by HTTP method, server_only/client_only to halve output.',
-            impact: 'Use file= to scope to specific files/directories.',
-            tests: 'Use file= to scope, exclude= to skip patterns.',
-            deadcode: 'Use file= to scope, exclude= to skip patterns.',
-            usages: 'Use file= to scope to specific files.',
-            deps: 'Use depth=1 or direction=imports/importers to narrow the graph.',
-        };
-        const narrow = hints[command] || 'Use file=/in=/exclude= to narrow scope.';
-        let rendered = cleanCut + `\n\n... OUTPUT TRUNCATED: showing ${limit} of ${fullSize} chars. Full output would be ~${fullTokens} tokens. ${narrow} Use all=true to lift formatter caps; the MCP transport still has a 100K character ceiling.`;
-        if (contractMetadata.lines.length > 0 || contractMetadata.omitted > 0) {
-            rendered += '\n\nPRESERVED CONTRACT METADATA (from omitted output):';
-            if (contractMetadata.lines.length > 0) rendered += '\n' + contractMetadata.lines.join('\n');
-            if (contractMetadata.omitted > 0) {
-                rendered += `\nWARNING: ${contractMetadata.omitted} additional contract line(s) could not fit the preservation budget; narrow scope before acting.`;
-            }
-        }
-        rendered += suffix;
-        return {
-            content: [{ type: 'text', text: rendered }],
-            structuredContent: {
-                truncated: true,
-                fullChars: fullSize,
-                requestedLimit: limit,
-                contractMetadata: contractMetadata.lines,
-                contractMetadataComplete: contractMetadata.complete,
-            },
+    const budget = applyOutputBudget(text, {
+        command,
+        maxChars,
+        surface: 'mcp',
+    });
+    const response = { content: [{ type: 'text', text: budget.text + suffix }] };
+    if (budget.truncated) {
+        response.structuredContent = {
+            truncated: true,
+            fullChars: budget.fullChars,
+            requestedLimit: budget.requestedLimit,
+            contractMetadata: budget.contractMetadata,
+            contractMetadataComplete: budget.contractMetadataComplete,
         };
     }
-    return { content: [{ type: 'text', text: text + suffix }] };
+    return response;
 }
 
 function toolError(message) {
@@ -235,7 +170,7 @@ const CONCISE_TOOL_DESCRIPTION = `Auditable AST code intelligence for JavaScript
 Use UCN for semantic questions: exact definitions, symbol-aware callers/callees, change impact, test selection, dependencies, APIs, entry points, and focused audits. Use grep/ripgrep for simple literals, error messages, configuration, filenames, Markdown, and unsupported languages. UCN search is worthwhile when AST structure, code-only filtering, or the shared agent contract matters.
 
 18 task-oriented commands:
-- repo: repository overview; sections=files,stats,health adds detail.
+- repo: repository overview; sections=files,stats,health adds detail. Reports skipped unsupported source explicitly and hands it to grep/language-native tooling.
 - show: one symbol; sections=summary,callers,callees,source,dependencies,tests,types,example,related.
 - find/usages/search/source: locate definitions, references, text/structure, or exact source.
 - trace: direction=callees or callers; to=entrypoints follows callers to roots.
@@ -421,6 +356,7 @@ server.registerTool(
             const presentationExecution = {
                 ...execution,
                 note: mn(execution.note),
+                surface: 'mcp',
             };
             return tr(output.formatPublicText(
                 canonicalCommand,

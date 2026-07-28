@@ -47,7 +47,8 @@ const {
 } = require('./consistency-gate-policy');
 
 const argv = process.argv.slice(2);
-const REPORTS_DIR = path.join(__dirname, 'reports');
+const REPORTS_DIR = path.resolve(
+    process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 const WITNESS_LIMIT = 100;
 
 function readArg(flag) {

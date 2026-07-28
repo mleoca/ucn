@@ -31,7 +31,7 @@ structural or code-only search.
 
 | Command | Purpose |
 |---|---|
-| `repo` | Repository orientation. Select `summary,files,stats,health` with `--sections`; `--deep` includes readiness evidence. |
+| `repo` | Repository orientation. Select `summary,files,stats,health` with `--sections`; `--deep` includes readiness evidence. Skipped unsupported source is listed with a grep/language-tool handoff. |
 | `deps <file>` | File dependency graph. Use `--direction=imports\|importers\|both`, `--detailed`, or `--cycles`. |
 | `api [file]` | Static exported/public surface for a project or file. |
 | `entrypoints` | Framework, route, task, test, and runtime entry points. |
@@ -61,6 +61,7 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--depth=N` | Set trace/dependency/test traversal depth. |
 | `--direction=<value>` | Select trace or dependency direction. |
 | `--all` | Lift result and formatter caps where supported. |
+| `--max-chars=N` | Set the CLI text budget (10K targeted / 3K broad by default; 100K ceiling). MCP spelling: `max_chars`. JSON is not transport-truncated. |
 | `--compact` / `--no-compact` | Select token-efficient or full semantic output. |
 | `--range=N-M` | Extract an explicit line range with `source --file=<path>`. |
 | `--json` | Emit the stable CLI `{ meta, data }` envelope; `meta.contract` carries the truth boundary, decision safety, and next actions. |

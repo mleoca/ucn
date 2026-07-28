@@ -8,7 +8,10 @@
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES, compareNames } = require('./discovery');
+const {
+    expandGlob, findProjectRoot, detectProjectPattern, isTestFile,
+    parseGitignore, DEFAULT_IGNORES, compareNames, classifyUnsupportedSourceFile,
+} = require('./discovery');
 const { cleanHtmlScriptTags } = require('./parser');
 const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
 const { validateFileIR } = require('./ir');
@@ -51,6 +54,7 @@ class ProjectIndex {
         this.callsCache = new Map();     // filePath -> { mtime, hash, calls, content }
         this.callsCacheDirty = false;    // set by getCachedCalls when entries are added or mutated
         this.failedFiles = new Set();    // files that failed to index (e.g. large minified bundles)
+        this.unsupportedFiles = [];      // common source files skipped by the parser registry
         this._opContentCache = null;     // per-operation file content cache (Map<filePath, string>)
         this._opUsagesCache = null;      // per-operation findUsagesInCode cache (Map<"file:name", usages[]>)
         this._opTreeCache = null;        // per-operation parsed-tree cache (Map<filePath, tree|null>, bounded FIFO)
@@ -253,6 +257,8 @@ class ProjectIndex {
 
         // Accept pre-expanded file array (glob mode) or a pattern string
         let files;
+        const implicitProjectDiscovery = !Array.isArray(pattern) && !pattern;
+        this.unsupportedFiles = [];
         if (Array.isArray(pattern)) {
             files = pattern;
         } else {
@@ -273,7 +279,18 @@ class ProjectIndex {
                 globOpts.ignores = [...DEFAULT_IGNORES, ...gitignorePatterns, ...configExclude];
             }
 
+            if (implicitProjectDiscovery) {
+                globOpts.onSkippedFile = (filePath) => {
+                    const kind = classifyUnsupportedSourceFile(filePath);
+                    if (!kind) return;
+                    this.unsupportedFiles.push({
+                        relativePath: path.relative(this.root, filePath),
+                        ...kind,
+                    });
+                };
+            }
             files = expandGlob(pattern, globOpts);
+            this.unsupportedFiles.sort((a, b) => compareNames(a.relativePath, b.relativePath));
         }
 
         // Track if files were truncated by maxFiles limit
@@ -1200,7 +1217,15 @@ class ProjectIndex {
             }
 
             const total = calls + definitions + imports;
-            const result = { total, calls, definitions, imports, references: 0 };
+            const result = {
+                total,
+                calls,
+                definitions,
+                imports,
+                references: 0,
+                complete: false,
+                countKind: 'fast-disambiguation-excludes-references',
+            };
             if (memoKey) this._opUsageTotalsCache.set(memoKey, result);
             return result;
         }
@@ -1309,7 +1334,9 @@ class ProjectIndex {
             calls,
             definitions,
             imports,
-            references
+            references,
+            complete: true,
+            countKind: 'detailed-ast-usages',
         };
     }
 

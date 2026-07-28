@@ -183,12 +183,25 @@ function _collectCallNodes(node, callTypes, targetRow, funcName, limit, out = []
                 funcNode = funcNode.childForFieldName('function') || funcNode.namedChild(0);
             }
             if (funcNode) {
+                const memberProperty = funcNode.type === 'member_expression'
+                    ? funcNode.childForFieldName('property')
+                    : null;
+                const indirectKind = memberProperty &&
+                    ['call', 'apply', 'bind'].includes(memberProperty.text)
+                    ? memberProperty.text
+                    : null;
+                const indirectObject = indirectKind
+                    ? funcNode.childForFieldName('object')
+                    : null;
+                const indirectTarget = indirectObject?.type === 'member_expression'
+                    ? indirectObject.childForFieldName('property')?.text
+                    : indirectObject?.text;
                 const funcText = funcNode.type === 'member_expression' || funcNode.type === 'selector_expression' || funcNode.type === 'field_expression' || funcNode.type === 'attribute'
                     ? (funcNode.childForFieldName('property') || funcNode.childForFieldName('field') || funcNode.childForFieldName('attribute') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
                     : funcNode.type === 'scoped_identifier'
                     ? (funcNode.childForFieldName('name') || funcNode.namedChild(funcNode.namedChildCount - 1))?.text
                     : funcNode.text;
-                if (funcText === funcName) out.push(node);
+                if (funcText === funcName || indirectTarget === funcName) out.push(node);
             }
         }
         if (out.length >= limit) return out;
@@ -765,9 +778,52 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
         const argsNode = callNode.childForFieldName('arguments');
         if (!argsNode) return { args: [], argCount: 0, isMethodCall, ...ctx };
 
-        const args = [];
+        let args = [];
         for (let i = 0; i < argsNode.namedChildCount; i++) {
             args.push(argsNode.namedChild(i).text.trim());
+        }
+
+        // Function.prototype indirection has a precise, AST-visible argument
+        // mapping. `fn.call(thisArg, a, b)` invokes fn(a, b). `fn.apply`
+        // is countable only when its argument array is a literal. `bind`
+        // creates a partially applied function rather than invoking it, so it
+        // remains explicitly uncertain instead of looking like a parser bug.
+        let indirectKind = null;
+        if (language === 'javascript' || language === 'typescript' ||
+            language === 'tsx' || language === 'html') {
+            const property = funcNode?.type === 'member_expression'
+                ? funcNode.childForFieldName('property')?.text
+                : null;
+            if (['call', 'apply', 'bind'].includes(property)) indirectKind = property;
+        }
+        if (indirectKind === 'bind') {
+            return {
+                args: null,
+                argCount: 0,
+                indirectKind,
+                uncertainReason: 'Function.bind creates a partial application; final invocation arguments are not known here',
+                isMethodCall,
+                ...ctx,
+            };
+        }
+        if (indirectKind === 'call') {
+            args = args.slice(1);
+        } else if (indirectKind === 'apply') {
+            const arrayArg = argsNode.namedChild(1);
+            if (!arrayArg || arrayArg.type !== 'array') {
+                return {
+                    args: null,
+                    argCount: 0,
+                    indirectKind,
+                    uncertainReason: 'Function.apply argument list is not a static array literal',
+                    isMethodCall,
+                    ...ctx,
+                };
+            }
+            args = [];
+            for (let i = 0; i < arrayArg.namedChildCount; i++) {
+                args.push(arrayArg.namedChild(i).text.trim());
+            }
         }
 
         return {
@@ -776,6 +832,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             hasSpread: args.some(a => a.startsWith('...')),
             hasVariable: args.some(a => /^[a-zA-Z_]\w*$/.test(a)),
             isMethodCall,
+            ...(indirectKind && { indirectKind }),
             ...ctx,
         };
     } catch (e) {
@@ -1081,7 +1138,7 @@ function verify(index, name, options = {}) {
                 file: call.relativePath,
                 line: call.line,
                 expression: call.content.trim(),
-                reason: 'Could not parse call arguments',
+                reason: analysis.uncertainReason || 'Could not parse call arguments',
                 patterns: patternFlagsFrom(analysis),
                 ...carry,
             });

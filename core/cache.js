@@ -9,7 +9,10 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { expandGlob, detectProjectPattern, parseGitignore, DEFAULT_IGNORES } = require('./discovery');
+const {
+    expandGlob, detectProjectPattern, parseGitignore, DEFAULT_IGNORES,
+    classifyUnsupportedSourceFile,
+} = require('./discovery');
 
 // Read UCN version for cache invalidation
 const UCN_VERSION = require('../package.json').version;
@@ -449,7 +452,11 @@ function clearProjectCache(projectRoot) {
 // field types for overload argument shapes.
 // v112: Java argument kinds retain class-qualified field identity so the
 // field declaration's static value type participates in overload selection.
-const CACHE_FORMAT_VERSION = 112;
+// v113: persist common unsupported source files so cached repo/health output
+// cannot silently lose the grep handoff discovered during a full scan.
+// v114: Rust impl owners normalize nested generics and reference impls to the
+// same concrete identity used by receiver-flow analysis.
+const CACHE_FORMAT_VERSION = 114;
 
 /**
  * Save index to cache file
@@ -576,6 +583,9 @@ function saveCache(index, cachePath) {
         extendedByGraph: Array.from(index.extendedByGraph.entries()),
         failedFiles: index.failedFiles
             ? Array.from(index.failedFiles).map(f => path.relative(root, f))
+            : [],
+        unsupportedFiles: Array.isArray(index.unsupportedFiles)
+            ? index.unsupportedFiles
             : [],
         ...(reachableSymbolsRel !== undefined && {
             reachableSymbols: reachableSymbolsRel,
@@ -785,6 +795,9 @@ function loadCache(index, cachePath) {
                 cacheData.failedFiles.map(f => path.isAbsolute(f) ? f : toAbs(f))
             );
         }
+        index.unsupportedFiles = Array.isArray(cacheData.unsupportedFiles)
+            ? cacheData.unsupportedFiles
+            : [];
 
         // Restore calleeIndex if persisted (v7 caches only; v8+ rebuilds lazily)
         if (Array.isArray(cacheData.calleeIndex)) {
@@ -885,7 +898,18 @@ function isCacheStale(index) {
     // Slow path: glob the project to detect new files added since last build.
     // Only reached when all cached files are unchanged.
     const pattern = detectProjectPattern(index.root);
-    const globOpts = { root: index.root };
+    const currentUnsupported = [];
+    const globOpts = {
+        root: index.root,
+        onSkippedFile: (filePath) => {
+            const kind = classifyUnsupportedSourceFile(filePath);
+            if (!kind) return;
+            currentUnsupported.push({
+                relativePath: path.relative(index.root, filePath),
+                ...kind,
+            });
+        },
+    };
     const gitignorePatterns = parseGitignore(index.root);
     const configExclude = index.config.exclude || [];
     if (gitignorePatterns.length > 0 || configExclude.length > 0) {
@@ -898,6 +922,16 @@ function isCacheStale(index) {
         if (!cachedPaths.has(file) && !(index.failedFiles && index.failedFiles.has(file))) {
             return true; // New file found
         }
+    }
+    const cachedUnsupported = (index.unsupportedFiles || [])
+        .map(f => `${f.relativePath}\0${f.language}`)
+        .sort();
+    const discoveredUnsupported = currentUnsupported
+        .map(f => `${f.relativePath}\0${f.language}`)
+        .sort();
+    if (cachedUnsupported.length !== discoveredUnsupported.length ||
+        cachedUnsupported.some((value, i) => value !== discoveredUnsupported[i])) {
+        return true;
     }
 
     // Record when we last confirmed the cache is fresh (enables 2s skip on burst calls)

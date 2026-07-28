@@ -6754,6 +6754,30 @@ describe('fix #221: bind/call/apply edges carry calledAs:bound', () => {
         } finally { rm(dir); }
     });
 
+    it('signature check maps .call arguments and explains .bind uncertainty', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'export function helper(a, b) { return a + b; }',
+                'helper(1, 2);',
+                'helper.call(null, 1, 2);',
+                'const bound = helper.bind(null, 1);',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'check', { name: 'helper' });
+            assert.ok(result.ok, result.error);
+            assert.strictEqual(result.result.valid, 2,
+                'direct call and Function.call are both statically checkable');
+            assert.strictEqual(result.result.uncertain, 1);
+            assert.match(result.result.uncertainDetails[0].reason, /partial application/);
+            const text = output.formatVerify(result.result);
+            assert.match(text, /STATUS: ⚠ Partial verification/);
+            assert.ok(!text.includes('Could not parse call arguments'));
+        } finally { rm(dir); }
+    });
+
     it('callback argument edges expose functionReference in context JSON', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
@@ -6771,6 +6795,31 @@ describe('fix #221: bind/call/apply edges carry calledAs:bound', () => {
             assert.strictEqual(ref.functionReference, true);
             assert.strictEqual(ref.calledAs, undefined,
                 'argument-position references are functionReference, not bound');
+        } finally { rm(dir); }
+    });
+
+    it('a bare callback value never confirms an instance method with the same name', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t","type":"module"}',
+            'lib.js': [
+                'class Dayjs {',
+                '  locale(preset) { return preset; }',
+                '}',
+                'const dayjs = {};',
+                'dayjs.locale = function (preset) { return preset; };',
+                'function locale(preset) { return preset; }',
+                'export function install() { dayjs.locale(locale); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const method = contextEdges(index, 'lib.js:2:locale');
+            assert.ok(!method.callers.some(c => c.line === 7),
+                `bare locale callback cannot denote Dayjs.locale: ${JSON.stringify(method)}`);
+            const standalone = contextEdges(index, 'lib.js:6:locale');
+            const ref = standalone.callers.find(c => c.line === 7);
+            assert.ok(ref, `the standalone callback remains confirmed: ${JSON.stringify(standalone)}`);
+            assert.strictEqual(ref.functionReference, true);
         } finally { rm(dir); }
     });
 });
@@ -8370,7 +8419,7 @@ describe('fix #271 (JS/TS): parser recovery and indirect receiver ownership', ()
             assert.ok(result.ok, result.error);
             assert.strictEqual(result.result.blindSpots.parseRecoveries.count, 1);
             assert.strictEqual(result.result.blindSpots.parseRecoveries.fileCount, 1);
-            assert.strictEqual(result.result.dimensions.index.level, 'MEDIUM');
+            assert.strictEqual(result.result.dimensions.index.level, 'PARTIAL');
             assert.strictEqual(result.result.dimensions.semanticRecall.level, 'LOW');
             const text = output.formatDoctor(result.result);
             assert.match(text, /Parser recovery: 1 recovered file \(results may be partial\)/);

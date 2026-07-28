@@ -16,6 +16,36 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('Rust impl owner identity', () => {
+    it('normalizes reference impls and nested generic impl heads', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub trait Encode { fn encode(self, value: &str); }',
+                'pub struct Serializer<T>(T);',
+                "impl<'a, T> Encode for &'a mut Serializer<T> {",
+                '  fn encode(self, _value: &str) {}',
+                '}',
+                'pub struct StrRead;',
+                'pub struct Deserializer<T>(T);',
+                "impl<'a> Deserializer<Option<Result<StrRead, &'a str>>> {",
+                "  pub fn from_str(_s: &'a str) -> Self { unimplemented!() }",
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const encode = (index.symbols.get('encode') || [])
+                .find(def => def.startLine === 4);
+            const fromStr = (index.symbols.get('from_str') || [])[0];
+            assert.strictEqual(encode.className, 'Serializer');
+            assert.strictEqual(encode.receiver, 'Serializer');
+            assert.strictEqual(fromStr.className, 'Deserializer');
+            assert.strictEqual(fromStr.receiver, 'Deserializer');
+        } finally { rm(dir); }
+    });
+});
+
 describe('Rust struct-literal constructor identity', () => {
     it('selects the struct binding over same-name impl blocks', () => {
         const dir = tmp({

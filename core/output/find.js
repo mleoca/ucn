@@ -111,6 +111,13 @@ function formatFindDetailed(symbols, query, options = {}) {
     }
 
     const lines = [];
+    const sameNameDefinitionCounts = new Map();
+    for (const symbol of symbols) {
+        sameNameDefinitionCounts.set(
+            symbol.name,
+            (sameNameDefinitionCounts.get(symbol.name) || 0) + 1,
+        );
+    }
     const limit = all ? symbols.length : (top > 0 ? top : DEFAULT_LIMIT);
     const showing = Math.min(limit, symbols.length);
     const hidden = symbols.length - showing;
@@ -144,7 +151,11 @@ function formatFindDetailed(symbols, query, options = {}) {
             // One line per result: "<handle>  <sig>  <usages?>  <doc snippet?>"
             const parts = [`${loc}  ${sig}${confStr}`];
             if (s.usageCounts !== undefined && s.usageCounts.total > 0) {
-                parts.push(`(${s.usageCounts.total} usages)`);
+                const scope = sameNameDefinitionCounts.get(s.name) > 1 ? ' name-wide' : '';
+                const label = s.usageCounts.complete === false
+                    ? `${scope} indexed activity; refs excluded`
+                    : `${scope} usages`;
+                parts.push(`(${s.usageCounts.total}${label})`);
             } else if (s.usageCount !== undefined) {
                 parts.push(`(${s.usageCount} usages)`);
             }
@@ -174,7 +185,12 @@ function formatFindDetailed(symbols, query, options = {}) {
             if (c.definitions > 0) parts.push(`${c.definitions} def`);
             if (c.imports > 0) parts.push(`${c.imports} imports`);
             if (c.references > 0) parts.push(`${c.references} refs`);
-            lines.push(`  (${c.total} usages: ${parts.join(', ')})`);
+            const scope = sameNameDefinitionCounts.get(s.name) > 1 ? 'name-wide ' : '';
+            const label = c.complete === false ? 'indexed activity' : 'usages';
+            const boundary = c.complete === false
+                ? '; references not counted — use usages for the full inventory'
+                : '';
+            lines.push(`  (${c.total} ${scope}${label}: ${parts.join(', ')}${boundary})`);
         } else if (s.usageCount !== undefined) {
             lines.push(`  (${s.usageCount} usages)`);
         }

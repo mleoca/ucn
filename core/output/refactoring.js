@@ -196,16 +196,18 @@ function formatVerify(result, options = {}) {
     lines.push('');
 
     // Summary
-    // BUG M1: don't claim "All calls valid" when 0 valid + N uncertain.
-    // Status precedence: mismatches > 0 → fail; total === 0 → empty;
-    // valid === 0 && uncertain > 0 → all-uncertain; valid > 0 && mismatches === 0 → ok.
+    // A partial check is never a clean pass. Agents often consume the headline
+    // and omit the counters, so any uncertain site must remain visible there.
     let status;
     if (result.mismatches > 0) {
-        status = `✗ ${result.mismatches} mismatch${result.mismatches === 1 ? '' : 'es'}`;
+        status = `✗ ${result.mismatches} mismatch${result.mismatches === 1 ? '' : 'es'}` +
+            (result.uncertain > 0 ? `; ${result.uncertain} uncertain` : '');
     } else if (result.totalCalls === 0) {
         status = 'ℹ No calls found';
     } else if (result.valid === 0 && result.uncertain > 0) {
         status = '⚠ All calls uncertain (no resolved sites)';
+    } else if (result.uncertain > 0) {
+        status = `⚠ Partial verification: ${result.valid} valid, ${result.uncertain} uncertain`;
     } else {
         status = '✓ All calls valid';
     }

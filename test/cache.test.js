@@ -168,6 +168,39 @@ describe('Cache Behavior', () => {
         }
     });
 
+    it('persists unsupported-source handoffs and invalidates when they change', () => {
+        const tmpDir = createTempDir();
+        try {
+            fs.writeFileSync(path.join(tmpDir, 'app.js'), 'export function app() {}');
+            fs.writeFileSync(path.join(tmpDir, 'worker.rb'), 'def work\nend\n');
+
+            const index1 = new ProjectIndex(tmpDir);
+            index1.build(null, { quiet: true });
+            assert.deepStrictEqual(
+                index1.unsupportedFiles.map(file => file.relativePath),
+                ['worker.rb'],
+            );
+            index1.saveCache();
+
+            const index2 = new ProjectIndex(tmpDir);
+            assert.strictEqual(index2.loadCache(), true);
+            assert.deepStrictEqual(
+                index2.unsupportedFiles.map(file => file.relativePath),
+                ['worker.rb'],
+            );
+            assert.strictEqual(index2.isCacheStale(), false);
+
+            fs.writeFileSync(path.join(tmpDir, 'extra.rb'), 'def extra\nend\n');
+            // Clear the burst optimization because it intentionally delays
+            // discovery of all newly added files, supported or unsupported.
+            index2._lastFreshAt = null;
+            assert.strictEqual(index2.isCacheStale(), true,
+                'new unsupported source must refresh repo/health handoff data');
+        } finally {
+            cleanup(tmpDir);
+        }
+    });
+
     it('should detect modified files as stale', () => {
         const tmpDir = createTempDir();
         try {

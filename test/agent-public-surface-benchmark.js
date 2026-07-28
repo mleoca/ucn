@@ -546,6 +546,29 @@ function scoreContract(scenario, document) {
         contract.decisionSafety === expectedSafety;
 }
 
+// CLI and MCP intentionally use their native invocation syntax in guidance.
+// Normalize only those presentation-only lines before parity scoring; engine
+// facts, trust tiers, locations, accounts, and source remain byte-compared.
+function normalizeSurfaceGuidance(text) {
+    return String(text || '')
+        .replace(/^Next: .*$/gm, 'Next: <surface-guidance>')
+        .replace(/(?:ucn repo --sections=health --deep for detail|run command=repo with sections=health and deep=true for detail)/g,
+            '<health-guidance>')
+        .replace(/(?:Use source <handle>|Run command=source with name=<handle>) to inspect a listed symbol\./g,
+            '<source-guidance>')
+        .replace(/(?:ucn usages\s+|run command=usages with name=)([^\s)]+)/g,
+            '<usages-guidance:$1>')
+        .replace(/(?:Use --limit=N|Use limit=<n>) to return and display more results\./g,
+            '<limit-guidance>')
+        .replace(/(?:Use --detailed|Use detailed=true) to list all functions and classes\./g,
+            '<detailed-guidance>')
+        .replace(/(?:Use --top=N or --all|Use top=<n> or all=true) to show more\./g,
+            '<top-guidance>')
+        .replace(/\((?:use --deep|use deep=true)\)/g, '(<deep-guidance>)')
+        .replace(/\buse (?:--all|all=true)\b/g, 'use <all>')
+        .replace(/(?:--expand-unverified|expand_unverified=true)/g, '<expand-unverified>');
+}
+
 function discoverabilityScore(description, scenario) {
     const commandName = toMcpName(scenario.command);
     const commandVisible = description.includes(`  ${commandName}:`);
@@ -602,7 +625,8 @@ async function runScenario(client, projectDir, scenario, plan, toolDescription) 
         };
     const contractPassed = scoreContract(scenario, document);
     const parity = cliText.ok && mcp.ok &&
-        cliText.stdout.trimEnd() === mcp.text.trimEnd();
+        normalizeSurfaceGuidance(cliText.stdout.trimEnd()) ===
+        normalizeSurfaceGuidance(mcp.text.trimEnd());
 
     return {
         id: scenario.id,
@@ -739,6 +763,13 @@ function evaluateGates(summary, gates = RELEASE_GATES) {
 
 function formatMarkdown(report) {
     const summary = report.summary;
+    const liveAgent = report.liveAgentPlans === true;
+    const selectionLabel = liveAgent
+        ? 'live-agent task-to-command selection'
+        : 'reference-plan command conformance';
+    const parameterLabel = liveAgent
+        ? 'live-agent parameter accuracy'
+        : 'reference-plan parameter conformance';
     const lines = [
         '# UCN public-surface agent benchmark',
         '',
@@ -746,6 +777,7 @@ function formatMarkdown(report) {
         `Fixture: ${report.fixtureDir}`,
         `Runs: ${report.runs}`,
         `Plan source: ${report.planSource}`,
+        `Measurement mode: ${report.measurementKind}`,
         '',
         '> The checked-in reference plan validates the public execution and scoring',
         '> contract. It is not a claim about a live model. Use `--plans=<file>` with',
@@ -756,12 +788,12 @@ function formatMarkdown(report) {
         '| metric | result | gate |',
         '|---|---:|---:|',
         `| public commands covered | ${summary.commandsCovered}/${CANONICAL_COMMANDS.length} | ${CANONICAL_COMMANDS.length}/${CANONICAL_COMMANDS.length} |`,
-        `| task-to-command selection | ${summary.selectionAccuracy} | ≥ ${RELEASE_GATES.minSelectionAccuracy} |`,
-        `| parameter accuracy | ${summary.parameterAccuracy} | ≥ ${RELEASE_GATES.minParameterAccuracy} |`,
+        `| ${selectionLabel} | ${summary.selectionAccuracy} | ≥ ${RELEASE_GATES.minSelectionAccuracy} |`,
+        `| ${parameterLabel} | ${summary.parameterAccuracy} | ≥ ${RELEASE_GATES.minParameterAccuracy} |`,
         `| answer accuracy | ${summary.answerAccuracy} | ${RELEASE_GATES.minAnswerAccuracy} |`,
         `| CLI success | ${summary.cliSuccessRate} | ${RELEASE_GATES.minSurfaceSuccessRate} |`,
         `| MCP success | ${summary.mcpSuccessRate} | ${RELEASE_GATES.minSurfaceSuccessRate} |`,
-        `| CLI/MCP text parity | ${summary.parityRate} | ${RELEASE_GATES.minParityRate} |`,
+        `| CLI/MCP semantic text parity (native guidance normalized) | ${summary.parityRate} | ${RELEASE_GATES.minParityRate} |`,
         `| command/parameter discoverability | ${summary.discoverabilityRate} | ${RELEASE_GATES.minDiscoverabilityRate} |`,
         `| answer contract | ${summary.contractRate} | ${RELEASE_GATES.minContractRate} |`,
         `| failure recovery | ${summary.recoveryRate} | ${RELEASE_GATES.minRecoveryRate} |`,
@@ -770,7 +802,7 @@ function formatMarkdown(report) {
         `| warm MCP latency p50/p95 | ${summary.mcpMsP50}/${summary.mcpMsP95} ms | report-only |`,
         `| output tokens p50/p95 | ${summary.outputTokensP50}/${summary.outputTokensP95} | p95 ≤ ${RELEASE_GATES.maxOutputTokensP95} |`,
         '',
-        `Gate: **${report.gate.passed ? 'PASS' : 'FAIL'}**`,
+        `${liveAgent ? 'Live-agent' : 'Reference-plan conformance'} gate: **${report.gate.passed ? 'PASS' : 'FAIL'}**`,
     ];
     if (report.gate.failures.length) {
         for (const failure of report.gate.failures) lines.push(`- ${failure}`);
@@ -801,6 +833,7 @@ async function runBenchmark(options = {}) {
     const fixtureDir = path.resolve(options.fixtureDir || DEFAULT_FIXTURE);
     if (!fs.existsSync(fixtureDir)) throw new Error(`Fixture not found: ${fixtureDir}`);
     const loadedPlans = options.loadedPlans || loadPlans(options.plansFile, scenarios);
+    const liveAgentPlans = options.liveAgentPlans === true || !!options.plansFile;
     const runs = options.runs || 3;
     const allResults = [];
     let toolMetadata = null;
@@ -845,11 +878,15 @@ async function runBenchmark(options = {}) {
         gate.failures.push('MCP command enum does not match the 18-command registry');
     }
     return {
-        schemaVersion: 3,
+        schemaVersion: 4,
         generatedAt: new Date().toISOString(),
         fixtureDir,
         runs,
         planSource: loadedPlans.source,
+        measurementKind: liveAgentPlans
+            ? 'captured-agent-plan-evaluation'
+            : 'reference-plan-contract-conformance',
+        liveAgentPlans,
         gates: RELEASE_GATES,
         gate,
         tool: toolMetadata,
@@ -905,8 +942,10 @@ async function main() {
     process.stdout.write('Public-surface agent benchmark complete.\n');
     process.stdout.write(`  JSON: ${jsonPath}\n`);
     process.stdout.write(`  MD:   ${mdPath}\n`);
-    process.stdout.write(`  selection=${report.summary.selectionAccuracy} ` +
-        `parameters=${report.summary.parameterAccuracy} ` +
+    process.stdout.write(`  mode=${report.measurementKind}\n`);
+    const selectionPrefix = report.liveAgentPlans ? 'agent' : 'reference';
+    process.stdout.write(`  ${selectionPrefix}_selection=${report.summary.selectionAccuracy} ` +
+        `${selectionPrefix}_parameters=${report.summary.parameterAccuracy} ` +
         `answers=${report.summary.answerAccuracy} ` +
         `contracts=${report.summary.contractRate} ` +
         `recovery=${report.summary.recoveryRate} ` +
@@ -935,6 +974,7 @@ module.exports = {
     toCliInvocation,
     toMcpArguments,
     scorePlan,
+    normalizeSurfaceGuidance,
     summarize,
     evaluateGates,
     formatMarkdown,

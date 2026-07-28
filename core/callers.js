@@ -263,8 +263,16 @@ function findCallers(index, name, options = {}) {
     const methodOwnerKey = (definition) => {
         const owner = definition.className ||
             (definition.receiver && definition.receiver.replace(/^\*/, ''));
-        if (!owner) return null;
         const language = definition.file && index.files.get(definition.file)?.language;
+        // Structural prototype/object-member assignments are callable member
+        // owners even though the parser represents their value as a function:
+        // `proto.locale = function (...) {}` can receive `obj.locale()`.
+        // Ignoring them manufactured "single method owner" evidence for an
+        // unrelated class method with the same spelling (Day.js measured).
+        if (!owner && definition.memberAssigned) {
+            return `${language || 'unknown'}:${definition.file || ''}:<member-assigned>`;
+        }
+        if (!owner) return null;
         if (language === 'csharp') {
             return `csharp:${definition.namespace || ''}:${owner}`;
         }
@@ -1151,16 +1159,20 @@ function findCallers(index, name, options = {}) {
                         continue;
                     }
 
-                    // A bare identifier can never denote a METHOD where bare
-                    // names don't reach methods (fix #220, grpc-go-measured:
-                    // `balancer.Get(Name)` references each package's const
-                    // Name, never the pinned method Name() — Go method values
-                    // require receivers, Rust `use` cannot import associated
-                    // functions). Java exempt (static imports). Compiler-grade
-                    // kind evidence — excluded with reason, all surfaces.
-                    if (!call.isMethod && !call.receiver &&
-                        langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
-                        !langTraits(fileEntry.language)?.bareCallReachesMethods) {
+                    // A bare identifier passed as a function value cannot
+                    // denote an instance METHOD in any language — method
+                    // values carry a receiver (`worker.run`, `Worker::run`,
+                    // `this::run`). This also covers structural languages:
+                    // `dayjs.locale(locale)` passes the imported standalone
+                    // value `locale`; it is not a reference to Dayjs.locale.
+                    // For nominal bare calls, retain the broader #220 rule
+                    // (Go/Rust names cannot reach methods; Java static imports
+                    // remain exempt). Compiler-grade kind evidence — excluded
+                    // with reason on every surface.
+                    if (!call.localShadow && !call.isMethod && !call.receiver &&
+                        (call.isFunctionReference ||
+                            (langTraits(fileEntry.language)?.typeSystem === 'nominal' &&
+                                !langTraits(fileEntry.language)?.bareCallReachesMethods))) {
                         const allMethodTargets = cbTargetDefs.length > 0 && cbTargetDefs.every(d =>
                             !NON_CALLABLE_TYPES.has(d.type) && (d.className || d.receiver));
                         if (allMethodTargets) {

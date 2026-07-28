@@ -9,7 +9,7 @@ Use UCN to gather compact, auditable code evidence before reading large files or
 
 ## Core workflow
 
-1. Run `ucn repo` in an unfamiliar repository. Add `--deep` when readiness or index health matters.
+1. Run `ucn repo` in an unfamiliar repository. Add `--deep` when readiness or index health matters. If it reports skipped unsupported source, use grep/ripgrep and a language-native analyzer for those files; never interpret an `UNSUPPORTED` or `PARTIAL` scope as a semantic zero.
 2. Pin a symbol with `ucn find <name>`, then pass its `path:line:name` handle to later commands.
 3. Run `ucn show <handle>` for the default summary, callers, and callees. Request extra projections with `--sections=source,tests,types,dependencies,example,related`.
 4. Before a change, run `ucn impact <handle>` and `ucn tests <handle> --depth=3`.
@@ -24,11 +24,21 @@ CLI, MCP, and interactive mode resolve the same 18 public commands through one r
 
 The release board independently cross-checks overlapping stable-handle answers from `find`, `show`, `source`, `impact`, `tests`, `check`, and caller `trace`. Target identity, source and direct-test projections, caller tiers, evidence reasons, totals, and accounting must agree exactly; a mismatch is a failing witness rather than an interpretation left to an agent.
 
-MCP keeps its process and project index warm across calls. Targeted commands default to 10K output characters, broad commands to 3K, with a 100K hard ceiling. Use `max_chars`, a narrower file/directory scope, or a smaller section projection when necessary.
+MCP keeps its process and project index warm across calls. CLI and MCP share
+the same text budget: targeted commands default to 10K output characters,
+broad commands to 3K, with a 100K hard ceiling. Use CLI `--max-chars`, MCP
+`max_chars`, a narrower file/directory scope, or a smaller section projection
+when necessary. Truncation must retain the accounting/contract lines needed to
+interpret the answer.
 
 Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use.
 
 Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
+
+`repo` readiness is task-specific. Its headline is navigation readiness;
+refactor, deletion, semantic recall, and the sampled evidence mix are separate
+dimensions. The confirmed/unverified percentage is a classification profile,
+not an accuracy grade.
 
 ## Interpret evidence correctly
 

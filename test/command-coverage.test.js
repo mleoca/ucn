@@ -888,7 +888,7 @@ describe('doctor command', () => {
             assert.strictEqual(result.blindSpots.parseFailures.count, 1);
             assert.strictEqual(result.blindSpots.parseFailures.fileCount, 1);
             assert.deepStrictEqual(result.blindSpots.parseFailures.files, ['missing-from-index.js']);
-            assert.strictEqual(result.dimensions.index.level, 'MEDIUM');
+            assert.strictEqual(result.dimensions.index.level, 'PARTIAL');
             assert.strictEqual(result.dimensions.semanticRecall.level, 'LOW');
         } finally { rm(dir); }
     });
@@ -903,10 +903,11 @@ describe('doctor command', () => {
             const index = idx(dir);
             const { ok, result } = execute(index, 'doctor', { deep: true });
             assert.ok(ok);
-            assert.ok(result.coverage, 'should have coverage data');
-            assert.ok(result.coverage.total >= 0);
-            assert.strictEqual(result.coverage.kind, 'evidence-profile-not-accuracy');
-            assert.strictEqual(result.evidenceProfile, result.coverage);
+            assert.ok(result.evidenceProfile, 'should have an evidence profile');
+            assert.ok(result.evidenceProfile.total >= 0);
+            assert.strictEqual(result.evidenceProfile.kind, 'evidence-profile-not-accuracy');
+            assert.ok(!Object.hasOwn(result, 'coverage'),
+                'v5 exposes one unambiguous evidenceProfile field');
         } finally { rm(dir); }
     });
 
@@ -953,10 +954,10 @@ describe('doctor command', () => {
             assert.ok(result.blindSpots.reflection.count >= 1, 'getattr flagged');
             // A small sampled project may stay UNKNOWN; rule-assigned evidence
             // weights are not an accuracy measurement and cannot justify HIGH.
-            assert.strictEqual(result.coverage.kind, 'evidence-profile-not-accuracy');
+            assert.strictEqual(result.evidenceProfile.kind, 'evidence-profile-not-accuracy');
             assert.notStrictEqual(result.trust, 'LOW',
                 `blind-spot presence alone must not yield LOW: ${result.trustReason}`);
-            assert.strictEqual(result.dimensions.semanticRecall.level, 'MEDIUM');
+            assert.strictEqual(result.dimensions.semanticRecall.level, 'REVIEW');
         } finally { rm(dir); }
     });
 
@@ -974,7 +975,7 @@ describe('doctor command', () => {
         } finally { rm(dir); }
     });
 
-    it('caps the --deep verdict below HIGH when blind spots are pervasive (field-report #1, reviewer)', () => {
+    it('keeps pervasive runtime blind spots in semantic/refactor dimensions, not the navigation headline', () => {
         // The evidence profile only buckets FOUND edges — a reflection-hidden
         // call is absent, not low-confidence. So pervasive reflection (here 8 of
         // 12 files) can hide a real slice of the call graph the sample can't see,
@@ -992,10 +993,44 @@ describe('doctor command', () => {
             assert.ok(result.files.scanned >= 10, `density gating needs >=10 files, got ${result.files.scanned}`);
             assert.strictEqual(result.blindSpots.reflection.fileCount, 8,
                 `reflection in 8 files, got ${result.blindSpots.reflection.fileCount}`);
-            assert.notStrictEqual(result.trust, 'HIGH',
-                `pervasive blind spots must cap below HIGH: ${result.trust} (${result.trustReason})`);
-            assert.strictEqual(result.dimensions.semanticRecall.level, 'MEDIUM');
+            assert.strictEqual(result.trustScope, 'navigation-readiness');
+            assert.strictEqual(result.dimensions.refactor.level, 'REVIEW');
+            assert.strictEqual(result.dimensions.semanticRecall.level, 'REVIEW');
             assert.match(result.dimensions.semanticRecall.reason, /runtime-resolved edges/);
+        } finally { rm(dir); }
+    });
+
+    it('reports unsupported source files and gives an explicit grep handoff', () => {
+        const dir = tmp({
+            'app.js': 'export function run() { return 1; }',
+            'worker.rb': 'def work\n  1\nend\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'doctor', {});
+            assert.ok(ok);
+            assert.strictEqual(result.blindSpots.unsupportedSources.count, 1);
+            assert.deepStrictEqual(result.blindSpots.unsupportedSources.languages, { Ruby: 1 });
+            assert.strictEqual(result.dimensions.navigation.level, 'PARTIAL');
+            assert.match(result.dimensions.navigation.reason, /grep\/ripgrep/);
+            assert.match(output.formatDoctor(result), /Unsupported source: 1 file skipped/);
+            assert.match(output.formatDoctor(result), /Handoff: use grep\/ripgrep/);
+        } finally { rm(dir); }
+    });
+
+    it('renders structured doctor filters instead of [object Object]', () => {
+        const dir = tmp({
+            'src/app.js': 'export function run() { return 1; }',
+            'test/app.test.js': 'export function testRun() { return 1; }',
+        });
+        try {
+            const { result } = execute(idx(dir), 'doctor', {
+                in: 'src',
+                exclude: ['vendor'],
+            });
+            const text = output.formatDoctor(result);
+            assert.match(text, /Filter: in=src · exclude=vendor/);
+            assert.ok(!text.includes('[object Object]'));
         } finally { rm(dir); }
     });
 

@@ -23,6 +23,7 @@ const {
 } = require('../core/registry');
 const { execute } = require('../core/execute');
 const { formatPublicJson, formatPublicText } = require('../core/output');
+const { normalizeSurfaceGuidance } = require('./agent-public-surface-benchmark');
 const { tmp, rm, idx, runCli, runInteractive, McpClient } = require('./helpers');
 
 const ROOT = path.join(__dirname, '..');
@@ -117,7 +118,8 @@ describe('single-router architecture', () => {
 
     it('CLI project, file, glob, and interactive modes share the public router', () => {
         assert.ok((cliCode.match(/buildPublicParams\(/g) || []).length >= 4);
-        assert.ok((cliCode.match(/formatPublicText\(/g) || []).length >= 4);
+        assert.match(cliCode, /function formatCliText\(/);
+        assert.ok((cliCode.match(/formatCliText\(/g) || []).length >= 5);
         assert.doesNotMatch(cliCode, /switch\s*\(canonical\)/);
         assert.doesNotMatch(cliCode, /switch\s*\(command\)/);
     });
@@ -207,8 +209,11 @@ describe('18-command CLI/MCP/interactive parity', () => {
             });
             assert.strictEqual(result.isError, false, result.text);
             assertClean(result.text, `MCP ${mcpName}`);
-            assert.strictEqual(result.text.trimEnd(), cli.trimEnd(),
-                `${cliName} text must be byte-equivalent through CLI and MCP`);
+            assert.strictEqual(
+                normalizeSurfaceGuidance(result.text.trimEnd()),
+                normalizeSurfaceGuidance(cli.trimEnd()),
+                `${cliName} engine facts must be byte-equivalent after native guidance normalization`,
+            );
         });
     }
 
@@ -248,14 +253,20 @@ describe('18-command CLI/MCP/interactive parity', () => {
             command: 'source', project_dir: dir, file: 'src/service.js', range: '1-2',
         });
         assert.strictEqual(mcpRange.isError, false, mcpRange.text);
-        assert.strictEqual(mcpRange.text.trimEnd(), cliRange.trimEnd());
+        assert.strictEqual(
+            normalizeSurfaceGuidance(mcpRange.text.trimEnd()),
+            normalizeSurfaceGuidance(cliRange.trimEnd()),
+        );
 
         const cliFull = runCli(dir, 'show', ['processData'], ['--no-compact']);
         const mcpFull = await mcp.callTool({
             command: 'show', project_dir: dir, name: 'processData', compact: false,
         });
         assert.strictEqual(mcpFull.isError, false, mcpFull.text);
-        assert.strictEqual(mcpFull.text.trimEnd(), cliFull.trimEnd());
+        assert.strictEqual(
+            normalizeSurfaceGuidance(mcpFull.text.trimEnd()),
+            normalizeSurfaceGuidance(cliFull.trimEnd()),
+        );
     });
 
     it('find uses one result cap and one explicit source control on every surface', async () => {
@@ -283,7 +294,10 @@ describe('18-command CLI/MCP/interactive parity', () => {
             with_source: true,
         });
         assert.strictEqual(mcpResult.isError, false, mcpResult.text);
-        assert.strictEqual(mcpResult.text.trimEnd(), cli.trimEnd());
+        assert.strictEqual(
+            normalizeSurfaceGuidance(mcpResult.text.trimEnd()),
+            normalizeSurfaceGuidance(cli.trimEnd()),
+        );
         assert.match(cli, /function processData/);
 
         const findFlags = generateMcpParamSection()

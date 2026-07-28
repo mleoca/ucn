@@ -15,6 +15,7 @@ const { execFileSync, execSync } = require('child_process');
 const { parse } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const output = require('../core/output');
+const { applyOutputBudget } = require('../core/output-budget');
 const { execute } = require('../core/execute');
 const { createTempDir, cleanup, tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, CLI_PATH, runCli, runInteractive } = require('./helpers');
 
@@ -1061,10 +1062,12 @@ describe('FIX 106-111: Null safety bug hunt', () => {
 
     // FIX 108: MCP toolResult handles null/undefined text
     it('fix #108: MCP toolResult does not crash on null text', () => {
-        // We test this by checking the function source pattern
-        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
-        assert.ok(serverCode.includes("if (!text) return"),
-            'toolResult should have a null guard for text parameter');
+        const result = applyOutputBudget(null, {
+            command: 'show',
+            surface: 'mcp',
+        });
+        assert.strictEqual(result.text, '(no output)');
+        assert.strictEqual(result.truncated, false);
     });
 
     // FIX 109: Output formatters handle file-ambiguous errors

@@ -1026,11 +1026,15 @@ function extractImplInfo(implNode) {
         typeName = typeNode.text;
     }
 
-    // Strip generic type arguments from typeName and traitName for lookup
-    // e.g., "CacheService<T>" → "CacheService", "Entity" stays "Entity"
-    const stripGenerics = (s) => s ? s.replace(/<[^>]*>/g, '').trim() : s;
-    const bareTypeName = stripGenerics(typeName);
-    const bareTraitName = stripGenerics(traitName);
+    // Resolve the AST head instead of stripping generic text with a regex.
+    // Nested type arguments (`Deserializer<read::StrRead<'a>>`) defeated the
+    // old `<[^>]*>` expression and left the impossible owner
+    // `Deserializer>`. Reference impls (`impl Trait for &'a mut Writer<T>`)
+    // likewise need the referent owner so declared-field receiver evidence
+    // and method definitions use the same identity.
+    const stripGenerics = (s) => s ? s.replace(/<.*$/s, '').trim() : s;
+    const bareTypeName = extractImplTypeHead(typeNode) || stripGenerics(typeName);
+    const bareTraitName = extractImplTypeHead(traitNode) || stripGenerics(traitName);
 
     let name;
     if (bareTraitName && bareTypeName) {
@@ -1045,6 +1049,37 @@ function extractImplInfo(implNode) {
     }
 
     return { name, traitName, typeName: bareTypeName, generics: typeParams || undefined };
+}
+
+/**
+ * Concrete lookup head of a Rust impl type.
+ *
+ * Generic wrappers remain their outer owner (`Box<Foo>` → `Box`), while
+ * transparent references unwrap (`&mut Foo` → `Foo`). Scoped types use their
+ * terminal name. Returning null for shapes without a named owner preserves
+ * the conservative text fallback in extractImplInfo.
+ */
+function extractImplTypeHead(typeNode) {
+    if (!typeNode) return null;
+    if (typeNode.type === 'type_identifier' ||
+        typeNode.type === 'primitive_type') {
+        return typeNode.text;
+    }
+    if (typeNode.type === 'scoped_type_identifier') {
+        return typeNode.childForFieldName('name')?.text || null;
+    }
+    if (typeNode.type === 'reference_type' ||
+        typeNode.type === 'parenthesized_type') {
+        const inner = typeNode.childForFieldName('type') ||
+            typeNode.namedChildren?.find(child =>
+                !['lifetime', 'mutable_specifier'].includes(child.type));
+        return extractImplTypeHead(inner);
+    }
+    if (typeNode.type === 'generic_type') {
+        return extractImplTypeHead(typeNode.childForFieldName('type') ||
+            typeNode.namedChild(0));
+    }
+    return null;
 }
 
 /**

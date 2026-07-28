@@ -59,6 +59,12 @@ UCN has no legacy command aliases. The public vocabulary is deliberately small, 
 
 Run `ucn --help` for the accepted flags. Flags that do not apply to a command are ignored with an explicit warning or MCP note.
 
+Project-wide discovery also records common source languages that UCN cannot
+parse. `repo` and its health view list those skipped files, mark an all-
+unsupported scope `UNSUPPORTED` and a mixed scope `PARTIAL`, and explicitly
+hand them to grep/ripgrep plus a language-native analyzer. They are never
+reported as a clean zero-file project.
+
 The command registry contains machine-checked contracts for every public command: its primary question, explicit modes, truth boundary, output shape, safety class, examples, proof coverage, and next useful command. Every parser feeds the same versioned, data-only language IR through one adapter and one index-ingestion path; sequential and worker builds therefore preserve the same symbols, calls, imports, and evidence fields.
 
 C support includes functions, structs, macros, includes, calls, entry points, and public/API analysis. C++ adds classes, methods, constructors, inheritance, namespaces, and typed field receivers. C# adds namespaces, classes/interfaces/records, fields/properties, attributes, overload-aware calls, async flow, top-level programs, .NET stack frames, and ASP.NET/HttpClient endpoint analysis. When available, `compile_commands.json` supplies C/C++ header-language and include-path context.
@@ -103,7 +109,9 @@ ucn deps --cycles
 
 All surfaces resolve a public command through the same registry, normalize parameters once, call the same `execute()` handler, and use the same public formatter. File, project, glob, and interactive CLI modes use that route too. CLI JSON includes `meta.contract` with the command question, decision-safety class, truth boundary, and suggested next actions.
 
-Text output is equivalent for equivalent parameters. `--json` always returns one stable envelope:
+Engine facts and trust metadata are equivalent for equivalent parameters.
+Presentation guidance uses the native surface syntax (`--all` in CLI,
+`all=true` in MCP). `--json` always returns one stable envelope:
 
 ```json
 {
@@ -112,9 +120,18 @@ Text output is equivalent for equivalent parameters. `--json` always returns one
 }
 ```
 
+Failed CLI JSON requests retain the same shape with `data: null`,
+`meta.ok: false`, the command contract when known, and an `error` string.
+
 CLI commands and flags use hyphenated spelling. MCP commands and parameters use snake case where needed, such as `audit_async`, `project_dir`, and `class_name`.
 
 The MCP server publishes exactly one tool named `ucn`. Its `command` enum contains the 18 commands, and its generated description lists the parameters accepted by each command. A warm MCP process reuses the same index cache and is normally faster than starting a CLI process for each question.
+
+CLI and MCP text use one shared output budget: targeted commands default to
+10K characters, broad commands to 3K, and both have a 100K ceiling. CLI can
+set `--max-chars=N`; MCP can set `max_chars`. `--all`/`all=true` lifts
+formatter caps while retaining the ceiling. Truncation preserves omitted
+`ACCOUNT`, `CONTRACT`, `WARNING`, and related trust lines.
 
 ## Cache location
 
@@ -250,7 +267,12 @@ Release gates additionally compare semantic answers with ts-morph, pyright, gopl
 
 The seven-repository release board is preact-signals, httpx, cobra, viper, ripgrep, clap, and javapoet. The wider scheduled semantic matrix contains nineteen pinned repositories: zod, preact-signals, express, httpx, rich, cobra, grpc-go, ripgrep, cursive, gson, clap, hono, zustand, viper, chi, javapoet, jsoup, click, and fastify.
 
-The public-surface agent harness replays task plans through CLI JSON, CLI text, and MCP, and records command/parameter selection, answer checks, parity, tool calls, latency, and output size. Its checked-in plan is a deterministic contract baseline; captured agent plans can be scored with `--plans=<file>`.
+The public-surface agent harness replays task plans through CLI JSON, CLI text,
+and MCP, and records command/parameter selection, answer checks, semantic text
+parity, tool calls, latency, and output size. Its default checked-in plans are
+labeled `reference-plan-contract-conformance`; their selection score is not a
+live-agent measurement. Plans captured from an actual agent can be scored with
+`--plans=<file>` and are labeled separately.
 
 Reproduce the gates with:
 

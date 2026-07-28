@@ -4,7 +4,7 @@
 
 'use strict';
 
-function formatDoctor(result) {
+function formatDoctor(result, options = {}) {
     if (!result) return 'No project to analyze.';
     const lines = [];
     lines.push(`UCN Trust Report — ${result.root}`);
@@ -12,7 +12,13 @@ function formatDoctor(result) {
     if (result.version) lines.push(`Version: ucn ${result.version}`);
     lines.push(`Index: ${result.files.scanned} file${result.files.scanned === 1 ? '' : 's'}, ${result.symbols} symbol${result.symbols === 1 ? '' : 's'}`);
 
-    if (result.filter) lines.push(`Filter: ${result.filter}`);
+    if (result.filter) {
+        const parts = [];
+        if (result.filter.file) parts.push(`file=${result.filter.file}`);
+        if (result.filter.in) parts.push(`in=${result.filter.in}`);
+        if (result.filter.exclude?.length) parts.push(`exclude=${result.filter.exclude.join(',')}`);
+        if (parts.length > 0) lines.push(`Filter: ${parts.join(' · ')}`);
+    }
 
     // Languages
     const langEntries = Object.entries(result.languages || {}).sort((a, b) => b[1].files - a[1].files);
@@ -52,7 +58,7 @@ function formatDoctor(result) {
         lines.push('Resolution evidence profile: no caller edges in the stratified sample.');
     } else {
         lines.push('');
-        lines.push('Resolution evidence profile: not computed (use --deep)');
+        lines.push(`Resolution evidence profile: not computed (${options.deepHint || 'use --deep'})`);
     }
 
     // Blind spots
@@ -65,10 +71,12 @@ function formatDoctor(result) {
         ['Reflection',      bs.reflection],
         ['Parse failures',  bs.parseFailures],
         ['Parser recovery', bs.parseRecoveries],
+        ['Unsupported source', bs.unsupportedSources],
     ];
     const unitFor = {
         'Dynamic imports': 'import', 'Eval/exec calls': 'use', Reflection: 'use',
         'Parse failures': 'failure',
+        'Unsupported source': 'file',
     };
     let anyBlindSpot = false;
     for (const [label, info] of bsLines) {
@@ -82,6 +90,12 @@ function formatDoctor(result) {
             const unit = unitFor[label] || 'use';
             if (label === 'Parser recovery') {
                 lines.push(`  ${label}: ${fileCount} recovered file${fileCount === 1 ? '' : 's'} (results may be partial)`);
+            } else if (label === 'Unsupported source') {
+                const languages = Object.entries(info.languages || {})
+                    .map(([language, count]) => `${language} ${count}`)
+                    .join(', ');
+                lines.push(`  ${label}: ${fileCount} file${fileCount === 1 ? '' : 's'} skipped${languages ? ` (${languages})` : ''}`);
+                lines.push('    Handoff: use grep/ripgrep and a language-native analyzer for these files.');
             } else {
                 lines.push(`  ${label}: ${info.count} ${unit}${info.count === 1 ? '' : 's'} in ${fileCount} file${fileCount === 1 ? '' : 's'}`);
             }

@@ -182,6 +182,12 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
     const unverifiedUnscoredRatio = rate(summary.unverifiedUnscored || 0, unverifiedUniverse);
     const calleeUniverse = (summary.calleeSites || 0) + (summary.calleeUnscoredSites || 0);
     const calleeUnscoredRatio = rate(summary.calleeUnscoredSites || 0, calleeUniverse);
+    const definitionUniverse = summary.definitionAdjudicationUniverse ||
+        ((summary.definitionValidatedOracleCalls || 0) +
+            (summary.definitionUnresolvedReferenceEdges || 0) +
+            (summary.oracleBroadReferenceEdges || 0));
+    const definitionUnresolvedRatio = rate(
+        summary.definitionUnresolvedReferenceEdges || 0, definitionUniverse);
     const failures = [];
 
     if (maxUnscoredRatio != null && precisionUnscoredRatio > maxUnscoredRatio) {
@@ -192,8 +198,18 @@ function evaluateOracleCoverage(summary, maxUnscoredRatio) {
         failures.push(`callee configuration-unscored ratio ${(calleeUnscoredRatio * 100).toFixed(2)}% ` +
             `> ${(maxUnscoredRatio * 100).toFixed(2)}%`);
     }
+    if (maxUnscoredRatio != null && definitionUnresolvedRatio > maxUnscoredRatio) {
+        failures.push(`definition-unresolved oracle ratio ${(definitionUnresolvedRatio * 100).toFixed(2)}% ` +
+            `> ${(maxUnscoredRatio * 100).toFixed(2)}%`);
+    }
 
-    return { failures, precisionUnscoredRatio, unverifiedUnscoredRatio, calleeUnscoredRatio };
+    return {
+        failures,
+        precisionUnscoredRatio,
+        unverifiedUnscoredRatio,
+        calleeUnscoredRatio,
+        definitionUnresolvedRatio,
+    };
 }
 
 module.exports = {

@@ -52,7 +52,9 @@ Configuration-gated candidates remain visible but are not labeled false when the
 
 ## Truncation
 
-MCP results may include:
+CLI and MCP text share the same 10K targeted / 3K broad default budgets and
+100K ceiling. CLI truncation appends preserved contract lines directly. MCP
+results may additionally include:
 
 ```json
 {
@@ -73,6 +75,7 @@ Allow an automated change to proceed to compiler/tests only when:
 - warnings and filtered counts are zero;
 - unverified sites are either zero or explicitly reviewed;
 - `ucn repo --sections=health --deep` reports no parse failure/recovery and its task-specific readiness has been reviewed;
+- the repo health report lists no unsupported source handoff relevant to the change;
 - the change is still validated by the language toolchain and relevant tests.
 
 Never auto-delete from a UCN-only signal. Require usages, entry-point review, public API review, and external validation.

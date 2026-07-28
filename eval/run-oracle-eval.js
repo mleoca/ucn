@@ -383,14 +383,32 @@ async function evaluateRepo(repo, oracle) {
                 adjudicatedOracleCalls.push(oc);
                 continue;
             }
+            // Some oracles already perform runtime-reachability filtering on
+            // each reference. In TypeScript, a call statically bound to a
+            // base/interface declaration may execute the sampled override;
+            // exact-definition equality would wrongly discard that
+            // compiler-proven may-dispatch edge. Untyped/unresolved calls do
+            // not carry this marker and still require adjudication below.
+            if (oc.oracleResolution === 'may-reach') {
+                adjudicatedOracleCalls.push(oc);
+                definitionValidatedOracleCalls++;
+                continue;
+            }
             const status = await definitionStatus(
                 oc.file, oc.line, sym.name, targetDef, oc.column);
             if (status === 'other') {
                 oracleBroadReferenceEdges++;
+            } else if (status === 'target') {
+                adjudicatedOracleCalls.push(oc);
+                definitionValidatedOracleCalls++;
+            } else if (status === 'unresolved') {
+                // A rename-oriented reference search plus an unresolved exact
+                // definition is not compiler ground truth for THIS repeated
+                // method. Keep the abstention measurable, but never punish
+                // the engine for excluding a site the oracle cannot pin.
+                definitionUnresolvedReferenceEdges++;
             } else {
                 adjudicatedOracleCalls.push(oc);
-                if (status === 'target') definitionValidatedOracleCalls++;
-                else definitionUnresolvedReferenceEdges++;
             }
         }
         // UCN's public occurrence contract is line-granular. Preserve columns
@@ -488,6 +506,9 @@ async function evaluateRepo(repo, oracle) {
         const anyRefKeys = new Set(oracleRefs
             .filter(r => !(r.file === sym.file && r.line === sym.line))
             .map(r => key(r.file, r.line)));
+        const oracleMayReachKeys = new Set(oracleRefs
+            .filter(r => r.kind === 'call' && r.oracleResolution === 'may-reach')
+            .map(r => key(r.file, r.line)));
         const hitKeys = sym.kind === 'class' ? anyRefKeys : oracleKeys;
         // usage-style edges (calledAs:'bound', functionReference) verify against
         // any oracle ref at the line — see the mapping comment above.
@@ -506,6 +527,9 @@ async function evaluateRepo(repo, oracle) {
         const edgeMatchesTarget = async c => {
             if (superCtorSite(c)) return { hit: true, scorable: true, definitionValidated: false };
             if (needsDefinitionAdjudication) {
+                if (oracleMayReachKeys.has(key(c.file, c.line))) {
+                    return { hit: true, scorable: true, definitionValidated: true };
+                }
                 const status = await definitionStatus(
                     c.file, c.line, c.calledAs || sym.name, targetDef);
                 if (status === 'target') return { hit: true, scorable: true, definitionValidated: true };
@@ -514,6 +538,11 @@ async function evaluateRepo(repo, oracle) {
                     return { hit: false, scorable: false, definitionValidated: true };
                 }
                 if (status === 'other') return { hit: false, scorable: true, definitionValidated: true };
+                if (status === 'unresolved' &&
+                    lineContainsIdentifier(index, c.file, c.line,
+                        c.calledAs || sym.name)) {
+                    return { hit: false, scorable: false, definitionValidated: false };
+                }
                 if (referenceHit) return { hit: true, scorable: true, definitionValidated: false };
                 if (await isConfigurationGated(c.file, c.line)) {
                     return { hit: false, scorable: false, definitionValidated: false };
@@ -907,6 +936,8 @@ async function evaluateRepo(repo, oracle) {
         definitionValidatedUnverified,
         definitionValidatedOracleCalls,
         definitionUnresolvedReferenceEdges,
+        definitionAdjudicationUniverse: definitionValidatedOracleCalls +
+            definitionUnresolvedReferenceEdges + oracleBroadReferenceEdges,
         definitionLookupErrors,
         oracleBroadReferenceEdges,
         configurationGatedUnscored,
@@ -1087,6 +1118,8 @@ async function main() {
             result.summary.unverifiedUnscoredRatio = Number(
                 coverageGate.unverifiedUnscoredRatio.toFixed(4));
             result.summary.calleeUnscoredRatio = Number(coverageGate.calleeUnscoredRatio.toFixed(4));
+            result.summary.definitionUnresolvedRatio = Number(
+                coverageGate.definitionUnresolvedRatio.toFixed(4));
             if (coverageGate.failures.length > 0) {
                 process.stdout.write(`  ⚠ ORACLE COVERAGE GATE FAILURE: ${coverageGate.failures.join('; ')}\n`);
                 gateFailed = true;

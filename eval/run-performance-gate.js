@@ -49,7 +49,8 @@ const budgets = {
     maxQueryP95Ms: positiveNumber('--max-query-p95-ms', DEFAULT_BUDGETS.maxQueryP95Ms),
     maxRssMb: positiveNumber('--max-rss-mb', DEFAULT_BUDGETS.maxRssMb),
 };
-const REPORTS_DIR = path.join(__dirname, 'reports');
+const REPORTS_DIR = path.resolve(
+    process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 
 function readArg(flag) {
     const i = args.indexOf(flag);

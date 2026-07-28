@@ -166,6 +166,17 @@ describe('oracle gate policy', () => {
         assert.match(verdict.failures[1], /callee configuration-unscored/);
     });
 
+    it('fails when broad reference families cannot be pinned to exact definitions', () => {
+        const verdict = evaluateOracleCoverage({
+            definitionValidatedOracleCalls: 10,
+            oracleBroadReferenceEdges: 5,
+            definitionUnresolvedReferenceEdges: 20,
+        }, 0.10);
+        assert.equal(verdict.failures.length, 1);
+        assert.match(verdict.failures[0], /definition-unresolved oracle ratio/);
+        assert.equal(verdict.definitionUnresolvedRatio, 20 / 35);
+    });
+
     it('remains report-only when no coverage ceiling is requested', () => {
         const verdict = evaluateOracleCoverage({
             confirmedEdges: 4,

@@ -17,6 +17,9 @@ const output = require('../core/output');
 const { getCliCommandSet, resolveCommand, suggestCommand, FLAG_APPLICABILITY, toCliName, FILE_LOCAL_COMMANDS } = require('../core/registry');
 const { buildPublicParams, isPublicCommand } = require('../core/public-command');
 const { execute } = require('../core/execute');
+const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
+
+let activeCanonicalCommand = null;
 
 // Sentinel error for command failures that have already printed their message.
 // Thrown instead of process.exit(1) so finally blocks can run (cache save).
@@ -112,6 +115,11 @@ function validateNumericFlags(flags) {
     if (flags.workersRaw != null) {
         flags.workers = validatePositiveInt(flags.workersRaw, '--workers', { allowZero: true });
     }
+    if (flags.maxCharsRaw != null) {
+        flags.maxChars = validatePositiveInt(flags.maxCharsRaw, '--max-chars', {
+            cap: MAX_OUTPUT_CHARS,
+        });
+    }
 }
 
 /**
@@ -124,7 +132,18 @@ function fail(msg) {
     // reliable source for the output mode.
     const wantsJson = process.argv.includes('--json');
     if (wantsJson) {
-        const env = { meta: { ok: false }, error: typeof msg === 'string' ? msg : String(msg) };
+        const error = typeof msg === 'string' ? msg : String(msg);
+        const env = {
+            meta: {
+                ok: false,
+                ...(activeCanonicalCommand && {
+                    command: activeCanonicalCommand,
+                    contract: output.contractMeta(activeCanonicalCommand),
+                }),
+            },
+            data: null,
+            error,
+        };
         try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) { /* stdout may be closed */ }
     }
     console.error(msg);
@@ -235,6 +254,8 @@ function parseFlags(tokens) {
         limitRaw: getValueFlag('--limit'),
         maxFiles: parseInt(getValueFlag('--max-files') || '0') || undefined,
         maxFilesRaw: getValueFlag('--max-files'),
+        maxChars: parseInt(getValueFlag('--max-chars') || '0') || undefined,
+        maxCharsRaw: getValueFlag('--max-chars'),
         // Structural search flags
         type: getValueFlag('--type'),
         param: getValueFlag('--param'),
@@ -287,7 +308,7 @@ const knownFlags = new Set([
     '--default', '--top', '--no-follow-symlinks',
     '--base', '--staged', '--stack',
     '--regex', '--no-regex', '--functions', '--hot', '--diverse', '--git', '--cycles',
-    '--max-lines', '--class-name', '--line', '--limit', '--max-files',
+    '--max-lines', '--class-name', '--line', '--limit', '--max-files', '--max-chars',
     '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
     '--hide-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
     '--framework', '--workers', '--deep', '--compact', '--no-compact',
@@ -329,7 +350,7 @@ try {
 } catch (e) {
     if (e instanceof FlagValidationError) {
         if (flags.json) {
-            const env = { meta: { ok: false }, error: e.message };
+            const env = { meta: { ok: false }, data: null, error: e.message };
             try { process.stdout.write(JSON.stringify(env) + '\n'); } catch (_) { /* stdout may be closed */ }
         }
         console.error(e.message);
@@ -344,7 +365,7 @@ const VALUE_FLAGS = new Set([
     '--add-param', '--remove-param', '--rename-to', '--default', '--default-value',
     '--base', '--exclude', '--not', '--in', '--max-lines', '--class-name', '--line',
     '--type', '--param', '--receiver', '--returns', '--decorator',
-    '--limit', '--max-files', '--min-confidence', '--stack', '--framework',
+    '--limit', '--max-files', '--max-chars', '--min-confidence', '--stack', '--framework',
     '--workers', '--method', '--prefix'
 ]);
 
@@ -375,6 +396,19 @@ function requireArg(arg, usage) {
     if (!arg) {
         fail(usage);
     }
+}
+
+function formatCliText(command, result, params, execution, displayFlags) {
+    const text = output.formatPublicText(command, result, params, {
+        ...execution,
+        surface: 'cli',
+    });
+    return applyOutputBudget(text, {
+        command,
+        maxChars: displayFlags?.maxChars,
+        all: !!displayFlags?.all,
+        surface: 'cli',
+    }).text;
 }
 
 // ============================================================================
@@ -465,7 +499,7 @@ const GLOBAL_FLAG_KEYS = new Set([
     'json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles',
     'verbose', 'interactive', '_fileFromFileMode', 'topRaw',
     'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw',
-    'workersRaw',
+    'workersRaw', 'maxChars', 'maxCharsRaw',
 ]);
 
 /** Apply one command/flag policy across project, file, glob, and REPL modes. */
@@ -497,6 +531,7 @@ function runFileCommand(filePath, command, arg) {
     }
 
     const canonical = resolveCommand(command, 'cli') || command;
+    activeCanonicalCommand = canonical;
 
     // Commands that need full project index — auto-route to project mode
     const fileLocalCommands = FILE_LOCAL_COMMANDS;
@@ -556,7 +591,7 @@ function runFileCommand(filePath, command, arg) {
     if (!ok) fail(error);
     console.log(flags.json
         ? output.formatPublicJson(canonical, result, params, execution)
-        : output.formatPublicText(canonical, result, params, execution));
+        : formatCliText(canonical, result, params, execution, scopedFlags));
 }
 
 // ============================================================================
@@ -608,6 +643,7 @@ function runProjectCommand(rootDir, command, arg) {
     try {
     // Resolve CLI spelling to the canonical command ID.
     const canonical = resolveCommand(command, 'cli') || command;
+    activeCanonicalCommand = canonical;
 
     if (!isPublicCommand(canonical)) {
         fail(unknownCommandMessage(command));
@@ -623,7 +659,7 @@ function runProjectCommand(rootDir, command, arg) {
     if (!publicExecution.ok) fail(publicExecution.error);
     console.log(flags.json
         ? output.formatPublicJson(canonical, publicExecution.result, publicParams, publicExecution)
-        : output.formatPublicText(canonical, publicExecution.result, publicParams, publicExecution));
+        : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
     } catch (e) {
         if (!(e instanceof CommandError)) {
             console.error(`Error: ${e.message}`);
@@ -654,6 +690,7 @@ function runGlobCommand(pattern, command, arg) {
     }
 
     const canonical = resolveCommand(command, 'cli') || command;
+    activeCanonicalCommand = canonical;
 
     // Build a temporary index over the matched files and route through execute().
     // This gives glob mode the same semantics as project mode: test exclusions,
@@ -671,7 +708,7 @@ function runGlobCommand(pattern, command, arg) {
     if (!publicExecution.ok) fail(publicExecution.error);
     console.log(flags.json
         ? output.formatPublicJson(canonical, publicExecution.result, publicParams, publicExecution)
-        : output.formatPublicText(canonical, publicExecution.result, publicParams, publicExecution));
+        : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
 }
 
 // ============================================================================
@@ -723,6 +760,7 @@ Common flags:
   --all --compact --no-compact --json --include-tests --class-name=X --line=N
   --range=N-M (source with --file=PATH)
   --base=REF --staged --no-cache --clear-cache --max-files=N --workers=N
+  --max-chars=N (text output; default 10K targeted / 3K broad, ceiling 100K)
   Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
 
 Trust:
@@ -846,7 +884,7 @@ Flags can be added per-command: show myFunc --sections=source,callers
         const tokens = input.split(/\s+/);
         const command = tokens[0];
         // Flags that take a space-separated value (--flag value)
-        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--to', '--sections', '--range', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--min-confidence', '--class-name', '--line', '--framework', '--method', '--prefix']);
+        const valueFlagNames = new Set(['--file', '--in', '--base', '--add-param', '--remove-param', '--rename-to', '--default', '--depth', '--top', '--context', '--max-lines', '--direction', '--to', '--sections', '--range', '--exclude', '--not', '--stack', '--type', '--param', '--receiver', '--returns', '--decorator', '--limit', '--max-files', '--max-chars', '--min-confidence', '--class-name', '--line', '--framework', '--method', '--prefix']);
         const flagTokens = [];
         const argTokens = [];
         const skipNext = new Set();
@@ -917,7 +955,13 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
         console.log(publicExecution.error);
         return;
     }
-    console.log(output.formatPublicText(command, publicExecution.result, publicParams, publicExecution));
+    console.log(formatCliText(
+        command,
+        publicExecution.result,
+        publicParams,
+        publicExecution,
+        iflags,
+    ));
 }
 
 // ============================================================================

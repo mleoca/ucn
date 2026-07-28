@@ -20,7 +20,7 @@ function renderFrontier(lines, frontier, options = {}, expanded = false) {
     if (!frontier || frontier.length === 0) return false;
     lines.push('');
     const suffix = expanded
-        ? 'followed (--expand-unverified); downstream nodes are possible impact'
+        ? `followed (${options.expandUnverifiedHint || '--expand-unverified'}); downstream nodes are possible impact`
         : 'not expanded; possible additional impact';
     lines.push(`UNVERIFIED EDGES (${frontier.length}) — call syntax, no binding/receiver evidence; ${suffix}:`);
     const cap = options.all ? Infinity : 20;
@@ -34,7 +34,7 @@ function renderFrontier(lines, frontier, options = {}, expanded = false) {
         shown++;
     }
     if (frontier.length > shown) {
-        lines.push(`  (+${frontier.length - shown} more unverified — use --all)`);
+        lines.push(`  (+${frontier.length - shown} more unverified — ${options.allHint || 'use --all'})`);
     }
     return true;
 }
@@ -317,13 +317,13 @@ function formatBlast(blast, options = {}) {
             if (unverifiedEdges > 0) {
                 s += blast.expandUnverified
                     ? ` · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} followed (${possiblyAffected || 0} possibly affected)`
-                    : ` · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (--expand-unverified to follow them)`;
+                    : ` · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (${options.expandUnverifiedHint || '--expand-unverified'} to follow them)`;
             }
             lines.push(s);
         } else if (unverifiedEdges > 0) {
             lines.push(blast.expandUnverified
                 ? `Summary: no confirmed callers · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} followed (${possiblyAffected || 0} possibly affected)`
-                : `Summary: no confirmed callers · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (--expand-unverified to follow them)`);
+                : `Summary: no confirmed callers · ${unverifiedEdges} unverified edge${unverifiedEdges !== 1 ? 's' : ''} (${options.expandUnverifiedHint || '--expand-unverified'} to follow them)`);
         } else {
             lines.push('Summary: No callers found — this function is a root/entry point.');
         }
@@ -345,7 +345,7 @@ function formatBlast(blast, options = {}) {
 
     const blastFiltered = (blast.treeAccount?.filteredEdges ?? 0);
     if (blast.includeMethods === false && blastFiltered > 0) {
-        lines.push(`\nNote: ${blastFiltered} obj.method() caller edge(s) hidden (counted as filtered in the account). Use --include-methods to show them.`);
+        lines.push(`\nNote: ${blastFiltered} obj.method() caller edge(s) hidden (counted as filtered in the account). ${options.includeMethodsHint || 'Use --include-methods to show them.'}`);
     }
 
     return lines.join('\n');
@@ -499,7 +499,7 @@ function formatReverseTrace(result, options = {}) {
 
     const rtFiltered = (result.treeAccount?.filteredEdges ?? 0);
     if (result.includeMethods === false && rtFiltered > 0) {
-        lines.push(`\nNote: ${rtFiltered} obj.method() caller edge(s) hidden (counted as filtered in the account). Use --include-methods to show them.`);
+        lines.push(`\nNote: ${rtFiltered} obj.method() caller edge(s) hidden (counted as filtered in the account). ${options.includeMethodsHint || 'Use --include-methods to show them.'}`);
     }
 
     return lines.join('\n');
@@ -570,7 +570,7 @@ function formatAffectedTests(result, options = {}) {
                 lines.push(`    ${tf.file} (links: ${tf.linkedFunctions.join(', ')})`);
             }
             if (pat.length > MAX_POSSIBLE) {
-                lines.push(`    ... ${pat.length - MAX_POSSIBLE} more (use --all)`);
+                lines.push(`    ... ${pat.length - MAX_POSSIBLE} more (${options.allHint || 'use --all'})`);
             }
         }
     }

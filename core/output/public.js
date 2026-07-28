@@ -57,6 +57,47 @@ function modeOf(command, result) {
     return undefined;
 }
 
+function presentationHints(surface = 'cli') {
+    if (surface === 'mcp') {
+        return {
+            surface: 'mcp',
+            all: 'use all=true',
+            limit: 'Use limit=<n> to return and display more results.',
+            source: 'Run command=source with name=<handle> to inspect a listed symbol.',
+            usages: name => `run command=usages with name=${name}`,
+            detailed: 'Use detailed=true to list all functions and classes.',
+            top: 'Use top=<n> or all=true to show more.',
+            health: 'run command=repo with sections=health and deep=true for detail',
+            expandUnverified: 'expand_unverified=true',
+            includeMethods: 'Use include_methods=true to show them.',
+            nextRepo: result => [
+                ...(result.suggest ? [`command=show name=${result.suggest}`] : []),
+                'command=repo sections=files detailed=true',
+                'command=repo sections=stats hot=true top=20',
+                'command=repo sections=health deep=true',
+            ],
+        };
+    }
+    return {
+        surface: 'cli',
+        all: 'use --all',
+        limit: 'Use --limit=N to return and display more results.',
+        source: 'Use source <handle> to inspect a listed symbol.',
+        usages: name => `ucn usages ${name}`,
+        detailed: 'Use --detailed to list all functions and classes.',
+        top: 'Use --top=N or --all to show more.',
+        health: 'ucn repo --sections=health --deep for detail',
+        expandUnverified: '--expand-unverified',
+        includeMethods: 'Use --include-methods to show them.',
+        nextRepo: result => [
+            ...(result.suggest ? [`ucn show ${result.suggest}`] : []),
+            'ucn repo --sections=files --detailed',
+            'ucn repo --sections=stats --hot --top=20',
+            'ucn repo --sections=health --deep',
+        ],
+    };
+}
+
 function formatSource(result) {
     const mode = modeOf('source', result);
     if (mode === 'lines' || (result && Array.isArray(result.lines))) {
@@ -66,7 +107,7 @@ function formatSource(result) {
     return legacy.formatFnResult(result);
 }
 
-function formatShow(result, params = {}) {
+function formatShow(result, params = {}, hints = presentationHints()) {
     const selected = new Set(result.sections || []);
     const parts = [];
 
@@ -84,13 +125,21 @@ function formatShow(result, params = {}) {
         const formatted = legacy.formatContext(context, {
             showConfidence: params.showConfidence !== false,
             compact: params.compact !== false,
-            expandHint: 'Use source <handle> to inspect a listed symbol.',
+            expandHint: hints.source,
+            allHint: hints.all,
+            usagesHint: hints.usages(context.function || result.target),
         });
         parts.push(block('RELATIONSHIPS', formatted.text));
     }
     if (result.source) parts.push(block('SOURCE', formatSource(result.source)));
     if (result.dependencies) parts.push(block('DEPENDENCIES', legacy.formatSmart(result.dependencies)));
-    if (result.tests) parts.push(block('TESTS', formatTests(result.tests, { ...params, depth: 0 })));
+    if (result.tests) {
+        parts.push(block('TESTS', formatTests(
+            result.tests,
+            { ...params, depth: 0 },
+            hints,
+        )));
+    }
     if (result.types) parts.push(block('TYPES', legacy.formatTypedef(result.types.types || [], result.target)));
     if (result.example) parts.push(block('EXAMPLE', legacy.formatExample(result.example, result.target)));
     if (result.related) parts.push(block('RELATED', legacy.formatRelated(result.related, { all: params.all, top: params.top })));
@@ -98,11 +147,25 @@ function formatShow(result, params = {}) {
     return parts.join('\n\n');
 }
 
-function formatTrace(result, params = {}) {
+function formatTrace(result, params = {}, hints = presentationHints()) {
+    const traceHints = {
+        allHint: hints.all,
+        expandUnverifiedHint: hints.expandUnverified,
+        includeMethodsHint: hints.includeMethods,
+    };
     const mode = modeOf('trace', result);
-    if (mode === 'entrypoints') return legacy.formatReverseTrace(result, { allHint: 'Increase depth for a wider path search.' });
-    if (mode === 'callers') return legacy.formatBlast(result, { allHint: 'Increase depth for a wider caller tree.' });
-    return legacy.formatTrace(result, { allHint: 'Increase depth for a wider callee tree.' });
+    if (mode === 'entrypoints') return legacy.formatReverseTrace(result, {
+        ...traceHints,
+        allHint: 'Increase depth for a wider path search.',
+    });
+    if (mode === 'callers') return legacy.formatBlast(result, {
+        ...traceHints,
+        allHint: 'Increase depth for a wider caller tree.',
+    });
+    return legacy.formatTrace(result, {
+        ...traceHints,
+        allHint: 'Increase depth for a wider callee tree.',
+    });
 }
 
 function formatImpact(result, params = {}) {
@@ -111,9 +174,9 @@ function formatImpact(result, params = {}) {
         : legacy.formatImpact(result, { compact: params.compact !== false });
 }
 
-function formatTests(result, params = {}) {
+function formatTests(result, params = {}, hints = presentationHints()) {
     return modeOf('tests', result) === 'affected'
-        ? legacy.formatAffectedTests(result, { all: params.all })
+        ? legacy.formatAffectedTests(result, { all: params.all, allHint: hints.all })
         : legacy.formatTests(result, params.name);
 }
 
@@ -131,19 +194,34 @@ function formatDeps(result, params = {}) {
     return parts.join('\n\n');
 }
 
-function formatRepo(result, params = {}) {
+function formatRepo(result, params = {}, hints = presentationHints()) {
     const parts = [];
-    if (result.summary) parts.push(legacy.formatOrient(result.summary));
-    if (result.files) parts.push(block('FILES', legacy.formatToc(result.files)));
+    if (result.summary) {
+        parts.push(legacy.formatOrient(result.summary, {
+            healthHint: hints.health,
+            nextHints: hints.nextRepo,
+        }));
+    }
+    if (result.files) {
+        parts.push(block('FILES', legacy.formatToc(result.files, {
+            detailedHint: hints.detailed,
+            topHint: hints.top,
+        })));
+    }
     if (result.stats) parts.push(block('STATISTICS', legacy.formatStats(result.stats, { top: params.top || 0 })));
-    if (result.health) parts.push(block('HEALTH', legacy.formatDoctor(result.health)));
+    if (result.health) {
+        parts.push(block('HEALTH', legacy.formatDoctor(result.health, {
+            deepHint: hints.surface === 'mcp' ? 'use deep=true' : 'use --deep',
+        })));
+    }
     return parts.join('\n\n');
 }
 
 function formatPublicText(command, result, params = {}, execution = {}) {
+    const hints = presentationHints(execution.surface);
     let text;
     switch (command) {
-        case 'show': text = formatShow(result, params); break;
+        case 'show': text = formatShow(result, params, hints); break;
         case 'find':
             text = modeOf('find', result) === 'type'
                 ? legacy.formatTypedef(result, params.name)
@@ -152,7 +230,7 @@ function formatPublicText(command, result, params = {}, execution = {}) {
                     withSource: params.withSource,
                     top: params.limit,
                     all: !!params.all,
-                    limitHint: 'Use --limit=N to return and display more results.',
+                    limitHint: hints.limit,
                 });
             break;
         case 'usages': text = legacy.formatUsages(result, params.name, { compact: params.compact }); break;
@@ -162,9 +240,9 @@ function formatPublicText(command, result, params = {}, execution = {}) {
                 : legacy.formatSearch(result, params.term);
             break;
         case 'source': text = formatSource(result); break;
-        case 'trace': text = formatTrace(result, params); break;
+        case 'trace': text = formatTrace(result, params, hints); break;
         case 'impact': text = formatImpact(result, params); break;
-        case 'tests': text = formatTests(result, params); break;
+        case 'tests': text = formatTests(result, params, hints); break;
         case 'deps': text = formatDeps(result, params); break;
         case 'api': text = legacy.formatApi(result, params.file || '.'); break;
         case 'check':
@@ -173,8 +251,11 @@ function formatPublicText(command, result, params = {}, execution = {}) {
                 : legacy.formatCheck(result);
             break;
         case 'plan': text = legacy.formatPlan(result); break;
-        case 'repo': text = formatRepo(result, params); break;
-        case 'deadcode': text = legacy.formatDeadcode(result, { top: params.top || 0 }); break;
+        case 'repo': text = formatRepo(result, params, hints); break;
+        case 'deadcode': text = legacy.formatDeadcode(result, {
+            top: params.top || 0,
+            topHint: hints.top,
+        }); break;
         case 'entrypoints': text = legacy.formatEntrypoints(result); break;
         case 'endpoints': text = legacy.formatEndpoints(result, { bridge: result._bridge, unmatched: result._unmatched }); break;
         case 'stacktrace': text = legacy.formatStackTrace(result); break;

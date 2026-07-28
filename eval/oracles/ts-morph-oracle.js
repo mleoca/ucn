@@ -139,11 +139,19 @@ const tsMorphOracle = {
                 // edges, retain exact-owner calls plus calls resolved through
                 // an interface/base that the target may override; reject
                 // concrete sibling owners.
-                if (kind === 'call' && !methodCallMayReach(handle, decl, node, SyntaxKind)) continue;
+                const reach = kind === 'call'
+                    ? methodCallMayReach(handle, decl, node, SyntaxKind)
+                    : 'resolved';
+                if (reach === false) continue;
                 refs.push({
                     file: rel,
                     line: node.getStartLineNumber(),
+                    column: node.getStart() - node.getStartLinePos(),
                     kind,
+                    ...(kind === 'call' && {
+                        oracleResolution: reach === 'unresolved'
+                            ? 'unresolved' : 'may-reach',
+                    }),
                 });
             }
         }
@@ -159,20 +167,104 @@ const tsMorphOracle = {
         // dispatch capable of reaching it, or unresolved (oracle uncertainty).
         if (decl.getKind() === SyntaxKind.MethodDeclaration) {
             for (const node of methodCallCandidates(handle, name, SyntaxKind)) {
-                if (!methodCallMayReach(handle, decl, node, SyntaxKind)) continue;
+                const reach = methodCallMayReach(handle, decl, node, SyntaxKind);
+                if (reach === false) continue;
                 const rel = path.relative(handle.root, node.getSourceFile().getFilePath());
                 if (rel.startsWith('..')) continue;
                 refs.push({
                     file: rel,
                     line: node.getStartLineNumber(),
+                    column: node.getStart() - node.getStartLinePos(),
                     kind: 'call',
+                    oracleResolution: reach === 'unresolved'
+                        ? 'unresolved' : 'may-reach',
                 });
             }
         }
 
         return dedupeReferences(refs);
     },
+
+    /**
+     * Resolve the declaration selected at an exact reference occurrence.
+     *
+     * TypeScript's findReferences is rename-oriented and deliberately expands
+     * structural method families. Definition lookup is therefore required to
+     * distinguish an exact runtime edge from a broad family member. Plain JS
+     * often has no resolvable definition; returning [] is an explicit oracle
+     * abstention, never evidence for the sampled target.
+     */
+    async resolveDefinition(handle, { name, file, line, column }) {
+        const sf = handle.project.getSourceFile(path.join(handle.root, file));
+        if (!sf) return [];
+        const { SyntaxKind } = require('ts-morph');
+        let nodes = sf.getDescendantsOfKind(SyntaxKind.Identifier)
+            .filter(node => node.getText() === name &&
+                node.getStartLineNumber() === line);
+        if (Number.isInteger(column)) {
+            nodes = nodes.filter(node =>
+                node.getStart() - node.getStartLinePos() === column);
+        }
+        const defs = new Map();
+        for (const node of nodes) {
+            let definitionNodes;
+            try {
+                definitionNodes = node.getDefinitionNodes();
+            } catch {
+                continue;
+            }
+            for (const def of expandAliasDefinitions(definitionNodes, SyntaxKind)) {
+                const defFile = def.getSourceFile().getFilePath();
+                const defLine = def.getStartLineNumber();
+                const insideRoot = defFile === handle.root ||
+                    defFile.startsWith(handle.root + path.sep);
+                const entry = insideRoot
+                    ? { file: path.relative(handle.root, defFile), line: defLine }
+                    : { file: defFile, line: defLine, external: true };
+                defs.set(`${entry.external ? 'external:' : ''}${entry.file}:${entry.line}`, entry);
+            }
+        }
+        return [...defs.values()];
+    },
 };
+
+/**
+ * Follow compiler-resolved, value-preserving const aliases. A definition
+ * lookup at `alias()` normally stops on `const alias = target`; for call
+ * identity the initializer's definition is equally authoritative. Only
+ * direct identifier aliases (optionally parenthesized/cast) are followed.
+ */
+function expandAliasDefinitions(initial, SyntaxKind) {
+    const out = [];
+    const queue = (initial || []).map(node => ({ node, depth: 0 }));
+    const seen = new Set();
+    while (queue.length > 0) {
+        const { node, depth } = queue.shift();
+        const key = `${node.getSourceFile().getFilePath()}:${node.getStart()}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        out.push(node);
+        if (depth >= 4 || node.getKind() !== SyntaxKind.VariableDeclaration) continue;
+        let value = node.getInitializer?.();
+        while (value && [
+            SyntaxKind.ParenthesizedExpression,
+            SyntaxKind.AsExpression,
+            SyntaxKind.TypeAssertionExpression,
+            SyntaxKind.SatisfiesExpression,
+        ].includes(value.getKind())) {
+            value = value.getExpression?.();
+        }
+        if (!value || value.getKind() !== SyntaxKind.Identifier) continue;
+        let next;
+        try {
+            next = value.getDefinitionNodes();
+        } catch {
+            next = [];
+        }
+        for (const target of next) queue.push({ node: target, depth: depth + 1 });
+    }
+    return out;
+}
 
 function findTsConfig(dir) {
     // Walk up from the target dir to the repo root looking for tsconfig.json
@@ -188,9 +280,9 @@ function findTsConfig(dir) {
 }
 
 function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
-    if (targetDecl.getKind() !== SyntaxKind.MethodDeclaration) return true;
+    if (targetDecl.getKind() !== SyntaxKind.MethodDeclaration) return 'resolved';
     const targetOwner = targetDecl.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
-    if (!targetOwner) return true;
+    if (!targetOwner) return 'unresolved';
 
     let call = null;
     const parent = referenceNode.getParent();
@@ -201,15 +293,15 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
         const grand = parent.getParent();
         if (grand?.getKind() === SyntaxKind.CallExpression && grand.getExpression() === parent) call = grand;
     }
-    if (!call) return true;
+    if (!call) return 'resolved';
 
     let signatureDecl;
     try {
         signatureDecl = handle.project.getTypeChecker().getResolvedSignature(call)?.getDeclaration();
     } catch (e) {
-        return true; // oracle uncertainty must not become a false negative
+        return 'unresolved';
     }
-    if (!signatureDecl) return true;
+    if (!signatureDecl) return 'unresolved';
     const sigInterface = signatureDecl.getFirstAncestorByKind(SyntaxKind.InterfaceDeclaration);
     const sigOwner = signatureDecl.getFirstAncestorByKind(SyntaxKind.ClassDeclaration);
     // A concrete call may resolve to a standalone function installed as a
@@ -220,13 +312,18 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
     // definitive negative ownership evidence.
     if (!sigOwner) {
         if (sigInterface) {
-            return receiverTypeMayReachTarget(
-                handle, call, targetOwner, SyntaxKind) ||
-                interfaceShapeMayReachTarget(sigInterface, targetOwner);
+            const receiverVerdict = receiverTypeMayReachTarget(
+                handle, call, targetOwner, SyntaxKind);
+            if (receiverVerdict === true ||
+                interfaceShapeMayReachTarget(sigInterface, targetOwner)) {
+                return 'resolved';
+            }
+            return receiverVerdict === null ? 'unresolved' : false;
         }
-        return signatureDecl.getKind() !== SyntaxKind.FunctionDeclaration;
+        return signatureDecl.getKind() === SyntaxKind.FunctionDeclaration
+            ? false : 'unresolved';
     }
-    if (sameDeclarationOwner(targetOwner, sigOwner)) return true;
+    if (sameDeclarationOwner(targetOwner, sigOwner)) return 'resolved';
 
     // A call resolved to a base declaration may execute the target override.
     // A call resolved to a different concrete sibling cannot.
@@ -236,7 +333,7 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
         const key = `${base.getSourceFile().getFilePath()}:${base.getStart()}`;
         if (visited.has(key)) break;
         visited.add(key);
-        if (sameDeclarationOwner(base, sigOwner)) return true;
+        if (sameDeclarationOwner(base, sigOwner)) return 'resolved';
         base = base.getBaseClass();
     }
     return false;
@@ -269,15 +366,15 @@ function receiverTypeMayReachTarget(handle, call, targetOwner, SyntaxKind) {
     // method. Unresolved/any/unknown receivers remain conservative.
     try {
         const access = call.getExpression();
-        if (access?.getKind() !== SyntaxKind.PropertyAccessExpression) return true;
+        if (access?.getKind() !== SyntaxKind.PropertyAccessExpression) return null;
         const receiverType = handle.project.getTypeChecker()
             .getTypeAtLocation(access.getExpression());
-        if (receiverType.isAny?.() || receiverType.isUnknown?.()) return true;
+        if (receiverType.isAny?.() || receiverType.isUnknown?.()) return null;
         const targetType = targetOwner.getType();
         return targetType.isAssignableTo(receiverType) ||
             receiverType.isAssignableTo(targetType);
     } catch {
-        return true;
+        return null;
     }
 }
 
@@ -313,7 +410,7 @@ function methodCallCandidates(handle, name, SyntaxKind) {
 function dedupeReferences(refs) {
     const seen = new Set();
     return refs.filter(ref => {
-        const key = `${ref.file}:${ref.line}:${ref.kind}`;
+        const key = `${ref.file}:${ref.line}:${ref.column ?? '*'}:${ref.kind}`;
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
