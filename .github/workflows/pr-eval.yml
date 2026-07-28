@@ -7,6 +7,8 @@ name: PR Eval Gate
 #    confirmed/unverified; conserving it in a count is no longer enough)
 #  - tier-1 precision below the floor (locks the measured numbers in:
 #    both fast-gate repos now measure 100%; a 98% floor blocks material drift)
+#  - any identity, caller-tier, reason, or account disagreement between
+#    overlapping stable-handle commands on the deterministic symbol board
 # The seven-repository publish battery runs before release. The weekly and
 # manually dispatched workflow covers all nineteen pinned repositories.
 

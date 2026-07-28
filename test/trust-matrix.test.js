@@ -106,14 +106,16 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         }
     });
 
-    it('release and weekly workflows execute semantic, deadcode, and performance gates', () => {
+    it('release and weekly workflows execute semantic, deadcode, consistency, and performance gates', () => {
         const pkg = require('../package.json');
         assert.match(pkg.scripts['trust:gate'], /trust:gate:semantic/);
         assert.match(pkg.scripts['trust:gate'], /trust:gate:deadcode/);
+        assert.match(pkg.scripts['trust:gate'], /trust:gate:consistency/);
         assert.match(pkg.scripts['trust:gate'], /trust:gate:performance/);
         const publish = fs.readFileSync(path.join(ROOT, '.github/workflows/publish.yml'), 'utf8');
         const weekly = fs.readFileSync(path.join(ROOT, '.github/workflows/eval.yml'), 'utf8');
         assert.match(publish, /npm run trust:gate/);
+        assert.match(weekly, /trust:gate:consistency/);
         assert.match(weekly, /trust:gate:performance/);
     });
 
@@ -127,6 +129,7 @@ describe('command trust matrix: fail-closed proof coverage', () => {
         for (const script of [
             pkg.scripts['trust:gate:semantic'],
             pkg.scripts['trust:gate:deadcode'],
+            pkg.scripts['trust:gate:consistency'],
             pkg.scripts['trust:gate:performance'],
         ]) {
             assert.match(script, /--release/, `${script} must use the shared release board`);

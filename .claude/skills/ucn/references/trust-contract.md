@@ -27,8 +27,9 @@ Required automation checks:
 5. Unverified and excluded reasons are retained for review.
 6. Compiler/LSP evaluation reports keep configuration-unscored evidence below the release ceiling; a high-precision result from an undersized scored subset is not accepted.
 7. The release review-burden board passes: true edges left unverified, zero-actionable-ambiguity target rate, actionable candidate p95, and effective unverified review items per oracle edge all remain within the published budget. Raw false candidates remain reported separately.
+8. The deterministic cross-command board reports zero disagreements: overlapping `find`, `show`, `source`, `impact`, `tests`, `check`, and caller `trace` claims resolve the same stable handle to the same identity, projections, caller tiers, evidence reasons, totals, and caller account.
 
-Even when all seven hold, `account.contract.semanticComplete` remains false. Use compiler/type-checker, test, runtime, and framework evidence for semantic decisions.
+Even when all eight hold, `account.contract.semanticComplete` remains false. Use compiler/type-checker, test, runtime, and framework evidence for semantic decisions.
 
 `account.contract.observedTextZero` is safe only for the claim “the complete observed literal-name ground set contained no caller candidates or beyond-text edges.” It is explicitly not safe-delete proof.
 

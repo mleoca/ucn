@@ -10,6 +10,8 @@ name: Eval
 #    fails when missing-unexplained > 0 (the contract gate)
 #  - deadcode: every deadcode claim checked for oracle references — fails
 #    when a default-arm claim has a reference UCN missed (false-dead gate)
+#  - consistency: deterministic stable-handle board requires overlapping find,
+#    show, source, impact, tests, check, and caller-trace claims to agree exactly
 # Separate from ci.yml: heavier, network-dependent, weekly + on demand.
 
 on:
@@ -72,6 +74,9 @@ jobs:
 
       - name: "Deadcode eval (gate: default-arm false-dead = 0)"
         run: node eval/run-deadcode-eval.js --sample 300
+
+      - name: "Cross-command consistency (gate: disagreements = 0)"
+        run: npm run trust:gate:consistency
 
       - name: "Performance gate (cold build, warm cache, semantic query p95)"
         run: npm run trust:gate:performance

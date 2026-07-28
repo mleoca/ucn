@@ -41,6 +41,11 @@ const PROOF_CATALOG = Object.freeze({
         artifact: 'test/conservation.test.js',
         claim: 'Observed text occurrences partition without unexplained loss.',
     },
+    'cross-command-consistency': {
+        kind: 'relational-invariant',
+        artifact: 'eval/run-consistency-eval.js',
+        claim: 'Overlapping stable-handle commands agree exactly on target identity, projections, caller tiers, evidence reasons, totals, and accounting.',
+    },
     'cross-language-fixtures': {
         kind: 'independent-fixture',
         artifact: 'test/cross-language.test.js',
@@ -93,15 +98,15 @@ function row(claim, proofs, performanceClass, decisionSafety, oracleReason = nul
 }
 
 const COMMAND_TRUST_MATRIX = Object.freeze({
-    show: row('tiered-symbol-projection', ['oracle-callers', 'oracle-callees', 'oracle-symbols', 'oracle-references', 'conservation', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
-    find: row('exact-indexed-definition', ['oracle-symbols', 'cross-language-fixtures', 'surface-parity'], 'symbol-query', 'navigation'),
+    show: row('tiered-symbol-projection', ['oracle-callers', 'oracle-callees', 'oracle-symbols', 'oracle-references', 'conservation', 'cross-command-consistency', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
+    find: row('exact-indexed-definition', ['oracle-symbols', 'cross-command-consistency', 'cross-language-fixtures', 'surface-parity'], 'symbol-query', 'navigation'),
     usages: row('literal-code-reference-inventory', ['oracle-references', 'cross-language-fixtures', 'surface-parity'], 'project-scan', 'review-required'),
     search: row('literal-or-structural-match', ['cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'navigation', 'Literal results are text-ground exact; structural filters are AST fixture-checked rather than semantic identity claims.'),
-    source: row('exact-source-or-line-extraction', ['oracle-symbols', 'cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'source-query', 'navigation', 'Symbol source is compiler/LSP-gated; line slices are checked directly against validated file bytes.'),
-    trace: row('tiered-bidirectional-call-traversal', ['oracle-callers', 'oracle-callees', 'conservation', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
-    impact: row('tiered-symbol-or-git-impact', ['oracle-callers', 'conservation', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
-    tests: row('tiered-direct-or-transitive-test-evidence', ['oracle-callers', 'oracle-references', 'conservation', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
-    check: row('tiered-signature-or-precommit-diagnostic', ['oracle-callers', 'oracle-references', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
+    source: row('exact-source-or-line-extraction', ['oracle-symbols', 'cross-command-consistency', 'cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'source-query', 'navigation', 'Symbol source is compiler/LSP-gated; line slices are checked directly against validated file bytes.'),
+    trace: row('tiered-bidirectional-call-traversal', ['oracle-callers', 'oracle-callees', 'conservation', 'cross-command-consistency', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
+    impact: row('tiered-symbol-or-git-impact', ['oracle-callers', 'conservation', 'cross-command-consistency', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
+    tests: row('tiered-direct-or-transitive-test-evidence', ['oracle-callers', 'oracle-references', 'conservation', 'cross-command-consistency', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
+    check: row('tiered-signature-or-precommit-diagnostic', ['oracle-callers', 'oracle-references', 'cross-command-consistency', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
     plan: row('refactor-preview', ['oracle-callers', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
     repo: row('diagnostic-repository-composition', ['cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'navigation', 'Repository orientation composes index accounting, framework hints, and explicit readiness diagnostics; it is not an accuracy estimate.'),
     deps: row('static-dependency-analysis', ['graph-invariants', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'Import, importer, traversal, and cycle views are algebraic derivatives of the static import graph; dynamic imports remain explicit blind spots.'),

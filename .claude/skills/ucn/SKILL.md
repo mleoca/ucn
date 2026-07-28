@@ -22,6 +22,8 @@ Prefer `--json` for automation. Every CLI JSON response uses `{ meta, data }`. M
 
 CLI, MCP, and interactive mode resolve the same 18 public commands through one registry, execute the same handlers, and use the same public formatters. CLI spells multiword commands with hyphens; MCP uses snake case. For example, use `audit-async` in CLI and `audit_async` in MCP.
 
+The release board independently cross-checks overlapping stable-handle answers from `find`, `show`, `source`, `impact`, `tests`, `check`, and caller `trace`. Target identity, source and direct-test projections, caller tiers, evidence reasons, totals, and accounting must agree exactly; a mismatch is a failing witness rather than an interpretation left to an agent.
+
 MCP keeps its process and project index warm across calls. Targeted commands default to 10K output characters, broad commands to 3K, with a 100K hard ceiling. Use `max_chars`, a narrower file/directory scope, or a smaller section projection when necessary.
 
 Persistent indexes live in a per-user, project-keyed cache rather than the analyzed repository. Set `UCN_CACHE_DIR` to override the cache root; CLI `--no-cache` bypasses persistence and `--clear-cache` removes the current project's cache. Legacy `<project>/.ucn-cache` directories are migrated on first use.

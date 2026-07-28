@@ -949,10 +949,18 @@ const HANDLERS = {
             const classErr = validateClassName(index, p.name, p.className);
             if (classErr) return { ok: false, error: classErr };
         }
+        if (p.line) {
+            const pinErr = checkDefinitionPin(index, p);
+            if (pinErr) return { ok: false, error: pinErr };
+        }
         // Auto-include tests when pattern clearly targets test functions
         // But only if the user didn't explicitly set include_tests=false
         let includeTests = p.includeTests;
-        if (includeTests === undefined && p.name && /^test[_*?A-Z]/i.test(p.name)) {
+        if (includeTests === undefined && p.line) {
+            // A stable handle is an explicit exact-definition request. Its
+            // target must not disappear merely because it lives in test code.
+            includeTests = true;
+        } else if (includeTests === undefined && p.name && /^test[_*?A-Z]/i.test(p.name)) {
             includeTests = true;
         }
         const exclude = applyTestExclusions(p.exclude, includeTests);
@@ -963,6 +971,10 @@ const HANDLERS = {
             exclude,
             in: p.in,
         });
+        const line = Number(p.line);
+        if (p.line && Number.isFinite(line)) {
+            result = result.filter(item => item.startLine === line);
+        }
         if (p.type) {
             const kindGroups = {
                 function: new Set(['function', 'method', 'constructor', 'get', 'set']),

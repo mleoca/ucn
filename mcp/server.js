@@ -245,7 +245,7 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 - check: symbol signature check when name is set; precommit check when omitted. plan previews a refactor.
 - deadcode/audit_async/stacktrace: focused audits and runtime evidence.
 
-CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned.` + generateMcpParamSection();
+CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Release evaluation cross-checks overlapping stable-handle claims across find, show, source, impact, tests, check, and caller trace.` + generateMcpParamSection();
 
 // The default description is the only public contract. The former verbose
 // description is intentionally not selectable: it documented retired commands
