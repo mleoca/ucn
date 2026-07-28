@@ -94,7 +94,11 @@ const COMMAND_CONTRACTS = Object.freeze({
         examples: ['ucn search "TODO|FIXME" --code-only', 'ucn search --type=call --receiver=db'],
         jsonData: 'Text mode returns files with line matches; structural mode returns indexed match records and mode metadata.',
         output: 'Project scan; narrow with `file`, `in`, `exclude`, `type`, or `limit`.',
-        next: ['Use `find` to pin a matched definition.', 'Use `source` to inspect a selected result.'],
+        next: [
+            'Use `find` to pin a matched definition.',
+            'Use `source` to inspect a selected result.',
+            'Use grep/ripgrep for simple literals, messages, configuration, filenames, Markdown, or unsupported languages.',
+        ],
         benchmark: 'A05',
     }),
     source: contract({

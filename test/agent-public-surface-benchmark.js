@@ -137,6 +137,8 @@ const SCENARIOS = Object.freeze([
             assertion('usages retains the alias reference',
                 doc => doc.data?.some(row => row.usageType === 'reference' &&
                     row.line === 27)),
+            assertion('every usage row has an explicit machine-readable kind',
+                doc => doc.data?.every(row => typeof row.usageType === 'string')),
         ],
     },
     {

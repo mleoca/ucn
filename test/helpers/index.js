@@ -24,7 +24,12 @@ const PROJECT_DIR = path.resolve(__dirname, '../..');
 const FIXTURES_PATH = path.join(__dirname, '..', 'fixtures');
 const CLI_PATH = path.join(__dirname, '../../cli/index.js');
 const MCP_PATH = path.join(__dirname, '../../mcp/server.js');
-const TIMEOUT_MS = 30000;
+// The full suite runs parser/oracle-heavy files concurrently. Interactive and
+// spawned CLI tests complete in a few seconds in isolation but can exceed 30s
+// under that intentional CPU pressure, producing a false release failure after
+// the child has already emitted valid output. Keep a bounded one-minute guard;
+// MCP gets two minutes because it also owns cold index construction.
+const TIMEOUT_MS = 60000;
 const MCP_TIMEOUT_MS = TIMEOUT_MS * 2;
 
 // ── Temp directory helpers ──────────────────────────────────────────────────

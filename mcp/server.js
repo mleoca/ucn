@@ -232,6 +232,8 @@ function resolveAndValidatePath(index, file) {
 
 const CONCISE_TOOL_DESCRIPTION = `Auditable AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, and HTML.
 
+Use UCN for semantic questions: exact definitions, symbol-aware callers/callees, change impact, test selection, dependencies, APIs, entry points, and focused audits. Use grep/ripgrep for simple literals, error messages, configuration, filenames, Markdown, and unsupported languages. UCN search is worthwhile when AST structure, code-only filtering, or the shared agent contract matters.
+
 18 task-oriented commands:
 - repo: repository overview; sections=files,stats,health adds detail.
 - show: one symbol; sections=summary,callers,callees,source,dependencies,tests,types,example,related.

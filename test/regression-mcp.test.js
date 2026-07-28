@@ -464,6 +464,8 @@ describe('MCP two-tier output limits', () => {
                 `description should be useful without consuming the context window (${description.length} chars)`);
             assert.ok(description.includes('observed-text zero'), description);
             assert.ok(description.includes('Evidence weights are ordinal, not probabilities'), description);
+            assert.ok(description.includes('Use UCN for semantic questions'), description);
+            assert.ok(description.includes('Use grep/ripgrep for simple literals'), description);
             assert.ok(!description.includes('genuinely has no callers'), description);
         } finally {
             client.stop();

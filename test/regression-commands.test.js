@@ -4517,6 +4517,42 @@ describe('fix #228: impact runs pure engine physics — agrees with context on t
             assert.ok(imp.result.account.conserved, 'impact account conserves');
         } finally { rm(dir); }
     });
+
+    it('an imported module call is not shadowed by a same-named wrapper method', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'search.js': [
+                'function usages(index, name) { return [index, name]; }',
+                'module.exports = { usages };',
+            ].join('\n'),
+            'project.js': [
+                'const searchModule = require("./search");',
+                'class ProjectIndex {',
+                '  usages(name) { return searchModule.usages(this, name); }',
+                '}',
+                'module.exports = { ProjectIndex };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const contextResult = execute(index, 'context', {
+                name: 'usages', file: 'search.js',
+            });
+            const impactResult = execute(index, 'impact', {
+                name: 'usages', file: 'search.js',
+            });
+            assert.ok(contextResult.ok, contextResult.error);
+            assert.ok(impactResult.ok, impactResult.error);
+            const contextSites = contextResult.result.callers
+                .map(site => `${site.relativePath}:${site.line}`);
+            const impactSites = impactResult.result.byFile
+                .flatMap(group => group.sites.map(site => `${group.file}:${site.line}`));
+            assert.deepStrictEqual(impactSites, contextSites);
+            assert.deepStrictEqual(impactSites, ['project.js:3']);
+            assert.strictEqual(impactResult.result.unverifiedSites.length, 0);
+            assert.ok(impactResult.result.account.conserved);
+        } finally { rm(dir); }
+    });
 });
 
 describe('fix #230: verify class targets arg-check the CONSTRUCTOR; ctor-call parsing; receiver shift', () => {

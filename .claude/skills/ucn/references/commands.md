@@ -2,6 +2,11 @@
 
 UCN exposes exactly 18 task-oriented public commands. CLI uses hyphenated names; MCP uses snake case.
 
+Use grep/ripgrep for simple literals, error messages, configuration, filenames,
+Markdown, and unsupported languages. Use UCN for exact symbol identity,
+callers/callees, change impact, test linkage, dependency/API questions, and AST
+structural or code-only search.
+
 ## Understand and navigate
 
 | Command | Purpose |

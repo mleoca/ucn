@@ -12,6 +12,13 @@ language IR/adapter boundary and first-class C, C++, and C# indexing.
 
 UCN is a tree-sitter code-intelligence engine for JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, and HTML inline scripts. It exposes the same 18 task-oriented commands through the CLI, interactive mode, and one MCP tool for AI agents.
 
+UCN complements grep rather than replacing it. Use grep/ripgrep for simple
+literals, error messages, configuration, filenames, Markdown, and unsupported
+languages. Reach for UCN when the question is semantic: which exact definition
+is this, who calls it, what can it call, what changes with it, which tests are
+statically linked, or how files and public surfaces connect. Use UCN `search`
+when AST structure, code-only filtering, or the shared agent contract matters.
+
 ```bash
 npm install -g ucn # Node.js 20+
 

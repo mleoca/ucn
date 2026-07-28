@@ -186,6 +186,7 @@ function usages(index, name, options = {}) {
     for (const def of definitions) {
         usagesList.push({
             ...def,
+            usageType: 'definition',
             isDefinition: true,
             line: def.startLine,
             content: index.getLineContent(def.file, def.startLine),

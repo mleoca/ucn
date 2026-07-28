@@ -730,6 +730,11 @@ Trust:
   requires review. ACCOUNT conserves observed text lines; it never proves full
   runtime semantics or safe deletion.
 
+UCN vs grep:
+  Use UCN for definitions, callers/callees, impact, tests, dependencies, APIs,
+  entry points, and audits. Use grep/ripgrep for simple literals, messages,
+  configuration, filenames, Markdown, and unsupported languages.
+
 Quick start:
   ucn repo
   ucn show handleRequest

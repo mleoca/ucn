@@ -911,7 +911,6 @@ function impact(index, name, options = {}) {
     let impactAccountRaw = null;
     let impactRoutedUnverified = []; // engine-routed retained drops (unverifiedEntries)
     const impactClaims = [];
-    const impactPostHocExcluded = [];
     const impactPostHocUnverified = [];
     if (options.className || defIsMethod || defIsTypeDef) {
         // findCallers has proper method call resolution (self/this, binding IDs, receiver checks)
@@ -968,7 +967,6 @@ function impact(index, name, options = {}) {
         });
         impactAccountRaw = callerResults.accountRaw;
         impactRoutedUnverified = callerResults.unverifiedEntries || [];
-        const targetBindingId = def.bindingId;
         // Convert findCallers results to the format expected by analyzeCallSite
         const calls = callerResults.map(c => ({
             file: c.file,
@@ -985,36 +983,20 @@ function impact(index, name, options = {}) {
             resolution: c.resolution,
             tier: c.tier,
         }));
-        // Keep the same binding filter for backward compat (findCallers already handles this,
-        // but cross-check with usages-based binding filter for safety)
-        const filteredCalls = calls.filter(u => {
-            const fileEntry = index.files.get(u.file);
-            if (fileEntry && targetBindingId) {
-                let localBindings = (fileEntry.bindings || []).filter(b => b.name === name);
-                if (localBindings.length === 0 && langTraits(fileEntry.language)?.packageScope === 'directory') {
-                    const dir = path.dirname(u.file);
-                    for (const [fp, fe] of index.files) {
-                        if (fp !== u.file && path.dirname(fp) === dir) {
-                            const sibling = (fe.bindings || []).filter(b => b.name === name);
-                            localBindings = localBindings.concat(sibling);
-                        }
-                    }
-                }
-                if (localBindings.length > 0 && !localBindings.some(b => b.id === targetBindingId)) {
-                    impactPostHocExcluded.push({ file: u.file, line: u.line, reason: 'other-definition' });
-                    return false;
-                }
-            }
-            return true;
-        });
-        // (findCallers already handles binding resolution and scope-aware filtering)
+        // findCallers already applied binding, receiver, module ownership, and
+        // target-definition pinning. Do not second-guess it with a file-level
+        // same-name binding scan: a wrapper method named `usages` can legally
+        // call `searchModule.usages()`, and the receiver proves that this is the
+        // imported standalone function rather than the local method. The old
+        // post-hoc filter dropped that confirmed edge from impact while show
+        // kept it, violating command parity.
 
         // Analyze each call site, filtering out method calls for non-method definitions
         callSites = [];
         const defFileEntry = index.files.get(def.file);
         const defLang = defFileEntry?.language;
         const targetDir = defLang === 'go' ? path.basename(path.dirname(def.file)) : null;
-        for (const call of filteredCalls) {
+        for (const call of calls) {
             const analysis = index.analyzeCallSite(call, name);
             // BUG-H3: when includeMethods is true, keep method-style calls
             // (e.g. obj.findCallers() resolves to standalone findCallers via the
@@ -1129,7 +1111,7 @@ function impact(index, name, options = {}) {
             if (cl.tier === 'unverified') unverifiedEntries.push(cl);
             else confirmedEntries.push(cl);
         }
-        const excludedEntries = [...(impactAccountRaw?.excludedEntries || []), ...impactPostHocExcluded];
+        const excludedEntries = impactAccountRaw?.excludedEntries || [];
         const filteredTotal = impactFilteredByFlag.exclude + impactFilteredByFlag.unreachableOnly;
         return buildAccount(index, name, {
             groundSet,

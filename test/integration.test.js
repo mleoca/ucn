@@ -85,6 +85,8 @@ describe('ProjectIndex', () => {
         const calls = usages.filter(u => u.usageType === 'call');
 
         assert.ok(defs.length > 0, 'Should find definition');
+        assert.ok(defs.every(u => u.usageType === 'definition'),
+            'definition rows should use the same explicit usageType shape');
         assert.ok(calls.length > 0, 'Should find calls');
     });
 
