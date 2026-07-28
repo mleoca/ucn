@@ -13,6 +13,7 @@ const { _declaredFieldType, _projectTopLevelNames } = require('./callers');
 const path = require('path');
 const { isTestFile } = require('./discovery');
 const { summarizeCommandTrust } = require('./trust-matrix');
+const { projectComputedDispatch } = require('./ast-analysis');
 
 function matchesReportingScope(index, relativePath, options = {}) {
     if (!relativePath) return false;
@@ -604,6 +605,7 @@ function doctor(index, options = {}) {
         dynamicImports: { count: 0, fileCount: 0, files: [] },
         evalCalls:      { count: 0, fileCount: 0, files: [] },
         reflection:     { count: 0, fileCount: 0, files: [] },
+        computedDispatch:{ count: 0, fileCount: 0, files: [] },
         parseFailures:  { count: 0, fileCount: 0, files: [] },
         parseRecoveries:{ count: 0, fileCount: 0, files: [] },
         unsupportedSources: {
@@ -616,6 +618,7 @@ function doctor(index, options = {}) {
     // footer, so the two never drift (field-report #2). Occurrence counts.
     const { hasTextBlindspots, countTextBlindspots } = require('./shared');
 
+    const computedDispatch = projectComputedDispatch(index);
     for (const [filePath, fe] of index.files) {
         fileCounts.total++;
         const rel = fe.relativePath || filePath;
@@ -637,6 +640,10 @@ function doctor(index, options = {}) {
         };
 
         if (fe.dynamicImports && fe.dynamicImports > 0) recordBlind(blindSpots.dynamicImports, fe.dynamicImports);
+        if (computedDispatch.has(filePath)) {
+            recordBlind(blindSpots.computedDispatch,
+                computedDispatch.get(filePath).length);
+        }
         if (fe.parseError) recordBlind(blindSpots.parseFailures, 1);
         if (fe.parseRecovery) recordBlind(blindSpots.parseRecoveries, 1);
 
@@ -707,6 +714,9 @@ function doctor(index, options = {}) {
     if (blindSpots.parseRecoveries.count > 0) blindSignals.push(`${blindSpots.parseRecoveries.count} parse-recovery file(s)`);
     if (blindSpots.evalCalls.count > 0) blindSignals.push(`${blindSpots.evalCalls.count} eval/exec use(s) in ${blindSpots.evalCalls.fileCount} file(s)`);
     if (blindSpots.reflection.count > 0) blindSignals.push(`${blindSpots.reflection.count} reflection use(s) in ${blindSpots.reflection.fileCount} file(s)`);
+    if (blindSpots.computedDispatch.count > 0) {
+        blindSignals.push(`${blindSpots.computedDispatch.count} computed dispatch call(s) in ${blindSpots.computedDispatch.fileCount} file(s)`);
+    }
     if (blindSpots.dynamicImports.count > 0) blindSignals.push(`${blindSpots.dynamicImports.count} dynamic import(s) in ${blindSpots.dynamicImports.fileCount} file(s)`);
     if (blindSpots.unsupportedSources.count > 0) {
         const mix = Object.entries(blindSpots.unsupportedSources.languages)
@@ -755,7 +765,8 @@ function doctor(index, options = {}) {
         }
     }
 
-    const dynamicCount = blindSpots.evalCalls.count + blindSpots.reflection.count + blindSpots.dynamicImports.count;
+    const dynamicCount = blindSpots.evalCalls.count + blindSpots.reflection.count +
+        blindSpots.dynamicImports.count + blindSpots.computedDispatch.count;
     const semanticLevel = blindSpots.parseFailures.count > 0 || blindSpots.parseRecoveries.count > 0 ? 'LOW'
         : unsupportedCount > 0 ? 'PARTIAL'
             : dynamicCount > 0 ? 'REVIEW' : 'UNKNOWN';

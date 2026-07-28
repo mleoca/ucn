@@ -4,6 +4,7 @@
 
 const { unverifiedReasonLabel, advisoryLine } = require('./shared');
 const { formatAccountLines } = require('./analysis');
+const { formatSurfaceMessage } = require('../registry');
 
 /**
  * Render the v4 unverified band shared by verify and plan: capped one-liners
@@ -41,9 +42,10 @@ function formatPlan(plan, options = {}) {
         // Only show the parameter list when the error result carries one —
         // unrelated errors (multi-op rejection) don't, and "none" would be
         // wrong for functions that have parameters.
+        const nativeError = formatSurfaceMessage(plan.error, options.surface || 'cli');
         return plan.currentParams
-            ? `Error: ${plan.error}\nCurrent parameters: ${plan.currentParams.join(', ') || 'none'}`
-            : `Error: ${plan.error}`;
+            ? `Error: ${nativeError}\nCurrent parameters: ${plan.currentParams.join(', ') || 'none'}`
+            : `Error: ${nativeError}`;
     }
 
     const lines = [];
@@ -63,6 +65,10 @@ function formatPlan(plan, options = {}) {
     // Summary
     lines.push(`CHANGES NEEDED: ${plan.totalChanges}`);
     lines.push(`  Files affected: ${plan.filesAffected}`);
+    if (plan.changeSummary) {
+        const summary = plan.changeSummary;
+        lines.push(`  Definition ${summary.definitions}, calls/references ${summary.calls}, imports ${summary.imports}, exports ${summary.exports}, manual review ${summary.reviewRequired}`);
+    }
     if (plan.scopeWarning) {
         lines.push(`  Note: ${plan.scopeWarning.hint}`);
     }
@@ -81,7 +87,9 @@ function formatPlan(plan, options = {}) {
     for (const [file, changes] of byFile) {
         lines.push(`\n${file} (${changes.length} changes)`);
         for (const change of changes) {
-            lines.push(`  :${change.line}`);
+            const kind = change.editKind ? ` [${change.editKind}]` : '';
+            const review = change.needsReview ? ' [review required]' : '';
+            lines.push(`  :${change.line}${kind}${review}`);
             lines.push(`    ${change.expression}`);
             lines.push(`    → ${change.suggestion}`);
         }
@@ -139,11 +147,18 @@ function formatPlanJson(plan) {
             after: { signature: plan.after.signature },
             totalChanges: plan.totalChanges,
             filesAffected: plan.filesAffected,
+            ...(plan.changeSummary && { changeSummary: plan.changeSummary }),
             changes: plan.changes.map(c => ({
                 file: c.file,
                 line: c.line,
                 expression: c.expression,
-                suggestion: c.suggestion
+                suggestion: c.suggestion,
+                ...(c.newExpression && { newExpression: c.newExpression }),
+                ...(c.editKind && { editKind: c.editKind }),
+                ...(c.isDefinition && { isDefinition: true }),
+                ...(c.isImport && { isImport: true }),
+                ...(c.isExport && { isExport: true }),
+                ...(c.needsReview && { needsReview: true }),
             })),
             // v4 tiered contract passthrough
             unverifiedCount: plan.unverifiedCount,

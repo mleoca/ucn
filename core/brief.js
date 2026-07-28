@@ -18,6 +18,7 @@ const fs = require('fs');
 const path = require('path');
 const { detectLanguage } = require('../languages');
 const { formatSymbolHandle } = require('./shared');
+const { computeAstComplexity } = require('./ast-analysis');
 
 // ============================================================================
 // Side-effect signal sets (per-language, conservative)
@@ -144,9 +145,10 @@ function brief(index, name, options = {}) {
         // For callable symbols, scan the body
         const filePath = path.isAbsolute(def.file) ? def.file : path.join(index.root, def.file);
         let bodyText = '';
+        let fileContent = '';
         try {
-            const content = fs.readFileSync(filePath, 'utf-8');
-            const lines = content.split('\n');
+            fileContent = fs.readFileSync(filePath, 'utf-8');
+            const lines = fileContent.split('\n');
             const start = Math.max(0, (def.startLine || 1) - 1);
             const end = Math.min(lines.length, def.endLine || def.startLine || 1);
             bodyText = lines.slice(start, end).join('\n');
@@ -167,7 +169,10 @@ function brief(index, name, options = {}) {
         const fileImports = collectImportNames(fileEntry);
 
         const sideEffects = classifySideEffects(bodyText, language, fileImports);
-        const complexity = computeComplexity(bodyText, language);
+        const complexity = computeAstComplexity(fileContent, language, {
+            startLine: def.startLine || 1,
+            endLine: def.endLine || def.startLine || 1,
+        });
 
         return {
             symbol,
@@ -308,59 +313,6 @@ function escapeRegExp(s) {
 }
 
 /**
- * Compute complexity metrics from a function body.
- * Cheap, AST-free counts on tokenized source.
- */
-function computeComplexity(bodyText, language) {
-    const lines = bodyText.split('\n');
-    const lineCount = lines.length;
-
-    // Branch count: count keywords that introduce a new branching path.
-    // We deliberately ignore final `else` (it's just the alternate of an `if`).
-    const branchPatterns = [
-        /\bif\s*\(/g,        // JS/TS/Java/Rust/Go/C-like
-        /\bif\s+/g,          // Python (if x:)
-        /\belif\b/g,         // Python
-        /\belse\s+if\b/g,    // JS/Java/etc.
-        /\bcase\b/g,         // switch case
-        /\bwhen\b/g,         // Rust match arms (and Kotlin/Scala but we don't support those)
-        /\bfor\s*\(/g,       // C-like for
-        /\bfor\s+\w/g,       // Python for x in
-        /\bwhile\s*\(/g,     // C-like while
-        /\bwhile\s+/g,       // Python while x:
-        /\?[^?]/g,           // ternary (rough)
-        /\bcatch\s*\(/g,     // catch
-        /\bexcept\b/g,       // Python except
-    ];
-    let branches = 0;
-    for (const re of branchPatterns) branches += (bodyText.match(re) || []).length;
-
-    // maxDepth: indent-based proxy. Fast, language-agnostic, off-by-one safe.
-    let maxDepth = 0;
-    let firstNonBlankIndent = -1;
-    for (const line of lines) {
-        if (!line.trim()) continue;
-        const m = line.match(/^(\s*)/);
-        const spaces = m ? expandIndent(m[1]) : 0;
-        if (firstNonBlankIndent === -1) firstNonBlankIndent = spaces;
-        // depth = (current - first) / unit; we don't know "unit", so just track
-        // raw delta and divide by 2 (conservative — most code is 2 or 4 space indented).
-        const rawDepth = Math.max(0, spaces - firstNonBlankIndent);
-        if (rawDepth > maxDepth) maxDepth = rawDepth;
-    }
-    // Translate raw spaces to depth levels (assume 2-space indent baseline)
-    const depth = Math.round(maxDepth / 2);
-
-    return { branches, maxDepth: depth, lineCount };
-}
-
-function expandIndent(s) {
-    let n = 0;
-    for (const c of s) n += (c === '\t') ? 4 : 1;
-    return n;
-}
-
-/**
  * Lazy classifier: side-effect tags for an arbitrary symbol record.
  * Used by callee output (`context`, `about`) to surface [fs]/[net]/[proc] tags
  * inline. Cached on the index in `_sideEffectCache` (key: file:startLine).
@@ -402,6 +354,6 @@ module.exports = {
     sideEffectsFor,
     // exposed for tests
     classifySideEffects,
-    computeComplexity,
+    computeComplexity: computeAstComplexity,
     firstSentence,
 };

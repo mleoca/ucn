@@ -592,8 +592,14 @@ describe('conservation: tree/diffImpact/verify/plan/context-callees/smart run th
             // BUG-BW lockstep under the contract: plan's confirmed sites === verify's
             const p = execute(index, 'plan', { name: 'save', file: 'lib.js', line: 4, addParam: 'opt' });
             assert.ok(p.ok, 'plan should succeed');
-            assert.strictEqual(p.result.totalChanges, v.result.totalCalls,
-                'plan totalChanges must equal verify totalCalls');
+            assert.strictEqual(p.result.changeSummary.calls, v.result.totalCalls,
+                'plan call edits must equal verify totalCalls');
+            assert.strictEqual(p.result.changeSummary.definitions, 1,
+                'plan must separately include the selected declaration edit');
+            assert.strictEqual(
+                p.result.totalChanges,
+                v.result.totalCalls + p.result.changeSummary.definitions,
+                'plan totalChanges includes calls plus the declaration edit');
             assert.strictEqual(p.result.unverifiedCount, v.result.unverifiedCount,
                 'plan and verify agree on the unverified band');
             assert.ok(p.result.account && p.result.account.conserved, 'plan account must conserve');

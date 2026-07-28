@@ -33,7 +33,15 @@ try {
 const { ProjectIndex } = require('../core/project');
 const { findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getMcpCommandEnum, normalizeParams, FLAG_APPLICABILITY, REVERSE_PARAM_MAP, generateMcpParamSection, resolveCommand } = require('../core/registry');
+const {
+    getMcpCommandEnum,
+    normalizeParams,
+    FLAG_APPLICABILITY,
+    REVERSE_PARAM_MAP,
+    generateMcpParamSection,
+    resolveCommand,
+    formatSurfaceMessage,
+} = require('../core/registry');
 const { execute } = require('../core/execute');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
 
@@ -172,13 +180,13 @@ Use UCN for semantic questions: exact definitions, symbol-aware callers/callees,
 18 task-oriented commands:
 - repo: repository overview; sections=files,stats,health adds detail. Reports skipped unsupported source explicitly and hands it to grep/language-native tooling.
 - show: one symbol; sections=summary,callers,callees,source,dependencies,tests,types,example,related.
-- find/usages/search/source: locate definitions, references, text/structure, or exact source.
+- find/usages/search/source: locate definitions, literal-name occurrences, literal text (regex=true is explicit), AST structure, or exact source.
 - trace: direction=callees or callers; to=entrypoints follows callers to roots.
 - impact: symbol impact when name is set; Git-diff impact when it is omitted.
 - tests: static direct links by default; depth>0 includes transitive affected links. Empty results are not runtime coverage proof.
 - deps/api/entrypoints/endpoints: architecture and public surfaces.
-- check: symbol signature check when name is set; precommit check when omitted. plan previews a refactor.
-- deadcode/audit_async/stacktrace: focused audits and runtime evidence.
+- check: symbol signature check when name is set; precommit check when omitted. plan previews the selected declaration plus indexed call/import/export edits.
+- deadcode/audit_async/stacktrace: focused audits and runtime evidence. Computed dispatch is reported as a health/deletion blind spot.
 
 CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires review. ACCOUNT conserves observed literal-name lines; an observed-text zero never claims semantic completeness or safe deletion. Evidence weights are ordinal, not probabilities. Warnings, excluded reasons, and contract metadata remain visible when caller evidence is returned. Release evaluation cross-checks overlapping stable-handle claims across find, show, source, impact, tests, check, and caller trace.` + generateMcpParamSection();
 
@@ -221,8 +229,8 @@ server.registerTool(
             direction: z.enum(['callees', 'callers', 'imports', 'importers', 'both']).optional().describe('trace: callees/callers. deps: imports/importers/both.'),
             to: z.enum(['entrypoints']).optional().describe('trace with direction=callers: continue toward entry points.'),
             cycles: z.boolean().optional().describe('deps: report circular imports instead of a file graph.'),
-            term: z.string().optional().describe('Search term (regex by default; set regex=false to force plain text)'),
-            regex: z.boolean().optional().describe('Treat search term as a regex pattern (default: true). Set false to force plain text escaping.'),
+            term: z.string().optional().describe('Literal search term by default. Set regex=true only for regular-expression syntax.'),
+            regex: z.boolean().optional().describe('Treat search term as a regular expression (default: false/literal).'),
             functions: z.boolean().optional().describe('repo stats: include per-function line counts sorted by size.'),
             hot: z.boolean().optional().describe('repo stats: include the top N most-called functions.'),
             diverse: z.boolean().optional().describe('show example: return representatives from distinct argument shapes.'),
@@ -329,7 +337,9 @@ server.registerTool(
             // command-specific switches are no longer part of the contract.
             index = getIndex(project_dir, ep);
             const execution = execute(index, canonicalCommand, ep);
-            if (!execution.ok) return te(execution.error);
+            if (!execution.ok) {
+                return te(formatSurfaceMessage(execution.error, 'mcp'));
+            }
 
             // Preserve MCP's path-boundary guarantee for source-bearing
             // results after consolidating fn/class/lines into source/show.

@@ -1462,7 +1462,8 @@ function plan(index, name, options = {}) {
                 line: site.line,
                 expression: site.expression,
                 suggestion,
-                args: site.args
+                args: site.args,
+                editKind: 'call',
             });
         }
     }
@@ -1519,7 +1520,8 @@ function plan(index, name, options = {}) {
                         line: site.line,
                         expression: site.expression,
                         suggestion: `Remove argument ${callerArgIndex + 1}: ${site.args[callerArgIndex] || '?'}`,
-                        args: site.args
+                        args: site.args,
+                        editKind: 'call',
                     });
                 } else if (!site.args) {
                     // Arguments unparseable (macro bodies, generated code) —
@@ -1530,7 +1532,8 @@ function plan(index, name, options = {}) {
                         line: site.line,
                         expression: site.expression,
                         suggestion: 'Could not parse arguments — review this call site manually',
-                        needsReview: true
+                        needsReview: true,
+                        editKind: 'call',
                     });
                 }
             }
@@ -1560,7 +1563,8 @@ function plan(index, name, options = {}) {
                 line: site.line,
                 expression: site.expression,
                 suggestion: `Rename to: ${newExpression}`,
-                newExpression
+                newExpression,
+                editKind: 'call',
             });
         }
 
@@ -1597,10 +1601,96 @@ function plan(index, name, options = {}) {
                 expression: imp.content.trim(),
                 suggestion: `Update import: ${newImport}`,
                 newExpression: newImport,
-                isImport: true
+                isImport: true,
+                editKind: 'import',
+            });
+        }
+
+        // Export surfaces owned by the selected definition are declaration
+        // references too. In particular, CommonJS shorthand
+        // `module.exports = { helper }` must be renamed or the otherwise
+        // complete caller/import edit set breaks the module API.
+        const targetEntry = index.files.get(def.file);
+        for (const exported of targetEntry?.exportDetails || []) {
+            if ((exported.name !== name && exported.alias !== name) ||
+                !exported.line) continue;
+            const exportFile = def.relativePath || def.file;
+            if (changes.some(change =>
+                change.file === exportFile && change.line === exported.line)) {
+                continue;
+            }
+            const sourceLine = index.getLineContent(def.file, exported.line).trim();
+            const occurrencePattern = new RegExp(
+                '\\b' + escapeRegExp(name) + '\\b', 'g');
+            const occurrences = sourceLine.match(occurrencePattern)?.length || 0;
+            const newExpression = sourceLine.replace(
+                occurrencePattern, options.renameTo);
+            changes.push({
+                file: exportFile,
+                line: exported.line,
+                expression: sourceLine,
+                suggestion: `Update export: ${newExpression}`,
+                newExpression,
+                isExport: true,
+                editKind: 'export',
+                ...(occurrences > 1 && { needsReview: true }),
             });
         }
     }
+
+    // Every operation changes the selected declaration. Historically `plan`
+    // only listed callers/imports in changes[], while rendering the new
+    // signature separately. An agent applying the advertised edit array
+    // therefore produced uncompilable code. Keep the declaration in the same
+    // concrete list and count as every other required edit.
+    const definitionLine = def.nameLine || def.startLine;
+    const definitionFile = def.relativePath || def.file;
+    const definitionSource = index.getLineContent(def.file, definitionLine).trim();
+    const existingDefinitionLine = changes.find(change =>
+        change.file === definitionFile && change.line === definitionLine);
+    if (existingDefinitionLine) {
+        existingDefinitionLine.isDefinition = true;
+        existingDefinitionLine.editKind = 'definition';
+        if (options.renameTo) {
+            const renamed = existingDefinitionLine.expression.replace(
+                new RegExp('\\b' + escapeRegExp(name) + '\\b', 'g'),
+                options.renameTo);
+            existingDefinitionLine.newExpression = renamed;
+            existingDefinitionLine.suggestion = `Update definition: ${renamed}`;
+        }
+    } else {
+        const definitionChange = {
+            file: definitionFile,
+            line: definitionLine,
+            expression: definitionSource,
+            isDefinition: true,
+            editKind: 'definition',
+        };
+        if (options.renameTo) {
+            const renamed = definitionSource.replace(
+                new RegExp('\\b' + escapeRegExp(name) + '\\b'),
+                options.renameTo);
+            definitionChange.newExpression = renamed;
+            definitionChange.suggestion = `Update definition: ${renamed}`;
+        } else {
+            definitionChange.suggestion =
+                `Update declaration signature to: ${newSignature}`;
+            // Signature layouts can span multiple lines and differ by
+            // language. The AST proves this edit is required, while the
+            // preview explicitly withholds a fake one-line replacement.
+            definitionChange.needsReview = true;
+        }
+        changes.unshift(definitionChange);
+    }
+
+    const changeSummary = {
+        definitions: changes.filter(change => change.isDefinition).length,
+        calls: changes.filter(change =>
+            !change.isDefinition && !change.isImport && !change.isExport).length,
+        imports: changes.filter(change => change.isImport).length,
+        exports: changes.filter(change => change.isExport).length,
+        reviewRequired: changes.filter(change => change.needsReview).length,
+    };
 
     return {
         found: true,
@@ -1621,6 +1711,7 @@ function plan(index, name, options = {}) {
         },
         totalChanges: changes.length,
         filesAffected: new Set(changes.map(c => c.file)).size,
+        changeSummary,
         changes,
         // v4 tiered contract: sites that MAY also need this change but lack
         // binding/receiver evidence — review manually before refactoring.

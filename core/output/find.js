@@ -274,11 +274,13 @@ function formatUsagesJson(usages, name) {
 
     const calls = refs.filter(u => u.usageType === 'call');
     const imports = refs.filter(u => u.usageType === 'import');
+    const textOccurrences = refs.filter(u => u.usageType === 'text');
     // Exhaustive complement (fix #241): a non-definition record that is
     // neither call nor import lands in references — same-name definer sites
     // (usageType 'definition', isDefinition false: shadowing locals, other
     // defs of the name) used to inflate totals while rendering in NO band.
-    const references = refs.filter(u => u.usageType !== 'call' && u.usageType !== 'import');
+    const references = refs.filter(u =>
+        !['call', 'import', 'text'].includes(u.usageType));
 
     // Each usage record points at a call site. We emit a per-occurrence handle
     // pointing at the SITE itself in the form "relativePath:line:callerName"
@@ -314,7 +316,10 @@ function formatUsagesJson(usages, name) {
             callCount: sc ? sc.calls : calls.length,
             importCount: sc ? sc.imports : imports.length,
             referenceCount: sc ? sc.references : references.length,
-            totalUsages: sc ? (sc.calls + sc.imports + sc.references) : refs.length,
+            textCount: sc ? (sc.text || 0) : textOccurrences.length,
+            totalUsages: sc
+                ? (sc.calls + sc.imports + sc.references + (sc.text || 0))
+                : refs.length,
             definitions: definitions.map(d => {
                 const handle = formatSymbolHandle({ ...d, name: d.name || name });
                 return {
@@ -331,7 +336,11 @@ function formatUsagesJson(usages, name) {
             }),
             calls: calls.map(formatUsage),
             imports: imports.map(formatUsage),
-            references: references.map(formatUsage)
+            references: references.map(formatUsage),
+            textOccurrences: textOccurrences.map(u => ({
+                ...formatUsage(u),
+                textKind: u.textKind || 'other-text',
+            })),
         }
     });
 }
@@ -344,15 +353,17 @@ function formatUsages(usages, name, options = {}) {
     const defs = usages.filter(u => u.isDefinition);
     const calls = usages.filter(u => u.usageType === 'call');
     const imports = usages.filter(u => u.usageType === 'import');
+    const textOccurrences = usages.filter(u => u.usageType === 'text');
     // Exhaustive complement (fix #241) — see formatUsagesJson.
-    const refs = usages.filter(u => !u.isDefinition && u.usageType !== 'call' && u.usageType !== 'import');
+    const refs = usages.filter(u => !u.isDefinition &&
+        !['call', 'import', 'text'].includes(u.usageType));
 
     // Under --limit the listed entries are truncated but the summary must
     // describe the FULL result set (fix #237) — the handler attaches the
     // full counts as a non-enumerable property.
     const sc = usages.summaryCounts;
     const lines = [];
-    lines.push(`Usages of "${name}": ${sc ? sc.definitions : defs.length} definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references`);
+    lines.push(`Usages of "${name}": ${sc ? sc.definitions : defs.length} definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references, ${sc ? (sc.text || 0) : textOccurrences.length} other-text`);
     if (!compact) lines.push('═'.repeat(60));
 
     function renderContextLines(usage) {
@@ -422,6 +433,24 @@ function formatUsages(usages, name, options = {}) {
                 renderContextLines(r);
                 lines.push(`    ${r.content.trim()}`);
                 renderAfterLines(r);
+            }
+        }
+    }
+
+    if (textOccurrences.length > 0) {
+        lines.push(`${compact ? '' : '\n'}OTHER TEXT (comments, strings, docstrings, or unclassified literal lines):`);
+        for (const occurrence of textOccurrences) {
+            const kind = occurrence.textKind || 'other-text';
+            if (compact) {
+                const expr = occurrence.content
+                    ? occurrence.content.trim().replace(/\s+/g, ' ').slice(0, 100)
+                    : '';
+                lines.push(`  ${occurrence.relativePath}:${occurrence.line} [${kind}]: ${expr}`);
+            } else {
+                lines.push(`  ${occurrence.relativePath}:${occurrence.line} [${kind}]`);
+                renderContextLines(occurrence);
+                lines.push(`    ${occurrence.content.trim()}`);
+                renderAfterLines(occurrence);
             }
         }
     }

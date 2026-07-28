@@ -69,12 +69,14 @@ function formatDoctor(result, options = {}) {
         ['Dynamic imports', bs.dynamicImports],
         ['Eval/exec calls', bs.evalCalls],
         ['Reflection',      bs.reflection],
+        ['Computed dispatch', bs.computedDispatch],
         ['Parse failures',  bs.parseFailures],
         ['Parser recovery', bs.parseRecoveries],
         ['Unsupported source', bs.unsupportedSources],
     ];
     const unitFor = {
         'Dynamic imports': 'import', 'Eval/exec calls': 'use', Reflection: 'use',
+        'Computed dispatch': 'call',
         'Parse failures': 'failure',
         'Unsupported source': 'file',
     };

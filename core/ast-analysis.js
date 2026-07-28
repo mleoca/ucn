@@ -1,0 +1,238 @@
+'use strict';
+
+/**
+ * Small AST-derived analyses shared by the public trust surface.
+ *
+ * Keep these queries syntax-only. They deliberately do not attempt compiler
+ * binding or runtime prediction; their job is to replace source-text guesses
+ * with stable tree-sitter facts.
+ */
+
+const { getParser, safeParse } = require('../languages');
+
+const CALLABLE_NODES = new Set([
+    // JavaScript / TypeScript
+    'function_declaration', 'generator_function_declaration',
+    'function_expression', 'generator_function', 'arrow_function',
+    'method_definition',
+    // Python
+    'function_definition', 'lambda',
+    // Go
+    'method_declaration', 'func_literal',
+    // Rust
+    'function_item', 'closure_expression',
+    // Java / C / C++ / C#
+    'method_declaration', 'constructor_declaration', 'lambda_expression',
+    'function_definition',
+    'local_function_statement', 'anonymous_method_expression',
+    'operator_declaration', 'conversion_operator_declaration',
+]);
+
+const BRANCH_NODES = new Set([
+    'if_statement', 'if_expression', 'elif_clause',
+    'for_statement', 'for_in_statement', 'for_expression',
+    'foreach_statement', 'for_range_loop',
+    'while_statement', 'while_expression', 'do_statement',
+    'catch_clause', 'except_clause',
+    'conditional_expression', 'ternary_expression',
+    'switch_case', 'case_clause', 'case_statement',
+    'switch_label', 'switch_section', 'expression_case',
+    'communication_case', 'match_arm',
+]);
+
+const NESTING_NODES = new Set([
+    'if_statement', 'if_expression', 'elif_clause',
+    'for_statement', 'for_in_statement', 'for_expression',
+    'foreach_statement', 'for_range_loop',
+    'while_statement', 'while_expression', 'do_statement',
+    'try_statement', 'catch_clause', 'except_clause',
+    'switch_statement', 'switch_expression', 'expression_switch_statement',
+    'type_switch_statement', 'select_statement', 'match_expression',
+]);
+
+const LITERAL_INDEX_NODES = new Set([
+    'string', 'string_literal', 'raw_string_literal', 'interpreted_string_literal',
+    'character', 'char_literal',
+    'number', 'integer', 'integer_literal', 'float', 'float_literal',
+    'true', 'false', 'null', 'none',
+]);
+
+function walkNamed(node, visit) {
+    if (!node) return;
+    if (visit(node) === false) return;
+    for (const child of node.namedChildren || []) walkNamed(child, visit);
+}
+
+function isDefaultBranch(node) {
+    const text = String(node.text || '').trimStart();
+    return text.startsWith('default') || text.startsWith('case _');
+}
+
+function findCallableForRange(root, startLine, endLine) {
+    const candidates = [];
+    walkNamed(root, node => {
+        if (!CALLABLE_NODES.has(node.type)) return true;
+        const start = node.startPosition.row + 1;
+        const end = node.endPosition.row + 1;
+        if (start < startLine || end > endLine) return true;
+        candidates.push({
+            node,
+            exactEnd: end === endLine ? 1 : 0,
+            exactStart: start === startLine ? 1 : 0,
+            span: end - start,
+            startDistance: Math.abs(start - startLine),
+        });
+        return true;
+    });
+    candidates.sort((a, b) =>
+        b.exactEnd - a.exactEnd ||
+        b.exactStart - a.exactStart ||
+        b.span - a.span ||
+        a.startDistance - b.startDistance);
+    return candidates[0]?.node || null;
+}
+
+/**
+ * Return AST structural branch count and control-flow nesting depth for one
+ * indexed callable. Formatting, comments, strings, optional chaining, and
+ * nullish coalescing cannot affect these values.
+ */
+function computeAstComplexity(content, language, {
+    startLine = 1,
+    endLine = startLine,
+} = {}) {
+    const lineCount = Math.max(0, endLine - startLine + 1);
+    try {
+        const parser = getParser(language);
+        if (!parser) {
+            return {
+                branches: null,
+                maxDepth: null,
+                lineCount,
+                measuredBy: 'unavailable-no-parser',
+            };
+        }
+        const tree = safeParse(parser, content);
+        const callable = findCallableForRange(tree.rootNode, startLine, endLine);
+        if (!callable) {
+            return {
+                branches: null,
+                maxDepth: null,
+                lineCount,
+                measuredBy: 'unavailable-no-callable-node',
+            };
+        }
+
+        let branches = 0;
+        let maxDepth = 0;
+        const visit = (node, depth) => {
+            if (node !== callable && CALLABLE_NODES.has(node.type)) return;
+
+            if (BRANCH_NODES.has(node.type) && !isDefaultBranch(node)) branches++;
+            const nextDepth = depth + (NESTING_NODES.has(node.type) ? 1 : 0);
+            if (nextDepth > maxDepth) maxDepth = nextDepth;
+            for (const child of node.namedChildren || []) visit(child, nextDepth);
+        };
+        visit(callable, 0);
+        return {
+            branches,
+            maxDepth,
+            lineCount,
+            measuredBy: 'tree-sitter-ast',
+        };
+    } catch (error) {
+        return {
+            branches: null,
+            maxDepth: null,
+            lineCount,
+            measuredBy: 'unavailable-parse-error',
+        };
+    }
+}
+
+function indexNodeForComputedCallee(callee) {
+    if (!callee) return null;
+    switch (callee.type) {
+        case 'subscript_expression':
+            return callee.childForFieldName('index') || callee.namedChild(1);
+        case 'index_expression':
+            return callee.childForFieldName('index') || callee.namedChild(1);
+        case 'subscript':
+            return callee.childForFieldName('subscript') || callee.namedChild(1);
+        case 'element_access_expression': {
+            const list = callee.childForFieldName('subscript') ||
+                (callee.namedChildren || []).find(child =>
+                    child.type === 'bracketed_argument_list');
+            return list?.namedChild(0)?.namedChild(0) || list?.namedChild(0) || null;
+        }
+        default:
+            return null;
+    }
+}
+
+function computedReceiver(callee) {
+    if (!callee) return null;
+    const node = callee.childForFieldName('object') ||
+        callee.childForFieldName('operand') ||
+        callee.childForFieldName('value') ||
+        callee.childForFieldName('expression') ||
+        callee.namedChild(0);
+    return node?.type === 'identifier' ? node.text : null;
+}
+
+/**
+ * Find direct computed dispatch calls such as handlers[name](). Literal keys
+ * are excluded because they retain a statically visible member name.
+ */
+function computedDispatchSites(content, language) {
+    try {
+        const parser = getParser(language);
+        if (!parser) return [];
+        const tree = safeParse(parser, content);
+        const sites = [];
+        walkNamed(tree.rootNode, node => {
+            let callee = null;
+            if (node.type === 'call_expression' || node.type === 'call' ||
+                node.type === 'invocation_expression') {
+                callee = node.childForFieldName('function');
+            }
+            const indexNode = indexNodeForComputedCallee(callee);
+            if (!indexNode || LITERAL_INDEX_NODES.has(indexNode.type)) return true;
+            sites.push({
+                line: node.startPosition.row + 1,
+                receiver: computedReceiver(callee),
+                expression: node.text,
+            });
+            return true;
+        });
+        return sites;
+    } catch (error) {
+        return [];
+    }
+}
+
+/**
+ * Project-level cached computed-dispatch inventory. ProjectIndex invalidates
+ * this memo on rebuilds and file removal so long-lived MCP sessions see edits.
+ */
+function projectComputedDispatch(index) {
+    if (index._computedDispatchBlindspots) return index._computedDispatchBlindspots;
+    const byFile = new Map();
+    for (const [filePath, fileEntry] of index.files) {
+        try {
+            const sites = computedDispatchSites(index._readFile(filePath), fileEntry.language);
+            if (sites.length > 0) byFile.set(filePath, sites);
+        } catch (_) {
+            // Unreadable files are reported through the existing parse/read
+            // diagnostics; do not turn this optional scan into a query crash.
+        }
+    }
+    index._computedDispatchBlindspots = byFile;
+    return byFile;
+}
+
+module.exports = {
+    computeAstComplexity,
+    computedDispatchSites,
+    projectComputedDispatch,
+};

@@ -4441,8 +4441,11 @@ describe('fix #228: plan default values respect language support (hasDefaultPara
             const r = execute(index, 'plan', { name: 'add', addParam: 'opt', defaultValue: 'null' });
             assert.ok(r.ok);
             assert.ok(r.result.after.signature.includes('opt = null'), 'JS keeps default syntax');
-            assert.ok(r.result.changes.every(c => c.suggestion.includes('No change needed')),
+            const callChanges = r.result.changes.filter(c => c.editKind === 'call');
+            assert.ok(callChanges.every(c => c.suggestion.includes('No change needed')),
                 'JS call sites need no change');
+            assert.strictEqual(r.result.changeSummary.definitions, 1,
+                'the selected declaration is still a required plan edit');
         } finally { rm(dir); }
     });
 });
@@ -4684,8 +4687,11 @@ describe('fix #230: plan rename import ownership, multi-call lines, remove-param
         try {
             const p = execute(idx(dir), 'plan', { name: 'run', removeParam: 'self' });
             assert.ok(p.ok);
-            assert.strictEqual(p.result.changes.length, 0,
+            const callChanges = p.result.changes.filter(c => c.editKind === 'call');
+            assert.strictEqual(callChanges.length, 0,
                 `bound calls pass self implicitly — no caller-side change: ${JSON.stringify(p.result.changes)}`);
+            assert.strictEqual(p.result.changeSummary.definitions, 1,
+                'the selected declaration remains part of the preview');
             assert.ok(!p.result.before.params.includes('self') || p.result.after.params.length ===
                 p.result.before.params.length - 1, 'signature change recorded');
         } finally { rm(dir); }

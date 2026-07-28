@@ -1221,13 +1221,14 @@ function handleResponse(res) {
         }
     });
 
-    it('regex is default — no flag needed for patterns', () => {
+    it('literal mode is default — regex syntax requires the flag', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
-            // Should work as regex without explicit regex:true
+            // Backslashes are literal without explicit regex:true.
             const results = idx.search('handle\\w+');
             const matches = results.reduce((sum, r) => sum + r.matches.length, 0);
-            assert.ok(matches >= 2, `Should find handle* functions by default (found ${matches})`);
+            assert.strictEqual(matches, 0,
+                `Should not interpret regex syntax by default (found ${matches})`);
         } finally {
             fs.rmSync(dir, { recursive: true });
         }
@@ -1237,7 +1238,7 @@ function handleResponse(res) {
         const { dir, idx } = makeRegexTestIndex();
         try {
             assert.doesNotThrow(() => idx.search('[invalid'));
-            const results = idx.search('[invalid');
+            const results = idx.search('[invalid', { regex: true });
             assert.ok(Array.isArray(results), 'Should return array (fallback to plain text)');
         } finally {
             fs.rmSync(dir, { recursive: true });
@@ -1247,7 +1248,7 @@ function handleResponse(res) {
     it('invalid regex fallback sets regexFallback in meta', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
-            const results = idx.search('[invalid');
+            const results = idx.search('[invalid', { regex: true });
             assert.ok(results.meta, 'Results should have meta');
             assert.ok(results.meta.regexFallback, 'meta.regexFallback should be set');
             assert.ok(results.meta.regexFallback.includes('Invalid regular expression'),
@@ -1260,7 +1261,7 @@ function handleResponse(res) {
     it('valid regex does not set regexFallback in meta', () => {
         const { dir, idx } = makeRegexTestIndex();
         try {
-            const results = idx.search('\\d+');
+            const results = idx.search('\\d+', { regex: true });
             assert.ok(results.meta, 'Results should have meta');
             assert.strictEqual(results.meta.regexFallback, false, 'regexFallback should be false for valid regex');
         } finally {

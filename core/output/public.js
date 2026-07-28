@@ -10,6 +10,7 @@
 
 const { COMMAND_CONTRACTS } = require('../command-contracts');
 const { COMMAND_TRUST_MATRIX } = require('../trust-matrix');
+const { toCliName, toMcpName } = require('../registry');
 
 const legacy = {
     ...require('./analysis'),
@@ -250,7 +251,7 @@ function formatPublicText(command, result, params = {}, execution = {}) {
                 ? legacy.formatVerify(result)
                 : legacy.formatCheck(result);
             break;
-        case 'plan': text = legacy.formatPlan(result); break;
+        case 'plan': text = legacy.formatPlan(result, { surface: execution.surface }); break;
         case 'repo': text = formatRepo(result, params, hints); break;
         case 'deadcode': text = legacy.formatDeadcode(result, {
             top: params.top || 0,
@@ -280,10 +281,29 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         commandMeta = formatted.meta || {};
         data = formatted.data;
     }
+    if (command === 'deadcode' && result?.computedDispatch?.count > 0) {
+        commandMeta.computedDispatch = result.computedDispatch;
+        commandMeta.deletionSafety = 'review-required';
+        if (result.excludedDynamicDispatch > 0) {
+            commandMeta.excludedDynamicDispatch = result.excludedDynamicDispatch;
+        }
+    }
+    if (command === 'search' && result?.meta) {
+        commandMeta.searchMode = result.meta.mode;
+        commandMeta.totalMatches = result.meta.totalMatches;
+        if (result.meta.regexFallback) {
+            commandMeta.regexFallback = result.meta.regexFallback;
+        }
+    }
+
+    const surfaceCommand = execution.surface === 'mcp'
+        ? toMcpName(command)
+        : execution.surface === 'cli' ? toCliName(command) : command;
 
     const envelope = {
         meta: {
-            command,
+            command: surfaceCommand,
+            ...(surfaceCommand !== command && { canonicalCommand: command }),
             ...(modeOf(command, result) && { mode: modeOf(command, result) }),
             contract: contractMeta(command),
             ...commandMeta,

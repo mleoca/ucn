@@ -13,8 +13,8 @@ structural or code-only search.
 |---|---|
 | `show <handle>` | Default symbol summary, callers, and callees. Select `summary,callers,callees,source,dependencies,tests,types,example,related` with `--sections`. |
 | `find <name>` | Locate definitions and stable handles. Use `--type=type` for type-like definitions, `--limit=N` as the single result cap, and `--with-source` to attach bodies. |
-| `usages <name>` | Inventory definitions, calls, imports, type references, and other references. |
-| `search [pattern]` | Regex text search, or structural search with `--type`, `--param`, `--receiver`, `--returns`, or `--decorator`. |
+| `usages <name>` | Inventory definitions, calls, imports, type references, and literal comment/string/docstring text. Those text sites appear under `OTHER TEXT` unless `--code-only`. |
+| `search [pattern]` | Literal text search by default; add `--regex` for regular expressions, or use structural filters such as `--type`, `--param`, `--receiver`, `--returns`, or `--decorator`. |
 | `source <handle\|file:range>` | Extract a function, class-like declaration, or exact line range. |
 | `trace <handle>` | Traverse callees by default. Use `--direction=callers` for blast radius and add `--to=entrypoints` for paths to roots. |
 
@@ -25,7 +25,7 @@ structural or code-only search.
 | `impact [handle]` | Show direct symbol impact when given a handle; without one, analyze the Git diff. |
 | `tests <handle\|file>` | Find statically linked direct tests. Set `--depth=N` for transitive affected tests. Empty results are not runtime coverage proof. |
 | `check [handle]` | Validate confirmed call-site arity for a symbol; without one, run the composed pre-commit diagnostic. |
-| `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits. |
+| `plan <handle>` | Preview `--rename-to`, `--add-param`, or `--remove-param` edits, including the selected declaration and indexed call/import/export sites. Review `changeSummary` and `needsReview`. |
 
 ## Repository and architecture
 
@@ -41,7 +41,7 @@ structural or code-only search.
 
 | Command | Purpose |
 |---|---|
-| `deadcode` | Conservative unreferenced-symbol candidates for review. |
+| `deadcode` | Conservative unreferenced-symbol candidates for review. Computed-dispatch registry members are withheld when modeled; health reports the remaining blind spot. |
 | `audit-async` | Potential missing-await sites in JavaScript/TypeScript/Python and C#. MCP spelling: `audit_async`. |
 | `stacktrace <text>` | Advisory stack-frame parsing and source lookup. |
 
@@ -60,7 +60,7 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--exclude=<patterns>` | Exclude matching paths. |
 | `--depth=N` | Set trace/dependency/test traversal depth. |
 | `--direction=<value>` | Select trace or dependency direction. |
-| `--all` | Lift result and formatter caps where supported. |
+| `--all` | Lift result and formatter caps where supported. It is recommended only for commands that accept it. |
 | `--max-chars=N` | Set the CLI text budget (10K targeted / 3K broad by default; 100K ceiling). MCP spelling: `max_chars`. JSON is not transport-truncated. |
 | `--compact` / `--no-compact` | Select token-efficient or full semantic output. |
 | `--range=N-M` | Extract an explicit line range with `source --file=<path>`. |
@@ -72,6 +72,7 @@ Symbol-listing commands emit handles such as `src/api.ts:42:handler`. Pass the f
 | `--include-exported` | Include exported symbols in `deadcode`. |
 | `--include-decorated` | Include decorated symbols in `deadcode`. |
 | `--code-only` | Exclude comments and strings in `search`/`usages`. |
+| `--regex` | Interpret a `search` term as a regular expression. Without it, the term is literal. |
 
 ## Target forms
 

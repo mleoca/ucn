@@ -41,8 +41,8 @@ UCN has no legacy command aliases. The public vocabulary is deliberately small, 
 | Orient in a repository | `repo [--sections=summary,files,stats,health] [--deep]` |
 | Understand one symbol | `show <symbol> [--sections=...]` |
 | Find definitions | `find <name> [--type=type] [--with-source]` |
-| Inspect all name usages | `usages <name>` |
-| Search text or AST shapes | `search [term] [structural flags]` |
+| Inspect all literal-name occurrences | `usages <name>` |
+| Search literal text, regex, or AST shapes | `search [term] [--regex] [structural flags]` |
 | Extract exact source | `source <symbol\|file:range>` |
 | Follow calls | `trace <symbol> [--direction=callees\|callers] [--to=entrypoints]` |
 | Assess change impact | `impact [symbol]` |
@@ -111,11 +111,12 @@ All surfaces resolve a public command through the same registry, normalize param
 
 Engine facts and trust metadata are equivalent for equivalent parameters.
 Presentation guidance uses the native surface syntax (`--all` in CLI,
-`all=true` in MCP). `--json` always returns one stable envelope:
+`all=true` in MCP), and only recommends `all` for commands that support it.
+`--json` always returns one stable envelope:
 
 ```json
 {
-  "meta": { "command": "show", "mode": "..." },
+  "meta": { "command": "audit-async", "canonicalCommand": "auditAsync", "mode": "..." },
   "data": {}
 }
 ```
@@ -124,6 +125,8 @@ Failed CLI JSON requests retain the same shape with `data: null`,
 `meta.ok: false`, the command contract when known, and an `error` string.
 
 CLI commands and flags use hyphenated spelling. MCP commands and parameters use snake case where needed, such as `audit_async`, `project_dir`, and `class_name`.
+JSON `meta.command` follows that native spelling; `canonicalCommand` is included
+only when the internal camel-case name differs.
 
 The MCP server publishes exactly one tool named `ucn`. Its `command` enum contains the 18 commands, and its generated description lists the parameters accepted by each command. A warm MCP process reuses the same index cache and is normally faster than starting a CLI process for each question.
 
@@ -175,6 +178,10 @@ CONTRACT: literal-name text partition complete; semantic completeness is not cla
 ```
 
 Treat `deadcode` as a candidate generator. Before deleting, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`, then corroborate with the compiler/type checker and tests.
+Computed/indexed dispatch such as `handlers[key]()` is reported as a health
+blind spot. Object-literal registry members reached through that shape are
+withheld from dead-code candidates, and any remaining result is still
+review-only.
 
 ## Common workflows
 
@@ -198,6 +205,27 @@ ucn plan parseRequest --rename-to=parseIncomingRequest
 ucn impact --staged
 ucn check --staged
 ```
+
+`plan` includes the selected declaration, owned imports/exports, and call-site
+previews. `changeSummary` separates those edit classes. A declaration edit that
+cannot be rendered as a safe one-line replacement is marked `needsReview`
+rather than silently omitted.
+
+### Search and occurrence inventory
+
+```bash
+# Literal by default: punctuation is not regex syntax
+ucn search '$scope.$apply'
+
+# Regex is explicit
+ucn search 'TODO|FIXME' --regex
+
+# Includes comment/string/docstring occurrences in a separate OTHER TEXT section
+ucn usages parseRequest --include-tests
+```
+
+Use `--code-only` to omit comment/string/docstring text. `usages` is a literal-name
+inventory, not proof that every occurrence binds to one selected definition.
 
 ### Inspect architecture
 
@@ -261,7 +289,7 @@ The skill teaches an agent when to use each command and how to interpret confirm
 
 ## Reliability and performance
 
-The suite covers parsers, the shared IR/adapter boundary, index/cache equivalence, command composition, CLI/MCP/interactive parity, formatters, security edge cases, conservation accounting, and language-specific regressions. The cross-language matrix covers all supported source families; the public-surface benchmark executes and scores all 18 commands through CLI JSON, CLI text, and MCP.
+The suite covers parsers, the shared IR/adapter boundary, index/cache equivalence, command composition, CLI/MCP/interactive parity, formatters, security edge cases, conservation accounting, adversarial release-surface regressions, and language-specific regressions. The cross-language matrix covers all supported source families; the public-surface benchmark executes and scores all 18 commands through CLI JSON, CLI text, and MCP.
 
 Release gates additionally compare semantic answers with ts-morph, pyright, gopls, rust-analyzer, and jdtls on pinned real repositories, limit unverified review burden, audit dead-code claims, and enforce cold/warm latency and peak-memory policies. A deterministic, stratified stable-handle board also requires overlapping `find`, `show`, `source`, `impact`, `tests`, `check`, and caller `trace` claims to agree exactly: target identity, source and direct-test projections, confirmed and unverified caller-site multisets, evidence reasons, totals, and caller accounting. Any disagreement fails with a minimal handle-and-field witness. C/C++/C# currently use parser, conformance, cross-surface, conservation, cross-command consistency, and adversarial fixture gates rather than a compiler/LSP real-repository oracle. The semantic board publishes both the human-readable report and its raw JSON source, including true edges left unverified, actionable candidate-set p50/p95/max, zero-actionable-ambiguity target rate, effective review items, raw false-candidate amplification, and reason families. Actionable false candidates count individually; a named runtime-dispatch family counts as one agent-facing review item while every raw site remains auditable.
 
@@ -273,6 +301,9 @@ parity, tool calls, latency, and output size. Its default checked-in plans are
 labeled `reference-plan-contract-conformance`; their selection score is not a
 live-agent measurement. Plans captured from an actual agent can be scored with
 `--plans=<file>` and are labeled separately.
+The checked-in fixture must contain at least 500 source lines, so the benchmark
+cannot accidentally pass on a toy repository below the skill's recommended
+usage threshold.
 
 Reproduce the gates with:
 

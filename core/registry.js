@@ -221,6 +221,23 @@ function toCliName(canonical) {
     return canonical.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
 }
 
+function formatSurfaceMessage(message, surface = 'cli') {
+    let rendered = String(message || '');
+    for (const [snake, camel] of Object.entries(PARAM_MAP)) {
+        const spellings = [snake, camel];
+        const target = surface === 'mcp'
+            ? snake
+            : `--${snake.replace(/_/g, '-')}`;
+        for (const spelling of spellings) {
+            rendered = rendered.replace(
+                new RegExp(`(?<![A-Za-z0-9_-])${spelling}(?![A-Za-z0-9_-])`, 'g'),
+                target,
+            );
+        }
+    }
+    return rendered;
+}
+
 /**
  * Build a reverse map: camelCase → snake_case from PARAM_MAP.
  * Flags not in PARAM_MAP are already snake_case-safe (single words).
@@ -234,6 +251,47 @@ function buildReverseParamMap() {
 }
 
 const REVERSE_PARAM_MAP = buildReverseParamMap();
+
+const CLI_GLOBAL_FLAGS = Object.freeze([
+    '--help', '-h', '--version', '-v', '--mcp',
+    '--json', '--verbose', '--no-quiet', '--quiet',
+    '--interactive', '-i',
+    '--no-cache', '--clear-cache', '--no-follow-symlinks',
+    '--max-files', '--max-chars', '--workers',
+]);
+
+const CLI_PARAM_FLAG_OVERRIDES = Object.freeze({
+    exclude: ['--exclude', '--not'],
+    includeMethods: ['--include-methods', '--no-include-methods'],
+    regex: ['--regex', '--no-regex'],
+    showConfidence: ['--hide-confidence', '--no-confidence'],
+    hideUncertain: ['--hide-uncertain', '--no-uncertain'],
+    compact: ['--compact', '--no-compact'],
+    defaultValue: ['--default-value', '--default'],
+});
+
+function cliFlagsForParam(param) {
+    if (CLI_PARAM_FLAG_OVERRIDES[param]) {
+        return CLI_PARAM_FLAG_OVERRIDES[param];
+    }
+    const snake = REVERSE_PARAM_MAP[param] || param;
+    return [`--${snake.replace(/_/g, '-')}`];
+}
+
+function getCliFlagsForCommand(command) {
+    const canonical = resolveCommand(command, 'cli') || command;
+    return [...new Set((FLAG_APPLICABILITY[canonical] || [])
+        .filter(param => !['name', 'term'].includes(param))
+        .flatMap(cliFlagsForParam))];
+}
+
+function getCliAcceptedFlags() {
+    const accepted = new Set(CLI_GLOBAL_FLAGS);
+    for (const command of CANONICAL_COMMANDS) {
+        for (const flag of getCliFlagsForCommand(command)) accepted.add(flag);
+    }
+    return accepted;
+}
 
 /**
  * Generate per-command parameter listing for the MCP tool description.
@@ -266,5 +324,9 @@ module.exports = {
     getMcpCommandEnum,
     toMcpName,
     toCliName,
+    formatSurfaceMessage,
+    cliFlagsForParam,
+    getCliFlagsForCommand,
+    getCliAcceptedFlags,
     generateMcpParamSection,
 };

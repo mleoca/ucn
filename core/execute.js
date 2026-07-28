@@ -1057,7 +1057,9 @@ const HANDLERS = {
                     // record that isn't a call or import is a reference —
                     // same-name definer sites (usageType 'definition' with
                     // isDefinition false) used to render in NO band.
-                    references: result.filter(u => !u.isDefinition && u.usageType !== 'call' && u.usageType !== 'import').length,
+                    references: result.filter(u => !u.isDefinition &&
+                        !['call', 'import', 'text'].includes(u.usageType)).length,
+                    text: result.filter(u => u.usageType === 'text').length,
                 },
                 enumerable: false, writable: true, configurable: true,
             });
@@ -1293,6 +1295,8 @@ const HANDLERS = {
             if (result.excludedExported != null) sliced.excludedExported = result.excludedExported;
             if (result.excludedDecorated != null) sliced.excludedDecorated = result.excludedDecorated;
             if (result.excludedExternalContract != null) sliced.excludedExternalContract = result.excludedExternalContract;
+            if (result.excludedDynamicDispatch != null) sliced.excludedDynamicDispatch = result.excludedDynamicDispatch;
+            if (result.computedDispatch != null) sliced.computedDispatch = result.computedDispatch;
             // Truncation must be visible IN the JSON payload, not only in the
             // stderr note (fix #242) — the formatter reads this to emit
             // meta.total + truncated.

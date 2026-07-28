@@ -332,9 +332,17 @@ describe('JSON formatters', () => {
 
     it('show example --json works via CLI', () => {
         const { execFileSync } = require('child_process');
-        // Run CLI with --json flag to ensure example command goes through printOutput
-        // Use formatFn which has call sites in the codebase (formatExample has none after output split)
-        const result = execFileSync('node', [CLI_PATH, '.', 'show', 'formatFn', '--sections=example', '--json'], {
+        // Use the compact fixture rather than cold-indexing the whole UCN
+        // repository in a parallel test process. The assertion is formatter
+        // routing, not large-repository build performance.
+        const result = execFileSync('node', [
+            CLI_PATH,
+            path.join(FIXTURES_PATH, 'javascript'),
+            'show',
+            'processData',
+            '--sections=example',
+            '--json',
+        ], {
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 30000,

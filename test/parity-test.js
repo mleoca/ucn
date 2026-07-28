@@ -232,7 +232,10 @@ describe('18-command CLI/MCP/interactive parity', () => {
             const text = runCli(dir, spec.cliName || toCliName(spec.command), spec.cliArgs,
                 [...spec.cliFlags, '--json']);
             const parsed = JSON.parse(text);
-            assert.strictEqual(parsed.meta.command, spec.command);
+            assert.strictEqual(parsed.meta.command, spec.cliName || toCliName(spec.command));
+            if ((spec.cliName || toCliName(spec.command)) !== spec.command) {
+                assert.strictEqual(parsed.meta.canonicalCommand, spec.command);
+            }
             assert.ok(Object.hasOwn(parsed, 'data'));
         }
     });

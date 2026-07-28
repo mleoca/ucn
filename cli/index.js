@@ -14,7 +14,17 @@ const { detectLanguage } = require('../core/parser');
 const { ProjectIndex } = require('../core/project');
 const { expandGlob, findProjectRoot } = require('../core/discovery');
 const output = require('../core/output');
-const { getCliCommandSet, resolveCommand, suggestCommand, FLAG_APPLICABILITY, toCliName, FILE_LOCAL_COMMANDS } = require('../core/registry');
+const {
+    getCliCommandSet,
+    resolveCommand,
+    suggestCommand,
+    FLAG_APPLICABILITY,
+    toCliName,
+    FILE_LOCAL_COMMANDS,
+    formatSurfaceMessage,
+    getCliFlagsForCommand,
+    getCliAcceptedFlags,
+} = require('../core/registry');
 const { buildPublicParams, isPublicCommand } = require('../core/public-command');
 const { execute } = require('../core/execute');
 const { applyOutputBudget, MAX_OUTPUT_CHARS } = require('../core/output-budget');
@@ -137,7 +147,10 @@ function fail(msg) {
             meta: {
                 ok: false,
                 ...(activeCanonicalCommand && {
-                    command: activeCanonicalCommand,
+                    command: toCliName(activeCanonicalCommand),
+                    ...(toCliName(activeCanonicalCommand) !== activeCanonicalCommand && {
+                        canonicalCommand: activeCanonicalCommand,
+                    }),
                     contract: output.contractMeta(activeCanonicalCommand),
                 }),
             },
@@ -241,7 +254,9 @@ function parseFlags(tokens) {
             : (tokens.includes('--compact') ? true : undefined),
         maxLines: getValueFlag('--max-lines') || null,
         maxLinesRaw: getValueFlag('--max-lines'),
-        regex: tokens.includes('--no-regex') ? false : undefined,
+        regex: tokens.includes('--regex')
+            ? true
+            : (tokens.includes('--no-regex') ? false : undefined),
         functions: tokens.includes('--functions') || undefined,
         hot: tokens.includes('--hot') || undefined,
         diverse: tokens.includes('--diverse') || undefined,
@@ -297,24 +312,7 @@ flags.interactive = args.includes('--interactive') || args.includes('-i');
 flags.followSymlinks = !args.includes('--no-follow-symlinks');
 
 // Known flags for validation
-const knownFlags = new Set([
-    '--help', '-h', '--version', '-v', '--mcp',
-    '--json', '--verbose', '--no-quiet', '--quiet',
-    '--code-only', '--with-types', '--with-source', '--top-level', '--exact', '--case-sensitive',
-    '--no-cache', '--clear-cache', '--include-tests', '--exclude-tests',
-    '--include-exported', '--include-decorated', '--interactive', '-i', '--all', '--include-methods', '--no-include-methods', '--expand-unverified', '--detailed', '--calls-only',
-    '--file', '--context', '--exclude', '--not', '--in',
-    '--depth', '--direction', '--to', '--sections', '--range', '--add-param', '--remove-param', '--rename-to', '--default-value',
-    '--default', '--top', '--no-follow-symlinks',
-    '--base', '--staged', '--stack',
-    '--regex', '--no-regex', '--functions', '--hot', '--diverse', '--git', '--cycles',
-    '--max-lines', '--class-name', '--line', '--limit', '--max-files', '--max-chars',
-    '--type', '--param', '--receiver', '--returns', '--decorator', '--exported', '--unused',
-    '--hide-confidence', '--no-confidence', '--min-confidence', '--unreachable-only',
-    '--framework', '--workers', '--deep', '--compact', '--no-compact',
-    '--bridge', '--server-only', '--client-only', '--unmatched',
-    '--method', '--prefix', '--hide-uncertain', '--no-uncertain'
-]);
+const knownFlags = getCliAcceptedFlags();
 
 // Handle help flag
 if (args.includes('--help') || args.includes('-h')) {
@@ -588,9 +586,11 @@ function runFileCommand(filePath, command, arg) {
     const params = buildPublicParams(canonical, arg, scopedFlags);
     const execution = execute(index, canonical, params);
     const { ok, result, error } = execution;
-    if (!ok) fail(error);
+    if (!ok) fail(formatSurfaceMessage(error, 'cli'));
     console.log(flags.json
-        ? output.formatPublicJson(canonical, result, params, execution)
+        ? output.formatPublicJson(canonical, result, params, {
+            ...execution, surface: 'cli',
+        })
         : formatCliText(canonical, result, params, execution, scopedFlags));
 }
 
@@ -656,9 +656,13 @@ function runProjectCommand(rootDir, command, arg) {
         ...(subdirScope && !flags.in ? { in: subdirScope } : {}),
     });
     const publicExecution = execute(index, canonical, publicParams);
-    if (!publicExecution.ok) fail(publicExecution.error);
+    if (!publicExecution.ok) {
+        fail(formatSurfaceMessage(publicExecution.error, 'cli'));
+    }
     console.log(flags.json
-        ? output.formatPublicJson(canonical, publicExecution.result, publicParams, publicExecution)
+        ? output.formatPublicJson(canonical, publicExecution.result, publicParams, {
+            ...publicExecution, surface: 'cli',
+        })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
     } catch (e) {
         if (!(e instanceof CommandError)) {
@@ -705,9 +709,13 @@ function runGlobCommand(pattern, command, arg) {
     warnInapplicableFlags(canonical, flags, (message) => console.error(message));
     const publicParams = buildPublicParams(canonical, arg, flags);
     const publicExecution = execute(index, canonical, publicParams);
-    if (!publicExecution.ok) fail(publicExecution.error);
+    if (!publicExecution.ok) {
+        fail(formatSurfaceMessage(publicExecution.error, 'cli'));
+    }
     console.log(flags.json
-        ? output.formatPublicJson(canonical, publicExecution.result, publicParams, publicExecution)
+        ? output.formatPublicJson(canonical, publicExecution.result, publicParams, {
+            ...publicExecution, surface: 'cli',
+        })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
 }
 
@@ -719,6 +727,10 @@ function runGlobCommand(pattern, command, arg) {
 // Single source of truth for the public CLI help. README points here ("Run `ucn --help`")
 // rather than carrying a copy — keep it that way.
 function printUsage() {
+    const perCommandFlags = [...getCliCommandSet()].map(command => {
+        const flags = getCliFlagsForCommand(command);
+        return `  ${command.padEnd(14)} ${flags.join(' ')}`;
+    }).join('\n');
     console.log(`UCN - Universal Code Navigator
 
 Supported: JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, HTML
@@ -737,6 +749,7 @@ Commands:
   find <name>                     Definitions; --type=type, --with-source
   usages <name>                   Calls, imports, definitions, references
   search [term]                   Text or structural search
+    literal text by default; --regex enables regular-expression syntax
   source <symbol|file:range>      Exact function, class, or line extraction
   trace <symbol>                  Call graph
     --direction=callees|callers   Downstream or upstream (default: callees)
@@ -762,6 +775,21 @@ Common flags:
   --base=REF --staged --no-cache --clear-cache --max-files=N --workers=N
   --max-chars=N (text output; default 10K targeted / 3K broad, ceiling 100K)
   Cache: per-user by default; set UCN_CACHE_DIR to override the cache root.
+
+Accepted flags by command:
+${perCommandFlags}
+
+Global/build/output flags:
+  --help -h --version -v --mcp --json --verbose --no-quiet --quiet
+  --interactive -i --no-cache --clear-cache --no-follow-symlinks
+  --max-files=N --max-chars=N --workers=N
+
+Boolean aliases:
+  --no-include-methods --no-regex --hide-confidence --no-confidence
+  --hide-uncertain --no-uncertain --compact --no-compact
+
+Value aliases:
+  --not=PATTERN (alias of --exclude) --default=VALUE (alias of --default-value)
 
 Trust:
   CONFIRMED means target-identity evidence exists. UNVERIFIED means possible and
@@ -952,7 +980,7 @@ function executeInteractiveCommand(index, command, arg, iflags = {}) {
     const publicParams = buildPublicParams(command, arg, iflags);
     const publicExecution = execute(index, command, publicParams);
     if (!publicExecution.ok) {
-        console.log(publicExecution.error);
+        console.log(formatSurfaceMessage(publicExecution.error, 'cli'));
         return;
     }
     console.log(formatCliText(

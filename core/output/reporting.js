@@ -9,6 +9,15 @@ const {
     formatClassSignature,
 } = require('./shared');
 
+const LIST_TEXT_LIMIT = 240;
+
+function elideListText(value, limit = LIST_TEXT_LIMIT) {
+    const text = String(value ?? '');
+    if (text.length <= limit) return text;
+    const kept = limit - 18;
+    return `${text.slice(0, kept)}… [${text.length} chars]`;
+}
+
 /**
  * Format toc command output
  * @param {object} toc - TOC data
@@ -63,10 +72,10 @@ function formatToc(toc, options = {}) {
             lines.push(`\n${file.file} (${parts.join(', ')})`);
             if (file.symbols) {
                 for (const fn of file.symbols.functions) {
-                    lines.push(`  ${lineRange(fn.startLine, fn.endLine)} ${formatFunctionSignature(fn)}`);
+                    lines.push(`  ${lineRange(fn.startLine, fn.endLine)} ${elideListText(formatFunctionSignature(fn))}`);
                 }
                 for (const cls of file.symbols.classes) {
-                    lines.push(`  ${lineRange(cls.startLine, cls.endLine)} ${formatClassSignature(cls)}`);
+                    lines.push(`  ${lineRange(cls.startLine, cls.endLine)} ${elideListText(formatClassSignature(cls))}`);
                 }
             }
         } else {
@@ -143,7 +152,7 @@ function formatStats(stats, options = {}) {
         lines.push(`\nFunctions by line count (top ${shown.length} of ${stats.functions.length}):`);
         for (const fn of shown) {
             const loc = `${fn.file}:${fn.startLine}`;
-            lines.push(`  ${String(fn.lines).padStart(5)} lines  ${fn.name}  (${loc})`);
+            lines.push(`  ${String(fn.lines).padStart(5)} lines  ${elideListText(fn.name, 100)}  (${loc})`);
         }
         if (stats.functions.length > top) {
             lines.push(`  ... ${stats.functions.length - top} more (use --top=N to show more)`);
@@ -159,7 +168,7 @@ function formatStats(stats, options = {}) {
         } else {
             for (const fn of items) {
                 const loc = `${fn.file}:${fn.startLine}`;
-                lines.push(`  ${String(fn.callCount).padStart(5)} calls  ${fn.name}  (${loc})`);
+                lines.push(`  ${String(fn.callCount).padStart(5)} calls  ${elideListText(fn.name, 100)}  (${loc})`);
                 // MEDIUM-6: when the same name has multiple definitions across
                 // files (e.g. test helpers vs. test fixtures both named `tmp`),
                 // list the additional locations indented so the user knows
@@ -194,7 +203,9 @@ function formatStatsJson(stats) {
  * @param {string} [options.exportedHint] - Hint about exported symbols exclusion
  */
 function formatDeadcode(results, options = {}) {
-    if (results.length === 0 && !results.excludedDecorated && !results.excludedExported && !results.excludedExternalContract) {
+    if (results.length === 0 && !results.excludedDecorated &&
+        !results.excludedExported && !results.excludedExternalContract &&
+        !results.excludedDynamicDispatch && !results.computedDispatch?.count) {
         return 'No dead code found.';
     }
 
@@ -238,7 +249,10 @@ function formatDeadcode(results, options = {}) {
             : '';
         // The only references are the symbol's own recursion (fix #253c).
         const recStr = item.selfRecursive ? ' [only self-references — recursive]' : '';
-        const displayName = item.className ? `${item.className}.${item.name}` : item.name;
+        const displayName = elideListText(
+            item.className ? `${item.className}.${item.name}` : item.name,
+            120,
+        );
         lines.push(`  ${lineRange(item.startLine, item.endLine)} ${displayName} (${item.type})${exported}${hintStr}${declStr}${extStr}${recStr}`);
     }
 
@@ -262,6 +276,12 @@ function formatDeadcode(results, options = {}) {
     if (results.excludedExternalContract > 0) {
         const extHint = options.externalContractHint || `${results.excludedExternalContract} symbol(s) hidden (override an out-of-tree base class — reachable via external contract, not dead). Use --include-exported to include them.`;
         lines.push(`\n${extHint}`);
+    }
+    if (results.excludedDynamicDispatch > 0) {
+        lines.push(`\n${results.excludedDynamicDispatch} registry member(s) hidden because a matching computed dispatch (registry[key]()) may invoke them.`);
+    }
+    if (results.computedDispatch?.count > 0) {
+        lines.push(`\nWARNING: ${results.computedDispatch.count} computed dispatch call(s) in ${results.computedDispatch.fileCount} file(s). Dead-code results are review candidates; runtime-selected members may not have a named static edge.`);
     }
 
     if (lines.length === 0) {
@@ -291,6 +311,8 @@ function formatDeadcodeJson(results) {
             ...(results.excludedExported > 0 && { excludedExported: results.excludedExported }),
             ...(results.excludedDecorated > 0 && { excludedDecorated: results.excludedDecorated }),
             ...(results.excludedExternalContract > 0 && { excludedExternalContract: results.excludedExternalContract }),
+            ...(results.excludedDynamicDispatch > 0 && { excludedDynamicDispatch: results.excludedDynamicDispatch }),
+            ...(results.computedDispatch?.count > 0 && { computedDispatch: results.computedDispatch }),
             symbols: results.map(item => {
                 const handleSym = { ...item, relativePath: item.relativePath || item.file };
                 const handle = formatSymbolHandle(handleSym);

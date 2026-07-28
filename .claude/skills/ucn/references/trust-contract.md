@@ -10,7 +10,7 @@ Use this reference when an agent, CI job, or script will make decisions from UCN
 
 `excluded` means the engine found evidence for a different definition, an incompatible receiver, an external package, an unrelated runtime-language boundary, an arity mismatch, or another stated reason. Inspect excluded reasons when investigating an accuracy issue.
 
-`non-call` means the literal name occurred as a definition, import, type reference, property, comment/string, or other text. Use `usages` for the underlying sites.
+`non-call` means the literal name occurred as a definition, import, type reference, property, comment/string, or other text. Use `usages` for the underlying sites; comment/string occurrences appear under `OTHER TEXT` unless `codeOnly=true`.
 
 `beyond-text` means semantic binding or alias evidence produced an edge that a literal-name ground set could not observe.
 
@@ -78,4 +78,7 @@ Allow an automated change to proceed to compiler/tests only when:
 - the repo health report lists no unsupported source handoff relevant to the change;
 - the change is still validated by the language toolchain and relevant tests.
 
-Never auto-delete from a UCN-only signal. Require usages, entry-point review, public API review, and external validation.
+Never auto-delete from a UCN-only signal. Computed dispatch is reported as a
+health blind spot, and modeled registry members are withheld from candidates,
+but neither protection proves runtime reachability. Require usages, entry-point
+review, public API review, and external validation.

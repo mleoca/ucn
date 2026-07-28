@@ -51,6 +51,7 @@ const RELEASE_GATES = Object.freeze({
     minRecoveryRate: 1,
     maxMedianAgentToolCalls: 2,
     maxOutputTokensP95: 2000,
+    minFixtureLoc: 500,
 });
 
 const POSITIONAL_PARAM = Object.freeze({
@@ -230,9 +231,10 @@ const SCENARIOS = Object.freeze([
         assertions: [
             assertion('plan stays a preview',
                 doc => doc.data?.operation === 'rename'),
-            assertion('plan includes calls and imports',
-                doc => doc.data?.totalChanges === 4 &&
-                    doc.data?.changes?.some(change => change.isImport)),
+            assertion('plan includes the declaration, calls, and imports',
+                doc => doc.data?.changes?.some(change => change.isDefinition) &&
+                    doc.data?.changes?.some(change => change.isImport) &&
+                    doc.data?.changeSummary?.calls > 0),
             assertion('plan renders the requested new name',
                 doc => doc.data?.after?.signature?.includes('emitOrderCreated')),
         ],
@@ -698,6 +700,23 @@ function rate(values) {
     return Number((values.reduce((sum, value) => sum + value, 0) / values.length).toFixed(4));
 }
 
+function fixtureLoc(fixtureDir) {
+    let total = 0;
+    const stack = [fixtureDir];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        for (const entry of fs.readdirSync(current, { withFileTypes: true })) {
+            const absolute = path.join(current, entry.name);
+            if (entry.isDirectory()) {
+                stack.push(absolute);
+            } else if (/\.(?:[cm]?[jt]sx?|py|go|rs|java|cs|html)$/.test(entry.name)) {
+                total += fs.readFileSync(absolute, 'utf8').split('\n').length;
+            }
+        }
+    }
+    return total;
+}
+
 function percentile(values, fraction) {
     if (!values.length) return 0;
     const sorted = [...values].sort((a, b) => a - b);
@@ -755,6 +774,9 @@ function evaluateGates(summary, gates = RELEASE_GATES) {
         failures.push(`output tokens p95 ${summary.outputTokensP95} ` +
             `> ${gates.maxOutputTokensP95}`);
     }
+    if ((summary.fixtureLoc || 0) < gates.minFixtureLoc) {
+        failures.push(`fixture LOC ${summary.fixtureLoc || 0} < ${gates.minFixtureLoc}`);
+    }
     if (summary.commandsCovered !== CANONICAL_COMMANDS.length) {
         failures.push(`public command coverage ${summary.commandsCovered}/${CANONICAL_COMMANDS.length}`);
     }
@@ -788,6 +810,7 @@ function formatMarkdown(report) {
         '| metric | result | gate |',
         '|---|---:|---:|',
         `| public commands covered | ${summary.commandsCovered}/${CANONICAL_COMMANDS.length} | ${CANONICAL_COMMANDS.length}/${CANONICAL_COMMANDS.length} |`,
+        `| fixture source LOC | ${summary.fixtureLoc} | ≥ ${RELEASE_GATES.minFixtureLoc} |`,
         `| ${selectionLabel} | ${summary.selectionAccuracy} | ≥ ${RELEASE_GATES.minSelectionAccuracy} |`,
         `| ${parameterLabel} | ${summary.parameterAccuracy} | ≥ ${RELEASE_GATES.minParameterAccuracy} |`,
         `| answer accuracy | ${summary.answerAccuracy} | ${RELEASE_GATES.minAnswerAccuracy} |`,
@@ -868,6 +891,7 @@ async function runBenchmark(options = {}) {
 
     const summary = summarize(allResults);
     summary.recoveryRate = recovery?.rate || 0;
+    summary.fixtureLoc = fixtureLoc(fixtureDir);
     const gate = evaluateGates(summary);
     if (toolMetadata?.toolCount !== 1) {
         gate.passed = false;
@@ -878,7 +902,7 @@ async function runBenchmark(options = {}) {
         gate.failures.push('MCP command enum does not match the 18-command registry');
     }
     return {
-        schemaVersion: 4,
+        schemaVersion: 5,
         generatedAt: new Date().toISOString(),
         fixtureDir,
         runs,

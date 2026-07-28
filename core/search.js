@@ -37,6 +37,61 @@ function matchesSubstring(text, pattern, caseSensitive) {
     return text.toLowerCase().includes(pattern.toLowerCase());
 }
 
+function literalNameRegex(name) {
+    return new RegExp(
+        `(?<![A-Za-z0-9_$])${escapeRegExp(name)}(?![A-Za-z0-9_$])`,
+    );
+}
+
+/**
+ * Complete the AST-classified usage inventory with literal-name lines that
+ * occur only in comments, strings, or docstrings. Do not reintroduce code
+ * references that the language adapter intentionally filtered (for example,
+ * a Rust enum variant that shares a struct's name).
+ * `usages` promises this observed-text complement unless codeOnly=true.
+ */
+function appendTextComplements(index, {
+    usagesList,
+    filePath,
+    fileEntry,
+    content,
+    lines,
+    name,
+    context,
+}) {
+    const represented = new Set(usagesList
+        .filter(usage => usage.file === filePath)
+        .map(usage => usage.line));
+    const pattern = literalNameRegex(name);
+    for (let idx = 0; idx < lines.length; idx++) {
+        const line = lines[idx];
+        const match = pattern.exec(line);
+        if (!match || represented.has(idx + 1)) continue;
+        const lineNum = idx + 1;
+        const commentOrString = index.isCommentOrStringAtPosition(
+            content, lineNum, match.index, filePath);
+        if (!commentOrString) continue;
+        const usage = {
+            file: filePath,
+            relativePath: fileEntry.relativePath,
+            line: lineNum,
+            content: line,
+            usageType: 'text',
+            textKind: 'comment-or-string',
+            isDefinition: false,
+        };
+        if (context > 0) {
+            usage.before = [];
+            usage.after = [];
+            for (let i = 1; i <= context; i++) {
+                if (idx - i >= 0) usage.before.unshift(lines[idx - i]);
+                if (idx + i < lines.length) usage.after.push(lines[idx + i]);
+            }
+        }
+        usagesList.push(usage);
+    }
+}
+
 /**
  * Find symbols by name with fuzzy/glob matching.
  *
@@ -401,6 +456,17 @@ function usages(index, name, options = {}) {
 
                     usagesList.push(usage);
                 }
+                if (!options.codeOnly) {
+                    appendTextComplements(index, {
+                        usagesList,
+                        filePath,
+                        fileEntry,
+                        content,
+                        lines,
+                        name,
+                        context: options.context || 0,
+                    });
+                }
                 continue; // Skip to next file
             }
 
@@ -420,13 +486,13 @@ function usages(index, name, options = {}) {
                         return;
                     }
 
-                    // Skip if the match is inside a string literal
-                    if (index.isInsideStringAST(content, lineNum, line, name, filePath)) {
-                        return;
-                    }
-
                     // Classify usage type (AST-based, defaults to 'reference' for unsupported languages)
-                    const usageType = index.classifyUsageAST(content, lineNum, name, filePath) ?? 'reference';
+                    const inText = index.isInsideStringAST(
+                        content, lineNum, line, name, filePath);
+                    const usageType = !options.codeOnly && inText
+                        ? 'text'
+                        : (index.classifyUsageAST(
+                            content, lineNum, name, filePath) ?? 'reference');
 
                     // BUG-4: enrich call usages with enclosing-function info.
                     let callerSym = null;
@@ -441,6 +507,9 @@ function usages(index, name, options = {}) {
                         content: line,
                         usageType,
                         isDefinition: false,
+                        ...(usageType === 'text' && {
+                            textKind: 'comment-or-string',
+                        }),
                         ...(callerSym && {
                             callerName: callerSym.name,
                             callerStartLine: callerSym.startLine
@@ -498,7 +567,7 @@ function search(index, term, options = {}) {
     let filesSkipped = 0;
     let filesFilteredByFlag = 0;
     const regexFlags = options.caseSensitive ? 'g' : 'gi';
-    const useRegex = options.regex !== false; // Default: regex ON
+    const useRegex = options.regex === true; // Safe default: literal text
     let regex;
     let regexFallback = false;
     if (useRegex) {
@@ -643,7 +712,17 @@ function search(index, term, options = {}) {
         results.push(...truncated);
     }
 
-    results.meta = { filesScanned, filesSkipped, filesFilteredByFlag, totalFiles: index.files.size, regexFallback, totalMatches, truncatedMatches, projectLanguage: index._getPredominantLanguage() };
+    results.meta = {
+        filesScanned,
+        filesSkipped,
+        filesFilteredByFlag,
+        totalFiles: index.files.size,
+        regexFallback,
+        mode: useRegex ? (regexFallback ? 'literal-fallback' : 'regex') : 'literal',
+        totalMatches,
+        truncatedMatches,
+        projectLanguage: index._getPredominantLanguage(),
+    };
     return results;
     } finally { index._endOp(); }
 }

@@ -3831,10 +3831,13 @@ describe('BUG-BW: plan finds class-method call sites the same way verify does', 
             assert.ok(verifyTotal > 0, 'verify must find at least one call');
             const p = execute(i, 'plan', { name: 'save', className: 'Repository', addParam: 'opt' });
             assert.ok(p.ok, 'plan should succeed');
-            assert.strictEqual(p.result.totalChanges, verifyTotal,
-                `plan totalChanges (${p.result.totalChanges}) must equal verify totalCalls (${verifyTotal})`);
+            const callChanges = p.result.changes.filter(c => c.editKind === 'call');
+            assert.strictEqual(callChanges.length, verifyTotal,
+                `plan call changes (${callChanges.length}) must equal verify totalCalls (${verifyTotal})`);
+            assert.strictEqual(p.result.changeSummary.definitions, 1,
+                'plan separately includes the selected declaration');
             assert.strictEqual(p.result.filesAffected, 1, 'expected 1 file affected');
-            assert.ok(p.result.changes.every(c => c.suggestion.includes('Add argument: opt')));
+            assert.ok(callChanges.every(c => c.suggestion.includes('Add argument: opt')));
         } finally { rm(dir); }
     });
 

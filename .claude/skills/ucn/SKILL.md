@@ -16,7 +16,10 @@ Use UCN to gather compact, auditable code evidence before reading large files or
 5. After a signature change, run `ucn check <handle>`. Before committing, run target-less `ucn check`.
 6. Read exact code with `ucn source <handle>` or `ucn source path/to/file:10-30` only when inspection is needed.
 
-Prefer `--json` for automation. Every CLI JSON response uses `{ meta, data }`. MCP returns text through one `ucn` tool and keeps contract metadata visible when truncating results.
+Prefer `--json` for automation. Every CLI JSON response uses `{ meta, data }`;
+`meta.command` uses the native surface spelling and may include the internal
+`canonicalCommand`. MCP returns text through one `ucn` tool and keeps contract
+metadata visible when truncating results.
 
 ## One contract across surfaces
 
@@ -60,8 +63,8 @@ An observed-text zero is not semantic zero or safe-delete proof. Numeric evidenc
 | Orient or diagnose a repository | `ucn repo [--sections=files,stats,health] [--deep]` |
 | Understand one symbol | `ucn show <handle> [--sections=...]` |
 | Locate definitions or types | `ucn find <name> [--type=type]` |
-| Inspect all reference kinds | `ucn usages <name>` |
-| Search text or AST structure | `ucn search [term] [--type=...]` |
+| Inspect literal-name occurrence kinds | `ucn usages <name>` |
+| Search literal text, explicit regex, or AST structure | `ucn search [term] [--regex] [--type=...]` |
 | Extract exact source | `ucn source <handle\|file:range>` |
 | Follow calls down or up | `ucn trace <handle> --direction=callees\|callers` |
 | Find paths to roots | `ucn trace <handle> --direction=callers --to=entrypoints` |
@@ -87,14 +90,23 @@ An observed-text zero is not semantic zero or safe-delete proof. Numeric evidenc
 
 ## Deletion protocol
 
-Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Never delete solely from `deadcode` or an observed-text-zero result.
+Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Computed dispatch such as `handlers[key]()` is a reported blind spot; registry members reached by a modeled computed receiver are withheld, but all remaining candidates are still review-only. Never delete solely from `deadcode` or an observed-text-zero result.
+
+`usages` includes comment/string/docstring occurrences in an `OTHER TEXT` section unless
+`--code-only` is set. This is a literal-name inventory, not exact target
+binding. `search` treats its term literally by default; pass `--regex` only
+when regular-expression semantics are intended.
+
+`plan` always includes the selected declaration plus indexed call/import/export
+previews. Read `changeSummary`, and manually review any edit marked
+`needsReview`; the command previews changes but does not apply or compile them.
 
 ## Efficient use
 
 - Prefer handles over plain names. Use `--class-name` or `--file` only when a handle is unavailable.
 - Use `--sections` to request only the `show` or `repo` evidence needed.
 - Use `--expand-unverified` only when deliberately exploring possible caller chains; those descendants remain possible, not confirmed.
-- Use `--all` when output reports a cap and `--exclude=test` only for an intentionally production-only view.
+- Use `--all` only when that command's output reports a supported cap; otherwise narrow the query or raise `--max-chars`.
 - Use `search` or ordinary repository search for text, filenames, configuration, and unsupported syntax.
 
 Read [references/commands.md](references/commands.md) for all public commands and flags. Read [references/trust-contract.md](references/trust-contract.md) before building automation that gates changes on UCN output.

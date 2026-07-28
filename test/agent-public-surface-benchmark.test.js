@@ -98,6 +98,7 @@ describe('public-surface agent benchmark contract', () => {
         }));
         const passing = summarize(passingRows);
         passing.recoveryRate = 1;
+        passing.fixtureLoc = RELEASE_GATES.minFixtureLoc;
         assert.deepEqual(evaluateGates(passing), { passed: true, failures: [] });
 
         passingRows[0] = {
@@ -125,6 +126,7 @@ describe('public-surface agent benchmark contract', () => {
             liveAgentPlans: false,
             summary: {
                 commandsCovered: CANONICAL_COMMANDS.length,
+                fixtureLoc: RELEASE_GATES.minFixtureLoc,
                 selectionAccuracy: 1,
                 parameterAccuracy: 1,
                 answerAccuracy: 1,

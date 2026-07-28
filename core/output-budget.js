@@ -1,6 +1,11 @@
 'use strict';
 
-const { BROAD_COMMANDS: BROAD_CANONICAL, toMcpName } = require('./registry');
+const {
+    BROAD_COMMANDS: BROAD_CANONICAL,
+    FLAG_APPLICABILITY,
+    resolveCommand,
+    toMcpName,
+} = require('./registry');
 
 const DEFAULT_OUTPUT_CHARS = 10000;
 const BROAD_OUTPUT_CHARS = 3000;
@@ -107,9 +112,16 @@ function applyOutputBudget(text, {
         ? truncated.substring(0, lastNewline)
         : truncated;
     const contractMetadata = preservedContractMetadata(text, cleanCut);
-    const allHint = surface === 'mcp'
-        ? 'Use all=true to lift formatter caps; the transport still has a 100K character ceiling.'
-        : 'Use --all to lift formatter caps, or --max-chars=N up to the 100K character ceiling.';
+    const canonical = resolveCommand(command, surface === 'mcp' ? 'mcp' : 'cli') ||
+        command;
+    const supportsAll = FLAG_APPLICABILITY[canonical]?.includes('all');
+    const allHint = supportsAll
+        ? (surface === 'mcp'
+            ? 'Use all=true to lift formatter caps; the transport still has a 100K character ceiling.'
+            : 'Use --all to lift formatter caps, or --max-chars=N up to the 100K character ceiling.')
+        : (surface === 'mcp'
+            ? 'Use max_chars=<n> up to the 100K character ceiling.'
+            : 'Use --max-chars=N up to the 100K character ceiling.');
     let rendered = cleanCut +
         `\n\n... OUTPUT TRUNCATED: showing at most ${limit} of ${text.length} chars. ` +
         `Full output would be ~${Math.round(text.length / 4)} tokens. ` +

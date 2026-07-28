@@ -1255,7 +1255,8 @@ fn main() {
         assert.ok(result.found);
         assert.ok(!result.error);
         assert.ok(result.changes.length >= 1);
-        const change = result.changes[0];
+        const change = result.changes.find(c => c.editKind === 'call');
+        assert.ok(change, 'expected a caller-side edit in addition to the declaration');
         assert.ok(change.suggestion.includes('argument 1'),
             `should say argument 1, got: ${change.suggestion}`);
     });
@@ -1277,7 +1278,8 @@ describe('FIX #118 — plan --remove-param unaffected for JS (no self)', () => {
         const result = index.plan('process', { removeParam: 'data' });
         assert.ok(result.found);
         assert.ok(!result.error);
-        const change = result.changes[0];
+        const change = result.changes.find(c => c.editKind === 'call');
+        assert.ok(change, 'expected a caller-side edit in addition to the declaration');
         assert.ok(change.suggestion.includes('argument 1'),
             `should say argument 1, got: ${change.suggestion}`);
         assert.ok(change.suggestion.includes('"hello"'),

@@ -2661,7 +2661,9 @@ def store():
             assert.ok(ttlIdx < hoursIdx, 'signature should be valid');
             // Call sites should have guidance
             assert.ok(result.result.changes.length > 0, 'should have call site changes');
-            assert.ok(result.result.changes[0].suggestion.includes('Add argument'));
+            const callChange = result.result.changes.find(change =>
+                !change.isDefinition && change.suggestion.includes('Add argument'));
+            assert.ok(callChange, 'call-site edit should say Add argument');
         } finally {
             rm(dir);
         }

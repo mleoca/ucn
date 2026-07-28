@@ -11,7 +11,7 @@ const { execFileSync } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
-const { CLI_PATH, PROJECT_DIR, tmp, rm, runInteractive } = require('./helpers');
+const { CLI_PATH, PROJECT_DIR, FIXTURES_PATH, tmp, rm, runInteractive } = require('./helpers');
 const { CANONICAL_COMMANDS, toCliName } = require('../core/registry');
 const {
     getProjectCacheDir,
@@ -64,7 +64,13 @@ describe('Interactive Mode', () => {
 
         const input = commands.join('\n') + '\nquit\n';
 
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+        // This checks interactive command routing, so use the compact fixture
+        // instead of making a parallel test process cold-index the full repo.
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
             input,
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
@@ -79,7 +85,11 @@ describe('Interactive Mode', () => {
     });
 
     it('help lists all commands', () => {
-        const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
+        const result = execFileSync('node', [
+            CLI_PATH,
+            '--interactive',
+            path.join(FIXTURES_PATH, 'javascript'),
+        ], {
             input: 'help\nquit\n',
             encoding: 'utf-8',
             cwd: PROJECT_DIR,

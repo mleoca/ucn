@@ -336,6 +336,7 @@ class ProjectIndex {
         // Always invalidate caches on rebuild
         this._completenessCache = null;
         this._attrTypeCache = null;
+        this._computedDispatchBlindspots = null;
         // Endpoints cache (server routes / client requests / bridges) becomes
         // stale when files change; clear on every rebuild.
         this._endpointsCache = null;
@@ -557,6 +558,8 @@ class ProjectIndex {
 
         // Invalidate lazy Java file index (will be rebuilt on next use)
         this._javaFileIndex = null;
+        // Computed-dispatch diagnostics are project-wide and read source text.
+        this._computedDispatchBlindspots = null;
         // Endpoints cache is project-wide; safest to clear on any file removal.
         this._endpointsCache = null;
     }

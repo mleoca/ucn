@@ -16,6 +16,7 @@ const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots, codeUnitComp
 const { isTestFile } = require('./discovery');
 const { computeReachability, symbolKey } = require('./entrypoints');
 const { getLanguageAdapter } = require('../languages');
+const { projectComputedDispatch } = require('./ast-analysis');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
 // Used to flag call sites whose enclosing function is an arrow callback
@@ -637,6 +638,8 @@ function detectCompleteness(index) {
     let dynamicImports = 0;
     let evalUsage = 0;
     let reflectionUsage = 0;
+    let computedDispatchUsage = 0;
+    const computedDispatch = projectComputedDispatch(index);
 
     for (const [filePath, fileEntry] of index.files) {
         // Skip node_modules - we don't care about their patterns
@@ -660,6 +663,7 @@ function detectCompleteness(index) {
             const bs = countTextBlindspots(content, fileEntry.language);
             evalUsage += bs.eval;
             reflectionUsage += bs.reflection;
+            computedDispatchUsage += computedDispatch.get(filePath)?.length || 0;
         } catch (e) {
             // Skip unreadable files
         }
@@ -686,6 +690,14 @@ function detectCompleteness(index) {
             type: 'reflection',
             count: reflectionUsage,
             message: `${reflectionUsage} reflection usage(s) detected - dynamic attribute access not tracked`
+        });
+    }
+
+    if (computedDispatchUsage > 0) {
+        warnings.push({
+            type: 'computed_dispatch',
+            count: computedDispatchUsage,
+            message: `${computedDispatchUsage} computed dispatch call(s) detected - runtime-selected members are not statically attributable`,
         });
     }
 

@@ -11,6 +11,7 @@ const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
 const { splitParentList } = require('./graph-build');
 const { isOverrideMarked, codeUnitCompare, lineInRanges, maskBlockComments } = require('./shared');
+const { projectComputedDispatch } = require('./ast-analysis');
 
 const _CLASS_KINDS = ['class', 'struct', 'interface', 'trait', 'record'];
 
@@ -476,6 +477,18 @@ function deadcode(index, options = {}) {
     let excludedDecorated = 0;
     let excludedExported = 0;
     let excludedExternalContract = 0;
+    let excludedDynamicDispatch = 0;
+    const computedDispatchByFile = projectComputedDispatch(index);
+    const computedDispatchInfo = { count: 0, fileCount: 0, files: [] };
+    for (const [dispatchFile, sites] of computedDispatchByFile) {
+        const fe = index.files.get(dispatchFile);
+        if (!fe || !index.matchesFilters(fe.relativePath, options)) continue;
+        computedDispatchInfo.count += sites.length;
+        computedDispatchInfo.fileCount++;
+        if (computedDispatchInfo.files.length < 10) {
+            computedDispatchInfo.files.push(fe.relativePath);
+        }
+    }
 
     // Ensure callee index is built (lazy, reused across operations)
     if (!index.calleeIndex) {
@@ -1071,6 +1084,20 @@ function deadcode(index, options = {}) {
                     return { kind: enclosing.type, name: symbol.className };
                 })();
 
+                // Object-literal registry members invoked through
+                // `registry[key]()` have no statically named call edge. The
+                // parser records their owning registry, so a matching
+                // computed receiver is positive evidence that "unused" is
+                // unsafe. Hide them from candidates and report the exclusion.
+                const dynamicallyDispatched = symbol.registryMember &&
+                    symbol.registryContainer &&
+                    (computedDispatchByFile.get(symbol.file) || []).some(site =>
+                        site.receiver === symbol.registryContainer);
+                if (dynamicallyDispatched) {
+                    excludedDynamicDispatch++;
+                    continue;
+                }
+
                 results.push({
                     name: symbol.name,
                     type: symbol.type,
@@ -1104,6 +1131,8 @@ function deadcode(index, options = {}) {
     results.excludedDecorated = excludedDecorated;
     results.excludedExported = excludedExported;
     results.excludedExternalContract = excludedExternalContract;
+    results.excludedDynamicDispatch = excludedDynamicDispatch;
+    results.computedDispatch = computedDispatchInfo;
 
     return results;
     } finally { index._endOp(); }
