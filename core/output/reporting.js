@@ -449,12 +449,16 @@ function formatOrient(result) {
     if (bs.evalCalls) bsParts.push(`${bs.evalCalls} eval`);
     if (bs.reflection) bsParts.push(`${bs.reflection} reflection`);
     if (bs.parseFailures) bsParts.push(`${bs.parseFailures} parse failure(s)`);
-    lines.push(`TRUST: ${result.trust?.level || 'UNKNOWN'}${bsParts.length ? ' — ' + bsParts.join(', ') : ''}  (ucn doctor for detail)`);
+    lines.push(`TRUST: ${result.trust?.level || 'UNKNOWN'}${bsParts.length ? ' — ' + bsParts.join(', ') : ''}  (ucn repo --sections=health --deep for detail)`);
     lines.push('');
 
     const next = [];
-    if (result.suggest) next.push(`ucn about ${result.suggest}`);
-    next.push('ucn toc --detailed', 'ucn stats --hot --top=20', 'ucn doctor --deep');
+    if (result.suggest) next.push(`ucn show ${result.suggest}`);
+    next.push(
+        'ucn repo --sections=files --detailed',
+        'ucn repo --sections=stats --hot --top=20',
+        'ucn repo --sections=health --deep',
+    );
     lines.push(`Next: ${next.join(' · ')}`);
 
     return lines.join('\n');

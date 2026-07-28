@@ -133,6 +133,11 @@ const SERVER_RECEIVER_PATTERNS = {
         // route mount with method ALL. (Prefix concat with inner router routes
         // is deferred — too complex to track inner Router argument.)
     ],
+    csharp: [
+        { receiverPattern: /^(app|endpoints|routes)$/i,
+          methodPattern: /^Map(Get|Post|Put|Delete|Patch|Methods|Fallback)$/,
+          framework: 'aspnet-minimal' },
+    ],
 };
 
 // Client: receiver+method patterns and bare-call patterns.
@@ -195,6 +200,15 @@ const CLIENT_PATTERNS = {
         // reqwest::get("/path") is a path-call captured separately
         callableReceivers: new Set(),
     },
+    csharp: {
+        bareCalls: new Set(),
+        receivers: [
+            { receiverPattern: /^(client|http|httpClient)$/i,
+              methodPattern: /^(GetAsync|PostAsync|PutAsync|DeleteAsync|PatchAsync|SendAsync)$/,
+              framework: 'dotnet-httpclient' },
+        ],
+        callableReceivers: new Set(),
+    },
 };
 
 // HTTP-method decorator/annotation/attribute patterns.
@@ -247,6 +261,7 @@ const PREFIX_ANNOTATIONS = new Set([
     'RequestMapping', // Spring class-level @RequestMapping("/api")
     'Path',           // JAX-RS class-level @Path("/api")
 ]);
+const CSHARP_PREFIX_ATTRIBUTES = new Set(['Route']);
 
 // ============================================================================
 // EXTRACT SERVER ROUTES
@@ -385,6 +400,13 @@ function collectClassPrefixes(sym, lang) {
             }
         }
     }
+    if (lang === 'csharp' && sym.attributesWithArgs) {
+        for (const attribute of sym.attributesWithArgs) {
+            if (CSHARP_PREFIX_ATTRIBUTES.has(attribute.name) && attribute.arg != null) {
+                prefixes.push(attribute.arg);
+            }
+        }
+    }
     return prefixes;
 }
 
@@ -492,6 +514,21 @@ function collectMethodRoutes(sym, lang, classPrefix) {
         }
     }
 
+    // ── C# attributes (ASP.NET Core) ─────────────────────────────────
+    if (lang === 'csharp' && sym.attributesWithArgs) {
+        for (const attribute of sym.attributesWithArgs) {
+            const match = attribute.name.match(
+                /^Http(Get|Post|Put|Delete|Patch|Head|Options)$/);
+            if (!match) continue;
+            const sub = attribute.arg || '';
+            out.push({
+                method: match[1].toUpperCase(),
+                path: joinRoutePath(classPrefix, sub) || '/',
+                framework: 'aspnet',
+            });
+        }
+    }
+
     return out;
 }
 
@@ -566,6 +603,10 @@ function matchCallPatternRoute(call, lang) {
         // axum router.route('/path', get(handler)) — method comes from the *second* arg's verb,
         // which we don't have direct access to here. Fall back to ALL.
         let method = call.name.toUpperCase();
+        if (p.framework === 'aspnet-minimal') {
+            const mapped = call.name.match(/^Map(Get|Post|Put|Delete|Patch)$/);
+            method = mapped ? mapped[1].toUpperCase() : 'ALL';
+        }
         if (method === 'ROUTE' || method === 'HANDLE' || method === 'HANDLEFUNC' || method === 'USE' || method === 'ANY') {
             method = 'ALL';
         }
@@ -773,7 +814,15 @@ function matchClientRequest(call, lang, allCallsInFile) {
             // we tag as ALL.
             let method;
             let inferred = false;
-            if (methodName === 'uri') {
+            if (lang === 'csharp' && methodName.endsWith('async')) {
+                const verb = methodName.slice(0, -'async'.length);
+                if (verb === 'send') {
+                    method = 'ALL';
+                    inferred = true;
+                } else {
+                    method = verb.toUpperCase();
+                }
+            } else if (methodName === 'uri') {
                 // Java pattern: rest of the chain — we can't easily extract method, use ALL
                 method = 'ALL';
                 inferred = true;

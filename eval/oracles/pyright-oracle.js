@@ -118,7 +118,12 @@ const pyrightOracle = {
                 op: 'classify_ref', file: relFile, line: refLine,
                 utf16_col: loc.range.start.character, name,
             });
-            refs.push({ file: relFile, line: refLine, kind: cls.kind });
+            refs.push({
+                file: relFile,
+                line: refLine,
+                column: loc.range.start.character,
+                kind: cls.kind,
+            });
         }
         return refs;
     },
@@ -127,7 +132,7 @@ const pyrightOracle = {
      *  Bulk reference search can omit alias, lazy-module, platform, and local
      *  flow sites. Precision credit is granted only when this independent
      *  definition lookup lands on the sampled declaration. */
-    async resolveDefinition(handle, { name, file, line }) {
+    async resolveDefinition(handle, { name, file, line, column }) {
         const absFile = path.join(handle.root, file);
         if (!handle.opened.has(absFile)) {
             handle.lsp.didOpen(absFile, 'python', fs.readFileSync(absFile, 'utf-8'));
@@ -145,7 +150,14 @@ const pyrightOracle = {
                 const range = loc.targetSelectionRange || loc.targetRange || loc.range;
                 if (!uri || !range) continue;
                 const defAbs = uriToPath(uri);
-                if (!defAbs.startsWith(handle.projectRoot + path.sep)) continue;
+                if (!defAbs.startsWith(handle.projectRoot + path.sep)) {
+                    defs.set(`external:${defAbs}:${range.start.line + 1}`, {
+                        file: defAbs,
+                        line: range.start.line + 1,
+                        external: true,
+                    });
+                    continue;
+                }
                 const entry = {
                     file: path.relative(handle.root, defAbs),
                     line: range.start.line + 1,
@@ -153,7 +165,8 @@ const pyrightOracle = {
                 defs.set(`${entry.file}:${entry.line}`, entry);
             }
         };
-        for (const character of nameColumns(sourceLine, name)) {
+        const columns = Number.isInteger(column) ? [column] : nameColumns(sourceLine, name);
+        for (const character of columns) {
             await requestAt(absFile, line, character);
         }
 

@@ -22,10 +22,10 @@ describe('Interactive Mode', () => {
     it('supports all commands without errors', () => {
         const commands = [
             'deadcode',
-            'related processData',
-            'example processData',
-            'verify processData',
-            'expand 1',
+            'show processData --sections=related',
+            'show processData --sections=example',
+            'check processData',
+            'source processData',
         ];
 
         const input = commands.join('\n') + '\nquit\n';
@@ -39,10 +39,9 @@ describe('Interactive Mode', () => {
         });
 
         assert.ok(!result.includes('Unknown command: deadcode'), 'deadcode should be recognized in interactive mode');
-        assert.ok(!result.includes('Unknown command: related'), 'related should be recognized in interactive mode');
-        assert.ok(!result.includes('Unknown command: example'), 'example should be recognized in interactive mode');
-        assert.ok(!result.includes('Unknown command: verify'), 'verify should be recognized in interactive mode');
-        assert.ok(!result.includes('Unknown command: expand'), 'expand should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: show'), 'show should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: check'), 'check should be recognized in interactive mode');
+        assert.ok(!result.includes('Unknown command: source'), 'source should be recognized in interactive mode');
     });
 
     it('help lists all commands', () => {
@@ -74,13 +73,13 @@ describe('Interactive Mode', () => {
         }
     });
 
-    it('supports fn, class, lines, graph, file-exports commands', () => {
+    it('supports unified source, deps, and api commands', () => {
         const commands = [
-            'fn formatToc',
-            'class ProjectIndex',
-            'lines 1-3 --file=core/output.js',
-            'graph core/output.js',
-            'file-exports core/output.js',
+            'source formatToc',
+            'source ProjectIndex',
+            'source core/output.js:1-3',
+            'deps core/output.js',
+            'api core/output.js',
         ];
 
         const input = commands.join('\n') + '\nquit\n';
@@ -92,13 +91,11 @@ describe('Interactive Mode', () => {
             stdio: ['pipe', 'pipe', 'pipe']
         });
 
-        assert.ok(!result.includes('Unknown command: fn'), 'fn should be recognized');
-        assert.ok(!result.includes('Unknown command: class'), 'class should be recognized');
-        assert.ok(!result.includes('Unknown command: lines'), 'lines should be recognized');
-        assert.ok(!result.includes('Unknown command: graph'), 'graph should be recognized');
-        assert.ok(!result.includes('Unknown command: file-exports'), 'file-exports should be recognized');
-        assert.ok(result.includes('formatToc'), 'fn command should output formatToc');
-        assert.ok(result.includes('ProjectIndex'), 'class command should output ProjectIndex');
+        assert.ok(!result.includes('Unknown command: source'), 'source should be recognized');
+        assert.ok(!result.includes('Unknown command: deps'), 'deps should be recognized');
+        assert.ok(!result.includes('Unknown command: api'), 'api should be recognized');
+        assert.ok(result.includes('formatToc'), 'source should output formatToc');
+        assert.ok(result.includes('ProjectIndex'), 'source should output ProjectIndex');
     });
 
     it('parses flags per-command (not frozen)', () => {
@@ -120,20 +117,20 @@ describe('Interactive Mode', () => {
         assert.ok(result.includes('formatToc'), 'First find should include formatToc');
     });
 
-    // MED-2 (Round 5): bare `stats` in interactive must not crash with
+    // MED-2 (Round 5): the unified stats projection must not crash with
     // "Invalid --top value: must be a positive integer (got 0)". Previously
     // parseFlags defaulted top to 0 and the dispatch handler passed that
     // straight through to the executor, which rejected it.
-    it('MED-2: bare stats command succeeds in interactive mode', () => {
+    it('MED-2: repo stats projection succeeds in interactive mode', () => {
         const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
-            input: 'stats\nquit\n',
+            input: 'repo --sections=stats\nquit\n',
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 60000,
             stdio: ['pipe', 'pipe', 'pipe']
         });
         assert.ok(!result.includes('Invalid --top'),
-            `bare stats should not produce 'Invalid --top' error, got: ${result.slice(0, 500)}`);
+            `repo stats should not produce 'Invalid --top' error, got: ${result.slice(0, 500)}`);
         assert.ok(result.includes('PROJECT STATISTICS'),
             `stats should print the standard header, got: ${result.slice(0, 500)}`);
     });
@@ -142,7 +139,7 @@ describe('Interactive Mode', () => {
     // (matching CLI behaviour) instead of being silently coerced to falsy.
     it('MED-3: interactive rejects --top=abc with helpful error', () => {
         const result = execFileSync('node', [CLI_PATH, '--interactive', '.'], {
-            input: 'context formatToc --top=abc\nquit\n',
+            input: 'show formatToc --top=abc\nquit\n',
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 60000,
@@ -173,7 +170,7 @@ describe('fix #250: interactive flag discipline', () => {
             'a.js': 'function addTask() { return 1; }\nmodule.exports = { addTask };\n',
         });
         try {
-            const out = runInteractive(dir, ['about addTask --bogus 5']);
+            const out = runInteractive(dir, ['show addTask --bogus 5']);
             assert.ok(out.includes('Unknown flag(s): --bogus'), out.slice(0, 400));
             assert.ok(!out.includes('addTask 5'), 'value not folded into the symbol name');
         } finally { rm(dir); }

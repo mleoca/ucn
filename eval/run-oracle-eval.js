@@ -28,6 +28,12 @@
  *   node eval/run-oracle-eval.js --min-precision 0.98   # ALSO gate on tier-1 precision
  *                                                 # (PR gate: catch regressions, not just
  *                                                 # contract violations)
+ *   node eval/run-oracle-eval.js --max-true-edge-unverified-rate 0.10
+ *   node eval/run-oracle-eval.js --min-zero-unverified-rate 0.80
+ *   node eval/run-oracle-eval.js --max-unverified-p95 5
+ *   node eval/run-oracle-eval.js --max-unverified-review-items-per-oracle-edge 0.10
+ *                                                 # review-burden gates; --release uses
+ *                                                 # the portable-AST v5 budgets by default
  *   node eval/run-oracle-eval.js --fresh 2        # fresh-repo arm: 2 UNPINNED repos from
  *                                                 # the weekly rotation (generalization
  *                                                 # guard — repos the engine was never
@@ -46,6 +52,7 @@ const { getCachedCalls } = require('../core/callers');
 const { execute } = require('../core/execute');
 const output = require('../core/output');
 const {
+    PROOF_COMMANDS,
     createCommandProofSummary,
     evaluateSymbolCommandProof,
     finalizeCommandProof,
@@ -60,8 +67,15 @@ const {
     resolveFreshCommit,
     selectFreshRepos,
 } = require('./lib/repos');
-const { validateOracle } = require('./oracles/oracle-interface');
-const { optionalRate, evaluateOracleCoverage } = require('./oracle-gate-policy');
+const { validateOracle, createOraclePathMapper } = require('./oracles/oracle-interface');
+const {
+    PORTABLE_AST_REVIEW_BUDGETS,
+    optionalRate,
+    optionalNonNegative,
+    summarizeReviewBurden,
+    evaluateReviewBurden,
+    evaluateOracleCoverage,
+} = require('./oracle-gate-policy');
 const { tsMorphOracle } = require('./oracles/ts-morph-oracle');
 const { pyrightOracle } = require('./oracles/pyright-oracle');
 const { jediOracle } = require('./oracles/jedi-oracle');
@@ -77,6 +91,20 @@ const sampleSize = Number(readArgValue(args, '--sample') || 50);
 const oracleFilter = readArgValue(args, '--oracle');
 const minPrecision = optionalRateArg('--min-precision');
 const maxUnscoredRatio = optionalRateArg('--max-unscored-ratio');
+const reviewBudgetOverrides = {
+    maxTrueEdgeUnverifiedRate: optionalRateArg('--max-true-edge-unverified-rate'),
+    maxKindTrueEdgeUnverifiedRate: optionalRateArg('--max-kind-true-edge-unverified-rate'),
+    minZeroUnverifiedTargetRate: optionalRateArg('--min-zero-unverified-rate'),
+    maxUnverifiedCandidatesP95: optionalNonNegativeArg('--max-unverified-p95', true),
+    maxUnverifiedReviewItemsPerOracleEdge: optionalNonNegativeArg(
+        '--max-unverified-review-items-per-oracle-edge'),
+    minKindOracleEdges: optionalNonNegativeArg('--min-kind-oracle-edges', true),
+};
+const requestedReviewBudgets = Object.fromEntries(
+    Object.entries(reviewBudgetOverrides).filter(([, value]) => value != null));
+const reviewBudgets = releaseOnly
+    ? { ...PORTABLE_AST_REVIEW_BUDGETS, ...requestedReviewBudgets }
+    : (Object.keys(requestedReviewBudgets).length > 0 ? requestedReviewBudgets : null);
 // Statistical-hardening runs: a different seed draws a different stratified
 // sample, confirming the board numbers aren't sample artifacts. Non-default
 // seeds get their own report filenames so they never clobber the canonical
@@ -89,7 +117,8 @@ const sampleSeed = readArgValue(args, '--seed') ? Number(readArgValue(args, '--s
 const freshCount = args.includes('--fresh') ? (Number(readArgValue(args, '--fresh')) || 2) : 0;
 const freshSuffix = freshCount ? '-fresh' : '';
 const seedSuffix = (sampleSeed === DEFAULT_SEED ? '' : `-seed${sampleSeed.toString(16)}`) + freshSuffix;
-const REPORTS_DIR = path.join(__dirname, 'reports');
+const REPORTS_DIR = path.resolve(
+    process.env.UCN_EVAL_REPORTS_DIR || path.join(__dirname, 'reports'));
 
 // Order matters: per repo the FIRST language match wins — pyright (stronger
 // inference) is the primary Python oracle, jedi stays as the second opinion
@@ -117,6 +146,13 @@ function optionalRateArg(flag) {
     return optionalRate(raw, flag);
 }
 
+function optionalNonNegativeArg(flag, integer = false) {
+    if (!args.includes(flag)) return null;
+    const raw = readArgValue(args, flag);
+    if (raw == null) throw new Error(`${flag} requires a value`);
+    return optionalNonNegative(raw, flag, integer);
+}
+
 function key(file, line) { return `${file}:${line}`; }
 
 const SYMBOL_KINDS = ['function', 'method', 'class'];
@@ -141,9 +177,43 @@ function emptyKindTotals() {
         sampled: 0,
         confirmedEdges: 0, confirmedHits: 0, confirmedUnscored: 0,
         unverifiedEdges: 0, unverifiedHits: 0, unverifiedUnscored: 0,
+        unverifiedReasons: {},
         oracleCallEdges: 0,
         placement: emptyPlacement(),
     };
+}
+
+function addReasonStat(stats, reason, verdict) {
+    const keyName = reason || 'unspecified';
+    if (!stats[keyName]) stats[keyName] = { candidates: 0, hits: 0, unscored: 0 };
+    const row = stats[keyName];
+    row.candidates++;
+    if (!verdict.scorable) row.unscored++;
+    else if (verdict.hit) row.hits++;
+}
+
+function mergeReasonStats(target, source) {
+    for (const [reason, row] of Object.entries(source || {})) {
+        if (!target[reason]) target[reason] = { candidates: 0, hits: 0, unscored: 0 };
+        target[reason].candidates += row.candidates || 0;
+        target[reason].hits += row.hits || 0;
+        target[reason].unscored += row.unscored || 0;
+    }
+}
+
+function finalizeReasonStats(stats) {
+    return Object.fromEntries(Object.entries(stats || {})
+        .map(([reason, row]) => {
+            const scored = Math.max(0, row.candidates - row.unscored);
+            const falseCandidates = Math.max(0, scored - row.hits);
+            return [reason, {
+                ...row,
+                scored,
+                falseCandidates,
+                precision: scored > 0 ? rate(row.hits, scored) : null,
+            }];
+        })
+        .sort((a, b) => b[1].candidates - a[1].candidates || a[0].localeCompare(b[0])));
 }
 
 async function evaluateRepo(repo, oracle) {
@@ -161,8 +231,10 @@ async function evaluateRepo(repo, oracle) {
     // target dir; UCN paths are relative to its detected project root (which
     // may be a parent, e.g. packages/core vs packages/core/src). Convert all
     // oracle paths to UCN-relative so the universes align.
-    const toUcnRel = (f) => path.relative(index.root, path.join(target, f));
-    const toOracleRel = (f) => path.relative(target, path.join(index.root, f));
+    const oracleRoot = handle.root || target;
+    const pathMapper = createOraclePathMapper(index.root, oracleRoot);
+    const toUcnRel = pathMapper.toIndex;
+    const toOracleRel = pathMapper.toOracle;
     const rawSymbols = await oracle.listSymbols(handle, {});
     const allSymbols = rawSymbols.map(s => ({ ...s, file: toUcnRel(s.file), oracleFile: s.file }));
     process.stdout.write(`  oracle lists ${allSymbols.length} symbols\n`);
@@ -203,6 +275,7 @@ async function evaluateRepo(repo, oracle) {
     const totals = {
         confirmedEdges: 0, confirmedHits: 0, confirmedUnscored: 0,
         unverifiedEdges: 0, unverifiedHits: 0, unverifiedUnscored: 0,
+        unverifiedReasons: {},
         oracleCallEdges: 0,
         placement: emptyPlacement(),
         zeroCases: 0, zeroAgreed: 0,
@@ -246,16 +319,18 @@ async function evaluateRepo(repo, oracle) {
         return !!gated;
     };
 
-    const resolvedDefinitions = async (file, line, name) => {
+    const resolvedDefinitions = async (file, line, name, column) => {
         if (typeof oracle.resolveDefinition !== 'function') return [];
-        const cacheKey = `${file}:${line}:${name}`;
+        const cacheKey = `${file}:${line}:${column ?? '*'}:${name}`;
         if (definitionCache.has(cacheKey)) return definitionCache.get(cacheKey);
         let defs = [];
         try {
             defs = await oracle.resolveDefinition(handle, {
-                file: toOracleRel(file), line, name,
+                file: toOracleRel(file), line, name, column,
             });
-            defs = (defs || []).map(d => ({ ...d, file: toUcnRel(d.file) }));
+            defs = (defs || []).map(d => d.external
+                ? { ...d }
+                : { ...d, file: toUcnRel(d.file) });
         } catch {
             // Definition lookup is secondary to reference search, but an LSP
             // failure must remain visible so a trust report cannot silently
@@ -265,15 +340,15 @@ async function evaluateRepo(repo, oracle) {
         definitionCache.set(cacheKey, defs);
         return defs;
     };
-    const resolvesTo = async (file, line, name, targetDef) => {
+    const resolvesTo = async (file, line, name, targetDef, column) => {
         if (!targetDef) return false;
-        const defs = await resolvedDefinitions(file, line, name);
+        const defs = await resolvedDefinitions(file, line, name, column);
         return defs.some(d => d.file === targetDef.relativePath &&
             d.line >= targetDef.startLine && d.line <= targetDef.endLine);
     };
-    const definitionStatus = async (file, line, name, targetDef) => {
+    const definitionStatus = async (file, line, name, targetDef, column) => {
         if (!targetDef || typeof oracle.resolveDefinition !== 'function') return 'unavailable';
-        const defs = await resolvedDefinitions(file, line, name);
+        const defs = await resolvedDefinitions(file, line, name, column);
         if (defs.length === 0) return 'unresolved';
         return defs.some(d => d.file === targetDef.relativePath &&
             d.line >= targetDef.startLine && d.line <= targetDef.endLine)
@@ -281,11 +356,16 @@ async function evaluateRepo(repo, oracle) {
     };
 
     for (const sym of sampled) {
+        const symbolStartedAt = Date.now();
+        if (process.env.UCN_EVAL_PROGRESS) {
+            process.stderr.write(
+                `  evaluating ${sym.kind} ${sym.file}:${sym.line}:${sym.name}\n`);
+        }
         const oracleRefs = refCache.get(sym) || [];
         const rawOracleCalls = dedupe(oracleRefs.filter(r => r.kind === 'call')
             // a "call" on the declaration line is the declaration itself in some
             // ts-morph shapes — exclude self-lines
-            .filter(r => !(r.file === sym.file && r.line === sym.line)));
+            .filter(r => !(r.file === sym.file && r.line === sym.line)), true);
 
         const sameNameDefs = index.symbols.get(sym.name) || [];
         const targetDef = sameNameDefs.find(d =>
@@ -297,21 +377,26 @@ async function evaluateRepo(repo, oracle) {
         // not inflate either this target's recall or its apparent precision.
         const needsDefinitionAdjudication = sameNameDefs.length > 1 &&
             typeof oracle.resolveDefinition === 'function';
-        const oracleCalls = [];
+        const adjudicatedOracleCalls = [];
         for (const oc of rawOracleCalls) {
             if (!needsDefinitionAdjudication) {
-                oracleCalls.push(oc);
+                adjudicatedOracleCalls.push(oc);
                 continue;
             }
-            const status = await definitionStatus(oc.file, oc.line, sym.name, targetDef);
+            const status = await definitionStatus(
+                oc.file, oc.line, sym.name, targetDef, oc.column);
             if (status === 'other') {
                 oracleBroadReferenceEdges++;
             } else {
-                oracleCalls.push(oc);
+                adjudicatedOracleCalls.push(oc);
                 if (status === 'target') definitionValidatedOracleCalls++;
                 else definitionUnresolvedReferenceEdges++;
             }
         }
+        // UCN's public occurrence contract is line-granular. Preserve columns
+        // through adjudication so same-name calls on one line are classified
+        // independently, then collapse compiler-true target calls to one line.
+        const oracleCalls = dedupe(adjudicatedOracleCalls);
 
         const perCommandProof = await evaluateSymbolCommandProof({
             summary: commandProof,
@@ -348,6 +433,10 @@ async function evaluateRepo(repo, oracle) {
                 return 'miss';
             },
         });
+        if (process.env.UCN_EVAL_PROGRESS) {
+            process.stderr.write(
+                `    public proof ${(Date.now() - symbolStartedAt)}ms\n`);
+        }
 
         // UCN answer via the REAL contract surface: execute → formatContextJson.
         // Pin resolution to the oracle's exact declaration via symbol handle.
@@ -375,6 +464,13 @@ async function evaluateRepo(repo, oracle) {
             file: c.file, line: c.line,
             ...(c.calledAs && c.calledAs !== 'bound' && { calledAs: c.calledAs }),
             usageStyle: c.calledAs === 'bound' || !!c.functionReference,
+            reason: c.reason || c.resolution || 'unspecified',
+            ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
+            ...(c.dispatchCandidates != null && {
+                dispatchCandidates: c.dispatchCandidates,
+            }),
+            ...(c.externalContract && { externalContract: true }),
+            uncertaintyClass: c.uncertaintyClass || 'actionable-ambiguity',
         })));
         const account = json.meta.account;
 
@@ -443,15 +539,24 @@ async function evaluateRepo(repo, oracle) {
         const confirmedHits = confirmedVerdicts.filter(v => v.hit).length;
         const confirmedUnscored = confirmedVerdicts.filter(v => !v.scorable).length;
         let unverifiedHits = 0, unverifiedUnscored = 0;
+        let actionableUnverifiedHits = 0, actionableUnverifiedUnscored = 0;
+        let runtimeDispatchHits = 0, runtimeDispatchUnscored = 0;
+        const unverifiedReasonStats = {};
         for (const c of unverified) {
             const verdict = await edgeMatchesTarget(c);
+            const runtimeDispatch = c.uncertaintyClass === 'runtime-dispatch';
+            addReasonStat(unverifiedReasonStats, c.reason, verdict);
             if (!verdict.scorable) {
                 unverifiedUnscored++;
+                if (runtimeDispatch) runtimeDispatchUnscored++;
+                else actionableUnverifiedUnscored++;
                 configurationGatedUnscored++;
                 continue;
             }
             if (verdict.hit) {
                 unverifiedHits++;
+                if (runtimeDispatch) runtimeDispatchHits++;
+                else actionableUnverifiedHits++;
                 if (verdict.definitionValidated) definitionValidatedUnverified++;
             }
         }
@@ -652,6 +757,7 @@ async function evaluateRepo(repo, oracle) {
         totals.unverifiedEdges += unverified.length;
         totals.unverifiedHits += unverifiedHits;
         totals.unverifiedUnscored += unverifiedUnscored;
+        mergeReasonStats(totals.unverifiedReasons, unverifiedReasonStats);
         totals.oracleCallEdges += oracleCalls.length;
         for (const k of Object.keys(placement)) totals.placement[camel(k)] += placement[k];
         totals.evaluated++;
@@ -666,14 +772,30 @@ async function evaluateRepo(repo, oracle) {
         kt.unverifiedEdges += unverified.length;
         kt.unverifiedHits += unverifiedHits;
         kt.unverifiedUnscored += unverifiedUnscored;
+        mergeReasonStats(kt.unverifiedReasons, unverifiedReasonStats);
         kt.oracleCallEdges += oracleCalls.length;
         for (const k of Object.keys(placement)) kt.placement[k] += placement[k];
 
+        const actionableUnverified = unverified.filter(
+            site => site.uncertaintyClass !== 'runtime-dispatch');
+        const runtimeDispatch = unverified.filter(
+            site => site.uncertaintyClass === 'runtime-dispatch');
+        const runtimeDispatchGroups = new Set(runtimeDispatch.map(site =>
+            `${site.dispatchVia || ''}\0${site.dispatchCandidates ?? ''}\0` +
+            `${site.externalContract ? 'external' : 'project'}`));
         perSymbol.push({
             name: sym.name, file: sym.file, line: sym.line, kind: sym.kind,
             oracleCalls: oracleCalls.length,
             confirmed: confirmed.length, confirmedHits, confirmedUnscored,
             unverified: unverified.length, unverifiedHits, unverifiedUnscored,
+            actionableUnverified: actionableUnverified.length,
+            actionableUnverifiedHits,
+            actionableUnverifiedUnscored,
+            runtimeDispatchSites: runtimeDispatch.length,
+            runtimeDispatchGroups: runtimeDispatchGroups.size,
+            runtimeDispatchHits,
+            runtimeDispatchUnscored,
+            unverifiedReasons: finalizeReasonStats(unverifiedReasonStats),
             placement,
             calleePlacement,
             calleeSites, calleeHits,
@@ -700,6 +822,14 @@ async function evaluateRepo(repo, oracle) {
         calleeTotals.placement.moduleLevel - calleeTotals.placement.missingExplained);
     const calleeSemanticRecall = calleeSemanticEligible > 0
         ? rate(calleeSemanticEligible - calleeSemanticMissing, calleeSemanticEligible) : 1;
+    const reviewBurden = summarizeReviewBurden({
+        symbols: perSymbol,
+        oracleCallEdges: totals.oracleCallEdges,
+        placement: totals.placement,
+        unverifiedEdges: totals.unverifiedEdges,
+        unverifiedHits: totals.unverifiedHits,
+        unverifiedUnscored: totals.unverifiedUnscored,
+    });
     const byKindSummary = {};
     for (const [kind, kt] of byKind) {
         if (kt.sampled === 0) continue;
@@ -707,6 +837,14 @@ async function evaluateRepo(repo, oracle) {
         const unverifiedScored = kt.unverifiedEdges - kt.unverifiedUnscored;
         const p1 = rate(kt.confirmedHits, confirmedScored);
         const pu = rate(kt.unverifiedHits, unverifiedScored);
+        const kindReviewBurden = summarizeReviewBurden({
+            symbols: perSymbol.filter(symbol => symbol.kind === kind),
+            oracleCallEdges: kt.oracleCallEdges,
+            placement: kt.placement,
+            unverifiedEdges: kt.unverifiedEdges,
+            unverifiedHits: kt.unverifiedHits,
+            unverifiedUnscored: kt.unverifiedUnscored,
+        });
         byKindSummary[kind] = {
             sampled: kt.sampled,
             oracleCallEdges: kt.oracleCallEdges,
@@ -723,6 +861,8 @@ async function evaluateRepo(repo, oracle) {
             tierSeparation: confirmedScored && unverifiedScored
                 ? Number((p1 - pu).toFixed(4)) : null,
             oraclePlacement: kt.placement,
+            reviewBurden: kindReviewBurden,
+            unverifiedReasons: finalizeReasonStats(kt.unverifiedReasons),
         };
     }
     const summary = {
@@ -745,6 +885,8 @@ async function evaluateRepo(repo, oracle) {
         unverifiedScoredEdges,
         unverifiedUnscored: totals.unverifiedUnscored,
         unverifiedHits: totals.unverifiedHits,
+        unverifiedReasons: finalizeReasonStats(totals.unverifiedReasons),
+        reviewBurden,
         tierSeparation: tier1ScoredEdges && unverifiedScoredEdges
             ? Number((tier1Precision - unverifiedPrecision).toFixed(4)) : null,
         oraclePlacement: totals.placement,
@@ -787,6 +929,16 @@ async function evaluateRepo(repo, oracle) {
         `semanticRecall ${pct(summary.semanticRecall)} (${summary.semanticMissing} missing) | ` +
         `observedZeroAgreement ${summary.observedZeroAgreement != null ? pct(summary.observedZeroAgreement) : 'n/a'} (${summary.zeroCases} cases) | ` +
         `conserved ${pct(summary.conservedRate)}\n`);
+    process.stdout.write(`  review burden: true-edge unverified ${pct(reviewBurden.trueEdgeUnverifiedRate)} | ` +
+        `zero-actionable-ambiguity targets ${pct(reviewBurden.zeroActionableUnverifiedTargetRate)} | ` +
+        `actionable candidates p50/p95/max ${reviewBurden.actionableUnverifiedCandidatesP50}/${reviewBurden.actionableUnverifiedCandidatesP95}/${reviewBurden.actionableUnverifiedCandidatesMax} | ` +
+        `runtime dispatch ${reviewBurden.runtimeDispatchSites} sites/${reviewBurden.runtimeDispatchGroups} families | ` +
+        `effective review items/oracle-edge ${reviewBurden.unverifiedReviewItemsPerOracleEdge} ` +
+        `(${reviewBurden.unverifiedReviewItems}; raw false candidates ` +
+        `${reviewBurden.rawFalseUnverifiedCandidates})\n`);
+    const topReasons = Object.entries(summary.unverifiedReasons).slice(0, 5)
+        .map(([reason, row]) => `${reason}:${row.candidates}`).join(', ');
+    if (topReasons) process.stdout.write(`  unverified reasons: ${topReasons}\n`);
     for (const [kind, k] of Object.entries(summary.byKind)) {
         process.stdout.write(`    ${kind.padEnd(8)} n=${k.sampled} | tier1 ${k.confirmedScored ? pct(k.tier1Precision) : 'n/a'} (${k.confirmedHits}/${k.confirmedScored} scored; ${k.confirmedUnscored} cfg-unscored) | ` +
             `unverified ${k.unverifiedScored ? pct(k.unverifiedPrecision) : 'n/a'} (${k.unverifiedHits}/${k.unverifiedScored} scored; ${k.unverifiedUnscored} cfg-unscored) | ` +
@@ -795,11 +947,10 @@ async function evaluateRepo(repo, oracle) {
     process.stdout.write(`  callee arm: precision ${pct(summary.calleePrecision)} (${summary.calleeHits}/${summary.calleeSites}) | ` +
         `semanticRecall ${pct(summary.calleeSemanticRecall)} (${summary.calleeSemanticMissing} missing) | ` +
         `placement ${JSON.stringify(summary.calleePlacement)}\n`);
-    process.stdout.write(`  command arm: definition ${pct(summary.commandProof.definition.recall)} | ` +
-        `find ${pct(summary.commandProof.find.recall)} | extraction ${pct(summary.commandProof.extraction.recall)} | ` +
-        `brief ${pct(summary.commandProof.brief.recall)} | typedef ${pct(summary.commandProof.typedef.recall)} | ` +
-        `usages ${pct(summary.commandProof.usages.recall)} | tests ${pct(summary.commandProof.tests.recall)} | ` +
-        `example ${pct(summary.commandProof.example.recall)} | failures ${summary.commandProof.failures}\n`);
+    const commandCells = PROOF_COMMANDS.map(command =>
+        `${command} ${pct(summary.commandProof[command].recall)}`);
+    process.stdout.write(`  public command arm: ${commandCells.join(' | ')} | ` +
+        `failures ${summary.commandProof.failures}\n`);
     if (typeof oracle.resolveDefinition === 'function') {
         process.stdout.write(`  definition adjudication: confirmed ${summary.definitionValidatedConfirmed}, ` +
             `unverified ${summary.definitionValidatedUnverified}, oracle calls ${summary.definitionValidatedOracleCalls} | ` +
@@ -874,10 +1025,12 @@ function pushSample(samples, sample, cap = 30) {
     if (samples.length < cap) samples.push(sample);
 }
 
-function dedupe(edges) {
+function dedupe(edges, includeColumn = false) {
     const seen = new Set();
     return edges.filter(e => {
-        const k = key(e.file, e.line);
+        const k = includeColumn
+            ? `${key(e.file, e.line)}:${e.column ?? '*'}`
+            : key(e.file, e.line);
         if (seen.has(k)) return false;
         seen.add(k);
         return true;
@@ -916,6 +1069,9 @@ async function main() {
         const oracle = ORACLES.find(o => o.languages.includes(repo.language));
         try {
             const result = await evaluateRepo(repo, oracle);
+            result.schemaVersion = 3;
+            result.generatedAt = new Date().toISOString();
+            result.reviewBudgets = reviewBudgets;
             results.push(result);
             if (result.summary.errors > 0 || result.summary.evaluated !== result.summary.sampled) {
                 process.stdout.write(`  ⚠ EXECUTION-COMPLETENESS GATE FAILURE: evaluated ${result.summary.evaluated}/${result.summary.sampled}, errors ${result.summary.errors}\n`);
@@ -933,6 +1089,26 @@ async function main() {
             result.summary.calleeUnscoredRatio = Number(coverageGate.calleeUnscoredRatio.toFixed(4));
             if (coverageGate.failures.length > 0) {
                 process.stdout.write(`  ⚠ ORACLE COVERAGE GATE FAILURE: ${coverageGate.failures.join('; ')}\n`);
+                gateFailed = true;
+            }
+            const reviewGate = evaluateReviewBurden(
+                result.summary.reviewBurden, reviewBudgets, repo.name);
+            const kindReviewFailures = [];
+            if (reviewBudgets?.maxKindTrueEdgeUnverifiedRate != null) {
+                for (const [kind, kindSummary] of Object.entries(result.summary.byKind || {})) {
+                    const burden = kindSummary.reviewBurden;
+                    const minEdges = reviewBudgets.minKindOracleEdges || 0;
+                    if (!burden || burden.semanticEligibleEdges < minEdges) continue;
+                    const verdict = evaluateReviewBurden(burden, {
+                        maxTrueEdgeUnverifiedRate:
+                            reviewBudgets.maxKindTrueEdgeUnverifiedRate,
+                    }, `${repo.name}/${kind}`);
+                    kindReviewFailures.push(...verdict.failures);
+                }
+            }
+            const reviewFailures = [...reviewGate.failures, ...kindReviewFailures];
+            if (reviewFailures.length > 0) {
+                process.stdout.write(`  ⚠ REVIEW-BURDEN GATE FAILURE: ${reviewFailures.join('; ')}\n`);
                 gateFailed = true;
             }
             if (result.summary.conservedRate < 1) {
@@ -982,6 +1158,25 @@ async function main() {
     for (const r of results) if (r?.summary?.repo) rollupByRepo.set(r.summary.repo, r);
     const rollupResults = [...rollupByRepo.values()].sort((a, b) =>
         a.summary.repo < b.summary.repo ? -1 : a.summary.repo > b.summary.repo ? 1 : 0);
+    const generatedAt = new Date().toISOString();
+    const rollupPayload = {
+        schemaVersion: 3,
+        generatedAt,
+        board: {
+            date,
+            sampleSize,
+            sampleSeed,
+            release: releaseOnly,
+            freshCount,
+            seedSuffix,
+            repositories: rollupResults.map(result => result.summary.repo),
+        },
+        reviewBudgets,
+        results: rollupResults,
+    };
+    const rollupJsonPath = path.join(
+        REPORTS_DIR, `oracle-eval-rollup-${date}${seedSuffix}.json`);
+    fs.writeFileSync(rollupJsonPath, JSON.stringify(rollupPayload, null, 2));
 
     const lines = [
         `# Oracle eval: ${date}${freshCount ? ' (fresh-repo arm: unpinned rotation)' : ''}`,
@@ -999,21 +1194,47 @@ async function main() {
         lines.push(`| ${s.repo} | ${s.oracle} | ${s.sampled} | ${s.oracleCallEdges} | ${pct(s.tier1Precision)} | ${pct(s.semanticRecall)} | **${s.semanticMissing}** | ${pct(s.unverifiedPrecision)} | ${s.observedZeroAgreement != null ? pct(s.observedZeroAgreement) : 'n/a'} (${s.zeroCases}) | ${pct(s.conservedRate)} |`);
     }
     lines.push('');
+    lines.push('## Unverified review burden');
+    lines.push('');
+    lines.push('Recall is not enough when an agent must inspect a large abstention band.');
+    lines.push('This board measures how much candidate review remains, how often a pinned');
+    lines.push('target has no actionable ambiguity, and how many effective review items');
+    lines.push('the engine creates. Actionable false candidates count individually; named');
+    lines.push('runtime-dispatch families count once because that is how agents receive them.');
+    lines.push('Raw candidates and raw false counts remain visible. Configuration-unscored');
+    lines.push('candidates stay visible but are not labeled false.');
+    lines.push('');
+    lines.push('| repo | true-edge unverified | zero actionable ambiguity | actionable p50/p95/max | runtime dispatch sites/families | raw unverified | raw false | effective review items | items/oracle edge | top reasons |');
+    lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---|');
+    for (const { summary: s } of rollupResults) {
+        if (s.error) continue;
+        const b = s.reviewBurden;
+        if (!b) {
+            lines.push(`| ${s.repo} | n/a | n/a | n/a | n/a | n/a | n/a | n/a | n/a | report predates schema v3 |`);
+            continue;
+        }
+        const reasons = Object.entries(s.unverifiedReasons || {}).slice(0, 3)
+            .map(([reason, row]) => `${reason} (${row.candidates})`).join(', ') || 'none';
+        lines.push(`| ${s.repo} | ${pct(b.trueEdgeUnverifiedRate)} (${b.trueEdgesUnverified}/${b.semanticEligibleEdges}) | ${pct(b.zeroActionableUnverifiedTargetRate)} (${b.zeroActionableUnverifiedTargets}/${b.reviewedSymbols}) | ${b.actionableUnverifiedCandidatesP50}/${b.actionableUnverifiedCandidatesP95}/${b.actionableUnverifiedCandidatesMax} | ${b.runtimeDispatchSites}/${b.runtimeDispatchGroups} | ${b.unverifiedCandidates} | ${b.rawFalseUnverifiedCandidates} | ${b.unverifiedReviewItems} | ${b.unverifiedReviewItemsPerOracleEdge} | ${reasons} |`);
+    }
+    lines.push('');
     lines.push('## Oracle-backed command surface');
     lines.push('');
-    lines.push('The sampled compiler/LSP symbols and references also gate exact definition');
-    lines.push('discovery, `find`, source extraction (`fn`/`class`), `brief`, `typedef`,');
-    lines.push('literal code-reference recall in `usages`, direct test-reference recall in');
-    lines.push('`tests`, and compiler-true selection by `example`. Command execution errors');
-    lines.push('are failures; they can no longer silently reduce the evaluated sample.');
+    lines.push('The sampled compiler/LSP symbols and references gate only commands an agent');
+    lines.push('can invoke on the v5 public surface: exact `find`, composed `show`, exact');
+    lines.push('`source`, caller `trace`, symbol `impact`, literal reference recall in');
+    lines.push('`usages`, and direct test-reference recall in `tests`. Removed internal');
+    lines.push('commands cannot make this gate pass. Command execution errors are failures.');
     lines.push('');
-    lines.push('| repo | evaluated | definition | find | extract | brief | typedef | usages | tests | example | execution errors | failures |');
-    lines.push('|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|');
+    lines.push(`| repo | evaluated | ${PROOF_COMMANDS.join(' | ')} | execution errors | failures |`);
+    lines.push(`|---|---:|${PROOF_COMMANDS.map(() => '---:').join('|')}|---:|---:|`);
     for (const { summary: s } of rollupResults) {
         if (s.error || !s.commandProof) continue;
         const c = s.commandProof;
         const cell = m => `${pct(m.recall)} (${m.hits}/${m.eligible})`;
-        lines.push(`| ${s.repo} | ${s.evaluated}/${s.sampled} | ${cell(c.definition)} | ${cell(c.find)} | ${cell(c.extraction)} | ${cell(c.brief)} | ${cell(c.typedef)} | ${cell(c.usages)} | ${cell(c.tests)} | ${cell(c.example)} | **${c.executionErrors}** | **${c.failures}** |`);
+        lines.push(`| ${s.repo} | ${s.evaluated}/${s.sampled} | ` +
+            `${PROOF_COMMANDS.map(command => cell(c[command])).join(' | ')} | ` +
+            `**${c.executionErrors}** | **${c.failures}** |`);
     }
     lines.push('');
     lines.push('## Per-kind breakdown');
@@ -1069,7 +1290,8 @@ async function main() {
     lines.push('');
     const mdPath = path.join(REPORTS_DIR, `oracle-eval-rollup-${date}${seedSuffix}.md`);
     fs.writeFileSync(mdPath, lines.join('\n'));
-    process.stdout.write(`\nwrote ${path.relative(process.cwd(), mdPath)}\n`);
+    process.stdout.write(`\nwrote ${path.relative(process.cwd(), rollupJsonPath)}\n`);
+    process.stdout.write(`wrote ${path.relative(process.cwd(), mdPath)}\n`);
 
     process.exit(gateFailed ? 1 : 0);
 }

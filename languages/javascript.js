@@ -379,6 +379,62 @@ function extractDecoratorsWithArgs(node) {
 
 // --- Single-pass helpers: extracted from find* callbacks ---
 
+const FUNCTION_SCOPE_NODES = new Set([
+    'function_declaration', 'generator_function_declaration',
+    'function_expression', 'generator_function', 'arrow_function',
+    'method_definition',
+]);
+
+function lexicalOwnerRange(node) {
+    for (let parent = node?.parent; parent; parent = parent.parent) {
+        if (!FUNCTION_SCOPE_NODES.has(parent.type)) continue;
+        const body = parent.childForFieldName('body') || parent;
+        return {
+            lexicalScopeStartLine: body.startPosition.row + 1,
+            lexicalScopeEndLine: body.endPosition.row + 1,
+        };
+    }
+    return {};
+}
+
+/**
+ * Concrete runtime value returned by a function when every reachable return
+ * constructs the same class. Nested functions/classes are separate scopes.
+ * This complements (never guesses beyond) a declared interface return type.
+ */
+function extractReturnedConcreteType(node) {
+    const body = node.childForFieldName('body');
+    if (!body) return null;
+    const types = [];
+    let incomplete = false;
+    const stack = [body];
+    while (stack.length > 0) {
+        const current = stack.pop();
+        if (current !== body && FUNCTION_SCOPE_NODES.has(current.type)) continue;
+        if (current.type === 'class_declaration' || current.type === 'class') continue;
+        if (current.type === 'return_statement') {
+            const value = current.namedChild(0);
+            if (value?.type !== 'new_expression') {
+                incomplete = true;
+                continue;
+            }
+            const constructor = value.childForFieldName('constructor');
+            if (!constructor ||
+                !['identifier', 'member_expression'].includes(constructor.type)) {
+                incomplete = true;
+                continue;
+            }
+            types.push(constructor.text.split('.').pop());
+            continue;
+        }
+        for (let i = current.namedChildCount - 1; i >= 0; i--) {
+            stack.push(current.namedChild(i));
+        }
+    }
+    return !incomplete && types.length > 0 && new Set(types).size === 1
+        ? types[0] : null;
+}
+
 /**
  * Process a node for function extraction (single-pass helper)
  * Returns true if node was matched, false otherwise
@@ -397,6 +453,7 @@ function _processFunction(node, functions, processedRanges, lines) {
         if (nameNode) {
             const { startLine, endLine, indent } = nodeToLocation(node, lines);
             const returnType = extractReturnType(node);
+            const returnedConcreteType = extractReturnedConcreteType(node);
             const generics = extractGenerics(node);
             const docstring = extractJSDocstring(lines, startLine);
             const isGen = isGenerator(node);
@@ -421,7 +478,9 @@ function _processFunction(node, functions, processedRanges, lines) {
                 isGenerator: isGen,
                 isAsync,
                 modifiers,
+                ...lexicalOwnerRange(node),
                 ...typeAnno,
+                ...(returnedConcreteType && { returnedConcreteType }),
                 ...(generics && { generics }),
                 ...(docstring && { docstring })
             });
@@ -862,18 +921,26 @@ function _processClass(node, classes, processedRanges, lines) {
         if (nameNode) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const docstring = extractJSDocstring(lines, startLine);
+            const valueNode = node.childForFieldName('value');
             // `type ZodTypeAny = ZodType<any, any, any>;` — the alias IS the
             // aliased type. Record the base name so receivers annotated with
             // the alias validate against the base type's methods (fix #208,
             // TS parity with Rust/Go).
-            const aliasOf = aliasBaseTypeName(node.childForFieldName('value'));
+            const aliasOf = aliasBaseTypeName(valueNode);
+            // Object type aliases are structural record declarations, not
+            // opaque labels. Index their declared fields just like interface
+            // fields so a compiler-typed hop such as
+            // `node: Node; node._source.unsubscribe()` can resolve Node's
+            // `_source: Signal` contract without name guessing.
+            const members = valueNode?.type === 'object_type'
+                ? extractTypeMembers(valueNode, lines) : [];
 
             classes.push({
                 name: nameNode.text,
                 startLine,
                 endLine,
                 type: 'type',
-                members: [],
+                members,
                 ...(aliasOf && { aliasOf }),
                 ...(docstring && { docstring })
             });
@@ -1041,10 +1108,13 @@ function extractInterfaceExtends(interfaceNode) {
  * Extract interface members (method signatures, property signatures)
  */
 function extractInterfaceMembers(interfaceNode, code) {
-    const members = [];
     const bodyNode = interfaceNode.childForFieldName('body');
-    if (!bodyNode) return members;
+    if (!bodyNode) return [];
+    return extractTypeMembers(bodyNode, code);
+}
 
+function extractTypeMembers(bodyNode, code) {
+    const members = [];
     for (let i = 0; i < bodyNode.namedChildCount; i++) {
         const child = bodyNode.namedChild(i);
 
@@ -1657,9 +1727,31 @@ function jsConstructorTypeQualifier(ctorNode) {
     return root?.type === 'identifier' ? root.text : undefined;
 }
 
+// CommonJS permits direct namespace calls without a local alias:
+// `require('./output').formatContextJson(...)`. Preserve the literal module
+// specifier on the outer call so the index can apply the same export-ownership
+// rules as `const output = require('./output'); output.formatContextJson()`.
+function jsLiteralRequireModule(node) {
+    if (node?.type !== 'call_expression') return undefined;
+    const fn = node.childForFieldName('function');
+    if (fn?.type !== 'identifier' || fn.text !== 'require') return undefined;
+    const args = node.childForFieldName('arguments');
+    if (!args || args.namedChildCount !== 1) return undefined;
+    const first = args.namedChild(0);
+    return first?.type === 'string' ? first.text.slice(1, -1) : undefined;
+}
+
 function findCallsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const calls = [];
+    const assignedMembers = new Set();
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type !== 'assignment_expression' &&
+            node.type !== 'augmented_assignment_expression') return true;
+        const left = node.childForFieldName('left');
+        if (left?.type === 'member_expression') assignedMembers.add(left.text);
+        return true;
+    });
     const functionStack = [];  // Stack of { name, startLine, endLine }
     // Local aliases with lexical ownership. A flat aliasName→target map leaks
     // block locals into the rest of a module (`let effect = batchedEffect`
@@ -1854,7 +1946,10 @@ function findCallsInCode(code, parser) {
     // Helper to get current enclosing function
     const getCurrentEnclosingFunction = () => {
         return functionStack.length > 0
-            ? { ...functionStack[functionStack.length - 1] }
+            ? {
+                ...functionStack[functionStack.length - 1],
+                scopeChain: functionStack.map(scope => scope.startLine),
+            }
             : null;
     };
 
@@ -2219,6 +2314,8 @@ function findCallsInCode(code, parser) {
                     ...(resolvedName && { resolvedName }),
                     ...(resolvedNames && { resolvedNames }),
                     line: node.startPosition.row + 1,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
                     isMethod: false,
                     ...(assignedTo && { assignedTo }),
                     enclosingFunction,
@@ -2235,6 +2332,8 @@ function findCallsInCode(code, parser) {
                 calls.push({
                     name: 'constructor',
                     line: node.startPosition.row + 1,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
                     isMethod: true,
                     receiver: 'super',
                     argCount: node.childForFieldName('arguments')?.namedChildCount ?? 0,
@@ -2270,10 +2369,17 @@ function findCallsInCode(code, parser) {
                             const innerProp = objNode.childForFieldName('property');
                             const innerObj = objNode.childForFieldName('object');
                             if (innerProp) {
-                                const boundReceiver = innerObj?.type === 'identifier'
-                                    ? innerObj.text : innerObj?.text;
-                                const boundReceiverType = innerObj?.type === 'identifier'
-                                    ? localVarTypes.get(innerObj.text) : undefined;
+                                const prototypeOwner = innerObj?.type === 'member_expression' &&
+                                    innerObj.childForFieldName('property')?.text === 'prototype' &&
+                                    innerObj.childForFieldName('object')?.type === 'identifier'
+                                    ? innerObj.childForFieldName('object').text
+                                    : undefined;
+                                const boundReceiver = prototypeOwner ||
+                                    (innerObj?.type === 'identifier'
+                                        ? innerObj.text : innerObj?.text);
+                                const boundReceiverType = prototypeOwner ||
+                                    (innerObj?.type === 'identifier'
+                                        ? localVarTypes.get(innerObj.text) : undefined);
                                 calls.push({
                                     name: innerProp.text,
                                     line: node.startPosition.row + 1,
@@ -2310,6 +2416,7 @@ function findCallsInCode(code, parser) {
                         // resolve their root type query-side (the enclosing
                         // class); identifier roots type from local annotations.
                         let receiverRoot, receiverFieldName, receiverRootType, receiverBindingNode;
+                        let receiverDeepPath = false;
                         if (receiver && objNode?.type === 'identifier') receiverBindingNode = objNode;
                         if (!receiver && objNode && objNode.type === 'member_expression') {
                             const rootNode = objNode.childForFieldName('object');
@@ -2322,6 +2429,12 @@ function findCallsInCode(code, parser) {
                                 if (rootNode.type === 'identifier') {
                                     receiverRootType = localVarTypes.get(rootNode.text);
                                 }
+                            } else {
+                                // Preserve unresolved deeper member chains
+                                // (`client.req.query()`). Their terminal name
+                                // must not borrow a same-file method binding
+                                // while the root object's type is unknown.
+                                receiverDeepPath = true;
                             }
                         }
                         // Chained receiver (fix #219): the receiver IS a call —
@@ -2329,6 +2442,7 @@ function findCallsInCode(code, parser) {
                         // findCallers can type the receiver from its declared
                         // return annotation (Promise<...> → Promise).
                         let receiverCall, receiverCallIsMethod, receiverCallAwaited, receiverCallLine;
+                        let receiverCallStart, receiverCallEnd;
                         {
                             let recvNode = objNode;
                             if (recvNode && recvNode.type === 'parenthesized_expression') {
@@ -2345,6 +2459,8 @@ function findCallsInCode(code, parser) {
                                     // Producer link (fix #258): plain-call
                                     // records carry the call node's start line
                                     receiverCallLine = recvNode.startPosition.row + 1;
+                                    receiverCallStart = recvNode.startIndex;
+                                    receiverCallEnd = recvNode.endIndex;
                                 } else if (prodFunc?.type === 'member_expression') {
                                     const prodProp = prodFunc.childForFieldName('property');
                                     if (prodProp) {
@@ -2353,6 +2469,8 @@ function findCallsInCode(code, parser) {
                                         // Method records report the property
                                         // node's own line
                                         receiverCallLine = prodProp.startPosition.row + 1;
+                                        receiverCallStart = recvNode.startIndex;
+                                        receiverCallEnd = recvNode.endIndex;
                                     }
                                 }
                             }
@@ -2375,8 +2493,10 @@ function findCallsInCode(code, parser) {
                                 (objNode ? JS_LITERAL_RECEIVER_TYPES[objNode.type] : undefined));
                         // Module receiver (ns.helper()) — unless locally shadowed
                         // by a typed instance binding
-                        const receiverIsModule = !!receiver && moduleAliases.has(receiver) &&
-                            !localVarTypes.has(receiver);
+                        const receiverModuleSpecifier = jsLiteralRequireModule(objNode);
+                        const receiverIsModule = !!receiverModuleSpecifier ||
+                            (!!receiver && moduleAliases.has(receiver) &&
+                                !localVarTypes.has(receiver));
                         const firstArg = getFirstStringArg(node);
                         const argCount = getArgCount(node);
                         const assignedTo = jsAssignmentTargetOf(node);
@@ -2387,6 +2507,8 @@ function findCallsInCode(code, parser) {
                             // line — the account's ground set is keyed by the
                             // name's line
                             line: propNode.startPosition.row + 1,
+                            callStart: node.startIndex,
+                            callEnd: node.endIndex,
                             isMethod: true,
                             receiver,
                             ...(receiverType && { receiverType }),
@@ -2396,15 +2518,22 @@ function findCallsInCode(code, parser) {
                                     localVarTypeQualifiers.get(receiver),
                             }),
                             ...(receiverIsModule && { receiverIsModule: true }),
+                            ...(receiverModuleSpecifier && { receiverModuleSpecifier }),
+                            ...(receiver && assignedMembers.has(`${receiver}.${propName}`) && {
+                                receiverMemberAssigned: true,
+                            }),
                             ...(receiverBindingNode &&
                                 isShadowedByLocal(receiverBindingNode, receiverBindingNode.text) &&
                                 { receiverLocalBinding: true }),
                             ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                             ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                            ...(receiverDeepPath && { receiverDeepPath: true }),
                             ...(receiverCall && { receiverCall }),
                             ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                             ...(receiverCallAwaited && { receiverCallAwaited: true }),
                             ...(receiverCallLine && { receiverCallLine }),
+                            ...(receiverCallStart != null && { receiverCallStart }),
+                            ...(receiverCallEnd != null && { receiverCallEnd }),
                             ...(assignedTo && { assignedTo }),
                             enclosingFunction,
                             uncertain,
@@ -3224,6 +3353,35 @@ function findExportsInCode(code, parser) {
                                     // require()-reachable function).
                                     const mName = prop.childForFieldName('name');
                                     if (mName) exports.push({ name: mName.text, type: 'module.exports', line });
+                                } else if (prop.type === 'spread_element') {
+                                    // CommonJS barrel: `module.exports = {
+                                    // ...require('./public') }`. This is the
+                                    // CJS equivalent of `export * from` and
+                                    // must retain its SOURCE so namespace
+                                    // calls through the barrel can establish
+                                    // name ownership. A dynamic spread stays
+                                    // an explicitly unmodelable CJS surface.
+                                    const value = prop.namedChild(0);
+                                    const fn = value?.type === 'call_expression'
+                                        ? value.childForFieldName('function') : null;
+                                    const args = value?.type === 'call_expression'
+                                        ? value.childForFieldName('arguments') : null;
+                                    const first = args?.namedChild(0);
+                                    if (fn?.type === 'identifier' && fn.text === 'require' &&
+                                        first?.type === 'string') {
+                                        exports.push({
+                                            name: '*',
+                                            type: 're-export-all',
+                                            line,
+                                            source: first.text.slice(1, -1),
+                                        });
+                                    } else {
+                                        exports.push({
+                                            name: '*',
+                                            type: 'module.exports',
+                                            line,
+                                        });
+                                    }
                                 }
                             }
                         } else if (rightNode && rightNode.type === 'identifier') {

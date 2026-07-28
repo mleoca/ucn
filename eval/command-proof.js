@@ -1,18 +1,17 @@
 'use strict';
 
 /**
- * Oracle-backed command-surface proofs shared by run-oracle-eval.js.
+ * Oracle-backed proofs for the public v5 command surface.
  *
- * The caller/callee scorer proves the semantic call engine.  This module
- * exercises the other commands that can be judged from the SAME independent
- * compiler/LSP symbol and reference set, so one strong call score cannot hide
- * a broken definition lookup, usage scan, extractor, test lookup, or example
- * selector.
+ * The caller/callee scorer proves the semantic engine independently. This
+ * module verifies that the same exact compiler/LSP symbols and references
+ * survive the public compositions an agent can actually call. Removed
+ * internal commands are intentionally absent: a v5 release must not pass
+ * because `brief`, `typedef`, `fn`, `class`, or `example` still work behind
+ * the public registry.
  *
- * Reference recall is intentionally scoped to oracle references whose source
- * line contains the symbol's literal identifier.  UCN's `usages` command is a
- * literal-name/code-reference inventory; renamed aliases that contain no
- * target token are call-graph evidence and are scored by the caller/callee arm.
+ * Only commands with an oracle-judgable assertion belong here. The separate
+ * public-surface agent benchmark covers the remaining commands and modes.
  */
 
 const fs = require('fs');
@@ -27,18 +26,15 @@ function emptyMetric() {
     return { eligible: 0, hits: 0, missing: 0, unscored: 0, abstained: 0 };
 }
 
+const PROOF_COMMANDS = Object.freeze([
+    'find', 'show', 'source', 'trace', 'impact', 'usages', 'tests',
+]);
+
 function createCommandProofSummary() {
     return {
         sampled: 0,
         executionErrors: 0,
-        definition: emptyMetric(),
-        find: emptyMetric(),
-        extraction: emptyMetric(),
-        brief: emptyMetric(),
-        typedef: emptyMetric(),
-        usages: emptyMetric(),
-        tests: emptyMetric(),
-        example: emptyMetric(),
+        ...Object.fromEntries(PROOF_COMMANDS.map(command => [command, emptyMetric()])),
         missingSamples: [],
         errorSamples: [],
     };
@@ -65,7 +61,6 @@ function lineContainsIdentifier(index, relFile, line, name) {
     let content = null;
     let match;
     while ((match = regex.exec(text)) !== null) {
-        // `left` may consume one boundary character; point at the identifier.
         const offset = match[0].lastIndexOf(String(name));
         const column = match.index + Math.max(0, offset);
         if (content == null) {
@@ -83,29 +78,23 @@ function relativeFile(index, item) {
     return path.isAbsolute(item.file) ? path.relative(index.root, item.file) : item.file;
 }
 
-function recordsContain(index, records, file, line) {
-    const relFile = path.isAbsolute(file) ? path.relative(index.root, file) : file;
-    return (records || []).some(r => relativeFile(index, r) === relFile && r.line === line);
-}
-
 function entriesContainTarget(index, result, targetDef) {
-    const entries = result?.entries || [];
-    return entries.some(entry => {
+    return (result?.entries || []).some(entry => {
         const match = entry.match || entry;
         return relativeFile(index, match) === targetDef.relativePath &&
             match.startLine === targetDef.startLine;
     });
 }
 
-function addMetric(summary, metricName, hit, sample) {
-    const metric = summary[metricName];
+function addMetric(summary, command, hit, sample) {
+    const metric = summary[command];
     metric.eligible++;
     if (hit) {
         metric.hits++;
     } else {
         metric.missing++;
         if (summary.missingSamples.length < 40) {
-            summary.missingSamples.push({ command: metricName, ...sample });
+            summary.missingSamples.push({ command, ...sample });
         }
     }
 }
@@ -118,7 +107,12 @@ function addExecutionError(summary, command, error, sample) {
 }
 
 function executeProof(summary, index, command, params, sample) {
+    const startedAt = Date.now();
     const response = execute(index, command, params);
+    if (process.env.UCN_EVAL_PROGRESS) {
+        process.stderr.write(
+            `      ${command} ${Date.now() - startedAt}ms (${sample.name})\n`);
+    }
     if (!response.ok) {
         addExecutionError(summary, command, response.error, sample);
         return null;
@@ -131,15 +125,14 @@ function isCallableTarget(targetDef) {
         ['function', 'method', 'constructor'].includes(targetDef.type));
 }
 
-function isTypeTarget(targetDef) {
-    return targetDef && [
-        'class', 'interface', 'type', 'typeAlias', 'struct', 'enum', 'trait',
-    ].includes(targetDef.type);
+function exactSymbol(result, targetDef) {
+    return result?.file === targetDef.relativePath &&
+        result?.startLine === targetDef.startLine;
 }
 
 /**
- * Evaluate every oracle-judgable command for one sampled compiler symbol.
- * Mutates `summary` and returns a compact per-symbol record.
+ * Evaluate every oracle-judgable public command for one sampled compiler
+ * symbol. Mutates `summary` and returns a compact per-symbol record.
  */
 async function evaluateSymbolCommandProof({
     summary,
@@ -148,25 +141,21 @@ async function evaluateSymbolCommandProof({
     targetDef,
     sameNameDefs,
     oracleRefs,
-    oracleCalls,
     indexedFiles,
-    adjudicateExample,
 }) {
     summary.sampled++;
     const sample = { name: sym.name, file: sym.file, line: sym.line, kind: sym.kind };
-    const handle = targetDef
-        ? `${targetDef.relativePath}:${targetDef.startLine}:${targetDef.name}`
-        : `${sym.file}:${sym.line}:${sym.name}`;
     const record = {};
 
-    // Definition presence is the prerequisite for every pinned command.  It
-    // is scored directly instead of being inferred from a successful context
-    // call, because the old evaluator silently skipped command errors.
-    const definitionHit = !!targetDef;
-    addMetric(summary, 'definition', definitionHit, sample);
-    record.definition = definitionHit;
-    if (!targetDef) return record;
+    // A missing indexed target is a public find failure. Do not manufacture
+    // eligibility for handle-based commands that cannot be invoked exactly.
+    if (!targetDef) {
+        addMetric(summary, 'find', false, sample);
+        record.find = false;
+        return record;
+    }
 
+    const handle = `${targetDef.relativePath}:${targetDef.startLine}:${targetDef.name}`;
     const exactParams = {
         name: sym.name,
         exact: true,
@@ -174,51 +163,58 @@ async function evaluateSymbolCommandProof({
         file: targetDef.relativePath,
         ...(targetDef.className && { className: targetDef.className }),
     };
+
     const found = executeProof(summary, index, 'find', exactParams, sample);
-    if (found) {
-        const hit = found.some(d => relativeFile(index, d) === targetDef.relativePath &&
-            d.startLine === targetDef.startLine);
-        addMetric(summary, 'find', hit, sample);
-        record.find = hit;
-    } else {
-        addMetric(summary, 'find', false, sample);
-        record.find = false;
-    }
+    const findHit = !!found && found.some(definition =>
+        relativeFile(index, definition) === targetDef.relativePath &&
+        definition.startLine === targetDef.startLine);
+    addMetric(summary, 'find', findHit, sample);
+    record.find = findHit;
 
-    const extractionCommand = sym.kind === 'class' || !isCallableTarget(targetDef)
-        ? (isTypeTarget(targetDef) ? 'class' : null)
-        : 'fn';
-    if (extractionCommand) {
-        const extracted = executeProof(summary, index, extractionCommand, { name: handle }, sample);
-        const hit = !!extracted && entriesContainTarget(index, extracted, targetDef);
-        addMetric(summary, 'extraction', hit, { ...sample, extractor: extractionCommand });
-        record.extraction = hit;
-    }
+    // `show` is independently scored from `source`: it is a composition and
+    // must retain exact target identity in both its summary and source
+    // projection.
+    const shown = executeProof(summary, index, 'show', {
+        name: handle,
+        sections: ['summary', 'source'],
+        includeTests: true,
+    }, sample);
+    const showHit = !!shown &&
+        shown.summary?.symbol?.file === targetDef.relativePath &&
+        shown.summary?.symbol?.startLine === targetDef.startLine &&
+        entriesContainTarget(index, shown.source, targetDef);
+    addMetric(summary, 'show', showHit, sample);
+    record.show = showHit;
 
-    const brief = executeProof(summary, index, 'brief', { name: handle }, sample);
-    const briefHit = !!brief && brief.symbol?.file === targetDef.relativePath &&
-        brief.symbol?.startLine === targetDef.startLine;
-    addMetric(summary, 'brief', briefHit, sample);
-    record.brief = briefHit;
+    const source = executeProof(summary, index, 'source', { name: handle }, sample);
+    const sourceHit = !!source && entriesContainTarget(index, source, targetDef);
+    addMetric(summary, 'source', sourceHit, sample);
+    record.source = sourceHit;
 
-    if (isTypeTarget(targetDef)) {
-        const typedef = executeProof(summary, index, 'typedef', {
-            name: targetDef.name,
-            file: targetDef.relativePath,
-            exact: true,
-            ...(targetDef.className && { className: targetDef.className }),
+    if (isCallableTarget(targetDef)) {
+        const trace = executeProof(summary, index, 'trace', {
+            name: handle,
+            direction: 'callers',
+            depth: 1,
+            includeTests: true,
         }, sample);
-        const typedefHit = !!typedef && typedef.some(d =>
-            relativeFile(index, d) === targetDef.relativePath &&
-            d.startLine === targetDef.startLine);
-        addMetric(summary, 'typedef', typedefHit, sample);
-        record.typedef = typedefHit;
+        const traceHit = !!trace && trace.root === targetDef.name &&
+            trace.file === targetDef.relativePath && trace.line === targetDef.startLine;
+        addMetric(summary, 'trace', traceHit, sample);
+        record.trace = traceHit;
+
+        const impact = executeProof(summary, index, 'impact', {
+            name: handle,
+            includeTests: true,
+        }, sample);
+        const impactHit = !!impact && exactSymbol(impact, targetDef);
+        addMetric(summary, 'impact', impactHit, sample);
+        record.impact = impactHit;
     }
 
-    // `usages` does not accept a definition handle.  Score exact semantic
-    // recall only for unique project names; repeated names would make a
-    // target-specific precision/recall claim impossible for this command's
-    // documented name-inventory contract.
+    // `usages` is a literal-name inventory, not a target-pinned reference
+    // command. Exact recall is therefore judged only for unique project names
+    // and oracle references whose source line contains the literal token.
     if (sameNameDefs.length === 1) {
         const eligibleRefs = (oracleRefs || []).filter(ref =>
             ref.kind !== 'definition' && indexedFiles.has(ref.file) &&
@@ -229,11 +225,15 @@ async function evaluateSymbolCommandProof({
                 includeTests: true,
                 codeOnly: true,
             }, sample);
-            const usageKeys = new Set((usageResult || []).map(u =>
-                key(relativeFile(index, u), u.line)));
+            const usageKeys = new Set((usageResult || []).map(usage =>
+                key(relativeFile(index, usage), usage.line)));
             for (const ref of eligibleRefs) {
                 const hit = usageKeys.has(key(ref.file, ref.line));
-                addMetric(summary, 'usages', hit, { ...sample, ref: key(ref.file, ref.line), refKind: ref.kind });
+                addMetric(summary, 'usages', hit, {
+                    ...sample,
+                    ref: key(ref.file, ref.line),
+                    refKind: ref.kind,
+                });
             }
             record.usageRefs = eligibleRefs.length;
         }
@@ -247,9 +247,7 @@ async function evaluateSymbolCommandProof({
         });
         if (directTestRefs.length > 0) {
             const testsResult = executeProof(summary, index, 'tests', {
-                name: sym.name,
-                file: targetDef.relativePath,
-                ...(targetDef.className && { className: targetDef.className }),
+                name: handle,
             }, sample);
             const testKeys = new Set();
             for (const fileResult of testsResult || []) {
@@ -259,40 +257,13 @@ async function evaluateSymbolCommandProof({
             }
             for (const ref of directTestRefs) {
                 const hit = testKeys.has(key(ref.file, ref.line));
-                addMetric(summary, 'tests', hit, { ...sample, ref: key(ref.file, ref.line), refKind: ref.kind });
+                addMetric(summary, 'tests', hit, {
+                    ...sample,
+                    ref: key(ref.file, ref.line),
+                    refKind: ref.kind,
+                });
             }
             record.testRefs = directTestRefs.length;
-        }
-    }
-
-    // `example` makes a precision claim: when an example is returned, it
-    // must be one of the compiler/LSP call sites for this exact target.
-    if ((oracleCalls || []).length > 0 && isCallableTarget(targetDef)) {
-        const example = executeProof(summary, index, 'example', {
-            name: handle,
-            includeTests: true,
-        }, sample);
-        const best = example?.best || (Array.isArray(example?.examples) ? example.examples[0] : null);
-        if (!best && example?.confirmedCalls === 0 && example?.unverifiedCalls > 0) {
-            summary.example.abstained++;
-            record.example = 'abstained-unverified';
-            return record;
-        }
-        let exampleVerdict = !!best && recordsContain(index, oracleCalls, best.file, best.line)
-            ? 'hit' : 'miss';
-        if (best && exampleVerdict === 'miss' && typeof adjudicateExample === 'function') {
-            exampleVerdict = await adjudicateExample(best);
-        }
-        if (exampleVerdict === 'unscored') {
-            summary.example.unscored++;
-            record.example = 'unscored';
-        } else {
-            const exampleHit = exampleVerdict === 'hit' || exampleVerdict === true;
-            addMetric(summary, 'example', exampleHit, {
-                ...sample,
-                selected: best ? key(best.file, best.line) : null,
-            });
-            record.example = exampleHit;
         }
     }
 
@@ -300,11 +271,12 @@ async function evaluateSymbolCommandProof({
 }
 
 function finalizeCommandProof(summary) {
-    const metrics = ['definition', 'find', 'extraction', 'brief', 'typedef', 'usages', 'tests', 'example'];
     let missing = 0;
-    for (const name of metrics) {
-        const metric = summary[name];
-        metric.recall = metric.eligible ? Number((metric.hits / metric.eligible).toFixed(4)) : 1;
+    for (const command of PROOF_COMMANDS) {
+        const metric = summary[command];
+        metric.recall = metric.eligible
+            ? Number((metric.hits / metric.eligible).toFixed(4))
+            : 1;
         missing += metric.missing;
     }
     summary.missing = missing;
@@ -313,6 +285,7 @@ function finalizeCommandProof(summary) {
 }
 
 module.exports = {
+    PROOF_COMMANDS,
     createCommandProofSummary,
     evaluateSymbolCommandProof,
     finalizeCommandProof,

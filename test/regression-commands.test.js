@@ -192,14 +192,14 @@ describe('blast: transitive blast radius', () => {
         }
     });
 
-    it('CLI blast command works', () => {
+    it('CLI trace --direction=callers works', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
             'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
         });
         try {
-            const out = runCli(dir, 'blast', ['helper']);
+            const out = runCli(dir, 'trace', ['helper'], ['--direction=callers']);
             assert.ok(out.includes('Blast radius for helper'), 'CLI output should have header');
             assert.ok(out.includes('main'), 'CLI output should show caller');
         } finally {
@@ -429,26 +429,28 @@ describe('blast: transitive blast radius', () => {
             'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
         });
         try {
-            const out = runCli(dir, 'blast', ['helper', '--json']);
+            const out = runCli(dir, 'trace', ['helper'], ['--direction=callers', '--json']);
             const parsed = JSON.parse(out);
-            assert.strictEqual(parsed.root, 'helper');
-            assert.ok(parsed.tree, 'JSON should have tree');
-            assert.ok(parsed.summary, 'JSON should have summary');
-            assert.ok(typeof parsed.maxDepth === 'number', 'maxDepth should be a number');
-            assert.ok(typeof parsed.summary.totalAffected === 'number');
+            assert.strictEqual(parsed.meta.command, 'trace');
+            assert.strictEqual(parsed.meta.mode, 'callers');
+            assert.strictEqual(parsed.data.root, 'helper');
+            assert.ok(parsed.data.tree, 'JSON should have tree');
+            assert.ok(parsed.data.summary, 'JSON should have summary');
+            assert.ok(typeof parsed.data.maxDepth === 'number', 'maxDepth should be a number');
+            assert.ok(typeof parsed.data.summary.totalAffected === 'number');
         } finally {
             rm(dir);
         }
     });
 
-    it('interactive mode blast works', () => {
+    it('interactive trace --direction=callers works', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
             'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }'
         });
         try {
-            const out = runInteractive(dir, ['blast helper']);
+            const out = runInteractive(dir, ['trace helper --direction=callers']);
             assert.ok(out.includes('Blast radius'), 'interactive should show blast header');
             assert.ok(out.includes('main'), 'interactive should show caller');
         } finally {
@@ -802,7 +804,7 @@ describe('affected-tests: transitive test detection', () => {
             'test/lib.test.js': 'const { helper } = require("../lib");\nit("test", () => { helper(); });',
         });
         try {
-            const out = runCli(dir, 'affected-tests', ['helper']);
+            const out = runCli(dir, 'tests', ['helper'], ['--depth=3']);
             assert.ok(out.includes('affected-tests: helper'));
             assert.ok(out.includes('functions affected'));
         } finally {
@@ -817,7 +819,7 @@ describe('affected-tests: transitive test detection', () => {
             'test/lib.test.js': 'const { helper } = require("../lib");\nit("test", () => { helper(); });',
         });
         try {
-            const out = runInteractive(dir, ['affected-tests helper']);
+            const out = runInteractive(dir, ['tests helper --depth=3']);
             assert.ok(out.includes('affected-tests: helper'));
         } finally {
             rm(dir);
@@ -1154,12 +1156,14 @@ describe('affected-tests: transitive test detection', () => {
             'test/lib.test.js': 'const { helper } = require("../lib");\nit("test", () => { helper(); });',
         });
         try {
-            const out = runCli(dir, 'affected-tests', ['helper'], ['--json']);
+            const out = runCli(dir, 'tests', ['helper'], ['--depth=3', '--json']);
             const parsed = JSON.parse(out);
-            assert.strictEqual(parsed.root, 'helper');
-            assert.ok(Array.isArray(parsed.affectedFunctions));
-            assert.ok(Array.isArray(parsed.testFiles));
-            assert.ok(parsed.summary);
+            assert.strictEqual(parsed.meta.command, 'tests');
+            assert.strictEqual(parsed.meta.mode, 'affected');
+            assert.strictEqual(parsed.data.root, 'helper');
+            assert.ok(Array.isArray(parsed.data.affectedFunctions));
+            assert.ok(Array.isArray(parsed.data.testFiles));
+            assert.ok(parsed.data.summary);
         } finally {
             rm(dir);
         }
@@ -1172,7 +1176,7 @@ describe('affected-tests: transitive test detection', () => {
             'test/lib.test.js': 'const { c } = require("../lib");\nit("test", () => { c(); });',
         });
         try {
-            const out = runCli(dir, 'affected-tests', ['a'], ['--depth=1']);
+            const out = runCli(dir, 'tests', ['a'], ['--depth=1']);
             assert.ok(out.includes('depth 1'));
         } finally {
             rm(dir);
@@ -1637,8 +1641,8 @@ impl Calculator {
         try {
             const out = runCli(dir, 'search', [], ['--type=class', '--json']);
             const parsed = JSON.parse(out);
-            assert.ok(parsed.results);
-            assert.strictEqual(parsed.meta.mode, 'structural');
+            assert.ok(parsed.data.results);
+            assert.strictEqual(parsed.data.meta.mode, 'structural');
         } finally { rm(dir); }
     });
 
@@ -2300,29 +2304,30 @@ module.exports = { a, b, c };
         assert.strictEqual(parsed.found, false);
     });
 
-    it('CLI reverse-trace works', () => {
+    it('CLI trace callers-to-entrypoints works', () => {
         const d = tmp(fixture);
         try {
-            const out = runCli(d, 'reverse-trace', ['helper']);
+            const out = runCli(d, 'trace', ['helper'], ['--direction=callers', '--to=entrypoints']);
             assert.ok(out.includes('Reverse trace for helper'));
             assert.ok(out.includes('entry point'));
         } finally { rm(d); }
     });
 
-    it('CLI rtrace alias works', () => {
+    it('CLI rtrace alias is retired', () => {
         const d = tmp(fixture);
         try {
             const out = runCli(d, 'rtrace', ['helper']);
-            assert.ok(out.includes('Reverse trace for helper'));
+            assert.ok(out.includes('not found') || out.includes('Unknown command'));
         } finally { rm(d); }
     });
 
     it('CLI --json flag works', () => {
         const d = tmp(fixture);
         try {
-            const out = runCli(d, 'reverse-trace', ['helper'], ['--json']);
+            const out = runCli(d, 'trace', ['helper'], ['--direction=callers', '--to=entrypoints', '--json']);
             const parsed = JSON.parse(out);
-            assert.ok(parsed.entryPoints);
+            assert.strictEqual(parsed.meta.mode, 'entrypoints');
+            assert.ok(parsed.data.entryPoints);
         } finally { rm(d); }
     });
 
@@ -2662,7 +2667,7 @@ def process():
             'a.js': 'function entry() { target(); }\nfunction target() {}\nmodule.exports = { entry, target };',
         });
         try {
-            const out = runInteractive(d, ['reverse-trace target']);
+            const out = runInteractive(d, ['trace target --direction=callers --to=entrypoints']);
             assert.ok(out.includes('Reverse trace for target') || out.includes('entry point'),
                 'interactive should work: ' + out.substring(0, 200));
         } finally { rm(d); }
@@ -4329,6 +4334,33 @@ describe('fix #227: verify/plan honor the exact-line pin (incl. stable handles)'
             assert.strictEqual(p.result.startLine, 4, 'plan must operate on the pinned def');
         } finally { rm(dir); }
     });
+
+    it('public impact preserves a stable handle through to exact symbol resolution', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const impact = execute(index, 'impact', { name: 'lib.js:4:save' });
+            assert.ok(impact.ok, JSON.stringify(impact.error));
+            assert.strictEqual(impact.result.file, 'lib.js');
+            assert.strictEqual(impact.result.startLine, 4,
+                'impact must not drop the stable handle line and select Store.save');
+            assert.ok(impact.result.totalCallSites > 0,
+                'the pinned standalone save has the app.js caller');
+        } finally { rm(dir); }
+    });
+
+    it('resolveSymbol treats a numeric-string line as an exact identity pin', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const exact = index.resolveSymbol('save', { file: 'lib.js', line: '4' });
+            assert.strictEqual(exact.def?.startLine, 4);
+            const stale = index.resolveSymbol('save', { file: 'lib.js', line: '99' });
+            assert.strictEqual(stale.def, null,
+                'an unsatisfied exact line must never fall back to another definition');
+            assert.deepStrictEqual(stale.definitions, []);
+        } finally { rm(dir); }
+    });
 });
 
 describe('fix #228: unsatisfiable definition pins error instead of silently falling back', () => {
@@ -5148,7 +5180,7 @@ describe('fix #246: affectedTests coverage bands agree with the engine account',
         } finally { rm(dir); }
     });
 
-    it('anonymous it() arrow frontier site routes into possiblyAffectedTests', () => {
+    it('returned-constructor flow confirms a site inside an anonymous it() callback', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'src/store.ts': 'export class Store { fetch(): number { return 1; } }\nexport class Api { fetch(): number { return 2; } }\n',
@@ -5158,9 +5190,10 @@ describe('fix #246: affectedTests coverage bands agree with the engine account',
             const index = idx(dir);
             const r = execute(index, 'affectedTests', { name: 'fetch', className: 'Store' });
             assert.ok(r.ok);
-            const poss = r.result.possiblyAffectedTests.map(t => t.file);
-            assert.ok(poss.some(f => f.includes('frontier.test.ts')),
-                'unverified site in an anonymous test callback must reach the possible band');
+            const covered = r.result.testFiles.map(t => t.file);
+            assert.ok(covered.some(f => f.includes('frontier.test.ts')),
+                'constructor-return flow must confirm the anonymous test callback site');
+            assert.strictEqual(r.result.possiblyAffectedTests.length, 0);
         } finally { rm(dir); }
     });
 
@@ -5587,7 +5620,7 @@ describe('fix #249: wave-6 urgent correctness', () => {
         });
         try {
             // FILE-mode target: pass the file path where the dir would go.
-            const out = runCli(path.join(dir, 'a.js'), 'fn', ['nosuchfn']);
+            const out = runCli(path.join(dir, 'a.js'), 'source', ['nosuchfn']);
             assert.ok(!/\n\s+at /.test(out), 'no stack frames in output: ' + out.slice(0, 300));
             assert.ok(out.includes('not found') || out.includes('Function'), 'error message present: ' + out.slice(0, 200));
         } finally { rm(dir); }
@@ -5719,7 +5752,8 @@ describe('fix #251: G8 command surface', () => {
             const r1 = execute(index, 'typedef', { name: 'UserId' });
             assert.ok(r1.ok && r1.result[0]?.type === 'type', 'PEP 695 alias indexed');
             const r2 = execute(index, 'typedef', { name: 'Vector' });
-            assert.ok(r2.ok && r2.result[0]?.aliasOf === 'list[float]', 'TypeAlias annotation indexed with aliasOf');
+            assert.ok(r2.ok && r2.result[0]?.aliasOf === 'list',
+                'TypeAlias annotation indexed with normalized aliasOf');
             assert.ok(!(index.symbols.get('normal') || []).some(s => s.type === 'type'), 'plain assignments stay out');
         } finally { rm(dir); }
     });
@@ -5793,9 +5827,9 @@ describe('fix #252: extraction/search leftovers', () => {
             'f.js': 'line1\nline2\nline3\n',
         });
         try {
-            const out1 = runCli(dir, 'lines', ['f.js', '1-2']);
+            const out1 = runCli(dir, 'source', ['f.js', '1-2']);
             assert.ok(out1.includes('line1') && out1.includes('line2'), out1.slice(0, 200));
-            const out2 = runCli(dir, 'lines', ['f.js:2']);
+            const out2 = runCli(dir, 'source', ['f.js:2']);
             assert.ok(out2.includes('line2'), out2.slice(0, 200));
         } finally { rm(dir); }
     });
@@ -5805,7 +5839,7 @@ describe('fix #252: extraction/search leftovers', () => {
         assert.ok(sig.includes('async'), sig);
     });
 
-    it('class not-found redirects to fn when a function owns the name', () => {
+    it('class not-found redirects to source when a function owns the name', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function widget() { return 1; }\nmodule.exports = { widget };\n',
@@ -5814,7 +5848,7 @@ describe('fix #252: extraction/search leftovers', () => {
             const index = idx(dir);
             const r = execute(index, 'class', { name: 'widget' });
             assert.strictEqual(r.ok, false);
-            assert.ok(r.error.includes('fn widget'), r.error);
+            assert.ok(r.error.includes('source widget'), r.error);
         } finally { rm(dir); }
     });
 

@@ -89,11 +89,12 @@ function runInteractive(fixtureDir, commands) {
 // ── MCP Client ──────────────────────────────────────────────────────────────
 
 class McpClient {
-    constructor() {
+    constructor({ timeoutMs = TIMEOUT_MS } = {}) {
         this.proc = null;
         this.requestId = 0;
         this.pending = new Map();
         this.buffer = '';
+        this.timeoutMs = timeoutMs;
     }
 
     start() {
@@ -166,7 +167,7 @@ class McpClient {
             const timer = setTimeout(() => {
                 this.pending.delete(id);
                 reject(new Error('TIMEOUT'));
-            }, TIMEOUT_MS);
+            }, this.timeoutMs);
 
             this.pending.set(id, { resolve, reject, timer });
 
@@ -192,8 +193,8 @@ class McpClient {
 
     async callTool(nameOrArgs, args) {
         // Support both signatures:
-        //   callTool('ucn', { command: 'about', ... })  — mcp-edge-cases style
-        //   callTool({ command: 'about', ... })          — parity-test style
+        //   callTool('ucn', { command: 'show', ... })  — mcp-edge-cases style
+        //   callTool({ command: 'show', ... })          — parity-test style
         if (typeof nameOrArgs === 'string') {
             return this.send('tools/call', { name: nameOrArgs, arguments: args });
         }

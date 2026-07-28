@@ -12,6 +12,7 @@
 
 const path = require('path');
 const fs = require('fs');
+const { findProjectRoot } = require('../../core/discovery');
 
 const SYMBOL_KINDS = { function: 'function', method: 'method', class: 'class' };
 
@@ -26,6 +27,11 @@ const tsMorphOracle = {
     async prepare(repoDir) {
         const { Project } = require('ts-morph');
         const ts = require('typescript');
+        // ProjectIndex roots at the nearest manifest so imports and callers
+        // in sibling source/test directories remain visible even when the
+        // requested target is a nested src directory. Mirror that universe;
+        // otherwise the oracle sees declarations but silently misses tests.
+        const projectRoot = findProjectRoot(repoDir);
         const tsConfigPath = findTsConfig(repoDir);
         let project;
         if (tsConfigPath) {
@@ -45,20 +51,20 @@ const tsMorphOracle = {
         // symbol universes (and therefore their historical samples) stay
         // byte-stable.
         const globs = [
-            path.join(repoDir, '**/*.ts'),
-            path.join(repoDir, '**/*.tsx'),
-            '!' + path.join(repoDir, '**/node_modules/**'),
-            '!' + path.join(repoDir, '**/*.d.ts'),
+            path.join(projectRoot, '**/*.ts'),
+            path.join(projectRoot, '**/*.tsx'),
+            '!' + path.join(projectRoot, '**/node_modules/**'),
+            '!' + path.join(projectRoot, '**/*.d.ts'),
         ];
         if (!tsConfigPath) {
             globs.push(
-                path.join(repoDir, '**/*.js'),
-                path.join(repoDir, '**/*.mjs'),
-                path.join(repoDir, '**/*.cjs'),
-                path.join(repoDir, '**/*.jsx'));
+                path.join(projectRoot, '**/*.js'),
+                path.join(projectRoot, '**/*.mjs'),
+                path.join(projectRoot, '**/*.cjs'),
+                path.join(projectRoot, '**/*.jsx'));
         }
         project.addSourceFilesAtPaths(globs);
-        return { project, root: repoDir, ts, isJsProject: !tsConfigPath };
+        return { project, root: projectRoot, ts, isJsProject: !tsConfigPath };
     },
 
     /**
@@ -141,7 +147,30 @@ const tsMorphOracle = {
                 });
             }
         }
-        return refs;
+
+        // TypeScript's rename-oriented findReferences can return no call
+        // references for a declaration-only class whose runtime methods are
+        // installed through `Type.prototype.method = function`. Preact
+        // Signals is a real example: the class declaration is the public type
+        // surface, while the ES5 prototype assignment is the implementation.
+        // Recover those sites from compiler-resolved call expressions. This is
+        // not a name-only fallback: methodCallMayReach still requires the
+        // resolved receiver/signature to be the exact owner, a base/interface
+        // dispatch capable of reaching it, or unresolved (oracle uncertainty).
+        if (decl.getKind() === SyntaxKind.MethodDeclaration) {
+            for (const node of methodCallCandidates(handle, name, SyntaxKind)) {
+                if (!methodCallMayReach(handle, decl, node, SyntaxKind)) continue;
+                const rel = path.relative(handle.root, node.getSourceFile().getFilePath());
+                if (rel.startsWith('..')) continue;
+                refs.push({
+                    file: rel,
+                    line: node.getStartLineNumber(),
+                    kind: 'call',
+                });
+            }
+        }
+
+        return dedupeReferences(refs);
     },
 };
 
@@ -190,8 +219,11 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
     // cannot classify stays conservative; an actual function declaration is
     // definitive negative ownership evidence.
     if (!sigOwner) {
-        if (sigInterface) return receiverTypeMayReachTarget(
-            handle, call, targetOwner, SyntaxKind);
+        if (sigInterface) {
+            return receiverTypeMayReachTarget(
+                handle, call, targetOwner, SyntaxKind) ||
+                interfaceShapeMayReachTarget(sigInterface, targetOwner);
+        }
         return signatureDecl.getKind() !== SyntaxKind.FunctionDeclaration;
     }
     if (sameDeclarationOwner(targetOwner, sigOwner)) return true;
@@ -208,6 +240,25 @@ function methodCallMayReach(handle, targetDecl, referenceNode, SyntaxKind) {
         base = base.getBaseClass();
     }
     return false;
+}
+
+function interfaceShapeMayReachTarget(interfaceDecl, targetOwner) {
+    // Generic target declarations are not always considered assignable to a
+    // concrete interface instantiation (`Signal<T>` vs
+    // `ReadonlySignal<number>`) even though some runtime instantiation can
+    // satisfy it. For a MAY-dispatch reference oracle, complete structural
+    // member coverage is sufficient potential evidence. Concrete sibling
+    // owners never enter this branch, so this cannot merge two unrelated
+    // class implementations merely because one method name matches.
+    try {
+        const required = interfaceDecl.getType().getProperties()
+            .map(property => property.getName());
+        const available = new Set(targetOwner.getType().getProperties()
+            .map(property => property.getName()));
+        return required.length > 0 && required.every(name => available.has(name));
+    } catch {
+        return false;
+    }
 }
 
 function receiverTypeMayReachTarget(handle, call, targetOwner, SyntaxKind) {
@@ -233,6 +284,40 @@ function receiverTypeMayReachTarget(handle, call, targetOwner, SyntaxKind) {
 function sameDeclarationOwner(a, b) {
     return a.getSourceFile().getFilePath() === b.getSourceFile().getFilePath() &&
         a.getStart() === b.getStart();
+}
+
+/**
+ * Cache property-call name nodes once per prepared project. The fallback above
+ * may be used for many sampled methods; rescanning every AST for every symbol
+ * would turn a correctness repair into an avoidable evaluation bottleneck.
+ */
+function methodCallCandidates(handle, name, SyntaxKind) {
+    if (!handle.methodCallCandidatesByName) {
+        const byName = new Map();
+        for (const sf of handle.project.getSourceFiles()) {
+            for (const call of sf.getDescendantsOfKind(SyntaxKind.CallExpression)) {
+                const expression = call.getExpression();
+                if (expression?.getKind() !== SyntaxKind.PropertyAccessExpression) continue;
+                const nameNode = expression.getNameNode();
+                const calledName = nameNode?.getText();
+                if (!calledName) continue;
+                if (!byName.has(calledName)) byName.set(calledName, []);
+                byName.get(calledName).push(nameNode);
+            }
+        }
+        handle.methodCallCandidatesByName = byName;
+    }
+    return handle.methodCallCandidatesByName.get(name) || [];
+}
+
+function dedupeReferences(refs) {
+    const seen = new Set();
+    return refs.filter(ref => {
+        const key = `${ref.file}:${ref.line}:${ref.kind}`;
+        if (seen.has(key)) return false;
+        seen.add(key);
+        return true;
+    });
 }
 
 /**

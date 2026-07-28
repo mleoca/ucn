@@ -15,6 +15,7 @@ const path = require('path');
 const { addTestExclusions, pickBestDefinition, parseSymbolHandle, looksLikeHandle } = require('./shared');
 const { cleanHtmlScriptTags, detectLanguage } = require('./parser');
 const { renderExpandItem } = require('./expand-cache');
+const { CANONICAL_COMMANDS } = require('./registry');
 
 // ============================================================================
 // HELPERS
@@ -308,11 +309,272 @@ function readAndExtract(match) {
     return cleanHtmlScriptTags(extracted, detectLanguage(match.file)).join('\n');
 }
 
+const SHOW_SECTIONS = new Set([
+    'summary', 'callers', 'callees', 'source', 'dependencies',
+    'tests', 'types', 'example', 'related',
+]);
+const REPO_SECTIONS = new Set(['summary', 'files', 'stats', 'health']);
+
+/** Parse a comma-separated/array section selector with validation. */
+function parseSections(value, defaults, allowed, command) {
+    const raw = value == null || value === ''
+        ? defaults
+        : (Array.isArray(value) ? value : String(value).split(','));
+    const sections = [...new Set(raw.map(s => String(s).trim().toLowerCase()).filter(Boolean))];
+    const invalid = sections.filter(s => !allowed.has(s));
+    if (invalid.length > 0) {
+        return {
+            error: `Unknown ${command} section(s): ${invalid.join(', ')}. Available: ${[...allowed].join(', ')}.`,
+        };
+    }
+    return { sections };
+}
+
+function addMode(result, mode) {
+    if (result && typeof result === 'object') {
+        Object.defineProperty(result, '_publicMode', {
+            value: mode,
+            enumerable: false,
+            configurable: true,
+        });
+    }
+    return result;
+}
+
+function combineNotes(notes) {
+    return notes.filter(Boolean).join('\n') || undefined;
+}
+
+const PUBLIC_COMMAND_SET = new Set(CANONICAL_COMMANDS);
+
+/**
+ * Validate mode-dependent parameter combinations before a handler chooses a
+ * branch. This is deliberately inside the engine so CLI, MCP, interactive,
+ * glob, file, and programmatic callers receive the same answer.
+ */
+function validatePublicParams(command, p) {
+    const hasName = typeof p.name === 'string' && p.name.trim() !== '';
+    const gitScope = p.staged || (typeof p.base === 'string' && p.base.trim() !== '');
+    if ((command === 'impact' || command === 'check') && hasName && gitScope) {
+        return `${command} accepts either a symbol target or Git diff scope (base/staged), not both.`;
+    }
+    if ((command === 'impact' || command === 'check') && p.staged && p.base) {
+        return `${command} accepts either staged=true or base, not both.`;
+    }
+    if (command === 'source' && p.range != null &&
+        (!p.file || !String(p.file).trim())) {
+        return 'source range mode requires file.';
+    }
+    if (command === 'source' && p.range != null &&
+        typeof p.name === 'string' && p.name.trim()) {
+        return 'source accepts either a symbol target or a file range, not both.';
+    }
+    if (command === 'search' && p.receiver && p.type && p.type !== 'call') {
+        return 'search receiver filtering requires type=call (or omit type to select call mode).';
+    }
+    if (command === 'trace' && p.to === 'entrypoints' &&
+        (p.direction || 'callees') !== 'callers') {
+        return 'trace --to=entrypoints requires --direction=callers.';
+    }
+    if (command === 'deps' && p.cycles &&
+        (p.file || p.direction || p.depth != null || p.detailed || p.all)) {
+        return 'deps cycles mode cannot be combined with file, direction, depth, detailed, or all.';
+    }
+    if (command === 'tests' && Number(p.depth || 0) > 0 && p.callsOnly) {
+        return 'tests callsOnly applies to direct mode and cannot be combined with depth>0.';
+    }
+    if (command === 'entrypoints' && p.includeTests === true && p.excludeTests === true) {
+        return 'entrypoints includeTests and excludeTests cannot both be true.';
+    }
+    if (command === 'endpoints' && p.serverOnly && p.clientOnly) {
+        return 'endpoints serverOnly and clientOnly cannot both be true.';
+    }
+    if (command === 'plan') {
+        const operations = [p.addParam, p.removeParam, p.renameTo]
+            .filter(value => value != null && String(value).trim() !== '');
+        if (operations.length !== 1) {
+            return 'plan requires exactly one operation: addParam, removeParam, or renameTo.';
+        }
+        if (p.defaultValue != null && !p.addParam) {
+            return 'plan defaultValue is valid only with addParam.';
+        }
+    }
+    return null;
+}
+
 // ============================================================================
 // COMMAND HANDLERS
 // ============================================================================
 
 const HANDLERS = {
+
+    // ── Public v5 compositions ─────────────────────────────────────────
+
+    show: (index, p) => {
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: err };
+        const parsed = parseSections(
+            p.sections,
+            ['summary', 'callers', 'callees'],
+            SHOW_SECTIONS,
+            'show',
+        );
+        if (parsed.error) return { ok: false, error: parsed.error };
+
+        const selected = new Set(parsed.sections);
+        const result = { target: p.name, sections: parsed.sections };
+        const notes = [];
+        const run = (handler, params) => {
+            const response = HANDLERS[handler](index, { ...params });
+            if (!response.ok) return response;
+            if (response.note) notes.push(response.note);
+            return response;
+        };
+
+        if (selected.has('summary')) {
+            const response = run('brief', p);
+            if (!response.ok) return response;
+            result.summary = response.result;
+        }
+        if (selected.has('callers') || selected.has('callees')) {
+            const response = run('context', p);
+            if (!response.ok) return response;
+            // Apply the projection in the engine result so text and JSON
+            // expose the same sections. ACCOUNT/CONTRACT metadata stays
+            // attached even when one relationship direction is omitted.
+            result.context = { ...response.result };
+            if (!selected.has('callers')) {
+                result.context.callers = [];
+                result.context.unverifiedCallers = [];
+            }
+            if (!selected.has('callees')) {
+                result.context.callees = [];
+                result.context.unverifiedCallees = [];
+            }
+        }
+        if (selected.has('source')) {
+            const response = run('source', p);
+            if (!response.ok) return response;
+            result.source = response.result;
+        }
+        if (selected.has('dependencies')) {
+            const response = run('smart', p);
+            if (!response.ok) return response;
+            result.dependencies = response.result;
+        }
+        if (selected.has('tests')) {
+            const response = run('tests', { ...p, depth: 0 });
+            if (!response.ok) return response;
+            result.tests = response.result;
+        }
+        if (selected.has('types')) {
+            const response = run('about', { ...p, withTypes: true, compact: true });
+            if (!response.ok) return response;
+            result.types = {
+                types: response.result.types || [],
+                otherDefinitions: response.result.otherDefinitions || [],
+            };
+        }
+        if (selected.has('example')) {
+            const response = run('example', p);
+            if (!response.ok) return response;
+            result.example = response.result;
+        }
+        if (selected.has('related')) {
+            const response = run('related', p);
+            if (!response.ok) return response;
+            result.related = response.result;
+        }
+
+        const note = combineNotes(notes);
+        return note ? { ok: true, result, note } : { ok: true, result };
+    },
+
+    source: (index, p) => {
+        if (p.range != null) {
+            const response = HANDLERS.lines(index, { file: p.file, range: p.range });
+            if (response.ok) addMode(response.result, 'lines');
+            return response;
+        }
+        const err = requireName(p.name);
+        if (err) return { ok: false, error: 'Symbol name or file range is required.' };
+
+        const functionResult = HANDLERS.fn(index, { ...p });
+        if (functionResult.ok) {
+            addMode(functionResult.result, 'function');
+            return functionResult;
+        }
+        const classResult = HANDLERS.class(index, { ...p });
+        if (classResult.ok) {
+            addMode(classResult.result, 'class');
+            return classResult;
+        }
+        const specific = [functionResult.error, classResult.error].find(message =>
+            message && !/^(?:Function|Class) .+ not found\.$/.test(message));
+        return { ok: false, error: specific || `Symbol "${p.name}" not found.` };
+    },
+
+    deps: (index, p) => {
+        if (p.cycles) {
+            const response = HANDLERS.circularDeps(index, { file: p.file, exclude: p.exclude });
+            if (response.ok) addMode(response.result, 'cycles');
+            return response;
+        }
+        const err = requireFile(p.file);
+        if (err) return { ok: false, error: err };
+        const direction = p.direction || 'both';
+        if (!['imports', 'importers', 'both'].includes(direction)) {
+            return { ok: false, error: 'deps direction must be imports, importers, or both.' };
+        }
+        const graphResponse = HANDLERS.graph(index, {
+            file: p.file,
+            direction,
+            depth: p.depth,
+            all: p.all,
+        });
+        if (!graphResponse.ok) return graphResponse;
+        const result = {
+            file: p.file,
+            direction,
+            graph: graphResponse.result,
+        };
+        if (p.detailed && (direction === 'imports' || direction === 'both')) {
+            const response = HANDLERS.imports(index, { file: p.file });
+            if (!response.ok) return response;
+            result.imports = response.result;
+        }
+        if (p.detailed && (direction === 'importers' || direction === 'both')) {
+            const response = HANDLERS.exporters(index, { file: p.file });
+            if (!response.ok) return response;
+            result.importers = response.result;
+        }
+        addMode(result, 'graph');
+        return { ok: true, result };
+    },
+
+    repo: (index, p) => {
+        const defaults = p.deep ? ['summary', 'health'] : ['summary'];
+        const parsed = parseSections(p.sections, defaults, REPO_SECTIONS, 'repo');
+        if (parsed.error) return { ok: false, error: parsed.error };
+        const selected = new Set(parsed.sections);
+        const result = { sections: parsed.sections };
+        const notes = [];
+        const collect = (key, handler, params) => {
+            const response = HANDLERS[handler](index, { ...params });
+            if (!response.ok) return response;
+            result[key] = response.result;
+            if (response.note) notes.push(response.note);
+            return null;
+        };
+        let failure;
+        if (selected.has('summary')) failure = collect('summary', 'orient', p);
+        if (!failure && selected.has('files')) failure = collect('files', 'toc', p);
+        if (!failure && selected.has('stats')) failure = collect('stats', 'stats', p);
+        if (!failure && selected.has('health')) failure = collect('health', 'doctor', p);
+        if (failure) return failure;
+        const note = combineNotes(notes);
+        return note ? { ok: true, result, note } : { ok: true, result };
+    },
 
     // ── Understanding Code ──────────────────────────────────────────────
 
@@ -371,6 +633,13 @@ const HANDLERS = {
     },
 
     impact: (index, p) => {
+        // Public v5 overload: no symbol means Git-diff impact. This replaces
+        // the separate diff-impact command without changing the symbol path.
+        if (!p.name || (typeof p.name === 'string' && !p.name.trim())) {
+            const response = HANDLERS.diffImpact(index, { ...p });
+            if (response.ok) addMode(response.result, 'diff');
+            return response;
+        }
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
@@ -383,6 +652,7 @@ const HANDLERS = {
         const result = index.impact(p.name, {
             file: p.file,
             className: p.className,
+            line: p.line,
             exclude: toExcludeArray(p.exclude),
             top: num(p.top, undefined),
             unreachableOnly: !!p.unreachableOnly,
@@ -395,6 +665,7 @@ const HANDLERS = {
         });
         if (!result) return { ok: false, error: `Function "${p.name}" not found.` };
         const tNote = truncationNote(index);
+        addMode(result, 'symbol');
         return { ok: true, result, ...(tNote && { note: tNote }) };
     },
 
@@ -466,6 +737,23 @@ const HANDLERS = {
     },
 
     trace: (index, p) => {
+        const direction = p.direction || 'callees';
+        if (!['callees', 'callers'].includes(direction)) {
+            return { ok: false, error: 'trace direction must be callees or callers.' };
+        }
+        if (p.to && p.to !== 'entrypoints') {
+            return { ok: false, error: 'trace --to currently accepts only entrypoints.' };
+        }
+        if (direction === 'callers') {
+            const response = p.to === 'entrypoints'
+                ? HANDLERS.reverseTrace(index, { ...p, direction: undefined, to: undefined })
+                : HANDLERS.blast(index, { ...p, direction: undefined, to: undefined });
+            if (response.ok) addMode(response.result, p.to === 'entrypoints' ? 'entrypoints' : 'callers');
+            return response;
+        }
+        if (p.to) {
+            return { ok: false, error: 'trace --to=entrypoints requires --direction=callers.' };
+        }
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
@@ -486,6 +774,7 @@ const HANDLERS = {
         const note = treeNote(result);
         const tNote = truncationNote(index);
         const combined = [note, tNote].filter(Boolean).join('\n') || undefined;
+        addMode(result, 'callees');
         return { ok: true, result, ...(combined && { note: combined }) };
     },
 
@@ -594,6 +883,13 @@ const HANDLERS = {
     },
 
     check: (index, p) => {
+        // Public v5 overload: a symbol target performs the former verify
+        // operation; a target-less invocation remains the diff/precommit check.
+        if (p.name && String(p.name).trim()) {
+            const response = HANDLERS.verify(index, { ...p });
+            if (response.ok) addMode(response.result, 'symbol');
+            return response;
+        }
         const { check } = require('./check');
         try {
             const result = check(index, {
@@ -602,6 +898,7 @@ const HANDLERS = {
                 file: p.file,
                 limit: num(p.limit, undefined),
             });
+            addMode(result, 'diff');
             return { ok: true, result };
         } catch (e) {
             return { ok: false, error: e && e.message ? e.message : String(e) };
@@ -611,6 +908,25 @@ const HANDLERS = {
     // ── Finding Code ────────────────────────────────────────────────────
 
     find: (index, p) => {
+        if (p.type === 'type') {
+            const response = HANDLERS.typedef(index, { ...p });
+            if (response.ok) {
+                if (!p.withSource && Array.isArray(response.result)) {
+                    response.result = response.result.map(({ code, ...item }) => item);
+                }
+                const limit = num(p.limit, undefined);
+                if (limit && limit > 0 && Array.isArray(response.result)) {
+                    const { items, total, limited } = applyLimit(response.result, limit);
+                    response.result = items;
+                    if (limited) {
+                        const note = limitNote(limit, total);
+                        response.note = response.note ? `${response.note}\n${note}` : note;
+                    }
+                }
+                addMode(response.result, 'type');
+            }
+            return response;
+        }
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         applyClassMethodSyntax(p);
@@ -635,6 +951,18 @@ const HANDLERS = {
             exclude,
             in: p.in,
         });
+        if (p.type) {
+            const kindGroups = {
+                function: new Set(['function', 'method', 'constructor', 'get', 'set']),
+                class: new Set(CLASS_KIND_TYPES),
+                variable: new Set(['state', 'constant', 'field']),
+            };
+            const kinds = kindGroups[p.type] || new Set([p.type]);
+            result = result.filter(item => kinds.has(item.type));
+        }
+        if (p.withSource) {
+            result = result.map(item => ({ ...item, code: readAndExtract(item) }));
+        }
         // Warn if exact mode silently disables glob expansion
         const notes = [];
         if (p.exact && p.name && (p.name.includes('*') || p.name.includes('?'))) {
@@ -830,6 +1158,12 @@ const HANDLERS = {
     },
 
     tests: (index, p) => {
+        const depth = num(p.depth, 0);
+        if (depth > 0) {
+            const response = HANDLERS.affectedTests(index, { ...p, depth });
+            if (response.ok) addMode(response.result, 'affected');
+            return response;
+        }
         const err = requireName(p.name);
         if (err) return { ok: false, error: err };
         // tests() accepts a FILE PATH as the target ("tests helper.go" — the
@@ -874,6 +1208,7 @@ const HANDLERS = {
             file: p.file,
             exclude: toExcludeArray(p.exclude),
         });
+        addMode(result, 'direct');
         return { ok: true, result };
     },
 
@@ -1131,10 +1466,10 @@ const HANDLERS = {
                     {
                     const kind = classMatches[0].type;
                     const article = /^[aeiou]/.test(kind) ? 'an' : 'a';
-                    notes.push(`"${fnName}" is ${article} ${kind}, not a function. Use \`class ${fnName}\` instead.`);
+                    notes.push(`"${fnName}" is ${article} ${kind}, not a function. Use \`source ${fnName}\` to extract it.`);
                 }
                 } else if ((index.symbols.get(actualName) || []).some(s => s.type === 'macro')) {
-                    notes.push(`"${fnName}" is a macro. fn/class extract functions and classes — use \`lines <file>:<start>-<end>\` for macro bodies.`);
+                    notes.push(`"${fnName}" is a macro. Use \`source <file>:<start>-<end>\` for its body.`);
                 } else {
                     notes.push(`Function "${fnName}" not found.`);
                 }
@@ -1209,7 +1544,7 @@ const HANDLERS = {
             const fnMatches = index.find(p.name, { file: p.file, skipCounts: true })
                 .filter(m => m.type === 'function' || (m.params !== undefined && !CLASS_KIND_TYPES.includes(m.type)));
             if (fnMatches.length > 0) {
-                return { ok: false, error: `Class "${p.name}" not found — "${p.name}" is a ${fnMatches[0].type}. Use \`fn ${p.name}\` instead.` };
+                return { ok: false, error: `Class "${p.name}" not found — "${p.name}" is a ${fnMatches[0].type}. Use \`source ${p.name}\` instead.` };
             }
             return { ok: false, error: `Class "${p.name}" not found.` };
         }
@@ -1477,7 +1812,13 @@ const HANDLERS = {
         if (fileErr) return { ok: false, error: fileErr };
         const classErr = validateClassName(index, p.name, p.className);
         if (classErr) return { ok: false, error: classErr };
-        const result = index.typedef(p.name, { exact: p.exact || false, className: p.className, file: p.file });
+        const result = index.typedef(p.name, {
+            exact: p.exact || false,
+            className: p.className,
+            file: p.file,
+            exclude: applyTestExclusions(p.exclude, p.includeTests),
+            in: p.in,
+        });
         return { ok: true, result };
     },
 
@@ -1601,7 +1942,7 @@ const HANDLERS = {
                 const scopeHint = p.symbolName ? ` (from context for "${p.symbolName}")` : '';
                 return { ok: false, error: `Item ${p.itemNum} not found${scopeHint}. Available: 1-${p.itemCount}` };
             }
-            return { ok: false, error: 'No expandable items. Run context first.' };
+            return { ok: false, error: 'No expandable items. Run show first.' };
         }
         const rendered = renderExpandItem(p.match, index.root, { validateRoot: p.validateRoot || false });
         if (!rendered.ok) return { ok: false, error: rendered.error };
@@ -1634,6 +1975,10 @@ function execute(index, command, params = {}) {
     // normalizers and returned wrong not-found answers).
     params = { ...params };
     try {
+        if (PUBLIC_COMMAND_SET.has(command)) {
+            const validationError = validatePublicParams(command, params);
+            if (validationError) return { ok: false, error: validationError };
+        }
         // Resolve name-less handles (e.g. `lib.js:42`) via index lookup before dispatch.
         // Handles WITH a name suffix are handled later by applyClassMethodSyntax.
         if (params && params.name && looksLikeHandle(params.name)) {
@@ -1673,4 +2018,4 @@ function lookupByLocation(index, file, line) {
     return null;
 }
 
-module.exports = { execute };
+module.exports = { execute, validatePublicParams };

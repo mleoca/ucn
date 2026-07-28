@@ -98,16 +98,16 @@ describe('fix: lines command rejects malformed ranges', () => {
     });
 });
 
-describe('fix: diff-impact suppresses git stderr in non-git directories', () => {
+describe('fix: impact without a symbol suppresses git stderr in non-git directories', () => {
     it('emits only UCN error, no raw git stderr', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function x(){}\n'
         });
         try {
-            const out = runCli(dir, 'diff-impact', [], ['--no-cache']);
+            const out = runCli(dir, 'impact', [], ['--no-cache']);
             // Should contain the friendly UCN error
-            assert.ok(out.includes('Not a git repository') || out.includes('diff-impact requires git'),
+            assert.ok(out.includes('Not a git repository') || out.includes('impact requires git'),
                 'should show UCN error message');
             // Should NOT contain raw git fatal message
             assert.ok(!out.includes('fatal:'),
@@ -167,7 +167,7 @@ describe('fix R2: nested diff-impact deleted-function detection and stderr', () 
                 'module.exports = {};\n');
 
             const pkgDir = path.join(dir, 'pkg');
-            const out = runCli(pkgDir, 'diff-impact', [], ['--base=HEAD', '--no-cache']);
+            const out = runCli(pkgDir, 'impact', [], ['--base=HEAD', '--no-cache']);
             assert.ok(!out.includes('fatal:'),
                 `should not leak git stderr, got: ${out}`);
         } finally {
@@ -2167,7 +2167,7 @@ class Beta:
         }
     });
 
-    it('should pass className via CLI to verify command', () => {
+    it('should pass className via CLI to check command', () => {
         const dir = tmp({
             'setup.py': 'from setuptools import setup',
             'app.py': `
@@ -2181,7 +2181,7 @@ def caller():
 `,
         });
         try {
-            const output = runCli(dir, 'verify', ['process'], ['--class-name=MyClass']);
+            const output = runCli(dir, 'check', ['process'], ['--class-name=MyClass']);
             assert.ok(!output.includes('Unknown flag'),
                 '--class-name should be a recognized flag');
         } finally {
@@ -2910,6 +2910,59 @@ describe('fix #274: findCallers fails loudly on semantic engine defects', () => 
                 /findCallees failed while analyzing caller\.js: getCachedCalls failed for caller\.js:.*ENOENT/,
                 'trace-down failures must abort instead of asserting no dependencies',
             );
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+// ============================================================================
+// Fix #275: CommonJS object-spread barrels preserve export ownership
+// ============================================================================
+describe('fix #275: CommonJS spread-barrel namespace calls', () => {
+    it('confirms a namespace call through module.exports = {...require(...)}', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'leaf.js': [
+                'function target(value) { return value; }',
+                'module.exports = { target };',
+            ].join('\n'),
+            'barrel.js': [
+                'module.exports = {',
+                "  ...require('./leaf'),",
+                '};',
+            ].join('\n'),
+            'app.js': [
+                "const api = require('./barrel');",
+                'function run() { return api.target(1); }',
+                'module.exports = { run };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const barrel = index.files.get(path.join(dir, 'barrel.js'));
+            assert.ok(barrel.exportDetails.some(detail =>
+                detail.type === 're-export-all' &&
+                detail.source === './leaf'));
+
+            const profile = {};
+            const result = index.findCallers('target', {
+                file: 'leaf.js',
+                collectAccount: true,
+                profile,
+            });
+            assert.ok(result.some(caller =>
+                caller.callerName === 'run' &&
+                caller.relativePath === 'app.js' &&
+                caller.tier === 'confirmed'));
+            assert.equal(result.unverifiedEntries.length, 0);
+            assert.equal(result.accountRaw.unverifiedLines.length, 0);
+            assert.equal(profile.confirmed, 1);
+            assert.equal(profile.unverified, 0);
+            assert.equal(profile.confirmedByResolution['scope-match'], 1);
+            assert.ok(profile.candidateScanMs >= 0);
+            assert.ok(profile.enrichmentMs >= 0);
+            assert.ok(profile.totalMs >= profile.candidateScanMs);
         } finally {
             rm(dir);
         }

@@ -12,77 +12,12 @@ const { workerData } = require('worker_threads');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
-const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
-const { parse } = require('./parser');
-const { extractImports, extractExports } = require('./imports');
+const { detectLanguage, getParser, getLanguageAdapter } = require('../languages');
+const { validateFileIR } = require('./ir');
+const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 
 const { files, rootDir, existingHashes, signal, workerIndex, port } = workerData;
 const signalArray = new Int32Array(signal);
-
-function addSymbol(fileEntry, item, type) {
-    const symbol = {
-        name: item.name,
-        type,
-        file: fileEntry.path,
-        relativePath: fileEntry.relativePath,
-        startLine: item.startLine,
-        endLine: item.endLine,
-        params: item.params,
-        paramsStructured: item.paramsStructured,
-        returnType: item.returnType,
-        modifiers: item.modifiers,
-        docstring: item.docstring,
-        bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,
-    };
-    // Field set MUST mirror project.js addSymbol exactly — a worker-side drop
-    // silently strips the field from every parallel-built index (>500 files).
-    // The cache.test.js / perf-optimizations.test.js indexSnapshot guards
-    // compare full symbol shapes, but only for shapes present in their
-    // fixtures — keep this list in sync by hand when addSymbol grows.
-    if (item.paramTypes) symbol.paramTypes = item.paramTypes;
-    if (item.returnedFunctionResult) symbol.returnedFunctionResult = item.returnedFunctionResult;
-    if (item.isFunctionVariable) symbol.isFunctionVariable = true;
-    if (item.isAsync) symbol.isAsync = true;
-    if (item.isGenerator) symbol.isGenerator = true;
-    if (item.generics) symbol.generics = item.generics;
-    if (item.extends) symbol.extends = item.extends;
-    if (item.implements) symbol.implements = item.implements;
-    if (item.indent !== undefined) symbol.indent = item.indent;
-    if (item.isNested) symbol.isNested = item.isNested;
-    if (item.enclosingType) symbol.enclosingType = item.enclosingType;
-    if (item.isMethod) symbol.isMethod = item.isMethod;
-    if (item.receiver) symbol.receiver = item.receiver;
-    if (item.className) symbol.className = item.className;
-    if (item.memberType) symbol.memberType = item.memberType;
-    if (item.fieldType) symbol.fieldType = item.fieldType;
-    if (item.aliasOf) symbol.aliasOf = item.aliasOf;
-    if (item.derefTarget) symbol.derefTarget = item.derefTarget;
-    if (item.decorators && item.decorators.length > 0) symbol.decorators = item.decorators;
-    if (item.decoratorsWithArgs && item.decoratorsWithArgs.length > 0) symbol.decoratorsWithArgs = item.decoratorsWithArgs;
-    if (item.annotationsWithArgs && item.annotationsWithArgs.length > 0) symbol.annotationsWithArgs = item.annotationsWithArgs;
-    if (item.attributesWithArgs && item.attributesWithArgs.length > 0) symbol.attributesWithArgs = item.attributesWithArgs;
-    if (item.nameLine) symbol.nameLine = item.nameLine;
-    if (item.traitImpl) symbol.traitImpl = true;
-    if (item.traitName) symbol.traitName = item.traitName;
-    if (item.isSignature) symbol.isSignature = true;
-    if (item.memberAssigned) symbol.memberAssigned = true;
-    if (item.bodyScopedName) symbol.bodyScopedName = true;
-    if (item.registryMember) symbol.registryMember = true;
-    if (item.registryContainer) symbol.registryContainer = item.registryContainer;
-
-    fileEntry.symbols.push(symbol);
-    // Property-assignment defs declare no lexical name (fix #269) — kept in
-    // lockstep with project.js addSymbol (the parallel≡sequential guard).
-    // Named function expressions bind only inside their own body.
-    if (!item.memberAssigned && !item.bodyScopedName) {
-        fileEntry.bindings.push({
-            id: symbol.bindingId,
-            name: symbol.name,
-            type: symbol.type,
-            startLine: symbol.startLine,
-        });
-    }
-}
 
 function processFile(filePath) {
     const stat = fs.statSync(filePath);
@@ -104,22 +39,14 @@ function processFile(filePath) {
     const language = detectLanguage(filePath);
     if (!language) return { filePath, skipped: true };
 
-    // Parse content — safeParse cache ensures tree is shared across
-    // parse()/extractImports()/extractExports()/findCallsInCode() (1 parse per file)
-    const parsed = parse(content, language);
-    const { imports, dynamicCount, importAliases } = extractImports(content, language);
-    const { exports } = extractExports(content, language);
-
-    // Extract calls in the same pass (eliminates buildCalleeIndex re-parsing)
-    let calls = null;
-    const langModule = getLanguageModule(language);
-    if (langModule.findCallsInCode) {
-        const parser = getParser(language);
-        const callOpts = {};
-        if (langTraits(language)?.hasReceiverPackageCalls) {
-            callOpts.imports = imports.flatMap(i => i.names || []);
-        }
-        calls = langModule.findCallsInCode(content, parser, callOpts);
+    // One adapter analysis produces the complete, validated file IR consumed
+    // by both worker and sequential builds.
+    const adapter = getLanguageAdapter(language);
+    const parser = getParser(language);
+    const ir = adapter.analyze(content, parser, filePath);
+    const irFailures = validateFileIR(ir);
+    if (irFailures.length > 0) {
+        throw new Error(`Invalid ${language} IR: ${irFailures.join('; ')}`);
     }
 
     // Detect bundled/minified files (same logic as indexFile in project.js)
@@ -150,69 +77,23 @@ function processFile(filePath) {
 
     const relativePath = path.relative(rootDir, filePath);
 
-    // Build fileEntry (mirrors indexFile)
-    const fileEntry = {
-        path: filePath,
+    const fileEntry = createFileEntryFromIR({
+        ir,
+        filePath,
         relativePath,
-        language,
-        lines: lineCount,
         hash,
         mtime: stat.mtimeMs,
         size: stat.size,
-        imports: imports.map(i => i.module),
-        importNames: imports.flatMap(i => i.names || []),
-        // Paired name↔module bindings (fix #209) — mirrors indexFile; was
-        // missing here, so parallel-built indexes (>500 files) silently lost
-        // the name-level scope/ownership discipline (found during fix #217).
-        importBindings: imports.flatMap(i => (i.names || [])
-            .filter(n => n && n !== '*' && n !== '_' && n !== '.')
-            .map(n => {
-                // Rename pairing (fix #269) — lockstep with project.js.
-                const rn = (i.renames || []).find(r => r.original === n);
-                return {
-                    name: n,
-                    module: i.module,
-                    ...(rn && { alias: rn.local }),
-                    ...(i.defaultLike && { defaultLike: true }),
-                };
-            })),
-        exports: exports.map(e => e.name),
-        exportDetails: exports,
-        symbols: [],
-        bindings: [],
-        dynamicImports: dynamicCount || 0,
-    };
-    if (parsed.parseRecovery) fileEntry.parseRecovery = true;
-    if (importAliases) fileEntry.importAliases = importAliases;
-    if (parsed.moduleAssignedNames) fileEntry.moduleAssignedNames = parsed.moduleAssignedNames;
-    if (isBundled) fileEntry.isBundled = true;
-    if (isGenerated) fileEntry.isGenerated = true;
-
-    // Build symbols (mirrors indexFile)
-    for (const fn of parsed.functions) {
-        if (fn.receiver && !fn.className) {
-            fn.className = fn.receiver.replace(/^\*/, '');
-        }
-        addSymbol(fileEntry, fn, fn.isConstructor ? 'constructor' : 'function');
-    }
-
-    for (const cls of parsed.classes) {
-        addSymbol(fileEntry, cls, cls.type || 'class');
-        if (cls.members) {
-            for (const m of cls.members) {
-                addSymbol(fileEntry, { ...m, className: cls.name, ...(cls.traitName && { traitImpl: true, traitName: cls.traitName }) }, m.memberType || 'method');
-            }
-        }
-    }
-
-    for (const state of parsed.stateObjects) {
-        addSymbol(fileEntry, state, 'state');
-    }
+        lineCount,
+        isBundled,
+        isGenerated,
+    });
+    populateFileEntryFromIR(fileEntry, ir);
 
     return {
         filePath,
         fileEntry,
-        calls,
+        calls: ir.calls,
         callsMtime: stat.mtimeMs,
         callsHash: hash,
         hadExisting: !!existing,

@@ -5,7 +5,7 @@
  * as the first argument instead of using `this`.
  */
 
-const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
+const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
 const { dirname: pathDirname } = require('path');
 const { isTestFile } = require('./discovery');
 const { isFrameworkEntrypoint } = require('./entrypoints');
@@ -303,7 +303,7 @@ function buildUsageIndex(index, filterNames) {
             // (HTML tree-sitter sees script content as raw_text, not JS identifiers)
             let tree;
             if (language === 'html') {
-                const htmlModule = getLanguageModule('html');
+                const htmlModule = getLanguageAdapter('html');
                 const htmlParser = getParser('html');
                 const jsParser = getParser('javascript');
                 const blocks = htmlModule.extractScriptBlocks(content, htmlParser);
@@ -402,7 +402,7 @@ function buildUsageIndex(index, filterNames) {
             // For HTML files, also extract identifiers from event handler attributes
             // (onclick="foo()" etc. — these are in HTML, not in <script> blocks)
             if (language === 'html') {
-                const htmlModule = getLanguageModule('html');
+                const htmlModule = getLanguageAdapter('html');
                 const htmlParser = getParser('html');
                 const handlerCalls = htmlModule.extractEventHandlerCalls(content, htmlParser);
                 for (const call of handlerCalls) {
@@ -914,7 +914,7 @@ function deadcode(index, options = {}) {
 
             // Language-specific entry points (called by runtime/test runner, not user code)
             // Each language module declares its own isEntryPoint() rules.
-            const langModule = getLanguageModule(lang);
+            const langModule = getLanguageAdapter(lang);
             if (langModule.isEntryPoint?.(symbol)) {
                 continue;
             }

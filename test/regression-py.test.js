@@ -56,6 +56,36 @@ describe('Regression: Python class methods in context', () => {
     });
 });
 
+describe('v5 ownership evidence: structural module exports', () => {
+    it('confirms an exact module-qualified re-export instead of leaving it unverified', () => {
+        const dir = tmp({
+            'httpx/__init__.py': 'from ._client import MockTransport\n',
+            'httpx/_client.py': [
+                'class MockTransport:',
+                '    def __init__(self, handler):',
+                '        self.handler = handler',
+            ].join('\n'),
+            'app.py': [
+                'import httpx',
+                'transport = httpx.MockTransport(lambda request: request)',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'httpx/_client.py:1:MockTransport',
+            });
+            assert.ok(result.ok, result.error);
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.ok(json.data.usages.some(c => c.file === 'app.py' && c.line === 2),
+                `module export ownership must confirm: ${JSON.stringify(json.data)}`);
+            assert.ok(!(json.data.unverifiedCallers || [])
+                .some(c => c.file === 'app.py' && c.line === 2));
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #272 (Python): dotted-package ownership and constructed properties', () => {
     it('treats an unaliased dotted import as both a package and submodule edge', () => {
         const dir = tmp({
@@ -80,7 +110,7 @@ describe('fix #272 (Python): dotted-package ownership and constructed properties
     it('associates a property reference on a fresh instance with its class', () => {
         const languages = require('../languages');
         const parser = languages.getParser('python');
-        const mod = languages.getLanguageModule('python');
+        const mod = languages.getLanguageAdapter('python');
         const source = 'assert ColorTriplet(1, 2, 3).normalized == (1, 2, 3)\n';
         const usages = mod.findUsagesInCode(source, 'normalized', parser);
         assert.deepStrictEqual(usages, [{
@@ -491,9 +521,9 @@ config = load_config()
 
 describe('Regression: Python self.attr.method() resolution', () => {
     it('findCallsInCode should detect selfAttribute for self.X.method()', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('python');
-        const langModule = getLanguageModule('python');
+        const langModule = getLanguageAdapter('python');
 
         const code = `class ReportGenerator:
     def __init__(self, analyzer):
@@ -533,10 +563,61 @@ describe('Regression: Python self.attr.method() resolution', () => {
         assert.strictEqual(upperCall.selfAttribute, 'name');
     });
 
+    it('records and resolves multi-hop annotated attribute receivers', () => {
+        const dir = tmp({
+            'models.py': [
+                'class ProjectDecoder:',
+                '    def decode(self, value: bytes) -> bytes:',
+                '        return value',
+                'class URL:',
+                '    @property',
+                '    def netloc(self) -> bytes:',
+                '        return b""',
+                'class Request:',
+                '    def __init__(self, url: URL):',
+                '        self.url = url',
+                'def format_request(request: Request):',
+                '    return request.url.netloc.decode("ascii")',
+                'def convert(value: str | bytes):',
+                '    return value if isinstance(value, str) else value.decode("ascii")',
+                'def decode_headers(headers: list[tuple[bytes, bytes]]):',
+                '    return [(name.decode(), value.decode()) for name, value in headers]',
+                'def option(**kwargs: str):',
+                '    return kwargs.get("name")',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(index.root, 'models.py'));
+            const call = calls.find(item => item.name === 'decode' && item.line === 12);
+            assert.deepStrictEqual(call.receiverFields, ['url', 'netloc']);
+            assert.strictEqual(call.receiverRoot, 'request');
+            assert.strictEqual(call.receiverRootType, 'Request');
+            const narrowed = calls.find(item => item.name === 'decode' && item.line === 14);
+            assert.strictEqual(narrowed.receiverType, 'bytes');
+            const comprehensionCalls = calls.filter(item =>
+                item.name === 'decode' && item.line === 16);
+            assert.strictEqual(comprehensionCalls.length, 2);
+            assert.ok(comprehensionCalls.every(item => item.receiverType === 'bytes'));
+            const kwargsCall = calls.find(item => item.name === 'get' && item.line === 18);
+            assert.strictEqual(kwargsCall.receiverType, 'dict');
+
+            const result = execute(index, 'context', {
+                name: 'models.py:2:decode',
+            });
+            assert.ok(result.ok, result.error);
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.ok(!(json.data.callers || []).some(item => item.line === 12));
+            assert.ok(!(json.data.unverifiedCallers || []).some(item => item.line === 12));
+            assert.strictEqual(
+                json.meta.account.excluded.byReason['receiver-type-mismatch'].count, 3);
+        } finally { rm(dir); }
+    });
+
     it('findInstanceAttributeTypes should parse __init__ assignments', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('python');
-        const langModule = getLanguageModule('python');
+        const langModule = getLanguageAdapter('python');
 
         const code = `class ReportGenerator:
     def __init__(self, analyzer=None, db=None):
@@ -1118,7 +1199,7 @@ class Point:
 `);
 
         const lang = require('../languages');
-        const pyMod = lang.getLanguageModule('python');
+        const pyMod = lang.getLanguageAdapter('python');
         const parser = lang.getParser('python');
         const code = fs.readFileSync(tmpFile, 'utf-8');
         const classes = pyMod.findClasses(code, parser);
@@ -4323,7 +4404,7 @@ describe('fix #274 (Python): qualified constructor provenance', () => {
         return JSON.parse(output.formatContextJson(result.result));
     }
 
-    it('keeps an external constructor receiver visible but out of the confirmed tier', () => {
+    it('excludes a concrete external constructor receiver with explicit accounting', () => {
         const dir = tmp({
             'target.py': 'class URL:\n    def join(self):\n        return self\n',
             'user.py': [
@@ -4337,12 +4418,12 @@ describe('fix #274 (Python): qualified constructor provenance', () => {
             const json = context(idx(dir), 'target.py:2:join');
             assert.ok(!(json.data.callers || []).some(c => c.file === 'user.py' && c.line === 4),
                 `threading.Thread.join must not confirm URL.join: ${JSON.stringify(json.data)}`);
-            const visible = (json.data.unverifiedCallers || [])
-                .find(c => c.file === 'user.py' && c.line === 4);
-            assert.ok(visible, `external receiver remains visible: ${JSON.stringify(json.data)}`);
-            assert.strictEqual(visible.reason, 'possible-dispatch');
-            assert.strictEqual(visible.dispatchVia, 'threading.Thread');
-            assert.strictEqual(visible.externalContract, true);
+            assert.ok(!(json.data.unverifiedCallers || [])
+                .some(c => c.file === 'user.py' && c.line === 4),
+            `a concrete external owner is exclusion evidence: ${JSON.stringify(json.data)}`);
+            const external = json.meta.account?.excluded?.byReason?.['external-package'];
+            assert.ok(external?.sample?.some(c => c.file === 'user.py' && c.line === 4),
+                `the exclusion remains auditable: ${JSON.stringify(json.meta.account)}`);
             assert.strictEqual(json.meta.account?.conserved, true);
         } finally { rm(dir); }
     });
@@ -4449,13 +4530,53 @@ describe('fix #275: Python lexical call ownership', () => {
             assert.ok(!callers.some(c => c.relativePath === 'app.py' && [4, 7].includes(c.line)),
                 `unproven receiver entered confirmed tier: ${JSON.stringify(callers)}`);
             const visible = callers.unverifiedEntries || [];
-            assert.ok(visible.some(c => c.line === 4 && c.reason === 'possible-dispatch'));
+            assert.ok(!visible.some(c => c.line === 4),
+                'stdlib StringIO is a concrete external receiver, not dispatch uncertainty');
             assert.ok(visible.some(c => c.line === 7 && c.reason === 'possible-dispatch'));
+            assert.ok(callers.accountRaw?.excludedEntries?.some(c => c.line === 4),
+            `external exclusion must remain accounted: ${JSON.stringify(callers)}`);
         } finally { rm(dir); }
     });
 });
 
 describe('fix #276: Python alias and chained-builtin precision', () => {
+    it('uses static aliases, preserved protocols, and callable iterable returns as receiver types', () => {
+        const dir = tmp({
+            'target.py': 'class Client:\n    def get(self, key):\n        return key\n',
+            'app.py': [
+                'import typing',
+                'Scope = typing.Dict[str, typing.Any]',
+                'def parse() -> list[dict[str, str]]:',
+                '    return []',
+                'def via_alias(scope: Scope):',
+                '    return scope.get("key")',
+                'def via_protocol(event_hooks: None | (typing.Mapping[str, list[str]]) = None):',
+                '    event_hooks = {} if event_hooks is None else event_hooks',
+                '    return event_hooks.get("request", [])',
+                'def via_return():',
+                '    return [item.get("key") for item in parse()]',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const scope = index.symbols.get('Scope')?.[0];
+            assert.strictEqual(scope?.type, 'type');
+            assert.strictEqual(scope?.aliasOf, 'dict');
+            const target = index.symbols.get('get')
+                .find(d => d.relativePath === 'target.py');
+            const callers = index.findCallers('get', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(!callers.some(c => c.relativePath === 'app.py'),
+                `builtin collection calls must not confirm Client.get: ${JSON.stringify(callers)}`);
+            for (const line of [6, 9, 11]) {
+                assert.ok(callers.accountRaw.excludedEntries.some(e =>
+                    e.line === line && e.reason === 'receiver-type-mismatch'),
+                `line ${line} should carry exact builtin mismatch evidence: ${JSON.stringify(callers.accountRaw)}`);
+            }
+        } finally { rm(dir); }
+    });
+
     it('preserves a class constructor alias in JSON output', () => {
         const dir = tmp({
             'app.py': [
@@ -4540,6 +4661,53 @@ describe('fix #276: Python alias and chained-builtin precision', () => {
             const result = execute(index, 'context', { name: 'target.py:2:decode' });
             const json = JSON.parse(require('../core/output').formatContextJson(result.result));
             assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('Python capability-guard dispatch provenance', () => {
+    it('labels a receiver-exact positive hasattr guard as runtime dispatch', () => {
+        const dir = tmp({
+            'target.py': [
+                'class AsyncReader:',
+                '    async def aread(self, size):',
+                '        return b""',
+            ].join('\n'),
+            'app.py': [
+                'class Wrapper:',
+                '    def __init__(self, stream):',
+                '        self._stream = stream',
+                '    async def run(self):',
+                '        if hasattr(self._stream, "aread"):',
+                '            return await self._stream.aread(1)',
+                '        return b""',
+                '    async def wrong_guard(self):',
+                '        if hasattr(self._stream, "other"):',
+                '            return await self._stream.aread(1)',
+                '        return b""',
+            ].join('\n'),
+        });
+        try {
+            const result = execute(idx(dir), 'context', {
+                name: 'target.py:2:aread',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(
+                require('../core/output').formatContextJson(result.result));
+            const guarded = json.data.unverifiedCallers.find(
+                caller => caller.file === 'app.py' && caller.line === 6);
+            assert.ok(guarded, JSON.stringify(json.data));
+            assert.strictEqual(guarded.reason, 'possible-dispatch');
+            assert.strictEqual(
+                guarded.dispatchVia, 'dynamic capability "aread"');
+            assert.strictEqual(guarded.uncertaintyClass, 'runtime-dispatch');
+
+            const wrongGuard = json.data.unverifiedCallers.find(
+                caller => caller.file === 'app.py' && caller.line === 10);
+            assert.ok(wrongGuard, JSON.stringify(json.data));
+            assert.notStrictEqual(wrongGuard.uncertaintyClass, 'runtime-dispatch',
+                'a guard for another attribute is not evidence for aread');
+            assert.strictEqual(result.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });

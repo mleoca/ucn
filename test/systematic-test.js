@@ -108,49 +108,26 @@ const languages = {
   },
 };
 
-// Commands to test with their expected behaviors
+// Every public v5 command, exercised through the same CLI router.
 const commands = [
-  // Basic commands
-  { name: 'toc', args: [], description: 'Table of contents', expectOutput: true },
-  { name: 'stats', args: [], description: 'Project statistics', expectOutput: true },
-
-  // Find commands
+  { name: 'repo', args: ['--sections=files,stats,health'], description: 'Repository overview', expectOutput: true },
+  { name: 'show', args: ['$FUNCTION'], description: 'Symbol summary and relationships', expectOutput: true },
   { name: 'find', args: ['$FUNCTION'], description: 'Find symbol definition', expectOutput: true },
   { name: 'usages', args: ['$FUNCTION'], description: 'Find symbol usages', expectOutput: true },
   { name: 'search', args: ['TODO'], description: 'Text search', expectOutput: false }, // May not have TODO
-
-  // Extraction commands
-  { name: 'fn', args: ['$FUNCTION'], description: 'Extract function', expectOutput: true },
-  { name: 'class', args: ['$CLASS'], description: 'Extract class', expectOutput: true },
-  { name: 'lines', args: ['1-10'], description: 'Extract lines', expectOutput: true, fileMode: true },
-
-  // Analysis commands
-  { name: 'context', args: ['$FUNCTION'], description: 'Show callers and callees', expectOutput: true },
-  { name: 'about', args: ['$FUNCTION'], description: 'Full symbol information', expectOutput: true },
-  { name: 'smart', args: ['$FUNCTION'], description: 'Function with dependencies', expectOutput: true },
-  { name: 'impact', args: ['$FUNCTION'], description: 'Impact analysis', expectOutput: true },
+  { name: 'source', args: ['$FUNCTION'], description: 'Extract source', expectOutput: true },
   { name: 'trace', args: ['$FUNCTION', '--depth=2'], description: 'Call tree', expectOutput: true },
-  { name: 'related', args: ['$FUNCTION'], description: 'Related functions', expectOutput: false }, // May not find related
-
-  // Additional analysis commands
-  { name: 'typedef', args: ['$CLASS'], description: 'Find type definition', expectOutput: false }, // May not have types
-  { name: 'example', args: ['$FUNCTION'], description: 'Best usage example', expectOutput: false }, // May not find example
-  { name: 'verify', args: ['$FUNCTION'], description: 'Verify call sites', expectOutput: false }, // May not need verify
-
-  // Dependency commands
-  { name: 'imports', args: ['$FILE'], description: 'File imports', expectOutput: false }, // May not have imports
-  { name: 'exporters', args: ['$FILE'], description: 'Who imports file', expectOutput: false },
-  { name: 'who-imports', args: ['$FILE'], description: 'Who imports (alias)', expectOutput: false },
-  { name: 'graph', args: ['$FILE', '--depth=2'], description: 'Dependency graph', expectOutput: false },
-
-  // Refactoring commands
-  { name: 'deadcode', args: [], description: 'Find unused functions', expectOutput: false },
-  { name: 'api', args: [], description: 'Public API', expectOutput: true },
+  { name: 'impact', args: ['$FUNCTION'], description: 'Impact analysis', expectOutput: true },
   { name: 'tests', args: ['$FUNCTION'], description: 'Find related tests', expectOutput: false },
-
-  // JSON output
-  { name: 'find', args: ['$FUNCTION', '--json'], description: 'Find with JSON output', expectOutput: true, checkJson: true },
-  { name: 'toc', args: ['--json'], description: 'TOC with JSON output', expectOutput: true, checkJson: true },
+  { name: 'check', args: ['$FUNCTION'], description: 'Check call signatures', expectOutput: false },
+  { name: 'plan', args: ['$FUNCTION', '--rename-to=renamedSymbol'], description: 'Preview refactor', expectOutput: true },
+  { name: 'deps', args: ['$FILE', '--depth=2'], description: 'Dependency graph', expectOutput: true },
+  { name: 'api', args: ['$FILE'], description: 'Public API', expectOutput: true },
+  { name: 'entrypoints', args: [], description: 'Runtime entry points', expectOutput: false },
+  { name: 'endpoints', args: [], description: 'HTTP endpoints', expectOutput: false },
+  { name: 'deadcode', args: [], description: 'Find unused functions', expectOutput: false },
+  { name: 'audit-async', args: [], description: 'Audit missing awaits', expectOutput: false },
+  { name: 'stacktrace', args: ['$STACK'], description: 'Resolve stack frame', expectOutput: false },
 ];
 
 /**
@@ -198,6 +175,10 @@ function replaceArgs(args, symbols, files, lang) {
     }
     if (arg === '$FILE') {
       return files[0];
+    }
+    if (arg === '$STACK') {
+      const fn = symbols.functions?.[0] || symbols.methods?.[0] || 'main';
+      return `"at ${fn} (${files[0]}:1:1)"`;
     }
     return arg;
   });
@@ -382,7 +363,7 @@ function testEdgeCases() {
     // Invalid path
     {
       name: 'Invalid path',
-      run: () => runUcn('/nonexistent/path', 'toc', []),
+      run: () => runUcn('/nonexistent/path', 'repo', []),
       expect: (r) => !r.success && (r.error?.includes('not found') || r.error?.includes('ENOENT') || r.error?.includes('No supported files')),
     },
     // Depth edge cases
@@ -405,7 +386,7 @@ function testEdgeCases() {
     // Multiple flags
     {
       name: 'Multiple flags combined',
-      run: () => runUcn(languages.javascript.path, 'find', ['processData', '--json', '--exact', '--top=1']),
+      run: () => runUcn(languages.javascript.path, 'find', ['processData', '--json', '--exact', '--limit=1']),
       expect: (r) => r.success,
     },
     // Flag variations
@@ -416,7 +397,7 @@ function testEdgeCases() {
     },
     {
       name: 'In flag (path filter)',
-      run: () => runUcn(languages.javascript.path, 'toc', ['--in=.']),
+      run: () => runUcn(languages.javascript.path, 'repo', ['--sections=files', '--in=.']),
       expect: (r) => r.success,
     },
     {
@@ -424,28 +405,28 @@ function testEdgeCases() {
       run: () => runUcn(languages.javascript.path, 'usages', ['processData', '--include-tests']),
       expect: (r) => r.success,
     },
-    // Context output with expand
+    // Composed show sections
     {
-      name: 'Context with expand flag',
-      run: () => runUcn(languages.javascript.path, 'context', ['processData', '--expand']),
+      name: 'Show with source section',
+      run: () => runUcn(languages.javascript.path, 'show', ['processData', '--sections=callers,source']),
       expect: (r) => r.success,
     },
-    // About with code-only flag
+    // Narrow show projection
     {
-      name: 'About with code-only',
-      run: () => runUcn(languages.javascript.path, 'about', ['processData', '--code-only']),
+      name: 'Show callers only',
+      run: () => runUcn(languages.javascript.path, 'show', ['processData', '--sections=callers']),
       expect: (r) => r.success || r.output.includes('processData'),
     },
-    // Smart with types
+    // Dependency and type projections
     {
-      name: 'Smart with types',
-      run: () => runUcn(languages.typescript.path, 'smart', ['filterTasks', '--with-types']),
+      name: 'Show dependencies with types',
+      run: () => runUcn(languages.typescript.path, 'show', ['filterTasks', '--sections=dependencies,types', '--with-types']),
       expect: (r) => r.success,
     },
     // File mode commands
     {
-      name: 'Single file toc',
-      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'toc', []),
+      name: 'Single file API',
+      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'api', []),
       expect: (r) => r.success && r.output.includes('main.js'),
     },
     {
@@ -462,27 +443,27 @@ function testEdgeCases() {
       },
       expect: (r) => r.success,
     },
-    // Lines command edge cases
+    // Source range edge cases
     {
       name: 'Lines with out-of-bounds range',
-      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'lines', ['9999-10000']),
+      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'source', ['9999-10000']),
       expect: (r) => !r.success && r.error?.includes('out of bounds'),
     },
     {
       name: 'Lines with reversed range',
-      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'lines', ['10-5']),
+      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'source', ['10-5']),
       expect: (r) => r.success && r.output.includes('5'),
     },
     {
       name: 'Lines with non-numeric range',
-      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'lines', ['abc-def']),
+      run: () => runUcn(path.join(languages.javascript.path, 'main.js'), 'source', ['--range=abc-def']),
       expect: (r) => !r.success && r.error?.includes('Invalid line range'),
     },
-    // Graph with negative depth — Round 5 MED-3: invalid numeric flag values
+    // Deps with negative depth — Round 5 MED-3: invalid numeric flag values
     // are now rejected with a helpful error instead of being silently ignored.
     {
-      name: 'Graph with negative depth',
-      run: () => runUcn(languages.javascript.path, 'graph', ['main.js', '--depth=-5']),
+      name: 'Deps with negative depth',
+      run: () => runUcn(languages.javascript.path, 'deps', ['main.js', '--depth=-5']),
       expect: (r) => !r.success && (r.error?.includes('Invalid --depth') || r.output?.includes('Invalid --depth')),
     },
     // Double-dash separator
@@ -497,10 +478,10 @@ function testEdgeCases() {
       run: () => runUcn(languages.javascript.path, 'plan', ['processData', '--rename-to=processInput']),
       expect: (r) => r.success && r.output.includes('Refactoring plan'),
     },
-    // Verify command
+    // Check command
     {
-      name: 'Verify function calls',
-      run: () => runUcn(languages.javascript.path, 'verify', ['processData']),
+      name: 'Check function calls',
+      run: () => runUcn(languages.javascript.path, 'check', ['processData']),
       expect: (r) => r.success,
     },
   ];

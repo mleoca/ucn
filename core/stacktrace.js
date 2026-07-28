@@ -276,6 +276,15 @@ function parseStackTrace(index, stackText) {
     // Stack trace patterns for different languages/runtimes
     // Order matters - more specific patterns first
     const patterns = [
+        // .NET: "at Namespace.Type.Method(...) in /src/File.cs:line 42"
+        // and Windows drive-letter paths.
+        { regex: /at\s+([^\s(]+)(?:\([^)]*\))?\s+in\s+(.+?):line\s+(\d+)/, extract: (m) => ({ funcName: m[1].split('.').pop(), file: m[2], line: parseInt(m[3]), col: null }) },
+        // Native sanitizers: "#0 0x... in ns::func /src/file.cpp:42:7"
+        { regex: /#\d+\s+(?:0x[0-9a-f]+\s+)?in\s+([^\s(]+)(?:\([^)]*\))?\s+(.+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)(?::(\d+))?/i, extract: (m) => ({ funcName: m[1].split('::').pop(), file: m[2], line: parseInt(m[3]), col: m[4] ? parseInt(m[4]) : null }) },
+        // GDB/lldb: "#0 ns::func (...) at src/file.cpp:42"
+        { regex: /#\d+\s+(?:0x[0-9a-f]+\s+in\s+)?([^\s(]+).*?\bat\s+(.+\.(?:c|cc|cpp|cxx|h|hpp)):(\d+)/i, extract: (m) => ({ funcName: m[1].split('::').pop(), file: m[2], line: parseInt(m[3]), col: null }) },
+        // MSVC diagnostics and native exception locations: "src\\file.cpp(42)"
+        { regex: /(.+\.(?:c|cc|cpp|cxx|h|hpp|cs))\((\d+)(?:,(\d+))?\)/i, extract: (m) => ({ file: m[1], line: parseInt(m[2]), col: m[3] ? parseInt(m[3]) : null, funcName: null }) },
         // Rust pre-1.65 panic header: "panicked at 'message', src/main.rs:150:9"
         // MUST precede the Node pattern — its [^():]+ file group has no
         // space/comma guard, so the quoted message glued into the file field

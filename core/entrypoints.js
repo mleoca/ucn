@@ -16,7 +16,7 @@ const fs = require('fs');
 const { codeUnitCompare, NON_CALLABLE_TYPES } = require('./shared');
 const path = require('path');
 const { getCachedCalls } = require('./callers');
-const { getLanguageModule } = require('../languages');
+const { getLanguageAdapter } = require('../languages');
 
 // ============================================================================
 // FRAMEWORK PATTERNS
@@ -163,6 +163,34 @@ const FRAMEWORK_PATTERNS = [
         framework: 'actix',
         detection: 'modifier',
         pattern: /^(get|post|put|delete|patch)$/,
+    },
+
+    // ASP.NET Core controllers and Azure Functions.
+    {
+        id: 'aspnet-controller-route',
+        languages: new Set(['csharp']),
+        type: 'http',
+        framework: 'aspnet',
+        detection: 'decorator',
+        pattern: /^(ApiController|Route|Http(Get|Post|Put|Delete|Patch|Head|Options)|AcceptVerbs)$/,
+    },
+    {
+        id: 'azure-function',
+        languages: new Set(['csharp']),
+        type: 'http',
+        framework: 'azure-functions',
+        detection: 'decorator',
+        pattern: /^(FunctionName|Function|HttpTrigger)$/,
+    },
+    // ASP.NET minimal APIs: app.MapGet("/path", Handler).
+    {
+        id: 'aspnet-minimal-route',
+        languages: new Set(['csharp']),
+        type: 'http',
+        framework: 'aspnet-minimal',
+        detection: 'callPattern',
+        receiverPattern: /^(app|endpoints|routes)$/i,
+        methodPattern: /^Map(Get|Post|Put|Delete|Patch|Methods|Fallback)$/,
     },
 
     // ── Dependency Injection ────────────────────────────────────────────
@@ -385,6 +413,34 @@ const FRAMEWORK_PATTERNS = [
         framework: 'rust',
         detection: 'modifier',
         pattern: /^(test|tokio::test|cfg\(test\))$/,
+    },
+
+    // ── C / C++ / C# runtime and test roots ─────────────────────────
+    {
+        id: 'c-family-main',
+        languages: new Set(['c', 'cpp']),
+        type: 'runtime',
+        framework: 'native',
+        detection: 'namePattern',
+        pattern: /^(main|WinMain|wWinMain|DllMain)$/,
+        symbolFilter: (s) => !s.className,
+    },
+    {
+        id: 'csharp-main',
+        languages: new Set(['csharp']),
+        type: 'runtime',
+        framework: 'dotnet',
+        detection: 'namePattern',
+        pattern: /^Main$/,
+        symbolFilter: (s) => s.modifiers?.includes('static'),
+    },
+    {
+        id: 'csharp-test',
+        languages: new Set(['csharp']),
+        type: 'test',
+        framework: 'dotnet-test',
+        detection: 'decorator',
+        pattern: /^(Fact|Theory|Test|TestMethod|TestCase|TestCaseSource|SetUp|OneTimeSetUp)$/,
     },
 
     // ── Go Framework Patterns ─────────────────────────────────────────
@@ -1169,7 +1225,7 @@ function computeReachability(index) {
                 langModule = langModuleCache.get(lang);
             } else {
                 try {
-                    langModule = getLanguageModule(lang);
+                    langModule = getLanguageAdapter(lang);
                 } catch (_e) {
                     langModule = null;
                 }

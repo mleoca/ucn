@@ -5,12 +5,14 @@
  */
 
 const path = require('path');
+const { createLanguageAdapter } = require('./adapter');
 
 // Lazy-loaded tree-sitter
 let TreeSitter = null;
 
 // Cached parser instances
 const parsers = {};
+const adapters = {};
 
 // Shared trait presets for languages with the same type-system characteristics
 const STRUCTURAL_TRAITS = {
@@ -229,6 +231,70 @@ const LANGUAGES = {
             testFileCandidates: (base, ext) => [`${base}Test.java`, `${base}Tests.java`, `${base}TestCase.java`],
         },
     },
+    c: {
+        name: 'c',
+        extensions: ['.c', '.h'],
+        treeSitterLang: 'c',
+        module: () => require('./c'),
+        treeSitterModule: () => require('tree-sitter-c'),
+        traits: {
+            ...NOMINAL_TRAITS,
+            selfParam: null,
+            packageScope: 'file',
+            hasDynamicImports: false,
+            exportVisibility: 'linkage',
+            typeQualifiedCallStyle: 'static',
+            bareCallReachesMethods: false,
+            methodCallReachesFunctions: true,
+            testFileCandidates: (base, ext) => [
+                `${base}_test${ext}`, `test_${base}${ext}`, `${base}.test${ext}`,
+            ],
+            testDirs: ['test', 'tests'],
+        },
+    },
+    cpp: {
+        name: 'cpp',
+        extensions: ['.cc', '.cpp', '.cxx', '.c++', '.hpp', '.hh', '.hxx', '.h++'],
+        treeSitterLang: 'cpp',
+        module: () => require('./cpp'),
+        treeSitterModule: () => require('tree-sitter-cpp'),
+        traits: {
+            ...NOMINAL_TRAITS,
+            selfParam: ['this'],
+            packageScope: 'file',
+            hasDynamicImports: false,
+            exportVisibility: 'linkage',
+            typeQualifiedCallStyle: 'path',
+            hasArityOverloads: true,
+            bareCallReachesMethods: true,
+            methodCallReachesFunctions: true,
+            testFileCandidates: (base, ext) => [
+                `${base}_test${ext}`, `test_${base}${ext}`, `${base}.test${ext}`,
+            ],
+            testDirs: ['test', 'tests'],
+        },
+    },
+    csharp: {
+        name: 'csharp',
+        extensions: ['.cs', '.csx'],
+        treeSitterLang: 'c_sharp',
+        module: () => require('./csharp'),
+        treeSitterModule: () => require('tree-sitter-c-sharp'),
+        traits: {
+            ...NOMINAL_TRAITS,
+            selfParam: ['this', 'base'],
+            packageScope: 'namespace',
+            hasDynamicImports: false,
+            hasArityOverloads: true,
+            bareCallReachesMethods: true,
+            typeQualifiedCallStyle: 'static',
+            universalSupertype: 'Object',
+            testFileCandidates: (base, ext) => [
+                `${base}Tests${ext}`, `${base}Test${ext}`, `${base}.Tests${ext}`,
+            ],
+            testDirs: ['test', 'tests'],
+        },
+    },
     html: {
         name: 'html',
         extensions: ['.html', '.htm'],
@@ -347,21 +413,28 @@ function getParser(language) {
  * @returns {string|null} Language name or null if unsupported
  */
 function detectLanguage(filePath) {
-    const ext = path.extname(filePath).toLowerCase();
+    const rawExt = path.extname(filePath);
+    const ext = rawExt.toLowerCase();
+    if (ext === '.h') {
+        const { detectHeaderLanguage } = require('../core/compilation-database');
+        return detectHeaderLanguage(filePath);
+    }
     return EXT_MAP[ext] || null;
 }
 
 /**
- * Get language module for a language
+ * Get the normalized v5 adapter for a language.
  * @param {string} language - Language name
- * @returns {object} Language module with parse functions
+ * @returns {object} Language adapter
  */
-function getLanguageModule(language) {
+function getLanguageAdapter(language) {
+    if (adapters[language]) return adapters[language];
     const config = LANGUAGES[language];
     if (!config) {
         throw new Error(`Unsupported language: ${language}`);
     }
-    return config.module();
+    adapters[language] = createLanguageAdapter(config);
+    return adapters[language];
 }
 
 /**
@@ -486,7 +559,7 @@ function langTraits(language) {
 module.exports = {
     detectLanguage,
     getParser,
-    getLanguageModule,
+    getLanguageAdapter,
     isSupported,
     getSupportedExtensions,
     getSupportedLanguages,

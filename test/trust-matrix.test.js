@@ -46,10 +46,8 @@ describe('command trust matrix: fail-closed proof coverage', () => {
 
     it('keeps high-risk semantic commands on an external oracle', () => {
         const required = [
-            'about', 'context', 'impact', 'blast', 'smart', 'trace',
-            'reverseTrace', 'example', 'related', 'find', 'usages', 'tests',
-            'affectedTests', 'deadcode', 'fn', 'class', 'verify', 'plan',
-            'diffImpact', 'check', 'typedef', 'brief',
+            'show', 'find', 'usages', 'source', 'trace', 'impact', 'tests',
+            'check', 'plan', 'deadcode',
         ];
         for (const command of required) {
             const spec = COMMAND_TRUST_MATRIX[command];
@@ -59,11 +57,11 @@ describe('command trust matrix: fail-closed proof coverage', () => {
     });
 
     it('labels destructive or heuristic outputs review-only/advisory', () => {
-        for (const command of ['deadcode', 'entrypoints', 'endpoints', 'example', 'auditAsync', 'stacktrace']) {
+        for (const command of ['deadcode', 'entrypoints', 'endpoints', 'auditAsync', 'stacktrace']) {
             assert.strictEqual(COMMAND_TRUST_MATRIX[command].decisionSafety, 'advisory-only',
                 `${command}: must not imply autonomous safety`);
         }
-        for (const command of ['about', 'impact', 'verify', 'plan', 'diffImpact', 'check', 'api']) {
+        for (const command of ['show', 'trace', 'impact', 'tests', 'plan', 'check', 'api']) {
             assert.strictEqual(COMMAND_TRUST_MATRIX[command].decisionSafety, 'review-required');
         }
     });

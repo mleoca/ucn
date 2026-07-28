@@ -7,7 +7,7 @@
  * as the original HTML file, with empty lines for non-script content.
  */
 
-const { getParser, getLanguageModule } = require('./index');
+const { getParser, getLanguageAdapter } = require('./index');
 
 // Script type values that indicate JavaScript content
 const JS_TYPES = new Set([
@@ -139,7 +139,7 @@ function extractJS(htmlContent, htmlParser) {
 
     const virtualJS = buildVirtualJSContent(htmlContent, blocks);
     const jsParser = getParser('javascript');
-    const jsModule = getLanguageModule('javascript');
+    const jsModule = getLanguageAdapter('javascript');
 
     return { virtualJS, jsParser, jsModule };
 }

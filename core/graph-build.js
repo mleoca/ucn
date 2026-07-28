@@ -89,6 +89,33 @@ function _resolveJavaPackageImport(index, importModule, javaFileIndex, opts = {}
     return opts.all ? [] : null;
 }
 
+function _buildCSharpNamespaceIndex(index) {
+    const namespaces = new Map();
+    const add = (key, file) => {
+        if (!key) return;
+        if (!namespaces.has(key)) namespaces.set(key, []);
+        if (!namespaces.get(key).includes(file)) namespaces.get(key).push(file);
+    };
+    for (const [filePath, fileEntry] of index.files) {
+        if (fileEntry.language !== 'csharp') continue;
+        for (const symbol of fileEntry.symbols || []) {
+            if (!['class', 'interface', 'struct', 'record', 'enum'].includes(symbol.type)) {
+                continue;
+            }
+            add(symbol.namespace, filePath);
+            if (symbol.namespace) add(`${symbol.namespace}.${symbol.name}`, filePath);
+        }
+    }
+    return namespaces;
+}
+
+function _resolveCSharpUsing(index, importModule, namespaceIndex = null, opts = {}) {
+    const map = namespaceIndex || _buildCSharpNamespaceIndex(index);
+    const matches = map.get(importModule) || [];
+    if (opts.all) return [...matches];
+    return matches[0] || null;
+}
+
 /**
  * Build import/export relationship graphs
  */
@@ -100,6 +127,7 @@ function buildImportGraph(index) {
     const dirToGoFiles = new Map();
     // Pre-build filename→files map for Java import resolution (O(1) vs O(n) scan)
     const javaFileIndex = new Map();
+    const csharpNamespaceIndex = _buildCSharpNamespaceIndex(index);
     for (const [fp, fe] of index.files) {
         if (langTraits(fe.language)?.packageScope === 'directory') {
             const dir = path.dirname(fp);
@@ -156,11 +184,23 @@ function buildImportGraph(index) {
                 }
             }
 
+            let csharpFiles = null;
+            if (!resolved && fileEntry.language === 'csharp') {
+                const all = _resolveCSharpUsing(
+                    index, importModule, csharpNamespaceIndex, { all: true });
+                if (all.length > 0) {
+                    resolved = all[0];
+                    csharpFiles = all;
+                }
+            }
+
             if (resolved && index.files.has(resolved)) {
                 moduleResolved[importModule] = path.relative(index.root, resolved);
                 // For Go, a package import means all files in that directory are dependencies
                 // (Go packages span multiple files in the same directory)
-                const filesToLink = javaWildcardFiles ? [...javaWildcardFiles] : [resolved];
+                const filesToLink = javaWildcardFiles
+                    ? [...javaWildcardFiles]
+                    : csharpFiles ? [...csharpFiles] : [resolved];
                 if (langTraits(fileEntry.language)?.packageScope === 'directory') {
                     const pkgDir = path.dirname(resolved);
                     const dirFiles = dirToGoFiles.get(pkgDir) || [];
@@ -347,4 +387,11 @@ function splitParentList(clause) {
         .filter(Boolean);
 }
 
-module.exports = { buildDirIndex, buildImportGraph, buildInheritanceGraph, splitParentList, _resolveJavaPackageImport };
+module.exports = {
+    buildDirIndex,
+    buildImportGraph,
+    buildInheritanceGraph,
+    splitParentList,
+    _resolveJavaPackageImport,
+    _resolveCSharpUsing,
+};

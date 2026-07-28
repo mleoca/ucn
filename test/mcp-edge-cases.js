@@ -11,6 +11,10 @@
 
 const path = require('path');
 const { McpClient, PROJECT_DIR, TIMEOUT_MS } = require('./helpers');
+// This suite proves protocol and error-handling behavior. The dedicated
+// performance gate owns latency budgets; allow headroom when node --test runs
+// the repository's CPU-heavy suites concurrently.
+const EDGE_TIMEOUT_MS = TIMEOUT_MS * 2;
 
 // ============================================================================
 // Test definitions
@@ -24,13 +28,13 @@ const tests = [
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'about - nonexistent symbol',
-        args: { command: 'about', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'context - nonexistent symbol',
-        args: { command: 'context', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
@@ -42,7 +46,7 @@ const tests = [
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'smart - nonexistent symbol',
-        args: { command: 'smart', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
@@ -54,31 +58,31 @@ const tests = [
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'verify - nonexistent symbol',
-        args: { command: 'verify', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        args: { command: 'check', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'related - nonexistent symbol',
-        args: { command: 'related', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'example - nonexistent symbol',
-        args: { command: 'example', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'fn - nonexistent function',
-        args: { command: 'fn', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_function_xyz' }
+        args: { command: 'source', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_function_xyz' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'class - nonexistent class',
-        args: { command: 'class', project_dir: PROJECT_DIR, name: 'ZzzNonexistentClassXyz' }
+        args: { command: 'source', project_dir: PROJECT_DIR, name: 'ZzzNonexistentClassXyz' }
     },
     {
         category: 'Null/Crash Safety',
@@ -90,31 +94,31 @@ const tests = [
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'typedef - nonexistent type',
-        args: { command: 'typedef', project_dir: PROJECT_DIR, name: 'ZzzNonexistentTypeXyz' }
+        args: { command: 'find', project_dir: PROJECT_DIR, name: 'ZzzNonexistentTypeXyz' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'graph - nonexistent file',
-        args: { command: 'graph', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        args: { command: 'deps', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'file_exports - nonexistent file',
-        args: { command: 'file_exports', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        args: { command: 'api', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'imports - nonexistent file',
-        args: { command: 'imports', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        args: { command: 'deps', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'exporters - nonexistent file',
-        args: { command: 'exporters', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
+        args: { command: 'deps', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js' }
     },
 
     {
@@ -127,13 +131,13 @@ const tests = [
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'lines - nonexistent file',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js', range: '1-10' }
+        args: { command: 'source', project_dir: PROJECT_DIR, file: 'nonexistent/path/to/file.js', range: '1-10' }
     },
     {
         category: 'Null/Crash Safety',
         tool: 'ucn',
         desc: 'expand - no prior context call',
-        args: { command: 'expand', project_dir: PROJECT_DIR, item: 1 }
+        args: { command: 'source', project_dir: PROJECT_DIR, item: 1 }
     },
 
     // ========================================================================
@@ -149,7 +153,7 @@ const tests = [
         category: 'Input Validation',
         tool: 'ucn',
         desc: 'about - name with special chars "foo()"',
-        args: { command: 'about', project_dir: PROJECT_DIR, name: 'foo()' }
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'foo()' }
     },
     {
         category: 'Input Validation',
@@ -173,7 +177,7 @@ const tests = [
         category: 'Input Validation',
         tool: 'ucn',
         desc: 'toc - nonexistent project_dir',
-        args: { command: 'toc', project_dir: '/nonexistent/fake/directory/abc123' }
+        args: { command: 'repo', project_dir: '/nonexistent/fake/directory/abc123' }
     },
     {
         category: 'Input Validation',
@@ -195,7 +199,7 @@ const tests = [
         category: 'Normal Operations',
         tool: 'ucn',
         desc: 'toc - project overview',
-        args: { command: 'toc', project_dir: PROJECT_DIR }
+        args: { command: 'repo', project_dir: PROJECT_DIR }
     },
     {
         category: 'Normal Operations',
@@ -225,13 +229,13 @@ const tests = [
         category: 'Normal Operations',
         tool: 'ucn',
         desc: 'stats - project stats',
-        args: { command: 'stats', project_dir: PROJECT_DIR }
+        args: { command: 'repo', project_dir: PROJECT_DIR }
     },
     {
         category: 'Normal Operations',
         tool: 'ucn',
         desc: 'lines - extract lines 1-5 from discovery.js',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-5' }
+        args: { command: 'source', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-5' }
     },
 
     // ========================================================================
@@ -255,63 +259,63 @@ const tests = [
         category: 'Correctness',
         tool: 'ucn',
         desc: 'smart(nonexistent) returns "not found" message',
-        args: { command: 'smart', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
         assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent smart target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'context(nonexistent) returns "not found" message',
-        args: { command: 'context', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
         assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent context target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'example(nonexistent) returns "no examples" message',
-        args: { command: 'example', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
         assert: (res, text, isError) => (isError && /no.*examples found|not found/i.test(text)) || 'Expected "no examples found" message for nonexistent example target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'related(nonexistent) returns "not found" message',
-        args: { command: 'related', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
+        args: { command: 'show', project_dir: PROJECT_DIR, name: 'zzz_nonexistent_symbol_xyz' },
         assert: (res, text, isError) => (isError && /not found/i.test(text)) || 'Expected "not found" message for nonexistent related target'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'lines(range="5-0") returns validation error for end=0',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '5-0' },
+        args: { command: 'source', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '5-0' },
         assert: (res, text, isError) => (isError && /line numbers must be >= 1/i.test(text)) || 'Expected validation error for end line 0'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'class(max_lines=-1) returns validation error',
-        args: { command: 'class', project_dir: PROJECT_DIR, name: 'ProjectIndex', max_lines: -1 },
+        args: { command: 'source', project_dir: PROJECT_DIR, name: 'ProjectIndex', max_lines: -1 },
         assert: (res, text, isError) => isError === true || 'Expected isError: true for negative max_lines'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'lines - unique partial file resolves successfully',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-3' },
+        args: { command: 'source', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-3' },
         assert: (res, text, isError) => isError === false || 'Expected success for unique partial file'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
-        desc: 'file_exports(file=utils.js) returns ambiguity error',
-        args: { command: 'file_exports', project_dir: PROJECT_DIR, file: 'utils.js' },
-        assert: (res, text, isError) => /ambiguous/i.test(text) || 'Expected file-ambiguous error message for utils.js'
+        desc: 'api(file=utils.js) accepts a basename pattern',
+        args: { command: 'api', project_dir: PROJECT_DIR, file: 'utils.js' },
+        assert: (res, text, isError) => (!isError && /utils\.js/i.test(text)) || 'Expected API results for matching utils.js files'
     },
     {
         category: 'Correctness',
         tool: 'ucn',
         desc: 'imports(file=utils.js) returns ambiguity error',
-        args: { command: 'imports', project_dir: PROJECT_DIR, file: 'utils.js' },
+        args: { command: 'deps', project_dir: PROJECT_DIR, file: 'utils.js' },
         assert: (res, text, isError) => /ambiguous/i.test(text) || 'Expected file-ambiguous error message for utils.js'
     },
 
@@ -322,49 +326,49 @@ const tests = [
         category: 'Security',
         tool: 'ucn',
         desc: 'lines rejects path traversal (../../../../etc/passwd)',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: '../../../../etc/passwd', range: '1-5' },
+        args: { command: 'source', project_dir: PROJECT_DIR, file: '../../../../etc/passwd', range: '1-5' },
         assert: (res, text, isError) => (/not found/i.test(text) || /outside project/i.test(text)) || 'Expected error message for path traversal'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'lines rejects path traversal (../../other-project/secret.js)',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: '../../other-project/secret.js', range: '1-5' },
+        args: { command: 'source', project_dir: PROJECT_DIR, file: '../../other-project/secret.js', range: '1-5' },
         assert: (res, text, isError) => (/not found/i.test(text) || /outside project/i.test(text)) || 'Expected error message for path traversal'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'lines works with valid file',
-        args: { command: 'lines', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-3' },
+        args: { command: 'source', project_dir: PROJECT_DIR, file: 'core/discovery.js', range: '1-3' },
         assert: (res, text, isError) => (!isError && text.length > 0) || 'Expected valid output for core/discovery.js'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'diff_impact rejects --config argument injection',
-        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: '--config=malicious' },
+        args: { command: 'impact', project_dir: PROJECT_DIR, base: '--config=malicious' },
         assert: (res, text, isError) => /invalid git ref/i.test(text) || 'Expected error message for argument injection in base'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'diff_impact rejects -o flag injection',
-        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: '-o /tmp/evil' },
+        args: { command: 'impact', project_dir: PROJECT_DIR, base: '-o /tmp/evil' },
         assert: (res, text, isError) => /invalid git ref/i.test(text) || 'Expected error message for flag injection in base'
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'diff_impact accepts valid ref HEAD~3',
-        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: 'HEAD~3' },
+        args: { command: 'impact', project_dir: PROJECT_DIR, base: 'HEAD~3' },
         assert: (res, text, isError) => true  // Should not error on valid ref format
     },
     {
         category: 'Security',
         tool: 'ucn',
         desc: 'diff_impact accepts valid ref origin/main',
-        args: { command: 'diff_impact', project_dir: PROJECT_DIR, base: 'origin/main' },
+        args: { command: 'impact', project_dir: PROJECT_DIR, base: 'origin/main' },
         assert: (res, text, isError) => true  // Should not error on valid ref format
     },
 ];
@@ -374,7 +378,7 @@ const tests = [
 // ============================================================================
 
 async function run() {
-    const client = new McpClient();
+    const client = new McpClient({ timeoutMs: EDGE_TIMEOUT_MS });
     const results = [];
 
     console.log('Starting MCP server...');
@@ -432,7 +436,7 @@ async function run() {
             const elapsed = Date.now() - startTime;
             if (e.message === 'TIMEOUT') {
                 status = 'FAIL';
-                detail = `TIMEOUT after ${TIMEOUT_MS}ms`;
+                detail = `TIMEOUT after ${EDGE_TIMEOUT_MS}ms`;
             } else {
                 status = 'FAIL';
                 detail = `CRASH: ${e.message} (${elapsed}ms)`;

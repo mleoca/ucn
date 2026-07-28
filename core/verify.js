@@ -5,7 +5,7 @@
  * as the first argument instead of using `this`.
  */
 
-const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits } = require('../languages');
+const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits } = require('../languages');
 const { escapeRegExp, codeUnitCompare } = require('./shared');
 
 // ============================================================================
@@ -711,7 +711,7 @@ function analyzeCallSite(index, call, funcName, occurrence = 0) {
             const content = index._readFile(call.file);
             // HTML files need special handling: parse script blocks as JS
             if (language === 'html') {
-                const htmlModule = getLanguageModule('html');
+                const htmlModule = getLanguageAdapter('html');
                 const htmlParser = getParser('html');
                 const jsParser = getParser('javascript');
                 if (!htmlParser || !jsParser) return { args: null, argCount: 0 };
@@ -809,7 +809,7 @@ function analyzeCallShape(index, filePath, lineNum, funcName) {
         if (!tree) {
             const content = index._readFile(filePath);
             if (language === 'html') {
-                const htmlModule = getLanguageModule('html');
+                const htmlModule = getLanguageAdapter('html');
                 const htmlParser = getParser('html');
                 const jsParser = getParser('javascript');
                 if (!htmlParser || !jsParser) return null;

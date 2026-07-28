@@ -153,6 +153,44 @@ module.exports = { parse };
         }
     });
 
+    it('classifies unshadowed builtin-global methods away from project targets', () => {
+        const dir = tmp({
+            'parser.js': [
+                'export function parse(code) { return code; }',
+                'export function load(code) { return JSON.parse(code); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('parse');
+            assert.equal(result.callers.length, 0);
+            assert.equal(result.unverifiedCallers.length, 0);
+            assert.equal(result.meta.account.excluded.byReason['external-package'].count, 1);
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
+    it('keeps an explicitly reassigned builtin member visible', () => {
+        const dir = tmp({
+            'parser.js': [
+                'export function parse(code) { return code; }',
+                'JSON.parse = parse;',
+                'export function load(code) { return JSON.parse(code); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = index.context('parse');
+            assert.ok(result.callers.some(call => call.line === 2));
+            assert.ok(result.unverifiedCallers.some(call => call.line === 3));
+            assert.equal(result.meta.account.conserved, true);
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('should not include path.parse when searching for parse', () => {
         const tmpDir = path.join(require('os').tmpdir(), `ucn-test-path-${Date.now()}`);
         fs.mkdirSync(tmpDir, { recursive: true });
@@ -1059,12 +1097,12 @@ describe('Regression: lines command should validate input', () => {
         const content = fs.readFileSync(fixtureFile, 'utf-8');
         const lineCount = content.split('\n').length;
 
-        // Run UCN with lines command that exceeds file length
+        // Run UCN with source's explicit line range beyond the file length.
         const { execSync } = require('child_process');
         const ucnPath = path.join(PROJECT_DIR, 'ucn.js');
 
         try {
-            execSync(`node ${ucnPath} ${fixtureFile} lines ${lineCount + 100}-${lineCount + 200}`, {
+            execSync(`node ${ucnPath} ${fixtureFile} source --range=${lineCount + 100}-${lineCount + 200}`, {
                 encoding: 'utf8',
                 stdio: ['pipe', 'pipe', 'pipe']
             });
@@ -1080,7 +1118,7 @@ describe('Regression: lines command should validate input', () => {
         const ucnPath = path.join(PROJECT_DIR, 'ucn.js');
 
         // Reversed range should work (10-5 should become 5-10)
-        const output = execSync(`node ${ucnPath} ${fixtureFile} lines 10-5`, {
+        const output = execSync(`node ${ucnPath} ${fixtureFile} source --range=10-5`, {
             encoding: 'utf8'
         });
 
@@ -1094,7 +1132,7 @@ describe('Regression: lines command should validate input', () => {
         const ucnPath = path.join(PROJECT_DIR, 'ucn.js');
 
         try {
-            execSync(`node ${ucnPath} ${fixtureFile} lines abc-def`, {
+            execSync(`node ${ucnPath} ${fixtureFile} source --range=abc-def`, {
                 encoding: 'utf8',
                 stdio: ['pipe', 'pipe', 'pipe']
             });
@@ -2998,9 +3036,9 @@ describe('fix #115: verify handles JS destructured params', () => {
 
 describe('Bug Hunt: JS export default function/class type', () => {
     it('should classify export default function as type "default"', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('javascript');
-        const jsMod = getLanguageModule('javascript');
+        const jsMod = getLanguageAdapter('javascript');
         const code = 'export default function processData() { return 42; }';
         const exports = jsMod.findExportsInCode(code, parser);
         assert.ok(exports.length === 1, 'should have 1 export');
@@ -3009,9 +3047,9 @@ describe('Bug Hunt: JS export default function/class type', () => {
     });
 
     it('should classify export default class as type "default"', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('javascript');
-        const jsMod = getLanguageModule('javascript');
+        const jsMod = getLanguageAdapter('javascript');
         const code = 'export default class MyClass { }';
         const exports = jsMod.findExportsInCode(code, parser);
         assert.ok(exports.length === 1, 'should have 1 export');
@@ -3020,9 +3058,9 @@ describe('Bug Hunt: JS export default function/class type', () => {
     });
 
     it('should still classify regular export function as type "named"', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('javascript');
-        const jsMod = getLanguageModule('javascript');
+        const jsMod = getLanguageAdapter('javascript');
         const code = 'export function processData() { return 42; }';
         const exports = jsMod.findExportsInCode(code, parser);
         assert.strictEqual(exports[0].type, 'named');
@@ -3035,9 +3073,9 @@ describe('Bug Hunt: JS export default function/class type', () => {
 
 describe('Bug Hunt: HTML usages include event handler attributes', () => {
     it('should detect function calls in onclick/onload attributes', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('html');
-        const htmlMod = getLanguageModule('html');
+        const htmlMod = getLanguageAdapter('html');
         const code = `<!DOCTYPE html>
 <html>
 <head><script>
@@ -3110,9 +3148,9 @@ export function helper() {}
 
 describe('Bug Hunt: HTML handler usages include column field', () => {
     it('should include column in handler usage results', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('html');
-        const htmlMod = getLanguageModule('html');
+        const htmlMod = getLanguageAdapter('html');
         const code = `<html><body>
 <button onclick="handleClick()">Click</button>
 </body></html>`;
@@ -5136,6 +5174,55 @@ describe('fix #197: package self-reference imports resolve via exports map', () 
         } finally { rm(dir); }
     });
 
+    it('falls back to the package source entry when exported build artifacts are absent', () => {
+        const dir = tmp({
+            'package.json': JSON.stringify({
+                name: '@scope/mypkg',
+                source: 'src/index.ts',
+                exports: {
+                    '.': {
+                        types: './dist/index.d.ts',
+                        import: './dist/index.mjs',
+                        require: './dist/index.js',
+                    },
+                },
+            }),
+            'src/index.ts': [
+                'export class Signal { peek(): number { return 1; } }',
+                'export interface ReadonlySignal { peek(): number; }',
+                'export class Computed extends Signal {}',
+                'export function signal(): Signal { return new Signal(); }',
+                'export function computed(): ReadonlySignal { return new Computed(); }',
+            ].join('\n'),
+            'test/use.test.ts': [
+                'import { signal, computed } from "@scope/mypkg";',
+                'export function use(): number { const s = signal(); return s.peek(); }',
+                'export function nested(): () => number { const s = signal(); return () => s.peek(); }',
+                'export function runtimeConcrete(): number { const c = computed(); return c.peek(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const testFile = [...index.files.keys()].find(file =>
+                file.endsWith('test/use.test.ts'));
+            assert.ok(testFile);
+            assert.strictEqual(
+                index.files.get(testFile).moduleResolved['@scope/mypkg'],
+                'src/index.ts');
+            const result = execute(index, 'context', { name: 'src/index.ts:1:peek' });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            assert.ok((result.result.callers || []).some(call =>
+                call.relativePath === 'test/use.test.ts' && call.line === 2),
+            JSON.stringify(result.result));
+            assert.ok((result.result.callers || []).some(call =>
+                call.relativePath === 'test/use.test.ts' && call.line === 3),
+            JSON.stringify(result.result));
+            assert.ok((result.result.callers || []).some(call =>
+                call.relativePath === 'test/use.test.ts' && call.line === 4),
+            JSON.stringify(result.result));
+        } finally { rm(dir); }
+    });
+
     it('deep re-export chains keep renamed-surface callers visible (never silently missing)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
@@ -6382,6 +6469,32 @@ describe('fix #219: structural declared-field receiver hop (TS)', () => {
         } finally { rm(dir); }
     });
 
+    it('object type-alias fields participate in declared-field receiver hops', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'svc.ts': [
+                'export class Signal {',
+                '  _unsubscribe(): void {}',
+                '}',
+                'type Node = { _source: Signal };',
+                'export function cleanup(node: Node) { node._source._unsubscribe(); }',
+                'export function inherited(node: Node) { Signal.prototype._unsubscribe.call(node._source); }',
+                'class Other { _unsubscribe(): void {} }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const ctx = contextOf(index, 'svc.ts:2:_unsubscribe');
+            assert.ok(ctx.confirmed.includes('svc.ts:5'),
+                `Node._source: Signal must confirm the exact owner: ${ctx.confirmed}`);
+            assert.ok(ctx.confirmed.includes('svc.ts:6'),
+                `explicit Signal.prototype binding must confirm the exact owner: ${ctx.confirmed}`);
+            const field = (index.symbols.get('_source') || [])
+                .find(symbol => symbol.className === 'Node');
+            assert.strictEqual(field?.fieldType, 'Signal');
+        } finally { rm(dir); }
+    });
+
     it('field typed as the TARGET class confirms (this.svc.run)', () => {
         const dir = tmp({
             'package.json': '{"name":"t"}',
@@ -6908,10 +7021,10 @@ module.exports = { cb, Holder };
 });
 
 describe('fix #232 (JS/TS): builtin-global receivers and optional-chaining receiver evidence', () => {
-    it('console.log routes possible-dispatch, never confirms via single-owner', () => {
+    it('unshadowed console.log is classified as external, never a project caller', () => {
         // Campaign G1-ts BUG-1: console.log() confirmed scope-match against a
         // private Logger.log — its single project-wide owner. console names a
-        // HOST object; demote-only (window.fn = projectFn is a real pattern).
+        // host object unless shadowed or its member is explicitly reassigned.
         const dir = tmp({
             'package.json': '{"name":"t"}',
             'logger.ts': 'export class Logger {\n  private log(msg: string): void {}\n  info(msg: string): void { this.log(msg); }\n}\n',
@@ -6923,10 +7036,12 @@ describe('fix #232 (JS/TS): builtin-global receivers and optional-chaining recei
             assert.ok(r.ok, `context failed: ${r.error}`);
             assert.ok(!r.result.callers.some(c => c.relativePath === 'main.ts'),
                 'console.log must not be a confirmed caller of Logger.log');
-            const unv = (r.result.unverifiedCallers || []).find(u => u.relativePath === 'main.ts');
-            assert.ok(unv, 'console.log stays visible in the unverified band');
-            assert.ok((unv.dispatchVia || '').includes('console'),
-                `attribution names the builtin global: ${JSON.stringify(unv)}`);
+            assert.ok(!(r.result.unverifiedCallers || [])
+                .some(u => u.relativePath === 'main.ts'));
+            assert.strictEqual(
+                r.result.meta.account.excluded.byReason['external-package'].count,
+                1);
+            assert.ok(r.result.meta.account.conserved);
         } finally { rm(dir); }
     });
 
@@ -8231,7 +8346,7 @@ describe('fix #271 (JS/TS): parser recovery and indirect receiver ownership', ()
         const languages = require('../languages');
         const parser = languages.getParser('typescript');
         const tree = parser.parse(source);
-        const calls = languages.getLanguageModule('typescript').findCallsInCode(source, parser);
+        const calls = languages.getLanguageAdapter('typescript').findCallsInCode(source, parser);
         assert.strictEqual(tree.rootNode.hasError, true);
         assert.ok(calls.some(c => c.name === 'Hono' && c.isConstructor && c.parseRecovery),
             `constructor must survive parser recovery (tree hasError=${tree.rootNode.hasError}): ${JSON.stringify(calls)}`);
@@ -8418,7 +8533,7 @@ describe('fix #272: declaration recovery and reference-complete usages', () => {
     it('records awaited generic TypeScript method calls', () => {
         const languages = require('../languages');
         const parser = languages.getParser('typescript');
-        const mod = languages.getLanguageModule('typescript');
+        const mod = languages.getLanguageAdapter('typescript');
         const source = [
             'declare const request: RequestApi',
             'async function load() {',
@@ -8737,6 +8852,78 @@ describe('fix #277c: nested destructured arrow params are locals, not callbacks'
             assert.ok((callers.accountRaw?.excludedEntries || []).some(e =>
                 e.line === 2 && e.reason === 'local-shadow'),
             `destructured param excludes as local-shadow: ${JSON.stringify(callers.accountRaw?.excludedEntries)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('v5 module and lexical ownership regressions', () => {
+    it('resolves an inline require namespace call in both graph directions', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'lib.js': [
+                'function target(value) { return value; }',
+                'module.exports = { target };',
+            ].join('\n'),
+            'app.js': [
+                'function run() {',
+                '  return require("./lib").target(1);',
+                '}',
+                'module.exports = { run };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('target')[0];
+            const callers = index.findCallers('target', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.relativePath === 'app.js' && c.line === 2),
+                `inline require is exact module evidence: ${JSON.stringify({
+                    confirmed: callers,
+                    unverified: callers.unverifiedEntries,
+                    excluded: callers.accountRaw?.excludedEntries,
+                })}`);
+
+            const run = index.symbols.get('run')[0];
+            const callees = index.findCallees(run, {
+                collectAccount: true, includeMethods: true,
+            });
+            assert.ok(callees.some(c => c.name === 'target'),
+                `callee direction preserves inline require ownership: ${JSON.stringify(callees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('pins duplicate nested helper declarations to their lexical owner', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'scope.test.js': [
+                'const first = () => {',
+                '  function contract() { return 1; }',
+                '  function use() { return contract(); }',
+                '  return use();',
+                '};',
+                'const second = () => {',
+                '  function contract() { return 2; }',
+                '  function use() { return contract(); }',
+                '  return use();',
+                '};',
+                'module.exports = { first, second };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('contract')
+                .find(d => d.startLine === 2);
+            const callers = index.findCallers('contract', {
+                targetDefinitions: [target], collectAccount: true,
+            });
+            assert.deepStrictEqual(
+                callers.map(c => `${c.relativePath}:${c.line}`),
+                ['scope.test.js:3'],
+            );
+            assert.ok((callers.accountRaw?.excludedEntries || []).some(e =>
+                e.line === 8 && e.reason === 'other-definition'),
+            `sibling lexical helper is excluded: ${JSON.stringify(callers.accountRaw?.excludedEntries)}`);
         } finally { rm(dir); }
     });
 });

@@ -100,6 +100,43 @@ const LANG_FIXTURES = {
             `mod lib;\n\nfn main() {\n    lib::${used}();\n}`,
         entryPoint: () => ({ name: 'main', code: 'fn main() {}' }),
     },
+    c: {
+        manifest: { 'CMakeLists.txt': 'project(fixture C)' },
+        function: name => `int ${name}(void) { return 1; }`,
+        caller: (fnName, callerName) =>
+            `int ${fnName}(void);\nint ${callerName}(void) { return ${fnName}(); }`,
+        unusedAndUsed: (unused, used) =>
+            `void ${unused}(void) {}\nvoid ${used}(void) {}`,
+        mainCaller: used =>
+            `void ${used}(void);\nint main(void) { ${used}(); return 0; }`,
+        entryPoint: () => ({ name: 'main', code: 'int main(void) { return 0; }' }),
+    },
+    cpp: {
+        manifest: { 'CMakeLists.txt': 'project(fixture CXX)' },
+        function: name => `int ${name}() { return 1; }`,
+        caller: (fnName, callerName) =>
+            `int ${fnName}();\nint ${callerName}() { return ${fnName}(); }`,
+        unusedAndUsed: (unused, used) =>
+            `void ${unused}() {}\nvoid ${used}() {}`,
+        mainCaller: used =>
+            `void ${used}();\nint main() { ${used}(); return 0; }`,
+        entryPoint: () => ({ name: 'main', code: 'int main() { return 0; }' }),
+    },
+    csharp: {
+        manifest: { 'fixture.csproj': '<Project Sdk="Microsoft.NET.Sdk" />' },
+        function: name =>
+            `public static class Lib { public static int ${name}() { return 1; } }`,
+        caller: (fnName, callerName) =>
+            `public static class App { public static int ${callerName}() { return Lib.${fnName}(); } }`,
+        unusedAndUsed: (unused, used) =>
+            `public static class Lib { public static void ${unused}() {} public static void ${used}() {} }`,
+        mainCaller: used =>
+            `public static class MainClass { public static void Main() { Lib.${used}(); } }`,
+        entryPoint: () => ({
+            name: 'Main',
+            code: 'public static class Program { public static void Main() {} }',
+        }),
+    },
 };
 
 // ── Test suites ────────────────────────────────────────────────────────────
@@ -284,8 +321,8 @@ describe('Cross-language: context returns callers', () => {
 describe('Cross-language: isEntryPoint exported from language modules', () => {
     forEachLanguage((lang) => {
         it(`${lang}: language module exports isEntryPoint`, () => {
-            const { getLanguageModule } = require('../languages');
-            const langModule = getLanguageModule(lang);
+            const { getLanguageAdapter } = require('../languages');
+            const langModule = getLanguageAdapter(lang);
             assert.ok(typeof langModule.isEntryPoint === 'function',
                 `${lang}: language module should export isEntryPoint()`);
         });
@@ -299,15 +336,15 @@ describe('Cross-language: isEntryPoint exported from language modules', () => {
 describe('Cross-language: getEntryPointKind exported and consistent with isEntryPoint', () => {
     forEachLanguage((lang) => {
         it(`${lang}: language module exports getEntryPointKind`, () => {
-            const { getLanguageModule } = require('../languages');
-            const langModule = getLanguageModule(lang);
+            const { getLanguageAdapter } = require('../languages');
+            const langModule = getLanguageAdapter(lang);
             assert.ok(typeof langModule.getEntryPointKind === 'function',
                 `${lang}: language module should export getEntryPointKind()`);
         });
 
         it(`${lang}: getEntryPointKind returns 'test' | 'main' | 'framework' | null`, () => {
-            const { getLanguageModule } = require('../languages');
-            const langModule = getLanguageModule(lang);
+            const { getLanguageAdapter } = require('../languages');
+            const langModule = getLanguageAdapter(lang);
             const ALLOWED = new Set(['test', 'main', 'framework', null]);
             // Probe across realistic shapes — at least every return must be in ALLOWED.
             const probes = [
@@ -331,8 +368,8 @@ describe('Cross-language: getEntryPointKind exported and consistent with isEntry
         });
 
         it(`${lang}: isEntryPoint and getEntryPointKind agree`, () => {
-            const { getLanguageModule } = require('../languages');
-            const langModule = getLanguageModule(lang);
+            const { getLanguageAdapter } = require('../languages');
+            const langModule = getLanguageAdapter(lang);
             const probes = [
                 { name: 'main', modifiers: ['public', 'static'] },
                 { name: 'main', modifiers: [] },
@@ -393,8 +430,8 @@ describe('Cross-language: getEntryPointKind returns kind="test" for canonical te
     forEachLanguage((lang) => {
         const langCases = cases[lang];
         if (!langCases) return;
-        const { getLanguageModule } = require('../languages');
-        const langModule = getLanguageModule(lang);
+        const { getLanguageAdapter } = require('../languages');
+        const langModule = getLanguageAdapter(lang);
         for (const c of langCases) {
             it(`${lang}: ${JSON.stringify(c.input)} -> kind=${c.kind}`, () => {
                 assert.strictEqual(
@@ -640,5 +677,45 @@ describe('Cross-language: callee account conserves on every fixture symbol', () 
             }
             assert.ok(checked > 0, `${lang}: no defs checked`);
         });
+    });
+});
+
+describe('Cross-language: direct-call runtime boundaries', () => {
+    it('excludes same-spelled calls from unrelated languages instead of calling them unverified', () => {
+        const dir = tmp({
+            'package.json': '{"name":"polyglot"}',
+            'pyproject.toml': '[project]\nname = "polyglot"\nversion = "0.0.1"\n',
+            'service.py': [
+                'class Service:',
+                '    def get(self):',
+                '        return 1',
+                'def use(service: Service):',
+                '    return service.get()',
+            ].join('\n'),
+            'client.js': [
+                'function run(map) {',
+                '  return map.get("key");',
+                '}',
+                'module.exports = { run };',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('get')
+                .find(def => def.relativePath === 'service.py');
+            const callers = index.findCallers('get', {
+                targetDefinitions: [target],
+                includeMethods: true,
+                collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.relativePath === 'service.py' && c.line === 5));
+            assert.ok(!(callers.unverifiedEntries || []).some(c =>
+                c.relativePath === 'client.js'),
+            `cross-runtime calls must not be unverified: ${JSON.stringify(callers.unverifiedEntries)}`);
+            assert.ok((callers.accountRaw?.excludedEntries || []).some(e =>
+                e.file.endsWith('client.js') && e.line === 2 &&
+                e.reason === 'language-boundary'),
+            `cross-runtime text hit is explained: ${JSON.stringify(callers.accountRaw?.excludedEntries)}`);
+        } finally { rm(dir); }
     });
 });

@@ -878,6 +878,35 @@ function findCallsInCode(code, parser) {
     const functionStack = [];  // Stack of { name, startLine, endLine }
     // Track variable -> type mappings per function scope (scopeStartLine -> Map<varName, typeName>)
     const scopeTypes = new Map();
+    const scopeRawTypes = new Map();
+    const scopeTypeQualifiers = new Map();
+    // Preserve import ownership in nested-call argument kinds. A simple
+    // `Method.getReturnType()` marker is not enough to distinguish
+    // java.lang.reflect.Method from a project class with the same name.
+    const importedTypeNames = new Map();
+    const localMethodReturnTypes = new Map();
+    traverseTreeCached(tree.rootNode, (node) => {
+        if (node.type === 'import_declaration') {
+            const spec = String(node.text || '')
+                .replace(/^import\s+/, '')
+                .replace(/^static\s+/, '')
+                .replace(/;\s*$/, '')
+                .trim();
+            if (!spec || spec.endsWith('.*')) return true;
+            const simple = spec.split('.').pop();
+            if (simple) importedTypeNames.set(simple, spec);
+        } else if (node.type === 'method_declaration') {
+            const name = node.childForFieldName('name')?.text;
+            const result = node.childForFieldName('type')?.text;
+            if (name && result) {
+                if (!localMethodReturnTypes.has(name)) {
+                    localMethodReturnTypes.set(name, new Set());
+                }
+                localMethodReturnTypes.get(name).add(result);
+            }
+        }
+        return true;
+    });
 
     // Helper: extract first string-arg literal from a method_invocation node.
     // Used by route extraction to capture path arg of webClient.uri("/users") etc.
@@ -897,6 +926,10 @@ function findCallsInCode(code, parser) {
     const isFunctionNode = (node) => {
         return ['method_declaration', 'constructor_declaration', 'lambda_expression'].includes(node.type);
     };
+    const JAVA_TYPE_DECLARATIONS = new Set([
+        'class_declaration', 'interface_declaration',
+        'enum_declaration', 'record_declaration',
+    ]);
 
     // Extract type name from a Java type node (strips generics, qualified names)
     const extractTypeName = (typeNode) => {
@@ -920,10 +953,69 @@ function findCallsInCode(code, parser) {
         }
         return null;
     };
+    // A bare nested type is resolved through its lexical owner:
+    // `JavaFile(Builder b)` inside JavaFile means JavaFile.Builder, and
+    // `Builder copy(Builder b)` inside JavaFile.Builder means the same nested
+    // type. Preserve that owner just as an explicit `JavaFile.Builder`
+    // annotation does; flattening all of them to `Builder` conflates every
+    // builder class in a package.
+    const lexicalNestedTypeOwner = (node, typeName) => {
+        if (!node || !typeName) return null;
+        const enclosingTypes = [];
+        for (let p = node.parent; p; p = p.parent) {
+            if (JAVA_TYPE_DECLARATIONS.has(p.type)) enclosingTypes.push(p);
+        }
+        for (let i = 0; i < enclosingTypes.length; i++) {
+            const owner = enclosingTypes[i];
+            const ownerName = owner.childForFieldName('name')?.text;
+            if (!ownerName) continue;
+            if (ownerName === typeName) {
+                return enclosingTypes[i + 1]?.childForFieldName('name')?.text || null;
+            }
+            const body = owner.childForFieldName('body');
+            if (!body) continue;
+            for (let j = 0; j < body.namedChildCount; j++) {
+                const child = body.namedChild(j);
+                if (JAVA_TYPE_DECLARATIONS.has(child.type) &&
+                    child.childForFieldName('name')?.text === typeName) {
+                    return ownerName;
+                }
+            }
+        }
+        return null;
+    };
+    const extractTypeQualifier = (typeNode) => {
+        if (!typeNode) return null;
+        const text = String(typeNode.text || '').replace(/<.*$/, '');
+        const parts = text.split('.');
+        if (parts.length >= 2) {
+            const qualifier = parts[parts.length - 2];
+            // A capitalized penultimate segment is a nested owner
+            // (Outer.Builder). Lowercase segments are packages and do not
+            // distinguish same-named top-level types by themselves.
+            if (/^[A-Z]/.test(qualifier)) return qualifier;
+        }
+        return lexicalNestedTypeOwner(typeNode, extractTypeName(typeNode));
+    };
+    const qualifyTypeName = (text) => {
+        const raw = String(text || '').trim()
+            .replace(/^\?\s+extends\s+/, '')
+            .replace(/^\?\s+super\s+/, '');
+        const base = raw.replace(/<.*$/s, '').replace(/\[\]$/, '').trim();
+        if (!base) return null;
+        if (base.includes('.')) return base;
+        if (importedTypeNames.has(base)) return importedTypeNames.get(base);
+        if (['Class', 'Enum', 'Object', 'String', 'Throwable'].includes(base)) {
+            return `java.lang.${base}`;
+        }
+        return base;
+    };
 
     // Build type map from method/constructor parameters
     const buildScopeTypeMap = (node) => {
         const typeMap = new Map();
+        const rawTypeMap = new Map();
+        const qualifierMap = new Map();
         const paramsNode = node.childForFieldName('parameters');
         if (paramsNode) {
             for (let i = 0; i < paramsNode.namedChildCount; i++) {
@@ -934,11 +1026,14 @@ function findCallsInCode(code, parser) {
                     const typeName = extractTypeName(typeNode);
                     if (nameNode && typeName) {
                         typeMap.set(nameNode.text, typeName);
+                        rawTypeMap.set(nameNode.text, typeNode.text);
+                        const qualifier = extractTypeQualifier(typeNode);
+                        if (qualifier) qualifierMap.set(nameNode.text, qualifier);
                     }
                 }
             }
         }
-        return typeMap;
+        return { typeMap, rawTypeMap, qualifierMap };
     };
 
     // Helper to extract function name from a function node
@@ -969,6 +1064,20 @@ function findCallsInCode(code, parser) {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return typeMap.get(varName);
+        }
+        return undefined;
+    };
+    const getReceiverRawType = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeRawTypes.get(functionStack[i].startLine);
+            if (typeMap?.has(varName)) return typeMap.get(varName);
+        }
+        return undefined;
+    };
+    const getReceiverTypeQualifier = (varName) => {
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const qualifierMap = scopeTypeQualifiers.get(functionStack[i].startLine);
+            if (qualifierMap?.has(varName)) return qualifierMap.get(varName);
         }
         return undefined;
     };
@@ -1046,6 +1155,45 @@ function findCallsInCode(code, parser) {
         }
         return undefined;
     };
+    const hasEnclosingField = (n, name) => {
+        for (let p = n.parent; p; p = p.parent) {
+            if (p.type !== 'class_declaration' && p.type !== 'interface_declaration' &&
+                p.type !== 'enum_declaration' && p.type !== 'record_declaration') continue;
+            const body = p.childForFieldName('body');
+            if (!body) return false;
+            for (let i = 0; i < body.namedChildCount; i++) {
+                const child = body.namedChild(i);
+                if (child.type !== 'field_declaration') continue;
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const decl = child.namedChild(j);
+                    if (decl.type === 'variable_declarator' &&
+                        decl.childForFieldName('name')?.text === name) return true;
+                }
+            }
+            return false;
+        }
+        return false;
+    };
+    const enclosingFieldTypeNode = (n, name) => {
+        for (let p = n.parent; p; p = p.parent) {
+            if (!JAVA_TYPE_DECLARATIONS.has(p.type)) continue;
+            const body = p.childForFieldName('body');
+            if (!body) return null;
+            for (let i = 0; i < body.namedChildCount; i++) {
+                const child = body.namedChild(i);
+                if (child.type !== 'field_declaration') continue;
+                for (let j = 0; j < child.namedChildCount; j++) {
+                    const decl = child.namedChild(j);
+                    if (decl.type === 'variable_declarator' &&
+                        decl.childForFieldName('name')?.text === name) {
+                        return child.childForFieldName('type') || null;
+                    }
+                }
+            }
+            return null;
+        }
+        return null;
+    };
 
     // Call-site argument shape: count + per-arg static kind. Kinds feed the
     // overload discipline in findCallers (Java is the only supported language
@@ -1059,6 +1207,39 @@ function findCallsInCode(code, parser) {
         const d = t.lastIndexOf('.');
         if (d >= 0) t = t.substring(d + 1);
         return t.trim();
+    };
+    const methodCallPathOf = (node) => {
+        if (node?.type !== 'method_invocation') return null;
+        const method = node.childForFieldName('name')?.text;
+        if (!method) return null;
+        let ownerNode = node.childForFieldName('object');
+        if (!ownerNode) {
+            const owner = findEnclosingClassName(node);
+            return owner ? { owner, methods: [method] } : null;
+        }
+        while (ownerNode?.type === 'parenthesized_expression' &&
+            ownerNode.namedChildCount === 1) {
+            ownerNode = ownerNode.namedChild(0);
+        }
+        if (ownerNode?.type === 'method_invocation') {
+            const parent = methodCallPathOf(ownerNode);
+            return parent
+                ? { owner: parent.owner, methods: [...parent.methods, method] }
+                : null;
+        }
+        let ownerType = null;
+        if (ownerNode?.type === 'identifier') {
+            ownerType = getReceiverRawType(ownerNode.text) ||
+                getReceiverType(ownerNode.text) ||
+                (/^[A-Z]/.test(ownerNode.text) ? ownerNode.text : null);
+        } else if (ownerNode?.type === 'cast_expression') {
+            ownerType = ownerNode.childForFieldName('type')?.text;
+        } else if (ownerNode?.type === 'object_creation_expression') {
+            ownerType = ownerNode.childForFieldName('type')?.text;
+        }
+        return ownerType
+            ? { owner: qualifyTypeName(ownerType), methods: [method] }
+            : null;
     };
     const argKindOf = (arg) => {
         switch (arg.type) {
@@ -1077,33 +1258,151 @@ function findCallsInCode(code, parser) {
             case 'null_literal': return 'null';
             case 'object_creation_expression': {
                 const tn = arg.childForFieldName('type');
-                return tn ? `new:${bareTypeName(tn.text)}` : 'expr';
+                return tn ? `new:${qualifyTypeName(tn.text)}` : 'expr';
             }
             case 'cast_expression': {
                 const tn = arg.childForFieldName('type');
-                return tn ? `cast:${bareTypeName(tn.text)}` : 'expr';
+                return tn ? `cast:${qualifyTypeName(tn.text)}` : 'expr';
             }
             case 'class_literal': {
                 const tn = arg.namedChild(0);
                 return tn ? `class:${bareTypeName(tn.text)}` : 'class:Object';
             }
             case 'identifier': {
-                const typeName = getReceiverType(arg.text);
-                return typeName ? `type:${bareTypeName(typeName)}` : 'expr';
+                const fieldType = !isDeclaredLocal(arg.text)
+                    ? enclosingFieldTypeNode(arg, arg.text) : null;
+                const typeName = getReceiverType(arg.text) ||
+                    extractTypeName(fieldType);
+                const rawType = getReceiverRawType(arg.text) ||
+                    fieldType?.text;
+                return typeName
+                    ? `type:${qualifyTypeName(rawType || typeName)}`
+                    : 'expr';
+            }
+            case 'field_access': {
+                // A class-qualified static field has a compiler-visible
+                // declared type (`TypeName.DOUBLE` is TypeName). Preserve
+                // owner + field identity in the call IR and resolve the
+                // declaration from the project index at query time. Do not
+                // flatten it to the owner's type: the field may hold any
+                // declared value type.
+                const ownerNode = arg.childForFieldName('object');
+                const fieldNode = arg.childForFieldName('field');
+                if (!ownerNode || !fieldNode) return 'expr';
+                let ownerType = null;
+                if (ownerNode.type === 'identifier') {
+                    ownerType = getReceiverRawType(ownerNode.text) ||
+                        getReceiverType(ownerNode.text) ||
+                        (/^[A-Z]/.test(ownerNode.text) ? ownerNode.text : null);
+                } else if (ownerNode.type === 'field_access' ||
+                    ownerNode.type === 'scoped_identifier') {
+                    ownerType = ownerNode.text;
+                }
+                const qualifiedOwner = ownerType && qualifyTypeName(ownerType);
+                return qualifiedOwner
+                    ? `field:${qualifiedOwner}:${fieldNode.text}`
+                    : 'expr';
             }
             case 'method_invocation': {
                 // Preserve compiler-visible producer ownership for nested
-                // static factories: build(CodeBlock.of(...)) can select a
-                // CodeBlock overload without guessing from the method name.
+                // factories and helpers. Imported owners stay qualified so
+                // platform contracts cannot be confused with project types
+                // that share a simple name.
                 const ownerNode = arg.childForFieldName('object');
                 const methodNode = arg.childForFieldName('name');
-                if (ownerNode?.type === 'identifier' && methodNode) {
-                    const ownerType = getReceiverType(ownerNode.text) ||
-                        (/^[A-Z]/.test(ownerNode.text) ? ownerNode.text : null);
-                    if (ownerType) return `call:${bareTypeName(ownerType)}:${methodNode.text}`;
+                if (!methodNode) return 'expr';
+                if (!ownerNode) {
+                    const owner = findEnclosingClassName(arg);
+                    return owner ? `call:${owner}:${methodNode.text}` : 'expr';
+                }
+                let normalizedOwner = ownerNode;
+                while (normalizedOwner?.type === 'parenthesized_expression' &&
+                    normalizedOwner.namedChildCount === 1) {
+                    normalizedOwner = normalizedOwner.namedChild(0);
+                }
+                let ownerType = null;
+                let ownerRawType = null;
+                if (normalizedOwner?.type === 'identifier') {
+                    ownerType = getReceiverType(normalizedOwner.text) ||
+                        (/^[A-Z]/.test(normalizedOwner.text) ? normalizedOwner.text : null);
+                    ownerRawType = getReceiverRawType(normalizedOwner.text);
+                } else if (normalizedOwner?.type === 'cast_expression') {
+                    const typeNode = normalizedOwner.childForFieldName('type');
+                    ownerType = extractTypeName(typeNode);
+                    ownerRawType = typeNode?.text;
+                } else if (normalizedOwner?.type === 'object_creation_expression') {
+                    const typeNode = normalizedOwner.childForFieldName('type');
+                    ownerType = extractTypeName(typeNode);
+                    ownerRawType = typeNode?.text;
+                } else if (normalizedOwner?.type === 'method_invocation') {
+                    const producerName = normalizedOwner.childForFieldName('name')?.text;
+                    const producerObject = normalizedOwner.childForFieldName('object');
+                    if (producerName && !producerObject) {
+                        const returns = localMethodReturnTypes.get(producerName);
+                        if (returns?.size === 1) {
+                            ownerRawType = [...returns][0];
+                            ownerType = bareTypeName(ownerRawType);
+                        }
+                    }
+                    if (!ownerType) {
+                        const producerKind = argKindOf(normalizedOwner);
+                        if (producerKind.startsWith('type:')) {
+                            ownerType = producerKind.slice('type:'.length);
+                            ownerRawType = ownerType;
+                        }
+                    }
+                }
+                // Generic container access has a source-declared result type:
+                // List<T>.get(i) -> T, Map<K,V>.get(k) -> V. Wildcard
+                // `? extends T` is safe in value position; `? super T` is not.
+                if (methodNode.text === 'get' && ownerRawType?.includes('<')) {
+                    const generic = ownerRawType.slice(
+                        ownerRawType.indexOf('<') + 1,
+                        ownerRawType.lastIndexOf('>'));
+                    const args = [];
+                    let start = 0;
+                    let depth = 0;
+                    for (let i = 0; i <= generic.length; i++) {
+                        const ch = generic[i];
+                        if (ch === '<') depth++;
+                        else if (ch === '>') depth--;
+                        else if ((ch === ',' || i === generic.length) && depth === 0) {
+                            args.push(generic.slice(start, i).trim());
+                            start = i + 1;
+                        }
+                    }
+                    const base = bareTypeName(ownerRawType);
+                    const picked = base === 'Map' ? args[1] : args[0];
+                    if (picked && !/^\?\s+super\b/.test(picked)) {
+                        const valueType = picked.replace(/^\?\s+extends\s+/, '').trim();
+                        if (valueType && valueType !== '?') {
+                            return `type:${qualifyTypeName(valueType)}`;
+                        }
+                    }
+                }
+                if (ownerType) {
+                    return `call:${qualifyTypeName(ownerRawType || ownerType)}:${methodNode.text}`;
+                }
+                const path = methodCallPathOf(arg);
+                if (path?.methods.length > 1) {
+                    return `chain:${path.owner}#${path.methods.join('#')}`;
                 }
                 return 'expr';
             }
+            case 'array_access': {
+                const arrayNode = arg.childForFieldName('array') || arg.namedChild(0);
+                if (!arrayNode) return 'expr';
+                if (arrayNode.type === 'identifier') {
+                    const rawType = getReceiverRawType(arrayNode.text);
+                    if (rawType?.endsWith('[]')) {
+                        return `type:${qualifyTypeName(rawType.slice(0, -2))}`;
+                    }
+                }
+                const containerKind = argKindOf(arrayNode);
+                return containerKind !== 'expr' ? `element:${containerKind}` : 'expr';
+            }
+            case 'parenthesized_expression':
+                return arg.namedChildCount === 1 ? argKindOf(arg.namedChild(0)) : 'expr';
             case 'lambda_expression':
             case 'method_reference': return 'lambda';
             case 'unary_expression':
@@ -1133,7 +1432,10 @@ function findCallsInCode(code, parser) {
                 endLine: node.endPosition.row + 1
             };
             functionStack.push(entry);
-            scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
+            const builtScope = buildScopeTypeMap(node);
+            scopeTypes.set(entry.startLine, builtScope.typeMap);
+            scopeRawTypes.set(entry.startLine, builtScope.rawTypeMap);
+            scopeTypeQualifiers.set(entry.startLine, builtScope.qualifierMap);
             scopeDeclared.set(entry.startLine, collectDeclaredNames(node));
         }
 
@@ -1144,16 +1446,25 @@ function findCallsInCode(code, parser) {
             const typeNode = node.childForFieldName('type');
             const nameNode = node.childForFieldName('name');
             const typeName = extractTypeName(typeNode);
+            const typeQualifier = extractTypeQualifier(typeNode);
             const scopeKey = functionStack[functionStack.length - 1].startLine;
             const typeMap = scopeTypes.get(scopeKey);
             if (nameNode && typeName && typeMap) {
+                const rawTypeMap = scopeRawTypes.get(scopeKey);
                 scopedTypeRestores.set(node.id, {
                     typeMap,
+                    rawTypeMap,
                     name: nameNode.text,
                     had: typeMap.has(nameNode.text),
                     previous: typeMap.get(nameNode.text),
+                    rawHad: rawTypeMap?.has(nameNode.text),
+                    rawPrevious: rawTypeMap?.get(nameNode.text),
                 });
                 typeMap.set(nameNode.text, typeName);
+                rawTypeMap?.set(nameNode.text, typeNode.text);
+                const qualifierMap = scopeTypeQualifiers.get(scopeKey);
+                if (typeQualifier) qualifierMap?.set(nameNode.text, typeQualifier);
+                else qualifierMap?.delete(nameNode.text);
             }
         }
 
@@ -1180,11 +1491,17 @@ function findCallsInCode(code, parser) {
                         ? receiverNode.text : undefined);
                 const receiverType = castReceiverType ||
                     ((receiver && receiver !== 'this') ? getReceiverType(receiver) : undefined);
+                const receiverTypeQualifier = !castReceiverType && receiver
+                    ? getReceiverTypeQualifier(receiver) : undefined;
+                const receiverIsTypeQualified = !!(receiverNode?.type === 'identifier' &&
+                    receiver && /^[A-Z]/.test(receiver) && !receiverType &&
+                    !isDeclaredLocal(receiver) && !hasEnclosingField(node, receiver));
                 // fix #202: one-hop declared-field receivers —
                 // this.service.execute(), svc.client.run(), and bare
                 // service.execute() where service is a class field (only when
                 // no same-named local is declared anywhere in the method).
                 let receiverRoot, receiverFieldName, receiverRootType;
+                let receiverRootNamespace;
                 if (objNode && !receiverType) {
                     if (objNode.type === 'field_access') {
                         const rootNode = objNode.childForFieldName('object');
@@ -1205,6 +1522,8 @@ function findCallsInCode(code, parser) {
                                     receiverRoot = rootNode.text;
                                     receiverFieldName = fldNode.text;
                                     receiverRootType = rootType;
+                                    receiverRootNamespace =
+                                        getReceiverTypeQualifier(rootNode.text);
                                 }
                             }
                         }
@@ -1234,6 +1553,13 @@ function findCallsInCode(code, parser) {
                 const firstArg = getFirstStringArg(node);
                 const callArgs = getCallArgs(node);
                 const assignedTo = assignmentTargetOf(node);
+                const receiverPath = objNode?.type === 'method_invocation'
+                    ? methodCallPathOf(objNode) : null;
+                const receiverCallTypePath = receiverPath
+                    ? (receiverPath.methods.length === 1
+                        ? `call:${receiverPath.owner}:${receiverPath.methods[0]}`
+                        : `chain:${receiverPath.owner}#${receiverPath.methods.join('#')}`)
+                    : null;
                 calls.push({
                     name: nameNode.text,
                     // Multi-line chains (builder.x()\n.y()) must report each
@@ -1243,12 +1569,18 @@ function findCallsInCode(code, parser) {
                     isMethod: !!objNode,
                     receiver,
                     ...(receiverType && { receiverType }),
+                    ...(receiverTypeQualifier && { receiverTypeQualifier }),
+                    ...(receiverIsTypeQualified && { receiverIsTypeQualified: true }),
                     ...(castReceiverType && { receiverTypeCast: true }),
                     ...(receiverFieldName && { receiverRoot, receiverField: receiverFieldName }),
                     ...(receiverFieldName && receiverRootType && { receiverRootType }),
+                    ...(receiverFieldName && receiverRootNamespace && {
+                        receiverRootNamespace,
+                    }),
                     ...(receiverCall && { receiverCall }),
                     ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
                     ...(receiverCallLine && { receiverCallLine }),
+                    ...(receiverCallTypePath && { receiverCallTypePath }),
                     argCount: callArgs.argCount,
                     ...(callArgs.argKinds && { argKinds: callArgs.argKinds }),
                     ...(assignedTo && { assignedTo }),
@@ -1400,6 +1732,8 @@ function findCallsInCode(code, parser) {
             const declTypeNode = node.childForFieldName('type');
             const declaredType = declTypeNode && declTypeNode.text !== 'var'
                 ? extractTypeName(declTypeNode) : null;
+            const declaredTypeQualifier = declTypeNode && declTypeNode.text !== 'var'
+                ? extractTypeQualifier(declTypeNode) : null;
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
                 if (child.type === 'variable_declarator') {
@@ -1410,11 +1744,23 @@ function findCallsInCode(code, parser) {
                     let typeName = valueNode?.type === 'object_creation_expression'
                         ? extractTypeName(valueNode.childForFieldName('type'))
                         : null;
+                    let typeQualifier = valueNode?.type === 'object_creation_expression'
+                        ? extractTypeQualifier(valueNode.childForFieldName('type'))
+                        : null;
                     if (!typeName) typeName = declaredType;
+                    if (!typeQualifier) typeQualifier = declaredTypeQualifier;
                     if (nameNode && typeName) {
                         const scopeKey = functionStack[functionStack.length - 1].startLine;
                         const typeMap = scopeTypes.get(scopeKey);
                         if (typeMap) typeMap.set(nameNode.text, typeName);
+                        const rawTypeMap = scopeRawTypes.get(scopeKey);
+                        const rawType = valueNode?.type === 'object_creation_expression'
+                            ? valueNode.childForFieldName('type')?.text
+                            : declTypeNode?.text;
+                        if (rawType) rawTypeMap?.set(nameNode.text, rawType);
+                        const qualifierMap = scopeTypeQualifiers.get(scopeKey);
+                        if (typeQualifier) qualifierMap?.set(nameNode.text, typeQualifier);
+                        else qualifierMap?.delete(nameNode.text);
                     }
                 }
             }
@@ -1430,13 +1776,25 @@ function findCallsInCode(code, parser) {
             let typeName = resValueNode?.type === 'object_creation_expression'
                 ? extractTypeName(resValueNode.childForFieldName('type'))
                 : null;
+            let typeQualifier = resValueNode?.type === 'object_creation_expression'
+                ? extractTypeQualifier(resValueNode.childForFieldName('type'))
+                : null;
             if (!typeName && resTypeNode && resTypeNode.text !== 'var') {
                 typeName = extractTypeName(resTypeNode);
+                typeQualifier = extractTypeQualifier(resTypeNode);
             }
             if (resNameNode && typeName) {
                 const scopeKey = functionStack[functionStack.length - 1].startLine;
                 const typeMap = scopeTypes.get(scopeKey);
                 if (typeMap) typeMap.set(resNameNode.text, typeName);
+                const rawTypeMap = scopeRawTypes.get(scopeKey);
+                const rawType = resValueNode?.type === 'object_creation_expression'
+                    ? resValueNode.childForFieldName('type')?.text
+                    : resTypeNode?.text;
+                if (rawType) rawTypeMap?.set(resNameNode.text, rawType);
+                const qualifierMap = scopeTypeQualifiers.get(scopeKey);
+                if (typeQualifier) qualifierMap?.set(resNameNode.text, typeQualifier);
+                else qualifierMap?.delete(resNameNode.text);
             }
         }
 
@@ -1447,12 +1805,21 @@ function findCallsInCode(code, parser) {
             if (restore) {
                 if (restore.had) restore.typeMap.set(restore.name, restore.previous);
                 else restore.typeMap.delete(restore.name);
+                if (restore.rawTypeMap) {
+                    if (restore.rawHad) {
+                        restore.rawTypeMap.set(restore.name, restore.rawPrevious);
+                    } else {
+                        restore.rawTypeMap.delete(restore.name);
+                    }
+                }
                 scopedTypeRestores.delete(node.id);
             }
             if (isFunctionNode(node)) {
                 const leaving = functionStack.pop();
                 if (leaving) {
                     scopeTypes.delete(leaving.startLine);
+                    scopeRawTypes.delete(leaving.startLine);
+                    scopeTypeQualifiers.delete(leaving.startLine);
                 }
             }
         }

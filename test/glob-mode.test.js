@@ -13,7 +13,7 @@ describe('Glob mode', () => {
             'lib/other.py': 'def other(): pass',
         });
         try {
-            const out = runCli(path.join(dir, 'src', '*.js'), 'toc', [], ['--detailed']);
+            const out = runCli(path.join(dir, 'src', '*.js'), 'repo', [], ['--sections=files', '--detailed']);
             assert.ok(out.includes('main'), 'Should include main from app.js');
             assert.ok(out.includes('helper'), 'Should include helper from utils.js');
             assert.ok(!out.includes('other'), 'Should NOT include other from .py file');
@@ -30,7 +30,7 @@ describe('Glob mode', () => {
             'top.js': 'function topFn() {}',
         });
         try {
-            const out = runCli(path.join(dir, 'src', '**', '*.js'), 'toc', [], ['--detailed']);
+            const out = runCli(path.join(dir, 'src', '**', '*.js'), 'repo', [], ['--sections=files', '--detailed']);
             assert.ok(out.includes('appMain'), 'Should match src/app.js');
             assert.ok(out.includes('deepFn'), 'Should match src/lib/deep.js');
             assert.ok(!out.includes('topFn'), 'Should NOT match top.js (outside src/)');
@@ -47,7 +47,7 @@ describe('Glob mode', () => {
             'data.txt': 'not code',
         });
         try {
-            const out = runCli(path.join(dir, '*.{js,py}'), 'toc', [], ['--detailed']);
+            const out = runCli(path.join(dir, '*.{js,py}'), 'repo', [], ['--sections=files', '--detailed']);
             assert.ok(out.includes('jsFunc'), 'Should match .js files');
             assert.ok(out.includes('pyFunc'), 'Should match .py files');
         } finally {
@@ -61,7 +61,7 @@ describe('Glob mode', () => {
             'app.js': 'function main() {}',
         });
         try {
-            const out = runCli(path.join(dir, '*.xyz'), 'toc', [], []);
+            const out = runCli(path.join(dir, '*.xyz'), 'repo', [], []);
             assert.ok(out.includes('No files match'), 'Should show no-match error');
         } finally {
             rm(dir);
@@ -107,21 +107,21 @@ describe('Glob mode', () => {
             'src/app.js': 'function main() {}',
         });
         try {
-            const out = runCli(path.join(dir, 'src', '*.js'), 'toc', [], ['--json']);
+            const out = runCli(path.join(dir, 'src', '*.js'), 'repo', [], ['--sections=files', '--json']);
             const parsed = JSON.parse(out);
-            assert.ok(parsed.files, 'JSON output should have files field');
+            assert.ok(parsed.data.files.files, 'JSON output should have files field');
         } finally {
             rm(dir);
         }
     });
 
-    it('glob + --detailed flag works on toc', () => {
+    it('glob + --detailed flag works on repo files', () => {
         const dir = tmp({
             'package.json': '{}',
             'src/app.js': 'function main() {}\nfunction helper() {}',
         });
         try {
-            const out = runCli(path.join(dir, 'src', '*.js'), 'toc', [], ['--detailed']);
+            const out = runCli(path.join(dir, 'src', '*.js'), 'repo', [], ['--sections=files', '--detailed']);
             assert.ok(out.includes('main'), 'Should list main');
             assert.ok(out.includes('helper'), 'Should list helper');
         } finally {
@@ -137,7 +137,7 @@ describe('Glob mode', () => {
             'other/extra.js': 'const { helper } = require("../src/utils");\nfunction extra() { helper(); }',
         });
         try {
-            const out = runCli(path.join(dir, 'src', '*.js'), 'context', ['helper'], []);
+            const out = runCli(path.join(dir, 'src', '*.js'), 'show', ['helper'], ['--sections=callers']);
             assert.ok(out.includes('helper'), 'Should find helper');
             // extra() should NOT appear as caller since other/ is outside glob scope
             assert.ok(!out.includes('extra'), 'Caller from outside glob scope should not appear');

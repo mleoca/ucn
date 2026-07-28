@@ -12,6 +12,7 @@ const os = require('os');
 
 const { ProjectIndex } = require('../core/project');
 const output = require('../core/output');
+const { BROAD_COMMANDS } = require('../core/registry');
 const { tmp, rm, McpClient, PROJECT_DIR } = require('./helpers');
 
 // ============================================================================
@@ -396,7 +397,7 @@ describe('fix: MCP max_files parameter honored', () => {
 
             // With max_files: 1, only one file should be indexed
             const res = await client.callTool('ucn', {
-                command: 'toc', project_dir: dir, max_files: 1
+                command: 'repo', project_dir: dir, max_files: 1, sections: 'files'
             });
             const text = res.result?.content?.map(c => c.text).join('') || '';
             // Toc should show only 1 file (max_files limits discovery)
@@ -422,12 +423,12 @@ describe('fix: MCP max_files parameter honored', () => {
 
             // First: limited query
             await client.callTool('ucn', {
-                command: 'toc', project_dir: dir, max_files: 1
+                command: 'repo', project_dir: dir, max_files: 1, sections: 'files'
             });
 
             // Second: full query (no max_files) — should see all files
             const res = await client.callTool('ucn', {
-                command: 'toc', project_dir: dir
+                command: 'repo', project_dir: dir, sections: 'files'
             });
             const text = res.result?.content?.map(c => c.text).join('') || '';
             assert.ok(text.includes('2 file'), `Full query should show 2 files, got: ${text}`);
@@ -452,7 +453,7 @@ describe('MCP two-tier output limits', () => {
             assert.ok(description.length > 1000 && description.length < 8000,
                 `description should be useful without consuming the context window (${description.length} chars)`);
             assert.ok(description.includes('observed-text zero'), description);
-            assert.ok(description.includes('ordinal evidence weights, not probabilities'), description);
+            assert.ok(description.includes('Evidence weights are ordinal, not probabilities'), description);
             assert.ok(!description.includes('genuinely has no callers'), description);
         } finally {
             client.stop();
@@ -460,9 +461,8 @@ describe('MCP two-tier output limits', () => {
     });
 
     it('BROAD_COMMANDS set includes the correct commands', () => {
-        const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
-        for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
-            assert.ok(serverCode.includes(`'${cmd}'`), `BROAD_COMMANDS should include ${cmd}`);
+        for (const cmd of ['repo', 'entrypoints', 'endpoints', 'tests', 'deadcode', 'usages', 'deps', 'check', 'auditAsync']) {
+            assert.ok(BROAD_COMMANDS.has(cmd), `BROAD_COMMANDS should include ${cmd}`);
         }
     });
 
@@ -476,7 +476,7 @@ describe('MCP two-tier output limits', () => {
 
     it('each broad command has a narrowing hint', () => {
         const serverCode = fs.readFileSync(path.join(__dirname, '..', 'mcp', 'server.js'), 'utf-8');
-        for (const cmd of ['toc', 'entrypoints', 'diff_impact', 'affected_tests', 'deadcode', 'usages']) {
+        for (const cmd of ['repo', 'entrypoints', 'endpoints', 'impact', 'tests', 'deadcode', 'usages', 'deps']) {
             assert.ok(serverCode.includes(`${cmd}:`), `Should have narrowing hint for ${cmd}`);
         }
     });
@@ -532,7 +532,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('top=1e100 is rejected by Zod (max cap)', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 1e100,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', top: 1e100,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on top=1e100, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -542,7 +542,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('top=-5 is rejected (must be positive)', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: -5,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', top: -5,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on top=-5, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -550,7 +550,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('top=NaN is rejected', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: NaN,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', top: NaN,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on top=NaN, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -558,7 +558,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('top=0 is rejected (must be positive)', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 0,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', top: 0,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on top=0, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -566,7 +566,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('top=1.5 is rejected (must be integer)', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 1.5,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', top: 1.5,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on top=1.5, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -582,7 +582,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('max_files=0 is rejected', async () => {
         const res = await client.callTool('ucn', {
-            command: 'toc', project_dir: PROJECT_DIR, max_files: 0,
+            command: 'repo', project_dir: PROJECT_DIR, max_files: 0,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on max_files=0, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -590,7 +590,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('max_chars above the documented 100K transport ceiling is rejected', async () => {
         const res = await client.callTool('ucn', {
-            command: 'about', project_dir: PROJECT_DIR, name: 'main', max_chars: 100001,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', max_chars: 100001,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error above max_chars=100000, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -619,7 +619,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('valid top=10 is accepted', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', top: 10,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', top: 10,
         });
         // Should succeed (or at worst, fail for other reasons — not Zod).
         // Just verify no Zod validation error.
@@ -630,7 +630,7 @@ describe('MED-4: MCP rejects out-of-range numeric params via Zod', () => {
 
     it('min_confidence=2.0 is rejected (must be in [0,1])', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context', project_dir: PROJECT_DIR, name: 'main', min_confidence: 2.0,
+            command: 'show', project_dir: PROJECT_DIR, name: 'main', min_confidence: 2.0,
         });
         const isError = res.error || (res.result && res.result.isError === true);
         assert.ok(isError, `should error on min_confidence=2.0, got: ${JSON.stringify(res).slice(0, 300)}`);
@@ -673,30 +673,32 @@ describe('fix #250: MCP find parity + compact + fn notes', () => {
     });
     after(() => { client.stop(); rm(dir); });
 
-    it('find renders detailed output with stable handles and honors all=true', async () => {
+    it('find renders detailed output with stable handles and honors limit', async () => {
         const res = await client.callTool({ command: 'find', project_dir: dir, name: 'task' });
         assert.ok(/a\.js:\d+:task/.test(res.text), 'stable file:line:name handles present: ' + res.text.slice(0, 300));
-        const all = await client.callTool({ command: 'find', project_dir: dir, name: 'task', all: true });
+        const all = await client.callTool({
+            command: 'find', project_dir: dir, name: 'task', limit: 6,
+        });
         for (const n of ['taskOne', 'taskTwo', 'taskThree', 'taskFour', 'taskFive', 'taskSix']) {
-            assert.ok(all.text.includes(n), `all=true shows ${n}`);
+            assert.ok(all.text.includes(n), `limit=6 shows ${n}`);
         }
     });
 
-    it('compact=true changes about output shape', async () => {
-        const full = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne', compact: false });
-        const compact = await client.callTool({ command: 'about', project_dir: dir, name: 'taskOne' });
+    it('compact=true changes show relationship output shape', async () => {
+        const params = { command: 'show', project_dir: dir, name: 'taskOne', sections: 'callers,callees' };
+        const full = await client.callTool({ ...params, compact: false });
+        const compact = await client.callTool(params);
         assert.ok(compact.text.length < full.text.length, `compact is smaller (${compact.text.length} vs ${full.text.length})`);
-        assert.ok(compact.text.includes('SOURCE: omitted in compact mode'), compact.text);
-        assert.ok(!compact.text.includes('─── CODE ───'), compact.text);
+        assert.ok(compact.text.includes('RELATIONSHIPS'), compact.text);
     });
 
-    it('fn multi-definition notes use param syntax, not --flags', async () => {
+    it('source multi-definition notes use param syntax, not --flags', async () => {
         const d2 = tmp({
             'package.json': '{"name":"test"}',
             'x.js': 'class A { run() { return 1; } }\nclass B { run() { return 2; } }\nmodule.exports = { A, B };\n',
         });
         try {
-            const res = await client.callTool({ command: 'fn', project_dir: d2, name: 'run' });
+            const res = await client.callTool({ command: 'source', project_dir: d2, name: 'run' });
             assert.ok(!res.text.includes('--all'), 'no CLI flag syntax: ' + res.text.slice(0, 300));
         } finally { rm(d2); }
     });

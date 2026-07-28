@@ -16,6 +16,7 @@ const os = require('os');
 const { ProjectIndex } = require('../core/project');
 const { tsMorphOracle } = require('../eval/oracles/ts-morph-oracle');
 const { constructedReceiverAt } = require('../eval/oracles/jdtls-oracle');
+const { createOraclePathMapper } = require('../eval/oracles/oracle-interface');
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -38,6 +39,33 @@ function idx(d, g) {
 }
 
 describe('Oracle contract', () => {
+    it('normalizes canonical roots before comparing oracle and index paths', (t) => {
+        const d = tmp({
+            'project/src/com/example/Example.java': 'class Example {}',
+        });
+        const alias = `${d}-alias`;
+        try {
+            try {
+                fs.symlinkSync(path.join(d, 'project'), alias, 'dir');
+            } catch (error) {
+                t.skip(`directory symlinks unavailable: ${error.code || error.message}`);
+                return;
+            }
+            const mapper = createOraclePathMapper(
+                alias,
+                fs.realpathSync(path.join(d, 'project', 'src')));
+            assert.strictEqual(
+                mapper.toIndex('com/example/Example.java'),
+                path.join('src', 'com', 'example', 'Example.java'));
+            assert.strictEqual(
+                mapper.toOracle(path.join('src', 'com', 'example', 'Example.java')),
+                path.join('com', 'example', 'Example.java'));
+        } finally {
+            try { fs.unlinkSync(alias); } catch (_) { /* not created or already removed */ }
+            rm(d);
+        }
+    });
+
     it('jdtls adjudication retains exact constructed receiver provenance', () => {
         const source = [
             'void run(Context context) {',
@@ -131,6 +159,37 @@ describe('Oracle contract', () => {
                 .map(r => `${r.file}:${r.line}`);
             assert.ok(calls.includes('use.ts:3'), `exact View call remains: ${calls}`);
             assert.ok(!calls.includes('use.ts:4'), `unrelated Digest call is excluded: ${calls}`);
+        } finally { rm(d); }
+    });
+
+    it('ts-morph call oracle covers declaration-only classes with prototype implementations', async () => {
+        const d = tmp({
+            'tsconfig.json': '{"compilerOptions":{"strict":true,"target":"ES2022"},"include":["**/*.ts"]}',
+            'signal.ts': [
+                'export declare class Signal {',
+                '  peek(): number',
+                '}',
+                'export interface ReadonlySignal { peek(): number }',
+                'export function Signal(this: Signal) {}',
+                'Signal.prototype.peek = function () { return 1 }',
+                'export function direct(value: Signal) { return value.peek() }',
+                'export function dynamic(value: ReadonlySignal) { return value.peek() }',
+                'class Other { peek(): number { return 2 } }',
+                'export function sibling(value: Other) { return value.peek() }',
+            ].join('\n'),
+        });
+        try {
+            const handle = await tsMorphOracle.prepare(d);
+            const refs = await tsMorphOracle.findReferences(handle, {
+                name: 'peek', file: 'signal.ts', line: 2,
+            });
+            const calls = refs.filter(r => r.kind === 'call')
+                .map(r => `${r.file}:${r.line}`);
+            assert.ok(calls.includes('signal.ts:7'), `exact Signal call remains: ${calls}`);
+            assert.ok(calls.includes('signal.ts:8'),
+                `structurally compatible interface dispatch remains potential: ${calls}`);
+            assert.ok(!calls.includes('signal.ts:10'),
+                `unrelated concrete sibling call is excluded: ${calls}`);
         } finally { rm(d); }
     });
 });

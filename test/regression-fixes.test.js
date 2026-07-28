@@ -78,18 +78,18 @@ it('FIX 88 — MCP context/smart pass undefined includeMethods for language defa
     assert.ok(smart, 'smart should work with default includeMethods');
 });
 
-it('FIX 92 — file-mode auto-routes verify/plan/expand/stacktrace/file-exports', () => {
+it('FIX 92 — file-mode auto-routes project-wide public commands', () => {
     const { execSync } = require('child_process');
     const testFile = path.join(PROJECT_DIR, 'core', 'parser.js');
 
-    // verify command should auto-route to project mode, not error with "Unknown command"
+    // check should auto-route to project mode, not error with "Unknown command"
     try {
-        const out = execSync(`node ${CLI_PATH} ${testFile} verify parse 2>&1`, { timeout: 30000 }).toString();
-        assert.ok(!out.includes('Unknown command'), 'verify should not be "Unknown command" in file mode');
+        const out = execSync(`node ${CLI_PATH} ${testFile} check parse 2>&1`, { timeout: 30000 }).toString();
+        assert.ok(!out.includes('Unknown command'), 'check should not be "Unknown command" in file mode');
     } catch (e) {
         const stderr = e.stderr?.toString() || e.stdout?.toString() || '';
         assert.ok(!stderr.includes('Unknown command'),
-            `verify should auto-route in file mode, got: ${stderr.slice(0, 200)}`);
+            `check should auto-route in file mode, got: ${stderr.slice(0, 200)}`);
     }
 });
 
@@ -1684,7 +1684,7 @@ describe('FIX 127 — formatGraph truncation hints for both direction', () => {
     });
 });
 
-describe('FIX 128 — CLI context/smart error exits with code 1', () => {
+describe('FIX 128 — CLI show error exits with code 1', () => {
     let dir;
     it('setup', () => {
         dir = tmp({
@@ -1692,11 +1692,11 @@ describe('FIX 128 — CLI context/smart error exits with code 1', () => {
         });
     });
 
-    it('context with missing name should exit with error', () => {
+    it('show with missing name should exit with error', () => {
         const { execFileSync } = require('child_process');
         let exitedWithError = false;
         try {
-            execFileSync('node', [CLI_PATH, dir, 'context'], {
+            execFileSync('node', [CLI_PATH, dir, 'show'], {
                 encoding: 'utf-8',
                 timeout: 30000,
                 stdio: ['pipe', 'pipe', 'pipe']
@@ -1706,7 +1706,7 @@ describe('FIX 128 — CLI context/smart error exits with code 1', () => {
             // Error should be on stderr
             assert.ok(e.stderr && e.stderr.length > 0, `error should be on stderr, got stdout: ${e.stdout}, stderr: ${e.stderr}`);
         }
-        assert.ok(exitedWithError, 'context with missing name should exit with non-zero code');
+        assert.ok(exitedWithError, 'show with missing name should exit with non-zero code');
     });
 
     it('cleanup', () => { rm(dir); });
@@ -1783,7 +1783,7 @@ class Helper:
     });
 });
 
-describe('FIX 132 — fn/class exit code on not-found', () => {
+describe('FIX 132 — source exit code on not-found', () => {
     let dir;
     it('setup', () => {
         dir = tmp({
@@ -1791,11 +1791,11 @@ describe('FIX 132 — fn/class exit code on not-found', () => {
         });
     });
 
-    it('fn with nonexistent name should exit with non-zero code', () => {
+    it('source with nonexistent function should exit with non-zero code', () => {
         const { execFileSync } = require('child_process');
         let exitedWithError = false;
         try {
-            execFileSync('node', [CLI_PATH, dir, 'fn', 'nonexistent'], {
+            execFileSync('node', [CLI_PATH, dir, 'source', 'nonexistent'], {
                 encoding: 'utf-8',
                 timeout: 30000,
                 stdio: ['pipe', 'pipe', 'pipe']
@@ -1804,14 +1804,14 @@ describe('FIX 132 — fn/class exit code on not-found', () => {
             exitedWithError = true;
             assert.ok(e.stderr.includes('not found'), `stderr should say not found, got: ${e.stderr}`);
         }
-        assert.ok(exitedWithError, 'fn with nonexistent name should exit with non-zero code');
+        assert.ok(exitedWithError, 'source with nonexistent name should exit with non-zero code');
     });
 
-    it('class with nonexistent name should exit with non-zero code', () => {
+    it('source with nonexistent class should exit with non-zero code', () => {
         const { execFileSync } = require('child_process');
         let exitedWithError = false;
         try {
-            execFileSync('node', [CLI_PATH, dir, 'class', 'NonexistentClass'], {
+            execFileSync('node', [CLI_PATH, dir, 'source', 'NonexistentClass'], {
                 encoding: 'utf-8',
                 timeout: 30000,
                 stdio: ['pipe', 'pipe', 'pipe']
@@ -1820,7 +1820,7 @@ describe('FIX 132 — fn/class exit code on not-found', () => {
             exitedWithError = true;
             assert.ok(e.stderr.includes('not found'), `stderr should say not found, got: ${e.stderr}`);
         }
-        assert.ok(exitedWithError, 'class with nonexistent name should exit with non-zero code');
+        assert.ok(exitedWithError, 'source with nonexistent class should exit with non-zero code');
     });
 
     it('cleanup', () => { rm(dir); });
@@ -1835,9 +1835,9 @@ describe('FIX 133 — Interactive --file value (space-separated)', () => {
         });
     });
 
-    it('interactive fn with --file <value> should work', () => {
+    it('interactive source with --file <value> should work', () => {
         const { execFileSync } = require('child_process');
-        const input = 'fn parse --file parser\nquit\n';
+        const input = 'source parse --file parser\nquit\n';
         const result = execFileSync('node', [CLI_PATH, '--interactive', dir], {
             input,
             encoding: 'utf-8',
@@ -2253,9 +2253,9 @@ function caller() { const f = new Foo(); f.bar(); }
             'package.json': '{"name":"test"}'
         });
         // With --include-methods=true, method calls should be included
-        const resultTrue = runCli(dir, 'context', ['caller'], ['--include-methods=true']);
+        const resultTrue = runCli(dir, 'show', ['caller'], ['--sections=callees', '--include-methods=true']);
         // With --include-methods=false, method calls should be excluded
-        const resultFalse = runCli(dir, 'context', ['caller'], ['--include-methods=false']);
+        const resultFalse = runCli(dir, 'show', ['caller'], ['--sections=callees', '--include-methods=false']);
         // Both should not error
         assert.ok(!resultTrue.includes('Unknown flag'), 'should accept --include-methods=true');
         assert.ok(!resultFalse.includes('Unknown flag'), 'should accept --include-methods=false');
@@ -2427,7 +2427,7 @@ describe('Bug Hunt: --stack flag accepted in CLI', () => {
     });
 });
 
-describe('Bug Hunt: glob mode toc --json output', () => {
+describe('Bug Hunt: glob mode repo --json output', () => {
     it('should produce valid JSON with totals and files fields', () => {
         const { execFileSync } = require('child_process');
         const dir = tmp({
@@ -2439,7 +2439,7 @@ describe('Bug Hunt: glob mode toc --json output', () => {
         const globPattern = path.join(dir, 'src', '*.js');
         let result;
         try {
-            result = execFileSync('node', [CLI_PATH, globPattern, 'toc', '--json'], {
+            result = execFileSync('node', [CLI_PATH, globPattern, 'repo', '--sections=files', '--json'], {
                 timeout: 30000,
                 encoding: 'utf-8'
             });
@@ -2450,11 +2450,12 @@ describe('Bug Hunt: glob mode toc --json output', () => {
         try {
             parsed = JSON.parse(result.trim());
         } catch (e) {
-            assert.fail(`glob toc --json should produce valid JSON, got: ${result.substring(0, 300)}`);
+            assert.fail(`glob repo --json should produce valid JSON, got: ${result.substring(0, 300)}`);
         }
-        assert.ok(parsed.totals, 'JSON should have totals field');
-        assert.ok(parsed.totals.files >= 2, `should have at least 2 files, got ${parsed.totals.files}`);
-        assert.ok(parsed.totals.functions >= 3, `should have at least 3 functions, got ${parsed.totals.functions}`);
+        const totals = parsed.data.files.totals;
+        assert.ok(totals, 'JSON should have totals field');
+        assert.ok(totals.files >= 2, `should have at least 2 files, got ${totals.files}`);
+        assert.ok(totals.functions >= 3, `should have at least 3 functions, got ${totals.functions}`);
         rm(dir);
     });
 });
@@ -2549,21 +2550,22 @@ describe('Bug Hunt: imports content.split performance', () => {
 
 describe('Bug hunt 2026-03-02 regressions', () => {
 
-    // Bug 1: example/related returned soft errors for not-found in MCP
+    // Bug 1: selected show sections return protocol errors for missing symbols.
     // Fix: mcp/server.js — all !ok results now return isError=true for reliable client branching
-    describe('fix: example/related MCP error semantics', () => {
+    describe('fix: show-section MCP error semantics', () => {
         let client;
 
-        it('example(nonexistent) returns isError=true', async () => {
+        it('show example(nonexistent) returns isError=true', async () => {
             const { McpClient } = require('./helpers');
             client = new McpClient();
             await client.start();
             await client.initialize();
 
             const res = await client.callTool('ucn', {
-                command: 'example',
+                command: 'show',
                 project_dir: FIXTURES_PATH + '/javascript',
                 name: 'zzz_nonexistent_symbol_xyz',
+                sections: 'example',
             });
 
             // Should be a protocol-level error so MCP clients can reliably branch on failure
@@ -2577,16 +2579,17 @@ describe('Bug hunt 2026-03-02 regressions', () => {
             client.stop();
         });
 
-        it('related(nonexistent) returns isError=true', async () => {
+        it('show related(nonexistent) returns isError=true', async () => {
             const { McpClient } = require('./helpers');
             client = new McpClient();
             await client.start();
             await client.initialize();
 
             const res = await client.callTool('ucn', {
-                command: 'related',
+                command: 'show',
                 project_dir: FIXTURES_PATH + '/javascript',
                 name: 'zzz_nonexistent_symbol_xyz',
+                sections: 'related',
             });
 
             assert.ok(!res.error, 'Should not be a transport error');
@@ -2978,7 +2981,7 @@ test('works', () => { processData(1); });
         });
         try {
             const { runInteractive } = require('./helpers');
-            const output = runInteractive(d, ['context processData --exclude test']);
+            const output = runInteractive(d, ['show processData --sections=callers --exclude test']);
             // With --exclude test, test files should not appear in callers
             assert.ok(!output.includes('main.test.js'), 'test file should be excluded from context output');
         } finally {
@@ -3000,7 +3003,7 @@ test('render', () => { render(); });
         });
         try {
             const { runInteractive } = require('./helpers');
-            const output = runInteractive(d, ['context render --not test']);
+            const output = runInteractive(d, ['show render --sections=callers --not test']);
             assert.ok(!output.includes('app.test.js'), '--not should exclude test files');
         } finally {
             rm(d);

@@ -36,6 +36,58 @@ function extractReturnType(node) {
 }
 
 /**
+ * Extract the compiler-declared associated item of an iterator return:
+ * `impl Iterator<Item = &Arg>` → `Arg`. Tuple/dyn/opaque item shapes abstain.
+ */
+function extractRustIteratorItemTypeFromTypeNode(typeNode) {
+    if (!typeNode) return null;
+    const pending = [typeNode];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current.type === 'type_binding') {
+            const nameNode = current.namedChild(0);
+            const valueNode = current.childForFieldName('type') || current.namedChild(1);
+            if (nameNode?.text === 'Item') return aliasBaseTypeName(valueNode);
+        }
+        for (let i = current.namedChildCount - 1; i >= 0; i--) {
+            pending.push(current.namedChild(i));
+        }
+    }
+    return null;
+}
+
+function extractRustIteratorItemType(node) {
+    return extractRustIteratorItemTypeFromTypeNode(
+        node.childForFieldName('return_type'));
+}
+
+/**
+ * A turbofish on `Iterator::collect` fixes both the concrete collection and
+ * its item type at the call site: `collect::<Vec<Haystack>>()`. Keep that
+ * compiler-declared result shape so a later collection callback
+ * (`sort_by(|a, b| ...)`) can type its closure parameters without guessing.
+ */
+function extractCollectResultContract(genericFunctionNode) {
+    if (genericFunctionNode?.type !== 'generic_function') return null;
+    const functionNode = genericFunctionNode.childForFieldName('function');
+    if (functionNode?.type !== 'field_expression' ||
+        functionNode.childForFieldName('field')?.text !== 'collect') {
+        return null;
+    }
+    const args = genericFunctionNode.namedChildren
+        .find(child => child.type === 'type_arguments');
+    if (!args || args.namedChildCount !== 1) return null;
+    const result = args.namedChild(0);
+    if (result.type !== 'generic_type') return null;
+    const outer = aliasBaseTypeName(result.childForFieldName('type') || result.namedChild(0));
+    const resultArgs = result.namedChildren
+        .find(child => child.type === 'type_arguments');
+    if (!outer || !resultArgs || resultArgs.namedChildCount !== 1) return null;
+    const item = aliasBaseTypeName(resultArgs.namedChild(0));
+    return item ? { type: outer, itemType: item } : null;
+}
+
+/**
  * Extract Rust parameters
  */
 function extractRustParams(paramsNode) {
@@ -46,6 +98,46 @@ function extractRustParams(paramsNode) {
     if (!paramsNode) return '...';
     const text = paramsNode.text;
     return text.replace(/^\(|\)$/g, '').trim();
+}
+
+function extractRustCallbackParamTypes(paramsNode) {
+    if (!paramsNode) return undefined;
+    const callbacks = {};
+    let callArgumentIndex = 0;
+    for (let i = 0; i < paramsNode.namedChildCount; i++) {
+        const parameter = paramsNode.namedChild(i);
+        if (parameter.type === 'self_parameter') continue;
+        if (parameter.type !== 'parameter') continue;
+        const typeNode = parameter.childForFieldName('type');
+        let functionType = null;
+        const pending = typeNode ? [typeNode] : [];
+        while (pending.length > 0 && !functionType) {
+            const current = pending.pop();
+            if (current.type === 'function_type') {
+                functionType = current;
+                break;
+            }
+            for (let j = 0; j < current.namedChildCount; j++) {
+                pending.push(current.namedChild(j));
+            }
+        }
+        const callbackParams = functionType?.childForFieldName('parameters');
+        if (callbackParams) {
+            const types = [];
+            let complete = true;
+            for (let j = 0; j < callbackParams.namedChildCount; j++) {
+                const name = aliasBaseTypeName(callbackParams.namedChild(j));
+                if (!name) {
+                    complete = false;
+                    break;
+                }
+                types.push(name);
+            }
+            if (complete && types.length > 0) callbacks[callArgumentIndex] = types;
+        }
+        callArgumentIndex++;
+    }
+    return Object.keys(callbacks).length > 0 ? callbacks : undefined;
 }
 
 /**
@@ -250,11 +342,13 @@ function _processFunction(node, functions, processedRanges, lines, code) {
             const isExtern = firstLine.includes('extern ');
             const visibility = extractVisibility(text);
             const returnType = extractReturnType(node);
+            const iteratorItemType = extractRustIteratorItemType(node);
             const docstring = extractRustDocstring(lines, startLine);
             const generics = extractGenerics(node);
             const attributes = extractAttributes(node, lines);
             const attributesWithArgs = extractAttributesWithArgs(node, lines);
             const inCfgTest = _isInsideCfgTestModule(node, lines);
+            const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
 
             const modifiers = [];
             if (visibility) modifiers.push(visibility);
@@ -274,11 +368,13 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                 name: nameNode.text,
                 params: extractRustParams(paramsNode),
                 paramsStructured: parseStructuredParams(paramsNode, 'rust'),
+                ...(callbackParamTypes && { callbackParamTypes }),
                 startLine,
                 endLine,
                 indent,
                 modifiers,
                 ...(returnType && { returnType }),
+                ...(iteratorItemType && { iteratorItemType }),
                 ...(docstring && { docstring }),
                 ...(generics && { generics }),
                 ...(attributesWithArgs.length > 0 && { attributesWithArgs })
@@ -305,6 +401,8 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                         const visibility = extractVisibility(child.text);
                         const returnType = extractReturnType(child);
                         const docstring = extractRustDocstring(lines, startLine);
+                        const callbackParamTypes = extractRustCallbackParamTypes(fParams);
+                        const iteratorItemType = extractRustIteratorItemType(child);
                         const modifiers = ['extern'];
                         if (visibility) modifiers.push(visibility);
 
@@ -312,6 +410,8 @@ function _processFunction(node, functions, processedRanges, lines, code) {
                             name: fName.text,
                             params: extractRustParams(fParams),
                             paramsStructured: parseStructuredParams(fParams, 'rust'),
+                            ...(callbackParamTypes && { callbackParamTypes }),
+                            ...(iteratorItemType && { iteratorItemType }),
                             startLine,
                             endLine,
                             indent,
@@ -327,6 +427,182 @@ function _processFunction(node, functions, processedRanges, lines, code) {
     }
 
     return false;
+}
+
+function _macroBodyTree(tree) {
+    let current = tree;
+    for (;;) {
+        const named = [];
+        for (let i = 0; i < current.namedChildCount; i++) {
+            named.push(current.namedChild(i));
+        }
+        if (named.length !== 1 || named[0].type !== 'token_tree') return current;
+        current = named[0];
+    }
+}
+
+function _macroTreeChildren(tree) {
+    const children = [];
+    for (let i = 0; i < tree.childCount; i++) {
+        const child = tree.child(i);
+        if (['{', '}', '(', ')', '[', ']'].includes(child.type)) continue;
+        children.push(child);
+    }
+    return children;
+}
+
+function _macroPathConstruction(children, methodIndex) {
+    const method = children[methodIndex];
+    if (!method || !['new', 'default'].includes(method.text) ||
+        children[methodIndex - 1]?.type !== '::' ||
+        children[methodIndex + 1]?.type !== 'token_tree') {
+        return null;
+    }
+    const typeNode = children[methodIndex - 2];
+    if (!typeNode || !['identifier', 'type_identifier'].includes(typeNode.type) ||
+        !/^[A-Z]/.test(typeNode.text)) {
+        return null;
+    }
+    const path = [typeNode.text];
+    let start = methodIndex - 2;
+    while (start >= 2 && children[start - 1]?.type === '::') {
+        const segment = children[start - 2];
+        if (!segment || ![
+            'identifier', 'type_identifier', 'metavariable', 'crate', 'self', 'super',
+        ].includes(segment.type)) {
+            break;
+        }
+        path.unshift(segment.text === '$crate' ? 'crate' : segment.text);
+        start -= 2;
+    }
+    let end = methodIndex + 1;
+    while (children[end + 1]?.type === '.' &&
+        children[end + 2]?.type === 'identifier' &&
+        children[end + 3]?.type === 'token_tree') {
+        end += 3;
+    }
+    return {
+        type: typeNode.text,
+        qualifier: path.length > 1 ? path.slice(0, -1).join('::') : undefined,
+        start,
+        end,
+    };
+}
+
+/**
+ * Infer a macro's value type only from its transcriber's final expression.
+ * This remains AST/token-tree driven: a constructor used merely as a temporary
+ * is not enough. Supported compiler-stable shapes are:
+ *   Type::new(...).builder_chain()
+ *   let value = Type::new(...); ...; value
+ * Recursive same-name rules delegate to the constructive rule, while a rule
+ * ending in compile_error! is divergent and cannot introduce another value.
+ */
+function _inferMacroReturn(node, macroName) {
+    const results = [];
+    let sawRule = false;
+    for (let i = 0; i < node.namedChildCount; i++) {
+        const rule = node.namedChild(i);
+        if (rule.type !== 'macro_rule') continue;
+        sawRule = true;
+        const right = rule.childForFieldName('right');
+        if (!right) return {};
+        const body = _macroBodyTree(right);
+        const children = _macroTreeChildren(body);
+        if (children.length === 0) {
+            results.push({ kind: 'unknown' });
+            continue;
+        }
+
+        const bindings = new Map();
+        for (let j = 0; j < children.length; j++) {
+            if (children[j].type !== 'let') continue;
+            let nameIndex = j + 1;
+            if (children[nameIndex]?.type === 'mutable_specifier') nameIndex++;
+            const nameNode = children[nameIndex];
+            if (nameNode?.type !== 'identifier') continue;
+            let eq = nameIndex + 1;
+            while (eq < children.length && children[eq].type !== '=' &&
+                children[eq].type !== ';') eq++;
+            if (children[eq]?.type !== '=') continue;
+            let construction = null;
+            let semi = eq + 1;
+            for (; semi < children.length && children[semi].type !== ';'; semi++) {
+                const candidate = _macroPathConstruction(children, semi);
+                if (candidate && candidate.start === eq + 1) {
+                    construction = candidate;
+                    break;
+                }
+            }
+            if (!construction) continue;
+            const prior = bindings.get(nameNode.text);
+            const identity = `${construction.qualifier || ''}\0${construction.type}`;
+            if (prior && prior.identity !== identity) {
+                bindings.set(nameNode.text, { ambiguous: true });
+            } else if (!prior) {
+                bindings.set(nameNode.text, { ...construction, identity });
+            }
+        }
+
+        const tail = children[children.length - 1];
+        if (tail.type === 'identifier' && bindings.has(tail.text) &&
+            !bindings.get(tail.text).ambiguous) {
+            const binding = bindings.get(tail.text);
+            results.push({ kind: 'return', type: binding.type, qualifier: binding.qualifier });
+            continue;
+        }
+
+        let direct = null;
+        for (let j = 0; j < children.length; j++) {
+            const candidate = _macroPathConstruction(children, j);
+            if (candidate && candidate.end === children.length - 1) {
+                direct = candidate;
+                break;
+            }
+        }
+        if (direct) {
+            results.push({ kind: 'return', type: direct.type, qualifier: direct.qualifier });
+            continue;
+        }
+
+        // Diverging compile_error!(...); commonly carries a trailing
+        // semicolon. A recursive value-delegating rule may not: `foo!();`
+        // returns unit, so only compile_error receives this allowance.
+        const effectiveTailIndex = tail.type === ';'
+            ? children.length - 2 : children.length - 1;
+        const effectiveTail = children[effectiveTailIndex];
+        const bang = children[effectiveTailIndex - 1];
+        const macro = children[effectiveTailIndex - 2];
+        if (bang?.type === '!' && effectiveTail?.type === 'token_tree' &&
+            macro?.type === 'identifier') {
+            if (macro.text === macroName && tail.type !== ';') {
+                results.push({ kind: 'delegate' });
+            } else if (macro.text === 'compile_error') results.push({ kind: 'never' });
+            else results.push({ kind: 'unknown' });
+            continue;
+        }
+        results.push({ kind: 'unknown' });
+    }
+
+    if (!sawRule) return {};
+    const returns = results.filter(result => result.kind === 'return');
+    const blockers = results.filter(result => !['return', 'delegate', 'never'].includes(result.kind));
+    if (returns.length > 0 && blockers.length === 0) {
+        const identities = new Set(returns.map(result =>
+            `${result.qualifier || ''}\0${result.type}`));
+        if (identities.size === 1) {
+            return {
+                returnType: returns[0].type,
+                ...(returns[0].qualifier && {
+                    returnTypeQualifier: returns[0].qualifier,
+                }),
+            };
+        }
+    }
+    if (results.every(result => result.kind === 'never')) {
+        return { macroNeverReturns: true };
+    }
+    return {};
 }
 
 /**
@@ -487,6 +763,7 @@ function _processClass(node, types, processedRanges, lines, code) {
         if (nameNode) {
             const { startLine, endLine } = nodeToLocation(node, lines);
             const docstring = extractRustDocstring(lines, startLine);
+            const inferred = _inferMacroReturn(node, nameNode.text);
 
             types.push({
                 name: nameNode.text,
@@ -495,6 +772,7 @@ function _processClass(node, types, processedRanges, lines, code) {
                 type: 'macro',
                 members: [],
                 modifiers: [],
+                ...inferred,
                 ...(docstring && { docstring })
             });
         }
@@ -822,7 +1100,9 @@ function extractTraitMembers(traitNode, codeOrLines) {
                 const { startLine, endLine } = nodeToLocation(child, code);
                 const paramsNode = child.childForFieldName('parameters');
                 const returnType = extractReturnType(child);
+                const iteratorItemType = extractRustIteratorItemType(child);
                 const hasSelf = paramsNode && paramsNode.text.includes('self');
+                const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
 
                 // Rust vocabulary (fix #248): trait members carry the trait's
                 // OWN visibility — a method of a private trait is not `pub`,
@@ -837,7 +1117,9 @@ function extractTraitMembers(traitNode, codeOrLines) {
                     modifiers: traitVisibility ? [traitVisibility] : [],
                     ...(paramsNode && { params: extractRustParams(paramsNode) }),
                     ...(paramsNode && { paramsStructured: parseStructuredParams(paramsNode, 'rust') }),
+                    ...(callbackParamTypes && { callbackParamTypes }),
                     ...(returnType && { returnType }),
+                    ...(iteratorItemType && { iteratorItemType }),
                     ...(hasSelf && { receiver: 'self' })
                 });
             }
@@ -870,6 +1152,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 const text = child.text;
                 const firstLine = text.split('\n')[0];
                 const returnType = extractReturnType(child);
+                const iteratorItemType = extractRustIteratorItemType(child);
                 const docstring = extractRustDocstring(code, startLine);
                 const visibility = extractVisibility(text);
 
@@ -892,10 +1175,12 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                 if (inCfgTest) modifiers.push('cfg_test_module');
 
                 const memberGenerics = extractGenerics(child);
+                const callbackParamTypes = extractRustCallbackParamTypes(paramsNode);
                 members.push({
                     name: nameNode.text,
                     params: extractRustParams(paramsNode),
                     paramsStructured: parseStructuredParams(paramsNode, 'rust'),
+                    ...(callbackParamTypes && { callbackParamTypes }),
                     startLine,
                     endLine,
                     memberType: 'method',
@@ -904,6 +1189,7 @@ function extractImplMembers(implNode, codeOrLines, typeName) {
                     modifiers,
                     ...(typeName && { receiver: typeName }),  // All impl members get receiver for findMethodsForType
                     ...(returnType && { returnType }),
+                    ...(iteratorItemType && { iteratorItemType }),
                     ...(docstring && { docstring }),
                     // Method-level type params (fix #229): generic-param receiver
                     // types inside the method resolve against this declaration.
@@ -1053,14 +1339,22 @@ function _tokenTreeCallArgsAfter(children, nameIndex) {
 }
 
 function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverType,
-    isPatternShadow, isFlowInvalidated) {
+    isPatternShadow, isFlowInvalidated, context = 'invocation') {
+    const contextKind = typeof context === 'string' ? context : context.kind;
+    const containerMacro = typeof context === 'object' ? context.containerMacro : undefined;
     const children = [];
     for (let i = 0; i < tree.childCount; i++) children.push(tree.child(i));
+    let lastProducer = null;
+    const macroFields = {
+        inMacro: true,
+        ...(contextKind === 'definition' && { inMacroDefinition: true }),
+        ...(containerMacro && { macroContainer: containerMacro }),
+    };
     for (let i = 0; i < children.length; i++) {
         const tok = children[i];
         if (tok.type === 'token_tree') {
             extractCallsFromTokenTree(tok, enclosingFunction, calls, getReceiverType,
-                isPatternShadow, isFlowInvalidated);
+                isPatternShadow, isFlowInvalidated, context);
             continue;
         }
         // `default` is tokenized as the Rust keyword even in the valid
@@ -1075,14 +1369,34 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
         // Nested macro invocation: name!(...)
         if (next && next.type === '!' &&
             children[i + 2] && children[i + 2].type === 'token_tree') {
-            calls.push({
+            const segments = [];
+            let startNode = tok;
+            let j = i - 1;
+            while (j >= 1 && children[j].type === '::') {
+                const segment = children[j - 1];
+                if (!segment || ![
+                    'identifier', 'metavariable', 'crate', 'self', 'super',
+                ].includes(segment.type)) break;
+                segments.unshift(segment.text === '$crate' ? 'crate' : segment.text);
+                startNode = segment;
+                j -= 2;
+            }
+            const record = {
                 name: tok.text,
                 line: tok.startPosition.row + 1,
+                callStart: startNode.startIndex,
+                callEnd: children[i + 2].endIndex,
                 isMethod: false,
                 isMacro: true,
-                inMacro: true,
+                ...(segments.length > 0 && {
+                    receiver: segments.join('::'),
+                    isPathMacro: true,
+                }),
+                ...macroFields,
                 enclosingFunction
-            });
+            };
+            calls.push(record);
+            lastProducer = record;
             continue;
         }
         const callArgs = _tokenTreeCallArgsAfter(children, i);
@@ -1090,8 +1404,11 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
         if (prev && prev.type === '::') {
             // Path call: Type::func(...) / module::sub::func(...) — segments
             // can be identifiers, primitives (char::from), or path keywords
-            const isSegment = (n) => n && ['identifier', 'primitive_type', 'self', 'super', 'crate'].includes(n.type);
+            const isSegment = (n) => n && [
+                'identifier', 'primitive_type', 'metavariable', 'self', 'super', 'crate',
+            ].includes(n.type);
             const segments = [];
+            let startNode = tok;
             let j = i - 1;
             while (j >= 1 && children[j].type === '::') {
                 let k = j - 1;
@@ -1115,23 +1432,39 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                     k -= 2;
                 }
                 if (!isSegment(children[k])) break;
-                segments.unshift(children[k].text);
+                segments.unshift(children[k].text === '$crate' ? 'crate' : children[k].text);
+                startNode = children[k];
                 j = k - 1;
             }
-            calls.push({
+            const record = {
                 name: tok.text,
                 line: tok.startPosition.row + 1,
+                callStart: startNode.startIndex,
+                callEnd: callArgs.endIndex,
                 isMethod: segments.length > 0,
                 isPathCall: true,
                 receiver: segments.length > 0 ? segments.join('::') : undefined,
-                inMacro: true,
+                ...macroFields,
                 enclosingFunction
-            });
+            };
+            calls.push(record);
+            lastProducer = record;
         } else if (prev && prev.type === '.') {
             // Method call: recv.method(...)
             const recvTok = children[i - 2];
             const receiver = recvTok && (recvTok.type === 'identifier' || recvTok.type === 'self')
                 ? recvTok.text : undefined;
+            // Token trees flatten `root.field.method(...)`. Retain the same
+            // one-hop field contract as the regular AST path so query-time
+            // analysis can type `args.separator.into_bytes()` from the
+            // declared type of `LowArgs.separator`.
+            let receiverRoot, receiverField;
+            if (receiver && children[i - 3]?.type === '.' &&
+                (children[i - 4]?.type === 'identifier' ||
+                 children[i - 4]?.type === 'self')) {
+                receiverRoot = children[i - 4].text;
+                receiverField = receiver;
+            }
             // Literal receivers type as builtins inside macros too (fix #220,
             // ripgrep-measured: assert_eq!(.., vec!["match:fg".parse()...]))
             const litType = recvTok
@@ -1142,26 +1475,47 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
                 ? getReceiverType(receiver, tok) : litType;
             const receiverPatternShadow = !!(receiver && isPatternShadow?.(tok, receiver));
             const receiverFlowInvalidated = !!(receiver && isFlowInvalidated?.(tok, receiver));
-            calls.push({
+            const iterationSource = rustIterationSourceOf(tok, receiver);
+            const producer = !receiver && lastProducer &&
+                lastProducer.callEnd === recvTok?.endIndex ? lastProducer : null;
+            const record = {
                 name: tok.text,
                 line: tok.startPosition.row + 1,
+                callStart: producer?.callStart ?? recvTok?.startIndex ?? tok.startIndex,
+                callEnd: callArgs.endIndex,
                 isMethod: true,
-                receiver,
+                receiver: receiverField ? undefined : receiver,
+                ...(receiverField && { receiverRoot, receiverField }),
                 ...(receiverType && { receiverType }),
                 ...(receiverPatternShadow && { receiverPatternShadow: true }),
                 ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
-                inMacro: true,
+                ...(iterationSource || {}),
+                ...(producer && {
+                    receiverCall: producer.name,
+                    ...(producer.isMethod && { receiverCallIsMethod: true }),
+                    ...(producer.isMacro && { receiverCallIsMacro: true }),
+                    receiverCallLine: producer.line,
+                    receiverCallStart: producer.callStart,
+                    receiverCallEnd: producer.callEnd,
+                }),
+                ...macroFields,
                 enclosingFunction
-            });
+            };
+            calls.push(record);
+            lastProducer = record;
         } else {
             // Plain call: func(...) — includes enum-variant constructors
-            calls.push({
+            const record = {
                 name: tok.text,
                 line: tok.startPosition.row + 1,
+                callStart: tok.startIndex,
+                callEnd: callArgs.endIndex,
                 isMethod: false,
-                inMacro: true,
+                ...macroFields,
                 enclosingFunction
-            });
+            };
+            calls.push(record);
+            lastProducer = record;
         }
     }
 }
@@ -1177,6 +1531,38 @@ function extractCallsFromTokenTree(tree, enclosingFunction, calls, getReceiverTy
  * Result<T, _>/Option<T> from the producer's return annotation. `let mut x`
  * works too — the pattern field is the plain identifier.
  */
+function rustDivergingExpression(node) {
+    if (!node) return false;
+    if (['return_expression', 'break_expression', 'continue_expression']
+        .includes(node.type)) return true;
+    if (node.type === 'expression_statement' && node.namedChildCount === 1) {
+        return rustDivergingExpression(node.namedChild(0));
+    }
+    if (node.type !== 'block') return false;
+    const last = node.namedChildCount > 0
+        ? node.namedChild(node.namedChildCount - 1) : null;
+    return rustDivergingExpression(last);
+}
+
+function rustMatchCallProducer(matchExpression) {
+    if (matchExpression?.type !== 'match_expression') return null;
+    const body = matchExpression.childForFieldName('body');
+    if (!body) return null;
+    const calls = [];
+    for (let i = 0; i < body.namedChildCount; i++) {
+        const arm = body.namedChild(i);
+        if (arm.type !== 'match_arm') continue;
+        const value = arm.childForFieldName('value');
+        if (rustDivergingExpression(value)) continue;
+        if (value?.type !== 'call_expression') return null;
+        calls.push(value);
+    }
+    if (calls.length === 0) return null;
+    const identities = new Set(calls.map(call =>
+        call.childForFieldName('function')?.text || ''));
+    return identities.size === 1 ? calls : null;
+}
+
 function rustAssignmentTargetOf(callNode) {
     let n = callNode;
     let p = n.parent;
@@ -1194,11 +1580,42 @@ function rustAssignmentTargetOf(callNode) {
         }
         break;
     }
+    if (p?.type === 'match_arm' &&
+        p.childForFieldName('value')?.id === n.id) {
+        let matchExpression = p.parent;
+        while (matchExpression && matchExpression.type !== 'match_expression') {
+            matchExpression = matchExpression.parent;
+        }
+        const producers = rustMatchCallProducer(matchExpression);
+        if (producers?.some(producer => producer.id === callNode.id)) {
+            const declaration = matchExpression.parent;
+            if (declaration?.type === 'let_declaration' &&
+                declaration.childForFieldName('value')?.id === matchExpression.id) {
+                const pattern = declaration.childForFieldName('pattern');
+                if (pattern?.type === 'identifier') {
+                    return { assignedTo: pattern.text };
+                }
+            }
+        }
+    }
     if (p.type === 'let_declaration') {
         const value = p.childForFieldName('value');
         const pattern = p.childForFieldName('pattern');
         if (value && value.id === n.id && pattern?.type === 'identifier') {
             return { assignedTo: pattern.text, ...(unwrapped && { unwrapped: true }) };
+        }
+        if (value && value.id === n.id && pattern?.type === 'tuple_pattern') {
+            const bindings = pattern.namedChildren
+                .filter(child => child.type === 'identifier')
+                .map(child => child.text);
+            if (bindings.length === pattern.namedChildCount && bindings.length > 0) {
+                return {
+                    assignedTo: bindings[0],
+                    tuple: true,
+                    ...(bindings.length > 1 && { tupleRest: bindings.slice(1) }),
+                    ...(unwrapped && { unwrapped: true }),
+                };
+            }
         }
         return undefined;
     }
@@ -1210,6 +1627,170 @@ function rustAssignmentTargetOf(callNode) {
         }
     }
     return undefined;
+}
+
+function rustCallIdentity(callNode) {
+    if (!callNode || callNode.type !== 'call_expression') return null;
+    const fn = callNode.childForFieldName('function');
+    if (!fn) return null;
+    if (fn.type === 'identifier') {
+        return { name: fn.text, isMethod: false };
+    }
+    if (fn.type === 'scoped_identifier' || fn.type === 'generic_function') {
+        const parts = fn.text.split('::').filter(Boolean);
+        const name = parts.pop()?.replace(/::<.*$/, '');
+        return name ? { name, isMethod: false } : null;
+    }
+    if (fn.type === 'field_expression') {
+        const field = fn.childForFieldName('field');
+        return field ? { name: field.text, isMethod: true } : null;
+    }
+    return null;
+}
+
+/**
+ * If this receiver is a for-loop binding, retain the exact iterator-source
+ * call so query-time analysis can apply its declared Item contract.
+ */
+function rustIterationSourceOf(node, receiver) {
+    if (!receiver) return null;
+    let current = node.parent;
+    while (current) {
+        if (current.type === 'for_expression') {
+            const pattern = current.childForFieldName('pattern');
+            const value = current.childForFieldName('value');
+            if (pattern?.type === 'identifier' && pattern.text === receiver) {
+                if (value?.type === 'identifier') {
+                    return { receiverIterationVariable: value.text };
+                }
+                if (value?.type === 'call_expression') {
+                    const identity = rustCallIdentity(value);
+                    if (!identity) return null;
+                    return {
+                        receiverIterationCall: identity.name,
+                        ...(identity.isMethod && { receiverIterationCallIsMethod: true }),
+                        receiverIterationCallLine: value.startPosition.row + 1,
+                        receiverIterationCallStart: value.startIndex,
+                        receiverIterationCallEnd: value.endIndex,
+                    };
+                }
+            }
+        }
+        current = current.parent;
+    }
+    return null;
+}
+
+/**
+ * Retain the enum-variant contract that binds a match-arm receiver:
+ * `DirEntryInner::Raw(ref entry) => entry.path()`. The variant's indexed
+ * payload type is resolved query-time, where cross-file identity is known.
+ * Destructured/nested payloads abstain unless the receiver is the whole
+ * positional field.
+ */
+function rustPatternBindingOf(node, receiver) {
+    if (!receiver) return null;
+    const directBindingName = pattern => {
+        if (!pattern) return null;
+        if (pattern.type === 'identifier') return pattern.text;
+        if (!['ref_pattern', 'mut_pattern', 'reference_pattern']
+            .includes(pattern.type)) return null;
+        const identifiers = [];
+        const pending = [pattern];
+        while (pending.length > 0) {
+            const current = pending.pop();
+            if (current.type === 'identifier') {
+                identifiers.push(current.text);
+                continue;
+            }
+            if (current !== pattern &&
+                ['tuple_pattern', 'tuple_struct_pattern', 'struct_pattern']
+                    .includes(current.type)) {
+                return null;
+            }
+            for (let i = 0; i < current.namedChildCount; i++) {
+                pending.push(current.namedChild(i));
+            }
+        }
+        return identifiers.length === 1 ? identifiers[0] : null;
+    };
+
+    for (let ancestor = node.parent; ancestor; ancestor = ancestor.parent) {
+        if (ancestor.type === 'function_item') break;
+        if (ancestor.type === 'closure_expression') {
+            const params = ancestor.childForFieldName('parameters');
+            if (params && patternContainsIdentifier(params, receiver)) break;
+            continue; // captured binding from an outer match arm
+        }
+        if (ancestor.type !== 'match_arm') continue;
+        let matchExpression = ancestor.parent;
+        while (matchExpression && matchExpression.type !== 'match_expression' &&
+            matchExpression.type !== 'function_item') {
+            matchExpression = matchExpression.parent;
+        }
+        const matchValue = matchExpression?.type === 'match_expression'
+            ? matchExpression.childForFieldName('value')
+            : null;
+        const source = matchValue?.type === 'identifier'
+            ? { receiverPatternSourceVariable: matchValue.text }
+            : {};
+        const root = ancestor.childForFieldName('pattern');
+        const pending = root ? [root] : [];
+        while (pending.length > 0) {
+            const pattern = pending.pop();
+            if (pattern.type === 'tuple_struct_pattern') {
+                const typeNode = pattern.childForFieldName('type');
+                const positional = pattern.namedChildren
+                    .filter(child => !typeNode || child.id !== typeNode.id);
+                for (let i = 0; i < positional.length; i++) {
+                    if (directBindingName(positional[i]) !== receiver) continue;
+                    const pathText = typeNode?.text;
+                    if (!pathText) return null;
+                    const segments = pathText.split('::').filter(Boolean);
+                    const variant = segments.pop();
+                    if (!variant) return null;
+                    return {
+                        receiverPatternVariant: variant,
+                        receiverPatternIndex: i,
+                        ...source,
+                        ...(segments.length > 0 && {
+                            receiverPatternOwner: segments.join('::'),
+                        }),
+                    };
+                }
+            }
+            for (let i = 0; i < pattern.namedChildCount; i++) {
+                pending.push(pattern.namedChild(i));
+            }
+        }
+        return null;
+    }
+    return null;
+}
+
+function patternContainsIdentifier(pattern, name) {
+    const pending = pattern ? [pattern] : [];
+    while (pending.length > 0) {
+        const current = pending.pop();
+        if (current.type === 'identifier' && current.text === name) return true;
+        for (let i = 0; i < current.namedChildCount; i++) {
+            pending.push(current.namedChild(i));
+        }
+    }
+    return false;
+}
+
+function rustMacroCallIdentity(macroNode) {
+    if (!macroNode) return null;
+    const parts = macroNode.text.replace(/!$/, '').split('::').filter(Boolean);
+    const name = parts.pop();
+    if (!name) return null;
+    return {
+        name,
+        ...(parts.length > 0 && {
+            receiver: parts.map(part => part === '$crate' ? 'crate' : part).join('::'),
+        }),
+    };
 }
 
 function findCallsInCode(code, parser) {
@@ -1256,9 +1837,18 @@ function findCallsInCode(code, parser) {
     // Extract the base type name from a Rust type node (strips &, &mut, Box<>, etc.)
     const extractTypeName = (typeNode) => {
         if (!typeNode) return null;
-        if (typeNode.type === 'type_identifier') return typeNode.text;
+        if (typeNode.type === 'type_identifier' ||
+            typeNode.type === 'primitive_type') {
+            return typeNode.text;
+        }
         if (typeNode.type === 'reference_type') {
             // &Filter or &mut Filter -> Filter
+            for (let i = 0; i < typeNode.namedChildCount; i++) {
+                const r = extractTypeName(typeNode.namedChild(i));
+                if (r) return r;
+            }
+        }
+        if (typeNode.type === 'abstract_type' || typeNode.type === 'dynamic_type') {
             for (let i = 0; i < typeNode.namedChildCount; i++) {
                 const r = extractTypeName(typeNode.namedChild(i));
                 if (r) return r;
@@ -1276,22 +1866,74 @@ function findCallsInCode(code, parser) {
         return null;
     };
 
+    const extractTypeQualifier = (typeNode) => {
+        if (!typeNode) return null;
+        if (typeNode.type === 'reference_type') {
+            for (let i = 0; i < typeNode.namedChildCount; i++) {
+                const qualifier = extractTypeQualifier(typeNode.namedChild(i));
+                if (qualifier) return qualifier;
+            }
+            return null;
+        }
+        if (typeNode.type === 'scoped_type_identifier') {
+            const nameNode = typeNode.childForFieldName('name');
+            const text = typeNode.text;
+            const suffix = nameNode ? `::${nameNode.text}` : '';
+            return suffix && text.endsWith(suffix)
+                ? text.slice(0, -suffix.length) : null;
+        }
+        return null;
+    };
+
     // Build type map from function parameters (including self receiver for impl methods)
     const buildScopeTypeMap = (node) => {
         const typeMap = new Map();
+        typeMap.qualifiers = new Map();
+        typeMap.iteratorItems = new Map();
+        typeMap.annotationTexts = new Map();
+        typeMap.boundNames = new Set();
+        const retainBoundNames = (pattern) => {
+            if (!pattern) return;
+            const pending = [pattern];
+            while (pending.length > 0) {
+                const current = pending.pop();
+                if (current.type === 'identifier') {
+                    typeMap.boundNames.add(current.text);
+                    continue;
+                }
+                for (let i = 0; i < current.namedChildCount; i++) {
+                    pending.push(current.namedChild(i));
+                }
+            }
+        };
         const paramsNode = node.childForFieldName('parameters');
         if (paramsNode) {
             for (let i = 0; i < paramsNode.namedChildCount; i++) {
                 const param = paramsNode.namedChild(i);
                 if (param.type === 'parameter') {
                     const patternNode = param.childForFieldName('pattern');
+                    retainBoundNames(patternNode);
                     const typeNode = param.childForFieldName('type');
                     const typeName = extractTypeName(typeNode);
+                    const qualifier = extractTypeQualifier(typeNode);
+                    const iteratorItem = extractRustIteratorItemTypeFromTypeNode(typeNode);
                     if (patternNode && typeName) {
                         // Pattern can be identifier or _
                         const name = patternNode.type === 'identifier' ? patternNode.text : null;
-                        if (name) typeMap.set(name, typeName);
+                        if (name) {
+                            typeMap.set(name, typeName);
+                            typeMap.annotationTexts.set(name, typeNode.text);
+                            if (qualifier) typeMap.qualifiers.set(name, qualifier);
+                            if (iteratorItem) typeMap.iteratorItems.set(name, iteratorItem);
+                        }
                     }
+                } else {
+                    // Closure parameters normally have no annotation. They
+                    // still bind the name and must stop lookup before an
+                    // identically-named outer parameter (`arg: &str`;
+                    // `.any(|arg| arg.method())`) leaks its unrelated type
+                    // into the closure call record.
+                    retainBoundNames(param);
                 }
             }
         }
@@ -1313,7 +1955,10 @@ function findCallsInCode(code, parser) {
     // Helper to get current enclosing function
     const getCurrentEnclosingFunction = () => {
         return functionStack.length > 0
-            ? { ...functionStack[functionStack.length - 1] }
+            ? {
+                ...functionStack[functionStack.length - 1],
+                scopeChain: functionStack.map(scope => scope.startLine),
+            }
             : null;
     };
 
@@ -1351,10 +1996,11 @@ function findCallsInCode(code, parser) {
         while (n && ['try_expression', 'await_expression', 'parenthesized_expression'].includes(n.type)) {
             n = n.namedChildCount === 1 ? n.namedChild(0) : null;
         }
-        return n?.type === 'call_expression';
+        return n?.type === 'call_expression' || n?.type === 'macro_invocation' ||
+            !!rustMatchCallProducer(n);
     };
 
-    const flowInvalidatedAt = (node, varName) => {
+    const flowEventAt = (node, varName) => {
         const pos = node?.startIndex ?? -1;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const byName = scopeFlowEvents.get(functionStack[i].startLine);
@@ -1365,19 +2011,123 @@ function findCallsInCode(code, parser) {
                 if (event.at <= pos && pos <= event.until &&
                     (!latest || event.at > latest.at)) latest = event;
             }
-            if (latest) return latest.invalidated;
+            if (latest) return latest;
         }
-        return false;
+        return null;
     };
+
+    const flowInvalidatedAt = (node, varName) =>
+        !!flowEventAt(node, varName)?.invalidated;
 
     // Look up variable type from scope chain
     const getReceiverType = (varName, atNode) => {
         if (atNode && patternShadowsAt(atNode, varName)) return undefined;
+        const flow = flowEventAt(atNode, varName);
+        if (flow?.type) return flow.type;
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return typeMap.get(varName);
+            if (typeMap?.boundNames?.has(varName)) return undefined;
         }
         return undefined;
+    };
+
+    const getReceiverTypeQualifier = (varName, atNode) => {
+        if (atNode && patternShadowsAt(atNode, varName)) return undefined;
+        const flow = flowEventAt(atNode, varName);
+        if (flow?.qualifier) return flow.qualifier;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.qualifiers?.has(varName)) {
+                return typeMap.qualifiers.get(varName);
+            }
+            if (typeMap?.boundNames?.has(varName)) return undefined;
+        }
+        return undefined;
+    };
+
+    const getReceiverIteratorItemType = (varName, atNode) => {
+        if (atNode && patternShadowsAt(atNode, varName)) return undefined;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.iteratorItems?.has(varName)) {
+                return typeMap.iteratorItems.get(varName);
+            }
+            if (typeMap?.boundNames?.has(varName)) return undefined;
+        }
+        return undefined;
+    };
+
+    const getReceiverAnnotationText = (varName, atNode) => {
+        if (atNode && patternShadowsAt(atNode, varName)) return undefined;
+        for (let i = functionStack.length - 1; i >= 0; i--) {
+            const typeMap = scopeTypes.get(functionStack[i].startLine);
+            if (typeMap?.annotationTexts?.has(varName)) {
+                return typeMap.annotationTexts.get(varName);
+            }
+            if (typeMap?.boundNames?.has(varName)) return undefined;
+        }
+        return undefined;
+    };
+
+    const matchBindingType = (value, atNode) => {
+        if (value?.type !== 'match_expression') return null;
+        const source = value.childForFieldName('value');
+        if (source?.type !== 'identifier') return null;
+        const sourceType = getReceiverAnnotationText(source.text, atNode);
+        if (!sourceType) return null;
+        const body = value.childForFieldName('body');
+        if (!body) return null;
+        let variant = null;
+        let binding = null;
+        for (let i = 0; i < body.namedChildCount; i++) {
+            const arm = body.namedChild(i);
+            if (arm.type !== 'match_arm') continue;
+            const armValue = arm.childForFieldName('value');
+            if (['return_expression', 'break_expression', 'continue_expression']
+                .includes(armValue?.type)) {
+                continue;
+            }
+            if (armValue?.type !== 'identifier') return null;
+            const pattern = arm.childForFieldName('pattern');
+            const tuples = [];
+            const pending = pattern ? [pattern] : [];
+            while (pending.length > 0) {
+                const current = pending.pop();
+                if (current.type === 'tuple_struct_pattern') tuples.push(current);
+                for (let j = 0; j < current.namedChildCount; j++) {
+                    pending.push(current.namedChild(j));
+                }
+            }
+            const tuple = tuples.find(candidate =>
+                candidate.namedChildren.some(child =>
+                    child.type === 'identifier' && child.text === armValue.text));
+            const typeNode = tuple?.childForFieldName('type');
+            if (!tuple || !typeNode) return null;
+            const parts = typeNode.text.split('::').filter(Boolean);
+            const currentVariant = parts.pop();
+            if (!currentVariant || (variant && variant !== currentVariant) ||
+                (binding && binding !== armValue.text)) {
+                return null;
+            }
+            variant = currentVariant;
+            binding = armValue.text;
+        }
+        if (!variant || !binding) return null;
+        const wrapper = sourceType.trim().match(
+            /^(?:[A-Za-z_][A-Za-z0-9_]*\s*::\s*)*(Option|Result)\s*<(.*)>$/s);
+        if (!wrapper) return null;
+        const args = wrapper[2].split(',');
+        const raw = args[variant === 'Err' ? 1 : 0]?.trim();
+        if (!raw || [...'<>()[]'].some(character => raw.includes(character))) {
+            return null;
+        }
+        const match = raw.match(/^(?:(.*)::)?([A-Za-z_][A-Za-z0-9_]*)$/);
+        if (!match) return null;
+        return {
+            type: match[2],
+            ...(match[1] && { qualifier: match[1] }),
+        };
     };
 
     // Walk up to the enclosing impl block's target type (impl<T> Foo<T> → Foo).
@@ -1391,13 +2141,96 @@ function findCallsInCode(code, parser) {
         return undefined;
     };
 
+    const closureContractSource = (node) => {
+        if (node.type !== 'closure_expression') return null;
+        const argumentsNode = node.parent;
+        const outerCall = argumentsNode?.type === 'arguments'
+            ? argumentsNode.parent : null;
+        if (outerCall?.type !== 'call_expression') return null;
+        let argumentIndex = 0;
+        let found = false;
+        for (let i = 0; i < argumentsNode.namedChildCount; i++) {
+            const argument = argumentsNode.namedChild(i);
+            if (argument.type.endsWith('comment')) continue;
+            if (argument.id === node.id) {
+                found = true;
+                break;
+            }
+            argumentIndex++;
+        }
+        if (!found) return null;
+        let functionNode = outerCall.childForFieldName('function');
+        if (functionNode?.type === 'generic_function') {
+            functionNode = functionNode.childForFieldName('function') || functionNode;
+        }
+        let callName;
+        let callIsMethod = false;
+        if (functionNode?.type === 'field_expression') {
+            callName = functionNode.childForFieldName('field')?.text;
+            callIsMethod = true;
+        } else if (functionNode?.type === 'identifier') {
+            callName = functionNode.text;
+        } else if (functionNode?.type === 'scoped_identifier') {
+            callName = functionNode.childForFieldName('name')?.text;
+            callIsMethod = true;
+        }
+        if (!callName) return null;
+        const parameters = node.childForFieldName('parameters');
+        const parameterNames = [];
+        let parametersComplete = true;
+        if (parameters) {
+            for (let i = 0; i < parameters.namedChildCount; i++) {
+                const parameter = parameters.namedChild(i);
+                if (parameter.type === 'identifier') {
+                    parameterNames.push(parameter.text);
+                    continue;
+                }
+                // `|ref a, ref b|` and `|mut value|` bind the same callback
+                // parameter as their identifier child. Destructuring patterns
+                // intentionally abstain: a tuple member is not the callback's
+                // whole declared type.
+                if (['ref_pattern', 'mut_pattern', 'reference_pattern']
+                    .includes(parameter.type)) {
+                    const identifiers = [];
+                    const pending = [parameter];
+                    while (pending.length > 0) {
+                        const current = pending.pop();
+                        if (current.type === 'identifier') {
+                            identifiers.push(current.text);
+                            continue;
+                        }
+                        for (let j = 0; j < current.namedChildCount; j++) {
+                            pending.push(current.namedChild(j));
+                        }
+                    }
+                    if (identifiers.length === 1) {
+                        parameterNames.push(identifiers[0]);
+                        continue;
+                    }
+                }
+                parametersComplete = false;
+                break;
+            }
+        }
+        if (!parametersComplete || parameterNames.length === 0) return null;
+        return {
+            closureSourceCall: callName,
+            closureSourceCallStart: outerCall.startIndex,
+            closureSourceCallEnd: outerCall.endIndex,
+            closureSourceCallIsMethod: callIsMethod,
+            closureArgumentIndex: argumentIndex,
+            closureParameterNames: parameterNames,
+        };
+    };
+
     traverseTree(tree.rootNode, (node) => {
         // Track function entry
         if (isFunctionNode(node)) {
             const entry = {
                 name: extractFunctionName(node),
                 startLine: node.startPosition.row + 1,
-                endLine: node.endPosition.row + 1
+                endLine: node.endPosition.row + 1,
+                ...closureContractSource(node),
             };
             functionStack.push(entry);
             scopeTypes.set(entry.startLine, buildScopeTypeMap(node));
@@ -1428,7 +2261,12 @@ function findCallsInCode(code, parser) {
                     byName.get(pattern.text).push({
                         at: node.endIndex,
                         until,
-                        invalidated: !valueHasFlowProducer(value),
+                        ...(() => {
+                            const inferred = matchBindingType(value, node);
+                            return inferred
+                                ? { invalidated: false, ...inferred }
+                                : { invalidated: !valueHasFlowProducer(value) };
+                        })(),
                     });
                 }
             }
@@ -1440,6 +2278,7 @@ function findCallsInCode(code, parser) {
             if (!funcNode) return true;
 
             // Unwrap turbofish: parse::<i32>() has generic_function wrapping the actual function
+            const collectResult = extractCollectResultContract(funcNode);
             if (funcNode.type === 'generic_function') {
                 funcNode = funcNode.childForFieldName('function') || funcNode;
             }
@@ -1469,10 +2308,14 @@ function findCallsInCode(code, parser) {
                 calls.push({
                     name: funcNode.text,
                     line: node.startPosition.row + 1,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
                     isMethod: false,
                     argCount,
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.unwrapped && { assignedUnwrap: true }),
+                    ...(assigned?.tuple && { assignedTuple: true }),
+                    ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
@@ -1483,6 +2326,18 @@ function findCallsInCode(code, parser) {
 
                 if (fieldNode) {
                     let receiver = (valueNode?.type === 'identifier' || valueNode?.type === 'self') ? valueNode.text : undefined;
+                    // A range index preserves the receiver's collection/slice
+                    // type (`doc[start..].find(...)` still dispatches on
+                    // `str`). A single-element index does NOT: `items[i]`
+                    // dispatches on the element type, so only the
+                    // range-expression shape may reuse the root binding.
+                    if (!receiver && valueNode?.type === 'index_expression' &&
+                        valueNode.namedChild(1)?.type === 'range_expression') {
+                        const indexed = valueNode.namedChild(0);
+                        if (indexed?.type === 'identifier' || indexed?.type === 'self') {
+                            receiver = indexed.text;
+                        }
+                    }
                     // Detect chained Router::new()-rooted method calls. axum's canonical
                     // idiom is `Router::new().route("/p", get(h)).route(...)` where the
                     // receiver of `.route(...)` is itself a call_expression. Walk the
@@ -1507,7 +2362,8 @@ function findCallsInCode(code, parser) {
                     // low.sep.into_bytes() — with .clone() transparency (clone()
                     // returns Self by stdlib convention). receiverRoot/Field/RootType
                     // let findCallers hop to the field's declared type cross-file.
-                    let receiverRoot, receiverField, receiverRootType;
+                    let receiverRoot, receiverField, receiverFields, receiverRootType;
+                    let receiverFieldCallRoot;
                     if (!receiver) {
                         let obj = valueNode;
                         while (obj?.type === 'call_expression') {
@@ -1518,15 +2374,32 @@ function findCallsInCode(code, parser) {
                             } else break;
                         }
                         if (obj?.type === 'field_expression') {
-                            const rootNode = obj.childForFieldName('value');
-                            const fldNode = obj.childForFieldName('field');
-                            if ((fldNode?.type === 'field_identifier' || fldNode?.type === 'integer_literal') && rootNode &&
+                            const fields = [];
+                            let rootNode = obj;
+                            while (rootNode?.type === 'field_expression') {
+                                const fldNode = rootNode.childForFieldName('field');
+                                if (!fldNode || ![
+                                    'field_identifier', 'integer_literal',
+                                ].includes(fldNode.type)) {
+                                    fields.length = 0;
+                                    break;
+                                }
+                                fields.unshift(fldNode.text);
+                                rootNode = rootNode.childForFieldName('value');
+                            }
+                            if (fields.length > 0 && rootNode &&
                                 (rootNode.type === 'identifier' || rootNode.type === 'self')) {
                                 receiverRoot = rootNode.text;
-                                receiverField = fldNode.text;
+                                receiverFields = fields;
+                                receiverField = fields[fields.length - 1];
                                 receiverRootType = rootNode.type === 'self'
                                     ? findEnclosingImplType(node)
                                     : getReceiverType(rootNode.text, node);
+                            } else if (fields.length > 0 &&
+                                rootNode?.type === 'call_expression') {
+                                receiverFields = fields;
+                                receiverField = fields[fields.length - 1];
+                                receiverFieldCallRoot = rootNode;
                             }
                         } else if (obj && obj !== valueNode &&
                             (obj.type === 'identifier' || obj.type === 'self')) {
@@ -1546,6 +2419,7 @@ function findCallsInCode(code, parser) {
                     // rooted chains keep their synthetic receiver marker for
                     // the bridge but get the link too.
                     let receiverCall, receiverCallIsMethod, receiverCallLine;
+                    let receiverCallStart, receiverCallEnd;
                     if ((!receiver || receiverIsChainRoot) && !receiverField &&
                         valueNode?.type === 'call_expression') {
                         let prodFunc = valueNode.childForFieldName('function');
@@ -1555,12 +2429,16 @@ function findCallsInCode(code, parser) {
                         if (prodFunc?.type === 'identifier') {
                             receiverCall = prodFunc.text;
                             receiverCallLine = valueNode.startPosition.row + 1;
+                            receiverCallStart = valueNode.startIndex;
+                            receiverCallEnd = valueNode.endIndex;
                         } else if (prodFunc?.type === 'field_expression') {
                             const pf = prodFunc.childForFieldName('field');
                             if (pf) {
                                 receiverCall = pf.text;
                                 receiverCallIsMethod = true;
                                 receiverCallLine = pf.startPosition.row + 1;
+                                receiverCallStart = valueNode.startIndex;
+                                receiverCallEnd = valueNode.endIndex;
                             }
                         } else if (prodFunc?.type === 'scoped_identifier') {
                             // Path producer: Command::new(...).arg(...) — the
@@ -1573,7 +2451,40 @@ function findCallsInCode(code, parser) {
                                 receiverCall = prodName;
                                 receiverCallIsMethod = true;
                                 receiverCallLine = valueNode.startPosition.row + 1;
+                                receiverCallStart = valueNode.startIndex;
+                                receiverCallEnd = valueNode.endIndex;
                             }
+                        }
+                    } else if ((!receiver || receiverIsChainRoot) && !receiverField &&
+                        valueNode?.type === 'macro_invocation') {
+                        const macro = rustMacroCallIdentity(
+                            valueNode.childForFieldName('macro'));
+                        if (macro) {
+                            receiverCall = macro.name;
+                            receiverCallLine = valueNode.startPosition.row + 1;
+                            receiverCallStart = valueNode.startIndex;
+                            receiverCallEnd = valueNode.endIndex;
+                        }
+                    }
+                    if (!receiverCall && receiverFieldCallRoot) {
+                        let prodFunc = receiverFieldCallRoot.childForFieldName('function');
+                        if (prodFunc?.type === 'generic_function') {
+                            prodFunc = prodFunc.childForFieldName('function') || prodFunc;
+                        }
+                        if (prodFunc?.type === 'identifier') {
+                            receiverCall = prodFunc.text;
+                        } else if (prodFunc?.type === 'field_expression') {
+                            receiverCall = prodFunc.childForFieldName('field')?.text;
+                            receiverCallIsMethod = !!receiverCall;
+                        } else if (prodFunc?.type === 'scoped_identifier') {
+                            const segments = prodFunc.text.split('::');
+                            receiverCall = segments[segments.length - 1];
+                            receiverCallIsMethod = !!receiverCall;
+                        }
+                        if (receiverCall) {
+                            receiverCallLine = receiverFieldCallRoot.startPosition.row + 1;
+                            receiverCallStart = receiverFieldCallRoot.startIndex;
+                            receiverCallEnd = receiverFieldCallRoot.endIndex;
                         }
                     }
                     // Literal receivers carry their builtin type (fix #220,
@@ -1587,8 +2498,23 @@ function findCallsInCode(code, parser) {
                     const receiverType = (receiver && receiver !== 'self' && !receiverIsChainRoot)
                         ? getReceiverType(receiver, node)
                         : literalReceiverType;
+                    const receiverTypeQualifier = receiver && receiverType
+                        ? getReceiverTypeQualifier(receiver, node)
+                        : undefined;
+                    const receiverIteratorItemType = receiver
+                        ? getReceiverIteratorItemType(receiver, node)
+                        : undefined;
                     const receiverPatternShadow = !!(receiver && patternShadowsAt(node, receiver));
+                    const receiverPatternBinding = rustPatternBindingOf(node, receiver);
+                    if (receiverPatternBinding?.receiverPatternSourceVariable) {
+                        const sourceType = getReceiverAnnotationText(
+                            receiverPatternBinding.receiverPatternSourceVariable, node);
+                        if (sourceType) {
+                            receiverPatternBinding.receiverPatternSourceType = sourceType;
+                        }
+                    }
                     const receiverFlowInvalidated = !!(receiver && flowInvalidatedAt(node, receiver));
+                    const iterationSource = rustIterationSourceOf(node, receiver);
                     const firstArg = getFirstStringArg(node);
                     // RUST-2: For chained calls like `a().b().parse::<T>().ok()`,
                     // each method should report the line where its OWN identifier
@@ -1598,20 +2524,38 @@ function findCallsInCode(code, parser) {
                     calls.push({
                         name: fieldNode.text,
                         line: fieldNode.startPosition.row + 1,
+                        callStart: node.startIndex,
+                        callEnd: node.endIndex,
                         isMethod: true,
                         receiver,
                         ...(receiverType && { receiverType }),
+                        ...(receiverTypeQualifier && { receiverTypeQualifier }),
+                        ...(receiverIteratorItemType && { receiverIteratorItemType }),
                         ...(receiverPatternShadow && { receiverPatternShadow: true }),
+                        ...(receiverPatternBinding || {}),
                         ...(receiverFlowInvalidated && { receiverFlowInvalidated: true }),
+                        ...(iterationSource || {}),
                         ...(receiverIsChainRoot && { receiverIsChainRoot: true }),
                         ...(receiverField && { receiverRoot, receiverField }),
+                        ...(receiverFields?.length > 1 && { receiverFields }),
                         ...(receiverField && receiverRootType && { receiverRootType }),
                         ...(receiverCall && { receiverCall }),
                         ...(receiverCallIsMethod && { receiverCallIsMethod: true }),
+                        ...(valueNode?.type === 'macro_invocation' && receiverCall && {
+                            receiverCallIsMacro: true,
+                        }),
                         ...(receiverCallLine && { receiverCallLine }),
+                        ...(receiverCallStart != null && { receiverCallStart }),
+                        ...(receiverCallEnd != null && { receiverCallEnd }),
                         argCount,
                         ...(assigned && { assignedTo: assigned.assignedTo }),
                         ...(assigned?.unwrapped && { assignedUnwrap: true }),
+                        ...(assigned?.tuple && { assignedTuple: true }),
+                        ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
+                        ...(collectResult && {
+                            explicitResultType: collectResult.type,
+                            explicitResultItemType: collectResult.itemType,
+                        }),
                         enclosingFunction,
                         ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                     });
@@ -1631,12 +2575,16 @@ function findCallsInCode(code, parser) {
                 calls.push({
                     name: name,
                     line: node.startPosition.row + 1,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
                     isMethod: segments.length > 1,
                     isPathCall: true,  // Distinguishes Type::func()/module::func() from obj.method()
                     receiver: recvSegments.length > 0 ? recvSegments.join('::') : undefined,
                     argCount,
                     ...(assigned && { assignedTo: assigned.assignedTo }),
                     ...(assigned?.unwrapped && { assignedUnwrap: true }),
+                    ...(assigned?.tuple && { assignedTuple: true }),
+                    ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
                     enclosingFunction,
                     ...(firstArg && { firstStringArg: firstArg.value, firstStringArgInterp: firstArg.interp })
                 });
@@ -1703,17 +2651,25 @@ function findCallsInCode(code, parser) {
         if (node.type === 'macro_invocation') {
             const macroNode = node.childForFieldName('macro');
             const enclosingFunction = getCurrentEnclosingFunction();
+            let macro = null;
             if (macroNode) {
-                let macroName = macroNode.text;
-                // Remove the trailing ! if present in the name
-                if (macroName.endsWith('!')) {
-                    macroName = macroName.slice(0, -1);
-                }
+                macro = rustMacroCallIdentity(macroNode);
+                const assigned = rustAssignmentTargetOf(node);
                 calls.push({
-                    name: macroName,
+                    name: macro?.name || macroNode.text.replace(/!$/, ''),
                     line: node.startPosition.row + 1,
+                    callStart: node.startIndex,
+                    callEnd: node.endIndex,
                     isMethod: false,
                     isMacro: true,
+                    ...(macro?.receiver && {
+                        receiver: macro.receiver,
+                        isPathMacro: true,
+                    }),
+                    ...(assigned && { assignedTo: assigned.assignedTo }),
+                    ...(assigned?.unwrapped && { assignedUnwrap: true }),
+                    ...(assigned?.tuple && { assignedTuple: true }),
+                    ...(assigned?.tupleRest && { assignedTupleRest: assigned.tupleRest }),
                     enclosingFunction
                 });
             }
@@ -1726,8 +2682,34 @@ function findCallsInCode(code, parser) {
                 if (child.type === 'token_tree') {
                     extractCallsFromTokenTree(
                         child, enclosingFunction, calls, getReceiverType,
-                        patternShadowsAt, flowInvalidatedAt);
+                        patternShadowsAt, flowInvalidatedAt, {
+                            kind: 'invocation',
+                            containerMacro: macro?.name,
+                        });
                 }
+            }
+            return true;
+        }
+
+        // Attribute arguments are token trees, but they contain ordinary
+        // Rust paths and builder expressions that proc macros resolve at
+        // compile time (`#[arg(value_parser = BoolishValueParser::new())]`).
+        // Recover those calls with the same AST-token reconstruction used for
+        // macro invocation arguments. The attribute name itself is metadata,
+        // not a direct call site, so only its argument token tree is scanned.
+        if (node.type === 'attribute_item') {
+            const attribute = node.namedChildren.find(child => child.type === 'attribute');
+            const attributeName = attribute?.namedChildren.find(child =>
+                child.type === 'identifier' || child.type === 'scoped_identifier')?.text;
+            const enclosingFunction = getCurrentEnclosingFunction();
+            for (const child of attribute?.namedChildren || []) {
+                if (child.type !== 'token_tree') continue;
+                extractCallsFromTokenTree(
+                    child, enclosingFunction, calls, getReceiverType,
+                    patternShadowsAt, flowInvalidatedAt, {
+                        kind: 'attribute',
+                        containerMacro: attributeName,
+                    });
             }
             return true;
         }
@@ -1746,7 +2728,7 @@ function findCallsInCode(code, parser) {
                     if (part.type === 'token_tree') {
                         extractCallsFromTokenTree(
                             part, enclosingFunction, calls, getReceiverType,
-                            patternShadowsAt, flowInvalidatedAt);
+                            patternShadowsAt, flowInvalidatedAt, 'definition');
                     }
                 }
             }
@@ -1797,9 +2779,11 @@ function findCallsInCode(code, parser) {
                 const typeMap = scopeTypes.get(scopeKey);
                 if (typeMap) {
                     let typeName = null;
+                    let typeQualifier = null;
                     // Pattern 3: explicit type annotation — let s: Server = ...
                     if (typeAnnotation) {
                         typeName = extractTypeName(typeAnnotation);
+                        typeQualifier = extractTypeQualifier(typeAnnotation);
                     }
                     if (!typeName && valueNode) {
                         // Pattern 1: struct expression — let s = Server { ... }
@@ -1809,6 +2793,7 @@ function findCallsInCode(code, parser) {
                             // Strip path prefix: module::Server → Server
                             if (typeName && typeName.includes('::')) {
                                 const parts = typeName.split('::');
+                                typeQualifier = parts.slice(0, -1).join('::');
                                 typeName = parts[parts.length - 1];
                             }
                         }
@@ -1820,6 +2805,7 @@ function findCallsInCode(code, parser) {
                                 typeName = nameNode?.text || null;
                                 if (typeName && typeName.includes('::')) {
                                     const parts = typeName.split('::');
+                                    typeQualifier = parts.slice(0, -1).join('::');
                                     typeName = parts[parts.length - 1];
                                 }
                             }
@@ -1834,13 +2820,17 @@ function findCallsInCode(code, parser) {
                                     const methodName = segments[segments.length - 1];
                                     if (/^(new|from|default|with_|create|build|open|connect|init)/.test(methodName)) {
                                         typeName = segments[segments.length - 2];
+                                        typeQualifier = segments.slice(0, -2).join('::') || null;
                                         if (!typeName || !/^[A-Z]/.test(typeName)) typeName = null;
                                     }
                                 }
                             }
                         }
                     }
-                    if (typeName) typeMap.set(varName, typeName);
+                    if (typeName) {
+                        typeMap.set(varName, typeName);
+                        if (typeQualifier) typeMap.qualifiers.set(varName, typeQualifier);
+                    }
                 }
             }
         }
@@ -1871,82 +2861,76 @@ function findImportsInCode(code, parser) {
     const tree = parseTree(parser, code);
     const imports = [];
 
+    const joinUsePath = (prefix, suffix) => {
+        const left = String(prefix || '').replace(/::$/, '');
+        const right = String(suffix || '').replace(/^::/, '');
+        return left && right ? `${left}::${right}` : left || right;
+    };
+    const addLeaf = (module, localName, type = 'use', dynamic = false, line) => {
+        if (!module || !localName) return;
+        imports.push({
+            module,
+            names: [localName],
+            type,
+            dynamic,
+            line,
+        });
+    };
+    const collectUseTree = (node, prefix, line) => {
+        if (!node || node.type === 'visibility_modifier') return;
+        if (node.type === 'scoped_use_list') {
+            const pathNode = node.childForFieldName('path');
+            const listNode = node.childForFieldName('list');
+            const nextPrefix = joinUsePath(prefix, pathNode?.text);
+            if (listNode) collectUseTree(listNode, nextPrefix, line);
+            return;
+        }
+        if (node.type === 'use_list') {
+            for (let i = 0; i < node.namedChildCount; i++) {
+                collectUseTree(node.namedChild(i), prefix, line);
+            }
+            return;
+        }
+        if (node.type === 'use_as_clause') {
+            const pathNode = node.namedChild(0);
+            const aliasNode = node.childForFieldName('alias') || node.namedChild(1);
+            if (pathNode && aliasNode) {
+                addLeaf(joinUsePath(prefix, pathNode.text), aliasNode.text,
+                    'use', false, line);
+            }
+            return;
+        }
+        if (node.type === 'use_wildcard') {
+            const pathNode = node.namedChild(0);
+            addLeaf(joinUsePath(prefix, pathNode?.text), '*',
+                'use-glob', true, line);
+            return;
+        }
+        if (node.type === 'identifier' || node.type === 'scoped_identifier' ||
+            node.type === 'crate' || node.type === 'self' || node.type === 'super') {
+            if (node.text === 'self' && prefix) {
+                addLeaf(prefix, prefix.split('::').pop(), 'use', false, line);
+                return;
+            }
+            const module = joinUsePath(prefix, node.text);
+            addLeaf(module, node.text.split('::').pop(), 'use', false, line);
+        }
+    };
+
     traverseTreeCached(tree.rootNode, (node) => {
         // use declarations
         if (node.type === 'use_declaration') {
             const line = node.startPosition.row + 1;
-
+            // A use declaration has one semantic tree below optional
+            // visibility. Recursively flatten every leaf while retaining its
+            // full module path. In particular,
+            // `use crate::{haystack::{Haystack, Builder}}` becomes the exact
+            // bindings `crate::haystack::Haystack` and
+            // `crate::haystack::Builder`, rather than the lossy old
+            // `{ module: "crate", name: "haystack" }` approximation.
             for (let i = 0; i < node.namedChildCount; i++) {
                 const child = node.namedChild(i);
-
-                if (child.type === 'use_as_clause') {
-                    // use foo::bar as baz
-                    const pathNode = child.namedChild(0); // the original path
-                    const aliasNode = child.childForFieldName('alias');
-                    if (pathNode) {
-                        const originalPath = pathNode.text;
-                        const alias = aliasNode ? aliasNode.text : originalPath.split('::').pop();
-                        imports.push({
-                            module: originalPath,
-                            names: [alias],
-                            type: 'use',
-                            dynamic: false,
-                            line
-                        });
-                    }
-                } else if (child.type === 'scoped_identifier' || child.type === 'identifier') {
-                    // use std::io or use foo
-                    const path = child.text;
-                    const segments = path.split('::');
-                    imports.push({
-                        module: path,
-                        names: [segments[segments.length - 1]],
-                        type: 'use',
-                        dynamic: false,
-                        line
-                    });
-                } else if (child.type === 'use_wildcard') {
-                    // use std::collections::*
-                    const scopedId = child.namedChild(0);
-                    if (scopedId) {
-                        imports.push({
-                            module: scopedId.text,
-                            names: ['*'],
-                            type: 'use-glob',
-                            dynamic: true,
-                            line
-                        });
-                    }
-                } else if (child.type === 'use_list' || child.type === 'scoped_use_list') {
-                    // use std::{io, fs} or use foo::{bar, baz}
-                    // Extract the base path and names
-                    const pathNode = child.childForFieldName('path');
-                    const listNode = child.childForFieldName('list');
-
-                    if (pathNode && listNode) {
-                        const basePath = pathNode.text;
-                        const names = [];
-                        for (let j = 0; j < listNode.namedChildCount; j++) {
-                            const item = listNode.namedChild(j);
-                            if (item.type === 'identifier') {
-                                names.push(item.text);
-                            } else if (item.type === 'use_as_clause') {
-                                const aliasNode = item.childForFieldName('alias');
-                                const pathItem = item.namedChild(0);
-                                names.push(aliasNode ? aliasNode.text : (pathItem ? pathItem.text : item.text));
-                            } else if (item.type === 'scoped_identifier') {
-                                names.push(item.text);
-                            }
-                        }
-                        imports.push({
-                            module: basePath,
-                            names,
-                            type: 'use',
-                            dynamic: false,
-                            line
-                        });
-                    }
-                }
+                collectUseTree(child, '', line);
             }
             return true;
         }

@@ -65,6 +65,246 @@ describe('Regression: Java class methods in context', () => {
     });
 });
 
+describe('v5 ownership evidence: nested Java method identity', () => {
+    it('does not conflate overloads on same-named nested classes in one package', () => {
+        const dir = tmp({
+            'src/main/java/p/OuterA.java': [
+                'package p;',
+                'public class OuterA {',
+                '  public static class Builder {',
+                '    public int build(int value) { return value; }',
+                '  }',
+                '  public static Builder builder() { return new Builder(); }',
+                '}',
+            ].join('\n'),
+            'src/main/java/p/OuterB.java': [
+                'package p;',
+                'public class OuterB {',
+                '  public static class Builder {',
+                '    public String build(String value) { return value; }',
+                '  }',
+                '  public static Builder builder() { return new Builder(); }',
+                '}',
+            ].join('\n'),
+            'src/main/java/p/Use.java': [
+                'package p;',
+                'class Use {',
+                '  void run(OuterA.Builder a, OuterB.Builder b) {',
+                '    a.build(1);',
+                '    b.build("x");',
+                '    OuterA.builder().build(2);',
+                '    OuterB.builder().build("y");',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('build').find(d =>
+                d.relativePath.endsWith('/OuterA.java'));
+            assert.strictEqual(target.enclosingType, 'OuterA');
+            const callers = index.findCallers('build', {
+                targetDefinitions: [target],
+                collectAccount: true,
+            });
+            assert.ok(callers.some(c => c.relativePath.endsWith('/Use.java') && c.line === 4),
+                `OuterA.Builder.build call must confirm: ${JSON.stringify(callers)}`);
+            assert.ok(callers.some(c => c.relativePath.endsWith('/Use.java') && c.line === 6),
+                `OuterA builder chain must confirm: ${JSON.stringify(callers)}`);
+            assert.ok(!callers.some(c => c.relativePath.endsWith('/Use.java') && c.line === 5),
+                `OuterB.Builder.build must not confirm: ${JSON.stringify(callers)}`);
+            assert.ok(!callers.some(c => c.relativePath.endsWith('/Use.java') && c.line === 7),
+                `OuterB builder chain must not confirm: ${JSON.stringify(callers)}`);
+            assert.ok(!(callers.unverifiedCallers || [])
+                .some(c => c.relativePath.endsWith('/Use.java') &&
+                    (c.line === 5 || c.line === 7)),
+                `other nested owner must be excluded, not ambiguous: ` +
+                `${JSON.stringify(callers.unverifiedCallers)}`);
+            const result = execute(index, 'context', {
+                name: `${target.relativePath}:${target.startLine}:build`,
+            });
+            assert.ok(result.ok, result.error);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('routes explicit Java static owners before overload ambiguity', () => {
+        const dir = tmp({
+            'src/main/java/p/A.java': [
+                'package p;',
+                'class A { static String get(String value) { return value; } }',
+            ].join('\n'),
+            'src/main/java/p/B.java': [
+                'package p;',
+                'class B { static String get(String value) { return value; } }',
+            ].join('\n'),
+            'src/main/java/p/Use.java': [
+                'package p;',
+                'class Use {',
+                '  void run() { A.get("a"); B.get("b"); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('get').find(d => d.className === 'A');
+            const callers = index.findCallers('get', {
+                targetDefinitions: [target],
+                collectAccount: true,
+            });
+            assert.strictEqual(callers.filter(c => c.relativePath.endsWith('/Use.java')).length, 1);
+            assert.ok(!(callers.unverifiedEntries || [])
+                .some(c => c.relativePath.endsWith('/Use.java')),
+                `B.get must be excluded before overload routing: ` +
+                `${JSON.stringify(callers.unverifiedEntries)}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('v5 Java evidence: nested fields, overloads, dispatch, and recursion', () => {
+    it('carries lexical nested owners through a declared-field receiver path', () => {
+        const dir = tmp({
+            'Code.java': [
+                'class Code {',
+                '  static class Builder {',
+                '    Code build() { return new Code(); }',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Envelope.java': [
+                'class Envelope {',
+                '  static class Builder {',
+                '    Code.Builder code;',
+                '  }',
+                '  Envelope(Builder builder) {',
+                '    builder.code.build();',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Decoy.java': [
+                'class Decoy {',
+                '  static class Builder {',
+                '    Decoy build() { return new Decoy(); }',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('build').find(definition =>
+                definition.enclosingType === 'Code');
+            const callers = index.findCallers('build', {
+                targetDefinitions: [target],
+                collectAccount: true,
+            });
+            assert.ok(callers.some(caller =>
+                caller.relativePath === 'Envelope.java' && caller.line === 6),
+            `Code.Builder.build owns the nested field call: ${JSON.stringify(callers)}`);
+            assert.ok(!(callers.unverifiedEntries || []).some(entry =>
+                entry.relativePath === 'Envelope.java' && entry.line === 6),
+            `exact nested field identity is not ambiguous: ` +
+                `${JSON.stringify(callers.unverifiedEntries)}`);
+        } finally { rm(dir); }
+    });
+
+    it('uses an enclosing field type to select an inherited varargs overload', () => {
+        const dir = tmp({
+            'Spec.java': 'class Spec {}',
+            'Base.java': [
+                'import java.util.List;',
+                'class Base {',
+                '  Base annotated(Spec... values) { return this; }',
+                '  Base annotated(List<Spec> values) { return this; }',
+                '}',
+            ].join('\n'),
+            'Child.java': [
+                'import java.util.List;',
+                'class Child extends Base {',
+                '  @Override Child annotated(List<Spec> values) { return this; }',
+                '}',
+            ].join('\n'),
+            'Use.java': [
+                'class Use {',
+                '  private final Spec VALUE = new Spec();',
+                '  void run(Child child) {',
+                '    child.annotated(VALUE);',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('annotated').find(definition =>
+                definition.className === 'Child');
+            const callers = index.findCallers('annotated', {
+                targetDefinitions: [target],
+                collectAccount: true,
+            });
+            assert.ok(!callers.some(caller =>
+                caller.relativePath === 'Use.java' && caller.line === 4));
+            assert.ok(!(callers.unverifiedEntries || []).some(entry =>
+                entry.relativePath === 'Use.java' && entry.line === 4));
+            assert.ok((callers.accountRaw?.excludedEntries || []).some(entry =>
+                entry.line === 4 && entry.reason === 'overload-mismatch'),
+            `Spec field selects inherited Spec... overload: ${JSON.stringify(callers.accountRaw)}`);
+        } finally { rm(dir); }
+    });
+
+    it('labels multi-owner Object methods as runtime dispatch, not actionable ambiguity', () => {
+        const dir = tmp({
+            'A.java': 'class A { @Override public String toString() { return "a"; } }',
+            'B.java': 'class B { @Override public String toString() { return "b"; } }',
+            'Use.java': [
+                'class Use {',
+                '  String render(Object value) { return value.toString(); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('toString').find(definition =>
+                definition.className === 'A');
+            const callers = index.findCallers('toString', {
+                targetDefinitions: [target],
+                collectAccount: true,
+            });
+            const site = (callers.unverifiedEntries || []).find(entry =>
+                entry.relativePath === 'Use.java' && entry.line === 2);
+            assert.strictEqual(site?.reason, 'possible-dispatch');
+            assert.ok(String(site?.dispatchVia || '').startsWith('Object'));
+        } finally { rm(dir); }
+    });
+
+    it('exposes exact self-recursion on the contract callee surface', () => {
+        const dir = tmp({
+            'Walk.java': [
+                'class Walk {',
+                '  void walk(int depth) {',
+                '    if (depth > 0) walk(1);',
+                '  }',
+                '  void walk(String value) {}',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('walk').find(definition =>
+                definition.startLine === 2);
+            const callees = index.findCallees(target, {
+                includeMethods: true,
+                collectAccount: true,
+            });
+            const recursive = callees.find(edge =>
+                edge.bindingId === target.bindingId);
+            assert.deepStrictEqual(recursive?.sites, [3]);
+            assert.strictEqual(
+                callees.calleeAccount?.excluded.byReason['self-recursion'] || 0,
+                0);
+            assert.strictEqual(callees.calleeAccount?.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 // ============================================================================
 // Java main() not flagged as deadcode
 // ============================================================================
@@ -1200,9 +1440,9 @@ public class Application {
 
 describe('Bug Hunt: Java final in params not misclassified as method modifier', () => {
     it('should not report "final" on method when only parameter is final', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = `public class Foo {
     void doWork(final String name, final int count) {}
     public static final void doStatic() {}
@@ -1216,9 +1456,9 @@ describe('Bug Hunt: Java final in params not misclassified as method modifier', 
     });
 
     it('should keep "final" on method when it IS a method modifier', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = `public class Foo {
     public final void locked() {}
 }`;
@@ -1236,9 +1476,9 @@ describe('Bug Hunt: Java final in params not misclassified as method modifier', 
 
 describe('fix #163: Java receiver type tracking in findCallsInCode', () => {
     it('infers receiverType from method parameters', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = `public class Runner {
     public void process(Filter f, Score s) {
         f.run();
@@ -1255,9 +1495,9 @@ describe('fix #163: Java receiver type tracking in findCallsInCode', () => {
     });
 
     it('infers receiverType from new Type() assignments', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = `public class App {
     public void main() {
         Filter f = new Filter();
@@ -1273,9 +1513,9 @@ describe('fix #163: Java receiver type tracking in findCallsInCode', () => {
     });
 
     it('does not set receiverType for this.method()', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = `public class Foo {
     public void bar() { this.baz(); }
     public void baz() {}
@@ -2312,7 +2552,8 @@ describe('fix #210: external-contract methods (Java)', () => {
             const output = require('../core/output');
             const formatted = output.formatContext(r.result);
             const text = typeof formatted === 'string' ? formatted : formatted.text;
-            assert.ok(text.includes('possible-dispatch via Number — external contract'),
+            assert.ok(text.includes('CALLERS — RUNTIME DISPATCH'));
+            assert.ok(text.includes('via Number: 1 site; open external implementation set'),
                 `label renders the contract: ${text}`);
         } finally { rm(dir); }
     });
@@ -3321,6 +3562,7 @@ describe('fix #268: callee-side same-class overload arity selection', () => {
             '        k.run(a);',        // 3
             '        k.run(a, b);',     // 4
             '        k.set(a);',        // 5
+            '        k.set(null);',     // 6 — compiler-visible ambiguity
             '    }',
             '}',
         ].join('\n'),
@@ -3341,7 +3583,7 @@ describe('fix #268: callee-side same-class overload arity selection', () => {
         } finally { rm(dir); }
     });
 
-    it('same-arity type overloads are statically undecidable — visible, not defs[0]', () => {
+    it('uses exact argument types and keeps genuinely ambiguous overloads visible', () => {
         const dir = tmp(FILES);
         try {
             const index = idx(dir);
@@ -3349,10 +3591,12 @@ describe('fix #268: callee-side same-class overload arity selection', () => {
             const res = index.findCallees(go, { includeMethods: true, collectAccount: true });
             const setEdges = res.filter(e => e.name === 'set');
             const confirmedSites = setEdges.flatMap(e => e.sites || []);
-            assert.ok(!confirmedSites.includes(5),
-                `k.set(a) cannot statically pick between set(A)/set(B): ${JSON.stringify(setEdges)}`);
+            assert.ok(confirmedSites.includes(5),
+                `k.set(a) statically selects set(A): ${JSON.stringify(setEdges)}`);
+            assert.ok(!confirmedSites.includes(6),
+                `k.set(null) cannot pick between set(A)/set(B): ${JSON.stringify(setEdges)}`);
             const unv = (res.unverifiedCallees || []).find(u => u.name === 'set');
-            assert.ok(unv && (unv.sites || []).includes(5),
+            assert.ok(unv && (unv.sites || []).includes(6),
                 `undecidable overload visible in the unverified band: ${JSON.stringify(res.unverifiedCallees)}`);
             assert.strictEqual(res.calleeAccount?.conserved, true);
         } finally { rm(dir); }
@@ -3800,6 +4044,185 @@ describe('fix #273 (Java): virtual bare calls and receiver-owned callees', () =>
                 targetDefinitions: [tokenData], collectAccount: true,
             });
             assert.ok(!tokenCallers.some(c => c.relativePath.endsWith('/parser/Use.java') && c.line === 5));
+        } finally { rm(dir); }
+    });
+});
+
+describe('v5 Java compiler-shaped call IR', () => {
+    it('does not treat Java type-qualified static calls as unbound instance calls', () => {
+        const dir = tmp({
+            'TypeVariableName.java': [
+                'class TypeVariableName {',
+                '  static void get(Object value) {}',
+                '  static void get(String name, Object... bounds) {}',
+                '}',
+            ].join('\n'),
+            'Use.java': [
+                'class Use {',
+                '  void run() { TypeVariableName.get("T", new Object()); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const oneArg = index.symbols.get('get').find(definition =>
+                definition.startLine === 2);
+            const result = index.findCallers('get', {
+                targetDefinitions: [oneArg], collectAccount: true,
+            });
+            assert.strictEqual(result.length, 0);
+            assert.strictEqual(result.unverifiedEntries?.length || 0, 0);
+            assert.ok((result.accountRaw?.excludedEntries || []).some(entry =>
+                entry.line === 2 && entry.reason === 'other-definition'),
+            `the two-argument call binds the sibling: ${JSON.stringify(result.accountRaw)}`);
+        } finally { rm(dir); }
+    });
+
+    it('uses class-qualified static field types to select overloads', () => {
+        const dir = tmp({
+            'Type.java': 'interface Type {}',
+            'TypeName.java': [
+                'class TypeName {',
+                '  static final TypeName DOUBLE = new TypeName();',
+                '}',
+            ].join('\n'),
+            'ParameterSpec.java': [
+                'class ParameterSpec {',
+                '  static void builder(Type type, String name) {}',
+                '  static void builder(TypeName type, String name) {}',
+                '  void go() { ParameterSpec.builder(TypeName.DOUBLE, "money"); }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const definitions = index.symbols.get('builder');
+            const typeOverload = definitions.find(definition =>
+                definition.paramsStructured?.[0]?.type === 'Type');
+            const typeNameOverload = definitions.find(definition =>
+                definition.paramsStructured?.[0]?.type === 'TypeName');
+
+            const wrong = index.findCallers('builder', {
+                targetDefinitions: [typeOverload], collectAccount: true,
+            });
+            assert.strictEqual(wrong.length, 0);
+            assert.strictEqual(wrong.unverifiedEntries?.length || 0, 0);
+            assert.ok((wrong.accountRaw?.excludedEntries || []).some(entry =>
+                entry.line === 4 && entry.reason === 'other-definition'));
+
+            const right = index.findCallers('builder', {
+                targetDefinitions: [typeNameOverload], collectAccount: true,
+            });
+            assert.ok(right.some(caller => caller.line === 4),
+                `field type selects TypeName overload: ${JSON.stringify(right)}`);
+        } finally { rm(dir); }
+    });
+
+    it('uses same-class helpers, generic collection values, and JDK return contracts for overloads', () => {
+        const dir = tmp({
+            'A.java': 'class A {}',
+            'B.java': 'class B {}',
+            'K.java': [
+                'import java.lang.reflect.Method;',
+                'import java.lang.reflect.Type;',
+                'import java.util.List;',
+                'class K {',
+                '  void pick(A value) {}',
+                '  void pick(B value) {}',
+                '  void reflect(Class<?> value) {}',
+                '  void reflect(Type value) {}',
+                '  A make() { return new A(); }',
+                '  void go(List<A> values, Method method) {',
+                '    pick(make());',
+                '    pick(values.get(0));',
+                '    reflect(method.getReturnType());',
+                '    reflect(method.getGenericReturnType());',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const go = index.symbols.get('go')[0];
+            const callees = index.findCallees(go, {
+                collectAccount: true,
+                includeMethods: true,
+            });
+            const sitesFor = startLine => callees
+                .filter(edge => edge.startLine === startLine)
+                .flatMap(edge => edge.sites || []);
+            assert.deepStrictEqual(sitesFor(5), [11, 12],
+                `A overload selected from helper and List<A>.get: ${JSON.stringify(callees)}`);
+            assert.deepStrictEqual(sitesFor(7), [13],
+                `Method.getReturnType selects Class: ${JSON.stringify(callees)}`);
+            assert.deepStrictEqual(sitesFor(8), [14],
+                `Method.getGenericReturnType selects Type: ${JSON.stringify(callees)}`);
+            assert.ok(!(callees.unverifiedCallees || []).some(edge =>
+                ['pick', 'reflect'].includes(edge.name) &&
+                [11, 12, 13, 14].some(line => edge.sites?.includes(line))),
+            `compiler-shaped sites are not unverified: ${JSON.stringify(callees.unverifiedCallees)}`);
+        } finally { rm(dir); }
+    });
+
+    it('excludes platform collection calls from an unrelated project method', () => {
+        const dir = tmp({
+            'Target.java': 'class Target { void get(int index) {} }',
+            'Use.java': [
+                'import javax.lang.model.element.ExecutableElement;',
+                'class Use {',
+                '  Object first(ExecutableElement element) {',
+                '    return element.getParameters().get(0);',
+                '  }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = index.symbols.get('get')
+                .find(definition => definition.className === 'Target');
+            const result = index.findCallers('get', {
+                targetDefinitions: [target],
+                collectAccount: true,
+                includeMethods: true,
+            });
+            assert.strictEqual(result.length, 0);
+            assert.strictEqual(result.unverifiedEntries?.length || 0, 0);
+            assert.ok((result.accountRaw?.excludedEntries || []).some(entry =>
+                entry.line === 4 && entry.reason === 'receiver-type-mismatch'),
+            `List.get is positively outside Target.get: ${JSON.stringify(result.accountRaw)}`);
+        } finally { rm(dir); }
+    });
+
+    it('resolves bare static calls through a nested class lexical owner', () => {
+        const dir = tmp({
+            'A.java': 'class A {}',
+            'Outer.java': [
+                'class Outer {',
+                '  static void get(A value) {}',
+                '  static class Inner {',
+                '    void run(A value) { get(value); }',
+                '  }',
+                '}',
+            ].join('\n'),
+            'Other.java': 'class Other { static void get(A value) {} }',
+        });
+        try {
+            const index = idx(dir);
+            const defs = index.symbols.get('get');
+            const outer = defs.find(definition => definition.className === 'Outer');
+            const other = defs.find(definition => definition.className === 'Other');
+            const outerCallers = index.findCallers('get', {
+                targetDefinitions: [outer], collectAccount: true,
+            });
+            assert.ok(outerCallers.some(caller =>
+                caller.relativePath === 'Outer.java' && caller.line === 4));
+            const otherCallers = index.findCallers('get', {
+                targetDefinitions: [other], collectAccount: true,
+            });
+            assert.ok(!otherCallers.some(caller =>
+                caller.relativePath === 'Outer.java' && caller.line === 4));
+            assert.ok(!(otherCallers.unverifiedEntries || []).some(entry =>
+                entry.relativePath === 'Outer.java' && entry.line === 4));
         } finally { rm(dir); }
     });
 });

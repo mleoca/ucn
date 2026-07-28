@@ -912,40 +912,40 @@ it('detectProjectPattern does not include .kt for Gradle/Maven projects', () => 
 // ============================================================================
 
 describe('fix: CLI value-flag args not consumed as positional', () => {
-    it('find --depth 1 without symbol name should error', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--depth', '1', '--no-cache']);
+    it('find --limit 1 without symbol name should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--limit', '1', '--no-cache']);
         assert.ok(out.includes('required') || out.includes('Usage') || out.includes('Symbol name'),
             `should error for missing symbol name, got: ${out.slice(0, 200)}`);
     });
 
-    it('find --top 5 without symbol name should error', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--top', '5', '--no-cache']);
+    it('find --file app.js without symbol name should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--file', 'app.js', '--no-cache']);
         assert.ok(out.includes('required') || out.includes('Usage') || out.includes('Symbol name'),
             `should error for missing symbol name, got: ${out.slice(0, 200)}`);
     });
 
-    it('find --base HEAD without symbol name should error', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--base', 'HEAD', '--no-cache']);
+    it('find --in . without symbol name should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'find', [], ['--in', '.', '--no-cache']);
         assert.ok(out.includes('required') || out.includes('Usage') || out.includes('Symbol name'),
             `should error for missing symbol name, got: ${out.slice(0, 200)}`);
     });
 });
 
 describe('fix R2: CLI --max-lines rejects non-integer values', () => {
-    it('class --max-lines=abc should error', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'class', ['DataProcessor'], ['--max-lines=abc', '--no-cache']);
+    it('source --max-lines=abc should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'source', ['DataProcessor'], ['--max-lines=abc', '--no-cache']);
         assert.ok(out.includes('positive integer'),
             `should reject non-numeric max-lines, got: ${out.slice(0, 200)}`);
     });
 
-    it('class --max-lines=1.5 should error', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'class', ['DataProcessor'], ['--max-lines=1.5', '--no-cache']);
+    it('source --max-lines=1.5 should error', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'source', ['DataProcessor'], ['--max-lines=1.5', '--no-cache']);
         assert.ok(out.includes('positive integer'),
             `should reject decimal max-lines, got: ${out.slice(0, 200)}`);
     });
 
-    it('class --max-lines=5 should succeed', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'class', ['DataProcessor'], ['--max-lines=5', '--no-cache']);
+    it('source --max-lines=5 should succeed', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'source', ['DataProcessor'], ['--max-lines=5', '--no-cache']);
         assert.ok(!out.includes('positive integer'),
             `valid max-lines should not error, got: ${out.slice(0, 200)}`);
     });
@@ -958,39 +958,39 @@ describe('fix R2: CLI --max-lines rejects non-integer values', () => {
 // MED-5 also reject --limit=0 / --max-files=0 instead of "no limit" coercion.
 // ============================================================================
 
-describe('Round 5 MED-3: --top validated on commands other than stats', () => {
-    it('context --top=abc errors out', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'context', ['processData'],
+describe('Round 5 MED-3: --top validated where the v5 contract accepts it', () => {
+    it('show --top=abc errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'show', ['processData'],
             ['--top=abc', '--no-cache']);
         assert.ok(out.includes('Invalid --top'),
-            `context --top=abc should error, got: ${out.slice(0, 200)}`);
+            `show --top=abc should error, got: ${out.slice(0, 200)}`);
     });
 
-    it('context --top=-1 errors out', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'context', ['processData'],
+    it('show --top=-1 errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'show', ['processData'],
             ['--top=-1', '--no-cache']);
         assert.ok(out.includes('Invalid --top'),
-            `context --top=-1 should error, got: ${out.slice(0, 200)}`);
+            `show --top=-1 should error, got: ${out.slice(0, 200)}`);
     });
 
-    it('find --top=abc errors out', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'find', ['processData'],
+    it('repo --top=abc errors out', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'repo', [],
             ['--top=abc', '--no-cache']);
         assert.ok(out.includes('Invalid --top'),
-            `find --top=abc should error, got: ${out.slice(0, 200)}`);
+            `repo --top=abc should error, got: ${out.slice(0, 200)}`);
     });
 
-    it('deadcode --top=NaN-equivalent errors out', () => {
+    it('show --top=NaN-equivalent errors out', () => {
         // CLI receives "abc" as the raw string; parseFlags now preserves topRaw
         // and validateNumericFlags catches it before the executor.
-        const out = runCli(FIXTURES_PATH + '/javascript', 'deadcode', [],
+        const out = runCli(FIXTURES_PATH + '/javascript', 'show', ['processData'],
             ['--top=abc', '--no-cache']);
         assert.ok(out.includes('Invalid --top'),
-            `deadcode --top=abc should error, got: ${out.slice(0, 200)}`);
+            `show --top=abc should error, got: ${out.slice(0, 200)}`);
     });
 
     it('valid --top=10 still works', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'context', ['processData'],
+        const out = runCli(FIXTURES_PATH + '/javascript', 'show', ['processData'],
             ['--top=10', '--no-cache']);
         assert.ok(!out.includes('Invalid --top'),
             `valid --top=10 should not error, got: ${out.slice(0, 200)}`);
@@ -1013,7 +1013,7 @@ describe('Round 5 MED-5: --limit and --max-files reject 0', () => {
     });
 
     it('--max-files=0 errors out', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'toc', [],
+        const out = runCli(FIXTURES_PATH + '/javascript', 'repo', [],
             ['--max-files=0', '--no-cache']);
         assert.ok(out.includes('Invalid --max-files'),
             `--max-files=0 should error, got: ${out.slice(0, 200)}`);
@@ -1157,6 +1157,12 @@ describe('Confidence Scoring', () => {
         it('scores scope-match for import evidence', () => {
             const result = scoreEdge({ hasImportEvidence: true });
             assert.strictEqual(result.resolution, RESOLUTION.SCOPE_MATCH);
+        });
+
+        it('scores one eligible project method owner as scope evidence', () => {
+            const result = scoreEdge({ hasSingleOwnerEvidence: true });
+            assert.strictEqual(result.resolution, RESOLUTION.SCOPE_MATCH);
+            assert.ok(result.evidence.includes('single project method owner'));
         });
 
         it('scores uncertain lowest', () => {

@@ -319,11 +319,11 @@ describe('JSON formatters', () => {
         assert.strictEqual(json.symbols[1].decorators[0], 'deprecated');
     });
 
-    it('example --json flag works via CLI', () => {
+    it('show example --json works via CLI', () => {
         const { execFileSync } = require('child_process');
         // Run CLI with --json flag to ensure example command goes through printOutput
         // Use formatFn which has call sites in the codebase (formatExample has none after output split)
-        const result = execFileSync('node', [CLI_PATH, '.', 'example', 'formatFn', '--json'], {
+        const result = execFileSync('node', [CLI_PATH, '.', 'show', 'formatFn', '--sections=example', '--json'], {
             encoding: 'utf-8',
             cwd: PROJECT_DIR,
             timeout: 30000,
@@ -331,7 +331,8 @@ describe('JSON formatters', () => {
         });
         const json = JSON.parse(result);
         // Should have structured output, not raw text
-        assert.ok(json.found !== undefined || json.query !== undefined, 'JSON output should have structured fields');
+        assert.strictEqual(json.meta.command, 'show');
+        assert.ok(json.data.example, 'JSON output should include the example section');
     });
 });
 
@@ -1110,6 +1111,34 @@ describe('New Formatter Coverage', () => {
             const all = output.formatContext({ ...ctx, meta: { ...ctx.meta, all: true } });
             assert.ok(!all.text.includes('more unverified'), '--all lifts the cap');
             assert.ok(all.text.includes('m.fn(12)'), 'All entries rendered under --all');
+        });
+
+        it('groups named runtime-dispatch sites while preserving --all expansion', () => {
+            const ctx = {
+                function: 'name_long', file: 'defs.rs', startLine: 1, endLine: 3,
+                callers: [], callees: [],
+                unverifiedCallers: Array.from({ length: 4 }, (_, i) => ({
+                    relativePath: 'help.rs',
+                    line: i + 10,
+                    content: 'flag.name_long()',
+                    reason: 'possible-dispatch',
+                    dispatchVia: 'Flag',
+                    dispatchCandidates: 104,
+                })),
+                meta: { complete: true, skipped: 0, dynamicImports: 0, uncertain: 4 }
+            };
+            const { text, expandable } = output.formatContext(ctx);
+            assert.ok(text.includes('CALLERS — RUNTIME DISPATCH (4 sites, 1 family)'));
+            assert.ok(text.includes('via Flag: 4 sites; 1 of 104 implementations'));
+            assert.ok(text.includes('(+2 more runtime-dispatch sites — use --all)'));
+            assert.ok(!text.includes('CALLERS — UNVERIFIED'),
+                'known runtime boundaries are not presented as actionable ambiguity');
+            assert.strictEqual(expandable.length, 2, 'default view keeps two representative samples');
+
+            const all = output.formatContext({ ...ctx, meta: { ...ctx.meta, all: true } });
+            assert.ok(!all.text.includes('more runtime-dispatch sites'));
+            assert.ok(all.text.includes('help.rs:13'));
+            assert.strictEqual(all.expandable.length, 4);
         });
 
         it('renders ACCOUNT line and unparsed WARNING from meta.account', () => {
@@ -2664,7 +2693,7 @@ describe('formatOrient', () => {
         assert.ok(text.includes('run — 7 call(s) · src/a.js:3'));
         assert.ok(text.includes('ENTRY POINTS: (detection unavailable)'));
         assert.ok(text.includes('TRUST: HIGH'));
-        assert.ok(text.includes('Next: ucn about run'));
+        assert.ok(text.includes('Next: ucn show run'));
         const j = JSON.parse(formatOrientJson(mock));
         assert.strictEqual(j.meta.trust, 'HIGH');
         assert.strictEqual(j.data.suggest, 'run');
@@ -2681,6 +2710,6 @@ describe('formatOrient', () => {
         const text = formatOrient(mock);
         assert.ok(text.includes('ENTRY POINTS: 5 — test 3, http 2'));
         assert.ok(text.includes('TRUST: MEDIUM — 4 dynamic import(s), 1 eval, 2 parse failure(s)'));
-        assert.ok(!text.includes('ucn about null'), 'no suggestion when none available');
+        assert.ok(!text.includes('ucn show null'), 'no suggestion when none available');
     });
 });

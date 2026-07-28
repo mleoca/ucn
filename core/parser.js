@@ -6,7 +6,7 @@
  */
 
 const fs = require('fs');
-const { detectLanguage, getParser, getLanguageModule, isSupported } = require('../languages');
+const { detectLanguage, getParser, getLanguageAdapter, isSupported } = require('../languages');
 
 /**
  * @typedef {Object} FunctionDef
@@ -80,9 +80,9 @@ function parse(code, language) {
     }
 
     const parser = getParser(language);
-    const langModule = getLanguageModule(language);
+    const adapter = getLanguageAdapter(language);
 
-    return langModule.parse(code, parser);
+    return adapter.parse(code, parser);
 }
 
 /**

@@ -81,7 +81,12 @@ const goplsOracle = {
                 op: 'classify_ref', file: relFile, line: refLine,
                 utf16_col: loc.range.start.character, name,
             });
-            refs.push({ file: relFile, line: refLine, kind: cls.kind });
+            refs.push({
+                file: relFile,
+                line: refLine,
+                column: loc.range.start.character,
+                kind: cls.kind,
+            });
         }
         return refs;
     },
@@ -90,12 +95,13 @@ const goplsOracle = {
      *  gopls reference search expands implicit interface implementation
      *  families; definition lookup recovers the static target so broad
      *  virtual-family references do not masquerade as exact edges. */
-    async resolveDefinition(handle, { name, file, line }) {
+    async resolveDefinition(handle, { name, file, line, column }) {
         const absFile = path.join(handle.root, file);
         ensureOpen(handle, absFile);
         const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
         const defs = new Map();
-        for (const character of nameColumns(sourceLine, name)) {
+        const columns = Number.isInteger(column) ? [column] : nameColumns(sourceLine, name);
+        for (const character of columns) {
             const locations = await handle.lsp.request('textDocument/definition', {
                 textDocument: { uri: pathToUri(absFile) },
                 position: { line: line - 1, character },
@@ -105,7 +111,14 @@ const goplsOracle = {
                 const range = loc.targetSelectionRange || loc.targetRange || loc.range;
                 if (!uri || !range) continue;
                 const defAbs = uriToPath(uri);
-                if (!defAbs.startsWith(handle.moduleRoot + path.sep)) continue;
+                if (!defAbs.startsWith(handle.moduleRoot + path.sep)) {
+                    defs.set(`external:${defAbs}:${range.start.line + 1}`, {
+                        file: defAbs,
+                        line: range.start.line + 1,
+                        external: true,
+                    });
+                    continue;
+                }
                 const entry = {
                     file: path.relative(handle.root, defAbs),
                     line: range.start.line + 1,

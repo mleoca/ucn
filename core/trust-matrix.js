@@ -79,7 +79,7 @@ const PROOF_CATALOG = Object.freeze({
     'protocol-fixtures': {
         kind: 'protocol-invariant',
         artifact: 'test/regression-mcp.test.js',
-        claim: 'Stateful expansion and MCP envelopes are checked end-to-end.',
+        claim: 'The one-tool MCP schema, error envelopes, cache freshness, and truncation contract are checked end-to-end.',
     },
     'performance-budget': {
         kind: 'performance-gate',
@@ -93,50 +93,24 @@ function row(claim, proofs, performanceClass, decisionSafety, oracleReason = nul
 }
 
 const COMMAND_TRUST_MATRIX = Object.freeze({
-    about: row('tiered-semantic', ['oracle-callers', 'oracle-callees', 'conservation', 'surface-parity'], 'semantic-query', 'review-required'),
-    context: row('tiered-semantic', ['oracle-callers', 'oracle-callees', 'conservation', 'surface-parity'], 'semantic-query', 'review-required'),
-    impact: row('tiered-semantic', ['oracle-callers', 'conservation', 'surface-parity'], 'semantic-query', 'review-required'),
-    blast: row('tiered-derived', ['oracle-callers', 'conservation', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
-    smart: row('tiered-derived', ['oracle-callees', 'oracle-symbols', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
-    trace: row('tiered-derived', ['oracle-callees', 'conservation', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
-    reverseTrace: row('tiered-derived', ['oracle-callers', 'conservation', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
-    example: row('confirmed-or-abstain-advisory', ['oracle-references', 'command-fixtures', 'surface-parity'], 'semantic-query', 'advisory-only'),
-    related: row('advisory-ranking', ['oracle-callers', 'oracle-callees', 'command-fixtures', 'surface-parity'], 'semantic-query', 'advisory-only'),
-    brief: row('ast-fact-summary', ['oracle-symbols', 'command-fixtures', 'surface-parity'], 'source-query', 'navigation'),
-
+    show: row('tiered-symbol-projection', ['oracle-callers', 'oracle-callees', 'oracle-symbols', 'oracle-references', 'conservation', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
     find: row('exact-indexed-definition', ['oracle-symbols', 'cross-language-fixtures', 'surface-parity'], 'symbol-query', 'navigation'),
     usages: row('literal-code-reference-inventory', ['oracle-references', 'cross-language-fixtures', 'surface-parity'], 'project-scan', 'review-required'),
-    toc: row('indexed-symbol-accounting', ['cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'project-scan', 'navigation', 'No compiler exposes a portable table-of-contents contract; symbol totals and filters use fixture/accounting invariants.'),
     search: row('literal-or-structural-match', ['cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'navigation', 'Literal results are text-ground exact; structural filters are AST fixture-checked rather than semantic identity claims.'),
-    tests: row('tiered-direct-test-evidence', ['oracle-references', 'cross-language-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
-    affectedTests: row('tiered-transitive-test-evidence', ['oracle-callers', 'oracle-references', 'conservation', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
-    deadcode: row('candidate-not-safe-delete', ['oracle-deadcode', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'project-scan', 'advisory-only'),
+    source: row('exact-source-or-line-extraction', ['oracle-symbols', 'cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'source-query', 'navigation', 'Symbol source is compiler/LSP-gated; line slices are checked directly against validated file bytes.'),
+    trace: row('tiered-bidirectional-call-traversal', ['oracle-callers', 'oracle-callees', 'conservation', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
+    impact: row('tiered-symbol-or-git-impact', ['oracle-callers', 'conservation', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
+    tests: row('tiered-direct-or-transitive-test-evidence', ['oracle-callers', 'oracle-references', 'conservation', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'graph-query', 'review-required'),
+    check: row('tiered-signature-or-precommit-diagnostic', ['oracle-callers', 'oracle-references', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
+    plan: row('refactor-preview', ['oracle-callers', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
+    repo: row('diagnostic-repository-composition', ['cross-language-fixtures', 'command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'navigation', 'Repository orientation composes index accounting, framework hints, and explicit readiness diagnostics; it is not an accuracy estimate.'),
+    deps: row('static-dependency-analysis', ['graph-invariants', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'Import, importer, traversal, and cycle views are algebraic derivatives of the static import graph; dynamic imports remain explicit blind spots.'),
+    api: row('static-public-surface', ['graph-invariants', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'project-scan', 'review-required', 'Static exports are the claim; reflection and external consumers are explicitly outside the universe.'),
     entrypoints: row('framework-advisory', ['framework-fixtures', 'cross-language-fixtures', 'surface-parity'], 'project-scan', 'advisory-only', 'Framework registration/reflection has no universal compiler oracle; positive and confusable framework fixtures define the static claim.'),
     endpoints: row('framework-advisory', ['framework-fixtures', 'cross-language-fixtures', 'surface-parity'], 'project-scan', 'advisory-only', 'Route/client matching is framework-specific and explicitly advisory.'),
-
-    fn: row('exact-source-extraction', ['oracle-symbols', 'cross-language-fixtures', 'surface-parity'], 'source-query', 'navigation'),
-    class: row('exact-source-extraction', ['oracle-symbols', 'cross-language-fixtures', 'surface-parity'], 'source-query', 'navigation'),
-    lines: row('exact-file-slice', ['command-fixtures', 'systematic-options', 'surface-parity'], 'source-query', 'navigation', 'The file bytes and validated line bounds are the direct oracle.'),
-    expand: row('stateful-protocol', ['protocol-fixtures', 'surface-parity'], 'source-query', 'navigation', 'Expansion is a cache/protocol contract, not a semantic-analysis claim.'),
-
-    imports: row('static-import-inventory', ['graph-invariants', 'cross-language-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'File import syntax/resolution is checked with language fixtures and graph duality; dynamic imports remain explicit blind spots.'),
-    exporters: row('reverse-static-import-inventory', ['graph-invariants', 'cross-language-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'Reverse edges are proven by import/export graph duality.'),
-    fileExports: row('static-export-inventory', ['graph-invariants', 'cross-language-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'Static visibility/export shapes use language fixtures; runtime mutation remains outside the claim.'),
-    graph: row('static-dependency-traversal', ['graph-invariants', 'cross-language-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'Traversal is an algebraic derivative of the static import graph.'),
-    circularDeps: row('static-cycle-detection', ['graph-invariants', 'command-fixtures', 'surface-parity'], 'graph-query', 'navigation', 'Cycle output is checked against known graph fixtures and traversal invariants.'),
-
-    verify: row('tiered-signature-check', ['oracle-callers', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
-    plan: row('refactor-preview', ['oracle-callers', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'semantic-query', 'review-required'),
-    diffImpact: row('git-diff-derived-impact', ['oracle-callers', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'git-query', 'review-required'),
-    check: row('composed-precommit-diagnostic', ['oracle-callers', 'oracle-references', 'git-fixtures', 'command-fixtures', 'surface-parity'], 'git-query', 'review-required'),
-
-    typedef: row('exact-indexed-type', ['oracle-symbols', 'cross-language-fixtures', 'surface-parity'], 'symbol-query', 'navigation'),
-    stacktrace: row('advisory-frame-resolution', ['command-fixtures', 'surface-parity'], 'source-query', 'advisory-only', 'Stack formats and source-map/runtime availability are environment-specific; unresolved frames remain visible.'),
-    api: row('static-public-surface', ['graph-invariants', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'project-scan', 'review-required', 'Static exports are the claim; reflection and external consumers are explicitly outside the universe.'),
-    stats: row('index-accounting', ['command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'navigation', 'Counts are checked against the built index and deterministic fixture totals.'),
-    doctor: row('diagnostic-not-accuracy', ['command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'advisory-only', 'Doctor reports index/evidence limitations and never presents itself as an accuracy oracle.'),
+    deadcode: row('candidate-not-safe-delete', ['oracle-deadcode', 'cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'project-scan', 'advisory-only'),
     auditAsync: row('async-advisory', ['cross-language-fixtures', 'command-fixtures', 'surface-parity'], 'project-scan', 'advisory-only', 'Missing-await semantics depend on framework/type flow; findings are advisory and fixture-tested.'),
-    orient: row('diagnostic-composition', ['command-fixtures', 'systematic-options', 'surface-parity'], 'project-scan', 'navigation', 'Orient composes index counts, entrypoint hints, and doctor limitations.'),
+    stacktrace: row('advisory-frame-resolution', ['command-fixtures', 'surface-parity'], 'source-query', 'advisory-only', 'Stack formats and source-map/runtime availability are environment-specific; unresolved frames remain visible.'),
 });
 
 function summarizeCommandTrust() {

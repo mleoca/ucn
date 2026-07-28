@@ -92,12 +92,12 @@ function formatFindJson(items) {
 }
 
 /**
- * Format find results with depth/confidence features (detailed view).
+ * Format find results with confidence and optional source.
  * Returns a string. Used by CLI and interactive mode.
  *
  * @param {Array} symbols - Find result array
  * @param {string} query - Original search query
- * @param {object} options - { depth, top, all }
+ * @param {object} options - { depth, top, all, compact, withSource, limitHint }
  */
 function formatFindDetailed(symbols, query, options = {}) {
     const { top, all, compact } = options;
@@ -153,6 +153,12 @@ function formatFindDetailed(symbols, query, options = {}) {
                 if (snip) parts.push(`— ${snip}`);
             }
             lines.push(parts.join('  '));
+            if (options.withSource && s.code) {
+                lines.push('  ───');
+                for (const codeLine of String(s.code).split('\n')) {
+                    lines.push(`  ${codeLine}`);
+                }
+            }
             continue;
         }
 
@@ -177,8 +183,14 @@ function formatFindDetailed(symbols, query, options = {}) {
             lines.push(`  ⚠ ${confidence.reasons.join(', ')}`);
         }
 
-        // Depth 2: + first 10 lines of code
-        if (depth === '2' || depth === 'full') {
+        if (options.withSource && s.code) {
+            lines.push('  ───');
+            for (const codeLine of String(s.code).split('\n')) {
+                lines.push(`  ${codeLine}`);
+            }
+        // Legacy internal formatter mode. The v5 public command uses the
+        // explicit withSource contract instead of overloading graph depth.
+        } else if (depth === '2' || depth === 'full') {
             try {
                 const content = fs.readFileSync(s.file, 'utf-8');
                 const fileLines = content.split('\n');
@@ -199,7 +211,8 @@ function formatFindDetailed(symbols, query, options = {}) {
     }
 
     if (hidden > 0) {
-        lines.push(`... ${hidden} more result(s). Use --all to see all, or --top=N to see more.`);
+        lines.push(`... ${hidden} more result(s). ${options.limitHint ||
+            'Use --all to see all, or --top=N to see more.'}`);
     }
 
     return lines.join('\n');

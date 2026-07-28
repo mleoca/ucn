@@ -79,6 +79,9 @@ function imports(index, filePath) {
             if (!resolvedPath && fileEntry.language === 'java' && !imp.module.startsWith('.')) {
                 resolvedPath = index._resolveJavaPackageImport(imp.module);
             }
+            if (!resolvedPath && fileEntry.language === 'csharp') {
+                resolvedPath = index._resolveCSharpUsing(imp.module);
+            }
 
             return {
                 module: imp.module,

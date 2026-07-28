@@ -23,7 +23,7 @@ const path = require('path');
 const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames } = require('./shared');
 const { isTestFile } = require('./discovery');
 const { getCachedCalls } = require('./callers');
-const { getLanguageModule } = require('../languages');
+const { getLanguageAdapter } = require('../languages');
 
 /**
  * Contract-mode caller expansion for the tree commands. Memoizes the full
@@ -898,7 +898,7 @@ function affectedTests(index, name, options = {}) {
                         if (!isTestCaller && fe.callerName) {
                             const defs = index.symbols.get(fe.callerName);
                             const d = defs?.find(x => x.file === fe.callerFile && x.startLine === fe.callerStartLine);
-                            const kindOf = getLanguageModule(cfe.language)?.getEntryPointKind;
+                            const kindOf = getLanguageAdapter(cfe.language)?.getEntryPointKind;
                             if (d && kindOf && kindOf(d) === 'test') isTestCaller = true;
                         }
                         if (!isTestCaller && fe.line != null) {
@@ -1246,7 +1246,7 @@ function affectedTests(index, name, options = {}) {
             // language's getEntryPointKind says so; they need no coverage.
             for (const [, fe] of index.files) {
                 if (isTestFile(fe.relativePath, fe.language)) continue;
-                const langModule = getLanguageModule(fe.language);
+                const langModule = getLanguageAdapter(fe.language);
                 const kindOf = langModule?.getEntryPointKind;
                 if (fe.symbols?.some(s => s.name === n && (!kindOf || kindOf(s) !== 'test'))) {
                     return true;
@@ -1329,7 +1329,7 @@ function _addAffectedTestCases(index, filePath, fileEntry, funcName, fileMatches
     } else {
         if (!fileEntry.symbols) return;
         try {
-            const langModule = getLanguageModule(lang);
+            const langModule = getLanguageAdapter(lang);
             if (!langModule) return;
             // Prefer the kinded predicate so we don't mis-tag fn main() / fn init()
             // (runtime entries) as test cases (BUG-CX). Fall back to isEntryPoint

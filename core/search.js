@@ -10,7 +10,7 @@
 const path = require('path');
 const { escapeRegExp, codeUnitCompare, inlineTestRanges, lineInRanges, classDispatchNames, CALLABLE_SYMBOL_KINDS } = require('./shared');
 const { isTestFile } = require('./discovery');
-const { detectLanguage, getParser, getLanguageModule, langTraits } = require('../languages');
+const { detectLanguage, getParser, getLanguageAdapter, langTraits } = require('../languages');
 const { getCachedCalls, _nameBindingReaches } = require('./callers');
 const { extractImports } = require('./imports');
 
@@ -854,7 +854,7 @@ function structuralSearch(index, options = {}) {
                         // #234, campaign G2 ×4 languages: Go main/init, Java
                         // main, Rust main/#[test] all listed — the deadcode
                         // protection, applied here).
-                        const langModule = fileEntry && getLanguageModule(fileEntry.language);
+                        const langModule = fileEntry && getLanguageAdapter(fileEntry.language);
                         if (langModule?.isEntryPoint?.(def)) continue;
                         // A bare decorator application (@with_logging) invokes
                         // the decorator at import time but is recorded as a
@@ -1921,7 +1921,7 @@ function _addTestCaseMatches(index, filePath, fileEntry, searchTerm, className, 
         // Go/Python/Java/Rust: check if any AST usage falls within a test function's range
         if (!fileEntry.symbols) return;
         try {
-            const langModule = getLanguageModule(lang);
+            const langModule = getLanguageAdapter(lang);
             if (!langModule) return;
             // Prefer kinded predicate so fn main() and fn init() aren't classified
             // as test cases (BUG-CX). Fall back to isEntryPoint for compat.

@@ -219,6 +219,8 @@ function formatContextJson(context) {
                     ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                     ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                     ...(c.externalContract && { externalContract: true }),
+                    uncertaintyClass: c.reason === 'possible-dispatch' && c.dispatchVia
+                        ? 'runtime-dispatch' : 'actionable-ambiguity',
                 })),
                 ...(context.warnings && { warnings: context.warnings })
             }
@@ -267,6 +269,8 @@ function formatContextJson(context) {
                 ...(c.dispatchVia && { dispatchVia: c.dispatchVia }),
                 ...(c.dispatchCandidates != null && { dispatchCandidates: c.dispatchCandidates }),
                 ...(c.externalContract && { externalContract: true }),
+                uncertaintyClass: c.reason === 'possible-dispatch' && c.dispatchVia
+                    ? 'runtime-dispatch' : 'actionable-ambiguity',
             })),
             callees: callees.map(c => ({
                 name: c.name,
@@ -464,15 +468,69 @@ function formatContext(ctx, options = {}) {
     // candidates ARE analyzed — they render in the unverified band with
     // reasons, and the ACCOUNT line reconciles every text occurrence.
 
-    // UNVERIFIED tier: call-syntax matches without binding/receiver evidence.
-    // Always visible (the contract: never silently hide an occurrence), capped
-    // at 10 one-liners unless --all.
+    // Runtime dispatch has a known boundary (trait/interface/supertype or a
+    // capability guard), but the concrete implementation is selected at
+    // runtime. Present repeated sites as one decision family with samples:
+    // the raw sites remain in JSON/accounting and --all expands every one.
+    // This separates unavoidable language semantics from ambiguity the agent
+    // can investigate.
     const unverified = ctx.unverifiedCallers || [];
-    if (unverified.length > 0) {
-        lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${unverified.length}) — call syntax, no binding/receiver evidence:`);
+    const runtimeDispatch = unverified.filter(u =>
+        u.reason === 'possible-dispatch' && u.dispatchVia);
+    const actionableUnverified = unverified.filter(u =>
+        u.reason !== 'possible-dispatch' || !u.dispatchVia);
+    if (runtimeDispatch.length > 0) {
+        const groups = new Map();
+        for (const site of runtimeDispatch) {
+            const key = `${site.dispatchVia}\0${site.dispatchCandidates ?? ''}\0` +
+                `${site.externalContract ? 'external' : 'project'}`;
+            if (!groups.has(key)) groups.set(key, []);
+            groups.get(key).push(site);
+        }
+        lines.push(`${compact ? '' : '\n'}CALLERS — RUNTIME DISPATCH ` +
+            `(${runtimeDispatch.length} site${runtimeDispatch.length === 1 ? '' : 's'}, ` +
+            `${groups.size} ${groups.size === 1 ? 'family' : 'families'}) — ` +
+            'implementation selected at runtime:');
+        const showAll = !!ctx.meta?.all;
+        let summarized = 0;
+        for (const sites of groups.values()) {
+            const first = sites[0];
+            const implementation = first.dispatchCandidates > 1
+                ? `; 1 of ${first.dispatchCandidates} implementations`
+                : first.externalContract ? '; open external implementation set' : '';
+            lines.push(`  via ${first.dispatchVia}: ${sites.length} ` +
+                `site${sites.length === 1 ? '' : 's'}${implementation}`);
+            const samples = showAll ? sites : sites.slice(0, 2);
+            for (const u of samples) {
+                const callerName = u.callerName ? ` [${u.callerName}]` : '';
+                const expr = u.content
+                    ? `: ${u.content.trim().replace(/\s+/g, ' ').slice(0, 100)}` : '';
+                lines.push(`    [${itemNum}] ${u.relativePath}:${u.line}${callerName}${expr}`);
+                expandable.push({
+                    num: itemNum++,
+                    type: 'caller',
+                    name: u.callerName || '(module level)',
+                    file: u.callerFile || u.file,
+                    relativePath: u.relativePath,
+                    line: u.line,
+                    startLine: u.callerStartLine || u.line,
+                    endLine: u.callerEndLine || u.line
+                });
+            }
+            summarized += sites.length - samples.length;
+        }
+        if (summarized > 0) {
+            lines.push(`  (+${summarized} more runtime-dispatch sites — use --all)`);
+        }
+    }
+
+    // Actionable ambiguity: call syntax without enough identity evidence.
+    // Always visible and capped at 10 one-liners unless --all.
+    if (actionableUnverified.length > 0) {
+        lines.push(`${compact ? '' : '\n'}CALLERS — UNVERIFIED (${actionableUnverified.length}) — call syntax, no binding/receiver evidence:`);
         const cap = (ctx.meta && ctx.meta.all) ? Infinity : 10;
         let shown = 0;
-        for (const u of unverified) {
+        for (const u of actionableUnverified) {
             if (shown >= cap) break;
             const callerName = u.callerName ? ` [${u.callerName}]` : '';
             const reason = u.reason ? ` (${unverifiedReasonLabel(u)})` : '';
@@ -490,8 +548,8 @@ function formatContext(ctx, options = {}) {
             });
             shown++;
         }
-        if (unverified.length > shown) {
-            lines.push(`  (+${unverified.length - shown} more unverified — use --all)`);
+        if (actionableUnverified.length > shown) {
+            lines.push(`  (+${actionableUnverified.length - shown} more unverified — use --all)`);
         }
     }
 
@@ -927,7 +985,7 @@ function formatAbout(about, options = {}) {
         lines.push(about.code);
     } else if (about.code && compact) {
         lines.push('');
-        lines.push(`SOURCE: omitted in compact mode; use fn ${sym.handle || sym.name} to extract it.`);
+        lines.push(`SOURCE: omitted in compact mode; use source ${sym.handle || sym.name} to extract it.`);
     }
 
     if (aboutTruncated) {

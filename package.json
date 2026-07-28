@@ -1,8 +1,8 @@
 {
   "name": "ucn",
-  "version": "4.2.3",
+  "version": "5.0.0",
   "mcpName": "io.github.mleoca/ucn",
-  "description": "Code intelligence toolkit for AI agents: extract functions, trace call chains, find callers, and detect dead code without reading entire files. Works as MCP server, CLI, or agent skill. Supports JS/TS, Python, Go, Rust, Java.",
+  "description": "Auditable AST code intelligence for AI agents: 18 task-oriented commands through one MCP tool, CLI, or agent skill. Supports JS/TS, Python, Go, Rust, Java, C, C++, C#, and HTML.",
   "main": "index.js",
   "bin": {
     "ucn": "cli/index.js",
@@ -10,19 +10,23 @@
   },
   "scripts": {
     "version": "node scripts/sync-server-version.js && git add server.json",
-    "test": "node --test test/parser-unit.test.js test/integration.test.js test/cache.test.js test/formatter.test.js test/interactive.test.js test/feature.test.js test/regression-js.test.js test/regression-py.test.js test/regression-go.test.js test/regression-java.test.js test/regression-rust.test.js test/regression-cross.test.js test/regression-mcp.test.js test/regression-parser.test.js test/regression-commands.test.js test/regression-fixes.test.js test/regression-bugfixes.test.js test/cross-language.test.js test/accuracy.test.js test/command-coverage.test.js test/perf-optimizations.test.js test/performance-gate-policy.test.js test/oracle-gate-policy.test.js test/systematic-test.js test/mcp-edge-cases.js test/conservation.test.js test/parity-test.js test/trust-matrix.test.js",
-    "benchmark:agent": "node test/agent-understanding-benchmark.js",
+    "test": "node --test test/parser-unit.test.js test/integration.test.js test/cache.test.js test/formatter.test.js test/interactive.test.js test/feature.test.js test/regression-js.test.js test/regression-py.test.js test/regression-go.test.js test/regression-java.test.js test/regression-rust.test.js test/regression-c-family.test.js test/regression-cross.test.js test/regression-mcp.test.js test/regression-parser.test.js test/regression-commands.test.js test/regression-fixes.test.js test/regression-bugfixes.test.js test/cross-language.test.js test/accuracy.test.js test/command-coverage.test.js test/perf-optimizations.test.js test/performance-gate-policy.test.js test/oracle-gate-policy.test.js test/agent-public-surface-benchmark.test.js test/command-contracts.test.js test/language-adapter.test.js test/systematic-test.js test/mcp-edge-cases.js test/conservation.test.js test/parity-test.js test/trust-matrix.test.js",
+    "benchmark:agent": "node test/agent-public-surface-benchmark.js",
+    "benchmark:agent:gate": "node test/agent-public-surface-benchmark.js --gate",
+    "benchmark:agent:legacy": "node test/agent-understanding-benchmark.js",
     "eval:conservation": "node eval/conservation-real.js",
     "eval:oracle": "node eval/run-oracle-eval.js",
     "eval:deadcode": "node eval/run-deadcode-eval.js",
     "eval:performance": "node --expose-gc eval/run-performance-gate.js",
-    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js",
+    "profile:callers": "node eval/profile-callers.js",
+    "lint": "eslint core/ cli/ mcp/ languages/ eval/run-*.js eval/*-gate-policy.js eval/profile-callers.js",
     "verify": "npm run lint && npm test",
     "trust:gate:semantic": "node eval/run-oracle-eval.js --release --min-precision 0.98 --max-unscored-ratio 0.10",
     "trust:gate:deadcode": "node eval/run-deadcode-eval.js --release --sample 100 --arm default",
     "trust:gate:performance": "node --expose-gc eval/run-performance-gate.js --release --queries 40",
+    "trust:gate:agent": "node test/agent-public-surface-benchmark.js --gate",
     "trust:gate:fast": "node eval/run-oracle-eval.js --repo preact-signals,httpx --min-precision 0.98 && node --expose-gc eval/run-performance-gate.js --repo preact-signals,httpx --queries 20",
-    "trust:gate": "npm run trust:gate:semantic && npm run trust:gate:deadcode && npm run trust:gate:performance"
+    "trust:gate": "npm run trust:gate:semantic && npm run trust:gate:deadcode && npm run trust:gate:performance && npm run trust:gate:agent"
   },
   "keywords": [
     "mcp",
@@ -58,7 +62,11 @@
     "python",
     "go",
     "rust",
-    "java"
+    "java",
+    "c",
+    "c++",
+    "csharp",
+    "html"
   ],
   "author": "Constantin-Mihail Leoca (https://github.com/mleoca)",
   "repository": {
@@ -71,24 +79,27 @@
     "node": ">=20"
   },
   "dependencies": {
-    "tree-sitter": "^0.21.0",
-    "tree-sitter-go": "^0.21.0",
-    "tree-sitter-html": "^0.23.0",
-    "tree-sitter-java": "^0.21.0",
-    "tree-sitter-javascript": "^0.21.0",
-    "tree-sitter-python": "^0.21.0",
-    "tree-sitter-rust": "^0.21.0",
-    "tree-sitter-typescript": "^0.21.0"
+    "tree-sitter": "0.21.1",
+    "tree-sitter-c": "0.23.2",
+    "tree-sitter-c-sharp": "0.23.1",
+    "tree-sitter-cpp": "0.23.4",
+    "tree-sitter-go": "0.23.4",
+    "tree-sitter-html": "0.23.2",
+    "tree-sitter-java": "0.23.5",
+    "tree-sitter-javascript": "0.23.1",
+    "tree-sitter-python": "0.23.4",
+    "tree-sitter-rust": "0.23.1",
+    "tree-sitter-typescript": "0.23.2"
   },
   "optionalDependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0",
-    "zod": "^3.25.0"
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.0.3",
-    "pyright": "1.1.410",
+    "eslint": "^10.8.0",
+    "pyright": "1.1.411",
     "ts-morph": "^28.0.0",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.2"
   }
 }

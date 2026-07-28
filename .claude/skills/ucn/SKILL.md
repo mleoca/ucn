@@ -1,115 +1,86 @@
 ---
 name: ucn
-description: AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, Java, and HTML. Use in repositories over roughly 500 LOC to orient, extract symbols, trace callers or callees, assess impact, verify call sites, select tests, or investigate dead code. Prefer it over repeated grep-and-read cycles for semantic questions; use text search for literals, messages, configuration, and unsupported languages.
+description: AST code intelligence for JavaScript/TypeScript, Python, Go, Rust, Java, C, C++, C#, and HTML. Use in repositories over roughly 500 LOC to orient, extract symbols, trace callers or callees, assess change impact, validate call sites, select tests, inspect dependencies, or investigate dead code. Prefer it over repeated grep-and-read cycles for semantic questions; use text search for literals, messages, configuration, and unsupported languages.
 ---
 
 # UCN
 
 Use UCN to gather compact, auditable code evidence before reading large files or changing a symbol.
 
-## Start here
+## Core workflow
 
-1. Run `ucn orient` in an unfamiliar repository.
-2. Pin the symbol. Use `ucn find <name>` when a name is ambiguous, then pass the emitted `path:line:name` handle to later commands.
-3. Run `ucn about <handle> --compact` for definition, direct callers, callees, tests, and contract metadata.
-4. Before a change, run `ucn impact <handle>` and `ucn affected-tests <handle>`.
-5. After a signature change, run `ucn verify <handle>`. Before committing, run `ucn check`.
-6. Read source with `ucn fn`, `ucn class`, or `ucn lines` only when the evidence indicates that source inspection is needed.
+1. Run `ucn repo` in an unfamiliar repository. Add `--deep` when readiness or index health matters.
+2. Pin a symbol with `ucn find <name>`, then pass its `path:line:name` handle to later commands.
+3. Run `ucn show <handle>` for the default summary, callers, and callees. Request extra projections with `--sections=source,tests,types,dependencies,example,related`.
+4. Before a change, run `ucn impact <handle>` and `ucn tests <handle> --depth=3`.
+5. After a signature change, run `ucn check <handle>`. Before committing, run target-less `ucn check`.
+6. Read exact code with `ucn source <handle>` or `ucn source path/to/file:10-30` only when inspection is needed.
 
-Prefer `--json` when another tool or script will consume the answer. MCP `about`, `context`, and `impact` default to compact output; request `compact=false` only when source and previews are necessary.
+Prefer `--json` for automation. Every CLI JSON response uses `{ meta, data }`. MCP returns text through one `ucn` tool and keeps contract metadata visible when truncating results.
 
-## CLI, MCP, and skill behavior
+## One contract across surfaces
 
-The skill is guidance, not a separate analysis engine. It tells the agent when and how to call UCN through the CLI or MCP.
+CLI, MCP, and interactive mode resolve the same 18 public commands through one registry, execute the same handlers, and use the same public formatters. CLI spells multiword commands with hyphens; MCP uses snake case. For example, use `audit-async` in CLI and `audit_async` in MCP.
 
-CLI and MCP resolve commands through the same registry, execute the same handlers, use the same project index and persisted cache, and call the same output formatters. Their defaults differ by transport:
+MCP keeps its process and project index warm across calls. Targeted commands default to 10K output characters, broad commands to 3K, with a 100K hard ceiling. Use `max_chars`, a narrower file/directory scope, or a smaller section projection when necessary.
 
-- CLI uses full text by default and emits raw JSON with `--json`.
-- MCP defaults `about`, `context`, and `impact` to compact text. It uses a 10K character default for targeted commands, 3K for broad commands, and a 100K hard ceiling. Contract metadata is preserved when output is truncated.
-- MCP uses snake_case command and parameter names. CLI uses hyphenated command and flag names.
-- To compare text, align compact/full settings and result caps. Surface-specific retry hints may still use CLI or MCP spelling.
+Supported source families are JavaScript/TypeScript/TSX, Python, Go, Rust, Java, C, C++, C#, and HTML inline JavaScript/event handlers. C/C++ uses `compile_commands.json` when available to classify headers and resolve include paths. This is portable AST analysis, not a compiler build; macros, templates, generated code, reflection, and external dependency semantics can remain unverified.
 
-MCP keeps the process and project index warm across calls, so repeated MCP queries usually avoid CLI process startup. The semantic work and cache format are otherwise shared.
+## Interpret evidence correctly
 
-## Read every answer as evidence, not proof
+For caller-bearing `show`, `impact`, `trace`, `tests`, and `check` views:
 
-For `about`, `context`, and `impact`, interpret caller results in two bands:
+- `CONFIRMED` has binding, receiver, import, or ownership evidence for the pinned target.
+- `UNVERIFIED` is a possible target with insufficient identity evidence. Review it before a breaking change.
+- `ACCOUNT` partitions observed literal-name lines into confirmed, unverified, non-call, excluded, and unresolved buckets.
+- `CONTRACT` states the scope and completeness of that observed-text partition.
+- `WARNING` identifies unreadable, unparsed, or partially indexed files.
+- `FILTERED` means query options hid evidence.
 
-- `CONFIRMED`: the call site has binding, receiver, import, or ownership evidence for the pinned target.
-- `UNVERIFIED`: the syntax could call the target, but the engine cannot prove the identity. Review these sites before a breaking change.
+An observed-text zero is not semantic zero or safe-delete proof. Numeric evidence values are ordinal ranking weights, not probabilities.
 
-Then inspect all contract signals:
-
-- `ACCOUNT` partitions literal-name text occurrences into confirmed, unverified, non-call, excluded, and unresolved buckets. It is an arithmetic conservation check, not a semantic-completeness claim.
-- `CONTRACT` states whether that literal-name partition is complete. `observed-text zero` means no caller was found in that observed text set. It does not prove semantic zero and is never safe-delete proof.
-- `WARNING` means parsing, reading, or indexing was incomplete. Inspect the named files with text search or the compiler.
-- `FILTERED` means flags hid evidence from display. Remove the filters before a breaking change.
-- `beyond-text callers` are alias- or binding-resolved edges that a literal grep would miss.
-- Numeric evidence scores are ordinal ranking weights, not calibrated probabilities or accuracy percentages.
-- Truncated MCP output preserves contract metadata when possible. If `contractMetadataComplete` is false, rerun with a larger output budget or narrower scope.
-
-Do not claim “no callers,” “safe to delete,” or “safe to refactor” from a zero result alone.
-
-## Match the command to the decision
+## Choose a command
 
 | Decision | Command |
 |---|---|
-| Understand one symbol | `ucn about <handle> --compact` |
-| Direct change impact | `ucn impact <handle>` |
-| Transitive callers | `ucn blast <handle> --depth=3` |
-| Downward execution flow | `ucn trace <handle> --depth=3` |
-| Paths from entry points | `ucn reverse-trace <handle>` |
-| Tests affected by a change | `ucn affected-tests <handle>` |
-| Validate call-site arity | `ucn verify <handle>` |
-| Pre-commit review | `ucn check [--base=main]` |
-| Exact source extraction | `ucn fn <handle>` or `ucn class <handle>` |
-| All references, not only calls | `ucn usages <name>` |
-| Potentially unreachable code | `ucn deadcode` |
-| Index limitations and readiness | `ucn doctor --deep` |
-
-Use `trace` instead of repeatedly calling `about` down a pipeline. Use `blast` instead of repeatedly calling `impact` up a caller chain.
+| Orient or diagnose a repository | `ucn repo [--sections=files,stats,health] [--deep]` |
+| Understand one symbol | `ucn show <handle> [--sections=...]` |
+| Locate definitions or types | `ucn find <name> [--type=type]` |
+| Inspect all reference kinds | `ucn usages <name>` |
+| Search text or AST structure | `ucn search [term] [--type=...]` |
+| Extract exact source | `ucn source <handle\|file:range>` |
+| Follow calls down or up | `ucn trace <handle> --direction=callees\|callers` |
+| Find paths to roots | `ucn trace <handle> --direction=callers --to=entrypoints` |
+| Assess direct or Git-diff impact | `ucn impact [handle]` |
+| Select direct or transitive tests | `ucn tests <handle> [--depth=N]` |
+| Validate a symbol or pending diff | `ucn check [handle]` |
+| Preview a refactor | `ucn plan <handle> --rename-to=X` |
+| Inspect file dependencies | `ucn deps <file> [--direction=...] [--cycles]` |
+| Inspect public surface | `ucn api [file]` |
+| Review entry points or HTTP routes | `ucn entrypoints`; `ucn endpoints` |
+| Generate review candidates | `ucn deadcode`; `ucn audit-async` |
+| Resolve runtime frames | `ucn stacktrace <text>` |
 
 ## Breaking-change protocol
 
-Before renaming, changing parameters, or changing behavior:
-
-1. Pin the exact definition with a handle.
-2. Run `impact`; review every unverified and warning entry.
-3. Run `blast` for transitive impact when behavior changes.
-4. Run `affected-tests`; treat “uncovered” as a test-planning signal, not proof of no coverage.
+1. Pin the exact definition with `find`.
+2. Run `impact`; review every unverified, excluded, filtered, and warning entry.
+3. Run `trace --direction=callers` for transitive behavioral impact.
+4. Run `tests --depth=3`; treat uncovered paths as test-planning signals.
 5. Make the change.
-6. Run `verify`, the relevant compiler or type checker, and the selected tests.
-7. Run `ucn check` to reconcile the repository diff.
-
-UCN augments the compiler and tests; it does not replace them.
+6. Run `check <handle>`, the relevant compiler/type checker, and selected tests.
+7. Run target-less `check` to reconcile the repository diff.
 
 ## Deletion protocol
 
-Treat `deadcode` as a candidate generator. Before deleting a symbol:
+Treat `deadcode` as a candidate generator. Before deletion, inspect `usages`, `impact`, `entrypoints`, `api`, and `repo --sections=health --deep`; then corroborate with the compiler/type checker and tests. Never delete solely from `deadcode` or an observed-text-zero result.
 
-1. Run `ucn deadcode`, then pin the candidate.
-2. Run `ucn usages <name>` to inspect calls, imports, type references, and non-call references.
-3. Run `ucn impact <handle>` and inspect `ACCOUNT`, `CONTRACT`, warnings, unverified sites, and beyond-text callers.
-4. Run `ucn entrypoints` and consider framework registration, reflection, serialization, dependency injection, public API use, and external consumers.
-5. Run `ucn doctor --deep`; inspect index health, evidence readiness, and the deletion review requirement.
-6. Delete only with corroborating compiler/type-checker and test evidence.
+## Efficient use
 
-Never delete solely because `deadcode` or an observed-text-zero contract reports zero callers.
+- Prefer handles over plain names. Use `--class-name` or `--file` only when a handle is unavailable.
+- Use `--sections` to request only the `show` or `repo` evidence needed.
+- Use `--expand-unverified` only when deliberately exploring possible caller chains; those descendants remain possible, not confirmed.
+- Use `--all` when output reports a cap and `--exclude=test` only for an intentionally production-only view.
+- Use `search` or ordinary repository search for text, filenames, configuration, and unsupported syntax.
 
-## Ambiguity and dispatch
-
-- Prefer handles over a plain symbol name.
-- Use `--class-name=<Class>` or `--file=<pattern>` only when a handle is unavailable.
-- Treat `possible-dispatch`, `method-ambiguous`, `alias-call`, and `call-not-resolved` as review-required.
-- Tree trunks contain confirmed edges. Unverified edges are separate and are not expanded unless `--expand-unverified` is requested.
-- Following an unverified edge produces a possible-impact chain, not a confirmed chain.
-
-## Efficient output
-
-- Use `--compact` for agent context and `--json` for automation.
-- Use `--exclude=test` only for a production-only view; rerun without it before a breaking change.
-- Use `--all` when a section says results were capped.
-- Use `--no-cache` after edits if cache freshness is in doubt.
-- Use `ucn search` for text or structural queries; use ordinary repository search for file names and unsupported syntax.
-
-Read [references/commands.md](references/commands.md) when a less common command or flag is needed. Read [references/trust-contract.md](references/trust-contract.md) before building automation that gates changes on UCN output.
+Read [references/commands.md](references/commands.md) for all public commands and flags. Read [references/trust-contract.md](references/trust-contract.md) before building automation that gates changes on UCN output.

@@ -1,17 +1,17 @@
 {
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "io.github.mleoca/ucn",
-  "description": "Code intelligence for AI agents. Extract, trace, and analyze code without reading whole files.",
+  "description": "Auditable AST code intelligence for AI agents through one 18-command MCP tool, with JS/TS, Python, Go, Rust, Java, C/C++, C#, and HTML support.",
   "repository": {
     "url": "https://github.com/mleoca/ucn",
     "source": "github"
   },
-  "version": "4.2.3",
+  "version": "5.0.0",
   "packages": [
     {
       "registryType": "npm",
       "identifier": "ucn",
-      "version": "4.2.3",
+      "version": "5.0.0",
       "transport": {
         "type": "stdio"
       }

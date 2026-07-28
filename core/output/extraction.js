@@ -124,7 +124,7 @@ function formatClassResult(result) {
                     lines.push(`  ${formatFunctionSignature(m)}  [line ${m.startLine}]`);
                 }
             }
-            lines.push(`\nClass is ${entry.totalLines} lines. Use --max-lines=N to see source, or "fn <method>" for individual methods.`);
+            lines.push(`\nClass is ${entry.totalLines} lines. Use --max-lines=N to see source, or "source <method-handle>" for an individual method.`);
             parts.push(lines.join('\n'));
         } else if (entry.truncated) {
             parts.push(formatClass(entry.match, entry.code) + `\n\n... showing ${entry.maxLines} of ${entry.totalLines} lines`);

@@ -15,6 +15,7 @@ const { execSync } = require('child_process');
 const { ProjectIndex } = require('../core/project');
 const output = require('../core/output');
 const { execute } = require('../core/execute');
+const { computeReachability } = require('../core/entrypoints');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR, runCli, runInteractive } = require('./helpers');
 
 describe('Bug: stats symbol count consistency', () => {
@@ -2690,391 +2691,9 @@ describe('P1: truncation notes on tree commands', () => {
 // CLI ↔ MCP ↔ Interactive Parity: --file flag and output consistency
 // ═══════════════════════════════════════════════════════════════════════════════
 
-describe('fix: --file flag works for file-centric commands across all surfaces', () => {
-    const JS = FIXTURES_PATH + '/javascript';
+// v5 CLI, MCP, interactive, positional-file, and JSON parity coverage lives in
+// parity-test.js and is derived from the public registry.
 
-    // ── CLI: positional arg vs --file flag equivalence ──────────────────
-
-    describe('CLI: --file flag produces same results as positional arg', () => {
-        it('imports: positional and --file produce equivalent output', () => {
-            const positional = runCli(JS, 'imports', ['main.js']);
-            const flagged = runCli(JS, 'imports', [], ['--file', 'main.js']);
-            assert.ok(positional.includes('Imports in main.js'), 'positional should show filename');
-            assert.ok(flagged.includes('Imports in main.js'), '--file should show filename');
-        });
-
-        it('exporters: positional and --file produce equivalent output', () => {
-            const positional = runCli(JS, 'exporters', ['utils.js']);
-            const flagged = runCli(JS, 'exporters', [], ['--file', 'utils.js']);
-            // Both should contain the file reference or importer info
-            assert.ok(positional.includes('utils.js'), 'positional should reference file');
-            assert.ok(flagged.includes('utils.js'), '--file should reference file');
-        });
-
-        it('file-exports: positional and --file produce equivalent output', () => {
-            const positional = runCli(JS, 'file-exports', ['utils.js']);
-            const flagged = runCli(JS, 'file-exports', [], ['--file', 'utils.js']);
-            assert.ok(positional.includes('utils.js'), 'positional should reference file');
-            assert.ok(flagged.includes('utils.js'), '--file should reference file');
-        });
-
-        it('graph: positional and --file produce equivalent output', () => {
-            const positional = runCli(JS, 'graph', ['main.js']);
-            const flagged = runCli(JS, 'graph', [], ['--file', 'main.js']);
-            assert.ok(positional.includes('main.js'), 'positional should reference file');
-            assert.ok(flagged.includes('main.js'), '--file should reference file');
-        });
-
-        it('api: positional and --file produce equivalent output', () => {
-            const positional = runCli(JS, 'api', ['utils.js']);
-            const flagged = runCli(JS, 'api', [], ['--file', 'utils.js']);
-            assert.ok(positional.includes('utils.js'), 'positional should reference file');
-            assert.ok(flagged.includes('utils.js'), '--file should reference file');
-        });
-    });
-
-    // ── Interactive: --file flag works ──────────────────────────────────
-
-    describe('Interactive: --file flag works for file-centric commands', () => {
-        it('imports --file shows correct filename', () => {
-            const out = runInteractive(JS, ['imports --file=main.js']);
-            assert.ok(out.includes('main.js'), 'interactive imports --file should show filename');
-        });
-
-        it('exporters --file shows correct filename', () => {
-            const out = runInteractive(JS, ['exporters --file=utils.js']);
-            assert.ok(out.includes('utils.js'), 'interactive exporters --file should show filename');
-        });
-
-        it('file-exports --file shows correct filename', () => {
-            const out = runInteractive(JS, ['file-exports --file=utils.js']);
-            assert.ok(out.includes('utils.js'), 'interactive file-exports --file should show filename');
-        });
-
-        it('graph --file shows correct filename', () => {
-            const out = runInteractive(JS, ['graph --file=main.js']);
-            assert.ok(out.includes('main.js'), 'interactive graph --file should show filename');
-        });
-
-        it('api --file shows correct filename', () => {
-            const out = runInteractive(JS, ['api --file=utils.js']);
-            assert.ok(out.includes('utils.js'), 'interactive api --file should show filename');
-        });
-    });
-
-    // ── CLI: all file-accepting commands don't crash with --file ────────
-
-    describe('CLI: every FLAG_APPLICABILITY[cmd] with file works via --file', () => {
-        it('about --file', () => {
-            const out = runCli(JS, 'about', ['helper'], ['--file', 'utils.js']);
-            assert.ok(out.includes('helper'), 'about --file should find symbol');
-        });
-
-        it('context --file', () => {
-            const out = runCli(JS, 'context', ['helper'], ['--file', 'utils.js']);
-            assert.ok(out.includes('helper') || out.includes('Context'), 'context --file should work');
-        });
-
-        it('impact --file', () => {
-            const out = runCli(JS, 'impact', ['helper'], ['--file', 'utils.js']);
-            assert.ok(!out.includes('Unknown command'), 'impact --file should not error');
-        });
-
-        it('find --file', () => {
-            const out = runCli(JS, 'find', ['helper'], ['--file', 'utils']);
-            assert.ok(out.includes('helper'), 'find --file should filter results');
-        });
-
-        it('usages --file', () => {
-            const out = runCli(JS, 'usages', ['helper'], ['--file', 'utils']);
-            assert.ok(out.includes('helper') || out.includes('Usages'), 'usages --file should work');
-        });
-
-        it('toc --file', () => {
-            const out = runCli(JS, 'toc', [], ['--file', 'utils.js']);
-            assert.ok(out.includes('utils.js'), 'toc --file should filter to file');
-        });
-
-        it('search --file', () => {
-            const out = runCli(JS, 'search', ['helper'], ['--file', 'utils.js']);
-            assert.ok(!out.includes('Unknown command'), 'search --file should not error');
-        });
-
-        it('fn --file', () => {
-            const out = runCli(JS, 'fn', ['helper'], ['--file', 'utils.js']);
-            assert.ok(out.includes('helper') || out.includes('function'), 'fn --file should extract function');
-        });
-
-        it('deadcode --file', () => {
-            const out = runCli(JS, 'deadcode', [], ['--file', 'utils.js']);
-            assert.ok(!out.includes('Unknown command'), 'deadcode --file should not error');
-        });
-
-        it('circular-deps --file', () => {
-            const out = runCli(JS, 'circular-deps', [], ['--file', 'utils.js']);
-            assert.ok(!out.includes('Unknown command'), 'circular-deps --file should not error');
-        });
-
-        it('verify --file', () => {
-            const out = runCli(JS, 'verify', ['helper'], ['--file', 'utils.js']);
-            assert.ok(!out.includes('Unknown command'), 'verify --file should not error');
-        });
-
-        it('diff-impact --file', () => {
-            const out = runCli(JS, 'diff-impact', [], ['--file', 'utils.js']);
-            assert.ok(!out.includes('Unknown command'), 'diff-impact --file should not error');
-        });
-
-        it('entrypoints --file', () => {
-            const out = runCli(JS, 'entrypoints', [], ['--file', 'main.js']);
-            assert.ok(!out.includes('Unknown command'), 'entrypoints --file should not error');
-        });
-    });
-});
-
-describe('CLI ↔ MCP parity: all commands produce non-error output', function() {
-    const JS = FIXTURES_PATH + '/javascript';
-    let client;
-
-    before(async () => {
-        client = new (require('./helpers').McpClient)();
-        await client.start();
-        await client.initialize();
-    });
-    after(() => client && client.stop());
-
-    // Helper: run same command via CLI and MCP, verify both succeed
-    async function assertParity(command, cliArgs, cliFlags, mcpParams, checks) {
-        const cliOut = runCli(JS, command, cliArgs || [], cliFlags || []);
-        const mcpRes = await client.callTool({ command: mcpParams.command || command, project_dir: JS, ...mcpParams });
-
-        // Neither should be an error
-        assert.ok(!mcpRes.isError, `MCP ${command} should not error: ${(mcpRes.text || '').slice(0, 200)}`);
-
-        // Both should contain expected content
-        if (checks) {
-            for (const check of checks) {
-                assert.ok(cliOut.includes(check), `CLI ${command} should contain "${check}"`);
-                assert.ok((mcpRes.text || '').includes(check), `MCP ${command} should contain "${check}"`);
-            }
-        }
-    }
-
-    // ── Understanding Code ──
-
-    it('about: CLI ↔ MCP', async () => {
-        await assertParity('about', ['helper'], [], { name: 'helper' }, ['helper', 'utils.js']);
-    });
-
-    it('about with --file: CLI ↔ MCP', async () => {
-        await assertParity('about', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
-    });
-
-    it('brief: CLI ↔ MCP', async () => {
-        await assertParity('brief', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
-    });
-
-    it('context: CLI ↔ MCP', async () => {
-        await assertParity('context', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('impact: CLI ↔ MCP', async () => {
-        await assertParity('impact', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('smart: CLI ↔ MCP', async () => {
-        await assertParity('smart', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('trace: CLI ↔ MCP', async () => {
-        await assertParity('trace', ['helper'], ['--depth', '2'], { name: 'helper', depth: 2 }, ['helper']);
-    });
-
-    it('reverse-trace: CLI ↔ MCP', async () => {
-        await assertParity('reverse-trace', ['helper'], ['--depth', '2'], { command: 'reverse_trace', name: 'helper', depth: 2 }, ['helper']);
-    });
-
-    it('blast: CLI ↔ MCP', async () => {
-        await assertParity('blast', ['helper'], ['--depth', '2'], { name: 'helper', depth: 2 }, ['helper']);
-    });
-
-    it('example: CLI ↔ MCP', async () => {
-        await assertParity('example', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('related: CLI ↔ MCP', async () => {
-        await assertParity('related', ['helper'], [], { name: 'helper' }, []);
-    });
-
-    // ── Finding Code ──
-
-    it('find: CLI ↔ MCP', async () => {
-        await assertParity('find', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('find with --file: CLI ↔ MCP', async () => {
-        await assertParity('find', ['helper'], ['--file', 'utils'], { name: 'helper', file: 'utils' }, ['helper']);
-    });
-
-    it('usages: CLI ↔ MCP', async () => {
-        await assertParity('usages', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('toc: CLI ↔ MCP', async () => {
-        await assertParity('toc', [], [], {}, []);
-    });
-
-    it('toc with --file: CLI ↔ MCP', async () => {
-        await assertParity('toc', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('toc --detailed: CLI ↔ MCP', async () => {
-        await assertParity('toc', [], ['--detailed'], { detailed: true }, []);
-    });
-
-    it('search: CLI ↔ MCP', async () => {
-        await assertParity('search', ['CONFIG'], [], { term: 'CONFIG' }, ['CONFIG', 'main.js']);
-    });
-
-    it('tests: CLI ↔ MCP', async () => {
-        await assertParity('tests', ['helper'], [], { name: 'helper' }, []);
-    });
-
-    it('affected-tests: CLI ↔ MCP', async () => {
-        await assertParity('affected-tests', ['helper'], [], { command: 'affected_tests', name: 'helper' }, []);
-    });
-
-    it('deadcode: CLI ↔ MCP', async () => {
-        await assertParity('deadcode', [], [], {}, []);
-    });
-
-    it('deadcode with --file: CLI ↔ MCP', async () => {
-        await assertParity('deadcode', [], ['--file', 'utils.js'], { file: 'utils.js' }, []);
-    });
-
-    it('entrypoints: CLI ↔ MCP', async () => {
-        await assertParity('entrypoints', [], [], {}, []);
-    });
-
-    it('endpoints: CLI ↔ MCP', async () => {
-        await assertParity('endpoints', [], [], {}, []);
-    });
-
-    // ── Extracting Code ──
-
-    it('fn: CLI ↔ MCP', async () => {
-        await assertParity('fn', ['helper'], ['--file', 'utils.js'], { name: 'helper', file: 'utils.js' }, ['helper']);
-    });
-
-    it('class: CLI ↔ MCP', async () => {
-        await assertParity('class', ['Service'], ['--file', 'service.js'], { name: 'Service', file: 'service.js' }, ['Service']);
-    });
-
-    it('lines: CLI ↔ MCP', async () => {
-        await assertParity('lines', ['1-5'], ['--file', 'utils.js'], { range: '1-5', file: 'utils.js' }, []);
-    });
-
-    // ── File Dependencies ──
-
-    it('imports: CLI ↔ MCP (positional)', async () => {
-        await assertParity('imports', ['main.js'], [], { file: 'main.js' }, ['main.js']);
-    });
-
-    it('imports: CLI ↔ MCP (--file)', async () => {
-        await assertParity('imports', [], ['--file', 'main.js'], { file: 'main.js' }, ['main.js']);
-    });
-
-    it('exporters: CLI ↔ MCP (positional)', async () => {
-        await assertParity('exporters', ['utils.js'], [], { file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('exporters: CLI ↔ MCP (--file)', async () => {
-        await assertParity('exporters', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('file-exports: CLI ↔ MCP (positional)', async () => {
-        await assertParity('file-exports', ['utils.js'], [], { command: 'file_exports', file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('file-exports: CLI ↔ MCP (--file)', async () => {
-        await assertParity('file-exports', [], ['--file', 'utils.js'], { command: 'file_exports', file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('graph: CLI ↔ MCP (positional)', async () => {
-        await assertParity('graph', ['main.js'], [], { file: 'main.js' }, ['main.js']);
-    });
-
-    it('graph: CLI ↔ MCP (--file)', async () => {
-        await assertParity('graph', [], ['--file', 'main.js'], { file: 'main.js' }, ['main.js']);
-    });
-
-    it('graph with --depth: CLI ↔ MCP', async () => {
-        await assertParity('graph', ['main.js'], ['--depth', '1'], { file: 'main.js', depth: 1 }, ['main.js']);
-    });
-
-    it('circular-deps: CLI ↔ MCP', async () => {
-        await assertParity('circular-deps', [], [], { command: 'circular_deps' }, []);
-    });
-
-    // ── Refactoring ──
-
-    it('verify: CLI ↔ MCP', async () => {
-        await assertParity('verify', ['helper'], [], { name: 'helper' }, ['helper']);
-    });
-
-    it('plan (rename): CLI ↔ MCP', async () => {
-        await assertParity('plan', ['helper'], ['--rename-to', 'helperFn'], { name: 'helper', rename_to: 'helperFn' }, []);
-    });
-
-    it('diff-impact: CLI ↔ MCP', async () => {
-        await assertParity('diff-impact', [], [], { command: 'diff_impact' }, []);
-    });
-
-    it('check: CLI ↔ MCP', async () => {
-        await assertParity('check', [], [], {}, ['Pre-commit Check']);
-    });
-
-    // ── Other ──
-
-    it('typedef: CLI ↔ MCP', async () => {
-        await assertParity('typedef', ['Service'], [], { name: 'Service' }, []);
-    });
-
-    it('api: CLI ↔ MCP (positional)', async () => {
-        await assertParity('api', ['utils.js'], [], { file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('api: CLI ↔ MCP (--file)', async () => {
-        await assertParity('api', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['utils.js']);
-    });
-
-    it('stats: CLI ↔ MCP', async () => {
-        await assertParity('stats', [], [], {}, ['STATISTICS']);
-    });
-
-    it('stats with --file: CLI ↔ MCP', async () => {
-        await assertParity('stats', [], ['--file', 'utils.js'], { file: 'utils.js' }, ['STATISTICS']);
-    });
-
-    it('doctor: CLI ↔ MCP', async () => {
-        await assertParity('doctor', [], [], {}, ['Command proofs: 39/39 classified']);
-    });
-
-    it('orient: CLI ↔ MCP', async () => {
-        await assertParity('orient', [], [], {}, ['PROJECT ORIENTATION']);
-    });
-
-    it('audit-async: CLI ↔ MCP', async () => {
-        await assertParity('audit-async', [], [], { command: 'audit_async' }, ['Async audit']);
-    });
-
-    it('stacktrace: CLI ↔ MCP', async () => {
-        const stack = 'at helper (utils.js:10:1)';
-        await assertParity('stacktrace', [stack], [], { stack }, ['helper', 'utils.js']);
-    });
-});
-
-// =============================================================================
 // Handoff report fixes: MCP error semantics, tests className scoping,
 // CLI adapter param gaps, expand cache invalidation
 // =============================================================================
@@ -3089,9 +2708,9 @@ describe('fix: MCP isError semantics — !ok returns isError=true', () => {
     });
     after(() => client && client.stop());
 
-    it('about(nonexistent) returns isError=true', async () => {
+    it('show(nonexistent) returns isError=true', async () => {
         const res = await client.callTool('ucn', {
-            command: 'about',
+            command: 'show',
             project_dir: FIXTURES_PATH + '/javascript',
             name: 'zzz_nonexistent_xyz',
         });
@@ -3100,9 +2719,9 @@ describe('fix: MCP isError semantics — !ok returns isError=true', () => {
         assert.ok(/not found/i.test(text), 'Error text should mention "not found"');
     });
 
-    it('context(nonexistent) returns isError=true', async () => {
+    it('trace(nonexistent) returns isError=true', async () => {
         const res = await client.callTool('ucn', {
-            command: 'context',
+            command: 'trace',
             project_dir: FIXTURES_PATH + '/javascript',
             name: 'zzz_nonexistent_xyz',
         });
@@ -3118,20 +2737,21 @@ describe('fix: MCP isError semantics — !ok returns isError=true', () => {
         assert.ok(!res.result?.isError, 'Valid find should not set isError');
     });
 
-    it('fn(nonexistent) returns isError=true', async () => {
+    it('source(nonexistent) returns isError=true', async () => {
         const res = await client.callTool('ucn', {
-            command: 'fn',
+            command: 'source',
             project_dir: FIXTURES_PATH + '/javascript',
             name: 'zzz_nonexistent_xyz',
         });
         assert.strictEqual(res.result?.isError, true);
     });
 
-    it('imports(nonexistent file) returns isError=true', async () => {
+    it('deps(nonexistent file) returns isError=true', async () => {
         const res = await client.callTool('ucn', {
-            command: 'imports',
+            command: 'deps',
             project_dir: FIXTURES_PATH + '/javascript',
             file: 'nonexistent.js',
+            direction: 'imports',
         });
         assert.strictEqual(res.result?.isError, true);
     });
@@ -3815,7 +3435,7 @@ describe('CLI file-mode scoping', () => {
         });
         try {
             // Target b.py specifically — should resolve to B.save, not A.save
-            const out = runCli(dir + '/b.py', 'about', ['save'], ['--json']);
+            const out = runCli(dir + '/b.py', 'show', ['save'], ['--json']);
             assert.ok(out.includes('b.py'), 'Should resolve to b.py');
             assert.ok(!out.includes('a.py'), 'Should not include a.py');
         } finally {
@@ -4198,7 +3818,7 @@ describe('about/context includeTests flag', () => {
         } finally { rm(dir); }
     });
 
-    it('context --include-tests warns as inapplicable', () => {
+    it('trace --include-tests warns as inapplicable', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function save() { return 1; }\nmodule.exports = { save };',
@@ -4207,18 +3827,18 @@ describe('about/context includeTests flag', () => {
             const { spawnSync } = require('child_process');
             const result = spawnSync('node', [
                 require('path').join(__dirname, '..', 'cli', 'index.js'),
-                dir, 'context', 'save', '--include-tests'
+                dir, 'trace', 'save', '--include-tests'
             ], { timeout: 30000, encoding: 'utf-8' });
             assert.ok((result.stderr || '').includes('no effect'),
-                'context --include-tests should warn on stderr');
+                'trace --include-tests should warn on stderr');
         } finally { rm(dir); }
     });
 });
 
 describe('flag validation parity across surfaces', () => {
     it('interactive mode warns about inapplicable flags', () => {
-        const out = runInteractive(FIXTURES_PATH + '/javascript', ['context helper --include-tests']);
-        assert.ok(out.includes('no effect'), 'interactive context --include-tests should warn');
+        const out = runInteractive(FIXTURES_PATH + '/javascript', ['trace helper --include-tests']);
+        assert.ok(out.includes('no effect'), 'interactive trace --include-tests should warn');
     });
 
     it('MCP strips inapplicable params and reports them', async () => {
@@ -4247,10 +3867,10 @@ describe('flag validation parity across surfaces', () => {
         const { spawnSync } = require('child_process');
         const result = spawnSync('node', [
             require('path').join(__dirname, '..', 'cli', 'index.js'),
-            FIXTURES_PATH + '/javascript', 'about', 'helper', '--no-regex'
+            FIXTURES_PATH + '/javascript', 'show', 'helper', '--no-regex'
         ], { timeout: 30000, encoding: 'utf-8' });
         const combined = (result.stdout || '') + (result.stderr || '');
-        assert.ok(combined.includes('no effect'), 'about --no-regex should warn (regex not applicable)');
+        assert.ok(combined.includes('no effect'), 'show --no-regex should warn (regex not applicable)');
     });
 
     it('CLI warns about inapplicable negation flags (--hide-confidence)', () => {
@@ -4264,8 +3884,8 @@ describe('flag validation parity across surfaces', () => {
     });
 
     it('interactive mode warns about inapplicable negation flags', () => {
-        const out = runInteractive(FIXTURES_PATH + '/javascript', ['about helper --no-regex']);
-        assert.ok(out.includes('no effect'), 'interactive about --no-regex should warn');
+        const out = runInteractive(FIXTURES_PATH + '/javascript', ['show helper --no-regex']);
+        assert.ok(out.includes('no effect'), 'interactive show --no-regex should warn');
     });
 
     it('glob mode warns about inapplicable flags', () => {
@@ -4273,10 +3893,11 @@ describe('flag validation parity across surfaces', () => {
         const { spawnSync } = require('child_process');
         const result = spawnSync('node', [
             require('path').join(__dirname, '..', 'cli', 'index.js'),
-            pattern, 'context', 'helper', '--include-tests'
+            pattern, 'trace', 'helper', '--include-tests'
         ], { timeout: 30000, encoding: 'utf-8' });
-        assert.ok((result.stderr || '').includes('no effect'),
-            'glob mode should warn about inapplicable --include-tests on context');
+        const combined = (result.stdout || '') + (result.stderr || '');
+        assert.ok(combined.includes('no effect'),
+            'glob mode should warn about inapplicable --include-tests on trace');
     });
 });
 
@@ -4397,56 +4018,52 @@ describe('tests --file: no basename collision across directories', () => {
 });
 
 describe('CLI glob-mode parity', () => {
-    it('glob mode supports about, context, tests commands', () => {
+    it('glob mode supports show and tests commands', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        // about
-        const aboutOut = runCli(pattern, 'about', ['helper'], ['--json']);
-        const about = JSON.parse(aboutOut);
-        assert.ok(about.found, 'glob about should find helper');
-        // context
-        const ctxOut = runCli(pattern, 'context', ['helper']);
-        assert.ok(ctxOut.includes('Context for helper'), 'glob context should show header');
-        assert.ok(!ctxOut.includes('[object Object]'), 'glob context should not print raw object');
+        const showOut = runCli(pattern, 'show', ['helper'], ['--sections=summary,callers', '--json']);
+        const shown = JSON.parse(showOut);
+        assert.ok(shown.data.summary, 'glob show should find helper');
+        assert.ok(shown.data.context, 'glob show should include relationships');
         // tests
         const testsOut = runCli(pattern, 'tests', ['helper']);
         assert.ok(testsOut.includes('Tests for "helper"'), 'glob tests should show header');
     });
 
-    it('glob mode passes filePath to imports/exporters/file-exports formatters', () => {
+    it('glob mode passes filePath and direction to deps', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const importsOut = runCli(pattern, 'imports', ['utils.js']);
+        const importsOut = runCli(pattern, 'deps', ['utils.js'], ['--direction=imports']);
         assert.ok(importsOut.includes('utils.js'), 'imports header should show filename');
         assert.ok(!importsOut.includes('undefined'), 'imports header should not show undefined');
 
-        const exportersOut = runCli(pattern, 'exporters', ['utils.js']);
+        const exportersOut = runCli(pattern, 'deps', ['utils.js'], ['--direction=exporters']);
         assert.ok(!exportersOut.includes('undefined'), 'exporters header should not show undefined');
 
-        const feOut = runCli(pattern, 'file-exports', ['utils.js']);
-        assert.ok(!feOut.includes('undefined'), 'file-exports header should not show undefined');
+        const apiOut = runCli(pattern, 'api', ['utils.js']);
+        assert.ok(!apiOut.includes('undefined'), 'api header should not show undefined');
     });
 
-    it('glob mode shows confidence in about by default (parity with project mode)', () => {
+    it('glob mode shows confidence in show by default (parity with project mode)', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
         // confidence annotations on caller lines are shown by default;
         // verify glob output matches project mode
-        const globOut = runCli(pattern, 'about', ['helper']);
-        const projOut = runCli(FIXTURES_PATH + '/javascript', 'about', ['helper']);
+        const globOut = runCli(pattern, 'show', ['helper']);
+        const projOut = runCli(FIXTURES_PATH + '/javascript', 'show', ['helper']);
         const globConf = (globOut.match(/confidence/g) || []).length;
         const projConf = (projOut.match(/confidence/g) || []).length;
         assert.strictEqual(globConf, projConf,
             'glob and project mode should show same number of confidence annotations');
     });
 
-    it('glob mode shows evidence aggregate in context by default', () => {
+    it('glob mode shows evidence aggregate in show callers', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const withConf = runCli(pattern, 'context', ['helper']);
-        assert.ok(withConf.includes('evidence: '), 'glob context should show evidence aggregate by default');
+        const withConf = runCli(pattern, 'show', ['helper'], ['--sections=callers']);
+        assert.ok(withConf.includes('evidence: '), 'glob show should show evidence aggregate');
     });
 
-    it('glob mode passes --top to related formatter', () => {
+    it('glob mode passes --top to the show related section', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const topOne = runCli(pattern, 'related', ['helper'], ['--top', '1']);
-        const topAll = runCli(pattern, 'related', ['helper']);
+        const topOne = runCli(pattern, 'show', ['helper'], ['--sections=related', '--top', '1']);
+        const topAll = runCli(pattern, 'show', ['helper'], ['--sections=related']);
         // --top 1 should produce fewer or equal lines than default
         assert.ok(topOne.split('\n').length <= topAll.split('\n').length,
             'glob related --top 1 should limit output');
@@ -4457,61 +4074,57 @@ describe('CLI glob-mode parity', () => {
         const out = runCli(pattern, 'api', ['utils.js'], ['--json']);
         const parsed = JSON.parse(out);
         // formatApiJson now wraps in {meta, data}; accept either shape
-        const exports = (parsed.data && parsed.data.exports) || parsed.exports;
+        const exports = parsed.data;
         assert.ok(exports.every(e => e.file === 'utils.js'),
             'glob api utils.js should only show utils.js exports');
     });
 
-    it('glob mode lines has proper formatter', () => {
+    it('glob mode source range has proper formatter', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const out = runCli(pattern, 'lines', ['1-3'], ['--file', 'utils.js']);
+        const out = runCli(pattern, 'source', ['utils.js:1-3']);
         assert.ok(out.includes('utils.js:1-3'), 'lines should show file:range header');
         assert.ok(!out.includes('"file"'), 'lines text mode should not be JSON');
     });
 
-    it('glob mode about --expand shows callee previews', () => {
+    it('glob mode show can select source and callees together', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const expandOut = runCli(pattern, 'about', ['helper'], ['--expand']);
-        const plainOut = runCli(pattern, 'about', ['helper']);
-        // --expand should produce more output (inline code previews)
-        assert.ok(expandOut.length > plainOut.length,
-            'about --expand should produce more output than plain about');
+        const out = runCli(pattern, 'show', ['helper'], ['--sections=source,callees']);
+        assert.ok(out.includes('SOURCE') && out.includes('CALLEES'), out);
     });
 
-    it('glob mode context advertises --expand, not two-phase expand', () => {
+    it('glob mode show does not advertise the retired expand workflow', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const out = runCli(pattern, 'context', ['helper']);
+        const out = runCli(pattern, 'show', ['helper']);
         assert.ok(!out.includes('ucn_expand'), 'glob context should not mention ucn_expand');
         assert.ok(!out.includes('expand <N>'), 'glob context should not advertise two-phase expand');
-        assert.ok(out.includes('--expand'), 'glob context should advertise --expand flag');
+        assert.ok(!out.includes('--expand'), 'glob show should not advertise retired --expand');
     });
 
-    it('glob mode context --expand shows inline callee previews', () => {
+    it('glob mode show sections narrow output', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const plain = runCli(pattern, 'context', ['helper']);
-        const expanded = runCli(pattern, 'context', ['helper'], ['--expand']);
-        assert.ok(expanded.length > plain.length,
-            'context --expand should produce more output (callee previews)');
-        assert.ok(expanded.includes('│'), 'expanded output should contain │ preview lines');
+        const summary = runCli(pattern, 'show', ['helper'], ['--sections=summary']);
+        const callers = runCli(pattern, 'show', ['helper'], ['--sections=callers']);
+        assert.ok(summary.includes('SUMMARY'));
+        assert.ok(callers.includes('CALLERS'));
     });
 
-    it('glob mode graph --all suppresses truncation', () => {
+    it('glob mode deps --all suppresses truncation', () => {
         const pattern = FIXTURES_PATH + '/javascript/**/*.js';
-        const defaultOut = runCli(pattern, 'graph', ['utils.js']);
-        const allOut = runCli(pattern, 'graph', ['utils.js'], ['--all']);
+        const defaultOut = runCli(pattern, 'deps', ['utils.js']);
+        const allOut = runCli(pattern, 'deps', ['utils.js'], ['--all']);
         // --all should not truncate; at minimum should not have fewer lines
         assert.ok(allOut.split('\n').length >= defaultOut.split('\n').length,
             'graph --all should show at least as many lines as default');
     });
 
-    it('graph --all no longer warns as inapplicable', () => {
-        const out = runCli(FIXTURES_PATH + '/javascript', 'graph', ['utils.js'], ['--all']);
-        assert.ok(!out.includes('has no effect'), 'graph --all should not warn as inapplicable');
+    it('deps --all is applicable', () => {
+        const out = runCli(FIXTURES_PATH + '/javascript', 'deps', ['utils.js'], ['--all']);
+        assert.ok(!out.includes('has no effect'), 'deps --all should not warn as inapplicable');
     });
 });
 
-describe('fix: CLI fn --class-name passes through to execute', () => {
-    it('fn with --class-name disambiguates methods', () => {
+describe('fix: CLI source --class-name passes through to execute', () => {
+    it('source with --class-name disambiguates methods', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'class A {\n  save() { return "A"; }\n}\nmodule.exports = { A };',
@@ -4532,16 +4145,16 @@ describe('fix: CLI fn --class-name passes through to execute', () => {
             assert.ok(resultB.result.entries[0].match.file.endsWith('b.js'), 'Should resolve to b.js');
 
             // CLI passes --class-name through
-            const cliOutput = runCli(dir, 'fn', ['save'], ['--class-name=A']);
-            assert.ok(cliOutput.includes('a.js'), 'CLI fn --class-name=A should show a.js');
+            const cliOutput = runCli(dir, 'source', ['save'], ['--class-name=A']);
+            assert.ok(cliOutput.includes('a.js'), 'CLI source --class-name=A should show a.js');
         } finally {
             rm(dir);
         }
     });
 });
 
-describe('fix: CLI example passes --file and --class-name to execute', () => {
-    it('example with --file narrows results', () => {
+describe('fix: CLI show example passes --file to execute', () => {
+    it('show --sections=example with --file narrows results', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
@@ -4549,7 +4162,7 @@ describe('fix: CLI example passes --file and --class-name to execute', () => {
         });
         try {
             // CLI should pass --file to execute
-            const cliOutput = runCli(dir, 'example', ['helper'], ['--file=app']);
+            const cliOutput = runCli(dir, 'show', ['helper'], ['--sections=example', '--file=lib.js']);
             assert.ok(cliOutput.includes('app.js') || cliOutput.includes('helper'), 'Should find example in app.js');
         } finally {
             rm(dir);
@@ -4672,35 +4285,34 @@ describe('fix: usages file filter graceful degradation', () => {
     });
 });
 
-describe('fix: file-exports --json returns populated exports array', () => {
-    it('formatFileExportsJson returns exports from the array result', () => {
+describe('fix: api --json returns populated exports array', () => {
+    it('public JSON envelope contains the API array', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            const cliOutput = runCli(dir, 'file-exports', ['lib.js'], ['--json']);
+            const cliOutput = runCli(dir, 'api', ['lib.js'], ['--json']);
             const parsed = JSON.parse(cliOutput);
             assert.ok(parsed.data, 'Should have data field');
-            assert.ok(Array.isArray(parsed.data.exports), 'exports should be an array');
-            assert.ok(parsed.data.exports.length > 0, 'exports should not be empty');
-            assert.ok(parsed.data.exports.some(e => e.name === 'helper'), 'Should include helper');
+            assert.ok(Array.isArray(parsed.data), 'data should be an array');
+            assert.ok(parsed.data.length > 0, 'exports should not be empty');
+            assert.ok(parsed.data.some(e => e.name === 'helper'), 'Should include helper');
         } finally {
             rm(dir);
         }
     });
 });
 
-describe('fix: class --class-name removed from FLAG_APPLICABILITY', () => {
-    it('class --class-name warns about inapplicable flag', () => {
+describe('source class extraction', () => {
+    it('source extracts a class by name', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'class Foo { run() {} }\nmodule.exports = { Foo };',
         });
         try {
-            const output = runCli(dir, 'class', ['Foo'], ['--class-name=Bar']);
-            // Should warn that --class-name has no effect on class command
-            assert.ok(output.includes('no effect') || output.includes('Foo'), 'Should warn or still work');
+            const output = runCli(dir, 'source', ['Foo']);
+            assert.ok(output.includes('class Foo'));
         } finally {
             rm(dir);
         }
@@ -4725,12 +4337,12 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // depth is not applicable to about — should be stripped and reported
-            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', depth: 3 });
+            // depth is not applicable to show — should be stripped and reported
+            const result = await client.callTool({ command: 'show', project_dir: dir, name: 'helper', depth: 3 });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('Note:'), 'should include a Note about stripped params');
             assert.ok(result.text.includes('depth'), 'note should mention "depth"');
-            assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
+            assert.ok(result.text.includes('not applicable to show'), 'note should mention the command');
         } finally {
             rm(dir);
         }
@@ -4742,8 +4354,8 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // file is applicable to about — no stripping note
-            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', file: 'lib.js' });
+            // file is applicable to show — no stripping note
+            const result = await client.callTool({ command: 'show', project_dir: dir, name: 'helper', file: 'lib.js' });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(!result.text.includes('ignored (not applicable'), 'should not include stripping note');
         } finally {
@@ -4757,12 +4369,12 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // depth and direction are not applicable to about
-            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', depth: 3, direction: 'imports' });
+            // depth and direction are not applicable to show
+            const result = await client.callTool({ command: 'show', project_dir: dir, name: 'helper', depth: 3, direction: 'imports' });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('depth'), 'note should mention "depth"');
             assert.ok(result.text.includes('direction'), 'note should mention "direction"');
-            assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
+            assert.ok(result.text.includes('not applicable to show'), 'note should mention the command');
         } finally {
             rm(dir);
         }
@@ -4774,11 +4386,11 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // depth is inapplicable to toc; max_chars=120 forces truncation
-            const result = await client.callTool({ command: 'toc', project_dir: dir, depth: 3, max_chars: 120 });
+            // depth is inapplicable to repo; max_chars=120 forces truncation
+            const result = await client.callTool({ command: 'repo', project_dir: dir, depth: 3, max_chars: 120 });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('depth'), 'stripping note should survive truncation');
-            assert.ok(result.text.includes('not applicable to toc'), 'should mention the command');
+            assert.ok(result.text.includes('not applicable to repo'), 'should mention the command');
         } finally {
             rm(dir);
         }
@@ -4790,11 +4402,11 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // about without name is an error; depth is inapplicable
-            const result = await client.callTool({ command: 'about', project_dir: dir, depth: 3 });
+            // show without name is an error; depth is inapplicable
+            const result = await client.callTool({ command: 'show', project_dir: dir, depth: 3 });
             assert.ok(result.isError, 'should be an error (missing name)');
             assert.ok(result.text.includes('depth'), 'stripping note should appear on error path');
-            assert.ok(result.text.includes('not applicable to about'), 'should mention the command');
+            assert.ok(result.text.includes('not applicable to show'), 'should mention the command');
         } finally {
             rm(dir);
         }
@@ -4806,11 +4418,11 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // regex=false is not applicable to about
-            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', regex: false });
+            // regex=false is not applicable to show
+            const result = await client.callTool({ command: 'show', project_dir: dir, name: 'helper', regex: false });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('regex'), 'note should mention "regex"');
-            assert.ok(result.text.includes('not applicable to about'), 'note should mention the command');
+            assert.ok(result.text.includes('not applicable to show'), 'note should mention the command');
         } finally {
             rm(dir);
         }
@@ -4822,8 +4434,8 @@ describe('MCP per-command param validation: stripping note', () => {
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // term is only for search, range is only for lines — both inapplicable to about
-            const result = await client.callTool({ command: 'about', project_dir: dir, name: 'helper', term: 'x', range: '1-2' });
+            // term is only for search, range is only for source — both inapplicable to show
+            const result = await client.callTool({ command: 'show', project_dir: dir, name: 'helper', term: 'x', range: '1-2' });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('term'), 'note should mention "term"');
             assert.ok(result.text.includes('range'), 'note should mention "range"');
@@ -4851,85 +4463,85 @@ describe('MCP per-command param validation: stripping note', () => {
     // BUG B1: FLAG_APPLICABILITY is keyed by canonical (camelCase) names but `command`
     // is the MCP (snake_case) name — multi-word commands silently skipped stripping.
     // The fix resolves command to canonical first.
-    it('multi-word commands strip inapplicable params (B1: circular_deps)', async () => {
+    it('composed deps strips inapplicable params', async () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'const b = require("./b");\nmodule.exports = {};',
             'b.js': 'const a = require("./a");\nmodule.exports = {};',
         });
         try {
-            // git, diverse, hot are not applicable to circular_deps
-            const result = await client.callTool({ command: 'circular_deps', project_dir: dir, git: true, diverse: true, hot: true });
+            // git, diverse, hot are not applicable to deps
+            const result = await client.callTool({ command: 'deps', project_dir: dir, cycles: true, git: true, diverse: true, hot: true });
             assert.ok(!result.isError, 'should not be an error');
             assert.ok(result.text.includes('Note:'), 'should include a Note about stripped params');
             assert.ok(result.text.includes('git') && result.text.includes('diverse') && result.text.includes('hot'),
                 'note should mention git, diverse, and hot');
-            assert.ok(result.text.includes('not applicable to circular_deps'),
+            assert.ok(result.text.includes('not applicable to deps'),
                 'note should mention the MCP command name');
         } finally {
             rm(dir);
         }
     });
 
-    it('multi-word commands strip inapplicable params (B1: diff_impact)', async () => {
+    it('composed diff impact strips inapplicable params', async () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }',
         });
         try {
-            // depth is not applicable to diff_impact
-            const result = await client.callTool({ command: 'diff_impact', project_dir: dir, depth: 3 });
-            // diff_impact may error if not in a git repo, but the stripping note must appear either way
+            // depth is not applicable to impact
+            const result = await client.callTool({ command: 'impact', project_dir: dir, depth: 3 });
+            // Diff impact may error if not in a git repo, but the stripping note must appear either way
             assert.ok(result.text.includes('depth'), 'stripping note should mention depth');
-            assert.ok(result.text.includes('not applicable to diff_impact'),
+            assert.ok(result.text.includes('not applicable to impact'),
                 'note should mention the MCP command name');
         } finally {
             rm(dir);
         }
     });
 
-    it('multi-word commands strip inapplicable params (B1: file_exports)', async () => {
+    it('api strips inapplicable params', async () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
         });
         try {
-            // depth is not applicable to file_exports
-            const result = await client.callTool({ command: 'file_exports', project_dir: dir, file: 'lib.js', depth: 3 });
+            // depth is not applicable to api
+            const result = await client.callTool({ command: 'api', project_dir: dir, file: 'lib.js', depth: 3 });
             assert.ok(result.text.includes('depth'), 'stripping note should mention depth');
-            assert.ok(result.text.includes('not applicable to file_exports'),
+            assert.ok(result.text.includes('not applicable to api'),
                 'note should mention the MCP command name');
         } finally {
             rm(dir);
         }
     });
 
-    it('multi-word commands strip inapplicable params (B1: reverse_trace)', async () => {
+    it('trace callers strips inapplicable params', async () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }\nfunction main() { helper(); }',
         });
         try {
-            // term is not applicable to reverse_trace
-            const result = await client.callTool({ command: 'reverse_trace', project_dir: dir, name: 'helper', term: 'x' });
+            // term is not applicable to trace
+            const result = await client.callTool({ command: 'trace', project_dir: dir, name: 'helper', direction: 'callers', term: 'x' });
             assert.ok(result.text.includes('term'), 'stripping note should mention term');
-            assert.ok(result.text.includes('not applicable to reverse_trace'),
+            assert.ok(result.text.includes('not applicable to trace'),
                 'note should mention the MCP command name');
         } finally {
             rm(dir);
         }
     });
 
-    it('multi-word commands strip inapplicable params (B1: affected_tests)', async () => {
+    it('transitive tests strips inapplicable params', async () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'lib.js': 'function helper() { return 1; }',
         });
         try {
-            // term is not applicable to affected_tests
-            const result = await client.callTool({ command: 'affected_tests', project_dir: dir, name: 'helper', term: 'x' });
+            // term is not applicable to tests
+            const result = await client.callTool({ command: 'tests', project_dir: dir, name: 'helper', depth: 2, term: 'x' });
             assert.ok(result.text.includes('term'), 'stripping note should mention term');
-            assert.ok(result.text.includes('not applicable to affected_tests'),
+            assert.ok(result.text.includes('not applicable to tests'),
                 'note should mention the MCP command name');
         } finally {
             rm(dir);
@@ -4953,42 +4565,12 @@ describe('MCP per-command param validation: stripping note', () => {
     });
 });
 
-describe('fix: expand cache invalidation on rebuild', () => {
-    it('CLI clears expandable.json when index is rebuilt', () => {
-        const dir = tmp({
-            'package.json': '{"name":"test"}',
-            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
-            'app.js': 'const { helper } = require("./lib");\nfunction main() { helper(); }',
-        });
-        try {
-            // Run context to create expandable.json
-            runCli(dir, 'context', ['main']);
-            const expandPath = path.join(dir, '.ucn-cache', 'expandable.json');
-            assert.ok(fs.existsSync(expandPath), 'expandable.json should exist after context');
-
-            // Modify a file to make cache stale — forces rebuild
-            fs.writeFileSync(path.join(dir, 'lib.js'),
-                'function helper() { return 2; }\nfunction helper2() {}\nmodule.exports = { helper, helper2 };'
-            );
-
-            // Run another command that triggers rebuild
-            runCli(dir, 'toc', []);
-
-            // expandable.json should be cleared
-            assert.ok(!fs.existsSync(expandPath), 'expandable.json should be cleared after rebuild');
-        } finally {
-            rm(dir);
-        }
-    });
-});
-
-
 // ============================================================================
 // Trust signals: confidence histogram + reachability tagging
 // ============================================================================
 
 describe('feature: caller/callee confidence histogram', () => {
-    it('histogram appears in context output when there are 2+ callers', () => {
+    it('histogram appears in show output when there are 2+ callers', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -5004,7 +4586,7 @@ func unused2() { helper() }
 `,
         });
         try {
-            const out = runCli(dir, 'context', ['helper']);
+            const out = runCli(dir, 'show', ['helper'], ['--sections=callers']);
             assert.ok(out.includes('CALLERS — CONFIRMED (3)'), 'should show 3 confirmed callers');
             assert.match(out, /evidence: (\d+ )?[a-z-]+/,
                 'evidence aggregate line should be present in caller section');
@@ -5026,7 +4608,7 @@ func helper() {}
 `,
         });
         try {
-            const out = runCli(dir, 'context', ['helper']);
+            const out = runCli(dir, 'show', ['helper'], ['--sections=callers']);
             assert.ok(out.includes('CALLERS — CONFIRMED (1)'), 'should show 1 confirmed caller');
             assert.ok(out.includes('evidence: '), 'evidence aggregate shown');
         } finally {
@@ -5052,6 +4634,7 @@ func unusedCaller() { helper() }
         });
         try {
             const index = idx(dir);
+            computeReachability(index);
             const ctx = index.context('helper');
             assert.ok(ctx.callers.length >= 2, 'should find at least 2 callers');
             const reachableCaller = ctx.callers.find(c => c.callerName === 'doWork');
@@ -5065,7 +4648,7 @@ func unusedCaller() { helper() }
         }
     });
 
-    it('text output shows "(unreachable from any entry point)" only when at least one caller is unreachable', () => {
+    it('compact show output omits verbose per-caller reachability prose', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -5080,15 +4663,15 @@ func unusedCaller() { helper() }
 `,
         });
         try {
-            const out = runCli(dir, 'context', ['helper']);
-            assert.ok(out.includes('unreachable from any entry point'),
-                'should show unreachable marker when at least one caller is unreachable');
+            const out = runCli(dir, 'show', ['helper'], ['--sections=callers']);
+            assert.ok(!out.includes('unreachable from any entry point'),
+                'compact show keeps reachability in JSON without verbose prose');
         } finally {
             rm(dir);
         }
     });
 
-    it('reachability is cached on the index across calls', () => {
+    it('reachability is opt-in and cached across filtered calls', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -5102,10 +4685,14 @@ func helper() {}
             const index = idx(dir);
             assert.strictEqual(index._reachableSymbols, undefined, 'reachable cache should not exist before first call');
             index.context('helper');
-            assert.ok(index._reachableSymbols instanceof Set, 'reachable cache should be a Set after context()');
+            assert.strictEqual(index._reachableSymbols, undefined,
+                'default context stays targeted and does not compute reachability');
+            index.context('helper', { unreachableOnly: true });
+            assert.ok(index._reachableSymbols instanceof Set,
+                'explicit reachability filtering computes the cache');
             const cachedSet = index._reachableSymbols;
             // Second call must reuse the same Set instance
-            index.context('helper');
+            index.context('helper', { unreachableOnly: true });
             assert.strictEqual(index._reachableSymbols, cachedSet, 'reachable cache should be reused across calls');
         } finally {
             rm(dir);
@@ -5114,7 +4701,7 @@ func helper() {}
 });
 
 describe('feature: --unreachable-only flag', () => {
-    it('CLI: --unreachable-only filters context to unreachable callers', () => {
+    it('CLI: --unreachable-only filters show callers', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -5130,10 +4717,10 @@ func unused2() { helper() }
 `,
         });
         try {
-            const fullOut = runCli(dir, 'context', ['helper']);
+            const fullOut = runCli(dir, 'show', ['helper'], ['--sections=callers']);
             assert.ok(fullOut.includes('CALLERS — CONFIRMED (3)'), 'without filter: 3 confirmed callers');
 
-            const filteredOut = runCli(dir, 'context', ['helper'], ['--unreachable-only']);
+            const filteredOut = runCli(dir, 'show', ['helper'], ['--sections=callers', '--unreachable-only']);
             assert.ok(filteredOut.includes('CALLERS — CONFIRMED (2)'), 'with --unreachable-only: 2 unreachable callers');
             assert.ok(!filteredOut.includes('[doWork]'), 'reachable caller doWork should be filtered out');
             assert.ok(filteredOut.includes('[unused1]'), 'unreachable caller unused1 should remain');
@@ -5162,10 +4749,37 @@ func deadCaller() { helper() }
             rm(dir);
         }
     });
+
+    it('impact computes whole-project reachability only when requested', () => {
+        const dir = tmp({
+            'main.go': [
+                'package main',
+                'func main() { helper() }',
+                'func helper() {}',
+                'func deadCaller() { helper() }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const plain = execute(index, 'impact', { name: 'helper' });
+            assert.ok(plain.ok, plain.error);
+            assert.ok(index._reachableSymbols == null,
+                'targeted impact must not trigger the whole-project BFS');
+
+            const filtered = execute(index, 'impact', {
+                name: 'helper', unreachableOnly: true,
+            });
+            assert.ok(filtered.ok, filtered.error);
+            assert.ok(index._reachableSymbols instanceof Set,
+                'the explicit reachability filter computes and caches the BFS');
+        } finally {
+            rm(dir);
+        }
+    });
 });
 
-describe('feature: histogram and reachable in JSON output', () => {
-    it('context --json includes callerHistogram and per-caller reachable', () => {
+describe('feature: histogram and optional reachability in JSON output', () => {
+    it('show callers JSON keeps histograms without eager reachability', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -5178,29 +4792,26 @@ func dead2() { helper() }
 `,
         });
         try {
-            const out = runCli(dir, 'context', ['helper'], ['--json']);
+            const out = runCli(dir, 'show', ['helper'], ['--sections=callers', '--json']);
             const parsed = JSON.parse(out);
             assert.ok(parsed.data, 'should have data');
-            assert.ok(parsed.data.callerHistogram, 'callerHistogram should be present');
-            assert.strictEqual(parsed.data.callerHistogram.total, 3, 'total should equal caller count');
-            assert.ok(typeof parsed.data.callerHistogram.high === 'number', 'high bucket is a number');
-            assert.ok(typeof parsed.data.callerHistogram.medium === 'number', 'medium bucket is a number');
-            assert.ok(typeof parsed.data.callerHistogram.low === 'number', 'low bucket is a number');
-            // Per-caller reachable
-            for (const c of parsed.data.callers) {
-                assert.ok(typeof c.reachable === 'boolean',
-                    'every caller should have a boolean reachable field');
+            const context = parsed.data.context;
+            assert.ok(context.callerHistogram, 'callerHistogram should be present');
+            assert.strictEqual(context.callerHistogram.total, 3, 'total should equal caller count');
+            assert.ok(typeof context.callerHistogram.high === 'number', 'high bucket is a number');
+            assert.ok(typeof context.callerHistogram.medium === 'number', 'medium bucket is a number');
+            assert.ok(typeof context.callerHistogram.low === 'number', 'low bucket is a number');
+            // Reachability is an explicit whole-project enrichment.
+            for (const c of context.callers) {
+                assert.strictEqual(c.reachable, undefined,
+                    'default targeted query omits reachability');
             }
-            const reachableCount = parsed.data.callers.filter(c => c.reachable).length;
-            const unreachableCount = parsed.data.callers.filter(c => !c.reachable).length;
-            assert.strictEqual(reachableCount, 1, 'main is reachable');
-            assert.strictEqual(unreachableCount, 2, 'dead1 and dead2 are unreachable');
         } finally {
             rm(dir);
         }
     });
 
-    it('about --json includes histograms and per-caller reachable', () => {
+    it('show --json includes histograms without forcing reachability', () => {
         const dir = tmp({
             'main.go': `package main
 
@@ -5212,14 +4823,14 @@ func unused1() { helper() }
 `,
         });
         try {
-            const out = runCli(dir, 'about', ['helper'], ['--json']);
+            const out = runCli(dir, 'show', ['helper'], ['--sections=callers', '--json']);
             const parsed = JSON.parse(out);
-            assert.ok(parsed.callers, 'callers section present');
-            assert.ok(parsed.callers.histogram, 'caller histogram present');
-            assert.strictEqual(parsed.callers.histogram.total, 2);
-            for (const c of parsed.callers.top) {
-                assert.ok(typeof c.reachable === 'boolean',
-                    'every caller in about should have reachable field');
+            assert.ok(parsed.data.context, 'callers section present');
+            assert.ok(parsed.data.context.callerHistogram, 'caller histogram present');
+            assert.strictEqual(parsed.data.context.callerHistogram.total, 2);
+            for (const c of parsed.data.context.callers) {
+                assert.strictEqual(c.reachable, undefined,
+                    'default show omits the expensive reachability enrichment');
             }
         } finally {
             rm(dir);
@@ -5431,12 +5042,12 @@ describe('BUG-H3: impact and verify honor --include-methods flag', () => {
         } finally { rm(dir); }
     });
 
-    it('FLAG_APPLICABILITY exposes includeMethods on impact and verify', () => {
+    it('FLAG_APPLICABILITY exposes includeMethods on impact and check', () => {
         const { FLAG_APPLICABILITY } = require('../core/registry');
         assert.ok(FLAG_APPLICABILITY.impact.includes('includeMethods'),
             'impact should accept includeMethods');
-        assert.ok(FLAG_APPLICABILITY.verify.includes('includeMethods'),
-            'verify should accept includeMethods');
+        assert.ok(FLAG_APPLICABILITY.check.includes('includeMethods'),
+            'check should accept includeMethods');
     });
 });
 

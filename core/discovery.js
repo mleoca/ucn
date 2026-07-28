@@ -85,7 +85,10 @@ const PROJECT_MARKERS = [
     'Cargo.toml',
     'pom.xml',
     'build.gradle',
-    'Makefile'
+    'Makefile',
+    'CMakeLists.txt',
+    'compile_commands.json',
+    'meson.build'
 ];
 
 // Test file patterns by language
@@ -94,12 +97,14 @@ const TEST_PATTERNS = {
         /\.test\.(js|jsx|ts|tsx|mjs|cjs)$/,
         /\.spec\.(js|jsx|ts|tsx|mjs|cjs)$/,
         /__tests__\//,
+        /(^|\/)tests?\//,
         /\.test$/
     ],
     typescript: [
         /\.test\.(ts|tsx)$/,
         /\.spec\.(ts|tsx)$/,
-        /__tests__\//
+        /__tests__\//,
+        /(^|\/)tests?\//
     ],
     python: [
         /^test_.*\.py$/,
@@ -118,6 +123,21 @@ const TEST_PATTERNS = {
     rust: [
         /.*_test\.rs$/,
         /(^|\/)tests\//
+    ],
+    c: [
+        /(^|\/)tests?\//,
+        /(^|\/)test_.*\.(c|h)$/,
+        /.*(_test|\.test)\.(c|h)$/
+    ],
+    cpp: [
+        /(^|\/)tests?\//,
+        /(^|\/)test_.*\.(cc|cpp|cxx|c\+\+|hpp|hh|hxx|h\+\+)$/,
+        /.*(_test|\.test)\.(cc|cpp|cxx|c\+\+|hpp|hh|hxx|h\+\+)$/
+    ],
+    csharp: [
+        /(^|\/)tests?\//,
+        /.*Tests?\.cs$/,
+        /.*\.Tests\.cs$/
     ]
 };
 
@@ -406,16 +426,27 @@ function findProjectRoot(startDir) {
                 return dir;
             }
         }
+        try {
+            const entries = fs.readdirSync(dir);
+            if (entries.some(name => /\.(csproj|sln|vcxproj)$/i.test(name))) {
+                return dir;
+            }
+        } catch (_) {
+            // Keep walking toward the filesystem root.
+        }
         dir = path.dirname(dir);
     }
 
     return path.resolve(startDir);
 }
 
-// All file extensions for languages UCN supports as code analysis (excludes .rb/.php/.c/.cpp etc.
-// which are extensions UCN scans but doesn't analyze). When build manifests can't tell us
-// what's in a project, we scan all of these — the file extension alone determines language.
-const ALL_SUPPORTED_EXTENSIONS = ['js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'py', 'go', 'java', 'rs', 'html', 'htm'];
+// All file extensions UCN analyzes. When manifests cannot identify the
+// project, extension-based discovery remains the source of truth.
+const ALL_SUPPORTED_EXTENSIONS = [
+    'js', 'jsx', 'ts', 'tsx', 'mjs', 'cjs', 'py', 'go', 'java', 'rs',
+    'c', 'h', 'cc', 'cpp', 'cxx', 'c++', 'hpp', 'hh', 'hxx', 'h++',
+    'cs', 'csx', 'html', 'htm',
+];
 
 // Build-manifest hints: when present, we know the project has files of that language
 // regardless of whether sources are visible at the time of scan. Used as hints, not gates —
@@ -430,6 +461,10 @@ const MANIFEST_HINTS = {
     'pom.xml':           ['java'],
     'build.gradle':      ['java'],
     'build.gradle.kts':  ['java'],
+    'Makefile':          ['c', 'h', 'cc', 'cpp', 'cxx', 'hpp'],
+    'CMakeLists.txt':    ['c', 'h', 'cc', 'cpp', 'cxx', 'hpp'],
+    'compile_commands.json': ['c', 'h', 'cc', 'cpp', 'cxx', 'hpp'],
+    'meson.build':       ['c', 'h', 'cc', 'cpp', 'cxx', 'hpp'],
 };
 
 /**

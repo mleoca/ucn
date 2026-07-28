@@ -7,7 +7,7 @@
 
 const fs = require('fs');
 const path = require('path');
-const { getParser, getLanguageModule } = require('../languages');
+const { getParser, getLanguageAdapter } = require('../languages');
 
 /**
  * Extract imports from file content using AST
@@ -20,7 +20,7 @@ function extractImports(content, language) {
     // Use JS language module for TS/TSX (same import syntax), but the actual language's parser
     const moduleLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
 
-    const langModule = getLanguageModule(moduleLang);
+    const langModule = getLanguageAdapter(moduleLang);
     if (langModule && typeof langModule.findImportsInCode === 'function') {
         try {
             const parser = getParser(language);
@@ -45,7 +45,7 @@ function extractExports(content, language) {
     // Use JS language module for TS/TSX (same export syntax), but the actual language's parser
     const moduleLang = (language === 'typescript' || language === 'tsx') ? 'javascript' : language;
 
-    const langModule = getLanguageModule(moduleLang);
+    const langModule = getLanguageAdapter(moduleLang);
     if (langModule && typeof langModule.findExportsInCode === 'function') {
         try {
             const parser = getParser(language);
@@ -180,8 +180,23 @@ function resolveImport(importPath, fromFile, config = {}) {
     }
 
     // Relative imports
+    const extensions = config.extensions || getExtensions(config.language);
     const resolved = path.resolve(fromDir, normalizedPath);
-    return resolveFilePath(resolved, config.extensions || getExtensions(config.language));
+    const direct = resolveFilePath(resolved, extensions);
+    if (direct) return direct;
+
+    // C/C++ quoted includes may be rooted at compiler -I/-iquote paths rather
+    // than the importing file. compile_commands.json is the authoritative
+    // build metadata when present; unresolved system includes remain external.
+    if (config.language === 'c' || config.language === 'cpp') {
+        const { includeDirectoriesForFile } = require('./compilation-database');
+        const includeName = normalizedPath.replace(/^\.\//, '');
+        for (const includeDir of includeDirectoriesForFile(fromFile, config.root)) {
+            const candidate = resolveFilePath(path.resolve(includeDir, includeName), extensions);
+            if (candidate) return candidate;
+        }
+    }
+    return null;
 }
 
 // Cache for Go module paths
@@ -484,8 +499,17 @@ function resolveRustImport(importPath, fromFile, projectRoot) {
         const cargo = findCargoRoot(fromDir);
         if (cargo && cargo.packageName && firstSeg === cargo.packageName) {
             const topDir = path.relative(cargo.root, fromFile).split(path.sep)[0];
+            const sourceRelative = path.relative(cargo.srcDir, fromFile);
+            const sourceHead = sourceRelative.split(path.sep)[0];
+            // A package's binaries are separate crates from its library even
+            // though both live below src/. `use package_name::Type` in
+            // src/main.rs or src/bin/** therefore names the lib target, not a
+            // child module of the binary. Treat these like examples/tests so
+            // the import graph can pin re-exported library types exactly.
+            const separateBinary = sourceRelative === 'main.rs' ||
+                sourceHead === 'bin';
             const externalTarget = topDir === 'tests' || topDir === 'benches' || topDir === 'examples' ||
-                !fromFile.startsWith(cargo.srcDir + path.sep);
+                separateBinary || !fromFile.startsWith(cargo.srcDir + path.sep);
             if (externalTarget) {
                 const restSegs = importPath.split('::').slice(1);
                 const resolved = restSegs.length > 0 ? resolveRustModulePath(cargo.srcDir, restSegs) : null;
@@ -593,7 +617,13 @@ function _findPackageJson(fromDir, stopDir) {
             try {
                 if (fs.existsSync(candidate)) {
                     const pkg = JSON.parse(fs.readFileSync(candidate, 'utf-8'));
-                    info = { dir: current, name: pkg.name, exports: pkg.exports, main: pkg.main };
+                    info = {
+                        dir: current,
+                        name: pkg.name,
+                        exports: pkg.exports,
+                        main: pkg.main,
+                        source: pkg.source,
+                    };
                 }
             } catch { /* unreadable or invalid JSON */ }
             _pkgCache.set(current, info);
@@ -666,6 +696,14 @@ function resolveSelfReference(importPath, fromDir, config) {
                 if (hit) return hit;
             }
         }
+        // Monorepo packages commonly export build artifacts that do not
+        // exist in a source checkout while declaring the development entry
+        // explicitly (`"source": "src/index.ts"`). For a package's own bare
+        // import, that source field is the authoritative local module.
+        if (subpath === '.' && typeof pkg.source === 'string') {
+            const source = resolveFilePath(path.resolve(pkg.dir, pkg.source), extensions);
+            if (source) return source;
+        }
         return null;
     }
     // No exports map: bare name -> main/index; subpath -> direct file
@@ -730,6 +768,12 @@ function getExtensions(language) {
             return ['.java'];
         case 'rust':
             return ['.rs'];
+        case 'c':
+            return ['.c', '.h'];
+        case 'cpp':
+            return ['.cc', '.cpp', '.cxx', '.c++', '.hpp', '.hh', '.hxx', '.h++', '.h'];
+        case 'csharp':
+            return ['.cs', '.csx'];
         default:
             return ['.js', '.ts'];
     }

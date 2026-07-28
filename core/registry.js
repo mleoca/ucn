@@ -11,56 +11,22 @@
 // CANONICAL COMMANDS
 // ============================================================================
 
-// All commands using camelCase canonical IDs.
-// Order: understanding, finding, extracting, file-deps, refactoring, other.
+// Public v5 commands using camelCase canonical IDs.
+//
+// The engine still exposes narrower internal operations (about/context/blast,
+// etc.) through execute.js so their well-tested analysis primitives can be
+// composed.  CLI and MCP are derived exclusively from this list: the public
+// surface is intentionally small and has no legacy command aliases.
 const CANONICAL_COMMANDS = [
-    // Understanding code
-    'about', 'context', 'impact', 'blast', 'smart', 'trace', 'reverseTrace', 'example', 'related', 'brief',
-    // Finding code
-    'find', 'usages', 'toc', 'search', 'tests', 'affectedTests', 'deadcode', 'entrypoints', 'endpoints',
-    // Extracting code
-    'fn', 'class', 'lines', 'expand',
-    // File dependencies
-    'imports', 'exporters', 'fileExports', 'graph', 'circularDeps',
-    // Refactoring
-    'verify', 'plan', 'diffImpact', 'check',
-    // Other
-    'typedef', 'stacktrace', 'api', 'stats', 'doctor', 'auditAsync', 'orient',
+    // Understand and navigate
+    'show', 'find', 'usages', 'search', 'source', 'trace',
+    // Change and validation
+    'impact', 'tests', 'check', 'plan',
+    // Repository and architecture
+    'repo', 'deps', 'api', 'entrypoints', 'endpoints',
+    // Focused audits / runtime evidence
+    'deadcode', 'auditAsync', 'stacktrace',
 ];
-
-// ============================================================================
-// COMMAND ALIASES (surface-specific → canonical)
-// ============================================================================
-
-// CLI uses hyphenated multi-word names plus legacy aliases.
-const CLI_ALIASES = {
-    'file-exports': 'fileExports',
-    'what-exports': 'fileExports',
-    'diff-impact':  'diffImpact',
-    'what-imports': 'imports',
-    'who-imports':  'exporters',
-    'stack':           'stacktrace',
-    'affected':        'affectedTests',
-    'affected-tests':  'affectedTests',
-    'reverse-trace':   'reverseTrace',
-    'rtrace':          'reverseTrace',
-    'circular-deps':   'circularDeps',
-    'circular':        'circularDeps',
-    'cycles':          'circularDeps',
-    'audit-async':     'auditAsync',
-    // BUG-3: parity with other multi-word commands (circular-deps, reverse-trace, ...)
-    'entry-points':    'entrypoints',
-};
-
-// MCP uses snake_case for multi-word names.
-const MCP_ALIASES = {
-    'file_exports':   'fileExports',
-    'diff_impact':    'diffImpact',
-    'affected_tests': 'affectedTests',
-    'reverse_trace':  'reverseTrace',
-    'circular_deps':  'circularDeps',
-    'audit_async':    'auditAsync',
-};
 
 // ============================================================================
 // PARAM NORMALIZATION (snake_case → camelCase)
@@ -71,7 +37,6 @@ const PARAM_MAP = {
     include_tests:     'includeTests',
     exclude_tests:     'excludeTests',
     include_methods:   'includeMethods',
-    include_uncertain: 'includeUncertain',
     with_types:        'withTypes',
     code_only:         'codeOnly',
     case_sensitive:    'caseSensitive',
@@ -79,7 +44,6 @@ const PARAM_MAP = {
     include_decorated: 'includeDecorated',
     min_confidence:    'minConfidence',
     show_confidence:   'showConfidence',
-    hide_confidence:   'hideConfidence',
     calls_only:        'callsOnly',
     class_name:        'className',
     max_lines:         'maxLines',
@@ -96,6 +60,7 @@ const PARAM_MAP = {
     client_only:       'clientOnly',
     hide_uncertain:    'hideUncertain',
     expand_unverified: 'expandUnverified',
+    with_source:       'withSource',
 };
 
 // ============================================================================
@@ -106,78 +71,39 @@ const PARAM_MAP = {
 // MCP param stripping, CLI inapplicable-flag warnings, and architecture guards.
 // file* = file is the command subject (required), not a filter pattern.
 const FLAG_APPLICABILITY = {
-    // Understanding code
-    about:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git'],
-    // Note: includeMethods/includeUncertain are deprecated no-ops for
-    // about/context/impact since the tiered-output contract (unverified
-    // callers are always shown in their own section); kept in the matrix so
-    // legacy invocations don't warn as "inapplicable". `all` lifts the
-    // unverified display cap.
-    context:      ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'all'],
-    impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'top', 'unreachableOnly', 'compact'],
-    // trace/blast/reverseTrace/affectedTests run the tiered tree contract:
-    // includeUncertain is an implied no-op (unverified edges are always
-    // visible — frontier/possible band); expandUnverified follows unverified
-    // CALLER edges, marking downstream nodes chainUnverified (blast/
-    // reverseTrace only — surface trace is down-direction, where unresolved
-    // callees have no definition to expand into).
-    blast:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
-    reverseTrace: ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence', 'expandUnverified'],
-    smart:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'withTypes', 'minConfidence'],
-    trace:        ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'all', 'minConfidence'],
-    example:      ['name', 'file', 'className', 'line', 'diverse', 'top', 'includeTests'],
-    related:      ['name', 'file', 'className', 'line', 'top', 'all'],
-    brief:        ['name', 'file', 'className', 'line', 'git'],
-    // Finding code
-    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'top', 'limit', 'exact', 'in', 'all', 'depth', 'compact'],
+    // Understand one symbol. `sections` is a comma-separated projection:
+    // summary, callers, callees, source, dependencies, tests, types, example,
+    // related. Caller-bearing projections always preserve ACCOUNT/CONTRACT.
+    show:         ['name', 'file', 'exclude', 'className', 'line', 'sections', 'includeMethods', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git', 'diverse'],
+    find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'exact', 'in', 'compact', 'type', 'withSource'],
     usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact'],
-    toc:          ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in'],
     search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
-    tests:        ['name', 'file', 'exclude', 'className', 'callsOnly'],
-    affectedTests:['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'includeUncertain', 'depth', 'minConfidence'],
+    source:       ['name', 'file', 'line', 'range', 'all', 'maxLines'],
+    trace:        ['name', 'file', 'exclude', 'className', 'line', 'direction', 'to', 'includeMethods', 'depth', 'all', 'minConfidence', 'expandUnverified'],
+    impact:       ['name', 'file', 'exclude', 'className', 'line', 'includeMethods', 'top', 'unreachableOnly', 'compact', 'base', 'staged', 'limit', 'all'],
+    tests:        ['name', 'file', 'exclude', 'className', 'line', 'callsOnly', 'depth', 'includeMethods', 'minConfidence', 'all'],
+    deps:         ['file', 'exclude', 'depth', 'direction', 'all', 'detailed', 'cycles'],
+    api:          ['file', 'limit'],
+    check:        ['name', 'file', 'className', 'line', 'includeMethods', 'base', 'staged', 'limit'],
+    plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
+    repo:         ['file', 'exclude', 'top', 'limit', 'all', 'detailed', 'topLevel', 'in', 'functions', 'hot', 'deep', 'sections'],
     deadcode:     ['file', 'exclude', 'includeTests', 'includeExported', 'includeDecorated', 'limit', 'in'],
     entrypoints:  ['file', 'exclude', 'includeTests', 'excludeTests', 'limit', 'type', 'framework'],
     endpoints:    ['file', 'exclude', 'limit', 'framework', 'bridge', 'serverOnly', 'clientOnly', 'unmatched', 'method', 'prefix', 'hideUncertain'],
-    // Extracting code
-    fn:           ['name', 'file', 'className', 'line', 'all'],
-    class:        ['name', 'file', 'line', 'all', 'maxLines'],
-    lines:        ['file', 'range'],
-    expand:       ['item'],
-    // File dependencies
-    imports:      ['file'],
-    exporters:    ['file'],
-    fileExports:  ['file'],
-    graph:        ['file', 'depth', 'direction', 'all'],
-    circularDeps: ['file', 'exclude'],
-    // Refactoring
-    // verify runs the tiered caller contract (v4): includeMethods/
-    // includeUncertain are implied no-ops (unverified sites always visible in
-    // their own band); kept in the matrix so legacy invocations don't warn.
-    verify:       ['name', 'file', 'className', 'line', 'includeMethods', 'includeUncertain'],
-    plan:         ['name', 'file', 'className', 'line', 'addParam', 'removeParam', 'renameTo', 'defaultValue'],
-    diffImpact:   ['file', 'limit', 'base', 'staged', 'all'],
-    check:        ['file', 'base', 'staged', 'limit'],
-    // Other
-    typedef:      ['name', 'file', 'className', 'exact'],
     stacktrace:   ['stack'],
-    api:          ['file', 'limit'],
-    stats:        ['functions', 'hot', 'top'],
-    doctor:       ['file', 'in', 'deep'],
-    orient:       ['top'],
     auditAsync:   ['file', 'exclude', 'limit'],
 };
 
 // Commands whose output is project-wide — truncation means you need a filter, not more text.
 // Used by MCP server for tighter default output limits.
 const BROAD_COMMANDS = new Set([
-    'toc', 'entrypoints', 'endpoints', 'diffImpact', 'affectedTests',
-    'deadcode', 'usages', 'reverseTrace', 'circularDeps',
-    'doctor', 'check', 'auditAsync', 'orient',
+    'repo', 'entrypoints', 'endpoints', 'tests', 'deadcode', 'usages',
+    'deps', 'check', 'auditAsync',
 ]);
 
 // Commands that can operate on a single file without a project index.
 // Used by CLI to decide whether to build a file-local or project-wide index.
-const FILE_LOCAL_COMMANDS = new Set(['toc', 'fn', 'class', 'find', 'usages', 'search', 'lines', 'typedef', 'api']);
+const FILE_LOCAL_COMMANDS = new Set(['find', 'usages', 'search', 'source', 'api']);
 
 // ============================================================================
 // HELPERS
@@ -186,16 +112,16 @@ const FILE_LOCAL_COMMANDS = new Set(['toc', 'fn', 'class', 'find', 'usages', 'se
 /**
  * Resolve a surface-specific command name to its canonical ID.
  *
- * @param {string} name  - Command name as used by the surface (e.g. 'diff-impact', 'diff_impact')
- * @param {'cli'|'mcp'} [surface='cli'] - Which surface's aliases to check first
+ * @param {string} name  - Command name as used by the surface (e.g. 'audit-async', 'audit_async')
+ * @param {'cli'|'mcp'} [surface='cli'] - Surface spelling to resolve
  * @returns {string|null} Canonical command ID, or null if unknown
  */
 function resolveCommand(name, surface) {
     if (CANONICAL_COMMANDS.includes(name)) return name;
     if (surface === 'mcp') {
-        return MCP_ALIASES[name] || CLI_ALIASES[name] || null;
+        return CANONICAL_COMMANDS.find(cmd => toMcpName(cmd) === name) || null;
     }
-    return CLI_ALIASES[name] || null;
+    return CANONICAL_COMMANDS.find(cmd => toCliName(cmd) === name) || null;
 }
 
 /**
@@ -215,8 +141,7 @@ function normalizeParams(params) {
 // ============================================================================
 
 /**
- * Generate the CLI COMMANDS set (canonical names + all CLI aliases).
- * Includes hyphenated forms and legacy aliases.
+ * Generate the exact CLI command set using hyphenated surface spelling.
  */
 function getCliCommandSet() {
     const set = new Set();
@@ -225,11 +150,6 @@ function getCliCommandSet() {
         // Add hyphenated form for CLI (single-word commands stay as-is)
         const hyphenated = cmd.replace(/([a-z])([A-Z])/g, '$1-$2').toLowerCase();
         set.add(hyphenated);
-    }
-
-    // Add legacy aliases
-    for (const alias of Object.keys(CLI_ALIASES)) {
-        set.add(alias);
     }
 
     return set;
@@ -277,7 +197,7 @@ const REVERSE_PARAM_MAP = buildReverseParamMap();
 /**
  * Generate per-command parameter listing for the MCP tool description.
  * Maps camelCase flags back to snake_case for MCP clients.
- * One line per command: `about: file, exclude, class_name, ...`
+ * One line per command: `show: file, exclude, class_name, ...`
  */
 function generateMcpParamSection() {
     const lines = ['', 'ACCEPTED FLAGS PER COMMAND (max_chars, max_files, follow_symlinks always accepted; flags not listed below are ignored):'];
@@ -293,8 +213,6 @@ function generateMcpParamSection() {
 
 module.exports = {
     CANONICAL_COMMANDS,
-    CLI_ALIASES,
-    MCP_ALIASES,
     PARAM_MAP,
     REVERSE_PARAM_MAP,
     FLAG_APPLICABILITY,

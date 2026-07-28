@@ -16,6 +16,93 @@ const { ProjectIndex } = require('../core/project');
 const { execute } = require('../core/execute');
 const { tmp, rm, idx, FIXTURES_PATH, PROJECT_DIR } = require('./helpers');
 
+describe('Rust struct-literal constructor identity', () => {
+    it('selects the struct binding over same-name impl blocks', () => {
+        const dir = tmp({
+            'src/main.rs': [
+                'struct Worker { value: usize }',
+                'impl Default for Worker {',
+                '    fn default() -> Worker { Worker { value: 0 } }',
+                '}',
+                'impl Worker {',
+                '    fn new() -> Worker { Worker { value: 1 } }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const result = execute(idx(dir), 'context', {
+                name: 'src/main.rs:1:Worker',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const json = JSON.parse(
+                require('../core/output').formatContextJson(result.result));
+            assert.deepStrictEqual(
+                json.data.usages.map(usage => usage.line).sort((a, b) => a - b),
+                [3, 6]);
+            assert.deepStrictEqual(json.data.unverifiedCallers, []);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('Rust receiver return-flow performance', () => {
+    it('never builds return-flow state to resolve self/Self calls', () => {
+        const dir = tmp({
+            'src/main.rs': [
+                'struct Worker;',
+                'impl Worker {',
+                '    fn ready(&self) -> bool { true }',
+                '    fn run(&self) -> bool { self.ready() }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const target = (index.symbols.get('ready') || [])[0];
+            const profile = {};
+            const callers = index.findCallers('ready', {
+                targetDefinitions: [target],
+                collectAccount: true,
+                includeMethods: true,
+                profile,
+            });
+            assert.ok(callers.some(c => c.line === 4 && c.tier === 'confirmed'));
+            assert.strictEqual(profile.returnFlowBuilds || 0, 0,
+                'reserved receivers have lexical type identity; query-time return flow is irrelevant');
+        } finally { rm(dir); }
+    });
+
+    it('does not build whole-file return flow for lexical or type-qualified callees', () => {
+        const dir = tmp({
+            'src/main.rs': [
+                'struct Worker;',
+                'impl Worker {',
+                '    fn new() -> Self { Worker }',
+                '    fn ready(&self) -> bool { true }',
+                '    fn run(&self) -> bool {',
+                '        let _other = Worker::new();',
+                '        self.ready()',
+                '    }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const run = (index.symbols.get('run') || [])[0];
+            const profile = {};
+            const callees = index.findCallees(run, {
+                collectAccount: true,
+                includeMethods: true,
+                profile,
+            });
+            assert.ok(callees.some(c => c.name === 'ready'));
+            assert.ok(callees.some(c => c.name === 'new'));
+            assert.strictEqual(profile.returnFlowBuilds || 0, 0,
+                'lexical and type-qualified receivers do not need assignment return flow');
+        } finally { rm(dir); }
+    });
+});
+
 describe('Regression: Rust impl methods in context', () => {
     it('should show impl methods for Rust structs via receiver', () => {
         const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ucn-rust-impl-'));
@@ -67,11 +154,43 @@ impl User {
     });
 });
 
+describe('v5 ownership evidence: fully-qualified Rust type paths', () => {
+    it('excludes a foreign concrete terminal type before method ambiguity', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"\n',
+            'src/lib.rs': [
+                'pub struct BoolValueParser;',
+                'impl BoolValueParser {',
+                '  pub fn new() -> Self { BoolValueParser }',
+                '}',
+                'pub fn external() {',
+                '  let _ = std::ffi::OsString::new();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'src/lib.rs:3:new',
+                className: 'BoolValueParser',
+            });
+            assert.ok(result.ok, result.error);
+            const json = JSON.parse(require('../core/output').formatContextJson(result.result));
+            assert.ok(!(json.data.callers || []).some(c => c.line === 6));
+            assert.ok(!(json.data.unverifiedCallers || []).some(c => c.line === 6),
+                `std::ffi::OsString::new must be excluded: ${JSON.stringify(json.data)}`);
+            const mismatch = json.meta.account.excluded.byReason['path-type-mismatch'];
+            assert.ok((mismatch?.count || mismatch || 0) >= 1);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
 describe('fix #272 (Rust): associated method references', () => {
     it('records Type::method callback values with their owner', () => {
         const languages = require('../languages');
         const parser = languages.getParser('rust');
-        const mod = languages.getLanguageModule('rust');
+        const mod = languages.getLanguageAdapter('rust');
         const source = [
             'struct Cursive;',
             'impl Cursive { fn quit(&mut self) {} }',
@@ -741,9 +860,9 @@ it('FIX 100 — findEnclosingFunction excludes enum and trait', () => {
 
 describe('Bug Hunt: Rust turbofish calls detected', () => {
     it('should detect turbofish method calls like .parse::<i32>()', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `fn main() {
     let x = "42".parse::<i32>().unwrap();
     let v: Vec<_> = vec![1,2,3].iter().collect::<Vec<_>>();
@@ -756,9 +875,9 @@ describe('Bug Hunt: Rust turbofish calls detected', () => {
     });
 
     it('should detect turbofish standalone calls like func::<T>()', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `fn main() { let x = convert::<String>(); }
 fn convert<T>() -> T { todo!() }`;
         const calls = rustMod.findCallsInCode(code, parser);
@@ -873,9 +992,9 @@ fn main() {
 
 describe('Bug Hunt: Rust use-as imports detected', () => {
     it('should detect use X as Y imports', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `use std::collections::HashMap as Map;
 use foo::bar::Baz as MyBaz;
 use crate::utils::helper as h;
@@ -889,9 +1008,9 @@ use crate::utils::helper as h;
     });
 
     it('should detect use-as inside use lists', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `use std::{io, collections::HashMap as Map};`;
         const imports = rustMod.findImportsInCode(code, parser);
         assert.ok(imports.length >= 1, 'should find imports');
@@ -978,9 +1097,9 @@ impl Config {
 // Bug Hunt: Rust deeply nested use paths should classify as import
 describe('Bug Hunt: Rust nested use path import classification', () => {
     it('should classify identifiers in deeply nested use paths as imports', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `
 use std::collections::HashMap;
 use std::io::Read;
@@ -1011,9 +1130,9 @@ fn main() {
 
 describe('fix #163: Rust receiver type tracking in findCallsInCode', () => {
     it('infers receiverType from function parameters', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `struct Filter {}
 impl Filter { fn run(&self) {} }
 struct Score {}
@@ -1032,9 +1151,9 @@ fn process(f: &Filter, s: &Score) {
     });
 
     it('does not set receiverType for self.method()', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `struct Foo {}
 impl Foo {
     fn bar(&self) { self.baz(); }
@@ -1047,9 +1166,9 @@ impl Foo {
     });
 
     it('strips reference types to get base type', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = `struct Config {}
 impl Config { fn validate(&self) -> bool { true } }
 fn check(cfg: &mut Config) {
@@ -1543,7 +1662,7 @@ mod tests {
         // Functions inside #[cfg(test)] mod blocks that lack a direct #[test]
         // attribute (shared test helpers) should still be classified as test
         // entries — they only compile under cargo test.
-        const { getLanguageModule } = require('../languages');
+        const { getLanguageAdapter } = require('../languages');
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "test"\nversion = "0.1.0"\nedition = "2021"',
             'src/lib.rs': `pub fn helper() -> i32 { 1 }
@@ -1563,7 +1682,7 @@ mod tests {
         });
         try {
             const index = idx(dir);
-            const rust = getLanguageModule('rust');
+            const rust = getLanguageAdapter('rust');
             assert.ok(typeof rust.getEntryPointKind === 'function',
                 'rust module must export getEntryPointKind');
 
@@ -1620,8 +1739,8 @@ describe('Rust generated attribute references in tests', () => {
 
 describe('BUG-CX/CY: getEntryPointKind distinguishes test from main', () => {
     it('rust: fn main() is kind=main, not kind=test', () => {
-        const { getLanguageModule } = require('../languages');
-        const rust = getLanguageModule('rust');
+        const { getLanguageAdapter } = require('../languages');
+        const rust = getLanguageAdapter('rust');
         assert.strictEqual(rust.getEntryPointKind({ name: 'main', modifiers: [] }), 'main');
         assert.strictEqual(rust.getEntryPointKind({ name: 'helper', modifiers: ['test'] }), 'test');
         assert.strictEqual(rust.getEntryPointKind({ name: 'helper', modifiers: ['bench'] }), 'test');
@@ -1979,7 +2098,38 @@ describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
         } finally { rm(dir); }
     });
 
-    it('macro_rules! transcriber calls are extracted; matcher patterns are not', () => {
+    it('resolves builder calls written inside proc-macro attributes', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
+            'src/lib.rs': [
+                'pub struct Wanted;',
+                'impl Wanted { pub fn new() -> Self { Self } }',
+                'pub struct Other;',
+                'impl Other { pub fn new() -> Self { Self } }',
+                '#[arg(value_parser = Wanted::new())]',
+                'pub struct Good;',
+                '#[arg(value_parser = Other::new())]',
+                'pub struct Bad;',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = execute(index, 'context', {
+                name: 'src/lib.rs:2:new',
+            });
+            assert.ok(result.ok, JSON.stringify(result.error));
+            const confirmed = (result.result.callers || [])
+                .map(call => `${call.relativePath}:${call.line}`);
+            assert.ok(confirmed.includes('src/lib.rs:5'),
+                `qualified attribute call is exact: ${JSON.stringify(result.result)}`);
+            assert.ok(!confirmed.includes('src/lib.rs:7'));
+            assert.strictEqual(
+                result.result.meta.account.excluded.byReason['path-type-mismatch']?.count, 1);
+            assert.strictEqual(result.result.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('macro_rules! transcriber calls are conserved as templates, not concrete callers', () => {
         const dir = tmp({
             'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"',
             'src/lib.rs': [
@@ -1998,8 +2148,11 @@ describe('fix #201 (rust): calls inside macro bodies are extracted', () => {
             assert.ok(r.ok);
             const all = [...(r.result.callers || []), ...(r.result.unverifiedCallers || [])]
                 .map(c => `${c.relativePath}:${c.line}`);
-            assert.ok(all.includes('src/lib.rs:5'),
-                `emit in the macro transcriber must be visible: ${all}`);
+            assert.ok(!all.includes('src/lib.rs:5'),
+                `template line is not a runtime dispatch site: ${all}`);
+            assert.ok(r.result.meta.account.excluded.byReason['macro-template'],
+                `template occurrence remains conserved: ${JSON.stringify(r.result.meta.account)}`);
+            assert.strictEqual(r.result.meta.account.conserved, true);
         } finally { rm(dir); }
     });
 });
@@ -3856,6 +4009,10 @@ pub fn group() -> u32 {
 pub fn from_param(c: Cfg) -> u32 {
     c.opt(3).opt(4).done()
 }
+
+pub fn nested_same_line() -> Cfg {
+    Cfg::new().opt(Grp::new().opt(5).n)
+}
 `,
     };
 
@@ -3913,6 +4070,172 @@ pub fn from_param(c: Cfg) -> u32 {
             const res = contract(index, 'src/cfg.rs:6:done');
             assert.ok(res.confirmed.includes('src/user.rs:8'), `terminal: ${res.confirmed}`);
             assert.ok(res.confirmed.includes('src/user.rs:16'), `param terminal: ${res.confirmed}`);
+        } finally { rm(dir); }
+    });
+
+    it('uses exact producer identity when nested constructors share one line', () => {
+        const dir = tmp(FILES);
+        try {
+            const index = idx(dir);
+            const cfg = contract(index, 'src/cfg.rs:5:opt');
+            const grp = contract(index, 'src/grp.rs:5:opt');
+            assert.ok(cfg.confirmed.includes('src/user.rs:20'),
+                `outer Cfg::new producer stays distinct: ${cfg.confirmed}`);
+            assert.ok(grp.confirmed.includes('src/user.rs:20'),
+                `inner Grp::new producer stays distinct: ${grp.confirmed}`);
+            assert.ok(!cfg.unverified.includes('src/user.rs:20'));
+            assert.ok(!grp.unverified.includes('src/user.rs:20'));
+        } finally { rm(dir); }
+    });
+
+    it('folds exact macro-return builders but leaves unknown macro values unverified', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Command;',
+                'impl Command {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn arg(self) -> Self { self }',
+                '}',
+                'pub struct Group;',
+                'impl Group { pub fn arg(self) -> Self { self } }',
+                'macro_rules! command { () => {{ Command::new() }} }',
+                'macro_rules! identity { ($value:expr) => {{ $value }} }',
+                'pub fn exact() { command!().arg(); }',
+                'pub fn unknown() { identity!(Command::new()).arg(); }',
+                'pub fn assigned() { let cmd = command!(); cmd.arg(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = contract(index, 'src/lib.rs:4:arg');
+            assert.ok(result.confirmed.includes('src/lib.rs:10'),
+                `macro transcriber pins Command: ${JSON.stringify(result)}`);
+            assert.ok(result.unverified.includes('src/lib.rs:11'),
+                `opaque identity macro remains visible: ${JSON.stringify(result)}`);
+            assert.ok(result.confirmed.includes('src/lib.rs:12'),
+                `exact macro assignment outranks parser invalidation: ${JSON.stringify(result)}`);
+            assert.strictEqual(result.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('reconstructs exact builder chains written inside macro token trees', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Command;',
+                'impl Command {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn arg(self) -> Self { self }',
+                '}',
+                'pub struct Group;',
+                'impl Group { pub fn arg(self) -> Self { self } }',
+                'pub fn build() { let _ = vec![Command::new().arg()]; }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = contract(index, 'src/lib.rs:4:arg');
+            assert.ok(result.confirmed.includes('src/lib.rs:8'),
+                `token-tree chain pins Command: ${JSON.stringify(result)}`);
+            assert.ok(!result.unverified.includes('src/lib.rs:8'));
+        } finally { rm(dir); }
+    });
+
+    it('types closure receivers from an exact callback parameter contract', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Command;',
+                'impl Command {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn arg(self) -> Self { self }',
+                '  pub fn defer(self, callback: fn(Command) -> Command) -> Self { callback(self) }',
+                '}',
+                'pub struct Group;',
+                'impl Group { pub fn arg(self) -> Self { self } }',
+                'pub fn build() { Command::new().defer(|cmd| cmd.arg()); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = contract(index, 'src/lib.rs:4:arg');
+            assert.ok(result.confirmed.includes('src/lib.rs:9'),
+                `callback contract pins cmd: ${JSON.stringify(result)}`);
+            assert.ok(!result.unverified.includes('src/lib.rs:9'));
+        } finally { rm(dir); }
+    });
+
+    it('types iterator closure receivers from a declared Item contract', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Arg;',
+                'impl Arg { pub fn marked(&self) -> bool { true } }',
+                'pub struct Other;',
+                'impl Other { pub fn marked(&self) -> bool { false } }',
+                'pub struct Items { values: Vec<Arg> }',
+                'impl Items {',
+                '  pub fn args(&self) -> impl Iterator<Item = &Arg> { self.values.iter() }',
+                '}',
+                'pub fn check(items: Items) { let _ = items.args().filter(|a| a.marked()).count(); }',
+                'pub fn each(items: Items) { for a in items.args() { let _ = a.marked(); } }',
+                'pub fn reversed(items: Items) { for a in items.args().rev() { let _ = a.marked(); } }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = contract(index, 'src/lib.rs:2:marked');
+            assert.ok(result.confirmed.includes('src/lib.rs:9'),
+                `iterator Item pins closure receiver: ${JSON.stringify(result)}`);
+            assert.ok(result.confirmed.includes('src/lib.rs:10'),
+                `iterator Item pins loop receiver: ${JSON.stringify(result)}`);
+            assert.ok(result.confirmed.includes('src/lib.rs:11'),
+                `item-preserving adapter keeps loop receiver: ${JSON.stringify(result)}`);
+            assert.ok(!result.unverified.includes('src/lib.rs:9'));
+        } finally { rm(dir); }
+    });
+
+    it('excludes concrete std builder chains from same-named project methods', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Command;',
+                'impl Command { pub fn arg(self, _value: &str) -> Self { self } }',
+                'pub fn probe() {',
+                '  std::process::Command::new("tool").arg("--version");',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = contract(index, 'src/lib.rs:2:arg');
+            assert.ok(!result.confirmed.includes('src/lib.rs:4'));
+            assert.ok(!result.unverified.includes('src/lib.rs:4'),
+                `stdlib owner is exclusion-grade: ${JSON.stringify(result)}`);
+            assert.strictEqual(result.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('handles builder chains longer than the old recursion budget', () => {
+        const hops = Array.from({ length: 80 }, () => '.opt(1)').join('');
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\n',
+            'src/lib.rs': [
+                'pub struct Cfg;',
+                'impl Cfg {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn opt(self, _value: u8) -> Self { self }',
+                '}',
+                `pub fn build() { let _ = Cfg::new()${hops}; }`,
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const result = contract(index, 'src/lib.rs:4:opt');
+            assert.strictEqual(result.confirmed.filter(edge =>
+                edge === 'src/lib.rs:6').length, 80);
+            assert.ok(!result.unverified.includes('src/lib.rs:6'));
         } finally { rm(dir); }
     });
 });
@@ -4297,9 +4620,11 @@ describe('fix #273 (Rust): chained associated-function receiver identity', () =>
                 `Self expression keeps concrete constructor identity: ${JSON.stringify(calls)}`);
             const r = execute(index, 'context', { name: 'src/lib.rs:1:Rgb' });
             const json = JSON.parse(require('../core/output').formatContextJson(r.result));
-            assert.ok((json.data.callers || []).some(c => c.line === 4) ||
-                (json.data.unverifiedCallers || []).some(c => c.line === 4),
+            const usage = (json.data.usages || []).find(c => c.line === 4);
+            assert.ok(usage,
                 `Rgb constructor edge is visible to agents: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(usage.resolution, 'exact-binding');
+            assert.ok(!(json.data.unverifiedCallers || []).some(c => c.line === 4));
         } finally { rm(dir); }
     });
 
@@ -4511,6 +4836,270 @@ describe('fix #276 (Rust): Deref target method lookup', () => {
             const json = JSON.parse(require('../core/output').formatContextJson(result.result));
             assert.ok((json.data.callers || []).some(c => c.line === 6),
                 `tuple field must reach Str.as_str: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+});
+
+describe('v5 Rust evidence: imports, patterns, fields, and return flow', () => {
+    function contextJson(index, handle) {
+        const result = execute(index, 'context', { name: handle });
+        assert.ok(result.ok, JSON.stringify(result.error));
+        return JSON.parse(require('../core/output').formatContextJson(result.result));
+    }
+
+    it('flattens nested grouped use trees to the exact imported type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'pub mod haystack;',
+                'use crate::{haystack::{Haystack, helper}};',
+                'pub fn go(haystack: Haystack) { haystack.path(); helper(); }',
+            ].join('\n'),
+            'src/haystack.rs': [
+                'pub struct Haystack;',
+                'impl Haystack { pub fn path(&self) {} }',
+                'pub fn helper() {}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const entry = index.files.get(path.join(dir, 'src/lib.rs'));
+            assert.ok(entry.importBindings.some(binding =>
+                binding.name === 'Haystack' &&
+                binding.module === 'crate::haystack::Haystack'),
+            `grouped import must preserve its leaf path: ${JSON.stringify(entry.importBindings)}`);
+            const json = contextJson(index, 'src/haystack.rs:2:path');
+            assert.ok(json.data.callers.some(c => c.file === 'src/lib.rs' && c.line === 3),
+                `imported receiver must confirm exactly: ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('pins grouped type imports through a re-export surface with same-name decoys', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': 'pub mod builder;\npub mod parser;',
+            'src/builder/mod.rs': [
+                'mod command;',
+                'pub use command::Command;',
+            ].join('\n'),
+            'src/builder/command.rs': [
+                'pub struct Command;',
+                'impl Command { pub fn find(&self) {} }',
+            ].join('\n'),
+            'src/parser.rs': [
+                'use crate::builder::{Command};',
+                'pub struct Parser<\'a> { cmd: &\'a Command }',
+                'pub fn direct(cmd: &Command) { cmd.find(); }',
+                'impl<\'a> Parser<\'a> {',
+                '  pub fn field(&self) { self.cmd.find(); }',
+                '}',
+            ].join('\n'),
+            'tests/decoy.rs': 'struct Command;',
+        });
+        try {
+            const index = idx(dir);
+            const json = contextJson(index, 'src/builder/command.rs:2:find');
+            assert.deepStrictEqual(
+                json.data.callers.map(c => c.line).sort((a, b) => a - b),
+                [3, 5],
+                `the imported barrel must pin both direct and field receivers: ${JSON.stringify(json.data)}`);
+            assert.deepStrictEqual(json.data.unverifiedCallers, []);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('keeps an untyped closure parameter from inheriting an outer namesake type', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'pub struct Arg;',
+                'impl Arg { pub fn is_last_set(&self) -> bool { true } }',
+                'pub struct Command;',
+                'impl Command { pub fn get_positionals(&self) -> impl Iterator<Item = &Arg> { [].iter() } }',
+                'pub fn run(cmd: &Command, arg: &str) {',
+                '  let _ = cmd.get_positionals().any(|arg| arg.is_last_set());',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const file = path.join(dir, 'src/lib.rs');
+            const call = (require('../core/callers').getCachedCalls(index, file) || [])
+                .find(candidate => candidate.name === 'is_last_set');
+            assert.strictEqual(call.receiverType, undefined,
+                'the closure binding must shadow the outer `arg: &str` annotation');
+            const json = contextJson(index, 'src/lib.rs:2:is_last_set');
+            assert.ok(json.data.callers.some(c => c.line === 6),
+                `Iterator::Item must type the closure receiver: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('unwraps imported Result aliases after an assigned builder chain', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'mod error { pub type Result<T> = std::result::Result<T, ()>; }',
+                'use crate::error::Result as LocalResult;',
+                'pub struct Matches;',
+                'impl Matches { pub fn contains_id(&self) -> bool { true } }',
+                'pub struct Command;',
+                'impl Command {',
+                '  pub fn new() -> Self { Command }',
+                '  pub fn parse(self) -> LocalResult<Matches> { Ok(Matches) }',
+                '}',
+                'pub fn run() {',
+                '  let matches = Command::new().parse().unwrap();',
+                '  let _ = matches.contains_id();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const json = contextJson(index, 'src/lib.rs:4:contains_id');
+            assert.ok(json.data.callers.some(c => c.line === 12),
+                `the alias wrapper must unwrap to Matches: ${JSON.stringify(json.data)}`);
+            assert.deepStrictEqual(json.data.unverifiedCallers, []);
+            assert.strictEqual(json.meta.account.excluded.total, 0);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('types iterator and collection callback parameters from declared Item contracts', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'pub struct Haystack;',
+                'impl Haystack { pub fn path(&self) -> &str { "" } }',
+                'pub fn from_iter(values: impl Iterator<Item = Haystack>) {',
+                '  values.for_each(|value| { value.path(); });',
+                '}',
+                'pub fn collect_sort(values: impl Iterator<Item = Haystack>) {',
+                '  let mut found = values.collect::<Vec<Haystack>>();',
+                '  found.sort_by(|left, right| left.path().cmp(right.path()));',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const json = contextJson(index, 'src/lib.rs:2:path');
+            const lines = json.data.callers.map(c => c.line);
+            assert.ok(lines.includes(4), `Iterator::Item must type for_each: ${JSON.stringify(json.data)}`);
+            assert.ok(lines.includes(8), `collect turbofish must type sort_by: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('pins project enum payload bindings and keeps external payloads out of tier 1', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'use foreign::Event as ForeignEvent;',
+                'pub struct Wanted;',
+                'impl Wanted { pub fn run(&self) {} }',
+                'pub struct Other;',
+                'impl Other { pub fn run(&self) {} }',
+                'pub enum Event { Ready(Wanted), Other(Other) }',
+                'pub fn local(event: Event) {',
+                '  match event { Event::Ready(value) => value.run(), _ => {} }',
+                '}',
+                'pub fn external(event: ForeignEvent) {',
+                '  match event { ForeignEvent::Ready(value) => value.run(), _ => {} }',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const json = contextJson(index, 'src/lib.rs:3:run');
+            assert.ok(json.data.callers.some(c => c.line === 8),
+                `project variant payload must confirm Wanted.run: ${JSON.stringify(json.data)}`);
+            assert.ok(!json.data.callers.some(c => c.line === 11),
+                `unresolved external payload must never enter tier 1: ${JSON.stringify(json.data)}`);
+            assert.strictEqual(json.meta.account.conserved, true);
+        } finally { rm(dir); }
+    });
+
+    it('walks multi-hop declared fields from both values and call results', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'pub struct Wanted;',
+                'impl Wanted { pub fn run(&self) {} }',
+                'pub struct Mid { pub wanted: Wanted }',
+                'pub struct Root { pub mid: Mid }',
+                'impl Root {',
+                '  pub fn direct(&self) { self.mid.wanted.run(); }',
+                '}',
+                'pub fn make() -> Root { unimplemented!() }',
+                'pub fn chained() { make().mid.wanted.run(); }',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const json = contextJson(index, 'src/lib.rs:2:run');
+            const lines = json.data.callers.map(c => c.line);
+            assert.ok(lines.includes(6), `self-rooted field path must confirm: ${JSON.stringify(json.data)}`);
+            assert.ok(lines.includes(9), `call-rooted field path must confirm: ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('carries exact producers through match, tuple, and multiline unwrap assignments', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'pub struct Wanted;',
+                'impl Wanted {',
+                '  pub fn new() -> Self { Self }',
+                '  pub fn run(&self) {}',
+                '}',
+                'pub fn pair() -> (Wanted, bool) { (Wanted, true) }',
+                'pub fn maybe() -> Result<Wanted, ()> { Ok(Wanted) }',
+                'pub fn matched(ok: bool) {',
+                '  let value = match ok { true => Wanted::new(), false => return };',
+                '  value.run();',
+                '}',
+                'pub fn tupled() {',
+                '  let (value, _) = pair();',
+                '  value.run();',
+                '}',
+                'pub fn unwrapped() {',
+                '  let value = maybe(',
+                '  ).unwrap();',
+                '  value.run();',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const json = contextJson(index, 'src/lib.rs:4:run');
+            const lines = json.data.callers.map(c => c.line);
+            assert.ok(lines.includes(10), `match producer must type value: ${JSON.stringify(json.data)}`);
+            assert.ok(lines.includes(14), `tuple producer must type first binding: ${JSON.stringify(json.data)}`);
+            assert.ok(lines.includes(19), `multiline unwrap must retain inner producer: ${JSON.stringify(json.data)}`);
+        } finally { rm(dir); }
+    });
+
+    it('types primitive references and range slices without typing element indexes as containers', () => {
+        const dir = tmp({
+            'Cargo.toml': '[package]\nname = "t"\nversion = "0.1.0"\nedition = "2021"',
+            'src/lib.rs': [
+                'pub struct Finder;',
+                'impl Finder { pub fn find(&self, _: char) {} }',
+                'pub fn text(doc: &str, at: usize) {',
+                '  doc.find(\'x\');',
+                '  doc[at..].find(\'x\');',
+                '}',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const calls = index.getCachedCalls(path.join(dir, 'src/lib.rs'))
+                .filter(call => call.name === 'find' && call.line >= 4);
+            assert.deepStrictEqual(calls.map(call => call.receiverType), ['str', 'str']);
+            const json = contextJson(index, 'src/lib.rs:2:find');
+            assert.ok(!json.data.callers.some(c => c.line === 4 || c.line === 5));
+            assert.ok(!json.data.unverifiedCallers.some(c => c.line === 4 || c.line === 5));
             assert.strictEqual(json.meta.account.conserved, true);
         } finally { rm(dir); }
     });

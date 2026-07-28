@@ -267,12 +267,12 @@ console.log(result);
 // ============================================================================
 
 describe('HTML Parsing', () => {
-    const { getParser, getLanguageModule } = require('../languages');
+    const { getParser, getLanguageAdapter } = require('../languages');
 
     function getHtmlTools() {
         return {
             parser: getParser('html'),
-            mod: getLanguageModule('html')
+            mod: getLanguageAdapter('html')
         };
     }
 
@@ -1706,7 +1706,7 @@ send(\`\${HOST}/api\`, JSON.stringify({}));
         } finally { rm(dir); }
     });
 
-    it('example abstains when the only conserved call is unresolved', () => {
+    it('example selects a package-scope receiver resolved from its constructor flow', () => {
         const dir = tmp({
             'go.mod': 'module example.com/example\n\ngo 1.22\n',
             'viper.go': [
@@ -1725,13 +1725,11 @@ send(\`\${HOST}/api\`, JSON.stringify({}));
                 className: 'Viper',
                 includeTests: true,
             });
-            assert.ok(result, `expected an explicit abstention: ${JSON.stringify(result)}`);
-            assert.strictEqual(result.best, null);
-            assert.strictEqual(result.confirmedCalls, 0);
-            assert.ok(result.unverifiedCalls >= 1,
-                `expected the unresolved call to remain visible: ${JSON.stringify(result)}`);
-            assert.ok(result.unverifiedCandidates.some(c => c.reason === 'call-not-resolved'),
-                `expected the conservation reason: ${JSON.stringify(result)}`);
+            assert.ok(result?.best,
+                `expected a confirmed package-scope example: ${JSON.stringify(result)}`);
+            assert.strictEqual(result.best.line, 5);
+            assert.strictEqual(result.confirmedCalls, 1);
+            assert.strictEqual(result.unverifiedCalls, 0);
         } finally { rm(dir); }
     });
 
@@ -2094,22 +2092,17 @@ describe('MCP parameter parity: all and top_level', () => {
             'Should NOT have per-case normalizeParams calls inside switch');
     });
 
-    it('MCP handlers pass ep to execute — not hand-picked params', () => {
-        // All standard commands should use the shared ep object
-        const standardCmds = ['about', 'context', 'impact', 'smart', 'trace', 'find',
-            'usages', 'toc', 'search', 'tests', 'deadcode', 'verify', 'plan',
-            'fn', 'class', 'lines', 'typedef', 'stacktrace', 'api', 'stats',
-            'imports', 'exporters', 'graph'];
-        for (const cmd of standardCmds) {
-            assert.ok(serverCode.includes(`execute(index, '${cmd}', ep)`) ||
-                       serverCode.includes(`execute(index, '${cmd.replace(/_([a-z])/g, (_, c) => c.toUpperCase())}', ep)`),
-                `${cmd} handler should pass ep to execute`);
-        }
+    it('MCP passes normalized params through one generic executor', () => {
+        assert.ok(serverCode.includes('execute(index, canonicalCommand, ep)'),
+            'the public registry should select the handler without per-command params');
+        assert.ok(!serverCode.includes('switch (command)'),
+            'MCP should not maintain a second command router');
     });
 
-    it('MCP graph handler respects all in showAll', () => {
-        assert.ok(serverCode.includes('showAll: ep.all || ep.depth !== undefined'),
-            'graph handler should include ep.all in showAll');
+    it('shared deps formatter respects all in showAll', () => {
+        const publicOutput = fs.readFileSync(path.join(__dirname, '..', 'core', 'output', 'public.js'), 'utf-8');
+        assert.ok(publicOutput.includes('showAll: params.all || params.depth !== undefined'),
+            'deps graph presentation should include all in showAll');
     });
 
     // Behavioral tests: verify all parameter works correctly in core

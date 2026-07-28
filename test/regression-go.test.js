@@ -555,9 +555,9 @@ describe('fix #116: verify handles Go multi-name and variadic params', () => {
 
 describe('Bug Hunt: Go struct fields should be extracted', () => {
     it('should extract struct field members with types', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `type Config struct {
     Name   string
     Port   int
@@ -605,9 +605,9 @@ func main() {}
 
 describe('Bug Hunt: Go raw string literal imports', () => {
     it('should detect imports using backtick strings', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = 'import `fmt`';
         const imports = goMod.findImportsInCode(code, parser);
         assert.ok(imports.length > 0, 'should detect raw string import');
@@ -621,9 +621,9 @@ describe('Bug Hunt: Go raw string literal imports', () => {
 
 describe('Bug Hunt: Go unnamed and generic receivers', () => {
     it('should extract correct receiver for unnamed receiver', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 func (Router) Handle() {}
 func (r Router) Get() {}
@@ -638,9 +638,9 @@ func (r Router) Get() {}
     });
 
     it('should extract correct receiver for pointer unnamed receiver', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 func (*Router) Handle() {}
 `;
@@ -651,9 +651,9 @@ func (*Router) Handle() {}
     });
 
     it('should extract correct receiver for generic receiver', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 func (r *Router[T]) Post() {}
 func (r Cache[K, V]) Get() {}
@@ -698,9 +698,9 @@ func (r Router) Get() {}
 
 describe('Bug Hunt: Go var-declared closures tracked', () => {
     it('should filter var-declared closure calls from callees', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 
 func outer() {
@@ -717,9 +717,9 @@ func outer() {
     });
 
     it('should filter short-var closures the same as var closures', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 
 func outer() {
@@ -739,9 +739,9 @@ func outer() {
 // Bug Hunt: Go var_declaration closure tracking should be per-spec
 describe('Bug Hunt: Go var_declaration per-spec closure tracking', () => {
     it('should not register non-closure vars as closures in grouped var declarations', () => {
-        const { getParser, getLanguageModule } = require('../languages');
+        const { getParser, getLanguageAdapter } = require('../languages');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `
 package main
 
@@ -1117,9 +1117,9 @@ func runTest(t *TestController) {
 
 describe('K8s fix: Bug 8 — embedded struct fields detected', () => {
     it('should detect embedded struct fields', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 
 type Base struct {
@@ -1147,9 +1147,9 @@ type Child struct {
 
 describe('K8s fix: Bug 9 — embedded interface members detected', () => {
     it('should detect embedded interfaces', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 
 type Reader interface {
@@ -1177,9 +1177,9 @@ type ReadWriter interface {
 
 describe('K8s fix: Bug 12 — Go function reference callbacks detected as callees', () => {
     it('should detect member expression used as argument as callee', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = `package main
 
 func (dc *Controller) Run() {

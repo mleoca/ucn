@@ -113,7 +113,12 @@ const rustAnalyzerOracle = {
                 op: 'classify_ref', file: relFile, line: refLine,
                 utf16_col: loc.range.start.character, name,
             });
-            refs.push({ file: relFile, line: refLine, kind: cls.kind });
+            refs.push({
+                file: relFile,
+                line: refLine,
+                column: loc.range.start.character,
+                kind: cls.kind,
+            });
         }
         return refs;
     },
@@ -122,14 +127,14 @@ const rustAnalyzerOracle = {
      *  Reference search can omit inactive/re-exported workspace edges; this
      *  independent definition check prevents those gaps from becoming fake
      *  UCN precision failures. */
-    async resolveDefinition(handle, { name, file, line }) {
+    async resolveDefinition(handle, { name, file, line, column }) {
         const absFile = path.join(handle.root, file);
         if (!handle.opened.has(absFile)) {
             handle.lsp.didOpen(absFile, 'rust', fs.readFileSync(absFile, 'utf-8'));
             handle.opened.add(absFile);
         }
         const sourceLine = fs.readFileSync(absFile, 'utf-8').split('\n')[line - 1] || '';
-        const columns = nameColumns(sourceLine, name);
+        const columns = Number.isInteger(column) ? [column] : nameColumns(sourceLine, name);
         const defs = new Map();
         for (const character of columns) {
             const locations = await handle.lsp.request('textDocument/definition', {
@@ -141,7 +146,14 @@ const rustAnalyzerOracle = {
                 const range = loc.targetSelectionRange || loc.targetRange || loc.range;
                 if (!uri || !range) continue;
                 const defAbs = uriToPath(uri);
-                if (!defAbs.startsWith(handle.workspaceRoot + path.sep)) continue;
+                if (!defAbs.startsWith(handle.workspaceRoot + path.sep)) {
+                    defs.set(`external:${defAbs}:${range.start.line + 1}`, {
+                        file: defAbs,
+                        line: range.start.line + 1,
+                        external: true,
+                    });
+                    continue;
+                }
                 const entry = { file: path.relative(handle.root, defAbs), line: range.start.line + 1 };
                 defs.set(`${entry.file}:${entry.line}`, entry);
             }

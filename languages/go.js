@@ -733,6 +733,12 @@ function findCallsInCode(code, parser, options = {}) {
     const scopeTypes = new Map();
     // Package qualifier paired with an inferred/declared receiver type.
     const scopeTypeQualifiers = new Map();
+    // Compiler-declared package variables are visible inside every function
+    // unless a lexical declaration shadows the name (`var v *Viper`;
+    // `func Set(...) { v.Set(...) }`). They are stored separately so local
+    // scope restoration cannot erase them.
+    const packageTypes = new Map();
+    const packageTypeQualifiers = new Map();
     // Names whose scope type is a New*-prefix GUESS (fix #266) — per scope
     const scopeGuesses = new Map();
     // Track function-typed parameter names per scope (scopeStartLine -> Set<name>)
@@ -898,19 +904,21 @@ function findCallsInCode(code, parser, options = {}) {
     };
 
     // Look up variable type from scope chain
-    const getReceiverType = (varName) => {
+    const getReceiverType = (varName, refNode) => {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const typeMap = scopeTypes.get(functionStack[i].startLine);
             if (typeMap?.has(varName)) return typeMap.get(varName);
         }
-        return undefined;
+        return refNode && isShadowedByLocal(refNode, varName)
+            ? undefined : packageTypes.get(varName);
     };
-    const getReceiverTypeQualifier = (varName) => {
+    const getReceiverTypeQualifier = (varName, refNode) => {
         for (let i = functionStack.length - 1; i >= 0; i--) {
             const qualifiers = scopeTypeQualifiers.get(functionStack[i].startLine);
             if (qualifiers?.has(varName)) return qualifiers.get(varName);
         }
-        return undefined;
+        return refNode && isShadowedByLocal(refNode, varName)
+            ? undefined : packageTypeQualifiers.get(varName);
     };
     // Is the FIRST scope-chain hit for this variable a New*-prefix GUESS
     // (fix #266, viper-measured)? `registry := NewCodecRegistry()` types
@@ -1146,9 +1154,12 @@ function findCallsInCode(code, parser, options = {}) {
         // on an untyped receiver fell to single-owner confirmation). Same
         // semantics as parameter annotations: the declared type is the
         // receiver's compile-time type.
-        if (node.type === 'var_declaration' && functionStack.length > 0) {
-            const scopeKey = functionStack[functionStack.length - 1].startLine;
-            const varTypeMap = scopeTypes.get(scopeKey);
+        if (node.type === 'var_declaration') {
+            const scopeKey = functionStack.length > 0
+                ? functionStack[functionStack.length - 1].startLine : null;
+            const varTypeMap = scopeKey == null ? packageTypes : scopeTypes.get(scopeKey);
+            const varQualifierMap = scopeKey == null
+                ? packageTypeQualifiers : scopeTypeQualifiers.get(scopeKey);
             if (varTypeMap) {
                 const recordSpec = (spec) => {
                     if (spec.type !== 'var_spec') return;
@@ -1159,10 +1170,11 @@ function findCallsInCode(code, parser, options = {}) {
                         const id = spec.namedChild(j);
                         if (id.type === 'identifier') {
                             varTypeMap.set(id.text, typeName);
-                            const qualifiers = scopeTypeQualifiers.get(scopeKey);
-                            if (qualifier) qualifiers?.set(id.text, qualifier);
-                            else qualifiers?.delete(id.text);
-                            scopeGuesses.get(scopeKey)?.delete(id.text); // declared type clears any guess
+                            if (qualifier) varQualifierMap?.set(id.text, qualifier);
+                            else varQualifierMap?.delete(id.text);
+                            if (scopeKey != null) {
+                                scopeGuesses.get(scopeKey)?.delete(id.text);
+                            }
                         }
                     }
                 };
@@ -1288,9 +1300,10 @@ function findCallsInCode(code, parser, options = {}) {
                     // Distinguish pkg.Func() (package-qualified) from obj.Method()
                     // If receiver is a known import alias, this is a package call, not a method call
                     const isPkgCall = receiver && importAliases.has(receiver);
-                    const receiverType = (!isPkgCall && receiver) ? getReceiverType(receiver) : undefined;
+                    const receiverType = (!isPkgCall && receiver)
+                        ? getReceiverType(receiver, operandNode) : undefined;
                     const receiverTypeQualifier = receiverType
-                        ? getReceiverTypeQualifier(receiver) : undefined;
+                        ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
                     // fix #202: one-hop declared-field receivers — h.inner.Run().
                     // receiverRoot/Field/RootType let findCallers hop to the
                     // field's declared struct-field type cross-file.
@@ -1310,8 +1323,9 @@ function findCallsInCode(code, parser, options = {}) {
                                 // concrete type lives outside the project.
                                 receiverRootIsModule = true;
                             } else {
-                                receiverRootType = getReceiverType(rootNode.text);
-                                receiverRootTypeQualifier = getReceiverTypeQualifier(rootNode.text);
+                                receiverRootType = getReceiverType(rootNode.text, rootNode);
+                                receiverRootTypeQualifier =
+                                    getReceiverTypeQualifier(rootNode.text, rootNode);
                                 if (receiverRootType && isGuessedType(rootNode.text)) {
                                     receiverRootTypeGuessed = true;
                                 }
@@ -1443,9 +1457,10 @@ function findCallsInCode(code, parser, options = {}) {
                 const operandNode = node.childForFieldName('operand');
                 if (fieldNode && operandNode) {
                     const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                    const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                    const receiverType = receiver
+                        ? getReceiverType(receiver, operandNode) : undefined;
                     const receiverTypeQualifier = receiverType
-                        ? getReceiverTypeQualifier(receiver) : undefined;
+                        ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
                     const enclosingFunction = getCurrentEnclosingFunction();
                     calls.push({
                         name: fieldNode.text,
@@ -1502,9 +1517,10 @@ function findCallsInCode(code, parser, options = {}) {
                         const operandNode = rhs.childForFieldName('operand');
                         if (fieldNode && operandNode) {
                             const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                            const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                            const receiverType = receiver
+                                ? getReceiverType(receiver, operandNode) : undefined;
                             const receiverTypeQualifier = receiverType
-                                ? getReceiverTypeQualifier(receiver) : undefined;
+                                ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
                             const enclosingFunction = getCurrentEnclosingFunction();
                             calls.push({
                                 name: fieldNode.text,
@@ -1600,9 +1616,10 @@ function findCallsInCode(code, parser, options = {}) {
                     const operandNode = valueNode.childForFieldName('operand');
                     if (fieldNode && operandNode) {
                         const receiver = operandNode.type === 'identifier' ? operandNode.text : undefined;
-                        const receiverType = receiver ? getReceiverType(receiver) : undefined;
+                        const receiverType = receiver
+                            ? getReceiverType(receiver, operandNode) : undefined;
                         const receiverTypeQualifier = receiverType
-                            ? getReceiverTypeQualifier(receiver) : undefined;
+                            ? getReceiverTypeQualifier(receiver, operandNode) : undefined;
                         const enclosingFunction = getCurrentEnclosingFunction();
                         calls.push({
                             name: fieldNode.text,
@@ -1952,6 +1969,26 @@ function isEntryPoint(symbol) {
     return getEntryPointKind(symbol) !== null;
 }
 
+// Stable Go standard-library runtime identities. Core consults these only
+// after proving the qualifier resolves outside the indexed project.
+const GO_PLATFORM_CONCRETE_CALLS = new Set([
+    'errors.New',
+    'fmt.Errorf',
+    'slog.New',
+]);
+
+const GO_PLATFORM_CONCRETE_TYPES = new Set([
+    'slog.Logger',
+]);
+
+function isPlatformConcreteCall(moduleName, functionName) {
+    return GO_PLATFORM_CONCRETE_CALLS.has(`${moduleName}.${functionName}`);
+}
+
+function isPlatformConcreteType(moduleName, typeName) {
+    return GO_PLATFORM_CONCRETE_TYPES.has(`${moduleName}.${typeName}`);
+}
+
 module.exports = {
     findFunctions,
     findClasses,
@@ -1960,6 +1997,8 @@ module.exports = {
     findImportsInCode,
     findExportsInCode,
     findUsagesInCode,
+    isPlatformConcreteCall,
+    isPlatformConcreteType,
     isEntryPoint,
     getEntryPointKind,
     parse

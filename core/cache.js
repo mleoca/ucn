@@ -180,11 +180,94 @@ const UCN_VERSION = require('../package.json').version;
 // v73: JS/TS call records preserve qualified-constructor provenance and bound
 // local receivers; conditional reassignments no longer persist a definite
 // inferred constructor type past a branch.
+// v74: JS/TS CommonJS object-spread barrels persist `module.exports = {
+// ...require('./source') }` as source-bearing re-export-all records. Namespace
+// calls can therefore establish exact name ownership through the facade.
 // Java nested type symbols preserve their enclosing type for exact constructor
 // ownership across same-named top-level and inner classes, and cast receivers
 // retain their compiler-declared type. Rust tuple fields are indexed by numeric
 // position so `self.0.method()` participates in declared-field resolution.
-const CACHE_FORMAT_VERSION = 73;
+// v75: v5's shared IR path persists lexical-owner ranges and C/C++/C# symbol
+// metadata; JS/TS call records preserve inline CommonJS module ownership,
+// explicit builtin-member reassignment, and the richer C-family receiver/flow
+// evidence used by caller resolution.
+// v76: Java member symbols retain their nested enclosing type so overload and
+// owner identity cannot conflate same-named inner classes.
+// v77: Java call records retain explicit type-qualified receivers and nested
+// type qualifiers for receiver-owner routing before overload selection.
+// v78: Java argument kinds retain qualified producer ownership, same-class
+// helper calls, and generic collection value types for exact overload routing.
+// v79: Java chained-call records retain their full producer type path for
+// platform collection/receiver ownership.
+// v80: Rust chained-call records retain exact producer byte offsets so
+// same-line nested constructors cannot collide in the fold.
+// v81: Rust producer identities include the complete byte span, separating
+// repeated same-name hops whose nested call expressions share a start offset.
+// v82: Rust macro symbols persist conservative transcriber return contracts;
+// macro invocations and token-tree calls retain complete producer spans and
+// path ownership for exact builder-chain folding.
+// v83: Rust callable symbols persist callback parameter type contracts and
+// calls inside closures retain their enclosing call/argument identity.
+// v84: Rust token-tree call records retain their containing macro identity so
+// code-generation templates (`quote!`) can use their own trust policy.
+// v85: Rust callable symbols persist declared iterator Item types for exact
+// closure and loop receiver inference.
+// v86: JS/TS package self-references can resolve a source entry when exported
+// build artifacts are absent, changing persisted module ownership graphs.
+// v87: JS/TS and Rust call records retain their lexical function-scope chain
+// so return-flow assignments remain visible inside nested closures.
+// v88: JS/TS callable symbols persist a unanimous concrete constructor return
+// for runtime dispatch through interface-typed factory annotations.
+// v89: JS/TS call records retain exact producer byte spans for same-line
+// return-flow assignments and chained-call identity.
+// v90: TypeScript object type aliases persist their declared field/method
+// members so structural field-hop resolution can use their type contracts;
+// explicit Type.prototype method bindings retain their type owner.
+// v91: Python call records retain complete attribute receiver paths and their
+// annotated root type for multi-hop declared-field resolution.
+// v92: Python calls retain isinstance-refined receiver types.
+// v93: Python calls retain receiver types derived from annotated iterable
+// tuple destructuring in loops and comprehensions.
+// v94: Python variadic parameter receivers retain their container type
+// (**kwargs is dict, *args is tuple).
+// v95: Python static generic aliases normalize to their runtime identity;
+// calls retain receiver types from same-file callable iterable returns and
+// collection-protocol conditional normalization.
+// v96: Python explicit instance-field type comments type receivers yielded
+// by loops and comprehensions over those fields.
+// v97: Python receiver records preserve compiler-declared variable types
+// through later assignments and unwrap parenthesized chained receivers.
+// v98: Python calls retain declared attribute paths that supply loop and
+// comprehension receiver values.
+// v99: Python context-manager producer calls retain their `as` target so
+// Iterator/ContextManager return contracts type the bound receiver.
+// v100: builtin open() context bindings retain their IO receiver type.
+// v101: Python generator yield assignments retain the declared send type.
+// v102: Python subscript receivers retain exact value types from local
+// string-keyed dictionary literals.
+// v103: Python pickle round-trip receivers retain the serialized value's
+// type plus the stdlib provenance needed to validate that contract.
+// v104: Python self-referential assignment calls retain the receiver's
+// pre-assignment type.
+// v105: Python calls persist nested lexical ownership, returned-constructor
+// contracts, and runtime instance-field assignments used by exact receiver
+// flow.
+// v106: Go calls persist package-scope typed receivers and exact wrapper-call
+// ownership used by the nominal dispatch path.
+// v107: Rust imports persist fully flattened grouped-use leaves; call records
+// retain iterator/collection contracts, match-payload provenance, multi-hop
+// field paths, tuple/match assignment producers, and primitive slice roots.
+// v108: JavaScript/TypeScript call records retain unresolved deep-member
+// receiver provenance so name bindings cannot impersonate receiver identity.
+// v109: Python call records retain positive receiver-exact hasattr capability
+// guards so uncertainty can name the runtime dispatch boundary.
+// v110: Rust untyped closure parameters block same-named outer receiver
+// annotations instead of persisting a stale, unrelated receiver type.
+// v111: Java call IR preserves lexical nested-type owners and uses declared
+// field types for overload argument shapes.
+// v112: Java argument kinds retain class-qualified field identity so the
+// field declaration's static value type participates in overload selection.
+const CACHE_FORMAT_VERSION = 112;
 
 /**
  * Save index to cache file

@@ -9,9 +9,10 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { expandGlob, findProjectRoot, detectProjectPattern, isTestFile, parseGitignore, DEFAULT_IGNORES, compareNames } = require('./discovery');
-const { extractImports, extractExports } = require('./imports');
-const { parse, cleanHtmlScriptTags } = require('./parser');
-const { detectLanguage, getParser, getLanguageModule, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
+const { cleanHtmlScriptTags } = require('./parser');
+const { detectLanguage, getParser, getLanguageAdapter, safeParse, langTraits, PARSE_OPTIONS } = require('../languages');
+const { validateFileIR } = require('./ir');
+const { createFileEntryFromIR, populateFileEntryFromIR } = require('./index-ir');
 const { getTokenTypeAtPosition } = require('../languages/utils');
 const { escapeRegExp, NON_CALLABLE_TYPES, codeUnitCompare } = require('./shared');
 const stacktrace = require('./stacktrace');
@@ -184,7 +185,7 @@ class ProjectIndex {
         }
 
         const lang = detectLanguage(filePath);
-        const langModule = getLanguageModule(lang);
+        const langModule = getLanguageAdapter(lang);
         if (!langModule || typeof langModule.findUsagesInCode !== 'function') return null;
 
         try {
@@ -384,9 +385,10 @@ class ProjectIndex {
         // avoiding the 2+ minute deferred cost when the first analysis command runs later.
         this.buildCalleeIndex();
 
-        // buildCalleeIndex re-parses changed files via getCachedCalls, which
-        // appends their entries at the callsCache TAIL — restore canonical
-        // key order so iteration-order consumers match a fresh build.
+        // Keep persisted iteration deterministic. Fresh and changed files
+        // already populated callsCache through the shared IR ingestion path;
+        // unchanged entries may have arrived from a sharded cache in a
+        // different order.
         this.callsCache = new Map([...this.callsCache.entries()].sort((a, b) => compareNames(a[0], b[0])));
 
         this.buildTime = Date.now() - startTime;
@@ -438,13 +440,13 @@ class ProjectIndex {
         const language = detectLanguage(filePath);
         if (!language) return;
 
-        // Parse content once — the tree-sitter cache in safeParse ensures the tree
-        // is shared across parse()/extractImports()/extractExports() (5→1 parse per file)
-        const parsed = parse(content, language);
-        parsed.filePath = filePath;
-        parsed.relativePath = filePath;
-        const { imports, dynamicCount, importAliases } = extractImports(content, language);
-        const { exports } = extractExports(content, language);
+        const adapter = getLanguageAdapter(language);
+        const parser = getParser(language);
+        const ir = adapter.analyze(content, parser, filePath);
+        const irFailures = validateFileIR(ir);
+        if (irFailures.length > 0) {
+            throw new Error(`Invalid ${language} IR: ${irFailures.join('; ')}`);
+        }
 
         // Detect bundled/minified files (webpack bundles, minified code)
         // These are build artifacts, not user-written source code
@@ -484,150 +486,26 @@ class ProjectIndex {
             content.slice(0, 500)
         );
 
-        const fileEntry = {
-            path: filePath,
+        const fileEntry = createFileEntryFromIR({
+            ir,
+            filePath,
             relativePath: path.relative(this.root, filePath),
-            language,
-            lines: lineCount,
             hash,
             mtime: stat.mtimeMs,
             size: stat.size,
-            imports: imports.map(i => i.module),
-            importNames: imports.flatMap(i => i.names || []),
-            // Paired name↔module bindings (fix #209): importNames flattens the
-            // pairing away, but name-level shadow detection needs to know WHICH
-            // module bound a name (`from urllib.parse import unquote` rebinds
-            // the bare name for the whole file).
-            importBindings: imports.flatMap(i => (i.names || [])
-                .filter(n => n && n !== '*' && n !== '_' && n !== '.')
-                .map(n => {
-                    // Rename pairing (fix #269): `{ validate: validateSchema }
-                    // = require('./validation')` — the record's local alias
-                    // pins to ITS module, not any module exporting the name.
-                    const rn = (i.renames || []).find(r => r.original === n);
-                    return {
-                        name: n,
-                        module: i.module,
-                        ...(rn && { alias: rn.local }),
-                        ...(i.defaultLike && { defaultLike: true }),
-                    };
-                })),
-            exports: exports.map(e => e.name),
-            exportDetails: exports,
-            symbols: [],
-            bindings: [],
-            ...(parsed.parseRecovery && { parseRecovery: true }),
-            ...(importAliases && { importAliases }),
-            // Module-scope assignment targets (fix #217): names a module can
-            // expose WITHOUT a def/class/import binding (`render = impl`,
-            // `global name`). The import-binding name-chase treats these as
-            // undetermined — a dead-end verdict would be unsound.
-            ...(parsed.moduleAssignedNames && { moduleAssignedNames: parsed.moduleAssignedNames }),
-            ...(isBundled && { isBundled: true }),
-            ...(isGenerated && { isGenerated: true })
-        };
-        fileEntry.dynamicImports = dynamicCount || 0;
-
-        // Add symbols
-        const addSymbol = (item, type) => {
-            const symbol = {
-                name: item.name,
-                type,
-                file: filePath,
-                relativePath: fileEntry.relativePath,
-                startLine: item.startLine,
-                endLine: item.endLine,
-                params: item.params,
-                paramsStructured: item.paramsStructured,
-                returnType: item.returnType,
-                ...(item.returnedFunctionResult && { returnedFunctionResult: item.returnedFunctionResult }),
-                ...(item.isFunctionVariable && { isFunctionVariable: true }),
-                ...(item.paramTypes && { paramTypes: item.paramTypes }),
-                ...(item.isAsync && { isAsync: true }),
-                ...(item.isGenerator && { isGenerator: true }),
-                modifiers: item.modifiers,
-                docstring: item.docstring,
-                bindingId: `${fileEntry.relativePath}:${type}:${item.startLine}`,
-                ...(item.generics && { generics: item.generics }),
-                ...(item.extends && { extends: item.extends }),
-                ...(item.implements && { implements: item.implements }),
-                ...(item.indent !== undefined && { indent: item.indent }),
-                ...(item.isNested && { isNested: item.isNested }),
-                ...(item.enclosingType && { enclosingType: item.enclosingType }),
-                ...(item.isMethod && { isMethod: item.isMethod }),
-                ...(item.receiver && { receiver: item.receiver }),
-                ...(item.className && { className: item.className }),
-                ...(item.memberType && { memberType: item.memberType }),
-                ...(item.fieldType && { fieldType: item.fieldType }),
-                ...(item.aliasOf && { aliasOf: item.aliasOf }),
-                ...(item.derefTarget && { derefTarget: item.derefTarget }),
-                ...(item.decorators && item.decorators.length > 0 && { decorators: item.decorators }),
-                // Decorator/annotation/attribute argument capture for endpoints command:
-                // these fields hold the parsed first-string-arg of each route-style annotation.
-                // Only populated when at least one entry has a string-literal arg, keeping memory
-                // overhead minimal for non-route code.
-                ...(item.decoratorsWithArgs && item.decoratorsWithArgs.length > 0 && { decoratorsWithArgs: item.decoratorsWithArgs }),
-                ...(item.annotationsWithArgs && item.annotationsWithArgs.length > 0 && { annotationsWithArgs: item.annotationsWithArgs }),
-                ...(item.attributesWithArgs && item.attributesWithArgs.length > 0 && { attributesWithArgs: item.attributesWithArgs }),
-                ...(item.nameLine && { nameLine: item.nameLine }),
-                ...(item.traitImpl && { traitImpl: true }),
-                // Trait the impl block implements (rust `impl Trait for X`
-                // members) — external-contract detection needs the NAME, not
-                // just the traitImpl flag (fix #210).
-                ...(item.traitName && { traitName: item.traitName }),
-                ...(item.isSignature && { isSignature: true }),
-                ...(item.memberAssigned && { memberAssigned: true }),
-                ...(item.bodyScopedName && { bodyScopedName: true }),
-                ...(item.registryMember && { registryMember: true }),
-                ...(item.registryContainer && { registryContainer: item.registryContainer })
-            };
-            fileEntry.symbols.push(symbol);
-            // Property-assignment defs (fix #269: Reply.prototype.serialize
-            // = function) declare no lexical name — a bare reference in the
-            // file can never bind them, so they never enter the bindings
-            // table (the symbol stays indexed and method-reachable). Named
-            // function expressions (bodyScopedName) bind only inside their
-            // own body (ECMA-262) — same consequence.
-            if (!item.memberAssigned && !item.bodyScopedName) {
-                fileEntry.bindings.push({
-                    id: symbol.bindingId,
-                    name: symbol.name,
-                    type: symbol.type,
-                    startLine: symbol.startLine
-                });
-            }
-
-            if (!this.symbols.has(item.name)) {
-                this.symbols.set(item.name, []);
-            }
-            this.symbols.get(item.name).push(symbol);
-        };
-
-        for (const fn of parsed.functions) {
-            // Go/Rust methods: set className from receiver for consistent method resolution.
-            // Go/Rust methods are standalone functions with receiver, not class members,
-            // so className is never set by the class member loop below.
-            if (fn.receiver && !fn.className) {
-                fn.className = fn.receiver.replace(/^\*/, '');
-            }
-            addSymbol(fn, fn.isConstructor ? 'constructor' : 'function');
-        }
-
-        for (const cls of parsed.classes) {
-            addSymbol(cls, cls.type || 'class');
-            if (cls.members) {
-                for (const m of cls.members) {
-                    const memberType = m.memberType || 'method';
-                    addSymbol({ ...m, className: cls.name, ...(cls.traitName && { traitImpl: true, traitName: cls.traitName }) }, memberType);
-                }
-            }
-        }
-
-        for (const state of parsed.stateObjects) {
-            addSymbol(state, 'state');
-        }
+            lineCount,
+            isBundled,
+            isGenerated,
+        });
+        populateFileEntryFromIR(fileEntry, ir, this.symbols);
 
         this.files.set(filePath, fileEntry);
+        this.callsCache.set(filePath, {
+            mtime: stat.mtimeMs,
+            hash,
+            calls: ir.calls,
+        });
+        this.callsCacheDirty = true;
         return true;
     }
 
@@ -836,6 +714,10 @@ class ProjectIndex {
             javaFileIndex = this._javaFileIndex;
         }
         return graphBuildModule._resolveJavaPackageImport(this, importModule, javaFileIndex);
+    }
+
+    _resolveCSharpUsing(importModule) {
+        return graphBuildModule._resolveCSharpUsing(this, importModule);
     }
 
     /**
@@ -1058,11 +940,16 @@ class ProjectIndex {
 
         // Filter by exact startLine when a handle was supplied. This pins
         // the resolution to one specific definition — no ambiguity allowed.
-        if (options.line && Number.isFinite(options.line)) {
-            const filtered = definitions.filter(d => d.startLine === options.line);
-            if (filtered.length > 0) {
-                definitions = filtered;
+        if (options.line != null && options.line !== '') {
+            const exactLine = Number(options.line);
+            if (Number.isFinite(exactLine)) {
+                // A line is an exact identity pin, never a ranking hint.
+                // An unsatisfied pin must not fall back to another definition.
+                definitions = definitions.filter(d => d.startLine === exactLine);
             }
+        }
+        if (definitions.length === 0) {
+            return { def: null, definitions: [], warnings: [] };
         }
 
         // Score each definition for selection
@@ -1656,7 +1543,7 @@ class ProjectIndex {
             return null; // Signal to use fallback
         }
 
-        const langModule = getLanguageModule(language);
+        const langModule = getLanguageAdapter(language);
         if (!langModule || typeof langModule.findUsagesInCode !== 'function') {
             return null;
         }
@@ -1854,6 +1741,62 @@ class ProjectIndex {
                     'FunctionalInterface', 'SafeVarargs',
                     'Iterable', 'Comparable', 'AutoCloseable', 'Cloneable',
                     'Enum', 'Record', 'Void'
+                ]),
+                c: new Set([
+                    'auto', 'break', 'case', 'char', 'const', 'continue',
+                    'default', 'do', 'double', 'else', 'enum', 'extern',
+                    'float', 'for', 'goto', 'if', 'inline', 'int', 'long',
+                    'register', 'restrict', 'return', 'short', 'signed',
+                    'sizeof', 'static', 'struct', 'switch', 'typedef', 'union',
+                    'unsigned', 'void', 'volatile', 'while', '_Bool',
+                    '_Complex', '_Atomic', '_Generic', '_Noreturn',
+                    'NULL', 'true', 'false', 'size_t', 'ptrdiff_t',
+                    'printf', 'fprintf', 'sprintf', 'snprintf', 'scanf',
+                    'malloc', 'calloc', 'realloc', 'free', 'memcpy', 'memmove',
+                    'memset', 'strlen', 'strcmp', 'strcpy', 'strncpy',
+                    'fopen', 'fclose', 'fread', 'fwrite', 'exit', 'abort',
+                ]),
+                cpp: new Set([
+                    'alignas', 'alignof', 'and', 'and_eq', 'asm', 'auto',
+                    'bitand', 'bitor', 'bool', 'break', 'case', 'catch',
+                    'char', 'char8_t', 'char16_t', 'char32_t', 'class',
+                    'compl', 'concept', 'const', 'consteval', 'constexpr',
+                    'constinit', 'const_cast', 'continue', 'co_await',
+                    'co_return', 'co_yield', 'decltype', 'default', 'delete',
+                    'do', 'double', 'dynamic_cast', 'else', 'enum', 'explicit',
+                    'export', 'extern', 'false', 'float', 'for', 'friend',
+                    'goto', 'if', 'inline', 'int', 'long', 'mutable',
+                    'namespace', 'new', 'noexcept', 'not', 'nullptr',
+                    'operator', 'or', 'private', 'protected', 'public',
+                    'register', 'reinterpret_cast', 'requires', 'return',
+                    'short', 'signed', 'sizeof', 'static', 'static_assert',
+                    'static_cast', 'struct', 'switch', 'template', 'this',
+                    'thread_local', 'throw', 'true', 'try', 'typedef',
+                    'typeid', 'typename', 'union', 'unsigned', 'using',
+                    'virtual', 'void', 'volatile', 'wchar_t', 'while',
+                    'std', 'string', 'vector', 'map', 'unordered_map', 'set',
+                    'unique_ptr', 'shared_ptr', 'weak_ptr', 'optional',
+                    'variant', 'tuple', 'move', 'forward', 'make_shared',
+                    'make_unique', 'cout', 'cerr', 'cin', 'endl',
+                ]),
+                csharp: new Set([
+                    'abstract', 'as', 'base', 'bool', 'break', 'byte', 'case',
+                    'catch', 'char', 'checked', 'class', 'const', 'continue',
+                    'decimal', 'default', 'delegate', 'do', 'double', 'else',
+                    'enum', 'event', 'explicit', 'extern', 'false', 'finally',
+                    'fixed', 'float', 'for', 'foreach', 'goto', 'if',
+                    'implicit', 'in', 'int', 'interface', 'internal', 'is',
+                    'lock', 'long', 'namespace', 'new', 'null', 'object',
+                    'operator', 'out', 'override', 'params', 'private',
+                    'protected', 'public', 'readonly', 'record', 'ref',
+                    'return', 'sbyte', 'sealed', 'short', 'sizeof',
+                    'stackalloc', 'static', 'string', 'struct', 'switch',
+                    'this', 'throw', 'true', 'try', 'typeof', 'uint', 'ulong',
+                    'unchecked', 'unsafe', 'ushort', 'using', 'virtual',
+                    'void', 'volatile', 'while', 'async', 'await', 'var',
+                    'dynamic', 'yield', 'Console', 'Math', 'String', 'Object',
+                    'Task', 'ValueTask', 'List', 'Dictionary', 'HashSet',
+                    'IEnumerable', 'IDisposable', 'Exception',
                 ])
             };
             // TypeScript/TSX share JavaScript keywords

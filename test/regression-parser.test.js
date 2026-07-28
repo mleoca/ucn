@@ -58,9 +58,9 @@ describe('TS: abstract classes and methods extracted', () => {
 
 describe('TS: enum members extracted', () => {
     it('enum members appear in class members', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = "enum Status {\n    Active = 'active',\n    Inactive = 'inactive'\n}";
         const classes = tsMod.findClasses(code, parser);
         const cls = classes.find(c => c.name === 'Status');
@@ -73,9 +73,9 @@ describe('TS: enum members extracted', () => {
 
 describe('TS: interface members extracted', () => {
     it('interface method signatures appear as members', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = 'interface ApiClient {\n    get(url: string): Promise<any>;\n    post(url: string, body: any): Promise<any>;\n    baseUrl: string;\n}';
         const classes = tsMod.findClasses(code, parser);
         const iface = classes.find(c => c.name === 'ApiClient');
@@ -107,9 +107,9 @@ describe('TS: namespace declarations extracted', () => {
 
 describe('TS: field decorators extracted', () => {
     it('@Column() on class field is captured', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'class User {',
             '    @Column()',
@@ -195,9 +195,9 @@ describe('Python: nested classes extracted', () => {
 
 describe('Python: property setter/deleter memberType', () => {
     it('@name.setter gets memberType setter', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('python');
-        const pyMod = getLanguageModule('python');
+        const pyMod = getLanguageAdapter('python');
         const code = [
             'class Config:',
             '    @property',
@@ -218,9 +218,9 @@ describe('Python: property setter/deleter memberType', () => {
 
 describe('Go: embedded structs surfaced as extends', () => {
     it('embedded struct appears as extends relationship', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = [
             'package main',
             'type Base struct { Name string }',
@@ -239,9 +239,9 @@ describe('Go: embedded structs surfaced as extends', () => {
 
 describe('Rust: trait impls surfaced as implements', () => {
     it('impl Display for Foo appears as implements on Foo', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = [
             'pub struct Person { name: String }',
             '',
@@ -306,9 +306,9 @@ describe('Rust: extern block functions extracted', () => {
 
 describe('Java: record members extracted', () => {
     it('record components appear as members', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = 'public record Point(int x, int y) {\n    public double distance() {\n        return Math.sqrt(x * x + y * y);\n    }\n}';
         const classes = javaMod.findClasses(code, parser);
         const record = classes.find(c => c.name === 'Point');
@@ -327,9 +327,9 @@ describe('Java: record members extracted', () => {
 
 describe('TS abstract class: edge cases', () => {
     it('abstract class with generics and multiple abstract methods', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'export abstract class Repository<T> {',
             '    abstract findById(id: string): Promise<T>;',
@@ -408,9 +408,9 @@ describe('TS abstract class: edge cases', () => {
 
 describe('Java record: edge cases', () => {
     it('record with no body (only components)', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = 'public record Pair(String first, String second) {}';
         const classes = javaMod.findClasses(code, parser);
         const pair = classes.find(c => c.name === 'Pair');
@@ -420,9 +420,9 @@ describe('Java record: edge cases', () => {
     });
 
     it('record implementing interface', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('java');
-        const javaMod = getLanguageModule('java');
+        const javaMod = getLanguageAdapter('java');
         const code = [
             'interface Measurable { double measure(); }',
             'public record Circle(double radius) implements Measurable {',
@@ -492,9 +492,9 @@ describe('Java record: edge cases', () => {
 
 describe('Go embedded struct: edge cases', () => {
     it('multiple embedded structs', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = [
             'package main',
             'type Reader struct {}',
@@ -513,9 +513,9 @@ describe('Go embedded struct: edge cases', () => {
     });
 
     it('pointer embedded struct', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = [
             'package main',
             'type Logger struct { Level int }',
@@ -575,9 +575,9 @@ describe('Go embedded struct: edge cases', () => {
     });
 
     it('embedded interface in struct', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('go');
-        const goMod = getLanguageModule('go');
+        const goMod = getLanguageAdapter('go');
         const code = [
             'package main',
             'type Handler interface { Handle() error }',
@@ -600,9 +600,9 @@ describe('Go embedded struct: edge cases', () => {
 
 describe('Rust trait impl: edge cases', () => {
     it('multiple traits on same struct', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = [
             'pub struct Config { pub name: String }',
             'impl Default for Config {',
@@ -620,9 +620,9 @@ describe('Rust trait impl: edge cases', () => {
     });
 
     it('trait impl for enum', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = [
             'pub enum Color { Red, Green, Blue }',
             'impl std::fmt::Display for Color {',
@@ -639,9 +639,9 @@ describe('Rust trait impl: edge cases', () => {
     });
 
     it('inherent impl (no trait) does NOT add to implements', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = [
             'pub struct Db { conn: String }',
             'impl Db {',
@@ -685,9 +685,9 @@ describe('Rust trait impl: edge cases', () => {
 
 describe('Rust extern: edge cases', () => {
     it('extern block with multiple functions', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('rust');
-        const rustMod = getLanguageModule('rust');
+        const rustMod = getLanguageAdapter('rust');
         const code = [
             'extern "C" {',
             '    pub fn c_malloc(size: usize) -> *mut u8;',
@@ -751,9 +751,9 @@ describe('Rust extern: edge cases', () => {
 
 describe('TS enum members: edge cases', () => {
     it('enum with mixed value types', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'enum Direction {',
             '    Up = 1,',
@@ -771,9 +771,9 @@ describe('TS enum members: edge cases', () => {
     });
 
     it('const enum', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = 'const enum Flags { Read = 1, Write = 2, Execute = 4 }';
         const classes = tsMod.findClasses(code, parser);
         const flags = classes.find(c => c.name === 'Flags');
@@ -797,9 +797,9 @@ describe('TS enum members: edge cases', () => {
     });
 
     it('enum without explicit values', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = 'enum Color { Red, Green, Blue }';
         const classes = tsMod.findClasses(code, parser);
         const color = classes.find(c => c.name === 'Color');
@@ -814,9 +814,9 @@ describe('TS enum members: edge cases', () => {
 
 describe('TS interface members: edge cases', () => {
     it('interface with optional and readonly properties', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'interface Config {',
             '    readonly host: string;',
@@ -884,9 +884,9 @@ describe('TS interface members: edge cases', () => {
 
 describe('TS field decorators: edge cases', () => {
     it('multiple decorators on same field', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'class Entity {',
             '    @PrimaryColumn()',
@@ -904,9 +904,9 @@ describe('TS field decorators: edge cases', () => {
     });
 
     it('decorated arrow field', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'class Handler {',
             '    @Bind()',
@@ -947,9 +947,9 @@ describe('TS field decorators: edge cases', () => {
     });
 
     it('field decorator does not affect method decorator detection', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'class Service {',
             '    @Inject()',
@@ -1043,9 +1043,9 @@ describe('Python nested class: edge cases', () => {
     });
 
     it('deeply nested class', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('python');
-        const pyMod = getLanguageModule('python');
+        const pyMod = getLanguageAdapter('python');
         const code = [
             'class Outer:',
             '    class Middle:',
@@ -1083,9 +1083,9 @@ describe('Python nested class: edge cases', () => {
 
 describe('Python property setter/deleter: edge cases', () => {
     it('getter + setter + deleter all extracted', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('python');
-        const pyMod = getLanguageModule('python');
+        const pyMod = getLanguageAdapter('python');
         const code = [
             'class Resource:',
             '    @property',
@@ -1219,9 +1219,9 @@ describe('TS namespace: edge cases', () => {
 
 describe('Cross-feature: abstract class + decorators + interface', () => {
     it('abstract class implementing interface with decorated fields', () => {
-        const { getParser, getLanguageModule } = require('../languages/index');
+        const { getParser, getLanguageAdapter } = require('../languages/index');
         const parser = getParser('typescript');
-        const tsMod = getLanguageModule('typescript');
+        const tsMod = getLanguageAdapter('typescript');
         const code = [
             'interface Serializable { serialize(): string; }',
             'abstract class Model implements Serializable {',

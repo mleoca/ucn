@@ -13,9 +13,9 @@
  *   async prepare(repoDir, opts) -> handle,
  *   async listSymbols(handle, { kinds, limit }) -> [{ name, file, line, kind }],
  *       // file: path RELATIVE to the prepared root; kind: 'function'|'method'|'class'
- *   async findReferences(handle, { name, file, line }) -> [{ file, line, kind }],
+ *   async findReferences(handle, { name, file, line }) -> [{ file, line, column?, kind }],
  *       // kind: 'call' | 'import' | 'reference' | 'definition'
- *   async resolveDefinition?(handle, { name, file, line }) -> [{ file, line }],
+ *   async resolveDefinition?(handle, { name, file, line, column? }) -> [{ file, line }],
  *       // optional exact static-target adjudication for reference-search gaps
  *   async isConfigurationGated?(handle, { file, line }) -> boolean,
  *       // optional single-configuration coverage marker (Rust cfg, etc.)
@@ -24,6 +24,9 @@
  */
 
 'use strict';
+
+const fs = require('fs');
+const path = require('path');
 
 const REQUIRED_MEMBERS = ['name', 'languages', 'prepare', 'listSymbols', 'findReferences'];
 const REFERENCE_KINDS = new Set(['call', 'import', 'reference', 'definition']);
@@ -63,4 +66,45 @@ function validateReference(ref, oracleName) {
     return ref;
 }
 
-module.exports = { validateOracle, validateReference, REFERENCE_KINDS };
+/**
+ * Map paths between an oracle's prepared root and UCN's project root.
+ *
+ * Both roots must be canonicalized before taking a relative path. On macOS,
+ * os.tmpdir() commonly returns /var/... while Eclipse/JDT reports the same
+ * files under /private/var/.... Comparing those lexical paths made the Java
+ * release gate discard its entire symbol universe.
+ */
+function createOraclePathMapper(indexRoot, oracleRoot) {
+    const canonical = root => {
+        const absolute = path.resolve(root);
+        try {
+            return fs.realpathSync.native
+                ? fs.realpathSync.native(absolute)
+                : fs.realpathSync(absolute);
+        } catch (_) {
+            return absolute;
+        }
+    };
+    const canonicalIndexRoot = canonical(indexRoot);
+    const canonicalOracleRoot = canonical(oracleRoot);
+
+    return {
+        toIndex(file) {
+            return path.relative(
+                canonicalIndexRoot,
+                path.resolve(canonicalOracleRoot, file));
+        },
+        toOracle(file) {
+            return path.relative(
+                canonicalOracleRoot,
+                path.resolve(canonicalIndexRoot, file));
+        },
+    };
+}
+
+module.exports = {
+    validateOracle,
+    validateReference,
+    createOraclePathMapper,
+    REFERENCE_KINDS,
+};

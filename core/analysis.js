@@ -14,7 +14,7 @@ const { parse } = require('./parser');
 const { detectLanguage, langTraits } = require('../languages');
 const { NON_CALLABLE_TYPES, addTestExclusions, countTextBlindspots, codeUnitCompare } = require('./shared');
 const { computeReachability, symbolKey } = require('./entrypoints');
-const { getLanguageModule } = require('../languages');
+const { getLanguageAdapter } = require('../languages');
 
 // JS/TS test framework helpers — calls to these bracket a test case.
 // Used to flag call sites whose enclosing function is an arrow callback
@@ -44,7 +44,7 @@ function tagInTestCase(index, sites) {
         const fe = index.files.get(filePath);
         if (!fe) { fileMeta.set(filePath, null); return null; }
         let langModule = null;
-        try { langModule = getLanguageModule(fe.language); } catch (_) { /* ignore */ }
+        try { langModule = getLanguageAdapter(fe.language); } catch (_) { /* ignore */ }
         const meta = { fileEntry: fe, langModule, language: fe.language, jsTestRanges: null };
         // For JS-family files, build line ranges of describe/it/test framework calls.
         if (langModule && (fe.language === 'javascript' || fe.language === 'typescript' ||
@@ -434,11 +434,16 @@ function context(index, name, options = {}) {
         return (a.startLine || 0) - (b.startLine || 0);
     });
 
-    // Trust signals: tag each caller/callee with reachability and build ordinal evidence histograms.
-    // Reachability is computed once per index and cached (see entrypoints.computeReachability).
-    const reachableSet = computeReachability(index);
-    tagCallersReachable(callers, reachableSet);
-    tagCalleesReachable(callees, reachableSet);
+    // Reachability is a whole-project BFS. Keep the default symbol query
+    // targeted; compute the enrichment only for the explicit unreachable
+    // filter, or validate/reuse an already available cache.
+    const reachableSet = (options.unreachableOnly || index._reachableSymbols)
+        ? computeReachability(index)
+        : null;
+    if (reachableSet) {
+        tagCallersReachable(callers, reachableSet);
+        tagCalleesReachable(callees, reachableSet);
+    }
 
     // Side-effect tags on callees (lazy-cached per symbol on the index)
     tagCalleesSideEffects(index, callees);
@@ -497,8 +502,11 @@ function context(index, name, options = {}) {
             account,
             calleeAccount: rawCallees.calleeAccount,
             // No detected entry points (e.g. library code) — reachability
-            // markers are meaningless and suppressed by formatters.
-            hasEntrypoints: reachableSet.size > 0,
+            // markers are meaningless and suppressed by formatters. Omit the
+            // field when the optional enrichment was not requested.
+            ...(reachableSet && {
+                hasEntrypoints: reachableSet.size > 0,
+            }),
             ...(options.all && { all: true }),
             // Structural facts for reliability hints
             ...(def.isMethod && { isMethod: true }),
@@ -1083,14 +1091,22 @@ function impact(index, name, options = {}) {
         impactFilteredByFlag.exclude += beforeUnverified - unverifiedSites.length;
     }
 
-    // Trust signals: tag each call site with reachability and build an ordinal evidence histogram.
-    // It is computed BEFORE top-N truncation so the evidence profile reflects the full scope.
-    const impactReachable = computeReachability(index);
-    for (const site of filteredSites) {
-        if (site.callerFile && site.callerStartLine != null) {
-            site.reachable = impactReachable.has(symbolKey(site.callerFile, site.callerStartLine));
+    // Reachability is a whole-project BFS and can dominate an otherwise
+    // targeted impact query. Compute it only when the caller requested the
+    // unreachable filter, or validate/reuse an already available cache.
+    // Default impact still returns the complete evidence-tiered call-site
+    // answer; `reachable` remains an optional enrichment.
+    const impactReachable = (options.unreachableOnly || index._reachableSymbols)
+        ? computeReachability(index)
+        : null;
+    if (impactReachable) {
+        for (const site of filteredSites) {
+            if (site.callerFile && site.callerStartLine != null) {
+                site.reachable = impactReachable.has(
+                    symbolKey(site.callerFile, site.callerStartLine));
+            }
+            // Module-level sites: no verdict — import-time execution (fix #256).
         }
-        // Module-level sites: no verdict — import-time execution (fix #256).
     }
     if (options.unreachableOnly) {
         const before = filteredSites.length;
@@ -1186,7 +1202,7 @@ function impact(index, name, options = {}) {
         shownCallSites: filteredSites.length,
         unverifiedSites,
         account: impactAccount,
-        hasEntrypoints: impactReachable.size > 0,
+        hasEntrypoints: !!impactReachable && impactReachable.size > 0,
         callerHistogram,
         // Stable ordering: files alphabetical, sites by line ascending. Documented contract.
         byFile: Array.from(byFile.entries())
@@ -1316,6 +1332,7 @@ function about(index, name, options = {}) {
     let allCallees = null;
     let aboutConfFiltered = 0;
     let aboutAccount = null;
+    let aboutReachable = null;
     let aboutUnverified = { total: 0, top: [] };
     // BUG-M3: include classes/structs/interfaces — `new Foo()` invocations are
     // tracked as calls in the parser (isConstructor:true) and findCallers resolves
@@ -1374,10 +1391,14 @@ function about(index, name, options = {}) {
         }
         const unverifiedShadowCount = shadowSurvivors.filter(s => s.tier === 'unverified').length;
         shadowSurvivors = shadowSurvivors.filter(s => s.tier !== 'unverified');
-        // Tag reachability on raw caller objects so we can preserve the field on the projection.
-        // Reachability is computed once per index and cached.
-        const aboutReachable = computeReachability(index);
-        tagCallersReachable(allCallers, aboutReachable);
+        // Whole-project reachability is optional enrichment. Compute it only
+        // for the explicit filter, or validate/reuse an existing cache.
+        aboutReachable = (options.unreachableOnly || index._reachableSymbols)
+            ? computeReachability(index)
+            : null;
+        if (aboutReachable) {
+            tagCallersReachable(allCallers, aboutReachable);
+        }
 
         // Optional: filter to unreachable-only callers
         if (options.unreachableOnly) {
@@ -1491,7 +1512,9 @@ function about(index, name, options = {}) {
         }
 
         // Tag callee reachability + optional unreachable-only filter
-        tagCalleesReachable(allCallees, aboutReachable);
+        if (aboutReachable) {
+            tagCalleesReachable(allCallees, aboutReachable);
+        }
         if (options.unreachableOnly) {
             allCallees = allCallees.filter(c => !c.reachable);
         }
@@ -1639,7 +1662,9 @@ function about(index, name, options = {}) {
         code,
         includeMethods,
         ...(aboutAccount && { account: aboutAccount }),
-        ...(allCallers && { hasEntrypoints: computeReachability(index).size > 0 }),
+        ...(allCallers && aboutReachable && {
+            hasEntrypoints: aboutReachable.size > 0,
+        }),
         ...(aboutConfFiltered > 0 && { confidenceFiltered: aboutConfFiltered }),
         // BUG-M4: surface ambiguous-resolution warnings so formatters can render
         // a "auto-selected ... pass --file to choose" note.
@@ -2272,7 +2297,9 @@ function parseDiff(diffText, root) {
 // Languages for which audit-async runs (those with async/await keyword we
 // track). Go/Java/Rust have async machinery but audit-async is scoped to
 // JS/TS/Python per spec.
-const _AUDIT_ASYNC_LANGS = new Set(['javascript', 'typescript', 'tsx', 'python', 'html']);
+const _AUDIT_ASYNC_LANGS = new Set([
+    'javascript', 'typescript', 'tsx', 'python', 'html', 'csharp',
+]);
 
 // Built-in/standard-library callees that return promises and are commonly
 // missing-awaited. Conservative starter set (rule #9 — generic, not
@@ -2309,7 +2336,7 @@ const _FIRE_AND_FORGET_PROMISE_FNS = new Set(['all', 'allSettled', 'race', 'any'
  *      to a variable — these are intentional non-await uses).
  *
  * Detection is AST-based per language; the language must support an
- * `await` keyword (JS/TS/Python). Other languages are skipped.
+ * `await` keyword (JS/TS/Python/C#). Other languages are skipped.
  *
  * @param {object} index - ProjectIndex instance
  * @param {object} [options] - { file, exclude }
@@ -2318,7 +2345,7 @@ const _FIRE_AND_FORGET_PROMISE_FNS = new Set(['all', 'allSettled', 'race', 'any'
 function auditAsync(index, options = {}) {
     index._beginOp();
     try {
-        const { getParser, getLanguageModule, safeParse } = require('../languages');
+        const { getParser, getLanguageAdapter, safeParse } = require('../languages');
         const issues = [];
 
         // Build a "is this name provably async" lookup from the symbol table.
@@ -2430,6 +2457,9 @@ function auditAsync(index, options = {}) {
         function processFile(filePath, fileEntry) {
             if (!fileEntry || !_AUDIT_ASYNC_LANGS.has(fileEntry.language)) return;
             const language = fileEntry.language;
+            const indexedCalls = language === 'csharp'
+                ? index.getCachedCalls(filePath) || []
+                : [];
 
             // Collect async functions from the file's symbol list.
             // Also build a per-file set of names that are async in THIS file —
@@ -2465,7 +2495,7 @@ function auditAsync(index, options = {}) {
             let parser, content, tree;
             try {
                 if (language === 'html') {
-                    const htmlModule = getLanguageModule('html');
+                    const htmlModule = getLanguageAdapter('html');
                     const htmlParser = getParser('html');
                     const jsParser = getParser('javascript');
                     if (!htmlParser || !jsParser) return;
@@ -2484,7 +2514,10 @@ function auditAsync(index, options = {}) {
             if (!tree) return;
 
             // Walk every call_expression within an async function range.
-            const callTypes = new Set(['call_expression', 'call', 'method_invocation', 'object_creation_expression']);
+            const callTypes = new Set([
+                'call_expression', 'call', 'method_invocation',
+                'invocation_expression', 'object_creation_expression',
+            ]);
 
             // Function-boundary nodes per language (used to find the nearest
             // enclosing function and determine if IT is async — not just any
@@ -2495,6 +2528,8 @@ function auditAsync(index, options = {}) {
                 tsx:        new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration', 'function_signature']),
                 html:       new Set(['function_declaration', 'function_expression', 'arrow_function', 'method_definition', 'generator_function', 'generator_function_declaration']),
                 python:     new Set(['function_definition', 'async_function_definition', 'lambda']),
+                csharp:     new Set(['method_declaration', 'local_function_statement',
+                    'anonymous_method_expression', 'lambda_expression']),
             }[language] || new Set();
 
             function isAsyncFnNode(node) {
@@ -2509,7 +2544,9 @@ function auditAsync(index, options = {}) {
                 // method_definition: scan first child for 'async' identifier.
                 for (let i = 0; i < node.namedChildCount; i++) {
                     const c = node.namedChild(i);
-                    if (c.type === 'async') return true;
+                    if (c.type === 'async' || (c.type === 'modifier' && c.text === 'async')) {
+                        return true;
+                    }
                 }
                 return false;
             }
@@ -2558,7 +2595,8 @@ function auditAsync(index, options = {}) {
                                 funcNode.type === 'selector_expression' || funcNode.type === 'field_expression') {
                                 const prop = funcNode.childForFieldName('property') ||
                                              funcNode.childForFieldName('field') ||
-                                             funcNode.childForFieldName('attribute');
+                                             funcNode.childForFieldName('attribute') ||
+                                             funcNode.childForFieldName('name');
                                 calleeName = prop ? prop.text : null;
                                 isMethodCall = true;
                             } else {
@@ -2575,7 +2613,31 @@ function auditAsync(index, options = {}) {
                                 // in unrelated.js — bad.js's helper() should
                                 // still be flagged).
                                 let calleeIsAsync;
-                                if (fileAsyncNames.has(calleeName)) {
+                                if (language === 'csharp') {
+                                    // C# method identity is nominal. Prefer the
+                                    // indexed receiver type at this call site;
+                                    // fall back only when every project
+                                    // definition with the name is async.
+                                    const indexed = indexedCalls.find(call =>
+                                        call.name === calleeName && call.line === line &&
+                                        call.isMethod === isMethodCall);
+                                    let receiverType = indexed?.receiverType || null;
+                                    if (!receiverType && indexed?.receiverField &&
+                                        indexed?.receiverRootType) {
+                                        const field = (fileEntry.symbols || []).find(symbol =>
+                                            symbol.type === 'field' &&
+                                            symbol.className === indexed.receiverRootType &&
+                                            symbol.name === indexed.receiverField);
+                                        receiverType = field?.fieldType || null;
+                                    }
+                                    const receiverDefs = receiverType
+                                        ? callableDefs(index.symbols.get(calleeName) || [])
+                                            .filter(def => def.className === receiverType)
+                                        : [];
+                                    calleeIsAsync = receiverDefs.length > 0
+                                        ? receiverDefs.every(isDefAsync)
+                                        : asyncNames.has(calleeName);
+                                } else if (fileAsyncNames.has(calleeName)) {
                                     calleeIsAsync = true;
                                 } else if (fileAnyDefNames.has(calleeName)) {
                                     // Same-file def exists and isn't async →
@@ -2595,7 +2657,7 @@ function auditAsync(index, options = {}) {
                                     // class's async `get`. Method-call audits
                                     // need a more sophisticated receiver
                                     // resolution that we don't have here.
-                                    if (isMethodCall) {
+                                    if (isMethodCall && language !== 'csharp') {
                                         // (Allow only when callee is in the
                                         // KNOWN_ASYNC_CALLEES list — those are
                                         // standard global functions, not
@@ -2606,7 +2668,8 @@ function auditAsync(index, options = {}) {
                                             // Fall through to common flag logic
                                         }
                                     }
-                                    if (!isMethodCall || _KNOWN_ASYNC_CALLEES.has(calleeName)) {
+                                    if (!isMethodCall || language === 'csharp' ||
+                                        _KNOWN_ASYNC_CALLEES.has(calleeName)) {
                                         // Check: is the call awaited?
                                         let awaited = false;
                                         const p = node.parent;

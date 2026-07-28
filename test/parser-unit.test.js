@@ -42,6 +42,14 @@ describe('Language Detection', () => {
         assert.strictEqual(detectLanguage('file.java'), 'java');
     });
 
+    it('detects C, C++, and C# files', () => {
+        assert.strictEqual(detectLanguage('file.c'), 'c');
+        assert.strictEqual(detectLanguage('file.h'), 'c');
+        assert.strictEqual(detectLanguage('file.cpp'), 'cpp');
+        assert.strictEqual(detectLanguage('file.hpp'), 'cpp');
+        assert.strictEqual(detectLanguage('file.cs'), 'csharp');
+    });
+
     it('returns null for unsupported files', () => {
         assert.strictEqual(detectLanguage('file.txt'), null);
         assert.strictEqual(detectLanguage('file.md'), null);

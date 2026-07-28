@@ -81,6 +81,7 @@ function scored(resolution, reasons) {
  * @param {boolean} [evidence.resolvedByReceiverHint] - Receiver type narrowed via local hints
  * @param {boolean} [evidence.hasImportEvidence] - File imports the target definition
  * @param {boolean} [evidence.hasReceiverEvidence] - Receiver variable has binding in file scope
+ * @param {boolean} [evidence.hasSingleOwnerEvidence] - One eligible project type owns the method
  * @param {boolean} [evidence.isUncertain] - Marked uncertain by resolution logic
  * @param {boolean} [evidence.isFunctionReference] - Passed as callback argument
  * @param {boolean} [evidence.hasReceiverType] - Go/Java/Rust parser-inferred receiverType
@@ -143,10 +144,12 @@ function scoreEdge(evidence) {
     }
 
     // Scope/import-supported match
-    if (evidence.hasImportEvidence || evidence.hasReceiverEvidence || evidence.hasSamePackageEvidence) {
+    if (evidence.hasImportEvidence || evidence.hasReceiverEvidence ||
+        evidence.hasSamePackageEvidence || evidence.hasSingleOwnerEvidence) {
         if (evidence.hasImportEvidence) reasons.push('import-supported');
         if (evidence.hasReceiverEvidence) reasons.push('receiver binding in scope');
         if (evidence.hasSamePackageEvidence) reasons.push('same package/module');
+        if (evidence.hasSingleOwnerEvidence) reasons.push('single project method owner');
         return scored(RESOLUTION.SCOPE_MATCH, reasons);
     }
 
