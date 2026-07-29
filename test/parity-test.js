@@ -217,12 +217,21 @@ describe('18-command CLI/MCP/interactive parity', () => {
         });
     }
 
-    it('MCP publishes one tool with exactly the public command enum', async () => {
+    it('MCP publishes one tool documenting exactly the public command set', async () => {
         const listed = await mcp.send('tools/list', {});
         assert.strictEqual(listed.result.tools.length, 1);
         const tool = listed.result.tools[0];
         assert.strictEqual(tool.name, 'ucn');
-        assert.deepStrictEqual(tool.inputSchema.properties.command.enum, getMcpCommandEnum());
+        // The command param is a described string, not a hard enum: an enum
+        // would make v4 names die in SDK validation with no replacement
+        // guidance. The handler validates against the same registry list.
+        const commandSchema = tool.inputSchema.properties.command;
+        assert.strictEqual(commandSchema.type, 'string');
+        assert.strictEqual(commandSchema.enum, undefined);
+        for (const name of getMcpCommandEnum()) {
+            assert.ok(commandSchema.description.includes(name),
+                `command description must list "${name}"`);
+        }
         assert.match(tool.description, /18 task-oriented commands/);
         assert.doesNotMatch(tool.description, /- about\b|- context\b|- blast\b/);
     });
@@ -362,5 +371,31 @@ describe('tiered evidence survives composition', () => {
             assert.match(execute(index, 'trace', { name: 'processData', to: 'entrypoints' }).error,
                 /requires --direction=callers/);
         } finally { rm(dir); }
+    });
+});
+
+describe('rule 11: no locale-dependent ordering in shipped code', () => {
+    // Output ordering is a public contract (byte-identical across runs and
+    // machines). localeCompare depends on the host ICU locale, so no shipped
+    // source may call it — codeUnitCompare (core/shared.js) or an inlined
+    // code-unit comparison is the only accepted ordering primitive.
+    it('no .localeCompare( call sites in core/cli/mcp/languages', () => {
+        const roots = ['core', 'cli', 'mcp', 'languages'];
+        const offenders = [];
+        const walk = (dir) => {
+            for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+                const full = path.join(dir, entry.name);
+                if (entry.isDirectory()) {
+                    if (entry.name === 'node_modules') continue;
+                    walk(full);
+                } else if (entry.name.endsWith('.js')) {
+                    const source = fs.readFileSync(full, 'utf8');
+                    if (source.includes('.localeCompare(')) offenders.push(full);
+                }
+            }
+        };
+        for (const root of roots) walk(path.join(__dirname, '..', root));
+        assert.deepStrictEqual(offenders, [],
+            'use codeUnitCompare (core/shared.js) instead of localeCompare');
     });
 });

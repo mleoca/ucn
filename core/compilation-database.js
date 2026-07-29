@@ -149,7 +149,8 @@ function nearestEntries(database, filePath) {
     return [...database.entries].sort((a, b) => {
         const distance = directoryDistance(directory, path.dirname(a.file)) -
             directoryDistance(directory, path.dirname(b.file));
-        return distance || a.file.localeCompare(b.file);
+        // Code-unit tiebreak (rule 11): localeCompare is ICU-locale-dependent.
+        return distance || (a.file < b.file ? -1 : a.file > b.file ? 1 : 0);
     });
 }
 

@@ -29,6 +29,93 @@ const CANONICAL_COMMANDS = [
 ];
 
 // ============================================================================
+// v4 COMMAND MIGRATIONS
+// ============================================================================
+
+// Directive guidance for command names that existed in UCN v4 but do not
+// resolve in v5 (plus the caller/callee intent names agents commonly try).
+// These are NOT aliases — the names stay invalid — but the unknown-command
+// error tells the caller exactly which v5 invocation answers the same
+// question, instead of stranding every v4-era prompt, skill file, and doc
+// at a bare "Unknown command". Keyed by v4 canonical name; all surface
+// spellings (hyphen/underscore/camel) resolve through V4_MIGRATION_LOOKUP.
+const V4_COMMAND_MIGRATIONS = {
+    about:         { to: 'show',       purpose: 'For a symbol summary (signature, callers, callees, tests)', cli: 'ucn show <name>', mcp: 'command "show" with name' },
+    context:       { to: 'show',       purpose: 'For callers and callees of a symbol', cli: 'ucn show <name>', mcp: 'command "show" with name' },
+    smart:         { to: 'show',       purpose: 'For a function plus the helpers it calls', cli: 'ucn show <name> --sections=source,callees', mcp: 'command "show" with name, sections="source,callees"' },
+    related:       { to: 'show',       purpose: 'For symbols related to a target', cli: 'ucn show <name> --sections=related', mcp: 'command "show" with name, sections="related"' },
+    example:       { to: 'show',       purpose: 'For a real call-site example', cli: 'ucn show <name> --sections=example', mcp: 'command "show" with name, sections="example"' },
+    brief:         { to: 'show',       purpose: 'For a compact symbol summary', cli: 'ucn show <name> --compact', mcp: 'command "show" with name, compact=true' },
+    callers:       { to: 'show',       purpose: 'For who calls a symbol', cli: 'ucn show <name> --sections=callers', mcp: 'command "show" with name, sections="callers"' },
+    callees:       { to: 'show',       purpose: 'For what a symbol calls', cli: 'ucn show <name> --sections=callees', mcp: 'command "show" with name, sections="callees"' },
+    typedef:       { to: 'find',       purpose: 'For a type definition', cli: 'ucn find <name> --type=type', mcp: 'command "find" with name, type="type"' },
+    blast:         { to: 'trace',      purpose: 'For the transitive caller tree', cli: 'ucn trace <name> --direction=callers', mcp: 'command "trace" with name, direction="callers"' },
+    reverseTrace:  { to: 'trace',      purpose: 'For entry-point paths to a symbol', cli: 'ucn trace <name> --direction=callers --to=entrypoints', mcp: 'command "trace" with name, direction="callers", to="entrypoints"' },
+    toc:           { to: 'repo',       purpose: 'For the per-file symbol listing', cli: 'ucn repo --sections=files', mcp: 'command "repo" with sections="files"' },
+    stats:         { to: 'repo',       purpose: 'For project statistics', cli: 'ucn repo --sections=stats', mcp: 'command "repo" with sections="stats"' },
+    doctor:        { to: 'repo',       purpose: 'For the index health and trust report', cli: 'ucn repo --sections=health --deep', mcp: 'command "repo" with sections="health", deep=true' },
+    orient:        { to: 'repo',       purpose: 'For repository orientation', cli: 'ucn repo', mcp: 'command "repo"' },
+    affectedTests: { to: 'tests',      purpose: 'For tests affected through the caller tree', cli: 'ucn tests <name> --depth=<n>', mcp: 'command "tests" with name, depth=<n>' },
+    fn:            { to: 'source',     purpose: 'To extract a function', cli: 'ucn source <name>', mcp: 'command "source" with name' },
+    class:         { to: 'source',     purpose: 'To extract a class', cli: 'ucn source <name>', mcp: 'command "source" with name' },
+    lines:         { to: 'source',     purpose: 'To extract a line range', cli: 'ucn source <file> --range=<start-end>', mcp: 'command "source" with name=<file>, range="<start-end>"' },
+    expand:        { to: 'source',     purpose: 'To expand a listed item', cli: 'ucn source <handle>', mcp: 'command "source" with name=<handle>' },
+    imports:       { to: 'deps',       purpose: 'For what a file imports', cli: 'ucn deps <file> --direction=imports', mcp: 'command "deps" with file, direction="imports"' },
+    exporters:     { to: 'deps',       purpose: 'For who imports a file', cli: 'ucn deps <file> --direction=importers', mcp: 'command "deps" with file, direction="importers"' },
+    graph:         { to: 'deps',       purpose: 'For the dependency graph around a file', cli: 'ucn deps <file> --depth=<n>', mcp: 'command "deps" with file, depth=<n>' },
+    circularDeps:  { to: 'deps',       purpose: 'For circular dependencies', cli: 'ucn deps --cycles', mcp: 'command "deps" with cycles=true' },
+    fileExports:   { to: 'api',        purpose: "For a file's public surface", cli: 'ucn api <file>', mcp: 'command "api" with file' },
+    verify:        { to: 'check',      purpose: 'To validate call sites against the signature', cli: 'ucn check <name>', mcp: 'command "check" with name' },
+    diffImpact:    { to: 'impact',     purpose: 'For the impact of a git diff', cli: 'ucn impact --base <ref>', mcp: 'command "impact" with base' },
+    stack:         { to: 'stacktrace', purpose: 'To analyze a stack trace', cli: 'ucn stacktrace "<paste>"', mcp: 'command "stacktrace" with stack' },
+    'entry-points': { to: 'entrypoints', purpose: 'For runtime and framework entry points', cli: 'ucn entrypoints', mcp: 'command "entrypoints"' },
+};
+
+// v4 surface aliases that named the same operations.
+const V4_SPELLING_ALIASES = {
+    'rtrace':       'reverseTrace',
+    'affected':     'affectedTests',
+    'circular':     'circularDeps',
+    'cycles':       'circularDeps',
+    'what-exports': 'fileExports',
+    'what-imports': 'imports',
+    'who-imports':  'exporters',
+};
+
+const V4_MIGRATION_LOOKUP = new Map();
+{
+    const normalize = (s) => String(s).toLowerCase().replace(/[-_]/g, '');
+    for (const [key, entry] of Object.entries(V4_COMMAND_MIGRATIONS)) {
+        V4_MIGRATION_LOOKUP.set(normalize(key), entry);
+    }
+    for (const [alias, key] of Object.entries(V4_SPELLING_ALIASES)) {
+        V4_MIGRATION_LOOKUP.set(normalize(alias), V4_COMMAND_MIGRATIONS[key]);
+    }
+}
+
+/**
+ * Directive replacement guidance for a command name v5 does not resolve.
+ * Returns e.g. `For a symbol summary (...), use: ucn show <name>.` in the
+ * requested surface's invocation syntax, or null when the name is not a
+ * known v4 command. Checked BEFORE edit-distance suggestions — `fn` must
+ * point at `source`, not "did you mean find?".
+ *
+ * @param {string} name - The unresolved command name as typed
+ * @param {'cli'|'mcp'} [surface='cli']
+ * @returns {string|null}
+ */
+function v4MigrationHint(name, surface = 'cli') {
+    if (!name) return null;
+    // A name that resolves is a live command, never a migration case —
+    // guards the normalized lookup ('entry-points' and live 'entrypoints'
+    // collapse to the same key).
+    if (resolveCommand(String(name), surface)) return null;
+    const entry = V4_MIGRATION_LOOKUP.get(String(name).toLowerCase().replace(/[-_]/g, ''));
+    if (!entry) return null;
+    return `${entry.purpose}, use: ${surface === 'mcp' ? entry.mcp : entry.cli}.`;
+}
+
+// ============================================================================
 // PARAM NORMALIZATION (snake_case → camelCase)
 // ============================================================================
 
@@ -157,7 +244,10 @@ function suggestCommand(name, surface = 'cli') {
     }));
     const ranked = spellings
         .map(row => ({ ...row, distance: editDistance(name, row.spelling) }))
-        .sort((a, b) => a.distance - b.distance || a.spelling.localeCompare(b.spelling));
+        // Code-unit tiebreak (rule 11) — registry stays require-free, so the
+        // comparison is inlined instead of importing shared.codeUnitCompare.
+        .sort((a, b) => a.distance - b.distance ||
+            (a.spelling < b.spelling ? -1 : a.spelling > b.spelling ? 1 : 0));
     const best = ranked[0];
     const threshold = String(name).length <= 4 ? 2 : Math.min(3, Math.floor(String(name).length / 3));
     if (!best || best.distance > threshold) return null;
@@ -312,6 +402,8 @@ function generateMcpParamSection() {
 
 module.exports = {
     CANONICAL_COMMANDS,
+    V4_COMMAND_MIGRATIONS,
+    v4MigrationHint,
     PARAM_MAP,
     REVERSE_PARAM_MAP,
     FLAG_APPLICABILITY,

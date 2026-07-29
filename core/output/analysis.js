@@ -88,17 +88,34 @@ function formatAccountLines(account) {
         `${account.confirmed} confirmed, ${account.unverified} unverified, ` +
         `${nc.total} non-call (${nc.imports} import, ${nc.definitions} definition, ${nc.references} reference, ${nc.unclassifiedText} other-text), ` +
         `${account.excluded ? account.excluded.total : 0} other-target, ` +
+        `${account.unsupported && account.unsupported.lines > 0 ? `${account.unsupported.lines} unsupported-language, ` : ''}` +
         `${account.unaccounted} unaccounted`;
     if (account.beyondText && account.beyondText.count > 0) {
         line += ` (+${account.beyondText.count} beyond-text caller${account.beyondText.count === 1 ? '' : 's'})`;
     }
     lines.push(line);
     const contract = account.contract || {};
+    const unsupported = account.unsupported ||
+        { fileCount: 0, lines: 0, files: [], languages: {}, sites: [], sitesTruncated: false };
     const textComplete = contract.textComplete !== undefined
         ? contract.textComplete
         : Boolean(account.conserved) && !(account.unparsed && account.unparsed.fileCount > 0) &&
+            unsupported.lines === 0 &&
             !(account.unreadableFiles && account.unreadableFiles.length > 0);
-    if (!textComplete) {
+    // When the ONLY gap is unsupported-language occurrences, say exactly that
+    // instead of the generic DEGRADED sentence: the partition over supported
+    // languages is still conserved, and the gap is enumerated below.
+    const unsupportedOnly = !textComplete && unsupported.lines > 0 &&
+        Boolean(account.conserved) &&
+        !(account.unparsed && account.unparsed.fileCount > 0) &&
+        !(account.unreadableFiles && account.unreadableFiles.length > 0);
+    if (unsupportedOnly) {
+        const langs = Object.keys(unsupported.languages).join(', ');
+        lines.push(`CONTRACT: literal-name text partition complete over SUPPORTED languages only — ` +
+            `${unsupported.lines} line${unsupported.lines === 1 ? '' : 's'} in unsupported-language file${unsupported.fileCount === 1 ? '' : 's'}` +
+            `${langs ? ` (${langs})` : ''} NOT analyzed (see WARNING; verify with grep/ripgrep). ` +
+            'Semantic completeness is not claimed.');
+    } else if (!textComplete) {
         lines.push('CONTRACT: literal-name text partition is DEGRADED; review WARNING and unaccounted lines before acting. Semantic completeness is not claimed.');
     } else if (contract.observedTextZero) {
         lines.push('CONTRACT: observed-text zero only; every literal-name line was classified, but aliases, indirect calls, generated code, and runtime dispatch may exist. Not safe-delete proof.');
@@ -111,8 +128,23 @@ function formatAccountLines(account) {
             `(${account.unparsed.lines} line${account.unparsed.lines === 1 ? '' : 's'}, NOT analyzed): ` +
             account.unparsed.files.join(', '));
     }
+    if (unsupported.lines > 0) {
+        const langParts = Object.entries(unsupported.languages)
+            .map(([lang, count]) => `${lang}: ${count}`).join(', ');
+        lines.push(`WARNING: ${unsupported.lines} line${unsupported.lines === 1 ? '' : 's'} in ` +
+            `${unsupported.fileCount} unsupported-language file${unsupported.fileCount === 1 ? '' : 's'} ` +
+            `contain${unsupported.lines === 1 ? 's' : ''} "${account.symbol}"` +
+            `${langParts ? ` (${langParts})` : ''} — NOT analyzed; verify with grep/ripgrep:`);
+        const shown = unsupported.sites.slice(0, 5);
+        for (const site of shown) {
+            lines.push(`  ${site.file}:${site.line}  ${site.text}`);
+        }
+        if (unsupported.lines > shown.length) {
+            lines.push(`  ... and ${unsupported.lines - shown.length} more line${unsupported.lines - shown.length === 1 ? '' : 's'}`);
+        }
+    }
     if (account.unreadableFiles && account.unreadableFiles.length > 0) {
-        lines.push(`WARNING: ${account.unreadableFiles.length} indexed-but-unreadable file(s) skipped: ${account.unreadableFiles.join(', ')}`);
+        lines.push(`WARNING: ${account.unreadableFiles.length} unreadable file(s) skipped: ${account.unreadableFiles.join(', ')}`);
     }
     if (account.filtered && account.filtered.total > 0) {
         const parts = [];

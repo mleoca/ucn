@@ -4,7 +4,7 @@
  *
  * Invariant (core/account.js):
  *   groundTotal === confirmed + unverified + nonCall.total + excluded.total
- *                   + unparsed.lines + unaccounted
+ *                   + unparsed.lines + unsupported.lines + unaccounted
  *
  * Phase 1 (baseline): the invariant arithmetic must hold exactly; engine
  * misses surface as `call-not-resolved` unverified lines, and the per-symbol
@@ -46,7 +46,8 @@ function accountForSymbol(index, name, { log = false } = {}) {
         // The arithmetic identity must hold unconditionally — a non-zero
         // residual means double-counting or a classification bug.
         const sum = account.confirmed + account.unverified + account.nonCall.total
-            + account.excluded.total + account.unparsed.lines + account.unaccounted;
+            + account.excluded.total + account.unparsed.lines
+            + (account.unsupported ? account.unsupported.lines : 0) + account.unaccounted;
         assert.strictEqual(sum, account.groundTotal,
             `buckets must sum to groundTotal for "${name}": ${JSON.stringify(account)}`);
         assert.strictEqual(account.unaccounted, 0,
@@ -58,8 +59,9 @@ function accountForSymbol(index, name, { log = false } = {}) {
         assert.strictEqual(account.contract.safeToDelete, false,
             'a zero literal-name partition is not deletion proof');
         assert.strictEqual(account.contract.textComplete,
-            account.unparsed.fileCount === 0 && account.unreadableFiles.length === 0,
-            'parse/read failures must degrade the text contract');
+            account.unparsed.fileCount === 0 && account.unreadableFiles.length === 0 &&
+                (!account.unsupported || account.unsupported.lines === 0),
+            'parse/read failures and unsupported-language occurrences must degrade the text contract');
 
         if (log && account.callNotResolved && account.callNotResolved.length > 0) {
             console.log(`  [gap] "${name}": ${account.callNotResolved.length} call line(s) not claimed by engine`,
@@ -548,7 +550,8 @@ describe('conservation: tree/diffImpact/verify/plan/context-callees/smart run th
             assert.ok(fn.account.conserved, `account must conserve: ${JSON.stringify(fn.account)}`);
             const a = fn.account;
             assert.strictEqual(
-                a.confirmed + a.unverified + a.nonCall.total + a.excluded.total + a.unparsed.lines + a.unaccounted,
+                a.confirmed + a.unverified + a.nonCall.total + a.excluded.total + a.unparsed.lines
+                    + (a.unsupported ? a.unsupported.lines : 0) + a.unaccounted,
                 a.groundTotal, 'buckets must sum to groundTotal');
 
             // Summary carries both bands
@@ -655,6 +658,141 @@ describe('conservation: tree/diffImpact/verify/plan/context-callees/smart run th
             assert.ok(s.result.meta.calleeAccount, 'smart must carry the calleeAccount');
             assert.ok(Array.isArray(s.result.unverifiedCallees), 'smart unverifiedCallees band present');
             assert.strictEqual(s.result.meta.calleeAccount.conserved, true, 'smart callee account conserves');
+        } finally { rm(dir); }
+    });
+});
+
+describe('mixed-language repos: unsupported files enter the ground set', () => {
+    const MIXED_FILES = {
+        'package.json': '{"name":"mixed"}',
+        'lib.js': 'function processPayment(order) { return order.total; }\nmodule.exports = { processPayment };',
+        'app.js': 'const { processPayment } = require("./lib");\nfunction main() { processPayment({ total: 5 }); }\nmain();',
+        'payments/processor.rb': 'def charge(order)\n  processPayment(order)\nend',
+        'payments/report.rb': '# processPayment summary generator\nputs "processPayment totals"',
+    };
+
+    it('unsupported-language occurrences join groundTotal and conserve', () => {
+        const dir = tmp(MIXED_FILES);
+        try {
+            const index = idx(dir);
+            const account = accountForSymbol(index, 'processPayment');
+
+            // grep truth: 4 JS lines + 3 Ruby lines
+            assert.strictEqual(account.groundTotal, 7);
+            assert.strictEqual(account.fileCount, 4);
+            assert.strictEqual(account.unsupported.lines, 3);
+            assert.strictEqual(account.unsupported.fileCount, 2);
+            assert.deepStrictEqual(account.unsupported.files,
+                [path.join('payments', 'processor.rb'), path.join('payments', 'report.rb')]);
+            assert.deepStrictEqual(account.unsupported.languages, { Ruby: 3 });
+            assert.strictEqual(account.unsupported.sitesTruncated, false);
+
+            // Sites make the answer a superset of grep: file, line, text.
+            assert.deepStrictEqual(account.unsupported.sites[0], {
+                file: path.join('payments', 'processor.rb'),
+                line: 2,
+                text: 'processPayment(order)',
+            });
+            assert.strictEqual(account.unsupported.sites.length, 3);
+
+            // Conserved, but the whole-text claim must be withdrawn.
+            assert.strictEqual(account.conserved, true);
+            assert.strictEqual(account.unaccounted, 0);
+            assert.strictEqual(account.contract.textComplete, false,
+                'partition-complete must not be claimed over a ground set with unanalyzed languages');
+        } finally { rm(dir); }
+    });
+
+    it('a Ruby-only caller blocks the observed-text-zero claim', () => {
+        const dir = tmp({
+            'package.json': '{"name":"mixed"}',
+            'lib.js': 'function orphanish() { return 1; }\nmodule.exports = { orphanish };',
+            'worker.rb': 'orphanish()',
+        });
+        try {
+            const index = idx(dir);
+            const account = accountForSymbol(index, 'orphanish');
+            assert.strictEqual(account.confirmed, 0);
+            assert.strictEqual(account.unsupported.lines, 1);
+            assert.strictEqual(account.contract.observedTextZero, false,
+                'a possible .rb caller means zero-callers is NOT observed');
+            assert.strictEqual(account.contract.textComplete, false);
+        } finally { rm(dir); }
+    });
+
+    it('single-language repos keep the complete contract (zero bucket)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"pure"}',
+            'lib.js': 'function helper() { return 1; }\nmodule.exports = { helper };',
+            'app.js': 'const { helper } = require("./lib");\nhelper();',
+        });
+        try {
+            const index = idx(dir);
+            const account = accountForSymbol(index, 'helper');
+            assert.strictEqual(account.unsupported.lines, 0);
+            assert.strictEqual(account.unsupported.fileCount, 0);
+            assert.strictEqual(account.contract.textComplete, true);
+        } finally { rm(dir); }
+    });
+
+    it('contract lines render the supported-languages-only sentence with sites', () => {
+        const dir = tmp(MIXED_FILES);
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const output = require('../core/output');
+            const execution = execute(index, 'show', { name: 'processPayment' });
+            assert.ok(execution.ok);
+            const text = output.formatPublicText('show', execution.result,
+                { name: 'processPayment' }, execution);
+            assert.match(text, /ACCOUNT: "processPayment" occurs on 7 lines in 4 files/);
+            assert.match(text, /3 unsupported-language, 0 unaccounted/);
+            assert.match(text, /CONTRACT: literal-name text partition complete over SUPPORTED languages only — 3 lines in unsupported-language files \(Ruby\) NOT analyzed/);
+            assert.match(text, /WARNING: 3 lines in 2 unsupported-language files contain "processPayment" \(Ruby: 3\)/);
+            assert.match(text, /payments\/processor\.rb:2 {2}processPayment\(order\)/);
+        } finally { rm(dir); }
+    });
+
+    it('usages and tests disclose unsupported matches in note and JSON meta', () => {
+        const dir = tmp(MIXED_FILES);
+        try {
+            const index = idx(dir);
+            const { execute } = require('../core/execute');
+            const output = require('../core/output');
+
+            const usages = execute(index, 'usages', { name: 'processPayment' });
+            assert.ok(usages.ok);
+            assert.match(usages.note, /3 line\(s\) in 2 unsupported-language file\(s\) \(Ruby\) also match/);
+            const usagesJson = JSON.parse(output.formatPublicJson(
+                'usages', usages.result, { name: 'processPayment' },
+                { ...usages, surface: 'cli' }));
+            assert.strictEqual(usagesJson.meta.unsupportedMatches.lines, 3);
+            assert.deepStrictEqual(usagesJson.meta.unsupportedMatches.languages, { Ruby: 3 });
+
+            const tests = execute(index, 'tests', { name: 'processPayment' });
+            assert.ok(tests.ok);
+            assert.match(tests.note, /unsupported-language file\(s\) \(Ruby\) — their test files are invisible to UCN/);
+            const testsJson = JSON.parse(output.formatPublicJson(
+                'tests', tests.result, { name: 'processPayment' },
+                { ...tests, surface: 'cli' }));
+            assert.strictEqual(testsJson.meta.unsupportedMatches.lines, 3);
+        } finally { rm(dir); }
+    });
+
+    it('site listings cap at 50 with sitesTruncated and full counts', () => {
+        const manyLines = Array.from({ length: 60 }, (_, i) => `probe(${i})`).join('\n');
+        const dir = tmp({
+            'package.json': '{"name":"mixed"}',
+            'lib.js': 'function probe() { return 1; }\nmodule.exports = { probe };',
+            'bulk.rb': manyLines,
+        });
+        try {
+            const index = idx(dir);
+            const account = accountForSymbol(index, 'probe');
+            assert.strictEqual(account.unsupported.lines, 60);
+            assert.strictEqual(account.unsupported.sites.length, 50);
+            assert.strictEqual(account.unsupported.sitesTruncated, true);
+            assert.strictEqual(account.conserved, true);
         } finally { rm(dir); }
     });
 });

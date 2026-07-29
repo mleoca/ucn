@@ -144,6 +144,7 @@ function evaluateRepo(repo) {
             nonCall: account.nonCall,
             excluded: account.excluded.total,
             unparsedLines: account.unparsed.lines,
+            unsupportedLines: account.unsupported ? account.unsupported.lines : 0,
             beyondText: account.beyondText.count,
             unaccounted: account.unaccounted,
             conserved: account.conserved,

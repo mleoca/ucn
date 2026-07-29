@@ -40,6 +40,8 @@ const {
     REVERSE_PARAM_MAP,
     generateMcpParamSection,
     resolveCommand,
+    suggestCommand,
+    v4MigrationHint,
     formatSurfaceMessage,
 } = require('../core/registry');
 const { execute } = require('../core/execute');
@@ -261,7 +263,12 @@ server.registerTool(
     {
         description: TOOL_DESCRIPTION,
         inputSchema: z.object(Object.assign(INPUT_SHAPE, {
-            command: z.enum(getMcpCommandEnum()),
+            // Deliberately a string, not z.enum: a strict enum makes every
+            // unknown command (v4 names included) die in SDK validation
+            // before the handler can answer with replacement guidance. The
+            // handler validates against the same registry list and returns
+            // a directive error for v4 names (about → show, toc → repo ...).
+            command: z.string().describe(`Command to run. One of: ${getMcpCommandEnum().join(', ')}.`),
             project_dir: z.string().describe('Absolute or relative path to the project root directory'),
             name: z.string().optional().describe('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
             file: z.string().optional().describe('File target for source/deps/api or a symbol-disambiguation filter.'),
@@ -337,6 +344,20 @@ server.registerTool(
     },
     async (args) => {
         const { command, project_dir, ...rawParams } = args;
+
+        // Command validation with directive guidance (the schema is a plain
+        // string so this handler, not SDK zod validation, answers). v4 names
+        // map to their v5 replacement; near-misses get a suggestion.
+        if (!resolveCommand(command, 'mcp')) {
+            const migration = v4MigrationHint(command, 'mcp');
+            if (migration) {
+                return toolError(`Unknown command: ${command}. ${migration}`);
+            }
+            const suggestion = suggestCommand(command, 'mcp');
+            return toolError(`Unknown command: ${command}.` +
+                (suggestion ? ` Did you mean "${suggestion}"?` : '') +
+                ` Valid commands: ${getMcpCommandEnum().join(', ')}.`);
+        }
 
         // Unknown, typo'd, or camelCase-spelled parameters must never
         // silently no-op. They are dropped, and each one gets a Note.

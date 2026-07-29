@@ -299,6 +299,21 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
             commandMeta.regexFallback = result.meta.regexFallback;
         }
     }
+    // Handles are the documented spine (`Pass the resulting handle to show/
+    // impact/source`) — the JSON records must carry them, not make agents
+    // concatenate relativePath:startLine:name themselves.
+    if (command === 'find' && Array.isArray(result)) {
+        const { formatSymbolHandle } = require('../shared');
+        data = result.map(item => {
+            const handle = formatSymbolHandle(item);
+            return handle ? { handle, ...item } : item;
+        });
+    }
+    // Mixed-language disclosure for commands whose result is not
+    // account-shaped: the counts must be machine-readable, not note-only.
+    if ((command === 'usages' || command === 'tests') && result?.unsupportedMatches) {
+        commandMeta.unsupportedMatches = result.unsupportedMatches;
+    }
 
     const surfaceCommand = execution.surface === 'mcp'
         ? toMcpName(command)

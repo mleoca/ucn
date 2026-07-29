@@ -331,6 +331,24 @@ describe('v5 release-surface adversarial regressions', () => {
         }
     });
 
+    it('find --json records carry the stable handle', () => {
+        const dir = tmp({
+            'package.json': '{}',
+            'lib.js': 'function helper(a) { return a; }\nmodule.exports = { helper };',
+        });
+        try {
+            const index = idx(dir);
+            const execution = execute(index, 'find', { name: 'helper' });
+            assert.equal(execution.ok, true);
+            const json = JSON.parse(output.formatPublicJson(
+                'find', execution.result, { name: 'helper' },
+                { ...execution, surface: 'cli' }));
+            assert.equal(json.data[0].handle, 'lib.js:1:helper');
+        } finally {
+            rm(dir);
+        }
+    });
+
     it('computed-dispatch metadata survives the public JSON envelope', () => {
         const dir = tmp({
             'package.json': '{}',

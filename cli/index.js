@@ -18,6 +18,7 @@ const {
     getCliCommandSet,
     resolveCommand,
     suggestCommand,
+    v4MigrationHint,
     FLAG_APPLICABILITY,
     toCliName,
     FILE_LOCAL_COMMANDS,
@@ -43,6 +44,10 @@ class FlagValidationError extends Error {
 }
 
 function unknownCommandMessage(command, { interactive = false } = {}) {
+    // v4 command names get directive replacement guidance before any
+    // edit-distance suggestion — `fn` must point at `source`, never "find".
+    const migration = v4MigrationHint(command, 'cli');
+    if (migration) return `Unknown command: ${command}. ${migration}`;
     const suggestion = suggestCommand(command, 'cli');
     const correction = suggestion ? ` Did you mean "${suggestion}"?` : '';
     const help = interactive && !suggestion ? ' Type "help" for available commands.' : '';
@@ -490,7 +495,9 @@ function main() {
             // Single file mode
             runFileCommand(target, command, arg);
         } else {
-            const suggestion = suggestCommand(target, 'cli');
+            // A migration-known v4 name (`ucn about x`) or a near-miss
+            // spelling is a command mistake, not a missing path.
+            const suggestion = suggestCommand(target, 'cli') || v4MigrationHint(target, 'cli');
             console.error(suggestion
                 ? unknownCommandMessage(target)
                 : `Error: "${target}" not found`);

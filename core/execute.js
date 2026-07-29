@@ -1080,6 +1080,21 @@ const HANDLERS = {
                 enumerable: false, writable: true, configurable: true,
             });
         }
+        // Escape-hatch integrity: usages is the raw name-match view, so it
+        // must not silently omit matches in files UCN cannot parse (.rb in a
+        // mixed repo). Counts ride a note + non-enumerable field; the
+        // account-bearing commands list the actual sites.
+        const unsupportedMatches = require('./account').scanUnsupportedFiles(index, p.name);
+        if (unsupportedMatches.lines > 0) {
+            const langs = Object.keys(unsupportedMatches.languages).join(', ');
+            notes.push(`${unsupportedMatches.lines} line(s) in ${unsupportedMatches.fileCount} ` +
+                `unsupported-language file(s)${langs ? ` (${langs})` : ''} also match — ` +
+                'NOT analyzed by UCN; verify with grep/ripgrep.');
+            Object.defineProperty(limited, 'unsupportedMatches', {
+                value: unsupportedMatches,
+                enumerable: false, writable: true, configurable: true,
+            });
+        }
         return { ok: true, result: limited, note: notes.length ? notes.join(' ') : undefined };
     },
 
@@ -1251,10 +1266,28 @@ const HANDLERS = {
             exclude: toExcludeArray(p.exclude),
         });
         addMode(result, 'direct');
+        const testNotes = [];
+        if (result.length === 0) testNotes.push(NO_STATIC_TEST_LINK_NOTE);
+        // Mixed-language honesty: test files in unsupported languages (RSpec
+        // for a .rb service, etc.) are invisible to the static scan — say so
+        // whenever the target name occurs in unsupported files at all.
+        if (!testsTargetIsFile) {
+            const unsupportedMatches = require('./account').scanUnsupportedFiles(index, p.name);
+            if (unsupportedMatches.lines > 0) {
+                const langs = Object.keys(unsupportedMatches.languages).join(', ');
+                testNotes.push(`"${p.name}" also occurs on ${unsupportedMatches.lines} line(s) in ` +
+                    `${unsupportedMatches.fileCount} unsupported-language file(s)${langs ? ` (${langs})` : ''} — ` +
+                    'their test files are invisible to UCN; verify with grep/ripgrep.');
+                Object.defineProperty(result, 'unsupportedMatches', {
+                    value: unsupportedMatches,
+                    enumerable: false, writable: true, configurable: true,
+                });
+            }
+        }
         return {
             ok: true,
             result,
-            ...(result.length === 0 && { note: NO_STATIC_TEST_LINK_NOTE }),
+            ...(testNotes.length > 0 && { note: testNotes.join(' ') }),
         };
     },
 
