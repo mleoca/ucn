@@ -2560,10 +2560,11 @@ describe('P3: className validation gaps', () => {
         });
     }
 
-    it('entrypoints includes test files by default and respects --exclude-tests', () => {
-        // JAVA-2: tests ARE entry points (JUnit @Test, pytest fixtures,
-        // Rust #[test], etc.). Show them by default; let users opt out via
-        // --exclude-tests.
+    it('entrypoints hides test files by default; --include-tests restores them', () => {
+        // Tests are excluded by default (matching search/usages/deadcode) —
+        // an agent orienting on a repo needs the entry surface of the
+        // project, not its fixtures. --include-tests restores the full
+        // universe; --exclude-tests is the explicit spelling of the default.
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'app.js': 'function main() {}\nmodule.exports = { main };',
@@ -2573,16 +2574,21 @@ describe('P3: className validation gaps', () => {
             const index = idx(dir);
             const { ok: okDefault, result: defaultResult } = execute(index, 'entrypoints', {});
             assert.strictEqual(okDefault, true);
-            // Default: test files appear (the test/ dir entry under js-test-file).
             const defaultTestEntries = (defaultResult || []).filter(e => e.file && e.file.includes('test'));
-            assert.ok(defaultTestEntries.length > 0,
-                'Default behavior: test entries should be visible');
+            assert.strictEqual(defaultTestEntries.length, 0,
+                'Default behavior: test-file entries are hidden');
+
+            const { ok: okIncl, result: inclResult } = execute(index, 'entrypoints', { includeTests: true });
+            assert.strictEqual(okIncl, true);
+            const inclTestEntries = (inclResult || []).filter(e => e.file && e.file.includes('test'));
+            assert.ok(inclTestEntries.length > 0,
+                '--include-tests restores test-file entries');
 
             const { ok: okExcl, result: exclResult } = execute(index, 'entrypoints', { excludeTests: true });
             assert.strictEqual(okExcl, true);
             const exclTestEntries = (exclResult || []).filter(e => e.file && e.file.includes('test'));
             assert.strictEqual(exclTestEntries.length, 0,
-                '--exclude-tests should remove test files from entrypoints');
+                '--exclude-tests behaves like the default');
         } finally {
             rm(dir);
         }

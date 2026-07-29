@@ -32,8 +32,111 @@ const IDENTIFIER_NODES = new Set([
     'operator_name', 'destructor_name',
 ]);
 
+// Attribute-macro parse recovery. Export/visibility macros (`TS_PUBLIC extern
+// void (*fp)(void *);`, `API int f(int);`) are consumed by the grammar as the
+// declaration's TYPE, displacing the real return type into an ERROR node — and
+// for function-pointer declarators, displacing the real name into a parameter.
+// Blanking the macro token with spaces preserves every byte offset, so one
+// whole-file re-parse yields correct positions for all extractors. Only files
+// whose first parse already contains errors pay this cost.
+const DECLARATION_NODES = new Set([
+    'declaration', 'function_definition', 'field_declaration', 'type_definition',
+]);
+// An identifier node can only carry one of these texts through a mis-parse —
+// they are reserved words in both C and C++.
+const RESERVED_TYPE_KEYWORDS = new Set([
+    'void', 'int', 'char', 'float', 'double', 'long', 'short',
+    'signed', 'unsigned', 'bool', '_Bool',
+]);
+
+function hasMissingChild(node) {
+    for (let i = 0; i < node.childCount; i++) {
+        if (node.child(i).isMissing) return true;
+    }
+    return false;
+}
+
+function macroTypeRanges(tree) {
+    const ranges = [];
+    traverseTree(tree.rootNode, node => {
+        if (!node.hasError) return false; // clean subtree — skip entirely
+        if (!DECLARATION_NODES.has(node.type)) return true;
+        const typeNode = node.childForFieldName('type');
+        if (!typeNode || typeNode.type !== 'type_identifier') return true;
+        const directError = (node.namedChildren || []).some(child => child.type === 'ERROR');
+        const identity = declaratorIdentity(functionDeclarator(node));
+        // Stacked attribute macros (`A B extern void (*fp)(void *);`) split
+        // into a fragment declaration [type_identifier, identifier,
+        // MISSING ';'] plus a clean tail — no ERROR node, so the evidence is
+        // the missing semicolon on a bare two-identifier fragment. Blanking
+        // the type re-joins the pair (the next round handles the inner
+        // macro) and removes the phantom state var the fragment indexed.
+        const declaratorNode = node.childForFieldName('declarator');
+        const bareFragment = declaratorNode && declaratorNode.type === 'identifier' &&
+            node.namedChildCount === 2 && hasMissingChild(node);
+        if (directError || bareFragment || RESERVED_TYPE_KEYWORDS.has(identity?.name)) {
+            ranges.push([typeNode.startIndex, typeNode.endIndex]);
+        }
+        return true;
+    });
+    return ranges;
+}
+
+function countParseErrors(node) {
+    let count = node.type === 'ERROR' ? 1 : 0;
+    for (let i = 0; i < node.childCount; i++) {
+        const child = node.child(i);
+        if (child.isMissing) count++;
+        else if (child.hasError || child.type === 'ERROR') count += countParseErrors(child);
+    }
+    return count;
+}
+
+// original code → blanked code (null = no recovery applies). The extractors
+// each re-parse the same file content; the memo makes recovery detection a
+// one-time cost per file content.
+const RECOVERY_MEMO_MAX = 8;
+const recoveryMemo = new Map();
+
 function parseTree(parser, code) {
-    return safeParse(parser, code, undefined, PARSE_OPTIONS);
+    const tree = safeParse(parser, code, undefined, PARSE_OPTIONS);
+    if (!tree.rootNode.hasError) return tree;
+    if (recoveryMemo.has(code)) {
+        const blanked = recoveryMemo.get(code);
+        return blanked === null ? tree : safeParse(parser, blanked, undefined, PARSE_OPTIONS);
+    }
+    // Non-worsening rounds may continue (blanking a stacked macro can turn a
+    // MISSING token into an ERROR before the next round clears it), but a
+    // recovery is only ACCEPTED when it strictly improved on the original.
+    let current = code;
+    let workingTree = tree;
+    let best = null;
+    let bestCode = null;
+    let bestErrors = countParseErrors(tree.rootNode);
+    for (let attempt = 0; attempt < 3; attempt++) {
+        const ranges = macroTypeRanges(workingTree);
+        if (ranges.length === 0) break;
+        let next = current;
+        for (const [start, end] of ranges) {
+            next = next.slice(0, start) + ' '.repeat(end - start) + next.slice(end);
+        }
+        const candidate = safeParse(parser, next, undefined, PARSE_OPTIONS);
+        const errors = countParseErrors(candidate.rootNode);
+        if (errors > bestErrors) break;
+        current = next;
+        workingTree = candidate;
+        if (errors < bestErrors) {
+            best = candidate;
+            bestCode = next;
+            bestErrors = errors;
+        }
+        if (!candidate.rootNode.hasError) break;
+    }
+    recoveryMemo.set(code, best ? bestCode : null);
+    if (recoveryMemo.size > RECOVERY_MEMO_MAX) {
+        recoveryMemo.delete(recoveryMemo.keys().next().value);
+    }
+    return best || tree;
 }
 
 function unwrapDeclarator(node) {
@@ -138,6 +241,27 @@ function modifiersOf(node, extra = []) {
     return [...modifiers];
 }
 
+// Full type text for a NAMED parameter: the parameter's own text with the
+// name removed — `const char *s` → `const char *`, `int **pp` → `int **`,
+// `void (*cb)(int)` → `void (*)(int)`. Reading around the identifier keeps
+// qualifiers, pointer levels, array suffixes, and function-pointer shapes
+// without re-deriving declarator grammar. Default values (C++ optional
+// params) are cut before the removal.
+function paramTypeText(param, identity) {
+    if (!identity.nameNode) return null;
+    const base = param.startIndex;
+    const defaultValue = param.childForFieldName('default_value');
+    const end = defaultValue ? defaultValue.startIndex : param.endIndex;
+    if (identity.nameNode.startIndex < base || identity.nameNode.endIndex > end) return null;
+    const text = param.text.slice(0, end - base);
+    const typeText = (text.slice(0, identity.nameNode.startIndex - base) +
+        text.slice(identity.nameNode.endIndex - base))
+        .replace(/\s+/g, ' ')
+        .replace(/\s*=\s*$/, '')
+        .trim();
+    return typeText || null;
+}
+
 function structuredParams(paramsNode) {
     if (!paramsNode) return [];
     const result = [];
@@ -148,10 +272,15 @@ function structuredParams(paramsNode) {
         const identity = declaratorIdentity(declarator);
         const typeNode = param.childForFieldName('type') ||
             param.namedChildren.find(child => TYPE_NODES.has(child.type));
+        // Unnamed parameters (`int f(size_t)`, `int f(void *)`) display as
+        // their type text alone — the type must not double as both name and
+        // annotation, and `void *` must not collapse into the `(void)` form.
         const info = {
-            name: identity.name || (typeNode?.text === 'void' ? 'void' : param.text),
+            name: identity.name || param.text.replace(/\s+/g, ' ').trim(),
         };
-        if (typeNode) info.type = typeNode.text;
+        if (typeNode && identity.name) {
+            info.type = paramTypeText(param, identity) || typeNode.text;
+        }
         if (param.type === 'optional_parameter_declaration') info.optional = true;
         if (declarator?.type === 'variadic_declarator' || param.text.includes('...')) {
             info.rest = true;
@@ -165,7 +294,24 @@ function structuredParams(paramsNode) {
 function returnTypeOf(node) {
     const typeNode = node.childForFieldName('type') ||
         node.namedChildren.find(child => TYPE_NODES.has(child.type));
-    return typeNode?.text || null;
+    if (!typeNode) return null;
+    // Pointer declarators wrapping the function declarator belong to the
+    // RETURN type: `char *dup(...)` returns `char *`, and the pointer
+    // variable `void *(*fp)(size_t)` yields `void *` when called. The walk
+    // stops at the function/parenthesized declarator — inner pointers are
+    // the function-pointer itself, not the return type.
+    let stars = 0;
+    let current = node.childForFieldName('declarator');
+    const seen = new Set();
+    while (current && !seen.has(current.id)) {
+        seen.add(current.id);
+        if (current.type === 'function_declarator' ||
+            current.type === 'parenthesized_declarator') break;
+        if (current.type === 'pointer_declarator') stars++;
+        current = current.childForFieldName('declarator') ||
+            (current.namedChildren || []).find(child => child.type.endsWith('_declarator'));
+    }
+    return stars > 0 ? `${typeNode.text} ${'*'.repeat(stars)}` : typeNode.text;
 }
 
 function memberFromNode(node, className, access, lines, mode) {
@@ -240,15 +386,76 @@ function classMembers(node, lines, mode) {
     return members;
 }
 
+function typedefEntries(node, lines) {
+    // `typedef void (*cb)(int);` / `typedef int myint;` / `typedef struct A B;`
+    // declare importable type names. Anonymous specifiers
+    // (`typedef struct { … } Point;`) are named through classIdentity's
+    // type_definition fallback, so only alias-style declarators are added here.
+    const inner = node.childForFieldName('type');
+    const innerIsClass = inner && CLASS_NODES.has(inner.type);
+    const innerClassName = innerIsClass ? inner.childForFieldName('name')?.text : null;
+    const entries = [];
+    for (const child of node.namedChildren || []) {
+        if (inner && sameNode(child, inner)) continue;
+        if (child.type === 'type_qualifier' || child.type === 'storage_class_specifier') continue;
+        const identity = declaratorIdentity(child);
+        if (!identity.name || RESERVED_TYPE_KEYWORDS.has(identity.name)) continue;
+        if (innerIsClass && (!innerClassName || innerClassName === identity.name)) continue;
+        const { startLine, endLine, indent } = nodeToLocation(child, lines);
+        // A function-pointer typedef aliases a function shape, not the return
+        // type — record no aliasOf for it.
+        const aliasOf = unwrapDeclarator(child)
+            ? null
+            : (innerIsClass ? innerClassName : typeName(inner));
+        entries.push({
+            name: identity.name,
+            type: 'type',
+            startLine,
+            endLine,
+            indent,
+            modifiers: ['public'],
+            members: [],
+            ...(aliasOf && aliasOf !== identity.name && { aliasOf }),
+            docstring: extractJSDocstring(lines, startLine),
+        });
+    }
+    return entries;
+}
+
 function findClasses(code, parser, mode) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const classes = [];
     const seen = new Set();
+    // Names with a bodied definition in this file: bodyless occurrences of
+    // the same name (forward declarations, `struct S` in a parameter or
+    // field type position) are references to it, never second definitions.
+    const bodiedNames = new Set();
     traverseTreeCached(tree.rootNode, node => {
+        if (!CLASS_NODES.has(node.type)) return true;
+        const bodiedName = node.childForFieldName('body') && classIdentity(node)?.name;
+        if (bodiedName) bodiedNames.add(bodiedName);
+        return true;
+    });
+    const forwardDeclared = new Set();
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type === 'type_definition') {
+            classes.push(...typedefEntries(node, lines));
+            return true; // descend — the inner specifier may be a named class
+        }
         if (!CLASS_NODES.has(node.type)) return true;
         const identity = classIdentity(node);
         if (!identity?.name) return true;
+        if (!node.childForFieldName('body')) {
+            if (bodiedNames.has(identity.name)) return true;
+            // A bodyless specifier is only a DECLARATION at declaration
+            // level (`struct S;`); in a type position (`void f(struct S *)`)
+            // it is a reference. One entry per opaque forward-declared name.
+            const parentType = node.parent?.type;
+            if (parentType !== 'translation_unit' && parentType !== 'declaration_list') return true;
+            if (forwardDeclared.has(identity.name)) return true;
+            forwardDeclared.add(identity.name);
+        }
         const key = `${node.startIndex}:${identity.name}`;
         if (seen.has(key)) return false;
         seen.add(key);
@@ -586,7 +793,12 @@ function findImportsInCode(code, parser) {
 }
 
 function findUsagesInCode(code, name, parser, existingTree) {
-    const tree = existingTree || parseTree(parser, code);
+    // Pre-parsed trees from generic callers bypass the macro-attribute
+    // recovery in parseTree — reject errored ones so usage classification
+    // sees the same recovered parse as symbol extraction.
+    const tree = (existingTree && !existingTree.rootNode.hasError)
+        ? existingTree
+        : parseTree(parser, code);
     const usages = [];
     visitNameNodes(tree, code, name, node => {
         if (!IDENTIFIER_NODES.has(node.type) || node.text !== name) return;

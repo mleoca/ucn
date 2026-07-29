@@ -55,12 +55,17 @@ function check(index, options = {}) {
             file: options.file,
         });
     } catch (e) {
-        // Not a git repo, or git command failed — treat as empty
+        // The gate could not run at all. This must stay distinguishable from a
+        // clean tree in every machine-readable field (status, ok), not just the
+        // free-text reason — CI gating on exit code or `empty` must never read
+        // "could not run" as "passed".
+        const message = e && e.message ? e.message : 'diff failed';
         return {
             base: options.base || 'HEAD',
             staged: !!options.staged,
-            empty: true,
-            reason: e && e.message ? e.message : 'diff failed',
+            ok: false,
+            status: /not a git repositor/i.test(message) ? 'not-a-repo' : 'diff-failed',
+            error: message,
         };
     }
 
@@ -78,8 +83,10 @@ function check(index, options = {}) {
         return {
             base: options.base || 'HEAD',
             staged: !!options.staged,
+            ok: true,
+            status: 'clean',
             empty: true,
-            reason: dr && dr.error ? dr.error : 'no changes detected',
+            reason: 'no changes detected',
         };
     }
 
@@ -272,6 +279,8 @@ function check(index, options = {}) {
     return {
         base: options.base || 'HEAD',
         staged: !!options.staged,
+        ok: true,
+        status: 'checked',
         changed: items,
         totalChanged: allChanged.length + deleted.length,
         truncated: !!(limit && allChanged.length > limit),

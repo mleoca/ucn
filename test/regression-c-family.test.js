@@ -22,7 +22,7 @@ describe('C language support', () => {
         assert.deepEqual(result.imports.map(item => item.module), ['./util.h']);
         assert.ok(result.classes.some(item => item.name === 'User' && item.type === 'struct'));
         assert.ok(result.functions.some(item => item.name === 'run' &&
-            item.paramsStructured[0].type === 'User'));
+            item.paramsStructured[0].type === 'User *'));
         const calls = getLanguageAdapter('c').findCalls(code, getParser('c'));
         assert.ok(calls.some(call => call.name === 'helper' && call.argCount === 1));
     });
@@ -352,5 +352,236 @@ describe('C# language support', () => {
         } finally {
             rm(dir);
         }
+    });
+});
+
+describe('fix: attribute-macro parse recovery (C/C++)', () => {
+    // Export/visibility macros (TS_PUBLIC, API) used to be consumed as the
+    // declaration's TYPE: `TS_PUBLIC extern void (*fp)(void *)` indexed a
+    // phantom symbol named "void" (the real name buried as a parameter type),
+    // and `TS_PUBLIC int f(...)` rendered the macro as the return type.
+    it('C: macro-attributed function pointer keeps its real name and return type', () => {
+        const code = [
+            '#define TS_PUBLIC __attribute__((visibility("default")))',
+            'TS_PUBLIC extern void  (*with_macro_void)(void *);',
+            'TS_PUBLIC extern void *(*with_macro_ptr)(size_t);',
+            'extern     void  (*no_macro_void)(void *);',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const names = result.functions.map(fn => fn.name);
+        assert.ok(names.includes('with_macro_void'), `expected with_macro_void, got: ${names}`);
+        assert.ok(names.includes('with_macro_ptr'));
+        assert.ok(names.includes('no_macro_void'));
+        assert.ok(!names.includes('void'), 'phantom "void" symbol must not exist');
+        const withMacro = result.functions.find(fn => fn.name === 'with_macro_void');
+        assert.equal(withMacro.returnType, 'void');
+        assert.equal(withMacro.startLine, 2);
+        const ptr = result.functions.find(fn => fn.name === 'with_macro_ptr');
+        assert.notEqual(ptr.returnType, 'TS_PUBLIC', 'macro must not become the return type');
+        assert.ok(!result.parseRecovery, 'recovered parse must not carry the parseRecovery flag');
+    });
+
+    it('C: macro before a plain function no longer leaks into the return type', () => {
+        const code = [
+            '#define TS_PUBLIC __attribute__((visibility("default")))',
+            'TS_PUBLIC int plain_fn(int a) { return a; }',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const fn = result.functions.find(item => item.name === 'plain_fn');
+        assert.ok(fn, 'plain_fn must be indexed');
+        assert.equal(fn.returnType, 'int');
+    });
+
+    it('C++: API macro on functions and class members recovers', () => {
+        const code = [
+            '#define API __attribute__((visibility("default")))',
+            'API int exported_fn(int a) { return a; }',
+            'class Widget {',
+            'public:',
+            '    API int compute(int x);',
+            '};',
+        ].join('\n');
+        const result = parse(code, 'cpp');
+        const fn = result.functions.find(item => item.name === 'exported_fn');
+        assert.equal(fn?.returnType, 'int');
+        const widget = result.classes.find(item => item.name === 'Widget');
+        const member = widget?.members.find(item => item.name === 'compute');
+        assert.equal(member?.returnType, 'int');
+    });
+
+    it('C: usages classification sees the recovered parse, not the broken one', () => {
+        const dir = tmp({
+            'lib.c': [
+                '#define TS_PUBLIC __attribute__((visibility("default")))',
+                'TS_PUBLIC extern void (*with_macro_void)(void *);',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const usages = index.usages('with_macro_void');
+            assert.ok(usages.some(u => u.line === 2),
+                'the declaration line must appear in usages');
+        } finally {
+            rm(dir);
+        }
+    });
+});
+
+describe('fix: C typedefs and unnamed parameters', () => {
+    it('indexes function-pointer and plain typedefs as type symbols', () => {
+        const code = [
+            'typedef void (*callback_t)(int);',
+            'typedef int myint;',
+            'typedef struct Foo_s Foo;',
+            'typedef struct { int x; } Point;',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const byName = new Map(result.classes.map(cls => [cls.name, cls]));
+        assert.equal(byName.get('callback_t')?.type, 'type');
+        assert.ok(!byName.get('callback_t')?.aliasOf,
+            'a function-pointer typedef is not an alias of its return type');
+        assert.equal(byName.get('myint')?.type, 'type');
+        assert.equal(byName.get('myint')?.aliasOf, 'int');
+        assert.equal(byName.get('Foo')?.aliasOf, 'Foo_s');
+        // Anonymous struct named through the typedef fallback: exactly one entry.
+        assert.equal(result.classes.filter(cls => cls.name === 'Point').length, 1);
+    });
+
+    it('renders unnamed parameters as their type alone', () => {
+        const code = 'int unnamed(size_t, int b) { return b; }\nvoid takes_ptr(void *) {}\n';
+        const result = parse(code, 'c');
+        const fn = result.functions.find(item => item.name === 'unnamed');
+        assert.deepEqual(fn.paramsStructured, [{ name: 'size_t' }, { name: 'b', type: 'int' }]);
+        const ptr = result.functions.find(item => item.name === 'takes_ptr');
+        assert.deepEqual(ptr.paramsStructured, [{ name: 'void *' }],
+            'an unnamed void* parameter must not collapse into the zero-param (void) form');
+    });
+});
+
+describe('fix: C# delegates, operators, indexers, and base classification', () => {
+    it('indexes delegate declarations as types', () => {
+        const code = 'public delegate int Transformer(int x);\n';
+        const result = parse(code, 'csharp');
+        const delegateEntry = result.classes.find(cls => cls.name === 'Transformer');
+        assert.equal(delegateEntry?.type, 'type');
+        assert.ok(delegateEntry?.modifiers.includes('public'));
+    });
+
+    it('indexes operator overloads, conversion operators, and indexers', () => {
+        const code = [
+            'public class Money {',
+            '    public int Amount { get; set; }',
+            '    public static Money operator +(Money a, Money b) => new Money();',
+            '    public static bool operator ==(Money a, Money b) => true;',
+            '    public static implicit operator int(Money m) => m.Amount;',
+            '    public int this[int i] { get { return i; } set {} }',
+            '}',
+        ].join('\n');
+        const result = parse(code, 'csharp');
+        const money = result.classes.find(cls => cls.name === 'Money');
+        const memberNames = money.members.map(member => member.name);
+        assert.ok(memberNames.includes('operator+'), `got: ${memberNames}`);
+        assert.ok(memberNames.includes('operator=='));
+        assert.ok(memberNames.includes('operator int'));
+        assert.ok(memberNames.includes('this[]'));
+        const conversion = money.members.find(member => member.name === 'operator int');
+        assert.ok(conversion.modifiers.includes('implicit'));
+        const indexer = money.members.find(member => member.name === 'this[]');
+        assert.equal(indexer.memberType, 'property');
+        assert.equal(indexer.returnType, 'int');
+        assert.deepEqual(indexer.paramsStructured, [{ name: 'i', type: 'int' }]);
+    });
+
+    it('classifies interface bases as implements, class bases as extends', () => {
+        const code = [
+            'public interface ISvc { void Run(); }',
+            'public interface IExtra : ISvc { void More(); }',
+            'public class Svc : ISvc, IDisposable { public void Run() {} public void Dispose() {} }',
+            'public class Money : BaseMoney { }',
+            'public struct Pair : ISvc { public void Run() {} }',
+            'public class Odd : IFoo { }',
+            'public class IFoo { }',
+        ].join('\n');
+        const result = parse(code, 'csharp');
+        const byName = new Map(result.classes.map(cls => [cls.name, cls]));
+        assert.equal(byName.get('Svc').extends, undefined,
+            'a class with only interface bases has no extends');
+        assert.deepEqual(byName.get('Svc').implements, ['ISvc', 'IDisposable']);
+        assert.equal(byName.get('Money').extends, 'BaseMoney');
+        assert.equal(byName.get('Money').implements, undefined);
+        assert.deepEqual(byName.get('Pair').implements, ['ISvc'],
+            'struct bases are always interfaces');
+        assert.equal(byName.get('IExtra').extends, 'ISvc',
+            'interfaces extend, never implement');
+        assert.equal(byName.get('Odd').extends, 'IFoo',
+            'a same-file CLASS named IFoo overrides the I-prefix convention');
+    });
+});
+
+describe('fix: C pointer types survive in signatures', () => {
+    it('named pointer params keep qualifiers and stars; returns keep stars', () => {
+        const code = [
+            'int a(void *p) { return 0; }',
+            'int d(int **pp) { return 0; }',
+            'char *strdup2(const char *s) { return 0; }',
+            'extern void *(*ts_current_malloc)(size_t);',
+            'void reg(void (*cb)(int)) {}',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const byName = new Map(result.functions.map(fn => [fn.name, fn]));
+        assert.deepEqual(byName.get('a').paramsStructured, [{ name: 'p', type: 'void *' }]);
+        assert.deepEqual(byName.get('d').paramsStructured, [{ name: 'pp', type: 'int **' }]);
+        assert.deepEqual(byName.get('strdup2').paramsStructured, [{ name: 's', type: 'const char *' }]);
+        assert.equal(byName.get('strdup2').returnType, 'char *');
+        assert.equal(byName.get('ts_current_malloc').returnType, 'void *');
+        assert.deepEqual(byName.get('reg').paramsStructured, [{ name: 'cb', type: 'void (*)(int)' }]);
+    });
+
+    it('C++ default values are cut before name removal', () => {
+        const result = parse('int f(int x = 5) { return x; }', 'cpp');
+        assert.deepEqual(result.functions[0].paramsStructured,
+            [{ name: 'x', type: 'int', optional: true }]);
+    });
+});
+
+describe('fix: bodyless struct specifiers are not duplicate definitions', () => {
+    it('one entry per type: definition wins, references and forward decls fold in', () => {
+        const code = [
+            'struct S;',
+            'void f(struct S *s);',
+            'struct S { int x; };',
+            'struct Fwd;',
+            'struct Fwd;',
+        ].join('\n');
+        const result = parse(code, 'c');
+        const s = result.classes.filter(cls => cls.name === 'S');
+        assert.equal(s.length, 1, `S indexed once, got lines ${s.map(c => c.startLine)}`);
+        assert.equal(s[0].startLine, 3, 'the bodied definition is the indexed one');
+        assert.equal(result.classes.filter(cls => cls.name === 'Fwd').length, 1,
+            'an opaque forward-declared type keeps exactly one entry');
+    });
+});
+
+describe('fix: stacked attribute macros recover fully', () => {
+    it('recovers the symbol, indexes no phantom state, and clears the recovery flag', () => {
+        const code = [
+            '#define A __attribute__((x))',
+            '#define B __attribute__((y))',
+            'A B extern void (*ab)(void *);',
+            'int plain(void) { return 1; }',
+        ].join('\n');
+        const result = parse(code, 'c');
+        assert.ok(result.functions.some(fn => fn.name === 'ab'), 'fn-pointer recovered');
+        assert.ok(result.functions.some(fn => fn.name === 'plain'));
+        assert.ok(!(result.stateObjects || []).some(s => s.name === 'B'),
+            'the macro fragment must not index a phantom state var');
+        assert.ok(!result.parseRecovery, 'a fully recovered parse carries no recovery flag');
+    });
+
+    it('keeps the recovery flag when a genuine syntax error remains', () => {
+        const code = '#define API __attribute__((x))\nAPI int good(void) { return 1; }\nint broken( { \n';
+        const result = parse(code, 'c');
+        assert.ok(result.functions.some(fn => fn.name === 'good'), 'macro part still recovers');
+        assert.equal(result.parseRecovery, true);
     });
 });

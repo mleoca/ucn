@@ -93,6 +93,35 @@ function structuredParams(paramsNode) {
     return params;
 }
 
+// `operator +` / `operator ==` name from the token following the anonymous
+// `operator` keyword; conversion operators name their target type
+// (`implicit operator int` → `operator int`), matching the C++ operator_name
+// convention.
+function operatorName(node) {
+    if (node.type === 'operator_declaration') {
+        for (let i = 0; i < node.childCount - 1; i++) {
+            if (node.child(i).type === 'operator') {
+                return `operator${node.child(i + 1).text}`;
+            }
+        }
+        return null;
+    }
+    if (node.type === 'conversion_operator_declaration') {
+        const target = node.childForFieldName('type');
+        return target ? `operator ${target.text}` : null;
+    }
+    return null;
+}
+
+function conversionKind(node) {
+    if (node.type !== 'conversion_operator_declaration') return null;
+    for (let i = 0; i < node.childCount; i++) {
+        const type = node.child(i).type;
+        if (type === 'implicit' || type === 'explicit') return type;
+    }
+    return null;
+}
+
 function memberFromNode(node, className, lines) {
     const methodLike = node.type === 'method_declaration' ||
         node.type === 'constructor_declaration' ||
@@ -102,6 +131,7 @@ function memberFromNode(node, className, lines) {
     if (!methodLike) return null;
     const nameNode = node.childForFieldName('name');
     const name = nameNode?.text ||
+        operatorName(node) ||
         (node.type === 'constructor_declaration' ? className : null);
     if (!name) return null;
     const paramsNode = node.childForFieldName('parameters');
@@ -112,6 +142,8 @@ function memberFromNode(node, className, lines) {
     const isConstructor = node.type === 'constructor_declaration';
     if (isConstructor) modifiers.push('constructor');
     if (node.type === 'destructor_declaration') modifiers.push('destructor');
+    const conversion = conversionKind(node);
+    if (conversion) modifiers.push(conversion);
     return {
         name,
         params: paramsNode ? paramsNode.text.replace(/^\(|\)$/g, '').trim() : '...',
@@ -157,6 +189,27 @@ function fieldMembers(node, lines) {
     return members;
 }
 
+function indexerMember(node, className, lines) {
+    if (node.type !== 'indexer_declaration') return null;
+    const paramsNode = node.childForFieldName('parameters');
+    const typeNode = node.childForFieldName('type');
+    const { startLine, endLine, indent } = nodeToLocation(node, lines);
+    return {
+        name: 'this[]',
+        params: paramsNode ? paramsNode.text.replace(/^\[|\]$/g, '').trim() : '...',
+        paramsStructured: structuredParams(paramsNode),
+        returnType: typeNode?.text || null,
+        startLine,
+        endLine,
+        indent,
+        modifiers: modifiersOf(node),
+        memberType: 'property',
+        isMethod: true,
+        className,
+        docstring: extractJSDocstring(lines, startLine),
+    };
+}
+
 function propertyMember(node, lines) {
     if (node.type !== 'property_declaration' && node.type !== 'event_declaration') return null;
     const nameNode = node.childForFieldName('name');
@@ -174,11 +227,72 @@ function propertyMember(node, lines) {
     };
 }
 
+function baseHeadName(text) {
+    return text.replace(/<.*$/, '').split('.').pop().trim();
+}
+
+// Classify the base list into extends/implements. The C# grammar guarantees a
+// class base precedes the interfaces, so only position 0 needs deciding:
+// same-file declarations are ground truth, and the BCL-wide I-prefix
+// convention (IDisposable, IList<T>) covers external names. Interfaces only
+// ever extend; structs only ever implement.
+function classifyBases(bases, type, fileTypeKinds) {
+    if (bases.length === 0) return {};
+    if (type === 'interface') return { extends: bases.join(', ') };
+    if (type === 'enum') return { extends: bases[0] };
+    let extendsBase = null;
+    let implementsList = bases;
+    if (type !== 'struct') {
+        const head = baseHeadName(bases[0]);
+        const declaredKind = fileTypeKinds.get(head);
+        const isInterface = declaredKind === 'interface' ||
+            (!declaredKind && /^I[A-Z]/.test(head));
+        if (!isInterface) {
+            extendsBase = bases[0];
+            implementsList = bases.slice(1);
+        }
+    }
+    return {
+        ...(extendsBase && { extends: extendsBase }),
+        ...(implementsList.length > 0 && { implements: implementsList }),
+    };
+}
+
 function findClasses(code, parser) {
     const tree = parseTree(parser, code);
     const lines = code.split('\n');
     const classes = [];
+    // Same-file type kinds override the I-prefix convention when classifying
+    // base lists (a project class legitimately named IFoo stays `extends`).
+    const fileTypeKinds = new Map();
     traverseTreeCached(tree.rootNode, node => {
+        const kind = TYPE_DECLARATIONS.get(node.type);
+        if (!kind) return true;
+        const kindName = node.childForFieldName('name')?.text;
+        if (kindName && !fileTypeKinds.has(kindName)) fileTypeKinds.set(kindName, kind);
+        return true;
+    });
+    traverseTreeCached(tree.rootNode, node => {
+        if (node.type === 'delegate_declaration') {
+            // A delegate declares an importable callable type, like a C
+            // function-pointer typedef.
+            const delegateName = node.childForFieldName('name');
+            if (delegateName) {
+                const { startLine, endLine, indent } = nodeToLocation(node, lines);
+                classes.push({
+                    name: delegateName.text,
+                    type: 'type',
+                    startLine,
+                    endLine,
+                    indent,
+                    modifiers: modifiersOf(node),
+                    ...(namespaceOf(node, tree) && { namespace: namespaceOf(node, tree) }),
+                    members: [],
+                    docstring: extractJSDocstring(lines, startLine),
+                });
+            }
+            return true;
+        }
         const type = TYPE_DECLARATIONS.get(node.type);
         if (!type) return true;
         const nameNode = node.childForFieldName('name');
@@ -191,7 +305,8 @@ function findClasses(code, parser) {
             const method = memberFromNode(child, nameNode.text, lines);
             if (method) members.push(method);
             else {
-                const property = propertyMember(child, lines);
+                const property = propertyMember(child, lines) ||
+                    indexerMember(child, nameNode.text, lines);
                 if (property) members.push(property);
                 members.push(...fieldMembers(child, lines));
             }
@@ -209,10 +324,7 @@ function findClasses(code, parser) {
             modifiers: modifiersOf(node),
             ...(namespaceOf(node, tree) && { namespace: namespaceOf(node, tree) }),
             members,
-            ...(bases.length > 0 && {
-                extends: bases[0],
-                ...(bases.length > 1 && { implements: bases.slice(1) }),
-            }),
+            ...classifyBases(bases, type, fileTypeKinds),
             docstring: extractJSDocstring(lines, startLine),
             ...(attrs.length > 0 && {
                 decorators: attrs.map(attr => attr.name),

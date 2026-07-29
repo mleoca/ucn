@@ -76,7 +76,7 @@ const FLAG_APPLICABILITY = {
     // related. Caller-bearing projections always preserve ACCOUNT/CONTRACT.
     show:         ['name', 'file', 'exclude', 'className', 'line', 'sections', 'includeMethods', 'includeTests', 'top', 'all', 'withTypes', 'minConfidence', 'showConfidence', 'unreachableOnly', 'compact', 'git', 'diverse'],
     find:         ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'exact', 'in', 'compact', 'type', 'withSource'],
-    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact'],
+    usages:       ['name', 'file', 'exclude', 'className', 'includeTests', 'limit', 'codeOnly', 'context', 'in', 'compact', 'all'],
     search:       ['term', 'file', 'exclude', 'includeTests', 'top', 'limit', 'codeOnly', 'caseSensitive', 'context', 'regex', 'in', 'type', 'param', 'receiver', 'returns', 'decorator', 'exported', 'unused'],
     source:       ['name', 'file', 'line', 'range', 'all', 'maxLines'],
     trace:        ['name', 'file', 'exclude', 'className', 'line', 'direction', 'to', 'includeMethods', 'depth', 'all', 'minConfidence', 'expandUnverified'],
@@ -264,7 +264,7 @@ const CLI_PARAM_FLAG_OVERRIDES = Object.freeze({
     exclude: ['--exclude', '--not'],
     includeMethods: ['--include-methods', '--no-include-methods'],
     regex: ['--regex', '--no-regex'],
-    showConfidence: ['--hide-confidence', '--no-confidence'],
+    showConfidence: ['--show-confidence', '--hide-confidence', '--no-confidence'],
     hideUncertain: ['--hide-uncertain', '--no-uncertain'],
     compact: ['--compact', '--no-compact'],
     defaultValue: ['--default-value', '--default'],

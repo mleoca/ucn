@@ -363,7 +363,11 @@ function formatUsages(usages, name, options = {}) {
     // full counts as a non-enumerable property.
     const sc = usages.summaryCounts;
     const lines = [];
-    lines.push(`Usages of "${name}": ${sc ? sc.definitions : defs.length} definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references, ${sc ? (sc.text || 0) : textOccurrences.length} other-text`);
+    // "syntax-classified": classification is by syntax alone — a method
+    // reference is a `reference` here even when the engine confirms it as a
+    // caller. ACCOUNT lines in show/impact are engine-adjudicated, so the
+    // two breakdowns can legitimately differ; both count lines.
+    lines.push(`Usages of "${name}" (syntax-classified): ${sc ? sc.definitions : defs.length} definitions, ${sc ? sc.calls : calls.length} calls, ${sc ? sc.imports : imports.length} imports, ${sc ? sc.references : refs.length} references, ${sc ? (sc.text || 0) : textOccurrences.length} other-text`);
     if (!compact) lines.push('═'.repeat(60));
 
     function renderContextLines(usage) {
@@ -383,8 +387,12 @@ function formatUsages(usages, name, options = {}) {
     }
 
     if (defs.length > 0) {
+        // Many same-name definitions (jsoup has 25 `parse` overloads) can
+        // consume the whole output budget before the rarer sections render —
+        // cap the section display; the header count stays complete.
+        const defLimit = !options.all && defs.length > 10 ? 10 : defs.length;
         lines.push(`${compact ? '' : '\n'}DEFINITIONS:`);
-        for (const d of defs) {
+        for (const d of defs.slice(0, defLimit)) {
             if (compact) {
                 lines.push(`  ${d.relativePath}:${d.line || d.startLine}${d.signature ? '  ' + d.signature : ''}`);
             } else {
@@ -392,23 +400,16 @@ function formatUsages(usages, name, options = {}) {
                 if (d.signature) lines.push(`    ${d.signature}`);
             }
         }
-    }
-
-    if (calls.length > 0) {
-        lines.push(`${compact ? '' : '\n'}CALLS:`);
-        for (const c of calls) {
-            if (compact) {
-                const expr = c.content ? c.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
-                lines.push(`  ${c.relativePath}:${c.line}: ${expr}`);
-            } else {
-                lines.push(`  ${c.relativePath}:${c.line}`);
-                renderContextLines(c);
-                lines.push(`    ${c.content.trim()}`);
-                renderAfterLines(c);
-            }
+        if (defLimit < defs.length) {
+            lines.push(`  ... and ${defs.length - defLimit} more definitions (${options.allHint || 'use --all'})`);
         }
     }
 
+    // Section order is bulk-LAST: imports, references, and other-text are
+    // small, high-signal sections the ACCOUNT explicitly routes agents to;
+    // CALLS is the homogeneous bulk that dominates large outputs. Rendering
+    // CALLS last means the output budget truncates redundant bulk instead of
+    // silently swallowing the rare sections (the header still promised them).
     if (imports.length > 0) {
         lines.push(`${compact ? '' : '\n'}IMPORTS:`);
         for (const i of imports) {
@@ -451,6 +452,21 @@ function formatUsages(usages, name, options = {}) {
                 renderContextLines(occurrence);
                 lines.push(`    ${occurrence.content.trim()}`);
                 renderAfterLines(occurrence);
+            }
+        }
+    }
+
+    if (calls.length > 0) {
+        lines.push(`${compact ? '' : '\n'}CALLS:`);
+        for (const c of calls) {
+            if (compact) {
+                const expr = c.content ? c.content.trim().replace(/\s+/g, ' ').slice(0, 100) : '';
+                lines.push(`  ${c.relativePath}:${c.line}: ${expr}`);
+            } else {
+                lines.push(`  ${c.relativePath}:${c.line}`);
+                renderContextLines(c);
+                lines.push(`    ${c.content.trim()}`);
+                renderAfterLines(c);
             }
         }
     }

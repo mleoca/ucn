@@ -5488,7 +5488,7 @@ describe('fix #247: deadcode/entrypoints batch', () => {
         });
         try {
             const index = idx(dir);
-            const r = execute(index, 'entrypoints', {}).result;
+            const r = execute(index, 'entrypoints', { includeTests: true }).result;
             assert.ok(r.some(e => e.name === 'realTest'), 'callable entry kept');
             for (const n of ['Color', 'Red', 'Cfg', 'url', 'Alias']) {
                 assert.ok(!r.some(e => e.name === n), `${n} is a declaration, not a runtime entry`);
@@ -5503,7 +5503,7 @@ describe('fix #247: deadcode/entrypoints batch', () => {
         });
         try {
             const index = idx(dir);
-            const r = execute(index, 'entrypoints', { limit: 2 });
+            const r = execute(index, 'entrypoints', { limit: 2, includeTests: true });
             assert.ok(r.ok);
             const j = JSON.parse(output.formatEntrypointsJson(r.result));
             assert.strictEqual(j.meta.count, 2);
@@ -6427,6 +6427,97 @@ describe('repo scope is consistent across every projection', () => {
             assert.strictEqual(r.result.health.blindSpots.dynamicImports.count, 0);
             assert.ok(r.result.health.evidenceProfile.candidateSymbols <= 2);
             assert.ok(!r.result.summary.dirs.some(row => row.dir.startsWith('test')));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix: plan rename/param-name validation', () => {
+    it('rejects non-identifier renameTo at the execute layer', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function greet(name) { return name; }\nmodule.exports = { greet };',
+        });
+        try {
+            const index = idx(dir);
+            const spaces = execute(index, 'plan', { name: 'greet', renameTo: 'foo bar' });
+            assert.strictEqual(spaces.ok, false);
+            assert.ok(spaces.error.includes('not a valid identifier'), spaces.error);
+            const dashes = execute(index, 'plan', { name: 'greet', renameTo: 'foo-bar' });
+            assert.strictEqual(dashes.ok, false);
+            const badParam = execute(index, 'plan', { name: 'greet', addParam: 'not valid' });
+            assert.strictEqual(badParam.ok, false);
+            assert.ok(badParam.error.includes('not a valid parameter name'), badParam.error);
+            // Typed specs remain accepted (fix #181 shape).
+            const typed = execute(index, 'plan', { name: 'greet', addParam: 'suffix: string' });
+            assert.ok(typed.ok && !typed.result.error,
+                `typed addParam spec must stay valid: ${typed.error || (typed.result && typed.result.error)}`);
+        } finally { rm(dir); }
+    });
+
+    it('rejects reserved words in the target language', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function greet(name) { return name; }\nmodule.exports = { greet };',
+            'b.py': 'def fetch_data():\n    return 1\n',
+        });
+        try {
+            const index = idx(dir);
+            const js = execute(index, 'plan', { name: 'greet', renameTo: 'class' });
+            assert.ok(js.ok && js.result.error, 'reserved-word rename reports an in-band error');
+            assert.ok(js.result.error.includes('reserved word in javascript'), js.result.error);
+            const py = execute(index, 'plan', { name: 'fetch_data', renameTo: 'lambda' });
+            assert.ok(py.ok && py.result.error);
+            assert.ok(py.result.error.includes('reserved word in python'), py.result.error);
+            // A word reserved in Python but not JS stays allowed for JS targets.
+            const jsOk = execute(index, 'plan', { name: 'greet', renameTo: 'lambda' });
+            assert.ok(jsOk.ok && !jsOk.result.error,
+                `"lambda" is a legal JS identifier: ${jsOk.result && jsOk.result.error}`);
+        } finally { rm(dir); }
+    });
+
+    it('rejects a same-name rename instead of producing a no-op plan', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function greet(name) { return name; }\nmodule.exports = { greet };',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'plan', { name: 'greet', renameTo: 'greet' });
+            assert.ok(ok);
+            assert.ok(result.error, 'same-name rename must report, not plan');
+            assert.ok(result.error.includes('matches the current name'), result.error);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix: --min-confidence CLI validation', () => {
+    const { execFileSync } = require('child_process');
+    const CLI_ENTRY = path.join(__dirname, '..', 'cli', 'index.js');
+
+    it('rejects non-numeric and out-of-range values with exit 1', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function greet() { return 1; }\nmodule.exports = { greet };',
+        });
+        try {
+            for (const bad of ['abc', '-1', '2.0']) {
+                let failed = false;
+                let output = '';
+                try {
+                    execFileSync('node', [CLI_ENTRY, dir, 'trace', 'greet', `--min-confidence=${bad}`],
+                        { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+                } catch (e) {
+                    failed = true;
+                    output = String(e.stderr || '') + String(e.stdout || '');
+                }
+                assert.ok(failed, `--min-confidence=${bad} must exit non-zero`);
+                assert.ok(output.includes('Invalid --min-confidence value'), output);
+            }
+            // Valid values still work.
+            const good = execFileSync('node',
+                [CLI_ENTRY, dir, 'trace', 'greet', '--min-confidence=0.5', '--no-cache'],
+                { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+            assert.ok(good.includes('greet'));
         } finally { rm(dir); }
     });
 });

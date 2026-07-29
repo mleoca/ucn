@@ -6,6 +6,10 @@
 
 function formatCheck(result) {
     if (!result) return 'No check result.';
+    if (result.ok === false) {
+        // The gate could not run — never render this like a clean tree.
+        return `Pre-commit Check (${result.base}${result.staged ? ', staged' : ''})\n${'═'.repeat(60)}\nCHECK DID NOT RUN [${result.status || 'diff-failed'}] — ${result.error || 'git diff failed'}\nThis is not a pass. Fix the git context (run inside a git repository with a valid base ref) and rerun.`;
+    }
     if (result.empty) {
         return `Pre-commit Check (${result.base}${result.staged ? ', staged' : ''})\n${'═'.repeat(60)}\nNo changes to analyze${result.reason ? ` (${result.reason})` : ''}.`;
     }

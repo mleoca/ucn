@@ -458,11 +458,10 @@ function getToc(index, options = {}) {
         if (options.in) {
             if (!index.matchesFilters(fileEntry.relativePath, { in: options.in })) continue;
         }
-        let functions = fileEntry.symbols.filter(s =>
-            s.type === 'function' || s.type === 'method' || s.type === 'static' ||
-            s.type === 'constructor' || s.type === 'public' || s.type === 'abstract' ||
-            s.type === 'classmethod'
-        );
+        // Every callable kind, incl. accessors/properties/indexers — a
+        // hand-rolled subset here silently dropped C# `this[]` (kind
+        // 'property') and Python accessor kinds from the detailed listing.
+        let functions = fileEntry.symbols.filter(s => CALLABLE_SYMBOL_KINDS.has(s.type));
         const classes = fileEntry.symbols.filter(s =>
             ['class', 'interface', 'type', 'enum', 'struct', 'trait', 'impl', 'record', 'namespace'].includes(s.type)
         );
@@ -959,13 +958,19 @@ function orient(index, options = {}) {
     let entrypoints = null;
     try {
         const { detectEntrypoints } = require('./entrypoints');
+        const { addTestExclusions } = require('./shared');
+        const orientExclude = Array.isArray(options.exclude)
+            ? options.exclude
+            : (options.exclude
+                ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
+                : []);
+        // Same default as the entrypoints command: the orientation count
+        // describes the project's own entry surface, not test fixtures.
         const detected = detectEntrypoints(index, {
             file: options.file,
-            exclude: Array.isArray(options.exclude)
-                ? options.exclude
-                : (options.exclude
-                    ? String(options.exclude).split(',').map(s => s.trim()).filter(Boolean)
-                    : []),
+            exclude: options.includeTests === true
+                ? orientExclude
+                : addTestExclusions(orientExclude),
         });
         const eps = Array.isArray(detected)
             ? detected.filter(entry => matchesReportingScope(

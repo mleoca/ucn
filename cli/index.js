@@ -130,6 +130,17 @@ function validateNumericFlags(flags) {
             cap: MAX_OUTPUT_CHARS,
         });
     }
+    // --min-confidence: number in [0,1] (ordinal evidence weight). Anything
+    // else used to coerce to 0 silently — "abc" behaved like no filter.
+    if (flags.minConfidenceRaw != null) {
+        const value = Number(flags.minConfidenceRaw);
+        if (flags.minConfidenceRaw === '' || !Number.isFinite(value) ||
+            value < 0 || value > 1) {
+            throw new FlagValidationError(
+                `Invalid --min-confidence value: "${flags.minConfidenceRaw}" — must be a number between 0 and 1.`);
+        }
+        flags.minConfidence = value;
+    }
 }
 
 /**
@@ -279,8 +290,10 @@ function parseFlags(tokens) {
         decorator: getValueFlag('--decorator'),
         exported: tokens.includes('--exported') || undefined,
         unused: tokens.includes('--unused') || undefined,
-        showConfidence: (tokens.includes('--hide-confidence') || tokens.includes('--no-confidence')) ? false : undefined,
-        minConfidence: parseFloat(getValueFlag('--min-confidence') || '0') || 0,
+        showConfidence: (tokens.includes('--hide-confidence') || tokens.includes('--no-confidence')) ? false
+            : tokens.includes('--show-confidence') ? true : undefined,
+        minConfidence: 0,
+        minConfidenceRaw: getValueFlag('--min-confidence'),
         unreachableOnly: tokens.includes('--unreachable-only') || undefined,
         framework: getValueFlag('--framework'),
         // endpoints command flags
@@ -421,6 +434,17 @@ function main() {
     let target, command, arg;
 
     if (positionalArgs.length === 0) {
+        // Standalone `ucn --clear-cache` (the form SKILL.md and README
+        // document) clears the current project's cache — falling through to
+        // the help banner made it a silent no-op.
+        if (flags.clearCache) {
+            const index = new ProjectIndex('.');
+            const removed = index.clearCache();
+            console.log(removed.length > 0
+                ? `Cache cleared (${index.root})`
+                : `No cache to clear (${index.root})`);
+            process.exit(0);
+        }
         // No args: show help
         printUsage();
         process.exit(0);
@@ -497,7 +521,7 @@ const GLOBAL_FLAG_KEYS = new Set([
     'json', 'quiet', 'cache', 'clearCache', 'followSymlinks', 'maxFiles',
     'verbose', 'interactive', '_fileFromFileMode', 'topRaw',
     'limitRaw', 'maxFilesRaw', 'maxLinesRaw', 'depthRaw', 'contextRaw',
-    'workersRaw', 'maxChars', 'maxCharsRaw',
+    'workersRaw', 'maxChars', 'maxCharsRaw', 'minConfidenceRaw',
 ]);
 
 /** Apply one command/flag policy across project, file, glob, and REPL modes. */
@@ -664,6 +688,11 @@ function runProjectCommand(rootDir, command, arg) {
             ...publicExecution, surface: 'cli',
         })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
+    // A gate that could not run (check outside git / bad base ref) must not
+    // exit 0 — CI gating on the exit code would read "could not run" as "passed".
+    if (publicExecution.result && publicExecution.result.ok === false) {
+        process.exitCode = 2;
+    }
     } catch (e) {
         if (!(e instanceof CommandError)) {
             console.error(`Error: ${e.message}`);
@@ -717,6 +746,9 @@ function runGlobCommand(pattern, command, arg) {
             ...publicExecution, surface: 'cli',
         })
         : formatCliText(canonical, publicExecution.result, publicParams, publicExecution, flags));
+    if (publicExecution.result && publicExecution.result.ok === false) {
+        process.exitCode = 2;
+    }
 }
 
 // ============================================================================
@@ -758,7 +790,7 @@ Commands:
   tests <symbol>                  Direct tests; --depth=N adds transitive impact
   deps <file>                     File graph; --direction=imports|importers|both
     --detailed                     Include import declarations
-    --cycles                       Report circular dependencies
+  deps --cycles                   Report circular dependencies (no file target)
   api [file]                      Project or file public API
   check [symbol]                  Signature check; without symbol, precommit check
   plan <symbol>                   Preview rename or parameter edits
@@ -785,8 +817,8 @@ Global/build/output flags:
   --max-files=N --max-chars=N --workers=N
 
 Boolean aliases:
-  --no-include-methods --no-regex --hide-confidence --no-confidence
-  --hide-uncertain --no-uncertain --compact --no-compact
+  --no-include-methods --no-regex --show-confidence --hide-confidence
+  --no-confidence --hide-uncertain --no-uncertain --compact --no-compact
 
 Value aliases:
   --not=PATTERN (alias of --exclude) --default=VALUE (alias of --default-value)

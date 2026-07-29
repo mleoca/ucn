@@ -2640,9 +2640,10 @@ module.exports = { startServer };
         } finally { rm(dir); }
     });
 
-    it('JS: app.get with inline arrow fn is NOT a named entrypoint', () => {
-        // Inline arrow functions are anonymous — they have no name to register
-        // as an entrypoint. The callback IS the handler but has no symbol name.
+    it('JS: app.get with inline arrow fn surfaces the route as an anonymous entry', () => {
+        // Inline arrow handlers have no symbol name, but the ROUTE is still a
+        // framework entry point — endpoints lists it, and entrypoints must
+        // agree (one <anonymous> entry per registration line).
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'routes.js': `
@@ -2659,9 +2660,13 @@ module.exports = app;
             const index = idx(dir);
             const { ok, result } = execute(index, 'entrypoints', {});
             assert.ok(ok);
-            assert.strictEqual(result.length, 0,
-                'inline arrow handlers should not produce named entrypoints, got: ' +
-                result.map(r => r.name).join(', '));
+            const anon = result.filter(r => r.name === '<anonymous>');
+            assert.strictEqual(anon.length, 2,
+                'each anonymous route registration surfaces once, got: ' +
+                result.map(r => `${r.name}@${r.line}`).join(', '));
+            assert.ok(anon.every(r => r.framework === 'express' && r.type === 'http'));
+            const lines = anon.map(r => r.line).sort((a, b) => a - b);
+            assert.deepStrictEqual(lines, [4, 5], 'anchored at the registration lines');
         } finally { rm(dir); }
     });
 
@@ -2869,12 +2874,12 @@ module.exports = { auth, handler };
         } finally { rm(dir); }
     });
 
-    it('JS: app.get("/path", require("./handler")) — require()-wrapped handler is a false negative', () => {
+    it('JS: app.get("/path", require("./handler")) — route surfaces anonymously', () => {
         // require() returns the module export at runtime, but in the AST it's a
-        // call_expression, not an identifier. Neither isFunctionReference nor
-        // isPotentialCallback is set on call_expression nodes, so the callback
-        // detection in buildCallbackEntrypointMap misses it.
-        // This is a known limitation — documenting it here.
+        // call_expression, not an identifier — the handler NAME cannot be
+        // attributed. The route itself still surfaces as an <anonymous> entry
+        // anchored at the registration line (the handler-name link remains a
+        // known limitation).
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'routes.js': `
@@ -2892,11 +2897,13 @@ module.exports = handleRequest;
             const index = idx(dir);
             const { ok, result } = execute(index, 'entrypoints', {});
             assert.ok(ok);
-            // False negative: require()-wrapped handler is not detected.
-            // The handler function exists in handler.js but is not linked to the
-            // route registration in routes.js.
-            assert.strictEqual(result.length, 0,
-                'require()-wrapped handlers are a known false negative (call_expression, not identifier)');
+            assert.ok(!result.some(r => r.name === 'handleRequest'),
+                'handler name attribution through require() is still out of reach');
+            const anon = result.filter(r => r.name === '<anonymous>');
+            assert.strictEqual(anon.length, 1,
+                'the route registration itself must surface, got: ' +
+                result.map(r => `${r.name}@${r.line}`).join(', '));
+            assert.strictEqual(anon[0].framework, 'express');
         } finally { rm(dir); }
     });
 
@@ -3306,6 +3313,124 @@ describe('BUG-1: impact text surfaces structural call-site patterns', () => {
             assert.ok(!/in try/i.test(text), `text output should not say "in try" when count is 0: ${text}`);
             assert.ok(!/in callback/i.test(text), `text output should not say "in callback" when count is 0: ${text}`);
             assert.ok(!/in test/i.test(text), `text output should not say "in test" when count is 0: ${text}`);
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix: entrypoints agrees with endpoints on framework identity', () => {
+    const { execute } = require('../core/execute');
+
+    it('labels @app.get as fastapi when the file imports fastapi', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.py': 'from fastapi import FastAPI\napp = FastAPI()\n\n@app.get("/g")\ndef read_g():\n    return {"g": 1}\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const route = result.find(r => r.name === 'read_g');
+            assert.ok(route, 'route handler detected');
+            assert.strictEqual(route.framework, 'fastapi',
+                `endpoints reports fastapi for this file — entrypoints must agree, got ${route.framework}`);
+        } finally { rm(dir); }
+    });
+
+    it('keeps flask attribution when the file imports flask (fix #245 control)', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'web.py': 'from flask import Flask\napp = Flask(__name__)\n\n@app.route("/")\ndef home():\n    return "hi"\n\n@app.get("/about")\ndef about_page():\n    return "about"\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            assert.ok(result.every(r => r.framework === 'flask'),
+                'both decorators stay flask: ' + result.map(r => `${r.name}:${r.framework}`).join(', '));
+        } finally { rm(dir); }
+    });
+
+    it('detects pytest-convention test functions like Go Test*', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'api.py': 'def test_something():\n    assert 1 == 1\n\ndef pytest_configure(config):\n    pass\n\ndef regular():\n    pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', { includeTests: true });
+            assert.ok(ok);
+            const names = result.filter(r => r.type === 'test').map(r => r.name);
+            assert.ok(names.includes('test_something'), `got: ${names}`);
+            assert.ok(names.includes('pytest_configure'));
+            assert.ok(!names.includes('regular'));
+        } finally { rm(dir); }
+    });
+
+    it('detects django management commands by module path', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'myapp/management/commands/sync_data.py':
+                'from django.core.management.base import BaseCommand\n\nclass Command(BaseCommand):\n    def handle(self, *args, **options):\n        pass\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', {});
+            assert.ok(ok);
+            const handle = result.find(r => r.name === 'handle');
+            assert.ok(handle, 'Command.handle detected: ' + result.map(r => r.name).join(', '));
+            assert.strictEqual(handle.framework, 'django');
+            assert.strictEqual(handle.type, 'cli');
+        } finally { rm(dir); }
+    });
+
+    it('detects C test-convention entry points', () => {
+        const dir = tmp({
+            'main.c': 'int test_parse(void) { return 0; }\nint helper(void) { return 1; }\n',
+        });
+        try {
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'entrypoints', { includeTests: true });
+            assert.ok(ok);
+            const names = result.filter(r => r.type === 'test').map(r => r.name);
+            assert.ok(names.includes('test_parse'), `got: ${names}`);
+            assert.ok(!names.includes('helper'));
+        } finally { rm(dir); }
+    });
+});
+
+describe('fix: entrypoints excludes test files by default', () => {
+    const { execute } = require('../core/execute');
+
+    it('hides test-file routes by default; --include-tests restores them', () => {
+        const dir = tmp({
+            'package.json': '{"name":"t"}',
+            'server.js': [
+                "const express = require('express');",
+                'const app = express();',
+                "app.get('/real', function realRoute(req, res) { res.send('ok'); });",
+            ].join('\n'),
+            'test/routes.test.js': [
+                "const express = require('express');",
+                'const app = express();',
+                "app.get('/fixture', function fixtureRoute(req, res) { res.send('t'); });",
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const def = execute(index, 'entrypoints', {}).result;
+            assert.ok(def.some(e => e.name === 'realRoute'), 'production route kept');
+            assert.ok(!def.some(e => e.file.startsWith('test/')),
+                'test-file entries hidden by default: ' + def.map(e => e.file).join(', '));
+
+            const withTests = execute(index, 'entrypoints', { includeTests: true }).result;
+            assert.ok(withTests.some(e => e.name === 'fixtureRoute'),
+                '--include-tests restores test-file entries');
+
+            const explicit = execute(index, 'entrypoints', { excludeTests: true }).result;
+            assert.deepStrictEqual(
+                explicit.map(e => `${e.file}:${e.line}:${e.name}`),
+                def.map(e => `${e.file}:${e.line}:${e.name}`),
+                '--exclude-tests is the explicit spelling of the default');
         } finally { rm(dir); }
     });
 });

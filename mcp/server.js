@@ -144,6 +144,59 @@ function toolError(message) {
     return { content: [{ type: 'text', text: `Error: ${message}` }], isError: true };
 }
 
+function paramEditDistance(a, b) {
+    if (Math.abs(a.length - b.length) > 2) return 3;
+    const prev = new Array(b.length + 1);
+    const curr = new Array(b.length + 1);
+    for (let j = 0; j <= b.length; j++) prev[j] = j;
+    for (let i = 1; i <= a.length; i++) {
+        curr[0] = i;
+        for (let j = 1; j <= b.length; j++) {
+            curr[j] = Math.min(
+                prev[j] + 1,
+                curr[j - 1] + 1,
+                prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1),
+            );
+        }
+        for (let j = 0; j <= b.length; j++) prev[j] = curr[j];
+    }
+    return prev[b.length];
+}
+
+/**
+ * Detect parameters the schema does not define, DELETE them from rawParams,
+ * and return one human-readable note per dropped key. Three cases:
+ * canonical camelCase spelling of a known param (includeTests), a close typo
+ * (include_test), and an entirely unknown key (zzz).
+ */
+function collectUnknownParamNotes(rawParams) {
+    const knownKeys = Object.keys(INPUT_SHAPE).filter(key => key !== 'command' && key !== 'project_dir');
+    const knownSet = new Set(knownKeys);
+    const notes = [];
+    for (const key of Object.keys(rawParams)) {
+        if (knownSet.has(key)) continue;
+        delete rawParams[key];
+        const snake = key.replace(/([a-z0-9])([A-Z])/g, '$1_$2').toLowerCase();
+        if (knownSet.has(snake)) {
+            notes.push(`${key} is not an accepted parameter — use ${snake}.`);
+            continue;
+        }
+        let best = null;
+        let bestDistance = 3;
+        for (const candidate of knownKeys) {
+            const distance = paramEditDistance(key.toLowerCase(), candidate);
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = candidate;
+            }
+        }
+        notes.push(best
+            ? `unknown parameter ${key} ignored — did you mean ${best}?`
+            : `unknown parameter ${key} ignored.`);
+    }
+    return notes;
+}
+
 /**
  * Resolve a file path via index and validate it's within the project root.
  * Returns the resolved absolute path string, or a toolError response.
@@ -195,11 +248,19 @@ CONFIRMED carries target-identity evidence. UNVERIFIED is possible and requires 
 // and made the single MCP tool difficult for agents to parse.
 const TOOL_DESCRIPTION = CONCISE_TOOL_DESCRIPTION;
 
+// The schema shape is named so the handler can distinguish known keys from
+// unknown/typo'd/camelCase ones — z.object() would otherwise strip them
+// silently, and a silently ignored parameter changes the answer with no
+// signal (e.g. include_test:true returning untested-filtered results).
+const INPUT_SHAPE = {
+    command: null, // assigned below (needs z at load time)
+};
+
 server.registerTool(
     'ucn',
     {
         description: TOOL_DESCRIPTION,
-        inputSchema: z.object({
+        inputSchema: z.object(Object.assign(INPUT_SHAPE, {
             command: z.enum(getMcpCommandEnum()),
             project_dir: z.string().describe('Absolute or relative path to the project root directory'),
             name: z.string().optional().describe('Symbol name or stable path:line:name handle. Used by show/find/usages/source/trace/impact/tests/check/plan.'),
@@ -207,7 +268,7 @@ server.registerTool(
             sections: z.string().optional().describe('Comma-separated projection. show: summary,callers,callees,source,dependencies,tests,types,example,related. repo: summary,files,stats,health.'),
             exclude: z.string().optional().describe('Comma-separated patterns to exclude (e.g. "test,mock,vendor")'),
             include_tests: z.boolean().optional().describe('Include test files in results (excluded by default)'),
-            exclude_tests: z.boolean().optional().describe('Exclude test files from results. Used by entrypoints (where tests are included by default).'),
+            exclude_tests: z.boolean().optional().describe('Explicit spelling of the default test-file exclusion (entrypoints). Use include_tests=true to include test files.'),
             include_methods: z.boolean().optional().describe('Include method callees where receiver evidence permits. Caller-bearing views always tier method sites.'),
             expand_unverified: z.boolean().optional().describe('trace callers: follow unverified edges; downstream nodes remain marked possible, never confirmed.'),
             min_confidence: z.number().min(0).max(1).optional().describe('Minimum ordinal evidence weight (legacy name; not a probability) for caller/callee edges'),
@@ -272,10 +333,14 @@ server.registerTool(
             prefix: z.string().optional().describe('Filter routes/requests by path prefix (endpoints command).'),
             hide_uncertain: z.boolean().optional().describe('Hide uncertain (interpolated-path) bridges (endpoints command).')
 
-        })
+        })).passthrough()
     },
     async (args) => {
         const { command, project_dir, ...rawParams } = args;
+
+        // Unknown, typo'd, or camelCase-spelled parameters must never
+        // silently no-op. They are dropped, and each one gets a Note.
+        const unknownParamNotes = collectUnknownParamNotes(rawParams);
 
         // Normalize ALL params once — execute() handlers pick what they need.
         // This eliminates per-case param selection and prevents CLI/MCP drift.
@@ -307,8 +372,13 @@ server.registerTool(
         const maxChars = ep.all ? MAX_OUTPUT_CHARS : ep.maxChars;
 
         // Build stripping note (appended inside truncation boundary on success paths)
-        const strippedNote = strippedParams.length > 0
-            ? `\n\nNote: ${strippedParams.join(', ')} ignored (not applicable to ${command}).`
+        const noteParts = [];
+        if (strippedParams.length > 0) {
+            noteParts.push(`${strippedParams.join(', ')} ignored (not applicable to ${command}).`);
+        }
+        noteParts.push(...unknownParamNotes);
+        const strippedNote = noteParts.length > 0
+            ? '\n\n' + noteParts.map(part => `Note: ${part}`).join('\n')
             : '';
 
         // Wrap toolResult to auto-inject command + maxChars + stripping note

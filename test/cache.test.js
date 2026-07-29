@@ -2635,3 +2635,36 @@ describe('fix #249: relocated project cache stays portable', () => {
         } finally { rm(dir); }
     });
 });
+
+describe('fix: standalone --clear-cache clears the cwd project cache', () => {
+    const { execFileSync } = require('child_process');
+    const CLI_ENTRY = path.join(__dirname, '..', 'cli', 'index.js');
+
+    it('clears without a target and reports the outcome', () => {
+        const dir = tmp({
+            'package.json': '{"name":"clear-cache-standalone"}',
+            'a.js': 'function alpha() { return 1; }\nmodule.exports = { alpha };',
+        });
+        try {
+            // Build a cache first.
+            execFileSync('node', [CLI_ENTRY, dir, 'repo'],
+                { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+            assert.ok(fs.existsSync(getProjectCachePath(dir)), 'cache exists after build');
+
+            // Standalone form, run FROM the project directory (no target arg).
+            const out1 = execFileSync('node', [CLI_ENTRY, '--clear-cache'],
+                { cwd: dir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+            assert.ok(out1.includes('Cache cleared'), `expected confirmation, got: ${out1}`);
+            assert.ok(!out1.includes('Usage:'), 'must not print the help banner');
+            assert.ok(!fs.existsSync(getProjectCachePath(dir)), 'cache is gone');
+
+            // Second run: nothing to clear, still exit 0 with an honest message.
+            const out2 = execFileSync('node', [CLI_ENTRY, '--clear-cache'],
+                { cwd: dir, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+            assert.ok(out2.includes('No cache to clear'), out2);
+        } finally {
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});

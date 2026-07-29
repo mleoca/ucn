@@ -72,7 +72,8 @@ An observed-text zero is not semantic zero or safe-delete proof. Numeric evidenc
 | Select direct or transitive tests | `ucn tests <handle> [--depth=N]` |
 | Validate a symbol or pending diff | `ucn check [handle]` |
 | Preview a refactor | `ucn plan <handle> --rename-to=X` |
-| Inspect file dependencies | `ucn deps <file> [--direction=...] [--cycles]` |
+| Inspect file dependencies | `ucn deps <file> [--direction=...]` |
+| Find circular imports | `ucn deps --cycles` (project-wide; no file target) |
 | Inspect public surface | `ucn api [file]` |
 | Review entry points or HTTP routes | `ucn entrypoints`; `ucn endpoints` |
 | Generate review candidates | `ucn deadcode`; `ucn audit-async` |

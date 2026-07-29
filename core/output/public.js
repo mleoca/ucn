@@ -234,7 +234,11 @@ function formatPublicText(command, result, params = {}, execution = {}) {
                     limitHint: hints.limit,
                 });
             break;
-        case 'usages': text = legacy.formatUsages(result, params.name, { compact: params.compact }); break;
+        case 'usages': text = legacy.formatUsages(result, params.name, {
+            compact: params.compact,
+            all: params.all,
+            allHint: hints.all,
+        }); break;
         case 'search':
             text = execution.structural || result?.meta?.mode === 'structural'
                 ? legacy.formatStructuralSearch(result)
@@ -304,6 +308,10 @@ function formatPublicJson(command, result, params = {}, execution = {}) {
         meta: {
             command: surfaceCommand,
             ...(surfaceCommand !== command && { canonicalCommand: command }),
+            // A result that self-reports it could not run (check with a bad
+            // base ref / outside git) must be machine-distinguishable from a
+            // successful empty result at the envelope level too.
+            ...(data && data.ok === false && { ok: false }),
             ...(modeOf(command, result) && { mode: modeOf(command, result) }),
             contract: contractMeta(command),
             ...commandMeta,

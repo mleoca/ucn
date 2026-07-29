@@ -74,7 +74,10 @@ const FRAMEWORK_PATTERNS = [
     // Listed BEFORE fastapi: both frameworks share the @app.get/@app.post
     // shortcuts, and @app.route is Flask-only — a file using @app.route +
     // @app.post on the SAME app object got split across two frameworks
-    // (fix #245; first match wins in matchDecoratorOrModifier).
+    // (fix #245; first match wins in matchDecoratorOrModifier). When the
+    // decorator shape is shared, the file's own imports break the tie
+    // (importSignal): a fastapi-importing file's @app.get is fastapi, not
+    // flask — the label must agree with what `endpoints` reports.
     {
         id: 'flask-route',
         languages: new Set(['python']),
@@ -82,6 +85,7 @@ const FRAMEWORK_PATTERNS = [
         framework: 'flask',
         detection: 'decorator',
         pattern: /^(app|bp|blueprint)\.(route|get|post|put|delete|patch)/,
+        importSignal: /^flask\b/,
     },
 
     // FastAPI (Python) — decorators: @app.get('/path'), @router.post('/path')
@@ -92,6 +96,7 @@ const FRAMEWORK_PATTERNS = [
         framework: 'fastapi',
         detection: 'decorator',
         pattern: /^(app|router)\.(get|post|put|delete|patch|options|head)/,
+        importSignal: /^fastapi\b/,
     },
 
     // Django (Python) — decorators: @api_view, @action, @permission_classes
@@ -293,6 +298,30 @@ const FRAMEWORK_PATTERNS = [
         framework: 'pytest',
         detection: 'decorator',
         pattern: /^pytest\.fixture/,
+    },
+
+    // pytest/unittest test functions and plugin hooks — the same name
+    // convention the Python language module already uses for deadcode entry
+    // points (the entrypoints command must agree with it; Go's Test* pattern
+    // set the precedent).
+    {
+        id: 'pytest-test',
+        languages: new Set(['python']),
+        type: 'test',
+        framework: 'pytest',
+        detection: 'namePattern',
+        pattern: /^(test_|pytest_)/,
+    },
+
+    // C/C++ test conventions (Unity, CTest, GoogleTest wrappers) — mirrors
+    // the c-family language module's own entry-point rule.
+    {
+        id: 'c-family-test',
+        languages: new Set(['c', 'cpp']),
+        type: 'test',
+        framework: 'native-test',
+        detection: 'namePattern',
+        pattern: /^(test_|Test|TEST_)/,
     },
 
     // ── Runtime ─────────────────────────────────────────────────────────
@@ -526,6 +555,19 @@ const FRAMEWORK_PATTERNS = [
         pathPattern: /(^|\/)__main__\.py$/,
     },
 
+    // Django management commands — discovered by module path
+    // (management/commands/<name>.py); the Command class and its handle()
+    // are invoked by `manage.py <name>` (the #253 external-contract family,
+    // now visible to the entrypoints command too).
+    {
+        id: 'django-command',
+        languages: new Set(['python']),
+        type: 'cli',
+        framework: 'django',
+        detection: 'filePath',
+        pathPattern: /(^|\/)management\/commands\/[^/]+\.py$/,
+    },
+
     // ── Catch-all fallbacks ─────────────────────────────────────────────
 
     // Python: any decorator with '.' (attribute access) — framework registration heuristic
@@ -563,25 +605,39 @@ const FRAMEWORK_PATTERNS = [
  * @param {string} language - File language
  * @returns {{ pattern: object, matchedOn: string }|null}
  */
-function matchDecoratorOrModifier(symbol, language) {
+function matchDecoratorOrModifier(symbol, language, fileEntry = null) {
     const decorators = symbol.decorators || [];
     const modifiers = symbol.modifiers || [];
 
+    const matches = [];
     for (const fp of FRAMEWORK_PATTERNS) {
         if (!fp.languages.has(language)) continue;
 
         if (fp.detection === 'decorator') {
             const matched = decorators.find(d => fp.pattern.test(d));
-            if (matched) return { pattern: fp, matchedOn: `@${matched}` };
+            if (matched) matches.push({ pattern: fp, matchedOn: `@${matched}` });
         }
 
         if (fp.detection === 'modifier') {
             const matched = modifiers.find(m => fp.pattern.test(m));
-            if (matched) return { pattern: fp, matchedOn: `@${matched}` };
+            if (matched) matches.push({ pattern: fp, matchedOn: `@${matched}` });
         }
     }
+    if (matches.length === 0) return null;
 
-    return null;
+    // Shared decorator shapes (@app.get is both flask and fastapi): the
+    // file's own imports break the tie. Without an import signal, declaration
+    // order keeps deciding (the #245 rule).
+    if (matches.length > 1 && fileEntry) {
+        // fileEntry.imports holds module strings; parser-level records hold
+        // { module } objects — accept both shapes.
+        const modules = (fileEntry.imports || []).map(imp =>
+            typeof imp === 'string' ? imp : String(imp?.module || ''));
+        const importBacked = matches.find(m => m.pattern.importSignal &&
+            modules.some(mod => m.pattern.importSignal.test(mod)));
+        if (importBacked) return importBacked;
+    }
+    return matches[0];
 }
 
 /**
@@ -659,6 +715,9 @@ function buildCallbackEntrypointMap(index) {
                 // only visible as the enclosingFunction of the handler
                 // body's own calls (fix #247; the route vanished entirely).
                 const handledLines = new Set();
+                // Route lines that produced an actual entry (pass 2 or 2b) —
+                // the remainder are anonymous-handler routes for pass 2c.
+                const attributedLines = new Set();
 
                 // Pass 2: find callbacks on route-registration lines
                 for (const call of calls) {
@@ -675,6 +734,7 @@ function buildCallbackEntrypointMap(index) {
                     // entry points. This aligns the HTTP Routes section with
                     // bridge.js's extractServerRoutes.
                     if (!index.symbols.has(call.name)) continue;
+                    attributedLines.add(call.line);
 
                     if (!result.has(call.name)) {
                         const def = resolveHandlerDef(call.name, filePath);
@@ -709,6 +769,7 @@ function buildCallbackEntrypointMap(index) {
                     const inlineDef = encDefs.find(d => d.bodyScopedName &&
                         d.file === filePath && d.startLine === enc.startLine);
                     if (encDefs.length > 0 && !inlineDef) continue;
+                    attributedLines.add(enc.startLine);
                     if (!result.has(enc.name)) {
                         result.set(enc.name, {
                             framework: route.pattern.framework,
@@ -719,6 +780,33 @@ function buildCallbackEntrypointMap(index) {
                             line: enc.startLine,
                             registrationFile: filePath,
                             registrationLine: enc.startLine,
+                        });
+                    }
+                }
+
+                // Pass 2c: routes with no attributable handler — anonymous
+                // arrows (`app.get('/e', (req, res) => …)`) or handlers UCN
+                // cannot name. The ROUTE is still a framework entry point:
+                // `endpoints` lists it, and `entrypoints` must agree.
+                // Literal-path routes only — the same rule that keeps
+                // library-internal registration helpers (gin's
+                // `group.GET(relativePath, handler)`) out of the route list.
+                for (const [line, route] of routeLines) {
+                    if (attributedLines.has(line)) continue;
+                    if (!route.call.firstStringArg || route.call.firstStringArgInterp) continue;
+                    const key = `<anonymous>@${filePath}:${line}`;
+                    if (!result.has(key)) {
+                        result.set(key, {
+                            name: '<anonymous>',
+                            framework: route.pattern.framework,
+                            type: route.pattern.type,
+                            patternId: route.pattern.id,
+                            method: route.call.name.toUpperCase(),
+                            file: filePath,
+                            line,
+                            registrationFile: filePath,
+                            registrationLine: line,
+                            route: route.call.firstStringArg,
                         });
                     }
                 }
@@ -861,7 +949,7 @@ function detectEntrypoints(index, options = {}) {
             if (!fileEntry) continue;
 
             // Check decorator/modifier-based patterns
-            const match = matchDecoratorOrModifier(symbol, fileEntry.language);
+            const match = matchDecoratorOrModifier(symbol, fileEntry.language, fileEntry);
             if (match) {
                 const key = `${symbol.file}:${symbol.startLine}:${name}`;
                 if (seen.has(key)) continue;
@@ -912,14 +1000,19 @@ function detectEntrypoints(index, options = {}) {
     // 2. Add call-pattern-based entry points (route handlers).
     // Run BEFORE file-level patterns so framework labels (express, gin, etc.) win
     // over generic file-level labels (e.g. server.js / index.js js-cli-main).
-    for (const [name, info] of callbackMap) {
+    for (const [mapKey, info] of callbackMap) {
+        // Anonymous-handler routes are stored under a synthetic unique key;
+        // the display name lives in info.name.
+        const name = info.name || mapKey;
         const fileEntry = index.files.get(info.file);
         const relPath = fileEntry?.relativePath || info.file;
         const key = `${info.file}:${info.line}:${name}`;
         if (seen.has(key)) continue;
         seen.add(key);
 
-        let evidence = `${info.method} route handler`;
+        let evidence = info.route
+            ? `${info.method} ${info.route} — inline anonymous handler`
+            : `${info.method} route handler`;
         let registeredAt;
         if (info.registrationFile) {
             const regEntry = index.files.get(info.registrationFile);
@@ -1350,7 +1443,7 @@ function isFrameworkEntrypoint(symbol, index) {
     if (!fileEntry) return false;
 
     // Fast path: check decorator/modifier patterns (no index scan needed)
-    if (matchDecoratorOrModifier(symbol, fileEntry.language)) {
+    if (matchDecoratorOrModifier(symbol, fileEntry.language, fileEntry)) {
         return true;
     }
 

@@ -404,6 +404,22 @@ function validatePublicParams(command, p) {
         if (p.defaultValue != null && !p.addParam) {
             return 'plan defaultValue is valid only with addParam.';
         }
+        // Names that land in declarations and call sites must at least be
+        // identifier-shaped — "foo bar" or "x-y" in a rename would write
+        // syntax errors into every planned edit. Language-specific reserved
+        // words are checked after symbol resolution (plan() knows the file).
+        const IDENTIFIER_SHAPE = /^[A-Za-z_$][A-Za-z0-9_$]*$/;
+        if (p.renameTo != null && String(p.renameTo).trim() !== '' &&
+            !IDENTIFIER_SHAPE.test(String(p.renameTo).trim())) {
+            return `plan renameTo "${String(p.renameTo).trim()}" is not a valid identifier.`;
+        }
+        // addParam also accepts a typed spec (`suffix: string`, `opt?: number`)
+        // — only the NAME portion must be identifier-shaped.
+        const ADD_PARAM_SHAPE = /^[A-Za-z_$][A-Za-z0-9_$]*\??(\s*:\s*\S.*)?$/;
+        if (p.addParam != null && String(p.addParam).trim() !== '' &&
+            !ADD_PARAM_SHAPE.test(String(p.addParam).trim())) {
+            return `plan addParam "${String(p.addParam).trim()}" is not a valid parameter name (use \`name\` or \`name: type\`).`;
+        }
     }
     return null;
 }
@@ -1319,13 +1335,19 @@ const HANDLERS = {
         // Rust #[test], etc.) — show them by default. Previously this command
         // applied addTestExclusions() unconditionally, which stripped Java
         // *Tests.java entries while letting Rust #[test] through (asymmetric).
-        // Now consistent: default = include test entries; user opts out via
-        // --exclude-tests (or --include-tests=false for back-compat).
+        // Tests are excluded by default, matching search/usages/deadcode —
+        // an agent orienting via entrypoints needs the routes that describe
+        // the project, not every fixture route under test/. --include-tests
+        // restores the full universe; --exclude-tests stays accepted as the
+        // explicit spelling of the default. Internal consumers (reachability
+        // seeding, check's orphan detection) call detectEntrypoints directly
+        // and always see the full universe.
         const userExclude = Array.isArray(p.exclude)
             ? p.exclude
             : (p.exclude ? p.exclude.split(',').map(s => s.trim()).filter(Boolean) : []);
-        const wantsExcludeTests = p.excludeTests === true || p.includeTests === false;
-        const exclude = wantsExcludeTests ? addTestExclusions(userExclude) : userExclude;
+        const exclude = p.includeTests === true
+            ? userExclude
+            : addTestExclusions(userExclude);
         let result = detectEntrypoints(index, {
             type: p.type,
             framework: p.framework,

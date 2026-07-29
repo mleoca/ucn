@@ -193,3 +193,56 @@ describe('deterministic disagreement evaluation', () => {
         assert.match(result.stderr, /positive integer/);
     });
 });
+
+describe('entrypoints ↔ endpoints agreement (the finding-4 class)', () => {
+    const { execute } = require('../core/execute');
+
+    it('every literal-path server route surfaces in entrypoints with the same framework', () => {
+        const dir = tmp({
+            'package.json': '{"name":"routes-agreement"}',
+            'server.js': [
+                "const express = require('express');",
+                'const app = express();',
+                "app.get('/e', (req, res) => res.send('ok'));",
+                "app.post('/named', function createUser(req, res) { res.json({}); });",
+                'app.listen(3000);',
+            ].join('\n'),
+            'api.py': [
+                'from fastapi import FastAPI',
+                'app = FastAPI()',
+                '',
+                '@app.get("/g")',
+                'def read_g():',
+                '    return {"g": 1}',
+            ].join('\n'),
+            'web.py': [
+                'from flask import Flask',
+                'app = Flask(__name__)',
+                '',
+                '@app.route("/")',
+                'def home():',
+                '    return "hi"',
+            ].join('\n'),
+        });
+        try {
+            const index = idx(dir);
+            const endpoints = execute(index, 'endpoints', {});
+            const entrypoints = execute(index, 'entrypoints', {});
+            assert.ok(endpoints.ok && entrypoints.ok);
+            const routes = endpoints.result.routes;
+            const httpEntries = entrypoints.result.filter(e => e.type === 'http');
+            assert.ok(routes.length >= 4, `expected 4 routes, got ${routes.length}`);
+            for (const route of routes) {
+                const match = httpEntries.find(e =>
+                    (e.name === route.handler || route.handler === '<anonymous>') &&
+                    e.file === route.file);
+                assert.ok(match,
+                    `route ${route.method} ${route.path} (${route.file}) has no entrypoints entry; ` +
+                    `entries: ${httpEntries.map(e => `${e.name}@${e.file}:${e.line}`).join(', ')}`);
+                assert.strictEqual(match.framework, route.framework,
+                    `framework labels must agree for ${route.path}: ` +
+                    `endpoints=${route.framework} entrypoints=${match.framework}`);
+            }
+        } finally { rm(dir); }
+    });
+});

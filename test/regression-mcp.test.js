@@ -753,3 +753,55 @@ describe('fix #250: MCP find parity + compact + fn notes', () => {
         } finally { rm(d2); }
     });
 });
+
+describe('fix: MCP surfaces unknown, typo\'d, and camelCase params', () => {
+    it('notes each dropped parameter instead of silently ignoring it', async () => {
+        const { McpClient } = require('./helpers');
+        const dir = tmp({
+            'package.json': '{"name":"unknown-param-test"}',
+            'a.js': 'function alpha() { return 1; }\nmodule.exports = { alpha };\n',
+        });
+        let client;
+        try {
+            client = new McpClient();
+            await client.start();
+            await client.initialize();
+
+            // Typo of a known param → did-you-mean note.
+            const typo = await client.callTool('ucn', {
+                command: 'usages', project_dir: dir, name: 'alpha', include_test: true,
+            });
+            const typoText = typo.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(/Note: unknown parameter include_test ignored — did you mean include_tests\?/.test(typoText),
+                `typo must be noted with a suggestion, got: ${typoText}`);
+
+            // Canonical camelCase spelling → use-the-snake-spelling note.
+            const camel = await client.callTool('ucn', {
+                command: 'usages', project_dir: dir, name: 'alpha', includeTests: true,
+            });
+            const camelText = camel.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(/Note: includeTests is not an accepted parameter — use include_tests\./.test(camelText),
+                `camelCase must be redirected to the accepted spelling, got: ${camelText}`);
+
+            // Entirely unknown key → ignored note.
+            const junk = await client.callTool('ucn', {
+                command: 'usages', project_dir: dir, name: 'alpha', zzz: 1,
+            });
+            const junkText = junk.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(/Note: unknown parameter zzz ignored\./.test(junkText),
+                `unknown keys must be noted, got: ${junkText}`);
+
+            // A valid param produces no unknown-param note.
+            const valid = await client.callTool('ucn', {
+                command: 'usages', project_dir: dir, name: 'alpha', include_tests: true,
+            });
+            const validText = valid.result?.content?.map(c => c.text).join('') || '';
+            assert.ok(!/unknown parameter|not an accepted parameter/.test(validText),
+                `valid params must not trigger notes, got: ${validText}`);
+        } finally {
+            if (client) client.stop();
+            clearProjectCache(dir);
+            rm(dir);
+        }
+    });
+});

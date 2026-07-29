@@ -15,3 +15,5 @@ eval/
 test/
 server.json
 scripts/
+eslint.config.js
+jsconfig.json

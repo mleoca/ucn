@@ -1222,7 +1222,7 @@ describe('New Formatter Coverage', () => {
             ];
             const text = output.formatUsages(usages, 'parse');
 
-            assert.ok(text.includes('Usages of "parse":'), 'Should show header with name');
+            assert.ok(text.includes('Usages of "parse" (syntax-classified):'), 'Should show header with name and classification basis');
             assert.ok(text.includes('1 definitions'), 'Should count definitions');
             assert.ok(text.includes('2 calls'), 'Should count calls');
             assert.ok(text.includes('1 imports'), 'Should count imports');
@@ -2758,5 +2758,41 @@ describe('formatOrient', () => {
         assert.ok(text.includes('ENTRY POINTS: 5 — test 3, http 2'));
         assert.ok(text.includes('TRUST: MEDIUM — 4 dynamic import(s), 1 eval, 2 parse failure(s)'));
         assert.ok(!text.includes('ucn show null'), 'no suggestion when none available');
+    });
+});
+
+describe('fix: usages renders bulk CALLS section last', () => {
+    it('imports/references/other-text precede CALLS so truncation eats bulk, not rare sections', () => {
+        const usages = [
+            { relativePath: 'a.js', line: 1, isDefinition: false, usageType: 'import', content: "const { f } = require('./f')" },
+            { relativePath: 'a.js', line: 5, isDefinition: false, usageType: 'call', content: 'f(1)' },
+            { relativePath: 'a.js', line: 7, isDefinition: false, usageType: 'reference', content: 'const g = f' },
+            { relativePath: 'a.js', line: 9, isDefinition: false, usageType: 'text', content: '// f in a comment' },
+        ];
+        const text = output.formatUsages(usages, 'f');
+        const order = ['IMPORTS:', 'REFERENCES:', 'OTHER TEXT', 'CALLS:']
+            .map(section => text.indexOf(section));
+        assert.ok(order.every(i => i >= 0), `all sections present: ${text}`);
+        for (let i = 1; i < order.length; i++) {
+            assert.ok(order[i] > order[i - 1],
+                `section order must be IMPORTS < REFERENCES < OTHER TEXT < CALLS, got indexes ${order}`);
+        }
+    });
+});
+
+describe('fix: usages caps the DEFINITIONS section display', () => {
+    it('shows 10 of many definitions with a recovery hint; --all lifts the cap', () => {
+        const usages = [];
+        for (let i = 1; i <= 25; i++) {
+            usages.push({ relativePath: 'src/p.java', line: i * 10, startLine: i * 10, isDefinition: true, usageType: 'definition', signature: `parse(a${i})` });
+        }
+        usages.push({ relativePath: 'src/q.java', line: 999, isDefinition: false, usageType: 'text', content: '// parse note' });
+        const text = output.formatUsages(usages, 'parse');
+        assert.ok(text.includes('25 definitions'), 'header count stays complete');
+        assert.ok(text.includes('... and 15 more definitions'), text.split('\n').slice(0, 5).join('\n'));
+        assert.ok(text.includes('OTHER TEXT'), 'later sections still render');
+        const full = output.formatUsages(usages, 'parse', { all: true });
+        assert.ok(!full.includes('more definitions'), '--all lifts the cap');
+        assert.ok(full.includes('src/p.java:250'), 'last definition rendered under --all');
     });
 });

@@ -849,8 +849,8 @@ describe('perf: PERF-3 atomic index.json write', () => {
 
 // ── JAVA-2: entrypoints includes test entries by default ──────────────────────
 
-describe('perf: JAVA-2 entrypoints test-entry default visibility', () => {
-    it('shows JUnit @Test methods by default for Java', () => {
+describe('perf: JAVA-2 entrypoints test-entry visibility', () => {
+    it('shows JUnit @Test methods with --include-tests for Java', () => {
         const dir = tmp({
             'pom.xml': '<project></project>',
             'src/main/java/App.java': `
@@ -876,21 +876,23 @@ public class AppTests {
         });
         try {
             const index = idx(dir);
-            const { ok, result } = execute(index, 'entrypoints', { type: 'test' });
+            const { ok, result } = execute(index, 'entrypoints', {
+                type: 'test', includeTests: true,
+            });
             assert.strictEqual(ok, true);
             const testEntries = (result || []).filter(e =>
                 e.framework === 'junit' && e.name === 'shouldRun');
             assert.ok(testEntries.length > 0,
-                '@Test method should appear in default entrypoints output');
+                '@Test method should appear with --include-tests');
 
             const { ok: ok2, result: result2 } = execute(index, 'entrypoints', {
-                type: 'test', excludeTests: true,
+                type: 'test',
             });
             assert.strictEqual(ok2, true);
             const stillThere = (result2 || []).filter(e =>
                 e.framework === 'junit' && e.name === 'shouldRun');
             assert.strictEqual(stillThere.length, 0,
-                '--exclude-tests should hide @Test methods');
+                'test-file @Test methods are hidden by default');
         } finally {
             rm(dir);
         }

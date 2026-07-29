@@ -1110,18 +1110,46 @@ describe('callee side-effect tags', () => {
 // ── check ──────────────────────────────────────────────────────────────────
 
 describe('check command', () => {
-    it('returns empty result when no diff', () => {
+    it('reports not-a-repo status outside git — distinguishable from a clean tree', () => {
         const dir = tmp({
             'package.json': '{"name":"test"}',
             'a.js': 'function a() {}',
         });
         try {
             const index = idx(dir);
-            // No git repo — diffImpact returns empty/no changes
+            // No git repo — the gate cannot run; this must NOT look like a
+            // clean tree (empty:true) to CI.
             const { ok, result } = execute(index, 'check', { base: 'HEAD' });
             assert.ok(ok);
-            assert.ok(result.empty || result.changed.length === 0,
-                'should be empty without git changes');
+            assert.strictEqual(result.ok, false, 'gate-could-not-run carries ok:false');
+            assert.strictEqual(result.status, 'not-a-repo');
+            assert.ok(result.error, 'carries the git error message');
+            assert.ok(!result.empty, 'must not claim empty when the diff never ran');
+        } finally { rm(dir); }
+    });
+
+    it('reports diff-failed status for an invalid base ref', () => {
+        const dir = tmp({
+            'package.json': '{"name":"test"}',
+            'a.js': 'function a() {}',
+        });
+        try {
+            execFileSync('git', ['init', '-q'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'add', '.'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir });
+            const index = idx(dir);
+            const { ok, result } = execute(index, 'check', { base: 'zzz-no-such-ref' });
+            assert.ok(ok);
+            assert.strictEqual(result.ok, false);
+            assert.strictEqual(result.status, 'diff-failed');
+            assert.ok(!result.empty);
+
+            // A genuinely clean tree keeps status clean + empty:true + ok:true.
+            const clean = execute(index, 'check', { base: 'HEAD' });
+            assert.ok(clean.ok);
+            assert.strictEqual(clean.result.status, 'clean');
+            assert.strictEqual(clean.result.ok, true);
+            assert.strictEqual(clean.result.empty, true);
         } finally { rm(dir); }
     });
 
@@ -1891,6 +1919,38 @@ describe('fix #228: diffImpact old-side identity and deletion attribution', () =
             assert.strictEqual(victim.remainingCallSites.length, 1, 'the remaining app.js call site is surfaced');
             assert.strictEqual(victim.remainingCallSites[0].relativePath, 'app.js');
             assert.strictEqual(victim.remainingCallSites[0].line, 2);
+        } finally { rm(dir); }
+    });
+});
+
+describe('check CLI exit codes distinguish could-not-run from clean', () => {
+    const CLI_ENTRY = path.join(__dirname, '..', 'cli', 'index.js');
+
+    function runCheckExit(cwd, extraArgs) {
+        try {
+            execFileSync('node', [CLI_ENTRY, '.', 'check', ...extraArgs, '--no-cache'],
+                { cwd, encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'] });
+            return 0;
+        } catch (e) {
+            return e.status;
+        }
+    }
+
+    it('exits 2 outside git and for a bad base ref; 0 for a clean tree', () => {
+        const dir = tmp({
+            'package.json': '{"name":"exitcodes"}',
+            'a.js': 'function a() { return 1; }',
+        });
+        try {
+            assert.strictEqual(runCheckExit(dir, []), 2, 'non-git directory must exit 2');
+
+            execFileSync('git', ['init', '-q'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'add', '.'], { cwd: dir });
+            execFileSync('git', ['-c', 'user.email=t@t.t', '-c', 'user.name=t', 'commit', '-q', '-m', 'init'], { cwd: dir });
+
+            assert.strictEqual(runCheckExit(dir, ['--base=zzz-no-such-ref']), 2,
+                'invalid base ref must exit 2');
+            assert.strictEqual(runCheckExit(dir, []), 0, 'clean tree exits 0');
         } finally { rm(dir); }
     });
 });

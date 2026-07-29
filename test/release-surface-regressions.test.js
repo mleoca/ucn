@@ -287,20 +287,24 @@ describe('v5 release-surface adversarial regressions', () => {
 
     it('transport truncation never recommends an inapplicable all flag', () => {
         const text = 'x'.repeat(200);
-        const usages = applyOutputBudget(text, {
-            command: 'usages',
+        const search = applyOutputBudget(text, {
+            command: 'search',
             maxChars: 20,
             surface: 'cli',
         }).text;
-        assert.doesNotMatch(usages, /--all/);
-        assert.match(usages, /--max-chars/);
+        assert.doesNotMatch(search, /--all/);
+        assert.match(search, /--max-chars/);
 
-        const show = applyOutputBudget(text, {
-            command: 'show',
-            maxChars: 20,
-            surface: 'cli',
-        }).text;
-        assert.match(show, /--all/);
+        // usages and show both support --all (usages gained it with the
+        // DEFINITIONS display cap) — the hint must recommend it.
+        for (const command of ['usages', 'show']) {
+            const hinted = applyOutputBudget(text, {
+                command,
+                maxChars: 20,
+                surface: 'cli',
+            }).text;
+            assert.match(hinted, /--all/);
+        }
     });
 
     it('detailed repository lists elide pathological identifiers', () => {

@@ -160,8 +160,14 @@ function formatNonCallLine(account, hintName, usagesHint) {
     if (!account || !account.nonCall || account.nonCall.total === 0) return null;
     const nc = account.nonCall;
     const hint = usagesHint || `ucn usages ${hintName}`;
+    // Classification differs across the two surfaces by contract: these
+    // counts are engine-adjudicated (a method reference that resolves to
+    // this target is a confirmed caller, not a reference), while `usages`
+    // classifies each line by syntax alone — the breakdowns can
+    // legitimately differ.
     return `NON-CALL OCCURRENCES: ${nc.total} (${nc.imports} imports, ${nc.definitions} definitions, ` +
-        `${nc.references} references, ${nc.unclassifiedText} other-text) — counts only; see: ${hint}`;
+        `${nc.references} references, ${nc.unclassifiedText} other-text) — engine-adjudicated counts; ` +
+        `syntax-classified line records: ${hint}`;
 }
 
 /** Format context (callers + callees) as JSON */

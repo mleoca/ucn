@@ -70,7 +70,7 @@ const COMMAND_CONTRACTS = Object.freeze({
             { name: 'inventory', when: 'Always.', answer: 'Occurrence records classified by usage kind.' },
         ],
         defaults: ['Tests excluded unless `includeTests=true`.', 'Comments/strings included unless `codeOnly=true`.'],
-        truth: 'The command reports the indexed literal-name occurrence universe, not exact semantic references to one definition.',
+        truth: 'The command reports the indexed literal-name occurrence universe, not exact semantic references to one definition. Classification is by syntax alone; show/impact ACCOUNT lines are engine-adjudicated, so the two breakdowns can legitimately differ (a method reference is a `reference` here but may be a confirmed caller there).',
         nonGoals: ['Alias-only references whose source line does not contain the queried name.', 'Safe-delete proof.'],
         invalidCombinations: ['A missing name is rejected.'],
         examples: ['ucn usages parseRequest --include-tests', 'ucn usages parseRequest --code-only --file=src'],

@@ -1335,6 +1335,44 @@ function verify(index, name, options = {}) {
  * @param {object} options - { addParam, removeParam, renameTo, defaultValue }
  * @returns {object} Plan with before/after signatures and affected call sites
  */
+// Strict reserved words per language — names that can never be identifiers.
+// Contextual/soft keywords (TS `interface`, Python `match`, C# `var`) are
+// deliberately absent: they are legal identifiers, and over-blocking a rename
+// is worse than trusting the compiler for the soft cases. Fail-open for
+// languages without an entry.
+const JS_RESERVED = new Set(('break case catch class const continue debugger default delete do else enum export ' +
+    'extends false finally for function if import in instanceof new null return super switch this throw true try ' +
+    'typeof var void while with yield let static await').split(' '));
+const C_RESERVED = new Set(('auto break case char const continue default do double else enum extern float for goto ' +
+    'if inline int long register restrict return short signed sizeof static struct switch typedef union unsigned ' +
+    'void volatile while _Bool').split(' '));
+const RESERVED_WORDS_BY_LANGUAGE = {
+    javascript: JS_RESERVED,
+    typescript: JS_RESERVED,
+    tsx: JS_RESERVED,
+    python: new Set(('False None True and as assert async await break class continue def del elif else except ' +
+        'finally for from global if import in is lambda nonlocal not or pass raise return try while with yield').split(' ')),
+    go: new Set(('break case chan const continue default defer else fallthrough for func go goto if import ' +
+        'interface map package range return select struct switch type var').split(' ')),
+    rust: new Set(('as async await break const continue crate dyn else enum extern false fn for if impl in let ' +
+        'loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where ' +
+        'while').split(' ')),
+    java: new Set(('abstract assert boolean break byte case catch char class const continue default do double ' +
+        'else enum extends final finally float for goto if implements import instanceof int interface long native ' +
+        'new package private protected public return short static strictfp super switch synchronized this throw ' +
+        'throws transient try void volatile while true false null').split(' ')),
+    c: C_RESERVED,
+    cpp: new Set([...C_RESERVED, ...('bool catch class constexpr delete explicit false friend mutable namespace ' +
+        'new noexcept nullptr operator private protected public template this throw true try typename using ' +
+        'virtual wchar_t').split(' ')]),
+    csharp: new Set(('abstract as base bool break byte case catch char checked class const continue decimal ' +
+        'default delegate do double else enum event explicit extern false finally fixed float for foreach goto if ' +
+        'implicit in int interface internal is lock long namespace new null object operator out override params ' +
+        'private protected public readonly ref return sbyte sealed short sizeof stackalloc static string struct ' +
+        'switch this throw true try typeof uint ulong unchecked unsafe ushort using virtual void volatile ' +
+        'while').split(' ')),
+};
+
 function plan(index, name, options = {}) {
     index._beginOp();
     try {
@@ -1386,6 +1424,28 @@ function plan(index, name, options = {}) {
             function: name,
             error: `plan accepts one operation at a time; got ${requestedOps.length}: ${requestedOps.join(', ')}. Run separately and compose results.`,
         };
+    }
+
+    // Rename-target sanity: a same-name rename is a 0-change request, and a
+    // reserved word in the target's language would write syntax errors into
+    // the declaration and every call site. (Identifier SHAPE is validated at
+    // the execute layer; keywords need the resolved symbol's language.)
+    if (options.renameTo) {
+        if (options.renameTo === def.name || options.renameTo === name) {
+            return {
+                found: true,
+                function: name,
+                error: `renameTo "${options.renameTo}" matches the current name — nothing to rename.`,
+            };
+        }
+        const reserved = RESERVED_WORDS_BY_LANGUAGE[planLang === 'html' ? 'javascript' : planLang];
+        if (reserved && reserved.has(options.renameTo)) {
+            return {
+                found: true,
+                function: name,
+                error: `renameTo "${options.renameTo}" is a reserved word in ${planLang === 'html' ? 'javascript' : planLang} and cannot be used as an identifier.`,
+            };
+        }
     }
 
     let newParams = [...currentParams];
